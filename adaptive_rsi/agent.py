@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -12,6 +13,8 @@ def object_schema(properties):
 
 TEXT = {"type": "string"}
 STRINGS = {"type": "array", "items": TEXT}
+REVIEW_AREAS = ["correctness", "security", "maintainability", "architecture", "tests", "scope"]
+VERDICT = {"type": "string", "enum": ["pass", "fail", "insufficient_evidence"]}
 SCHEMAS = {
     "analysis": object_schema({"findings": {"type": "array", "items": object_schema({
         "title": TEXT, "body": TEXT, "path": TEXT, "quote": TEXT,
@@ -20,7 +23,13 @@ SCHEMAS = {
                                "reason": TEXT, "scope": STRINGS, "acceptance": STRINGS,
                                "risk": {"type": "string", "enum": ["low", "medium", "high"]}}),
     "implementation": object_schema({"summary": TEXT}),
-    "review": object_schema({"decision": {"type": "string", "enum": ["pass", "fail", "insufficient_evidence"]}, "reason": TEXT}),
+    "review": object_schema({"decision": VERDICT, "reason": TEXT,
+        "assessments": {"type": "array", "items": object_schema({
+            "area": {"type": "string", "enum": REVIEW_AREAS}, "decision": VERDICT, "reason": TEXT})},
+        "findings": {"type": "array", "items": object_schema({
+            "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+            "area": {"type": "string", "enum": REVIEW_AREAS}, "path": TEXT,
+            "line": {"type": "integer"}, "title": TEXT, "reason": TEXT, "suggestion": TEXT})}}),
     "evolution": object_schema({"kind": {"type": "string", "enum": ["strategy", "meta_strategy", "adapter"]},
                                 "guidance": TEXT, "triggers": STRINGS, "rationale": TEXT}),
 }
@@ -45,6 +54,27 @@ def validate_output(value, schema):
             validate_output(item, schema["items"])
 
 
+def provider_arguments(route, config):
+    provider_id = route.get("provider", "openai")
+    if provider_id in ["ollama", "lmstudio"]:
+        return ["--oss", "--local-provider", provider_id]
+    if provider_id == "openai":
+        return ["-c", 'model_provider="openai"']
+    provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
+    if provider is None:
+        raise RuntimeError("Unknown model provider: " + provider_id)
+    if provider["env_key"] and not os.environ.get(provider["env_key"]):
+        raise RuntimeError("Missing provider environment variable: " + provider["env_key"])
+    settings = {"name": provider["name"], "base_url": provider["base_url"],
+                "wire_api": "responses", "requires_openai_auth": False}
+    if provider["env_key"]:
+        settings["env_key"] = provider["env_key"]
+    argv = ["-c", "model_provider=" + json.dumps(provider_id)]
+    for key, value in settings.items():
+        argv += ["-c", "model_providers." + provider_id + "." + key + "=" + json.dumps(value)]
+    return argv
+
+
 class CodexAgent:
     def __init__(self, store):
         self.store = store
@@ -57,28 +87,31 @@ class CodexAgent:
         if routes[0].get("fallback"):
             routes.append(routes[0]["fallback"])
         for index, route in enumerate(routes):
+            provider_args = provider_arguments(route, config)
             call = self.store.reserve_call(project, run, role, route, config)
-            sandbox = Sandbox(self.store.root, config)
-            agent_dir = Path(workspace) / ".rsi-agent" / call
-            agent_dir.mkdir(parents=True)
-            schema_path = agent_dir / "schema.json"
-            schema_path.write_text(json.dumps(SCHEMAS[role]))
-            output_path = agent_dir / "result.json"
-            prompt_path = agent_dir / "prompt.txt"
-            prompt_path.write_text(prompt, encoding="utf-8")
-            mode = "workspace-write" if role == "implementation" else "read-only"
-            argv = [binary, "-a", "never", "exec", "--ignore-user-config", "--ignore-rules",
-                    "--ephemeral", "--model", route["model"], "-c", 'model_reasoning_effort="' + route["effort"] + '"',
-                    "--sandbox", mode, "-c", "sandbox_workspace_write.network_access=false",
-                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-                    "--json", "--color", "never", "--output-schema", str(schema_path),
-                    "--output-last-message", str(output_path), "-C", str(workspace),
-                    "Read the task in " + str(prompt_path) + ". Follow its instructions; return the requested JSON."]
-            argv = sandbox.worker(argv, workspace, protected, read_only=role != "implementation", output_dir=agent_dir)
-            self.store.event("model", role + ": " + route["model"] + " / " + route["effort"], project, run)
             started = time.time()
             try:
+                sandbox = Sandbox(self.store.root, config)
+                agent_dir = Path(workspace) / ".rsi-agent" / call
+                agent_dir.mkdir(parents=True)
+                schema_path = agent_dir / "schema.json"
+                schema_path.write_text(json.dumps(SCHEMAS[role]))
+                output_path = agent_dir / "result.json"
+                prompt_path = agent_dir / "prompt.txt"
+                prompt_path.write_text(prompt, encoding="utf-8")
+                mode = "workspace-write" if role == "implementation" else "read-only"
+                argv = [binary, "-a", "never", "exec", "--ignore-user-config", "--ignore-rules",
+                        "--ephemeral", "--model", route["model"]] + provider_args
+                if route["effort"] != "default":
+                    argv += ["-c", "model_reasoning_effort=" + json.dumps(route["effort"])]
+                argv += ["--sandbox", mode, "-c", "sandbox_workspace_write.network_access=false",
+                         "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                         "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                         "--json", "--color", "never", "--output-schema", str(schema_path),
+                         "--output-last-message", str(output_path), "-C", str(workspace),
+                         "Read the task in " + str(prompt_path) + ". Follow its instructions; return the requested JSON."]
+                argv = sandbox.worker(argv, workspace, protected, read_only=role != "implementation", output_dir=agent_dir)
+                self.store.event("model", role + ": " + route.get("provider", "openai") + " / " + route["model"] + " / " + route["effort"], project, run)
                 result = run_process(argv, workspace, config["limits"]["run_seconds"], cancel,
                                      config["limits"]["max_output_mb"])
                 (agent_dir / "events.jsonl").write_text(result["stdout"], encoding="utf-8")
@@ -91,19 +124,20 @@ class CodexAgent:
                             tokens += int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
                     except (ValueError, TypeError):
                         continue
-                self.store.execute("UPDATE calls SET state=?,tokens=?,seconds=? WHERE id=?",
-                                   ("failed" if result["exit_code"] or result["error"] else "completed", tokens, time.time() - started, call))
+                self.store.execute("UPDATE calls SET tokens=?,seconds=? WHERE id=?", (tokens, time.time() - started, call))
                 self.store.execute("UPDATE runs SET tokens=tokens+? WHERE id=?", (tokens, run))
                 if result["exit_code"] or result["error"]:
                     error = (result["stderr"] or result["error"] or result["stdout"])[-2000:]
                     # Fallback is explicit, recorded, and only used for provider/model errors.
                     unavailable = any(s in error.lower() for s in ["model not found", "not supported", "does not exist", "rate limit", "usage limit"])
                     if unavailable and index + 1 < len(routes):
+                        self.store.execute("UPDATE calls SET state='failed' WHERE id=?", (call,))
                         self.store.event("fallback", error, project, run)
                         continue
                     raise RuntimeError("Codex call failed: " + error)
                 data = json.loads(output_path.read_text(encoding="utf-8"))
                 validate_output(data, SCHEMAS[role])
+                self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                 return data
             except Exception:
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=? AND state='reserved'",

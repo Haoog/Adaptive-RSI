@@ -3,6 +3,7 @@ import json
 import os
 import platform
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -13,12 +14,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.adapters import detect
-from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.config import DEFAULTS, fingerprint, merge, validate
+from adaptive_rsi.agent import CodexAgent, REVIEW_AREAS, provider_arguments
+from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge, validate
 from adaptive_rsi.evaluator import Evaluator, empty_test_run
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import git, snapshot
 from adaptive_rsi.process import Sandbox, checked, run_process
+from adaptive_rsi.review import enforce_review
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store, encode, uid
@@ -59,7 +61,8 @@ class FakeAgent:
                 (workspace / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
             return {"summary": "Corrected addition"}
         if role == "review":
-            return {"decision": "pass", "reason": "Narrow change meets acceptance"}
+            return {"decision": "pass", "reason": "Narrow change meets acceptance", "findings": [],
+                    "assessments": [{"area": area, "decision": "pass", "reason": "Checked staged change and surrounding code"} for area in REVIEW_AREAS]}
         if role == "analysis":
             return {"findings": [{"title": "Addition subtracts", "body": "add(2, 3) returns -1",
                                   "path": "calculator.py", "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60}]}
@@ -88,6 +91,29 @@ class RuntimeTest(unittest.TestCase):
         task = self.runtime.goal(self.project, text)
         self.runtime.pause(self.project, False)
         return task, self.store.claim(self.project, self.runtime.config(self.project))
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_green_tests_cannot_bypass_blocking_maintainability_review(self):
+        class ContradictoryReviewer(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "review":
+                    result["findings"] = [{"severity": "medium", "area": "maintainability",
+                        "path": "calculator.py", "line": 2, "title": "Duplicated business logic",
+                        "reason": "New implementation diverges from shared arithmetic behavior",
+                        "suggestion": "Use the existing shared implementation"}]
+                return result
+        self.runtime.agent = ContradictoryReviewer()
+        task, run = self.claim()
+        self.runtime.process(run)
+        row = self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "failed", result)
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        self.assertEqual(result["review"]["reported_decision"], "pass")
+        self.assertEqual(result["review"]["decision"], "fail")
+        self.assertTrue((Path(row["path"]) / "review.json").exists())
+        self.assertNotIn("pr", result)
 
     def test_settings_precedence_and_frozen_run(self):
         self.runtime.configure({"schedule": {"light_minutes": 240}})
@@ -312,6 +338,7 @@ Path(%r).write_text('allowed output')
         store = self.store
         proposal_prompts = []
         class GuidedProvider(FakeAgent):
+            reject_reviews = False
             def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
                 call = store.reserve_call(project, run, role, config["models"][role], config)
                 store.execute("UPDATE calls SET state='completed',tokens=100 WHERE id=?", (call,))
@@ -323,7 +350,10 @@ Path(%r).write_text('allowed output')
                         path = workspace / "calculator.py"
                         path.write_text(path.read_text().replace("a - b", "a + b").replace("a / b", "a * b"))
                     return {"summary": "Applied supplied strategy"}
-                return super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == "review" and self.reject_reviews:
+                    result["assessments"][2]["decision"] = "fail"
+                return result
         self.runtime.agent = GuidedProvider()
         self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10}}, self.project)
         self.runtime.pause(self.project, False)
@@ -335,6 +365,15 @@ Path(%r).write_text('allowed output')
         self.assertNotIn("Protected multiply acceptance task", proposal_prompts[0])
         self.assertEqual(len(json.loads(candidates[0]["evidence"])["trials"]), 2)
         self.assertEqual(len(self.runtime.memories(self.project, "add")), 1)
+        self.runtime.agent.reject_reviews = True
+        self.runtime.request(self.project, "evolve")
+        rejected_run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.process(rejected_run)
+        rejected = self.store.one("SELECT * FROM candidates WHERE id<>?", (candidates[0]["id"],))
+        self.assertNotEqual(rejected["status"], "stable")
+        evidence = json.loads(rejected["evidence"])
+        self.assertTrue(evidence["trials"])
+        self.assertTrue(all(not trial["candidate"]["pass"] and trial["candidate"]["review"]["decision"] == "fail" for trial in evidence["trials"]))
         self.runtime.configure({"models": {"implementation": {"model": "another-model"}}}, self.project)
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
@@ -346,6 +385,47 @@ Path(%r).write_text('allowed output')
 
 
 class ConfigurationAndAdapterTest(unittest.TestCase):
+    def test_existing_call_history_migrates_without_losing_usage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with sqlite3.connect(str(Path(temp) / "state.sqlite3")) as db:
+                db.execute("CREATE TABLE calls (id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT, state TEXT, tokens INTEGER, seconds REAL, created REAL)")
+                db.execute("INSERT INTO calls VALUES ('old','p','r','review','model','high','completed',100,1,0)")
+            store = Store(temp)
+            self.assertEqual(store.one("SELECT provider,tokens FROM calls WHERE id='old'"), {"provider": "openai", "tokens": 100})
+            Store(temp)
+            self.assertEqual(len(store.query("SELECT * FROM calls")), 1)
+
+    def test_review_requires_every_area_and_preserves_nonblocking_findings(self):
+        review = FakeAgent().invoke("review", "", None, None, None, DEFAULTS)
+        review["assessments"][0]["decision"] = "insufficient_evidence"
+        self.assertEqual(enforce_review(review, DEFAULTS)["decision"], "insufficient_evidence")
+        review["assessments"][0]["decision"] = "pass"
+        review["findings"] = [{"severity": "low", "area": "maintainability", "path": "source.py",
+            "line": 1, "title": "Naming", "reason": "Name obscures units", "suggestion": "Include unit in name"}]
+        self.assertEqual(enforce_review(review, DEFAULTS)["decision"], "pass")
+        self.assertEqual(enforce_review(review, merge(DEFAULTS, {"review": {"block_on": "low"}}))["decision"], "fail")
+        review["assessments"].pop()
+        with self.assertRaisesRegex(RuntimeError, "every review area"):
+            enforce_review(review, DEFAULTS)
+
+    def test_provider_validation_and_strategy_compatibility(self):
+        provider = {"id": "gateway", "name": "Gateway", "base_url": "https://models.example/v1", "env_key": "RSI_MODEL_KEY"}
+        config = validate({"providers": [provider], "models": {"implementation": {
+            "provider": "gateway", "model": "qwen/coder:latest", "effort": "default"}}})
+        self.assertNotEqual(compatibility(config), compatibility(DEFAULTS))
+        self.assertNotEqual(compatibility(DEFAULTS), compatibility(merge(DEFAULTS, {"review": {"block_on": "high"}})))
+        for bad in [{**provider, "api_key": "secret"}, {**provider, "env_key": "sk-secret"},
+                    {**provider, "base_url": "https://key@models.example/v1"},
+                    {**provider, "base_url": "https://models.example/v1?key=secret"},
+                    {**provider, "base_url": "http://models.example/v1"}, {**provider, "id": "openai"}]:
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate({"providers": [bad]})
+        with self.assertRaises(ValueError):
+            validate({"models": {"review": {"provider": "missing"}}})
+        with self.assertRaisesRegex(RuntimeError, "environment variable"):
+            with patch.dict(os.environ, {}, clear=True):
+                provider_arguments(config["models"]["implementation"], config)
+
     def test_rust_integration_tests_are_not_rejected_for_empty_doc_tests(self):
         self.assertFalse(empty_test_run("running 0 tests\nrunning 3 tests\n3 passed; 0 failed\nrunning 0 tests"))
         self.assertTrue(empty_test_run("running 0 tests\n0 passed; 0 failed"))
@@ -388,6 +468,69 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
     def test_subprocess_timeout_and_output_cap(self):
         result = run_process(["python3", "-c", "import time; time.sleep(5)"], timeout=0.1)
         self.assertEqual(result["error"], "Command timed out")
+
+    def test_custom_and_local_models_route_without_forced_reasoning_or_secret_arguments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "controller")
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            commands = []
+            def provider(argv, *args, **kwargs):
+                commands.append(argv)
+                Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":"done"}')
+                return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
+            config = validate({"providers": [{"id": "gateway", "name": "Gateway", "base_url": "https://models.example/v1", "env_key": "RSI_MODEL_KEY"}],
+                "models": {"implementation": {"provider": "gateway", "model": "qwen/coder:latest", "effort": "default"}}})
+            with patch.dict(os.environ, {"RSI_MODEL_KEY": "test-secret-never-in-arguments"}), \
+                 patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
+                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.run_process", side_effect=provider):
+                agent = CodexAgent(store)
+                agent.invoke("implementation", "task", workspace, "project", "run", config)
+                local = merge(config, {"models": {"implementation": {"provider": "ollama"}}})
+                agent.invoke("implementation", "task", workspace, "project", "run", local)
+            self.assertIn('model_provider="gateway"', commands[0])
+            self.assertIn('model_providers.gateway.wire_api="responses"', commands[0])
+            self.assertIn('model_providers.gateway.env_key="RSI_MODEL_KEY"', commands[0])
+            self.assertFalse(any("model_reasoning_effort" in arg for arg in commands[0]))
+            self.assertNotIn("test-secret-never-in-arguments", json.dumps(commands))
+            self.assertIn("--oss", commands[1])
+            self.assertEqual(commands[1][commands[1].index("--local-provider") + 1], "ollama")
+            self.assertEqual([c["provider"] for c in store.query("SELECT provider FROM calls ORDER BY rowid")], ["gateway", "ollama"])
+
+    def test_provider_fallback_and_failed_setup_are_accounted_for(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "controller")
+            workspace = Path(temp) / "workspace"
+            workspace.mkdir()
+            commands = []
+            def provider(argv, *args, **kwargs):
+                commands.append(argv)
+                if len(commands) == 1:
+                    return {"exit_code": 1, "error": None, "stderr": "model not found", "stdout": ""}
+                Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":"done"}')
+                return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
+            config = validate({"models": {"implementation": {"fallback": {"provider": "lmstudio", "model": "other-coder", "effort": "default"}}}})
+            with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
+                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.run_process", side_effect=provider):
+                CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", config)
+            self.assertEqual([c["state"] for c in store.query("SELECT state FROM calls ORDER BY rowid")], ["failed", "completed"])
+            self.assertIn("lmstudio", commands[1])
+            with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
+                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=RuntimeError("sandbox unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "sandbox unavailable"):
+                    CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
+            self.assertEqual(store.query("SELECT state FROM calls ORDER BY rowid")[-1]["state"], "failed")
+            def malformed_output(argv, *args, **kwargs):
+                Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":42}')
+                return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
+            with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
+                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.run_process", side_effect=malformed_output):
+                with self.assertRaisesRegex(RuntimeError, "invalid structured output"):
+                    CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
+            self.assertEqual(store.query("SELECT state FROM calls ORDER BY rowid")[-1]["state"], "failed")
 
     def test_codex_command_really_routes_model_and_effort_and_records_usage(self):
         with tempfile.TemporaryDirectory() as temp:

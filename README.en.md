@@ -6,6 +6,87 @@ A local autonomous improvement runtime for Codex: **code inspection, user goals,
 
 Includes a plugin entry point, persistent scheduler, SQLite state and session budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
+## Workflow
+
+```mermaid
+flowchart TD
+    S[Scheduler: timed, manual and task-state triggers] --> I[Autonomous inspection]
+    S --> G[Incremental GitHub Issues sync]
+    U[User goals at any time] --> Q[Task queue: verify, deduplicate, prioritize]
+    I --> Q
+    G --> Q
+    M[Memory: evidence, failures, verified strategies] --> P[Planner: acceptance, scope, risk]
+    Q --> P
+    P --> W[Executor: isolated snapshot at a fixed commit]
+    W --> T[Host checks: frozen harness, baseline and candidate regression]
+    T --> R[Independent review: correctness, security, maintainability, architecture, tests, scope]
+    R --> D{Both checks and review pass?}
+    D -->|Yes| C[Local candidate / create PR]
+    C --> A[Human approval or controlled auto-merge]
+    T -->|Failure or insufficient evidence| F[Keep evidence, bounded retry or attention]
+    D -->|No| F
+    A --> M
+    C --> M
+    F --> M
+    M --> E[Strategy proposal: paired stable and candidate replay]
+    E --> V[Validation and protected holdout: checks and code review]
+    V --> H{Quality and cost acceptable?}
+    H -->|Yes| N[Promote and monitor, restore parent on failure]
+    H -->|No| M
+    N --> M
+```
+
+The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. Automatic PR creation and merging are separate settings. Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
+
+## Code quality gates
+
+Implementation and review use separate sessions with different permissions. Review can use a different provider. All six review areas require reasoned assessments; actionable findings include severity, file, line, impact and a suggested change. Reports appear in task details.
+
+The default threshold blocks **medium and above**, configurable to high or low. Critical and high findings always block. A failed area or insufficient evidence also blocks delivery. A reported pass cannot override a blocking finding: the host enforces the outcome. Failed reports enter subsequent retry context.
+
+Maintainability review covers duplication, unnecessary abstraction, complex branches, coupling, naming and project conventions. It targets introduced issues without demanding unrelated refactoring. Add project lint, type, complexity or dependency checks to `checks` for deterministic gates alongside tests; the runtime does not automatically impose a static-analysis tool suite. Model review can miss problems and cannot guarantee code quality.
+
+Both ordinary tasks and strategy replay use these gates. Paired experiments review both variants and count review costs symmetrically. The default experiment session cap is now 40; the project daily cap remains 30. Check both before a formal experiment. Exhaustion stops work without silently increasing limits.
+
+## Non-GPT models and providers
+
+Codex CLI still supplies execution tools, while each role can choose its own model and provider, including non-GPT models:
+
+| Route | Configuration | Requirements |
+| --- | --- | --- |
+| OpenAI / Codex | `provider: "openai"`, default | Existing Codex authentication |
+| Local Ollama | `provider: "ollama"` | Codex OSS mode, available local model and tool use |
+| Local LM Studio | `provider: "lmstudio"` | Same; start the service first |
+| Third-party gateway / self-hosted service | Register a provider, then select its ID | Responses streaming protocol, tools and structured output |
+
+Native Anthropic Messages, Gemini GenerateContent and Chat-Completions-only endpoints are **not directly connected**; they need a compatible gateway. A model name alone does not establish support for specific Claude, Gemini, DeepSeek or Qwen versions. The first real invocation establishes compatibility; no silent substitution occurs.
+
+In **Settings → Models & reasoning effort**, add providers, edit endpoints, choose each role's provider/model, and set the review threshold. Prefer `default` for local or third-party models to omit the explicit GPT reasoning-effort parameter. Explicit effort settings must be supported by the service.
+
+Example configuration (use the model ID offered by your service):
+
+```json
+{
+  "providers": [{"id":"gateway","name":"My model gateway","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],
+  "models": {
+    "implementation": {"provider":"gateway","model":"your-coder-model","effort":"default"},
+    "review": {"provider":"openai","model":"gpt-6.1-sol","effort":"high"}
+  }
+}
+```
+
+`env_key` is an **environment variable name**, never a key value. Supply it through the runtime service's launch environment; restart an existing service to inherit changes. Provider settings, database fields and command arguments do not store key values. Model workers inherit the launch environment; project checks use isolated environments. Do not paste keys into project files or the dashboard. Remote endpoints require HTTPS; loopback permits HTTP. An unauthenticated local service may use an empty `env_key`. Provider lists replace the entire list and IDs must be unique.
+
+Explicit fallback routes can cross providers, for example:
+
+```json
+{"models":{"implementation":{"fallback":{"provider":"ollama","model":"your-local-coder","effort":"default"}}}}
+```
+
+Only provider/model availability or rate-limit errors trigger fallback. Failed checks and reviews cannot be bypassed by switching models. Each session records actual provider, model, effort and usage. Changing models, endpoints or review rules invalidates previous strategy compatibility evidence and requires revalidation.
+
+Configuration reference: [official Codex advanced configuration](https://developers.openai.com/codex/config-advanced/). Parameter routing and deterministic substitutes have been tested; live third-party/local model execution has not.
+
 ## Quick start
 
 On macOS, double-click `启动 Adaptive RSI.command`, or run from this directory:
@@ -43,7 +124,7 @@ Full **model-worker execution currently requires macOS Seatbelt**, layered with 
 
 Adapters recognize Java/Kotlin (Maven, Gradle), JavaScript/TypeScript (npm, pnpm, Yarn), Python, Go, Rust, C/C++, .NET, PHP, Ruby, Swift/Objective-C, and Dart/Flutter, and analyze SQL, Shell, PowerShell, HTML/CSS, Docker, and CI configuration. Capability states distinguish unverified, analysis-only, and environment-blocked projects. Xcode, Make, and other project-specific builds need explicit commands. Uncached dependencies require environment preparation. Detection does not certify all builds for a language.
 
-Acceptance relies on fixed project checks. Configure appropriate checks where missing; model review cannot replace tests. Frozen tests, separate sessions, and OS sandboxes reduce tampering risk but are not a formal security proof against arbitrary malicious code. Native Codex CLI handles model authentication and network access. Code context is sent according to the user's Codex data settings. The runtime does not independently publish local dashboard data, logs, or memory.
+Acceptance relies on fixed project checks. Configure appropriate checks where missing; model review cannot replace tests. Frozen tests, separate sessions, and OS sandboxes reduce tampering risk but are not a formal security proof against arbitrary malicious code. Codex CLI handles model authentication and networking. Code context goes to the selected provider under that provider's data policy. The runtime does not independently publish local dashboard data, logs, or memory.
 
 Long-term recursive improvement requires real tasks and sustained experiments; this release does not claim to have demonstrated it. Without protected evaluation cases, candidates can be proposed and archived but **cannot be automatically promoted**. Scheduling is periodic or manual. There is no OS startup service or native Codex settings page.
 

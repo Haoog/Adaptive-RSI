@@ -56,9 +56,13 @@ class Store:
                     UNIQUE(project,family));
                 CREATE TABLE IF NOT EXISTS calls (
                     id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
-                    state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL);
+                    state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL,
+                    provider TEXT DEFAULT 'openai');
                 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+                db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
 
     @contextlib.contextmanager
     def connect(self):
@@ -162,7 +166,7 @@ class Store:
             if used >= config["limits"]["daily_calls"] or run_used >= config["limits"]["run_calls"]:
                 raise RuntimeError("Model call budget exhausted")
             call = uid()
-            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created) VALUES (?,?,?,?,?,?,?,?)",
-                       (call, project, run, role, route["model"], route["effort"], "reserved", now))
+            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (call, project, run, role, route["model"], route["effort"], "reserved", now, route.get("provider", "openai")))
             db.execute("UPDATE runs SET calls=calls+1 WHERE id=?", (run,))
         return call

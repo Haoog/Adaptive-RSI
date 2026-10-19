@@ -6,6 +6,7 @@ from pathlib import Path
 from .config import compatibility, fingerprint, merge, validate
 from .gitops import changes, git, repository, snapshot
 from .process import Cancelled, scrub_tree
+from .review import REVIEW_PROMPT, enforce_review
 from .store import encode, uid
 
 
@@ -132,8 +133,14 @@ class Evolution:
                         baseline = snapshot(spec["repository"], trial_dir / "baseline", spec["base"])
                         result = self.runtime.evaluator.evaluate(baseline, sealed, spec["checks"], trial_dir / "evaluation", config,
                                                                  lambda: self.runtime.is_cancelled(run), spec.get("overlay"))
+                        # Both variants pay for the same review gate, including failing baselines.
+                        review = enforce_review(self.runtime.invoke("review", REVIEW_PROMPT +
+                            encode({"task": spec["task"], "plan": plan,
+                                    "check_decision": result["decision"]}), sealed, run), config)
+                        (trial_dir / "review.json").write_text(encode(review), encoding="utf-8")
                         after = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
-                        trial[variant] = {"pass": result["decision"] == "pass", "seconds": time.time() - started,
+                        trial[variant] = {"pass": result["decision"] == "pass" and review["decision"] == "pass",
+                                          "review": review, "seconds": time.time() - started,
                                           "tokens": after - before, "report": str(trial_dir / "evaluation" / "report.json")}
                     evidence["trials"].append(trial)
                     # Persist detailed evidence in protected state, never in proposal prompts.

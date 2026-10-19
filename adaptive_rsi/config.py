@@ -1,19 +1,22 @@
 import copy
 import json
 import re
+from urllib.parse import urlsplit
 
 
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
     "schedule": {"light_minutes": 120, "issues_minutes": 60, "deep_minutes": 4320,
                  "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
+    "providers": [],
     "models": {
-        "analysis": {"model": "gpt-6.1-sol", "effort": "high", "fallback": None},
-        "planning": {"model": "gpt-6.1-sol", "effort": "high", "fallback": None},
-        "implementation": {"model": "gpt-6-luna", "effort": "max", "fallback": None},
-        "review": {"model": "gpt-6.1-sol", "effort": "high", "fallback": None},
-        "evolution": {"model": "gpt-6.1-sol", "effort": "high", "fallback": None},
+        "analysis": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
+        "planning": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
+        "implementation": {"provider": "openai", "model": "gpt-6-luna", "effort": "max", "fallback": None},
+        "review": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
+        "evolution": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
     },
+    "review": {"block_on": "medium"},
     "limits": {"daily_calls": 30, "run_calls": 5, "run_seconds": 1800,
                "command_seconds": 300, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 40, "retention_days": 30},
@@ -25,7 +28,7 @@ DEFAULTS = {
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
-                  "min_cases_per_split": 3, "repeats": 1, "max_calls": 28,
+                  "min_cases_per_split": 3, "repeats": 1, "max_calls": 40,
                   "max_cost_ratio": 1.25, "max_holdout_uses": 3,
                   "monitor_tasks": 5, "archive_limit": 50},
 }
@@ -57,16 +60,44 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
+    providers = {"openai", "ollama", "lmstudio"}
+    if len(config["providers"]) > 100:
+        raise ValueError("Too many model providers")
+    for provider in config["providers"]:
+        if not isinstance(provider, dict) or set(provider) != {"id", "name", "base_url", "env_key"}:
+            raise ValueError("Provider requires only id, name, base_url, env_key; never store API keys")
+        if not all(isinstance(value, str) for value in provider.values()):
+            raise ValueError("Provider fields must be strings")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", provider["id"]) or provider["id"] in providers:
+            raise ValueError("Invalid, duplicate or reserved provider id")
+        providers.add(provider["id"])
+        endpoint = urlsplit(provider["base_url"])
+        local = endpoint.hostname in ["localhost", "127.0.0.1", "::1"]
+        if any(c.isspace() or ord(c) < 32 for c in provider["base_url"]) or \
+                not endpoint.hostname or endpoint.username is not None or endpoint.password is not None or \
+                endpoint.query or endpoint.fragment or not (endpoint.scheme == "https" or endpoint.scheme == "http" and local):
+            raise ValueError("Provider URL requires HTTPS (HTTP allowed on loopback), without credentials or query")
+        if not provider["name"].strip() or len(provider["name"]) > 100:
+            raise ValueError("Provider requires a short display name")
+        if provider["env_key"] and not re.fullmatch(r"[A-Z_][A-Z0-9_]*", provider["env_key"]):
+            raise ValueError("env_key must be an environment variable name, not a secret")
     for role, route in config["models"].items():
         for item in [route, route.get("fallback")]:
             if item is None:
                 continue
-            if not isinstance(item, dict) or not re.fullmatch(r"[a-zA-Z0-9._/-]+", item.get("model", "")):
+            if not isinstance(item, dict) or set(item) - {"provider", "model", "effort", "fallback"} or \
+                    not isinstance(item.get("model"), str) or not re.fullmatch(r"[a-zA-Z0-9._/:-]+", item["model"]):
                 raise ValueError("Invalid model route for " + role)
-            if item.get("effort") not in ["low", "medium", "high", "xhigh", "max", "ultra"]:
+            if not isinstance(item.get("provider", "openai"), str) or item.get("provider", "openai") not in providers:
+                raise ValueError("Unknown model provider for " + role)
+            if item is not route and item.get("fallback") is not None:
+                raise ValueError("Nested fallback routes are not supported")
+            if item.get("effort") not in ["default", "low", "medium", "high", "xhigh", "max", "ultra"]:
                 raise ValueError("Invalid reasoning effort for " + role)
             if "luna" in item["model"] and item["effort"] == "ultra":
                 raise ValueError("Luna supports max, not ultra")
+    if config["review"]["block_on"] not in ["low", "medium", "high"]:
+        raise ValueError("Review blocking threshold must be low, medium or high")
     for name in ["light_minutes", "issues_minutes", "deep_minutes"]:
         if not 5 <= config["schedule"][name] <= 525600:
             raise ValueError(name + " must be between 5 and 525600")
@@ -139,4 +170,4 @@ def fingerprint(value):
 
 
 def compatibility(config):
-    return fingerprint({key: config[key] for key in ["models", "sandbox", "checks", "environment"]})
+    return fingerprint({key: config[key] for key in ["models", "providers", "review", "sandbox", "checks", "environment"]})
