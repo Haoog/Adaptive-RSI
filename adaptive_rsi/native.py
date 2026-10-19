@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .agent import SCHEMAS, TEXT, object_schema, validate_output
 from .config import relative_path
+from .credentials import Credentials
 from .process import Cancelled, Sandbox, scrub_tree
 
 
@@ -43,6 +44,8 @@ def post_json(url, payload, headers, timeout, max_bytes):
 
 
 def tools_for(role):
+    if role == "probe":
+        return [("finish", "Return summary RSI_OK to test structured tool output.", SCHEMAS[role])]
     tools = [
         ("list_files", "List tracked and new source files in the snapshot, excluding internal metadata.", object_schema({})),
         ("read_file", "Read at most 500 lines. Paths must be relative to this snapshot.", object_schema({
@@ -241,9 +244,7 @@ class NativeAgent:
 
     def invoke(self, role, prompt, workspace, project, run, config, route, provider, cancel=None, protected=()):
         protocol = provider["protocol"]
-        key = os.environ.get(provider["env_key"], "") if provider["env_key"] else ""
-        if provider["env_key"] and not key:
-            raise RuntimeError("Missing provider environment variable: " + provider["env_key"])
+        key = Credentials(self.store.root).get(provider)
         headers = {"User-Agent": "Adaptive-RSI"}
         if key:
             headers[{"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(protocol, "Authorization")] = key if protocol in ["anthropic", "gemini"] else "Bearer " + key

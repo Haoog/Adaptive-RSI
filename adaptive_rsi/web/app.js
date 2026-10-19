@@ -32,7 +32,7 @@ function render(){const project=currentProject(), tasks=scoped(state.tasks), run
  const activity=$('activity');activity.replaceChildren();const events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,9);if(!events.length)activity.append(el('p',t('运行记录将在这里出现。每次调用、检查与决策都可追溯。'),'empty-copy'));
  for(const e of events){const row=el('div',undefined,'activity-row');row.append(el('time',stamp(e.created)),el('span',e.kind,'event-kind'),el('span',e.message));activity.append(row);}
  renderUpdate();if(view==='tasks')renderTasks(); if(view==='evolution')renderEvolution(); if(view==='settings'&&!settingsBaseline)renderSettings();}
-function showView(name){view=name;document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===name));$('page-name').textContent={overview:t('运行总览'),tasks:t('任务与证据'),evolution:t('策略与记忆'),settings:t('运行设置')}[name];if(name==='settings'){settingsBaseline=null;renderSettings();}render();window.scrollTo(0,0);}
+function showView(name){view=name;document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===name));$('page-name').textContent={overview:t('运行总览'),tasks:t('任务与证据'),evolution:t('策略与记忆'),settings:t('运行设置'),models:t('模型中心')}[name];if(name==='settings'){settingsBaseline=null;renderSettings();}if(name==='models')window.RSIModelCenter?.show();render();window.scrollTo(0,0);}
 function renderTasks(){const list=$('tasks-list');list.replaceChildren();const filter=$('task-filter').value;
  const tasks=scoped(state.tasks).filter(t=>filter==='all'||(filter==='running'?['planning','executing','evaluating'].includes(t.state):filter==='blocked'?['blocked','failed','insufficient_evidence','interrupted'].includes(t.state):t.state===filter));
  if(!tasks.length)list.append(el('p',t('这里还没有任务。可以输入目标，或启用巡检与 Issues 同步。'),'empty-copy'));
@@ -65,99 +65,15 @@ function renderEvolution(){const summary=$('suite-summary');summary.replaceChild
 function getPath(obj,path){return path.split('.').reduce((v,k)=>v?.[k],obj);}
 function setPath(obj,path,value){const keys=path.split('.');let node=obj;keys.slice(0,-1).forEach(k=>node=node[k]??={});node[keys.at(-1)]=value;}
 function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typeof value==='object'&&!Array.isArray(value))a[key]=deepMerge(a[key]||{},value);else a[key]=value;}return a;}
-function readProviders(){return [...$('provider-fields').children].map(row=>Object.fromEntries([...row.querySelectorAll('[data-field]')].map(input=>[input.dataset.field,input.value])));}
-const modelCatalogs=new Map(), catalogRequests=new Map();
-const catalogErrors={missing_key:'服务进程未读取到密钥环境变量，请配置后重启服务。',auth:'模型目录认证失败，请检查密钥及权限。',unsupported:'供应商未提供标准模型目录，可手动输入模型。',rate_limit:'模型目录请求被限流，请稍后重试。',http_error:'供应商模型目录暂不可用，请稍后重试或手动输入。',connection:'无法连接模型服务，请检查地址及服务状态。',timeout:'获取模型超时，请重试。',too_large:'模型目录响应过大，请缩小服务端目录或手动输入。',invalid_response:'供应商模型目录格式不兼容，可手动输入。',invalid_provider:'请完整填写服务标识、名称、有效地址和密钥环境变量名。',codex_missing:'未找到 Codex CLI，请安装并登录，或选择 API 服务。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。'};
-function catalogProvider(id){return ['openai','ollama','lmstudio'].includes(id)?id:readProviders().find(p=>p.id===id)||null;}
-function modelPicker(row,input,provider,title){
- const box=el('div',undefined,'model-picker'),controls=el('div',undefined,'model-picker-controls'),choices=el('select'),manual=action(t('手动输入'),()=>{input.hidden=!input.hidden;choices.hidden=!input.hidden;manual.textContent=t(input.hidden?'手动输入':'返回列表');if(!input.hidden)input.focus();},'model-manual');
- const hint=el('small',undefined,'model-catalog-hint'),button=action(t('获取模型'),fetchModels,'button small');
- let signature,sequence=0;
- input.hidden=true;input.placeholder=t('输入模型标识');choices.setAttribute('aria-label',t(title)+' · '+t('选择模型'));button.setAttribute('aria-label',t(title)+' · '+t('获取模型'));hint.setAttribute('role','status');
- function fill(data){
-  choices.replaceChildren();const current=el('option',input.value||t('请选择模型'));current.value=input.value;choices.append(current);
-  if(data){for(const model of data.models){if(model.id===input.value){current.textContent=model.name===model.id?model.id:model.name+' · '+model.id;continue;}const option=el('option',model.name===model.id?model.id:model.name+' · '+model.id);option.value=model.id;choices.append(option);}
-   hint.textContent=data.models.length?data.models.length+' '+t('个模型 · 点击列表选择')+(data.truncated?' · '+t('目录已截断，可手动输入其他模型'):''):t('模型目录为空，请检查账号或本地已安装的模型；也可手动输入。');
-  }else hint.textContent='';
-  choices.value=input.value;
- }
- function sync(){const next=JSON.stringify(catalogProvider(provider.value));if(next!==signature){signature=next;sequence++;button.disabled=false;button.textContent=t('获取模型');hint.classList.remove('error');}fill(modelCatalogs.get(signature));}
- async function fetchModels(){
-  const descriptor=catalogProvider(provider.value);if(!descriptor){hint.textContent=t(catalogErrors.invalid_provider);return;}
-  const requested=JSON.stringify(descriptor),ticket=++sequence;signature=requested;button.disabled=true;button.textContent=t('获取中…');hint.textContent=t('正在读取供应商模型目录…');hint.classList.remove('error');
-  try{
-   let request=catalogRequests.get(requested);
-   if(!request){request=api('models',{provider:descriptor});catalogRequests.set(requested,request);request.finally(()=>{if(catalogRequests.get(requested)===request)catalogRequests.delete(requested);}).catch(()=>{});}
-   const data=await request;
-   modelCatalogs.set(requested,data);
-   if(!row.isConnected||ticket!==sequence||JSON.stringify(catalogProvider(provider.value))!==requested)return;
-   fill(data);input.hidden=true;choices.hidden=false;manual.textContent=t('手动输入');
-   document.querySelectorAll('.model-row').forEach(other=>{if(other!==row)other.refreshModelCatalog?.();});
-  }catch(error){if(row.isConnected&&ticket===sequence&&JSON.stringify(catalogProvider(provider.value))===requested){hint.textContent=t(catalogErrors[error.code]||catalogErrors.http_error);hint.classList.add('error');}}
-  finally{if(row.isConnected&&ticket===sequence){button.disabled=false;button.textContent=t('获取模型');}}
- }
- choices.addEventListener('change',()=>{input.value=choices.value;input.dispatchEvent(new Event('change',{bubbles:true}));});
- input.addEventListener('input',()=>fill(modelCatalogs.get(signature)));
- provider.addEventListener('change',sync);row.refreshModelCatalog=sync;
- controls.append(choices,input,button);box.append(controls,manual,hint);return box;
-}
-function refreshProviderChoices(){
- const choices=[['openai','OpenAI / Codex'],['ollama','Ollama'],['lmstudio','LM Studio'],...readProviders().map(p=>[p.id,p.name||p.id])];
- document.querySelectorAll('[data-path$=".provider"]').forEach(select=>{
-  const selected=select.value||getPath(settingsBaseline,select.dataset.path);
-  select.replaceChildren();
-  for(const [id,name]of choices){const option=el('option',name);option.value=id;select.append(option);}
-  if(selected&&!choices.some(p=>p[0]===selected)){const option=el('option',selected+' · '+t('服务未配置'));option.value=selected;select.append(option);}
-  select.value=selected;
- });
- document.querySelectorAll('.model-row').forEach(row=>row.refreshModelCatalog?.());
-}
-function renderProviders(providers){
- $('provider-fields').replaceChildren();
- for(const provider of providers){
-  const row=el('div',undefined,'provider-card'),grid=el('div',undefined,'field-grid');
-  for(const [key,title,placeholder]of [['id','服务标识','gateway'],['name','显示名称','My gateway'],['base_url','服务地址','https://example.com/v1'],['env_key','密钥环境变量名','MODEL_API_KEY']]){
-   const label=el('label',t(title)),input=el('input');input.dataset.field=key;input.value=provider[key]||'';input.placeholder=placeholder;input.setAttribute('aria-label',t(title));
-   input.addEventListener('input',refreshProviderChoices);input.addEventListener('change',refreshProviderChoices);label.append(input);grid.append(label);
-  }
-  const protocolLabel=el('label',t('接口协议')),protocol=el('select');protocol.dataset.field='protocol';protocol.setAttribute('aria-label',t('接口协议'));
-  for(const [value,label]of [['codex','Codex / Responses'],['responses','Responses API'],['chat_completions','Chat Completions API'],['anthropic','Anthropic Messages'],['gemini','Gemini GenerateContent'],['ollama','Ollama API']]){const option=el('option',label);option.value=value;protocol.append(option);}
-  protocol.value=provider.protocol||'codex';protocol.addEventListener('change',refreshProviderChoices);protocolLabel.append(protocol);grid.append(protocolLabel);
-  row.append(grid,action(t('移除服务'),()=>{row.remove();refreshProviderChoices();}));$('provider-fields').append(row);
- }
- refreshProviderChoices();
-}
-function renderSettings(){settingsBaseline=structuredClone($('config-scope').value==='global'?state.config:(currentProject()?.config||state.config));const models=$('model-fields');models.replaceChildren();
- renderProviders(settingsBaseline.providers);
- for(const [role,title]of Object.entries(roleNames)){
-  const row=el('div',undefined,'model-row'),input=el('input'),select=el('select'),provider=el('select');
-  input.dataset.path='models.'+role+'.model';input.setAttribute('aria-label',t(title)+t(' 模型'));
-  provider.dataset.path='models.'+role+'.provider';provider.setAttribute('aria-label',t(title)+' · '+t('模型服务'));
-  select.dataset.path='models.'+role+'.effort';select.setAttribute('aria-label',t(title)+t(' 推理强度'));
-  for(const effort of ['default','low','medium','high','xhigh','max','ultra']){const o=el('option',effort==='default'?t('服务默认'):effort);o.value=effort;select.append(o);}
-  provider.addEventListener('change',()=>{if(provider.value!=='openai')select.value='default';});
-  row.append(el('span',t(title)),provider,modelPicker(row,input,provider,title),select);models.append(row);
- }
- refreshProviderChoices();
+function renderSettings(){settingsBaseline=structuredClone($('config-scope').value==='global'?state.config:(currentProject()?.config||state.config));
  document.querySelectorAll('[data-path]').forEach(node=>{const value=getPath(settingsBaseline,node.dataset.path);if(node.type==='checkbox')node.checked=value;else node.value=value;});
- document.querySelectorAll('.model-row').forEach(row=>row.refreshModelCatalog());
  document.querySelector('[data-path="limits.concurrency"]').disabled=$('config-scope').value!=='global';
  document.querySelectorAll('[data-path^="updates."]').forEach(node=>node.disabled=$('config-scope').value!=='global');
  renderUpdate();
  $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';
  safe(async()=>{const target=$('capabilities');target.replaceChildren();if(!projectId){target.append(el('p',t('接入项目后识别工具链。'),'muted'));return;}const capabilities=await api('capabilities?project='+projectId);if(!capabilities.modules.length)target.append(el('p',t('未识别到标准构建清单。可手动配置验收命令。'),'muted'));for(const module of capabilities.modules){const row=el('div',undefined,'capability-row');row.append(el('strong',module.language),el('code',module.manifest),el('span',{executable:t('检查可执行 · 已验证'),unverified:t('待隔离验证'),analysis_only:t('可分析 · 需配置检查'),environment_blocked:t('环境缺少工具')}[module.status],'badge '+(module.status==='environment_blocked'?'warn':module.status==='executable'?'good':'neutral')));target.append(row);}});}
 document.querySelectorAll('.nav').forEach(node=>node.addEventListener('click',()=>showView(node.dataset.view)));
-const providerPresets={
- custom:{id:'gateway',name:'Gateway',base_url:'https://example.com/v1',env_key:'MODEL_API_KEY',protocol:'chat_completions'},
- openai:{id:'openai_api',name:'OpenAI API',base_url:'https://api.openai.com/v1',env_key:'OPENAI_API_KEY',protocol:'responses'},
- anthropic:{id:'anthropic_api',name:'Anthropic',base_url:'https://api.anthropic.com/v1',env_key:'ANTHROPIC_API_KEY',protocol:'anthropic'},
- gemini:{id:'gemini_api',name:'Gemini',base_url:'https://generativelanguage.googleapis.com/v1beta',env_key:'GEMINI_API_KEY',protocol:'gemini'},
- deepseek:{id:'deepseek_api',name:'DeepSeek',base_url:'https://api.deepseek.com',env_key:'DEEPSEEK_API_KEY',protocol:'chat_completions'},
- ollama:{id:'ollama_api',name:'Ollama API',base_url:'http://127.0.0.1:11434',env_key:'',protocol:'ollama'},
- lmstudio:{id:'lmstudio_api',name:'LM Studio API',base_url:'http://127.0.0.1:1234/v1',env_key:'',protocol:'chat_completions'}
-};
-$('add-provider').addEventListener('click',()=>{const current=readProviders(),preset={...providerPresets[$('provider-preset').value]},base=preset.id;let i=2;while(current.some(p=>p.id===preset.id))preset.id=base+'_'+i++;renderProviders([...current,preset]);});
-$('project-select').addEventListener('change',()=>{projectId=$('project-select').value;localStorage.setItem('rsi-project',projectId);settingsBaseline=null;render();});
+$('project-select').addEventListener('change',()=>{projectId=$('project-select').value;localStorage.setItem('rsi-project',projectId);settingsBaseline=null;window.RSIModelCenter?.projectChanged();render();});
 for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>$('project-dialog').showModal());
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});
@@ -184,7 +100,6 @@ $('task-filter').addEventListener('change',renderTasks);$('config-scope').addEve
 $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=node.type==='checkbox'?node.checked:node.type==='number'?Number(node.value):node.value;if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});
  const hours=[Number($('work-start').value),Number($('work-end').value)];if(JSON.stringify(hours)!==JSON.stringify(settingsBaseline.schedule.working_hours))setPath(patch,'schedule.working_hours',hours);
  const labels=$('issue-labels').value.split(',').map(x=>x.trim()).filter(Boolean);if(JSON.stringify(labels)!==JSON.stringify(settingsBaseline.github.labels))setPath(patch,'github.labels',labels);
- const providers=readProviders();if(JSON.stringify(providers)!==JSON.stringify(settingsBaseline.providers))patch.providers=providers;
  const checks=JSON.parse($('checks-json').value);if(JSON.stringify(checks)!==JSON.stringify(settingsBaseline.checks))patch.checks=checks;
  patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));await api('config',{project:$('config-scope').value==='project'?projectId:null,values:patch});settingsBaseline=null;await refresh();toast(t('已保存，从下一轮生效'));});});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});$('case-form').reset();await refresh();toast(t('评估任务已导入'));});});
@@ -204,16 +119,14 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  const form=$('settings-form');
  const values=[...form.querySelectorAll('input,textarea,select')].map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked}));
  const baseline=settingsBaseline;
- const providers=readProviders();
  showView(view);
  if(view==='settings'){
   settingsBaseline=baseline;
-  renderProviders(providers);
   for(const saved of values){
    const node=saved.id?$(saved.id):saved.path?form.querySelector('[data-path="'+saved.path+'"]'):null;
    if(node){node.value=saved.value;node.checked=saved.checked;}
   }
-  refreshProviderChoices();
  }
+ window.RSIModelCenter?.translate();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));

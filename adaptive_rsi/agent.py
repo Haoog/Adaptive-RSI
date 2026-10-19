@@ -16,6 +16,7 @@ STRINGS = {"type": "array", "items": TEXT}
 REVIEW_AREAS = ["correctness", "security", "maintainability", "architecture", "tests", "scope"]
 VERDICT = {"type": "string", "enum": ["pass", "fail", "insufficient_evidence"]}
 SCHEMAS = {
+    "probe": object_schema({"summary": TEXT}),
     "analysis": object_schema({"findings": {"type": "array", "items": object_schema({
         "title": TEXT, "body": TEXT, "path": TEXT, "quote": TEXT,
         "acceptance": STRINGS, "priority": {"type": "integer"}})}}),
@@ -58,7 +59,7 @@ def validate_output(value, schema):
             validate_output(item, schema["items"])
 
 
-def provider_arguments(route, config):
+def provider_arguments(route, config, environment=None):
     provider_id = route.get("provider", "openai")
     if provider_id in ["ollama", "lmstudio"]:
         return ["--oss", "--local-provider", provider_id]
@@ -67,7 +68,7 @@ def provider_arguments(route, config):
     provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
     if provider is None:
         raise RuntimeError("Unknown model provider: " + provider_id)
-    if provider["env_key"] and not os.environ.get(provider["env_key"]):
+    if provider["env_key"] and not (environment if environment is not None else os.environ).get(provider["env_key"]):
         raise RuntimeError("Missing provider environment variable: " + provider["env_key"])
     settings = {"name": provider["name"], "base_url": provider["base_url"],
                 "wire_api": "responses", "requires_openai_auth": False}
@@ -102,7 +103,14 @@ class CodexAgent:
             binary = shutil.which("codex")
             if not binary:
                 raise RuntimeError("Codex CLI is not installed for this route")
-            provider_args = provider_arguments(route, config)
+            environment = None
+            secret = ""
+            if provider and provider.get("credential", "env") in ["keychain", "session"]:
+                from .credentials import Credentials
+                secret = Credentials(self.store.root).get(provider)
+                environment = {**os.environ, "RSI_PROVIDER_API_KEY": secret}
+                config = {**config, "providers": [{**p, "env_key": "RSI_PROVIDER_API_KEY"} if p["id"] == provider["id"] else p for p in config["providers"]]}
+            provider_args = provider_arguments(route, config, environment)
             call = self.store.reserve_call(project, run, role, route, config)
             started = time.time()
             try:
@@ -117,6 +125,8 @@ class CodexAgent:
                 mode = "workspace-write" if role == "implementation" else "read-only"
                 argv = [binary, "-a", "never", "exec", "--ignore-user-config", "--ignore-rules",
                         "--ephemeral", "--model", route["model"]] + provider_args
+                if secret:
+                    argv += ["-c", 'shell_environment_policy.exclude=["RSI_PROVIDER_API_KEY"]']
                 if route["effort"] != "default":
                     argv += ["-c", "model_reasoning_effort=" + json.dumps(route["effort"])]
                 argv += ["--sandbox", mode, "-c", "sandbox_workspace_write.network_access=false",
@@ -128,7 +138,10 @@ class CodexAgent:
                 argv = sandbox.worker(argv, workspace, protected, read_only=role != "implementation", output_dir=agent_dir)
                 self.store.event("model", role + ": " + route.get("provider", "openai") + " / " + route["model"] + " / " + route["effort"], project, run)
                 result = run_process(argv, workspace, config["limits"]["run_seconds"], cancel,
-                                     config["limits"]["max_output_mb"])
+                                     config["limits"]["max_output_mb"], environment)
+                if secret:
+                    for field in ["stdout", "stderr"]:
+                        result[field] = result[field].replace(secret, "[REDACTED]")
                 (agent_dir / "events.jsonl").write_text(result["stdout"], encoding="utf-8")
                 tokens = 0
                 for line in result["stdout"].splitlines():

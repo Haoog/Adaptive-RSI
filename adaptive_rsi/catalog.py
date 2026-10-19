@@ -55,7 +55,15 @@ def normalize(rows, protocol):
         if not isinstance(name, str):
             name = model
         name = " ".join(name.split())[:160]
-        models[model] = {"id": model, "name": name}
+        item = {"id": model, "name": name}
+        efforts = row.get("supportedReasoningEfforts")
+        if protocol == "codex_login" and isinstance(efforts, list):
+            item["efforts"] = sorted({effort.get("reasoningEffort") for effort in efforts if isinstance(effort, dict)
+                                      and effort.get("reasoningEffort") in ["low", "medium", "high", "xhigh", "max", "ultra"]})
+        kind = row.get("type")
+        if kind in ["embedding", "embeddings", "image", "audio", "rerank"]:
+            item["kind"] = kind
+        models[model] = item
     return sorted(models.values(), key=lambda model: model["id"].casefold())
 
 
@@ -93,10 +101,10 @@ def get_json(url, headers, deadline):
         raise CatalogError("invalid_response") from None
 
 
-def http_models(provider):
+def http_models(provider, key_override=None):
     protocol = provider.get("protocol", "codex")
     key_name = provider["env_key"]
-    key = os.environ.get(key_name, "") if key_name else ""
+    key = key_override if key_override is not None else os.environ.get(key_name, "") if key_name else ""
     if key_name and not key:
         raise CatalogError("missing_key")
     headers = {}
@@ -218,7 +226,7 @@ def codex_models():
                 process.stdout.close()
 
 
-def list_models(provider):
+def list_models(provider, key=None):
     if isinstance(provider, str):
         if provider == "openai":
             models, truncated = codex_models()
@@ -232,5 +240,5 @@ def list_models(provider):
         provider = validate({"providers": [provider]})["providers"][0]
     except (ValueError, TypeError, KeyError, AttributeError):
         raise CatalogError("invalid_provider") from None
-    models, truncated = http_models(provider)
+    models, truncated = http_models(provider, key)
     return {"models": models, "truncated": truncated}

@@ -66,7 +66,7 @@ def validate(config):
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
     for provider in config["providers"]:
-        if not isinstance(provider, dict) or set(provider) - {"id", "name", "base_url", "env_key", "protocol"} or not {"id", "name", "base_url", "env_key"}.issubset(provider):
+        if not isinstance(provider, dict) or set(provider) - {"id", "name", "base_url", "env_key", "protocol", "credential", "secret_ref"} or not {"id", "name", "base_url", "env_key"}.issubset(provider):
             raise ValueError("Provider requires id, name, base_url, env_key and optional protocol; never store API keys")
         if not all(isinstance(value, str) for value in provider.values()):
             raise ValueError("Provider fields must be strings")
@@ -85,6 +85,14 @@ def validate(config):
             raise ValueError("env_key must be an environment variable name, not a secret")
         if provider.get("protocol", "codex") not in ["codex", "responses", "chat_completions", "anthropic", "gemini", "ollama"]:
             raise ValueError("Unsupported model protocol")
+        mode = provider.get("credential", "env")
+        if mode not in ["env", "keychain", "session", "none"]:
+            raise ValueError("Unsupported credential mode")
+        if mode in ["keychain", "session"]:
+            if provider["env_key"] or not re.fullmatch(r"[a-f0-9]{32}", provider.get("secret_ref", "")):
+                raise ValueError("Stored credentials require a reference, not an environment variable or key")
+        elif provider.get("secret_ref"):
+            raise ValueError("Unexpected credential reference")
     for role, route in config["models"].items():
         for item in [route, route.get("fallback")]:
             if item is None:

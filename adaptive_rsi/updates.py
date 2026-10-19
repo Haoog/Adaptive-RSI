@@ -120,7 +120,7 @@ class UpdateManager:
         if config["mode"] != "manual" and time.time() - status.get("checked", 0) >= config["interval_minutes"] * 60:
             self.check_async()
         elif status.get("state") in ["available", "waiting_idle"] and (status.get("requested") or config["mode"] == "automatic" and status.get("patch")):
-            if not self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
+            if not self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") and not getattr(getattr(self.runtime, "model_center", None), "busy", 0):
                 self.apply_async()
 
     def check_async(self):
@@ -161,7 +161,7 @@ class UpdateManager:
     def apply(self, status):
         staging = None
         try:
-            if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
+            if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or getattr(getattr(self.runtime, "model_center", None), "busy", 0):
                 self.store.put_setting("update-status", {**status, "state": "waiting_idle"})
                 return
             self.store.put_setting("update-status", {**status, "state": "downloading"})

@@ -12,6 +12,7 @@ Requires Python 3.9+. The fully tested execution environment is macOS. Models ca
 python3 -m unittest discover -v
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
+node --check adaptive_rsi/web/model-center.js
 python3 scripts/start.py
 ```
 

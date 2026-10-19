@@ -14,6 +14,8 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .adapters import detect
 from .catalog import CatalogError, list_models
+from .credentials import CredentialError
+from .model_center import CenterError
 from .config import compatibility
 from .gitops import git
 from .evolution import Evolution
@@ -129,6 +131,8 @@ class Handler(BaseHTTPRequestHandler):
                             module["status"] = "executable"
                             module["verified_at"] = proof["at"]
                 self.respond(data)
+            elif parsed.path == "/api/model-center":
+                self.respond(runtime.model_center.snapshot(params.get("project", [None])[0] or None))
             elif parsed.path == "/api/run":
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
@@ -142,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/i18n.js", "/style.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 self.respond(path.read_bytes(), content_type=(mimetypes.guess_type(str(path))[0] or "application/octet-stream") + "; charset=utf-8")
@@ -167,6 +171,31 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected an object")
             runtime = self.server.runtime
+            path = urlparse(self.path).path
+            if path.startswith("/api/model-center/"):
+                center = runtime.model_center
+                project = body.get("project") or None
+                if path == "/api/model-center/fetch":
+                    result = center.fetch(body.get("provider"), project)
+                elif path == "/api/model-center/probe":
+                    result = center.probe(body.get("provider"), body.get("model"), body.get("effort", "default"), project)
+                else:
+                    with runtime.dispatch_lock:
+                        if runtime.updates.installing:
+                            raise CenterError("update_in_progress")
+                        if path == "/api/model-center/provider":
+                            result = center.save_provider(body.get("provider"), body.get("authentication", {}), project)
+                        elif path == "/api/model-center/remove":
+                            result = center.remove_provider(body.get("provider"), project)
+                        elif path == "/api/model-center/model":
+                            result = center.edit_model(body.get("provider"), body.get("model"), project)
+                        elif path == "/api/model-center/routes":
+                            result = center.save_routes(body.get("models"), project)
+                        else:
+                            self.respond({"error": "Not found"}, 404)
+                            return
+                self.respond(result)
+                return
             if urlparse(self.path).path == "/api/models":
                 try:
                     self.respond(list_models(body.get("provider")))
@@ -218,5 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond({"error": "Not found"}, 404)
                     return
                 self.respond(result)
+        except (CenterError, CredentialError, CatalogError) as exc:
+            self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
         except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
             self.respond({"error": str(exc)}, 400)

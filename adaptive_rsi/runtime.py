@@ -41,6 +41,8 @@ class Runtime:
         self.dispatch_lock = threading.RLock()
         from .updates import UpdateManager
         self.updates = UpdateManager(self)
+        from .model_center import ModelCenter
+        self.model_center = ModelCenter(self)
 
     def config(self, project=None):
         override = {}

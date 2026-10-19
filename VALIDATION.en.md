@@ -6,8 +6,8 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 
 ## Executed checks
 
-- `python3 -m unittest discover -v`: **59 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
-- `node --check adaptive_rsi/web/app.js`, `node --check adaptive_rsi/web/i18n.js`, and Python byte-compilation passed.
+- `python3 -m unittest discover -v`: **75 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
+- `node --check adaptive_rsi/web/app.js`, `node --check adaptive_rsi/web/i18n.js`, `node --check adaptive_rsi/web/model-center.js`, and Python byte-compilation passed.
 - Both bundled skills passed the system skill-creator validator. The validator's PyYAML dependency was supplied in an isolated uv environment; the runtime has no third-party Python dependencies.
 - The runtime wheel and local plugin ZIP were built. The plugin archive excludes state, sessions, auth data, build caches and browser logs.
 - Playwright checked a real local server at 1440 x 1100 and 390 x 844. Project registration, paused-by-default state, schedule edits and goal enqueueing persisted. The browser reported zero console errors/warnings on the final page. Screenshots are in `output/playwright/`.
@@ -16,7 +16,16 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 
 The new provider and review controls were checked in the in-app browser: provider registration, role routing, provider-default effort and review thresholds saved correctly. Switching languages preserved unsaved provider/model values; saved values survived a reload. At 1440 x 1100 and 390 x 844 there was no horizontal overflow or console error/warning. Temporary provider settings were removed and original model/threshold defaults restored. No real project was registered or enabled. Screenshot: `output/playwright/models-review-settings.png`.
 
-## Model directories and selection
+## Model center redesign validation
+
+- Sixteen new tests cover secure credentials, persistent directories, connection invalidation, project isolation and per-role inheritance, explicit model tests and budgets, update exclusion, and authenticated APIs.
+- A disposable macOS Keychain entry passes real write/read/delete operations. Session credentials reach local directory and model fixtures. Configuration, database events and API snapshots contain no raw keys; custom Codex credentials use process environments only and are excluded from command-tool environments and redacted from logs.
+- Refresh preserves disabled, custom and missing models. Key rotation preserves preferences but clears capability evidence. Projects store only changed roles; other roles continue inheriting global defaults. Scope transitions clear old roles and disable saving until the new scope loads.
+- Explicit tests require user confirmation and count against call budgets. Native routes validate structured tool results; the Codex replacement must read randomized content from an isolated directory rather than return fixed JSON. No real paid models are called.
+- Playwright covers connection creation/editing, session/Keychain storage, directory refresh/error recovery, search/selection, role save/reload, project overrides/restored inheritance, and bilingual unsaved-value preservation. Chinese and English have no horizontal overflow at 1440 x 1100, 390 x 844 and 320 x 844. No JavaScript exceptions occur; simulated authentication failure produces an expected HTTP 400. Screenshots: `output/playwright/model-center-*.png`.
+- The actual user service only queries the real Codex directory. Provider round trips and explicit tests use isolated local fixtures, not proof of real vendor account permissions or long-running agent capability. Temporary configuration and test keys are cleaned up.
+
+## Model directories and selection (earlier validation)
 
 - Eight new tests cover directory requests across six provider protocols, auth headers, pagination, deduplication and IDs, empty directories, the 1,000-entry cap, malformed responses, repeated cursors, auth failure, redirect refusal and redacted errors; built-in Ollama / LM Studio endpoints and no connection when a required key is missing.
 - A replacement Codex process verifies initialize / initialized / model/list sequencing, pagination, no inference and timeout cleanup. The real installed Codex separately returned 14 directory entries without starting inference.
