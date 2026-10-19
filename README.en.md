@@ -78,6 +78,12 @@ Native routes supply host-controlled read, search, edit and sandbox command tool
 
 **Settings → Models & reasoning effort** offers provider presets, custom endpoints, environment-variable names and per-role models. Native Anthropic, Gemini and Ollama currently require `default`; vendor-specific thinking parameters are not translated. Explicit Responses / Chat Completions effort also requires model support. Default planning/review remains `gpt-6.1-sol / high`, implementation `gpt-6-luna / max`.
 
+Choose a provider for each role, click **Fetch models**, select a model from the dropdown, then save settings. Third-party catalogs use the current endpoint, protocol and key environment variable, **without requiring provider settings to be saved first**. A directory is reusable across roles using that provider; the button refreshes it. Editing the endpoint or protocol invalidates the old list.
+
+The default Codex route reads [App Server `model/list`](https://developers.openai.com/codex/app-server#list-models-modellist). Responses, Chat Completions, Codex-compatible gateways and Anthropic use `/models`; Gemini uses `/models` and filters entries explicitly lacking `generateContent`; Ollama uses `/api/tags`; LM Studio uses `/v1/models`. Pagination is supported, with at most 1,000 entries displayed. Authentication failures, empty lists and incompatible directories show a message; **Enter manually** remains available.
+
+Fetching a directory starts no inference task and does not consume this software's model-call budget. Only the local service reads keys and sends them in request headers; keys never reach the browser. Restart the service after configuring an environment variable. **A directory entry does not verify execution permission, tool support or reasoning-effort compatibility**; the first real task still validates these.
+
 ```json
 {
   "providers": [{"id":"gateway","name":"My model gateway","protocol":"chat_completions","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],

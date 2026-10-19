@@ -78,6 +78,12 @@ flowchart TD
 
 「运行设置 → 模型与推理强度」提供服务预设、自定义地址、密钥环境变量名和各角色模型。Anthropic、Gemini、Ollama 原生接口使用 `default`，暂不翻译厂商各自的思考参数；Responses / Chat Completions 的显式强度也需要所选模型支持。默认规划/评审为 `gpt-6.1-sol / high`，实现为 `gpt-6-luna / max`。
 
+选择各角色的模型服务后，点击 **「获取模型」**，从下拉列表选择，再保存设置。第三方服务按当前填写的地址、协议和密钥环境变量查询，**无需先保存供应商**。目录可供同一服务的其他角色选择，按钮可重新获取；更改地址或协议后旧列表失效。
+
+默认 Codex 登录通过 [App Server 的 `model/list`](https://developers.openai.com/codex/app-server#list-models-modellist) 读取目录；Responses、Chat Completions、Codex 兼容网关及 Anthropic 使用 `/models`，Gemini 使用 `/models` 并过滤明确不支持 `generateContent` 的条目，Ollama 使用 `/api/tags`，LM Studio 使用 `/v1/models`。支持分页，最多展示 1000 个条目；认证失败、空列表或目录不兼容会给出提示，仍可切换「手动输入」。
+
+获取目录不启动推理任务，不消耗本软件的模型调用预算。密钥只由本地服务读取并放入请求头，不传给浏览器；配置环境变量后需重启服务。**目录条目不代表已经验证账号执行权限、工具调用或推理强度兼容性**；首次真实任务仍须验证。
+
 ```json
 {
   "providers": [{"id":"gateway","name":"我的模型网关","protocol":"chat_completions","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],

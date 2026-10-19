@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .adapters import detect
+from .catalog import CatalogError, list_models
 from .config import compatibility
 from .gitops import git
 from .evolution import Evolution
@@ -166,6 +167,12 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected an object")
             runtime = self.server.runtime
+            if urlparse(self.path).path == "/api/models":
+                try:
+                    self.respond(list_models(body.get("provider")))
+                except CatalogError as exc:
+                    self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
+                return
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
                 if runtime.updates.installing:

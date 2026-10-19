@@ -6,7 +6,7 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 
 ## Executed checks
 
-- `python3 -m unittest discover -v`: **51 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
+- `python3 -m unittest discover -v`: **59 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
 - `node --check adaptive_rsi/web/app.js`, `node --check adaptive_rsi/web/i18n.js`, and Python byte-compilation passed.
 - Both bundled skills passed the system skill-creator validator. The validator's PyYAML dependency was supplied in an isolated uv environment; the runtime has no third-party Python dependencies.
 - The runtime wheel and local plugin ZIP were built. The plugin archive excludes state, sessions, auth data, build caches and browser logs.
@@ -15,6 +15,14 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 - Bilingual checks confirmed that switching language preserves unsaved settings, saving persists changes, reloading remembers English, and the English task view retains Chinese goal text. At 390px width there was no horizontal overflow; the final page reported zero console errors or warnings.
 
 The new provider and review controls were checked in the in-app browser: provider registration, role routing, provider-default effort and review thresholds saved correctly. Switching languages preserved unsaved provider/model values; saved values survived a reload. At 1440 x 1100 and 390 x 844 there was no horizontal overflow or console error/warning. Temporary provider settings were removed and original model/threshold defaults restored. No real project was registered or enabled. Screenshot: `output/playwright/models-review-settings.png`.
+
+## Model directories and selection
+
+- Eight new tests cover directory requests across six provider protocols, auth headers, pagination, deduplication and IDs, empty directories, the 1,000-entry cap, malformed responses, repeated cursors, auth failure, redirect refusal and redacted errors; built-in Ollama / LM Studio endpoints and no connection when a required key is missing.
+- A replacement Codex process verifies initialize / initialized / model/list sequencing, pagination, no inference and timeout cleanup. The real installed Codex separately returned 14 directory entries without starting inference.
+- Real local HTTP API checks cover authentication, Origin and CSRF. Unsaved providers can be queried without storing configuration, reserving model calls or holding the task dispatch lock.
+- Playwright uses a local directory server to check preserving the current model on fetch, explicit selection, save/reload, bilingual value preservation and manual entry. Delayed response interception checks provider-switch isolation; empty lists, auth failures, retries and invalidation after a protocol edit pass. The simulated auth failure produces an expected HTTP 400 console record, with no JavaScript exception.
+- Chinese and English layouts have no horizontal overflow at 1440 x 1100 / 390 x 844. Screenshots: `output/playwright/model-catalog-*.png`. Temporary settings are restored and no project is enabled. Replacement directories do not establish real vendor execution permission or model tool capability.
 
 ## New validation in 0.2.0
 
