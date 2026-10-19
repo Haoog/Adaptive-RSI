@@ -1,0 +1,168 @@
+import contextlib
+import json
+import sqlite3
+import time
+import uuid
+from pathlib import Path
+
+
+def uid():
+    return uuid.uuid4().hex[:16]
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+class Store:
+    def __init__(self, root):
+        self.root = Path(root).expanduser().resolve()
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.chmod(0o700)
+        self.path = self.root / "state.sqlite3"
+        with self.connect() as db:
+            db.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS projects (
+                    id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, config TEXT,
+                    paused INTEGER DEFAULT 1, created REAL);
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id TEXT PRIMARY KEY, project TEXT REFERENCES projects(id), source TEXT,
+                    fingerprint TEXT, title TEXT, body TEXT, evidence TEXT, acceptance TEXT,
+                    state TEXT, priority INTEGER DEFAULT 50, attempts INTEGER DEFAULT 0,
+                    overrides TEXT DEFAULT '{}', available REAL DEFAULT 0, created REAL, updated REAL,
+                    UNIQUE(project, fingerprint));
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY, task TEXT REFERENCES tasks(id), project TEXT,
+                    state TEXT, config TEXT, strategy TEXT, base TEXT, path TEXT,
+                    calls INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0, started REAL, ended REAL,
+                    result TEXT DEFAULT '{}');
+                CREATE TABLE IF NOT EXISTS events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, run TEXT,
+                    kind TEXT, message TEXT, data TEXT, created REAL);
+                CREATE TABLE IF NOT EXISTS schedules (
+                    project TEXT, kind TEXT, due REAL, fingerprint TEXT DEFAULT '',
+                    PRIMARY KEY(project,kind));
+                CREATE TABLE IF NOT EXISTS candidates (
+                    id TEXT PRIMARY KEY, project TEXT, kind TEXT, parent TEXT, status TEXT,
+                    content TEXT, evidence TEXT DEFAULT '{}', created REAL, promoted REAL);
+                CREATE TABLE IF NOT EXISTS skills (
+                    id TEXT PRIMARY KEY, project TEXT, task TEXT, status TEXT, triggers TEXT,
+                    content TEXT, evidence TEXT, expires REAL, created REAL);
+                CREATE TABLE IF NOT EXISTS cases (
+                    id TEXT PRIMARY KEY, project TEXT, family TEXT, split TEXT,
+                    spec TEXT, uses INTEGER DEFAULT 0, created REAL,
+                    UNIQUE(project,family));
+                CREATE TABLE IF NOT EXISTS calls (
+                    id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
+                    state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL);
+                CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
+            """)
+
+    @contextlib.contextmanager
+    def connect(self):
+        db = sqlite3.connect(str(self.path), timeout=15)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def query(self, sql, args=()):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(sql, args).fetchall()]
+
+    def one(self, sql, args=()):
+        rows = self.query(sql, args)
+        return rows[0] if rows else None
+
+    def execute(self, sql, args=()):
+        with self.connect() as db:
+            db.execute(sql, args)
+
+    def setting(self, key, default=None):
+        row = self.one("SELECT value FROM settings WHERE key=?", (key,))
+        return json.loads(row["value"]) if row else default
+
+    def put_setting(self, key, value):
+        self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
+
+    def event(self, kind, message, project=None, run=None, data=None):
+        self.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                     (project, run, kind, message, encode(data or {}), time.time()))
+
+    def add_task(self, project, source, key, title, body="", evidence=None, acceptance=None,
+                 priority=50, overrides=None):
+        task = uid()
+        now = time.time()
+        with self.connect() as db:
+            db.execute("""INSERT OR IGNORE INTO tasks
+                (id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,
+                 overrides,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       (task, project, source, key, title[:300], body[:30000], encode(evidence or []),
+                        encode(acceptance or []), "queued", priority, encode(overrides or {}), now, now))
+            row = db.execute("SELECT id FROM tasks WHERE project=? AND fingerprint=?", (project, key)).fetchone()
+        return row["id"]
+
+    def claim(self, project, config):
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
+            busy = db.execute("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project,)).fetchone()
+            if not p or p["paused"] or busy:
+                return None
+            task = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
+                              "ORDER BY priority DESC,created LIMIT 1", (project, now)).fetchone()
+            if not task:
+                return None
+            from .config import merge, validate
+            effective = validate(merge(config, json.loads(task["overrides"])))
+            run = uid()
+            db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
+            db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                       (run, task["id"], project, "planning", encode(effective), now))
+        return self.one("SELECT * FROM runs WHERE id=?", (run,))
+
+    def transition(self, run, state, result=None, terminal=False):
+        now = time.time()
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
+            if not row or row["ended"] is not None:
+                return False
+            db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
+                       (state, encode(result or {}), now if terminal else None, run))
+            db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
+        self.event(state, (result or {}).get("reason", state), row["project"], run, result)
+        return True
+
+    def recover(self):
+        rows = self.query("SELECT id FROM runs WHERE ended IS NULL")
+        for row in rows:
+            self.transition(row["id"], "interrupted", {"reason": "Runtime restarted; artifacts retained. Retry creates a fresh isolated run."}, True)
+        self.execute("UPDATE candidates SET status='interrupted' WHERE status IN ('proposing','evaluating')")
+        return len(rows)
+
+    def reserve_call(self, project, run, role, route, config):
+        import datetime
+        from zoneinfo import ZoneInfo
+        now = time.time()
+        zone = ZoneInfo(config["schedule"]["timezone"])
+        midnight = datetime.datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            used = db.execute("SELECT count(*) FROM calls WHERE project=? AND created>=?", (project, midnight)).fetchone()[0]
+            run_used = db.execute("SELECT count(*) FROM calls WHERE run=?", (run,)).fetchone()[0]
+            if used >= config["limits"]["daily_calls"] or run_used >= config["limits"]["run_calls"]:
+                raise RuntimeError("Model call budget exhausted")
+            call = uid()
+            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created) VALUES (?,?,?,?,?,?,?,?)",
+                       (call, project, run, role, route["model"], route["effort"], "reserved", now))
+            db.execute("UPDATE runs SET calls=calls+1 WHERE id=?", (run,))
+        return call

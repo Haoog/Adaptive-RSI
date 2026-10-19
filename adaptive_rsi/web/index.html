@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Adaptive RSI · 本地控制台</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css"><script src="/i18n.js" defer></script><script src="/app.js" defer></script></head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="/" aria-label="Adaptive RSI 首页"><span class="brand-mark">a<span>↗</span></span><span>adaptive<span class="brand-sub">RSI / LOCAL RUNTIME</span></span></a>
+  <div class="workspace-label">WORKSPACE / 工作空间</div>
+  <nav aria-label="主导航">
+    <button class="nav active" data-view="overview"><span>◈</span>运行总览</button>
+    <button class="nav" data-view="tasks"><span>≡</span>任务与证据<span class="nav-count" id="queue-count">0</span></button>
+    <button class="nav" data-view="evolution"><span>↗</span>策略与记忆</button>
+    <button class="nav" data-view="settings"><span>⚙</span>运行设置</button>
+  </nav>
+  <div class="sidebar-bottom"><span class="live-dot"></span>状态存本机 · 使用 Codex 模型<small id="version">Adaptive RSI</small></div>
+</aside>
+<main>
+  <header class="topbar"><div class="breadcrumb">Adaptive RSI <span>/</span> <span id="page-name">运行总览</span></div><div class="project-tools"><select id="language-select" aria-label="Language / 语言"><option value="zh-CN">中文</option><option value="en">English</option></select><select id="project-select" aria-label="当前项目"><option value="">选择项目</option></select><button class="button small" id="add-project">＋ 接入项目</button></div></header>
+  <section id="view-overview" class="view">
+    <div class="page-heading"><div><div class="eyebrow">AUTONOMOUS, WITH EVIDENCE</div><h1>让改进持续发生<span class="accent">。</span></h1><p>发现机会，验证改动，把经过验证的经验带进下一轮。</p></div><button class="button primary" id="pause-button" disabled>启用项目</button></div>
+    <div class="empty-banner" id="onboarding"><div><strong>从一个 Git 项目开始</strong><p>接入后可自主巡检，也可以直接输入目标或同步 GitHub Issues。启用前不会调用模型。</p></div><button class="button" id="onboard-add">接入第一个项目 ↗</button></div>
+    <div class="stats-grid">
+      <article class="stat"><span>待处理任务</span><strong id="stat-queue">00</strong><small>合并三种任务来源</small></article>
+      <article class="stat"><span>执行中</span><strong id="stat-active">00</strong><small>每个项目串行隔离</small></article>
+      <article class="stat"><span>已通过独立验收</span><strong id="stat-pass">00</strong><small>代码交付与策略晋升分别把关</small></article>
+      <article class="stat"><span>近 24 小时会话</span><strong id="stat-calls">00</strong><small id="stat-tokens">0 tokens · 实际记录</small></article>
+    </div>
+    <div class="content-grid">
+      <article class="panel loop-panel"><div class="panel-title"><div><span class="eyebrow">THE IMPROVEMENT LOOP</span><h2>每一轮，都有依据</h2></div><span class="badge neutral" id="project-status">尚未接入</span></div>
+        <div class="sources"><span>◎ 自主发现</span><span>↳ 用户目标</span><span>＃ GitHub Issues</span></div>
+        <div class="pipeline"><div><b>01</b><strong>规划</strong><small>核实证据 · 确定范围</small></div><span class="connector">→</span><div><b>02</b><strong>执行</strong><small>隔离快照 · 修改实现</small></div><span class="connector">→</span><div><b>03</b><strong>独立评估</strong><small>重跑检查 · 审查风险</small></div></div>
+        <div class="loop-outcomes"><span>✓ 通过 → 候选 / PR</span><span>↶ 失败 → 保留证据，重新规划</span></div>
+        <div class="memory-line">↻ &nbsp; 观察 → 候选经验 → 验证 → 可检索技能</div>
+      </article>
+      <article class="panel goal-panel"><div class="eyebrow">HAVE SOMETHING IN MIND?</div><h2>也可以，从你的目标开始</h2><p>告诉它要改善什么。规划器会先核实当前代码，再形成可验收的任务。</p><form id="goal-form"><label class="sr-only" for="goal-text">你的目标</label><textarea id="goal-text" placeholder="例如：排查分页查询的边界情况，并补上回归验证。" required maxlength="30000"></textarea><div class="goal-bottom"><small>进入同一任务池</small><button class="button primary" type="submit">加入任务 ↗</button></div></form></article>
+    </div>
+    <div class="section-heading"><h2>按需工作，平时等待</h2><span>队列有任务时连续处理</span></div>
+    <div class="schedule-grid">
+      <article class="schedule-card"><div><span class="badge neutral">LIGHT</span><h3>轻量巡检</h3></div><strong id="light-interval">2 <small>小时 / 次</small></strong><div class="schedule-footer"><span id="light-due">启用后开始</span><button data-inspect="light">立即巡检 ↗</button></div></article>
+      <article class="schedule-card"><div><span class="badge neutral">ISSUES</span><h3>增量同步</h3></div><strong id="issues-interval">1 <small>小时 / 次</small></strong><div class="schedule-footer"><span id="issues-due">未关联仓库</span><button data-inspect="issues">立即同步 ↗</button></div></article>
+      <article class="schedule-card"><div><span class="badge neutral">DEEP</span><h3>深度巡检</h3></div><strong id="deep-interval">3 <small>天 / 次</small></strong><div class="schedule-footer"><span id="deep-due">轮换模块，深入检查</span><button data-inspect="deep">立即巡检 ↗</button></div></article>
+    </div>
+    <article class="panel activity-panel"><div class="panel-title"><h2>最近活动</h2><span class="eyebrow">LIVE LOG</span></div><div id="activity" class="activity"><p class="empty-copy">运行记录将在这里出现。每次调用、检查与决策都可追溯。</p></div></article>
+  </section>
+  <section id="view-tasks" class="view" hidden><div class="page-heading"><div><div class="eyebrow">ONE QUEUE, THREE SOURCES</div><h1>任务与证据<span class="accent">。</span></h1><p>从发现到交付，查看每次判断的依据和实际验收结果。</p></div><select id="task-filter" aria-label="筛选任务状态"><option value="all">全部任务</option><option value="queued">排队中</option><option value="running">执行中</option><option value="awaiting_approval">待交付</option><option value="blocked">需要处理</option></select></div><div class="panel task-list" id="tasks-list"></div></section>
+  <section id="view-evolution" class="view" hidden><div class="page-heading"><div><div class="eyebrow">LEARNING MUST EARN ITS PLACE</div><h1>让经验，经得起验证<span class="accent">。</span></h1><p>保留多个候选；独立任务对照评估通过后，才进入稳定策略。</p></div><button class="button primary" data-inspect="evolve">提出改进候选 ↗</button></div><div class="info-strip">策略、元策略和适配指导可以演化。评估器、权限、预算与晋升标准由运行器控制。</div><div class="suite-grid" id="suite-summary"></div><div id="candidates" class="candidate-grid"></div><article class="panel"><h2>导入评估任务</h2><p class="muted">历史真实修复或隔离环境中的合成缺陷。相同缺陷家族只能进入一个集合；最终评估任务不进入规划提示词。</p><details><summary>导入任务清单 JSON</summary><form id="case-form"><label for="case-json">任务清单（含 repository、base、family、split、task、checks、source，可选 overlay）</label><textarea id="case-json" rows="7" placeholder='{"family":"pagination-boundary","split":"holdout","repository":"/path/to/fixture","base":"HEAD","task":"...","source":"real","checks":[{"name":"regression","cwd":".","argv":["python3","-m","unittest","discover"]}]}' required></textarea><button class="button" type="submit">导入受保护任务</button></form></details></article></section>
+  <section id="view-settings" class="view" hidden><div class="page-heading"><div><div class="eyebrow">YOUR RUNTIME, YOUR SETTINGS</div><h1>按你的方式运行<span class="accent">。</span></h1><p>单任务覆盖优先，其次项目设置，再次全局默认。保存后从下一轮生效。</p></div><select id="config-scope" aria-label="设置作用范围"><option value="project">当前项目</option><option value="global">全局默认</option></select></div>
+    <form id="settings-form">
+      <article class="panel settings-panel"><div class="settings-intro"><span class="section-number">01</span><h2>任务来源与时间</h2><p>不需要先设定目标。启用后，巡检和 Issues 都能主动提供任务。</p></div><div class="settings-fields">
+        <label class="toggle-label"><span>自主项目巡检</span><input type="checkbox" data-path="sources.inspection"></label><label class="toggle-label"><span>GitHub Issues 同步</span><input type="checkbox" data-path="sources.issues"></label>
+        <div class="field-grid"><label>轻量巡检 / 分钟<input type="number" min="5" max="525600" data-path="schedule.light_minutes"></label><label>Issues 同步 / 分钟<input type="number" min="5" max="525600" data-path="schedule.issues_minutes"></label><label>深度巡检 / 分钟<input type="number" min="5" max="525600" data-path="schedule.deep_minutes"></label><label>时区<input data-path="schedule.timezone"></label><label>开始工作 / 时<input type="number" min="0" max="23" id="work-start"></label><label>结束工作 / 时<input type="number" min="1" max="24" id="work-end"></label></div>
+        <label>GitHub 仓库<input data-path="github.repository" placeholder="owner/repository"></label><label>只处理这些标签（逗号分隔，留空表示全部）<input id="issue-labels"></label>
+      </div></article>
+      <article class="panel settings-panel"><div class="settings-intro"><span class="section-number">02</span><h2>模型与推理强度</h2><p>每个角色单独调用。默认不替换不可用的模型；可在高级配置中显式指定备用路由。</p></div><div class="settings-fields" id="model-fields"></div></article>
+      <article class="panel settings-panel"><div class="settings-intro"><span class="section-number">03</span><h2>资源与交付</h2><p>默认保留本地候选。选择 PR 模式即授权后续通过验收的低、中风险任务推送分支并创建 PR。</p></div><div class="settings-fields"><div class="field-grid"><label>每日 Codex 会话上限<input type="number" min="1" data-path="limits.daily_calls"></label><label>每轮 Codex 会话上限<input type="number" min="1" data-path="limits.run_calls"></label><label>每轮总时限 / 秒<input type="number" min="1" data-path="limits.run_seconds"></label><label>检查命令时限 / 秒<input type="number" min="1" data-path="limits.command_seconds"></label><label>全局并行项目数<input type="number" min="1" max="4" data-path="limits.concurrency"></label><label>自动重试次数<input type="number" min="0" data-path="limits.retries"></label><label>隔离后端<select data-path="sandbox.backend"><option value="auto">自动选择</option><option value="seatbelt">macOS Seatbelt</option><option value="docker">Docker（检查）</option></select></label><label>交付方式<select data-path="delivery.mode"><option value="local">本地候选，等待交付</option><option value="pr">通过后自动创建 PR</option></select></label></div><label class="toggle-label"><span>通过检查后申请自动合并（遵循 GitHub 分支规则）</span><input type="checkbox" data-path="delivery.auto_merge"></label><label>固定验收命令（JSON 数组；留空数组则自动识别）<textarea id="checks-json" rows="4"></textarea></label></div></article>
+      <article class="panel settings-panel"><div class="settings-intro"><span class="section-number">04</span><h2>自我改进与验证</h2><p>普通任务与策略实验分别计数。证据不足时继续使用稳定版；新策略先监测，失败自动恢复。</p></div><div class="settings-fields"><label class="toggle-label"><span>自动提出策略候选</span><input type="checkbox" data-path="evolution.enabled"></label><label class="toggle-label"><span>配对验证通过后自动晋升</span><input type="checkbox" data-path="evolution.auto_promote"></label><div class="field-grid"><label>每完成多少任务触发<input type="number" min="1" data-path="evolution.every_completed"></label><label>每次实验会话上限<input type="number" min="1" data-path="evolution.max_calls"></label><label>每个验证集合最少任务数<input type="number" min="1" data-path="evolution.min_cases_per_split"></label><label>评估重复次数<input type="number" min="1" data-path="evolution.repeats"></label><label>时间 / token 成本倍率上限<input type="number" min="1" max="10" step="0.05" data-path="evolution.max_cost_ratio"></label><label>晋升后监测任务数<input type="number" min="1" data-path="evolution.monitor_tasks"></label></div></div></article>
+      <article class="panel"><details><summary>高级配置覆盖 / JSON</summary><p class="muted">仅填写要覆盖的字段。可配置备用模型、Issue 排除标签、容器资源和保留期限。</p><textarea id="advanced-json" rows="6" placeholder="{}"></textarea></details></article>
+      <div class="save-bar"><span id="save-note">运行中的任务保留开始时的完整配置。</span><button class="button primary" type="submit">保存设置 ↗</button></div>
+    </form>
+    <article class="panel"><h2>当前项目的语言能力</h2><p class="muted">识别语言不等于检查可运行。只有实际沙箱检查成功，才会记录为通过。SQL、Shell、PowerShell、HTML/CSS、Docker 与 CI 配置参与分析。</p><div id="capabilities"></div></article>
+  </section>
+  <footer>ADAPTIVE RSI <span>·</span> 通过证据改进，保留人的控制权。<span id="connection" class="connection">已连接</span></footer>
+</main>
+<dialog id="project-dialog"><form id="project-form"><div class="dialog-heading"><h2>接入本地项目</h2><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><p class="muted">选择已有提交的 Git 仓库根目录。运行器在独立快照中工作。</p><label>项目名称<input id="project-name" placeholder="留空时使用目录名"></label><label>项目路径<input id="project-path" placeholder="/Users/you/projects/example" required></label><label class="toggle-label"><span>接入后立即启用巡检和任务执行</span><input id="project-enabled" type="checkbox"></label><p class="muted">启用后会按设置调用你的 Codex 账户。默认交付方式为本地候选。</p><button class="button primary" type="submit">接入项目 ↗</button></form></dialog>
+<dialog id="detail-dialog"><div class="dialog-heading"><h2 id="detail-title">任务详情</h2><button class="icon-button close-dialog" type="button" aria-label="关闭">×</button></div><div id="detail-body"></div></dialog>
+<div id="toast" role="status" hidden></div>
+</body></html>
