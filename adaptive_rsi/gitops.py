@@ -55,3 +55,13 @@ def origin_repository(root):
         return match.group(1) if match else ""
     except RuntimeError:
         return ""
+
+
+def github_url(value):
+    import re
+    if not isinstance(value, str):
+        raise ValueError("Expected a GitHub repository URL")
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?", value.strip())
+    if not match or any(part in [".", ".."] for part in match.group(1).split("/")):
+        raise ValueError("Use a GitHub repository URL such as https://github.com/owner/repository")
+    return match.group(1), "https://github.com/" + match.group(1) + ".git"

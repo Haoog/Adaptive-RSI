@@ -1,6 +1,7 @@
 import hmac
 import json
 import mimetypes
+import os
 import secrets
 import sqlite3
 import threading
@@ -21,7 +22,7 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, runtime, port=0):
+    def __init__(self, runtime, port=0, session=None):
         self.runtime = runtime
         self.token = secrets.token_urlsafe(32)
         self.csrf = secrets.token_urlsafe(32)
@@ -29,6 +30,10 @@ class Server(ThreadingHTTPServer):
         self.origin = "http://127.0.0.1:" + str(self.server_port)
         self.cookie = "rsi_" + str(self.server_port)
         self.url = self.origin + "/?token=" + self.token
+        if session:
+            if session["origin"] != self.origin or session["cookie"] != self.cookie:
+                raise RuntimeError("Restart session does not match this listener")
+            self.token, self.csrf, self.url = session["token"], session["csrf"], session["url"]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -85,7 +90,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             runtime = self.server.runtime
             store = runtime.store
-            if parsed.path == "/api/state":
+            if parsed.path == "/api/health":
+                self.respond({"version": __version__, "pid": os.getpid()})
+            elif parsed.path == "/api/state":
                 projects = store.query("SELECT * FROM projects ORDER BY created")
                 for project in projects:
                     project["overrides"] = json.loads(project["config"])
@@ -105,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
                     candidate["trial_count"] = len(evidence.get("trials", []))
                     candidate["monitor"] = evidence.get("monitor", {})
                 self.respond({"version": __version__, "csrf": self.server.csrf, "projects": projects, "tasks": tasks,
-                              "runs": runs, "candidates": candidates, "config": runtime.config(),
+                              "runs": runs, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.status(),
                               "events": store.query("SELECT * FROM events ORDER BY seq DESC LIMIT 100"),
                               "schedules": store.query("SELECT * FROM schedules"),
                               "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
@@ -159,37 +166,50 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("Expected an object")
             runtime = self.server.runtime
-            path = urlparse(self.path).path
-            if path == "/api/projects":
-                result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
-            elif path == "/api/config":
-                runtime.configure(body["values"], body.get("project"))
-                result = {"saved": True}
-            elif path == "/api/goal":
-                result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
-            elif path == "/api/request":
-                result = {"id": runtime.request(body["project"], body["kind"])}
-            elif path == "/api/pause":
-                runtime.pause(body["project"], body["paused"])
-                result = {"saved": True}
-            elif path == "/api/retry":
-                runtime.retry(body["task"])
-                result = {"saved": True}
-            elif path == "/api/cancel":
-                runtime.cancel_task(body["task"])
-                result = {"saved": True}
-            elif path == "/api/deliver":
-                result = {"id": runtime.deliver(body["run"])}
-            elif path == "/api/rollback":
-                runtime.rollback_strategy(body["candidate"])
-                result = {"saved": True}
-            elif path == "/api/revert-code":
-                result = {"id": runtime.revert_code(body["run"])}
-            elif path == "/api/cases":
-                result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
-            else:
-                self.respond({"error": "Not found"}, 404)
-                return
-            self.respond(result)
+            with runtime.dispatch_lock:
+                path = urlparse(self.path).path
+                if runtime.updates.installing:
+                    raise ValueError("Software update in progress; wait for restart to complete")
+                if path == "/api/projects":
+                    result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
+                elif path == "/api/projects/import":
+                    result = {"id": runtime.import_project(body["url"], body.get("directory"))}
+                elif path == "/api/updates/check":
+                    runtime.updates.check_async()
+                    result = {"started": True}
+                elif path == "/api/updates/apply":
+                    if body.get("confirm") is not True:
+                        raise ValueError("Confirm installation and idle restart")
+                    runtime.updates.apply_async()
+                    result = {"started": True}
+                elif path == "/api/config":
+                    runtime.configure(body["values"], body.get("project"))
+                    result = {"saved": True}
+                elif path == "/api/goal":
+                    result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
+                elif path == "/api/request":
+                    result = {"id": runtime.request(body["project"], body["kind"])}
+                elif path == "/api/pause":
+                    runtime.pause(body["project"], body["paused"])
+                    result = {"saved": True}
+                elif path == "/api/retry":
+                    runtime.retry(body["task"])
+                    result = {"saved": True}
+                elif path == "/api/cancel":
+                    runtime.cancel_task(body["task"])
+                    result = {"saved": True}
+                elif path == "/api/deliver":
+                    result = {"id": runtime.deliver(body["run"])}
+                elif path == "/api/rollback":
+                    runtime.rollback_strategy(body["candidate"])
+                    result = {"saved": True}
+                elif path == "/api/revert-code":
+                    result = {"id": runtime.revert_code(body["run"])}
+                elif path == "/api/cases":
+                    result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
+                else:
+                    self.respond({"error": "Not found"}, 404)
+                    return
+                self.respond(result)
         except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
             self.respond({"error": str(exc)}, 400)

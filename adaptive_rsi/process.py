@@ -109,7 +109,7 @@ class Sandbox:
         # CLI applies workspace-write/read-only too; outer sandbox hides controller state.
         return ["sandbox-exec", "-p", profile] + argv
 
-    def command(self, argv, workspace, cwd=".", protected=()):
+    def command(self, argv, workspace, cwd=".", protected=(), hidden=()):
         workspace = Path(workspace).resolve()
         location = (workspace / cwd).resolve()
         location.relative_to(workspace)
@@ -145,12 +145,14 @@ class Sandbox:
         profile += '(allow file-read* file-write* (subpath %s))' % quote_sb(workspace)
         for item in protected:
             profile += '(deny file-write* (subpath %s))' % quote_sb(item)
+        for item in hidden:
+            profile += '(deny file-read* file-write* (subpath %s))' % quote_sb(item)
         profile += '(deny network*)'
         return ["sandbox-exec", "-p", profile] + list(argv), location
 
-    def check(self, check, workspace, cancel=None, protected=()):
+    def check(self, check, workspace, cancel=None, protected=(), hidden=()):
         scrub_tree(workspace)
-        argv, cwd = self.command(check["argv"], workspace, check.get("cwd", "."), protected)
+        argv, cwd = self.command(check["argv"], workspace, check.get("cwd", "."), protected, hidden)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path(workspace) / ".rsi-home"),
                "TMPDIR": str(Path(workspace) / ".rsi-tmp"), "CI": "1", "PYTHONDONTWRITEBYTECODE": "1",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,

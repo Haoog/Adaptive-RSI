@@ -19,8 +19,12 @@ SCHEMAS = {
     "analysis": object_schema({"findings": {"type": "array", "items": object_schema({
         "title": TEXT, "body": TEXT, "path": TEXT, "quote": TEXT,
         "acceptance": STRINGS, "priority": {"type": "integer"}})}}),
-    "planning": object_schema({"decision": {"type": "string", "enum": ["ready", "obsolete", "blocked"]},
+    "planning": object_schema({"decision": {"type": "string", "enum": ["ready", "obsolete", "blocked", "deferred", "rejected"]},
                                "reason": TEXT, "scope": STRINGS, "acceptance": STRINGS,
+                               "value": object_schema({"impact": {"type": "string", "enum": ["low", "medium", "high"]},
+                                   "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+                                   "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                                   "benefit": TEXT, "cost": TEXT, "inaction": TEXT, "evidence": STRINGS}),
                                "risk": {"type": "string", "enum": ["low", "medium", "high"]}}),
     "implementation": object_schema({"summary": TEXT}),
     "review": object_schema({"decision": VERDICT, "reason": TEXT,
@@ -80,13 +84,24 @@ class CodexAgent:
         self.store = store
 
     def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
-        binary = shutil.which("codex")
-        if not binary:
-            raise RuntimeError("Codex CLI is not installed")
         routes = [config["models"][role]]
         if routes[0].get("fallback"):
             routes.append(routes[0]["fallback"])
         for index, route in enumerate(routes):
+            provider = next((p for p in config["providers"] if p["id"] == route.get("provider")), None)
+            if provider and provider.get("protocol", "codex") != "codex":
+                from .native import NativeAgent, ProviderUnavailable
+                try:
+                    return NativeAgent(self.store).invoke(role, prompt, workspace, project, run,
+                                                         config, route, provider, cancel, protected)
+                except ProviderUnavailable as exc:
+                    if index + 1 == len(routes):
+                        raise
+                    self.store.event("fallback", str(exc), project, run)
+                    continue
+            binary = shutil.which("codex")
+            if not binary:
+                raise RuntimeError("Codex CLI is not installed for this route")
             provider_args = provider_arguments(route, config)
             call = self.store.reserve_call(project, run, role, route, config)
             started = time.time()

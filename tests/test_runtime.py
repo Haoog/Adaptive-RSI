@@ -53,7 +53,10 @@ class FakeAgent:
         self.roles.append((role, config["models"][role]))
         if role == "planning":
             return {"decision": "ready", "reason": "Verified arithmetic defect", "scope": ["calculator.py", "tests"],
-                    "acceptance": ["2 + 3 equals 5"], "risk": "low"}
+                    "acceptance": ["2 + 3 equals 5"], "risk": "low", "value": {
+                        "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Restore arithmetic correctness",
+                        "cost": "One operator change and regression verification", "inaction": "Addition continues returning wrong values",
+                        "evidence": ["calculator.py:2 subtracts; 2 + 3 returns -1"]}}
         if role == "implementation":
             if self.malicious:
                 (workspace / "tests/test_calculator.py").write_text("import unittest\nclass Fake(unittest.TestCase):\n    def test_fake(self): pass\n")
@@ -320,6 +323,7 @@ Path(%r).write_text('allowed output')
             self.runtime.sync_issues(self.runtime.project(self.project), config)
             self.assertEqual(len(self.store.query("SELECT * FROM tasks WHERE source='issue'")), 1)
             self.assertIn("--search", [args for args in calls if args[1] == "issue"][1])
+            self.store.execute("UPDATE tasks SET state='deferred' WHERE source='issue'")
             issue["state"] = "CLOSED"
             self.runtime.sync_issues(self.runtime.project(self.project), config)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE source='issue'")["state"], "obsolete")

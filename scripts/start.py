@@ -12,10 +12,12 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root))
 from adaptive_rsi.cli import default_state
+from adaptive_rsi.updates import installed_root
 
 state = default_state().expanduser().resolve()
 state.mkdir(mode=0o700, parents=True, exist_ok=True)
 state.chmod(0o700)
+root = installed_root(state, root)
 session_file = state / "server.json"
 
 

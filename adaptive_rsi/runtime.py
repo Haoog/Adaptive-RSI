@@ -10,7 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .adapters import detect
-from .agent import CodexAgent
+from .agent import CodexAgent, SCHEMAS, validate_output
 from .config import DEFAULTS, compatibility, fingerprint, merge, relative_path, validate
 from .evaluator import Evaluator
 from .gitops import changes, git, origin_repository, repository, snapshot
@@ -37,6 +37,10 @@ class Runtime:
         self.lockfile = None
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi")
         self.futures = set()
+        self.import_lock = threading.Lock()
+        self.dispatch_lock = threading.RLock()
+        from .updates import UpdateManager
+        self.updates = UpdateManager(self)
 
     def config(self, project=None):
         override = {}
@@ -52,12 +56,22 @@ class Runtime:
         return row
 
     def add_project(self, path, name=None, enabled=False):
+        with self.dispatch_lock:
+            return self._add_project(path, name, enabled)
+
+    def _add_project(self, path, name=None, enabled=False):
         root = repository(path)
         if self.store.root == root or self.store.root in root.parents or root in self.store.root.parents:
             raise ValueError("Project and controller state must be in separate directory trees")
         existing = self.store.one("SELECT * FROM projects WHERE path=?", (str(root),))
         if existing:
             return existing["id"]
+        if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
+            raise ValueError("Wait until active runs finish before registering projects so every worker uses the same isolation boundaries")
+        for item in self.store.query("SELECT path FROM projects"):
+            other = Path(item["path"]).resolve()
+            if root in other.parents or other in root.parents:
+                raise ValueError("Projects must not contain each other's directories")
         project = uid()
         overrides = {"github": {"repository": origin_repository(root)}}
         self.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
@@ -66,11 +80,45 @@ class Runtime:
         self.wake.set()
         return project
 
+    def import_project(self, url, directory=None):
+        from .gitops import github_url
+        import shutil
+        repo, _ = github_url(url)
+        parent = Path(directory).expanduser().resolve() if directory else self.store.root.parent / (self.store.root.name + "-projects")
+        if parent == self.store.root or self.store.root in parent.parents or parent in self.store.root.parents:
+            raise ValueError("Clone directory must be separate from controller state")
+        with self.import_lock, self.dispatch_lock:
+            for item in self.store.query("SELECT id,path FROM projects"):
+                if origin_repository(item["path"]).lower() == repo.lower():
+                    return item["id"]
+            if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
+                raise ValueError("Wait until active runs finish before importing projects")
+            target = parent / repo.replace("/", "--")
+            if target.exists():
+                raise ValueError("Import directory already exists; register it as a local project instead")
+            for item in self.store.query("SELECT path FROM projects"):
+                other = Path(item["path"]).resolve()
+                if target == other or target in other.parents or other in target.parents:
+                    raise ValueError("Projects must not contain each other's directories")
+            parent.mkdir(parents=True, exist_ok=True)
+            try:
+                checked(["gh", "repo", "clone", repo, str(target), "--", "--no-recurse-submodules", "--template=",
+                         "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false"], timeout=180)
+                if origin_repository(target).lower() != repo.lower():
+                    raise RuntimeError("Cloned repository origin did not match the requested project")
+                return self.add_project(target, repo)
+            except Exception:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                raise
+
     def configure(self, values, project=None):
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
         if project and "concurrency" in values.get("limits", {}):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
+        if project and "updates" in values:
+            raise ValueError("Software updates are a global setting")
         previous = json.loads(self.project(project)["config"]) if project else self.store.setting("config", {})
         updated = merge(previous, values)
         validate(merge(self.store.setting("config", {}) if project else {}, updated))
@@ -129,7 +177,7 @@ class Runtime:
 
     def retry(self, task):
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
-        if not row or row["state"] not in ["failed", "blocked", "interrupted", "cancelled", "insufficient_evidence"]:
+        if not row or row["state"] not in ["failed", "blocked", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected"]:
             raise ValueError("This task cannot be retried")
         self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (time.time(), task))
         self.wake.set()
@@ -149,8 +197,7 @@ class Runtime:
         if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
             raise ValueError("Independent gates have not passed")
         task = self.store.add_task(original["project"], "system_publish", "publish:" + run_id,
-                                   "Publish approved candidate", run_id, priority=100,
-                                   overrides={"delivery": {"mode": "pr", "auto_merge": False}})
+                                   "Publish approved candidate", run_id, priority=100)
         self.wake.set()
         return task
 
@@ -199,10 +246,31 @@ class Runtime:
                     self.request(project, kind, priority=20)
                 self.store.execute("INSERT INTO schedules(project,kind,due) VALUES (?,?,?) "
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
+        key = "deferred-check:" + project
+        if now - self.store.setting(key, 0) >= config["schedule"]["light_minutes"] * 60:
+            rows = self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,))
+            head = git(self.project(project)["path"], "rev-parse", "HEAD") if rows else None
+            for task in rows:
+                run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],))
+                prior = json.loads(run["result"]) if run else {}
+                signature = fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})
+                if head != prior.get("base") or signature != prior.get("triage_input"):
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=? AND state='deferred'", (now, task["id"]))
+                    self.store.event("triage_recheck", "New evidence or baseline; deferred task queued for reassessment", project)
+            self.store.put_setting(key, now)
 
     def loop(self):
         while not self.stop.is_set():
             try:
+                ready = self.store.root / "update-ready"
+                if ready.exists():
+                    ready.unlink()
+                    self.updates.installing = False
+                if self.updates.installing:
+                    self.wake.wait(timeout=1)
+                    self.wake.clear()
+                    continue
+                self.updates.tick()
                 self.maintenance()
                 self.futures = {f for f in self.futures if not f.done()}
                 for project in self.store.query("SELECT * FROM projects WHERE paused=0 ORDER BY created"):
@@ -214,7 +282,8 @@ class Runtime:
                     self.schedule(project["id"], config)
                     if len(self.futures) >= self.config()["limits"]["concurrency"]:
                         break
-                    run = self.store.claim(project["id"], config)
+                    with self.dispatch_lock:
+                        run = None if self.updates.installing else self.store.claim(project["id"], config)
                     if run:
                         self.futures.add(self.pool.submit(self.process, run))
             except Exception as exc:
@@ -249,9 +318,10 @@ class Runtime:
                 any(t.lower() in text.lower() for t in json.loads(r["triggers"]))][:5]
 
     def invoke(self, role, text, workspace, run):
-        project = self.project(run["project"])
+        protected = [p["path"] for p in self.store.query("SELECT path FROM projects")]
+        protected += [json.loads(c["spec"])["repository"] for c in self.store.query("SELECT spec FROM cases")]
         return self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
-                                 json.loads(run["config"]), lambda: self.is_cancelled(run), [project["path"]])
+                                 json.loads(run["config"]), lambda: self.is_cancelled(run), protected)
 
     def process(self, run):
         project = self.project(run["project"])
@@ -319,12 +389,25 @@ class Runtime:
                 plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
                         "scope": prior_result["files"], "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
             else:
-                plan = self.invoke("planning", "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
+                plan = self.invoke("planning", "First decide whether this work is worth doing, including user goals. Do not automatically implement every suggestion. "
+                               "Assess evidenced impact, benefit, cost/effort, confidence and what happens if nothing is changed. "
+                               "Use deferred for weak evidence, unclear requirements or low current priority; rejected for cosmetic churn, disproportionate cost or incompatible direction. "
+                               "Only ready authorizes implementation. Evidence must cite concrete current-code behavior or a specific user requirement. "
+                               "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
                                "If ready, define narrow file/directory scope and observable acceptance criteria. "
-                                   "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes.\n" + encode(context), workspace, run)
+                                   "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes.\n" +
+                                   encode({"value_policy": config["triage"]["policy"], **context}), workspace, run)
+                validate_output(plan, SCHEMAS["planning"])
+                value = plan["value"]
+                if plan["decision"] == "ready" and (value["confidence"] == "low" or not any(e.strip() for e in value["evidence"]) or
+                        not all(value[k].strip() for k in ["benefit", "cost", "inaction"]) or
+                        value["impact"] == "low" and value["effort"] == "high"):
+                    plan["decision"] = "deferred"
+                    plan["reason"] = "Value gate held: insufficient evidence or disproportionate effort. " + plan["reason"]
             (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
             if plan["decision"] != "ready":
-                self.store.transition(run["id"], plan["decision"], {"reason": plan["reason"]}, True)
+                self.store.transition(run["id"], plan["decision"], {"reason": plan["reason"], "value": plan.get("value"), "base": base,
+                    "triage_input": fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})}, True)
                 return
             if not plan["scope"] or not plan["acceptance"]:
                 raise RuntimeError("Plan lacks scope or acceptance criteria")
@@ -379,6 +462,7 @@ class Runtime:
             (directory / "review.json").write_text(encode(review), encoding="utf-8")
             outcome = {"reason": review["reason"], "summary": result["summary"], "files": files,
                        "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
+                       "value": plan.get("value"),
                        "patch_hash": fingerprint(patch)}
             if review["decision"] != "pass":
                 self.finish_failure(run, task, {**outcome, "decision": review["decision"]}, config)
@@ -388,12 +472,7 @@ class Runtime:
                 return
             if self.is_cancelled(run):
                 raise Cancelled("Cancelled before delivery")
-            state = "awaiting_approval"
-            if config["delivery"]["mode"] == "pr" and plan["risk"] != "high":
-                url = self.publish(project, task, run, workspace, config)
-                outcome["pr"] = url
-                state = "pr_open"
-            self.store.transition(run["id"], state, outcome, True)
+            self.store.transition(run["id"], "awaiting_approval", outcome, True)
             self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                                (uid(), project["id"], task["id"], "observation", encode([task["title"]]),
                                 result["summary"], encode({"run": run["id"], "base": base}), time.time() + 30 * 86400, time.time()))
@@ -483,11 +562,11 @@ class Runtime:
             allowed = not set(config["github"]["exclude_labels"]).intersection(labels) and (
                 not config["github"]["labels"] or set(config["github"]["labels"]).issubset(labels))
             if issue["state"] != "OPEN" or not allowed:
-                if existing and existing["state"] == "queued":
+                if existing and existing["state"] in ["queued", "deferred"]:
                     self.store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
                 continue
             evidence = [{"number": issue["number"], "url": issue["url"], "updated": issue["updatedAt"]}]
-            if existing and existing["state"] == "queued":
+            if existing and existing["state"] in ["queued", "deferred"]:
                 self.store.execute("UPDATE tasks SET title=?,body=?,evidence=?,updated=? WHERE id=?",
                                    (issue["title"], issue["body"][:30000], encode(evidence), time.time(), existing["id"]))
             else:
@@ -512,6 +591,10 @@ class Runtime:
         return row["state"] == "OPEN"
 
     def publish(self, project, task, run, workspace, config):
+        approval = self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_publish' AND body=? AND state='planning'",
+                                  (project["id"], run["id"]))
+        if not approval or run["state"] != "awaiting_approval":
+            raise RuntimeError("Publishing requires explicit approval for this verified candidate")
         repo = config["github"]["repository"]
         if not repo or repo != origin_repository(project["path"]):
             raise RuntimeError("PR repository must match the project's GitHub origin")
@@ -537,8 +620,6 @@ class Runtime:
             args += ["--base", config["delivery"]["base_branch"]]
         url = checked(args, timeout=60)
         self.store.event("pr", "PR created", project["id"], run["id"], {"url": url, "head": sha})
-        if config["delivery"]["auto_merge"]:
-            checked(["gh", "pr", "merge", url, "--repo", repo, "--auto", "--squash", "--match-head-commit", sha], timeout=60)
         return url
 
     def maybe_evolve(self, project, config):

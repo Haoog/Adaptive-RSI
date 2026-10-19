@@ -83,13 +83,14 @@ class Evaluator:
                         shutil.copy2(src, dst)
                         protected.append(dst)
             sandbox = Sandbox(self.store.root, config)
+            hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
             rows = []
             for setup in config["environment"]["setup"]:
-                result = sandbox.check(setup, target, cancel, protected)
+                result = sandbox.check(setup, target, cancel, protected, hidden)
                 if result["exit_code"] or result["error"]:
                     return {"decision": "insufficient_evidence", "reason": "Isolated dependency preparation failed", "setup": result}
             for check in checks:
-                result = sandbox.check(check, target, cancel, protected)
+                result = sandbox.check(check, target, cancel, protected, hidden)
                 text = result["stdout"] + result["stderr"]
                 empty = empty_test_run(text)
                 result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty

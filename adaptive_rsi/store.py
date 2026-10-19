@@ -63,6 +63,18 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                 db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
+            # Earlier versions exposed automatic delivery. Upgrades always revoke it.
+            for row in db.execute("SELECT id,config FROM projects").fetchall():
+                config = json.loads(row["config"])
+                if config.get("delivery", {}).get("mode", "local") != "local" or config.get("delivery", {}).get("auto_merge"):
+                    config["delivery"] = {**config["delivery"], "mode": "local", "auto_merge": False}
+                    db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
+            row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+            if row:
+                config = json.loads(row["value"])
+                if config.get("delivery", {}).get("mode", "local") != "local" or config.get("delivery", {}).get("auto_merge"):
+                    config["delivery"] = {**config["delivery"], "mode": "local", "auto_merge": False}
+                    db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))
 
     @contextlib.contextmanager
     def connect(self):

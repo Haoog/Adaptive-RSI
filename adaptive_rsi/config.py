@@ -17,6 +17,8 @@ DEFAULTS = {
         "evolution": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
     },
     "review": {"block_on": "medium"},
+    "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
+    "updates": {"mode": "notify", "interval_minutes": 1440},
     "limits": {"daily_calls": 30, "run_calls": 5, "run_seconds": 1800,
                "command_seconds": 300, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 40, "retention_days": 30},
@@ -64,8 +66,8 @@ def validate(config):
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
     for provider in config["providers"]:
-        if not isinstance(provider, dict) or set(provider) != {"id", "name", "base_url", "env_key"}:
-            raise ValueError("Provider requires only id, name, base_url, env_key; never store API keys")
+        if not isinstance(provider, dict) or set(provider) - {"id", "name", "base_url", "env_key", "protocol"} or not {"id", "name", "base_url", "env_key"}.issubset(provider):
+            raise ValueError("Provider requires id, name, base_url, env_key and optional protocol; never store API keys")
         if not all(isinstance(value, str) for value in provider.values()):
             raise ValueError("Provider fields must be strings")
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", provider["id"]) or provider["id"] in providers:
@@ -81,6 +83,8 @@ def validate(config):
             raise ValueError("Provider requires a short display name")
         if provider["env_key"] and not re.fullmatch(r"[A-Z_][A-Z0-9_]*", provider["env_key"]):
             raise ValueError("env_key must be an environment variable name, not a secret")
+        if provider.get("protocol", "codex") not in ["codex", "responses", "chat_completions", "anthropic", "gemini", "ollama"]:
+            raise ValueError("Unsupported model protocol")
     for role, route in config["models"].items():
         for item in [route, route.get("fallback")]:
             if item is None:
@@ -98,6 +102,10 @@ def validate(config):
                 raise ValueError("Luna supports max, not ultra")
     if config["review"]["block_on"] not in ["low", "medium", "high"]:
         raise ValueError("Review blocking threshold must be low, medium or high")
+    if not config["triage"]["policy"].strip() or len(config["triage"]["policy"]) > 4000:
+        raise ValueError("Triage policy requires 1..4000 characters")
+    if config["updates"]["mode"] not in ["manual", "notify", "automatic"] or not 60 <= config["updates"]["interval_minutes"] <= 525600:
+        raise ValueError("Invalid update mode or interval (minimum 60 minutes)")
     for name in ["light_minutes", "issues_minutes", "deep_minutes"]:
         if not 5 <= config["schedule"][name] <= 525600:
             raise ValueError(name + " must be between 5 and 525600")
@@ -126,10 +134,8 @@ def validate(config):
     for field in ["labels", "exclude_labels"]:
         if not all(isinstance(x, str) and len(x) <= 100 for x in config["github"][field]):
             raise ValueError("Invalid issue labels")
-    if config["delivery"]["mode"] not in ["local", "pr"]:
-        raise ValueError("Delivery mode must be local or pr")
-    if config["delivery"]["auto_merge"] and config["delivery"]["mode"] != "pr":
-        raise ValueError("Auto merge requires PR delivery")
+    if config["delivery"]["mode"] != "local" or config["delivery"]["auto_merge"]:
+        raise ValueError("Delivery requires explicit approval per candidate; automatic PRs and merges are disabled")
     for path in config["environment"]["seed_paths"]:
         relative_path(path)
         if path in [".", ""]:
