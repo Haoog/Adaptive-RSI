@@ -149,6 +149,14 @@ The dashboard defaults to Chinese. Select **English** in the top bar; the browse
 
 State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_HOME` or `--state-dir`. Keep state outside managed project trees. The dashboard listens only on `127.0.0.1`. Its login URL contains a local session token: do not share it. Reopen with `python3 scripts/rsi open`.
 
+### Everyday use
+
+- With a project connected, Settings defaults to that project. Shared defaults supply values only where no project override exists. Delivery authorization is project-specific; shared settings offers a project shortcut.
+- Delivery modes mean keep changes locally, automatically submit a change request (PR) awaiting merge, or automatically merge after checks. Automatic merging still requires value assessment, tests, independent review and repository protection checks.
+- The Chinese UI uses everyday terms while retaining actual parameters such as `high` and `max`. A basic capability test makes a real, potentially billable model call and checks tool use/output format; it does not certify real-task performance.
+- Form errors preserve input, repeated clicks do not add duplicate goals, and partial batch imports retain only unsuccessful URLs for retry. Unchanged background polls preserve activity expansion and task-list focus.
+- If a browser session expires, follow the recovery page or run `python3 scripts/rsi open`. Projects and settings remain intact; no restart is required. Do not share authenticated links.
+
 ## The improvement loop
 
 - **Scheduling:** light inspection every 120 minutes, incremental Issues sync every 60 minutes, and deep inspection every 4320 minutes. Configure time zone and working hours. Ready tasks continue without waiting for the next inspection. Light inspection skips model calls when the committed snapshot is unchanged; deep inspection rotates modules. Resume does not replay every missed trigger.

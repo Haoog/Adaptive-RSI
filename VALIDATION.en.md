@@ -5,7 +5,17 @@
 Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
 
 
-## Simplified workspace acceptance (latest result)
+## Usability and reliability fixes (latest result)
+
+- Removed repeated workspace project headings and descriptions. Settings defaults to the current project. Shared defaults offers a project delivery shortcut instead of a disabled selector. Authorization rules remain unchanged.
+- Chinese wording uses everyday terms with actual model parameters retained; all delivery modes are explained. Missing sessions show bilingual recovery instructions. APIs still require authentication, Origin and CSRF; recovery pages contain no credentials.
+- All **118 backend tests passed**, along with **25 frontend regressions**, covering stale state/toolchain responses, duplicate submission, expired sessions, non-JSON responses, retained input/expansion and project-default scope.
+- Two paused fixture projects verified partial import retries, real delivery-setting saves/isolation, scope switching, draft-preserving home navigation and inline JSON errors. Chinese/English pages have no horizontal overflow at 1440/390/320 widths or page-script exceptions. Git cloning and model directories used local substitutes; no remote repository or real project/model inference was started.
+- Screenshots: `output/playwright/usability-workspace.png`, `usability-workspace-mobile.png`, `usability-inline-error.png`, `session-recovery.png`. Expected unauthenticated 401 and invalid-import 400 responses are not page-script failures.
+- Interaction references: [GOV.UK form errors](https://design-system.service.gov.uk/components/error-summary/) and [Open WebUI connections](https://docs.openwebui.com/getting-started/quick-start/connect-a-provider/). No extra framework or permission-model change was introduced.
+- The independent review's import-selection and cross-scope feedback findings were fixed and verified with delayed browser requests and regressions. All six final assessment areas passed; remaining English fragments and the queued-action translation were also corrected. See [review and resolution evidence](docs/validation/usability-review-20261020.json).
+
+## Simplified workspace acceptance (previous result)
 
 - Primary navigation is Workspace, Tasks and Settings. Model settings and learning history are secondary pages. The empty workspace fits a 390 × 844 viewport; everyday settings expose six configuration values plus two interval-unit selectors, retaining all advanced settings.
 - The complete backend suite passed **117 tests**, and **14 frontend tests** passed. New regressions cover task grouping, hour/day conversion, custom delivery preservation, cancellation after out-of-order details, closed details staying closed, and independent draft baselines/units across projects. Syntax checks, wheel and plugin ZIP builds passed.

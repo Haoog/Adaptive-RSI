@@ -1,0 +1,12 @@
+:root { color-scheme: light; color: #26352f; background: #f4f4eb; font-family: Georgia, "Songti SC", serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: radial-gradient(ellipse at top right, #dce9d8, transparent 65%); padding: clamp(20px, 7vw, 90px); }
+main { max-width: 680px; margin: 0 auto; }
+.brand { letter-spacing: .14em; font: 13px sans-serif; color: #526c5a; }
+h1 { font-size: clamp(36px, 7vw, 58px); line-height: 1.25; font-weight: 500; margin: 40px 0 24px; }
+h2 { font-size: 22px; margin-top: 32px; }
+p { line-height: 1.85; }
+pre { background: #fffdf7; border: 1px solid #d2dacb; padding: 18px; overflow-x: auto; border-radius: 8px; }
+a { display: inline-block; color: #215c45; margin: 18px 0; text-underline-offset: 5px; }
+details { border-top: 1px solid #cbd5c5; margin-top: 28px; padding-top: 20px; }
+summary { cursor: pointer; }
