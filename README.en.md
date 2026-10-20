@@ -254,7 +254,7 @@ node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 ```
 
-Tests substitute the model interface while running real Git snapshots, SQLite concurrency, macOS sandbox checks, and regression checks. They do not consume model sessions or write to GitHub. Browser checks cover desktop/mobile layout and settings persistence. Live model authorization, long-running operation, and remote PR integration require a real project.
+The automated tests above substitute the model interface while running real Git snapshots, SQLite concurrency, macOS sandbox checks, and regression checks. They do not consume model sessions or write to GitHub. Browser checks cover desktop/mobile layout and settings persistence. Separately, an isolated Python fixture completed two rounds of real model calls, remote CI, automatic PR merging and post-merge checks. Other providers, languages and long-running operation still require scenario-specific validation.
 
 See [the validation report](VALIDATION.en.md) and [contribution guide](CONTRIBUTING.en.md).
 
