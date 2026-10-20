@@ -20,6 +20,9 @@ Keep temporary UI-check projects paused to avoid unintended model calls. Store r
 
 ## Commits and documentation
 
+- Start every change on a new working branch. Do not commit or push directly to `main`. Automated improvements to this repository must also pass checks, code review, and a PR before merging.
+- Each candidate requires explicit user confirmation before pushing its branch and creating a PR. PR creation and merging require separate authorization. Do not merge or enable auto-merge without explicit user authorization. The current application disables automatic PR creation and merging.
+- These instructions do not configure GitHub branch protection. Maintainers should also configure rules for `main` requiring PRs, checks, and reviews on GitHub.
 - Use Chinese commit messages describing the behavior change, for example: `修复巡检任务重复入队的问题` (fix duplicate inspection tasks).
 - PR descriptions can be Chinese or English. Explain the problem, behavior change, verification, and known limitations.
 - Update both READMEs, relevant documentation, and UI translations when changing user-facing features. Chinese is the default UI language; English translations live in `adaptive_rsi/web/i18n.js`.
