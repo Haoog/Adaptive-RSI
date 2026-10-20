@@ -248,7 +248,7 @@ class UpdatesTest(unittest.TestCase):
                     children.append(child)
                     return child
                 try:
-                    with patch.dict(os.environ, {"RSI_TEST_RESTART_STATE": str(state)}), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=spawn):
+                    with patch.dict(os.environ, {"RSI_TEST_RESTART_STATE": str(state), "PYTHONPROFILEIMPORTTIME": "1"}), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=spawn):
                         supervise_restart(state)
                     expected = "0.2.1" if healthy else __version__
                     deadline = time.monotonic() + 10
@@ -262,7 +262,7 @@ class UpdatesTest(unittest.TestCase):
                             if time.monotonic() > deadline:
                                 self.fail(str({"health_error": str(error), "children": [child.poll() for child in children],
                                                "update": store.setting("update-status"),
-                                               "log": (state / "server.log").read_text()}))
+                                               "log": (state / "server.log").read_text()[-12000:]}))
                             time.sleep(0.1)
                     self.assertEqual(health["version"], expected)
                     self.assertEqual(store.setting("sentinel"), {"project": "keep-me", "settings": [1, 2, 3]})
