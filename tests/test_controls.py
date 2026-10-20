@@ -193,6 +193,53 @@ def bundle(target="0.2.1", extra=None):
 
 
 class UpdatesTest(unittest.TestCase):
+    def test_restored_login_is_writable_without_an_upgrade(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime(Store(temp))
+            try:
+                runtime.store.put_setting("update-status", {"state": "no_release"})
+                runtime.updates.restore_startup()
+                runtime.updates.require_ready()
+                self.assertFalse(runtime.updates.snapshot()["busy"])
+                runtime.configure({"schedule": {"light_minutes": 240}})
+                self.assertEqual(runtime.config()["schedule"]["light_minutes"], 240)
+            finally:
+                runtime.close()
+
+    def test_upgrade_unlocks_from_committed_result_without_a_ready_marker(self):
+        from adaptive_rsi import __version__
+        from adaptive_rsi.updates import UpdateInProgress
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime(Store(temp))
+            try:
+                runtime.store.put_setting("update-status", {"state": "restarting", "version": __version__})
+                runtime.updates.restore_startup()
+                ready = runtime.store.root / "update-ready"
+                ready.write_text("stale marker")
+                with self.assertRaises(UpdateInProgress):
+                    runtime.updates.require_ready()
+                self.assertTrue(runtime.updates.snapshot()["busy"])
+                ready.unlink()
+                runtime.store.put_setting("update-status", {"state": "installed", "current": "wrong-version"})
+                with self.assertRaises(UpdateInProgress):
+                    runtime.updates.require_ready()
+                runtime.store.put_setting("update-status", {"state": "installed", "current": __version__})
+                runtime.updates.require_ready()
+                self.assertFalse(runtime.updates.snapshot()["busy"])
+            finally:
+                runtime.close()
+
+    def test_ready_marker_does_not_unlock_an_active_installation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Runtime(Store(temp))
+            try:
+                runtime.updates.installing = True
+                (runtime.store.root / "update-ready").write_text("stale marker")
+                self.assertTrue(runtime.updates.is_busy())
+                self.assertTrue(runtime.updates.installing)
+            finally:
+                runtime.close()
+
     def test_bootstrap_selects_managed_version_for_explicit_state_directory(self):
         import sys
         with tempfile.TemporaryDirectory() as temp:
@@ -222,6 +269,7 @@ class UpdatesTest(unittest.TestCase):
                 state = root / "state"
                 store = Store(state)
                 store.put_setting("config", {"updates": {"mode": "manual"}})
+                store.put_setting("update-status", {"state": "restarting", "version": "0.2.1", "current": __version__})
                 store.put_setting("sentinel", {"project": "keep-me", "settings": [1, 2, 3]})
                 installs = state / "installations"
                 installs.mkdir()
@@ -269,6 +317,13 @@ class UpdatesTest(unittest.TestCase):
                     self.assertEqual(store.setting("update-status")["state"], "installed" if healthy else "rolled_back")
                     self.assertEqual((installs / "active.json").exists(), healthy)
                     self.assertEqual((installs / "current").exists(), healthy)
+                    request = urllib.request.Request(session["origin"] + "/api/config",
+                        json.dumps({"values": {"schedule": {"light_minutes": 240}}}).encode(),
+                        {"Cookie": session["cookie"] + "=" + session["token"], "Origin": session["origin"],
+                         "X-RSI-CSRF": session["csrf"], "Content-Type": "application/json"})
+                    with urllib.request.urlopen(request, timeout=3) as response:
+                        self.assertTrue(json.load(response)["saved"])
+                    self.assertEqual(store.setting("config")["schedule"]["light_minutes"], 240)
                 finally:
                     for child in children:
                         if child.poll() is None:

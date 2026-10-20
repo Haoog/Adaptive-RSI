@@ -581,6 +581,53 @@ class ServerTest(unittest.TestCase):
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
 
+    def test_update_gate_rejects_before_mutation_with_a_retryable_code(self):
+        self.runtime.updates.installing = True
+        headers = {**self.headers(), "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+                   "Content-Type": "application/json"}
+        before = self.runtime.config()["schedule"]["light_minutes"]
+        for path, body in [("config", {"values": {"schedule": {"light_minutes": 240}}}),
+                           ("projects/import", {"url": "https://github.com/example/project"}),
+                           ("model-center/provider", {})]:
+            with self.subTest(path=path), patch("adaptive_rsi.runtime.checked") as clone:
+                request = urllib.request.Request(self.server.origin + "/api/" + path, json.dumps(body).encode(), headers)
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request)
+                self.assertEqual(caught.exception.code, 503)
+                self.assertEqual(json.load(caught.exception)["error_code"], "update_in_progress")
+                caught.exception.close()
+                clone.assert_not_called()
+        self.assertEqual(self.runtime.config()["schedule"]["light_minutes"], before)
+        self.assertEqual(self.runtime.store.query("SELECT * FROM projects"), [])
+
+    def test_restored_session_imports_project_and_saves_settings_on_the_same_server(self):
+        self.runtime.updates.restore_startup()
+        headers = {**self.headers(), "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+                   "Content-Type": "application/json"}
+        with tempfile.TemporaryDirectory() as temp:
+            source = fixture(Path(temp) / "source")
+            def clone(argv, **kwargs):
+                destination = argv[4]
+                checked(["git", "clone", "--quiet", str(source), destination])
+                git(destination, "remote", "set-url", "origin", "https://github.com/example/project.git")
+                return ""
+            with patch("adaptive_rsi.runtime.checked", side_effect=clone):
+                request = urllib.request.Request(self.server.origin + "/api/projects/import",
+                    json.dumps({"url": "https://github.com/example/project", "directory": str(Path(temp) / "managed")}).encode(), headers)
+                with urllib.request.urlopen(request) as response:
+                    project = json.load(response)["id"]
+            request = urllib.request.Request(self.server.origin + "/api/config",
+                json.dumps({"project": project, "values": {"schedule": {"light_minutes": 240, "weight": 3}}}).encode(), headers)
+            with urllib.request.urlopen(request) as response:
+                result = json.load(response)
+                self.assertTrue(result["saved"])
+                self.assertEqual(result["config"]["schedule"]["weight"], 3)
+            with urllib.request.urlopen(urllib.request.Request(self.server.origin + "/api/health", headers=self.headers())) as response:
+                self.assertEqual(json.load(response)["pid"], os.getpid())
+            self.assertEqual(self.runtime.config(project)["schedule"]["weight"], 3)
+            self.assertEqual(self.runtime.config(project)["schedule"]["light_minutes"], 240)
+            self.assertTrue(self.runtime.project(project)["paused"])
+
     def test_loopback_startup_does_not_depend_on_reverse_dns(self):
         with patch("socket.getfqdn", side_effect=OSError("reverse DNS unavailable")):
             server = Server(self.runtime)

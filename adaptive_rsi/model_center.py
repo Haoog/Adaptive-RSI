@@ -141,7 +141,7 @@ class ModelCenter:
 
     def fetch(self, provider_id, project=None):
         with self.runtime.dispatch_lock:
-            if self.runtime.updates.installing:
+            if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
         provider = self.provider(provider_id, project)
         signature = self.signature(provider)
@@ -151,13 +151,13 @@ class ModelCenter:
             result = list_models(provider_id if provider["id"] in {p["id"] for p in BUILTINS} else provider, secret)
         except (CatalogError, CredentialError) as exc:
             with self.runtime.dispatch_lock, self.lock:
-                if not self.runtime.updates.installing:
+                if not self.runtime.updates.is_busy():
                     previous = self.directory(provider, project)
                     previous.update(error=exc.code, attempted=time.time())
                     self.store.put_setting(key, previous)
             raise
         with self.runtime.dispatch_lock, self.lock:
-            if self.runtime.updates.installing:
+            if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
             if self.signature(self.provider(provider_id, project)) != signature:
                 raise CenterError("connection_changed")
@@ -237,7 +237,7 @@ class ModelCenter:
         config["limits"]["run_calls"] = 1
         run = "model-test-" + uid()
         with self.runtime.dispatch_lock:
-            if self.runtime.updates.installing:
+            if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
             self.busy += 1
         try:

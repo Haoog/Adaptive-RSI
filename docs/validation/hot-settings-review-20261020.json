@@ -1,0 +1,88 @@
+{
+  "date": "2026-10-20",
+  "branch": "fix/live-settings-unlock",
+  "value": {
+    "decision": "implement",
+    "reason": "修复用户实际遇到的项目导入误锁，消除配置保存后的重启要求并保护填写内容。"
+  },
+  "reviewer": {
+    "model": "gpt-6.1-sol",
+    "effort": "high",
+    "permissions": "read-only"
+  },
+  "review": {
+    "decision": "pass",
+    "reason": "No introduced blockers found. Previously closed findings remain closed. Review completed read-only.",
+    "assessments": [
+      {
+        "area": "correctness",
+        "decision": "pass",
+        "reason": "Current code preserves upgrade gating, original retry payloads, acknowledged settings baselines, newer drafts, and active-run configuration snapshots."
+      },
+      {
+        "area": "security",
+        "decision": "pass",
+        "reason": "Authentication, Origin/CSRF checks, credential boundaries, and project authorization remain intact. Ambiguous write failures are not automatically replayed."
+      },
+      {
+        "area": "maintainability",
+        "decision": "pass",
+        "reason": "Shared update-readiness checks and request handling are coherent; translations, documentation, and CI checks accompany the changes."
+      },
+      {
+        "area": "architecture",
+        "decision": "pass",
+        "reason": "Restart-session restoration is separated from upgrade installation; unlocking requires the committed matching-version installation result."
+      },
+      {
+        "area": "tests",
+        "decision": "pass",
+        "reason": "Observed saved backend output contains 117 passing tests and final OK. Direct regression inspection covers restored-session writes, upgrade/rollback recovery, rejection before mutation, frozen configuration, payload preservation, and draft-20 baseline handling. Independently ran all 8 Node tests and three JS syntax checks successfully. Package integrity and SHA-256 passed; 45 packaged source/test/script/manifest files match current files. Limits: Python was not rerun here; Node tests use a simulated DOM, and browser-verification assertions were not relied upon."
+      },
+      {
+        "area": "scope",
+        "decision": "pass",
+        "reason": "Changes remain focused on hot settings, upgrade recovery, draft preservation, and supporting regression checks and bilingual documentation."
+      }
+    ],
+    "findings": [],
+    "reported_decision": "pass",
+    "blocking_threshold": "medium"
+  },
+  "host_verification": {
+    "python": {
+      "version": "3.12.13",
+      "command": "python -m unittest discover -v",
+      "passed": 117
+    },
+    "frontend": {
+      "command": "node --test tests/web_requests.cjs",
+      "passed": 8
+    },
+    "syntax": [
+      "Python compileall",
+      "app.js",
+      "i18n.js",
+      "model-center.js"
+    ],
+    "builds": [
+      "wheel",
+      "plugin ZIP"
+    ],
+    "browser": {
+      "fixtures": "local Git clone and HTTP model directory; no remote repository created",
+      "checks": [
+        "two separate paused project imports",
+        "settings saved within the same process",
+        "provider session key and directory immediately available",
+        "explicit update rejection retries original payload",
+        "acknowledged baseline permits restoring original value",
+        "new drafts survive delayed acknowledgement refresh",
+        "version changes retain page",
+        "ambiguous write failure is not replayed",
+        "Chinese and English",
+        "390px English layout without horizontal overflow"
+      ]
+    }
+  }
+}

@@ -23,6 +23,10 @@ REPOSITORY = "Haoog/Adaptive-RSI"
 RELEASE_API = "https://api.github.com/repos/" + REPOSITORY + "/releases/latest"
 
 
+class UpdateInProgress(RuntimeError):
+    code = "update_in_progress"
+
+
 def version(value):
     if not isinstance(value, str) or not re.fullmatch(r"v?\d+\.\d+\.\d+", value):
         raise ValueError("Only stable major.minor.patch releases are supported")
@@ -109,10 +113,37 @@ class UpdateManager:
         self.runtime, self.store = runtime, runtime.store
         self.lock = threading.Lock()
         self.installing = False
+        self.restart_target = None
         self.shutdown = None
 
     def status(self):
         return self.store.setting("update-status", {"state": "unchecked", "current": __version__})
+
+    def restore_startup(self):
+        status = self.status()
+        # 恢复登录会话不代表正在升级；仅新版本等待监督进程确认安装。
+        if status.get("state") == "restarting" and status.get("version") == __version__:
+            self.restart_target = __version__
+            self.installing = True
+
+    def is_busy(self):
+        if self.restart_target:
+            with self.runtime.dispatch_lock:
+                status = self.status()
+                if status.get("state") == "installed" and status.get("current") == self.restart_target:
+                    self.installing = False
+                    self.restart_target = None
+        if not self.installing:
+            (self.store.root / "update-ready").unlink(missing_ok=True)
+        return self.installing
+
+    def snapshot(self):
+        busy = self.is_busy()
+        return {**self.status(), "busy": busy}
+
+    def require_ready(self):
+        if self.is_busy():
+            raise UpdateInProgress("Software update in progress")
 
     def tick(self):
         config = self.runtime.config()["updates"]

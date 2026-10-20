@@ -1,6 +1,14 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+  "后台已更新，当前输入已保留。刷新页面可加载新版界面。": "The service has updated and your input is retained. Refresh to load the new interface.",
+  "已保存提交的配置，后续修改仍未保存。": "Submitted settings are saved; your later edits are still unsaved.",
+  "服务正在完成更新，表单已保留，恢复后自动提交。": "The service is finishing an update. Your form is retained and will submit automatically when ready.",
+  "更新尚未完成，已保留输入；请稍后再提交。": "The update is still in progress. Your input is retained; please submit again later.",
+  "已保存，无需重启；新任务使用新配置": "Saved without restart; new tasks use the updated settings",
+  "项目接入和配置保存后即可使用，无需重启。各项目的任务、记忆、配置和预算独立，PR 交付由项目授权控制。": "Projects and settings are available as soon as they are saved, without restart. Tasks, memory, settings and budgets stay separate; project authorization controls PR delivery.",
+  "请填写密钥；环境变量不可用时，可改用钥匙串或会话密钥。": "Enter an API key. If the environment variable is unavailable, use Keychain or a session key.",
+
   "交付跟踪与复查": "Delivery tracking and verification",
   "暂缓任务复核": "Deferred task reassessment",
   "未经验证的外部合并": "Unverified external merge",

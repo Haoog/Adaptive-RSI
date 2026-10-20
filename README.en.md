@@ -139,6 +139,8 @@ python3 scripts/rsi doctor
 
 In **Add project**, choose a local Git repository or **GitHub URLs**, one repository per line. GitHub import uses your authenticated `gh`, clones separately and starts paused. Local repositories need an existing commit. Review settings, then enable each project. No initial goal is required.
 
+Project registration, providers and keys, model roles, inspection intervals, budgets and delivery settings take effect when saved, without a service restart. Active tasks retain their sealed configuration; new tasks use the updated settings. Installing a new runtime version restarts the service in the background. Forms retain their input and wait up to two minutes through an installation window before submitting. A connection failure after submission is never retried automatically, avoiding duplicate operations.
+
 The dashboard defaults to Chinese. Select **English** in the top bar; the browser remembers the choice. Task content, model output, raw logs, and evidence retain their original language. CLI commands and configuration keys remain English.
 
 State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_HOME` or `--state-dir`. Keep state outside managed project trees. The dashboard listens only on `127.0.0.1`. Its login URL contains a local session token: do not share it. Reopen with `python3 scripts/rsi open`.

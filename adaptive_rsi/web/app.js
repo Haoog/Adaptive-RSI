@@ -7,16 +7,42 @@ const statusNames = {unverified_merge:'未经验证的外部合并',reverted:'�
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量巡检',system_deep:'深度巡检',system_issues:'Issues 同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 巡检',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
+const formRevisions=new WeakMap();
+function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
+for(const type of ['input','change','reset'])document.addEventListener(type,event=>reviseForm(event.target.closest('form')),true);
+document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')reviseForm(event.target.querySelector('form'));},true);
+function unchangedForm(form){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&projectId===project;}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
 function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').hidden=true,6500); }
-async function api(path,body){ const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-RSI-CSRF':state.csrf},body:JSON.stringify(body)}; const response=await fetch('/api/'+path,options); const data=await response.json(); if(!response.ok){const error=Error(data.error||response.status);error.code=data.catalog_error;throw error;} return data; }
+async function sendApi(path,body){
+ const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-RSI-CSRF':state.csrf},body:JSON.stringify(body)};
+ const response=await fetch('/api/'+path,options),data=await response.json();
+ if(!response.ok){const error=Error(data.error||response.status);error.code=data.error_code||data.catalog_error;throw error;}
+ return data;
+}
+async function api(path,body){
+ const payload=body===undefined?undefined:structuredClone(body);
+ try{return await sendApi(path,payload);}catch(error){if(payload===undefined||error.code!=='update_in_progress')throw error;}
+ toast(t('服务正在完成更新，表单已保留，恢复后自动提交。'));
+ const deadline=Date.now()+120000;
+ while(Date.now()<deadline){
+  await new Promise(resolve=>setTimeout(resolve,1000));
+  let next;
+  try{next=await sendApi('state');}catch(error){if(error instanceof TypeError)continue;throw error;}
+  if(next.update?.busy??['downloading','restarting'].includes(next.update?.state))continue;
+  state=next;
+  // 只重试服务明确拒绝执行的请求；提交后断线时不重复操作。
+  try{return await sendApi(path,payload);}catch(error){if(error.code!=='update_in_progress')throw error;}
+ }
+ throw Error(t('更新尚未完成，已保留输入；请稍后再提交。'));
+}
 function currentProject(){return state.projects.find(p=>p.id===projectId);}
 function scoped(rows){return rows.filter(row=>row.project===projectId);}
 function stamp(seconds){return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
 async function safe(fn){try{await fn();}catch(error){toast(error.message,true);}}
-async function refresh(){const next=await api('state');if(state&&state.version!==next.version){location.reload();return;}state=next; $('connection').textContent=t('已连接'); $('version').textContent='Adaptive RSI '+state.version;
+async function refresh(){const next=await api('state');if(state&&state.version!==next.version)toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));state=next; $('connection').textContent=t('已连接'); $('version').textContent='Adaptive RSI '+state.version;
  const select=$('project-select'); const old=projectId; if(!state.projects.some(p=>p.id===projectId))projectId=state.projects[0]?.id||'';
  if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,p.name]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',p.name);o.value=p.id;return o;})); if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
  select.value=projectId; if(old!==projectId){settingsBaseline=null;localStorage.setItem('rsi-project',projectId);}
@@ -102,33 +128,38 @@ for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});
 $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
+ const unchanged=unchangedForm(event.target);
  $('project-submit').disabled=true;
  try{
+  let addedProject;
   if($('project-source').value==='github'){
-   const urls=$('project-urls').value.split(/\s+/).filter(Boolean);if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
+   const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
    const failed=[];
    for(let i=0;i<urls.length;i++){
     $('import-status').textContent=t('正在导入')+' '+(i+1)+' / '+urls.length;
-    try{const added=await api('projects/import',{url:urls[i],directory:$('project-directory').value||null});projectId=added.id;}catch(error){failed.push(urls[i]+': '+error.message);}
+    try{const added=await api('projects/import',{url:urls[i],directory});addedProject=added.id;}catch(error){failed.push(urls[i]+': '+error.message);}
    }
-   settingsBaseline=null;await refresh();
-   if(failed.length){$('import-status').textContent=failed.join('\n');return;}
-  }else{const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});projectId=added.id;settingsBaseline=null;await refresh();}
-  $('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';toast(t('项目已接入'));
+   if(failed.length){if(unchanged())$('import-status').textContent=failed.join('\n');await refresh();return;}
+  }else{const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;}
+  if(unchanged()){projectId=addedProject;settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
+  await refresh();toast(t('项目已接入'));
  }finally{$('project-submit').disabled=false;}
 });});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
-$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));await api('goal',{project:projectId,text:$('goal-text').value});$('goal-text').value='';await refresh();toast(currentProject().paused?t('目标已入队；启用项目后执行'):t('目标已加入任务池'));});});
+$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target),project=projectId;await api('goal',{project,text:$('goal-text').value});if(unchanged())$('goal-text').value='';await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务池'));});});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',renderTasks);$('config-scope').addEventListener('change',renderSettings);
-$('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=node.type==='checkbox'?node.checked:node.type==='number'?Number(node.value):node.value;if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});
+$('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));const unchanged=unchangedForm(event.target),baseline=settingsBaseline,scope=$('config-scope').value,project=projectId;let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=node.type==='checkbox'?node.checked:node.type==='number'?Number(node.value):node.value;if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});
  const hours=[Number($('work-start').value),Number($('work-end').value)];if(JSON.stringify(hours)!==JSON.stringify(settingsBaseline.schedule.working_hours))setPath(patch,'schedule.working_hours',hours);
  const labels=$('issue-labels').value.split(',').map(x=>x.trim()).filter(Boolean);if(JSON.stringify(labels)!==JSON.stringify(settingsBaseline.github.labels))setPath(patch,'github.labels',labels);
  const checks=JSON.parse($('checks-json').value);if(JSON.stringify(checks)!==JSON.stringify(settingsBaseline.checks))patch.checks=checks;
- patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));await api('config',{project:$('config-scope').value==='project'?projectId:null,values:patch});settingsBaseline=null;await refresh();toast(t('已保存，从下一轮生效'));});});
-$('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});$('case-form').reset();await refresh();toast(t('评估任务已导入'));});});
+ patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const saved=await api('config',{project:scope==='project'?project:null,values:patch}),acknowledged=saved.config||deepMerge(structuredClone(baseline),patch);
+ if(settingsBaseline===baseline&&projectId===project&&$('config-scope').value===scope)settingsBaseline=acknowledged;
+ await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings')renderSettings();
+ toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));});});
+$('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));});});
 const updateNames={unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
-function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+update.reason:'');$('apply-update').disabled=!['available','waiting_idle'].includes(update.state);$('check-update').disabled=['downloading','restarting'].includes(update.state);}
+function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+update.reason:'');$('apply-update').disabled=!['available','waiting_idle'].includes(update.state);$('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);}
 $('check-update').addEventListener('click',()=>safe(async()=>{await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!confirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？')))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);setInterval(()=>refresh().catch(error=>{$('connection').textContent=t('连接中断');}),5000);

@@ -21,6 +21,7 @@ from .telemetry import quality_summary
 from .config import compatibility
 from .gitops import git
 from .evolution import Evolution
+from .updates import UpdateInProgress
 
 
 class Server(ThreadingHTTPServer):
@@ -129,7 +130,7 @@ class Handler(BaseHTTPRequestHandler):
                     candidate["trial_count"] = len(evidence.get("trials", []))
                     candidate["monitor"] = evidence.get("monitor", {})
                 self.respond({"version": __version__, "csrf": self.server.csrf, "projects": projects, "tasks": tasks,
-                              "runs": runs, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.status(),
+                              "runs": runs, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.snapshot(),
                               "events": store.query("SELECT * FROM events ORDER BY seq DESC LIMIT 100"),
                               "schedules": store.query("SELECT * FROM schedules"),
                               "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
@@ -197,8 +198,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = center.probe(body.get("provider"), body.get("model"), body.get("effort", "default"), project)
                 else:
                     with runtime.dispatch_lock:
-                        if runtime.updates.installing:
-                            raise CenterError("update_in_progress")
+                        runtime.updates.require_ready()
                         if path == "/api/model-center/provider":
                             result = center.save_provider(body.get("provider"), body.get("authentication", {}), project)
                         elif path == "/api/model-center/remove":
@@ -222,8 +222,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
-                if runtime.updates.installing:
-                    raise ValueError("Software update in progress; wait for restart to complete")
+                runtime.updates.require_ready()
                 if path == "/api/projects":
                     result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
                 elif path == "/api/projects/import":
@@ -238,7 +237,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"started": True}
                 elif path == "/api/config":
                     runtime.configure(body["values"], body.get("project"))
-                    result = {"saved": True}
+                    result = {"saved": True, "config": runtime.config(body.get("project"))}
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
                 elif path == "/api/request":
@@ -265,6 +264,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond({"error": "Not found"}, 404)
                     return
                 self.respond(result)
+        except UpdateInProgress as exc:
+            self.respond({"error": str(exc), "error_code": exc.code}, 503)
         except (CenterError, CredentialError, CatalogError) as exc:
             self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
         except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
