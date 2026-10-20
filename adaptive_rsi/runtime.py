@@ -407,6 +407,8 @@ class Runtime:
                     plan["decision"] = "deferred"
                     plan["reason"] = "Value gate held: insufficient evidence or disproportionate effort. " + plan["reason"]
             (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
+            self.store.transition(run["id"], "planning", {"value": plan.get("value"), "scope": plan.get("scope", []),
+                                  "plan_reason": plan.get("reason", ""), "plan_decision": plan["decision"]})
             if plan["decision"] != "ready":
                 self.store.transition(run["id"], plan["decision"], {"reason": plan["reason"], "value": plan.get("value"), "base": base,
                     "triage_input": fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})}, True)
@@ -453,7 +455,7 @@ class Runtime:
             evaluation = self.evaluator.evaluate(baseline, workspace, checks, directory / "evaluation", config,
                                                  lambda: self.is_cancelled(run), seeds=seeds)
             if evaluation["decision"] != "pass":
-                self.finish_failure(run, task, evaluation, config)
+                self.finish_failure(run, task, {**evaluation, "evaluation": evaluation}, config)
                 return
             self.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
                                    "compatibility": compatibility(config), "at": time.time()})

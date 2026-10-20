@@ -10,11 +10,18 @@ from pathlib import Path
 from .agent import SCHEMAS, TEXT, object_schema, validate_output
 from .config import relative_path
 from .credentials import Credentials
+from .provider_health import error_code
 from .process import Cancelled, Sandbox, scrub_tree
 
 
 class ProviderUnavailable(RuntimeError):
     pass
+
+
+class ProviderInterrupted(RuntimeError):
+    def __init__(self, cause):
+        self.code = error_code(cause)
+        super().__init__("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -295,10 +302,10 @@ class NativeAgent:
                     results.append((call_id, name, value))
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
-            except ProviderUnavailable:
+            except ProviderUnavailable as exc:
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
                 if tools.changed:
-                    raise RuntimeError("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations") from None
+                    raise ProviderInterrupted(exc) from None
                 raise
             except Exception:
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))

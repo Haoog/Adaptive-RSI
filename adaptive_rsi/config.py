@@ -4,6 +4,12 @@ import re
 from urllib.parse import urlsplit
 
 
+BUILTIN_PROVIDERS = [
+    {"id": "openai", "name": "Codex", "protocol": "codex_login", "base_url": "", "env_key": ""},
+    {"id": "ollama", "name": "Ollama", "protocol": "ollama", "base_url": "http://127.0.0.1:11434", "env_key": ""},
+    {"id": "lmstudio", "name": "LM Studio", "protocol": "chat_completions", "base_url": "http://127.0.0.1:1234/v1", "env_key": ""},
+]
+
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
     "schedule": {"light_minutes": 120, "issues_minutes": 60, "deep_minutes": 4320,

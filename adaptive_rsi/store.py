@@ -63,6 +63,8 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                 db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
+            if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+                db.execute("ALTER TABLE calls ADD COLUMN unit_price REAL")
             # Earlier versions exposed automatic delivery. Upgrades always revoke it.
             for row in db.execute("SELECT id,config FROM projects").fetchall():
                 config = json.loads(row["config"])
@@ -152,6 +154,8 @@ class Store:
             row = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
             if not row or row["ended"] is not None:
                 return False
+            previous = json.loads(row["result"])
+            result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
             db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
@@ -171,6 +175,16 @@ class Store:
         now = time.time()
         zone = ZoneInfo(config["schedule"]["timezone"])
         midnight = datetime.datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        from .config import BUILTIN_PROVIDERS, fingerprint
+        provider_id = route.get("provider", "openai")
+        provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
+        provider = provider or next((p for p in BUILTIN_PROVIDERS if p["id"] == provider_id), {"id": provider_id})
+        signature = fingerprint({k: v for k, v in provider.items() if k != "name"})
+        prefix = "model-center:"
+        directory = self.setting(prefix + str(project) + ":" + provider_id + ":" + signature)
+        if directory is None:
+            directory = self.setting(prefix + "global:" + provider_id + ":" + signature, {})
+        price = next((m.get("unit_price") for m in directory.get("models", []) if m["id"] == route["model"]), None)
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             used = db.execute("SELECT count(*) FROM calls WHERE project=? AND created>=?", (project, midnight)).fetchone()[0]
@@ -178,7 +192,7 @@ class Store:
             if used >= config["limits"]["daily_calls"] or run_used >= config["limits"]["run_calls"]:
                 raise RuntimeError("Model call budget exhausted")
             call = uid()
-            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider) VALUES (?,?,?,?,?,?,?,?,?)",
-                       (call, project, run, role, route["model"], route["effort"], "reserved", now, route.get("provider", "openai")))
+            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (call, project, run, role, route["model"], route["effort"], "reserved", now, provider_id, price))
             db.execute("UPDATE runs SET calls=calls+1 WHERE id=?", (run,))
         return call

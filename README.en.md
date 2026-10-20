@@ -87,6 +87,14 @@ The default Codex route reads [App Server `model/list`](https://developers.opena
 
 Fetching a directory starts no inference task and consumes no model-call budget. **Test** explicitly runs a basic tool-call and structured-output check. Its dialog explains possible charges; calls count toward the current project or global test scope's daily limit and record actual tokens. No project code is sent; software updates wait for tests to finish. Credentials, directory and test states are distinct. **Passing this check does not establish real project capability or support for other effort settings.**
 
+Model lists support favorites, enabled-only filtering, search and 20 entries per page; role pickers also filter by provider. Advanced parameters provide visual fallback provider/model/effort controls, and role drafts can be discarded. Each role shows draft inheritance, fallback routing and the tool-test status for its exact effort.
+
+Tool-test outcomes are retained per effort with timestamps. Failure invalidates only that effort's old pass proof. Authentication, rate limits, connection errors, missing models and tool-format failures have distinct diagnostics. Three consecutive authentication/rate-limit/connection failures pause further inference for that project and connection version, including across restarts. Check the connection and explicitly resume it in Model Center. Budgets, code checks and tool-format failures do not count as provider outages. Directory requests remain available for diagnosis. Connection changes start separate health records. Explicit fallbacks retain workspace and delivery protections.
+
+Optional blended USD prices per million total tokens are frozen on each call. Blank means unknown; later price edits do not alter history. Estimates do not separate input/output/cache rates, establish a hard monetary limit, or represent invoices; missing provider usage can understate costs. The overview separates 24-hour calls, tokens, duration, failures and estimates, showing unpriced calls. Without a project it shows global model-test usage.
+
+Task cards expose planned benefit, cost, evidence and scope, retained through execution. Thirty-day quality indicators use runs with acceptance evidence, reviewed runs and repeatedly failing tasks; system inspections are excluded from code-task successes. These statistics do not establish improved capabilities. See [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md) for live validation.
+
 ```json
 {
   "providers": [{"id":"gateway","name":"My model gateway","protocol":"chat_completions","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],

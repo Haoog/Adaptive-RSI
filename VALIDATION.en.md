@@ -1,4 +1,4 @@
-# Local validation / 2026-10-19
+# Local validation / 2026-10-20
 
 [简体中文](VALIDATION.md) | **English**
 
@@ -6,7 +6,7 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 
 ## Executed checks
 
-- `python3 -m unittest discover -v`: **75 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
+- `python3 -m unittest discover -v`: **83 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
 - `node --check adaptive_rsi/web/app.js`, `node --check adaptive_rsi/web/i18n.js`, `node --check adaptive_rsi/web/model-center.js`, and Python byte-compilation passed.
 - Both bundled skills passed the system skill-creator validator. The validator's PyYAML dependency was supplied in an isolated uv environment; the runtime has no third-party Python dependencies.
 - The runtime wheel and local plugin ZIP were built. The plugin archive excludes state, sessions, auth data, build caches and browser logs.
@@ -15,6 +15,14 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 - Bilingual checks confirmed that switching language preserves unsaved settings, saving persists changes, reloading remembers English, and the English task view retains Chinese goal text. At 390px width there was no horizontal overflow; the final page reported zero console errors or warnings.
 
 The new provider and review controls were checked in the in-app browser: provider registration, role routing, provider-default effort and review thresholds saved correctly. Switching languages preserved unsaved provider/model values; saved values survived a reload. At 1440 x 1100 and 390 x 844 there was no horizontal overflow or console error/warning. Temporary provider settings were removed and original model/threshold defaults restored. No real project was registered or enabled. Screenshot: `output/playwright/models-review-settings.png`.
+
+## Configuration, diagnostics and telemetry / 2026-10-20
+
+- Eight new behavioral tests cover atomic consecutive-outage accounting, restart persistence and project isolation, no network/budget reservation while paused, explicit resume and fallback, no fallback after workspace edits, effort-specific probes, frozen prices and refresh preferences, retained planning evidence and quality statistics. The full 83-test suite passes; affected model-center and operability tests are repeated after final adjustments.
+- Tests blocked by budgets, missing credentials or paused connections retain earlier tool proofs. Actual tool-format failures invalidate only the matching effort. Pricing rejects negatives, booleans, NaN, Infinity and strings.
+- Playwright exercises favorites/filters/paging, provider filtering, visual fallbacks, discard/save/reload, bilingual draft preservation, pricing, tool tests, repeated rate limits and pause/resume, project usage/estimates, and task evidence through a real isolated HTTP fixture. Chinese and English overview/task/model pages have no horizontal overflow at 320px; desktop is 1440 x 1100. Expected HTTP 400 responses occur during rate-limit/pause tests, with no JavaScript exceptions. Screenshots: `output/playwright/operability-*.png`.
+- English overview grid minimums are corrected for narrow screens. Cost estimates use user-supplied blended rates and cannot establish actual billing with missing rates or usage. Pass-rate denominators are evaluated runs; review-block denominators are reviewed runs. System inspections are excluded from code-task quality.
+- New bilingual live-validation procedures are in `LIVE_VALIDATION.md` / `LIVE_VALIDATION.en.md`. No real paid model, GitHub push or PR is performed. The actual local service retains its original session; all test projects and settings use isolated state.
 
 ## Model center redesign validation
 

@@ -11,16 +11,12 @@ from pathlib import Path
 
 from .agent import CodexAgent
 from .catalog import CatalogError, list_models
-from .config import fingerprint, merge, validate
+from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
 from .store import encode, uid
+from .provider_health import ProviderHealth, error_code
 
 
-BUILTINS = [
-    {"id": "openai", "name": "Codex", "protocol": "codex_login", "base_url": "", "env_key": ""},
-    {"id": "ollama", "name": "Ollama", "protocol": "ollama", "base_url": "http://127.0.0.1:11434", "env_key": ""},
-    {"id": "lmstudio", "name": "LM Studio", "protocol": "chat_completions", "base_url": "http://127.0.0.1:1234/v1", "env_key": ""},
-]
 NON_AGENT = {"embedding", "embeddings", "image", "audio", "rerank"}
 
 
@@ -73,7 +69,8 @@ class ModelCenter:
                         known.add(item["model"])
             builtin = provider["id"] in {p["id"] for p in BUILTINS}
             items.append({**provider, "builtin": builtin, "credential_status": "login" if provider["id"] == "openai"
-                          else self.credentials.status(provider), "catalog": directory})
+                          else self.credentials.status(provider), "catalog": directory,
+                          "health": ProviderHealth(self.store).status(config, provider["id"], project or "model-center")})
         override = self.store.one("SELECT config FROM projects WHERE id=?", (project,)) if project else None
         return {"providers": items, "models": config["models"], "overrides": json.loads(override["config"]).get("models", {}) if override else {},
                 "keychain": platform.system() == "Darwin", "project": project,
@@ -123,7 +120,7 @@ class ModelCenter:
             raise
         if old and self.signature(old) != self.signature(provider):
             previous = self.directory(old, project)
-            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "enabled", "manual"]}
+            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "enabled", "manual", "favorite", "unit_price"]}
                            for model in previous["models"]]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
@@ -170,18 +167,22 @@ class ModelCenter:
             for model in result["models"]:
                 old = before.pop(model["id"], {})
                 models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT), "manual": False, "missing": False,
-                               **({"verified": old["verified"]} if old.get("verified") else {})})
+                               **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price"] if k in old}})
             models.extend({**model, "missing": not model.get("manual", False)} for model in before.values())
             directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"]}
             self.store.put_setting(key, directory)
         return directory
 
     def edit_model(self, provider_id, data, project=None):
-        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
+        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual", "favorite", "unit_price"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
             raise CenterError("invalid_model")
         if "enabled" in data and type(data["enabled"]) is not bool or "manual" in data and type(data["manual"]) is not bool:
             raise CenterError("invalid_model")
         if "name" in data and (not isinstance(data["name"], str) or not 1 <= len(data["name"].strip()) <= 160):
+            raise CenterError("invalid_model")
+        if "favorite" in data and type(data["favorite"]) is not bool:
+            raise CenterError("invalid_model")
+        if "unit_price" in data and data["unit_price"] is not None and (type(data["unit_price"]) not in [int, float] or not 0 <= data["unit_price"] <= 1000000):
             raise CenterError("invalid_model")
         with self.lock:
             provider = self.provider(provider_id, project)
@@ -194,8 +195,14 @@ class ModelCenter:
                 directory["models"].append(model)
             if model.get("kind") in NON_AGENT and data.get("enabled"):
                 raise CenterError("unsupported_model_kind")
-            model.update({k: v for k, v in data.items() if k in ["name", "enabled"]})
+            model.update({k: v for k, v in data.items() if k in ["name", "enabled", "favorite", "unit_price"]})
             self.store.put_setting(self.key(provider, project), directory)
+        return {"saved": True}
+
+    def resume_provider(self, provider_id, project=None):
+        self.provider(provider_id, project)
+        ProviderHealth(self.store).reset(self.runtime.config(project), provider_id, project or "model-center")
+        self.store.event("provider_resumed", "Provider resumed by user", project, data={"provider": provider_id})
         return {"saved": True}
 
     def save_routes(self, routes, project=None):
@@ -252,15 +259,26 @@ class ModelCenter:
                 directory = self.directory(provider, project)
                 model = next(m for m in directory["models"] if m["id"] == model_id)
                 model["verified"] = {"at": time.time(), "effort": effort, "kind": "structured_tool"}
+                model.pop("last_attempt", None)
+                model.setdefault("probes", {})[effort] = {**model["verified"], "state": "pass"}
                 self.store.put_setting(self.key(provider, project), directory)
             return {"verified": model["verified"], "calls": self.store.query("SELECT state,tokens,seconds FROM calls WHERE run=?", (run,))}
-        except CenterError:
-            raise
-        except CredentialError:
-            raise
         except Exception as exc:
-            reason = str(exc)
-            code = "budget_exhausted" if "budget exhausted" in reason else "auth" if "HTTP 401" in reason or "HTTP 403" in reason else "default_effort_required" if "requires effort=default" in reason else "probe_failed"
+            code = "default_effort_required" if "requires effort=default" in str(exc) else error_code(exc)
+            with self.runtime.dispatch_lock, self.lock:
+                if self.signature(self.provider(provider_id, project)) == signature:
+                    self.edit_model(provider_id, {"id": model_id}, project)
+                    directory = self.directory(provider, project)
+                    model = next(m for m in directory["models"] if m["id"] == model_id)
+                    proof = {"at": time.time(), "effort": effort, "state": "fail", "code": code}
+                    if code in ["budget_exhausted", "provider_paused", "missing_key", "keychain_locked", "keychain_unavailable", "keychain_failed", "default_effort_required"]:
+                        model["last_attempt"] = proof
+                    else:
+                        model.pop("last_attempt", None)
+                        model.setdefault("probes", {})[effort] = proof
+                        if model.get("verified", {}).get("effort") == effort:
+                            model.pop("verified", None)
+                    self.store.put_setting(self.key(provider, project), directory)
             raise CenterError(code) from None
         finally:
             with self.runtime.dispatch_lock:

@@ -16,6 +16,7 @@ from .adapters import detect
 from .catalog import CatalogError, list_models
 from .credentials import CredentialError
 from .model_center import CenterError
+from .telemetry import quality_summary
 from .config import compatibility
 from .gitops import git
 from .evolution import Evolution
@@ -107,6 +108,12 @@ class Handler(BaseHTTPRequestHandler):
                     row["summary"] = result.get("summary", "")
                     row["reason"] = result.get("reason", "")
                     row["pr"] = result.get("pr")
+                    row["value"] = result.get("value")
+                    row["plan_reason"] = result.get("plan_reason", "")
+                    row["plan_decision"] = result.get("plan_decision")
+                    row["scope"] = result.get("scope", result.get("files", []))
+                    row["review_decision"] = result.get("review", {}).get("decision")
+                    row["evaluation_decision"] = result.get("evaluation", {}).get("decision")
                 candidates = store.query("SELECT * FROM candidates ORDER BY created DESC LIMIT 100")
                 for candidate in candidates:
                     evidence = json.loads(candidate.pop("evidence"))
@@ -119,7 +126,9 @@ class Handler(BaseHTTPRequestHandler):
                               "events": store.query("SELECT * FROM events ORDER BY seq DESC LIMIT 100"),
                               "schedules": store.query("SELECT * FROM schedules"),
                               "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
-                              "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,))})
+                              "quality": quality_summary(store),
+                              "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
+                              "model_usage": store.query("SELECT project,provider,model,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model", (time.time() - 86400,))})
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
                 data = detect(project["path"])
@@ -191,6 +200,8 @@ class Handler(BaseHTTPRequestHandler):
                             result = center.edit_model(body.get("provider"), body.get("model"), project)
                         elif path == "/api/model-center/routes":
                             result = center.save_routes(body.get("models"), project)
+                        elif path == "/api/model-center/resume":
+                            result = center.resume_provider(body.get("provider"), project)
                         else:
                             self.respond({"error": "Not found"}, 404)
                             return

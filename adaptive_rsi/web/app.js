@@ -24,14 +24,31 @@ function render(){const project=currentProject(), tasks=scoped(state.tasks), run
  $('project-status').className='badge '+(project&&!project.paused?'good':'neutral');
  const queue=tasks.filter(t=>t.state==='queued').length; $('stat-queue').textContent=String(queue).padStart(2,'0'); $('queue-count').textContent=queue;
  $('stat-active').textContent=String(runs.filter(r=>!r.ended).length).padStart(2,'0'); $('stat-pass').textContent=String(tasks.filter(t=>['awaiting_approval','pr_open'].includes(t.state)).length).padStart(2,'0');
- const usage=state.usage.find(u=>u.project===projectId); $('stat-calls').textContent=String(usage?.calls||0).padStart(2,'0'); $('stat-tokens').textContent=(usage?.tokens||0).toLocaleString()+t(' tokens · 实际记录');
+ const usage=state.usage.find(u=>u.project===(projectId||'model-center')); $('stat-calls').textContent=String(usage?.calls||0).padStart(2,'0'); $('stat-tokens').textContent=(usage?.tokens||0).toLocaleString()+t(' tokens · 实际记录');
  const config=project?.config||state.config;
  for(const kind of ['light','issues','deep']){const mins=config.schedule[kind+'_minutes']; let number=mins,unit=t('分钟');if(mins%1440===0){number=mins/1440;unit=t('天');}else if(mins%60===0){number=mins/60;unit=t('小时');} if(language==='en'&&number===1)unit={minutes:'minute',hours:'hour',days:'day'}[unit]; const node=$(kind+'-interval');node.replaceChildren(document.createTextNode(number+' '),el('small',unit+t(' / 次')));
   const schedule=state.schedules.find(s=>s.project===projectId&&s.kind===kind); $(kind+'-due').textContent=!project?t('接入后开始'):project.paused?t('项目已暂停'):kind==='issues'&&!config.github.repository?t('未关联仓库'):schedule?t('下次 ')+stamp(schedule.due):t('等待首次检查');}
  document.querySelectorAll('[data-inspect]').forEach(b=>b.disabled=!project);
  const activity=$('activity');activity.replaceChildren();const events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,9);if(!events.length)activity.append(el('p',t('运行记录将在这里出现。每次调用、检查与决策都可追溯。'),'empty-copy'));
  for(const e of events){const row=el('div',undefined,'activity-row');row.append(el('time',stamp(e.created)),el('span',e.kind,'event-kind'),el('span',e.message));activity.append(row);}
- renderUpdate();if(view==='tasks')renderTasks(); if(view==='evolution')renderEvolution(); if(view==='settings'&&!settingsBaseline)renderSettings();}
+ renderTelemetry();renderUpdate();if(view==='tasks')renderTasks(); if(view==='evolution')renderEvolution(); if(view==='settings'&&!settingsBaseline)renderSettings();}
+function renderTelemetry(){
+ const summary=$('quality-summary');summary.replaceChildren();const quality=state.quality?.find(q=>q.project===projectId);
+ const rate=(n,d)=>d?Math.round(n/d*100)+'% ('+n+'/'+d+')':t('暂无样本');
+ for(const [label,value]of [['验收与评审通过率',rate(quality?.passed||0,quality?.evaluated||0)],['评审阻断率',rate(quality?.review_blocked||0,quality?.reviewed||0)],['重复失败任务',quality?.repeat_failures||0]]){const card=el('div');card.append(el('small',t(label)),el('strong',String(value)));summary.append(card);}
+ const usage=$('usage-summary');usage.replaceChildren();const usageScope=projectId||'model-center',rows=(state.model_usage||[]).filter(u=>u.project===usageScope);
+ const total=(state.usage||[]).find(u=>u.project===usageScope);usage.append(el('p',t('近 24 小时')+' · '+(total?.calls||0)+' '+t('次调用')+' · '+Math.round(total?.seconds||0)+'s · '+(total?.tokens||0)+' tokens'));
+ const estimate=total?.estimate==null?t('未知'):('$'+total.estimate.toFixed(4));usage.append(el('p',t('估算费用')+' · '+estimate+' USD · '+(total?.unpriced||0)+' '+t('次调用缺少价格'),'muted'));
+ usage.append(el('p',t('费用由用户单价估算，不代表账单或金额硬上限。调用按 Codex 会话或原生 HTTP 请求统计。'),'muted'));
+ if(rows.length){const table=el('table'),head=el('tr');for(const key of ['供应商 / 模型','调用','失败','耗时','估算费用'])head.append(el('th',t(key)));const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');for(const row of rows){const tr=el('tr');for(const value of [row.provider+' / '+row.model,row.calls,row.failed,Math.round(row.seconds)+'s',row.estimate==null?t('未知'):'$'+row.estimate.toFixed(4)+(row.unpriced?' *':'')])tr.append(el('td',String(value)));body.append(tr);}table.append(body);const wrap=el('div',undefined,'usage-table');wrap.append(table);usage.append(wrap);}
+}
+function valueReport(value,reason,scope){
+ const report=el('div',undefined,'value-report');if(reason)report.append(el('p',reason));
+ if(value){for(const [key,label]of [['benefit','预期收益'],['cost','预计成本'],['inaction','不做的影响']])if(value[key]){const row=el('p');row.append(el('strong',t(label)+' · '),document.createTextNode(value[key]));report.append(row);}
+ const levels=el('p',t('影响')+' '+t(reviewNames[value.impact]||value.impact)+' · '+t('工作量')+' '+t(reviewNames[value.effort]||value.effort)+' · '+t('信心')+' '+t(reviewNames[value.confidence]||value.confidence),'muted');report.append(levels);
+ if(value.evidence?.length){const details=el('details'),list=el('ul');details.append(el('summary',t('判断证据')));for(const item of value.evidence)list.append(el('li',item));details.append(list);report.append(details);}}
+ if(scope?.length)report.append(el('p',t('计划范围')+' · '+scope.join(', '),'muted'));return report;
+}
 function showView(name){view=name;document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===name));$('page-name').textContent={overview:t('运行总览'),tasks:t('任务与证据'),evolution:t('策略与记忆'),settings:t('运行设置'),models:t('模型中心')}[name];if(name==='settings'){settingsBaseline=null;renderSettings();}if(name==='models')window.RSIModelCenter?.show();render();window.scrollTo(0,0);}
 function renderTasks(){const list=$('tasks-list');list.replaceChildren();const filter=$('task-filter').value;
  const tasks=scoped(state.tasks).filter(t=>filter==='all'||(filter==='running'?['planning','executing','evaluating'].includes(t.state):filter==='blocked'?['blocked','failed','insufficient_evidence','interrupted'].includes(t.state):t.state===filter));
@@ -39,13 +56,14 @@ function renderTasks(){const list=$('tasks-list');list.replaceChildren();const f
  for(const task of tasks){const row=el('div',undefined,'task-row'),title=el('div');title.append(action(task.title,()=>showTask(task),'task-title'),el('span',stamp(task.updated)+' · '+task.id.slice(0,8),'task-meta'));const actions=el('div',undefined,'task-actions');
   if(['blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});toast(t('已重新排队'));await refresh();},''));
   if(['queued','planning','executing','evaluating'].includes(task.state))actions.append(action(t('取消'),async()=>{await api('cancel',{task:task.id});await refresh();},''));
+  const latest=scoped(state.runs).find(r=>r.task===task.id);if(latest&&(latest.value||latest.plan_reason))title.append(valueReport(latest.value,latest.plan_reason||latest.reason,latest.scope));
   row.append(el('span',t(sourceNames[task.source]||task.source),'source-tag'),title,badge(task.state),actions);list.append(row);}}
 let detailTask;
 async function showTask(task){detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));const description=el('p',task.body,'muted');body.append(description);
  const evidence=el('section',undefined,'detail-section');evidence.append(el('h3',t('来源与证据')),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
  for(const run of scoped(state.runs).filter(r=>r.task===task.id)){const data=await api('run?id='+run.id),section=el('section',undefined,'detail-section');section.append(el('h3',t('运行 ')+run.id+' · '+(t(statusNames[run.state]||run.state))),el('p',run.reason,'muted'));
-  section.append(el('pre',JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));
-  if(data.result.value){const report=el('div',undefined,'review-report');report.append(el('h3',t('任务价值评估')),el('pre',JSON.stringify(data.result.value,null,2)));section.append(report);}
+  const raw=el('details');raw.append(el('summary',t('原始运行记录')),el('pre',JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));section.append(raw);
+  if(data.result.value){const report=el('div',undefined,'review-report');report.append(el('h3',t('任务价值评估')),valueReport(data.result.value,data.result.plan_reason,data.result.scope));section.append(report);}
   if(data.result.review){
    const review=data.result.review,report=el('div',undefined,'review-report');report.append(el('h3',t('代码评审')),badge(review.decision),el('p',review.reason));
    for(const assessment of review.assessments||[]){const row=el('p');row.append(badge(assessment.decision),el('strong',' '+t(reviewNames[assessment.area]||assessment.area)+' · '),document.createTextNode(assessment.reason));report.append(row);}
