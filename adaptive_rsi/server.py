@@ -9,6 +9,7 @@ import time
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
@@ -25,6 +26,12 @@ from .evolution import Evolution
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self):
+        # 本地控制台不需要反向 DNS；解析阻塞不能拖住更新后的启动。
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
     def __init__(self, runtime, port=0, session=None):
         self.runtime = runtime

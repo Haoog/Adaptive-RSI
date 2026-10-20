@@ -581,6 +581,16 @@ class ServerTest(unittest.TestCase):
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
 
+    def test_loopback_startup_does_not_depend_on_reverse_dns(self):
+        with patch("socket.getfqdn", side_effect=OSError("reverse DNS unavailable")):
+            server = Server(self.runtime)
+        try:
+            self.assertEqual(server.server_name, "localhost")
+            self.assertGreater(server.server_port, 0)
+            self.assertEqual(server.origin, "http://127.0.0.1:" + str(server.server_port))
+        finally:
+            server.server_close()
+
     def test_local_api_requires_authentication_origin_and_csrf(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(self.server.origin + "/api/state")

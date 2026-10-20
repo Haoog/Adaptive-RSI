@@ -248,7 +248,7 @@ class UpdatesTest(unittest.TestCase):
                     children.append(child)
                     return child
                 try:
-                    with patch.dict(os.environ, {"RSI_TEST_RESTART_STATE": str(state), "PYTHONPROFILEIMPORTTIME": "1"}), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=spawn):
+                    with patch.dict(os.environ, {"RSI_TEST_RESTART_STATE": str(state)}), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=spawn):
                         supervise_restart(state)
                     expected = "0.2.1" if healthy else __version__
                     deadline = time.monotonic() + 10

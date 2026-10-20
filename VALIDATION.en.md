@@ -2,12 +2,13 @@
 
 [简体中文](VALIDATION.md) | **English**
 
-Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
+Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
 
 
 ## Autonomous delivery acceptance (current final result)
 
-- **111 tests passed** in the complete suite, including pause-control, pinned-target and stale-candidate regressions; JavaScript syntax, Python compilation, plugin ZIP and wheel builds passed.
+- **112 tests passed** in the complete suite, including pause-control, pinned-target, stale-candidate and reverse-DNS-independent startup regressions; JavaScript syntax, Python compilation, plugin ZIP and wheel builds passed.
+- Startup review also passed: the loopback listener skips unnecessary reverse DNS, and isolation tests use the current interpreter and verify that it actually runs.
 - The final targeted independent review passed with no remaining blockers; [review evidence](docs/validation/code-review-20261020.json). Additional fixes seal delivery targets, reject external merges into other branches, normalize historical scheduling credits, persist long failure reports and pin post-merge monitoring to its original branch.
 - Independent review found and prompted fixes for writable native Git metadata, lost merge metadata after feedback errors, local/remote deferred-baseline mismatch and PR retargeting. Regression checks cover real sandbox isolation, host Git filters, retryable feedback failures, remote baselines and changed PR targets.
 - Frozen original regression, full candidate tests and sealed pre-implementation acceptance run together; newly failing tests cannot disappear under harness freezing. Acceptance design runs in a separate snapshot whose artifacts never enter the implementer workspace.
