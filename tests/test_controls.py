@@ -5,6 +5,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -127,15 +128,16 @@ class ValueAndIsolationTest(unittest.TestCase):
         program = "from pathlib import Path; print(Path(" + repr(str(self.other / "private.txt")) + ").read_text())"
         sandbox = Sandbox(self.store.root, DEFAULTS)
         from adaptive_rsi.process import run_process
-        result = run_process(sandbox.worker(["/usr/bin/python3", "-c", program], workspace,
+        result = run_process(sandbox.worker([sys.executable, "-c", program], workspace,
                                             [self.repo, self.other]), workspace)
         self.assertNotEqual(result["exit_code"], 0)
         self.assertNotIn("project-b-secret", result["stdout"])
         with patch.dict(os.environ, {"PRIVATE_OTHER_KEY": "do-not-inherit"}):
-            result = sandbox.check({"name": "project isolation", "cwd": ".", "argv": ["/usr/bin/python3", "-c", program]}, workspace,
+            result = sandbox.check({"name": "project isolation", "cwd": ".", "argv": [sys.executable, "-c", program]}, workspace,
                                    hidden=[self.repo, self.other])
         self.assertNotEqual(result["exit_code"], 0)
-        env = sandbox.check({"name": "env isolation", "cwd": ".", "argv": ["/usr/bin/python3", "-c", "import os; print(os.environ.get('PRIVATE_OTHER_KEY','absent'))"]}, workspace)
+        env = sandbox.check({"name": "env isolation", "cwd": ".", "argv": [sys.executable, "-c", "import os; print(os.environ.get('PRIVATE_OTHER_KEY','absent'))"]}, workspace)
+        self.assertEqual(env["exit_code"], 0, env["stderr"])
         self.assertEqual(env["stdout"].strip(), "absent")
 
     def test_github_import_registers_separate_paused_projects_without_network(self):
@@ -256,9 +258,11 @@ class UpdatesTest(unittest.TestCase):
                             with urllib.request.urlopen(req, timeout=1) as response:
                                 health = json.load(response)
                             break
-                        except OSError:
+                        except OSError as error:
                             if time.monotonic() > deadline:
-                                self.fail((state / "server.log").read_text())
+                                self.fail(str({"health_error": str(error), "children": [child.poll() for child in children],
+                                               "update": store.setting("update-status"),
+                                               "log": (state / "server.log").read_text()}))
                             time.sleep(0.1)
                     self.assertEqual(health["version"], expected)
                     self.assertEqual(store.setting("sentinel"), {"project": "keep-me", "settings": [1, 2, 3]})

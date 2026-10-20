@@ -16,6 +16,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: 启动恢复与隔离预检
+        run: >-
+          python3 -m unittest -v
+          tests.test_controls.UpdatesTest.test_supervised_upgrade_and_failed_start_restore_real_service_and_database
+          tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project
       - run: python3 -m unittest discover -v
       - run: node --check adaptive_rsi/web/app.js
       - run: node --check adaptive_rsi/web/i18n.js
