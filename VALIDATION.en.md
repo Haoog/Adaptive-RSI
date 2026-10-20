@@ -5,7 +5,15 @@
 Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
 
 
-## Hot settings fix (latest result)
+## Simplified workspace acceptance (latest result)
+
+- Primary navigation is Workspace, Tasks and Settings. Model settings and learning history are secondary pages. The empty workspace fits a 390 × 844 viewport; everyday settings expose six configuration values plus two interval-unit selectors, retaining all advanced settings.
+- The complete backend suite passed **117 tests**, and **14 frontend tests** passed. New regressions cover task grouping, hour/day conversion, custom delivery preservation, cancellation after out-of-order details, closed details staying closed, and independent draft baselines/units across projects. Syntax checks, wheel and plugin ZIP builds passed.
+- Two separate paused fixture projects and a local model directory verified real form saves, project-specific delivery authorization, hidden setting retention and drafts across project/shared-default/language/model-page changes. Saving a planning model leaves the other four roles and other project unchanged. Projects were not enabled and no model inference was started.
+- Browser checks include goal submission/cancellation, attention/history groups, learning history, model directory/favorites and revealing invalid collapsed fields. Primary pages in Chinese and English have no horizontal overflow at 1440, 390 and 320 pixels; screenshots are in `output/playwright/simple-*.png`.
+- Independent review found and prompted a fix for cancellation targeting the wrong task after out-of-order detail responses. The final six-area review passed; see [review evidence](docs/validation/simple-workspace-review-20261020.json). Backend execution and project authorization rules are unchanged.
+
+## Hot settings fix (previous result)
 
 - The full backend suite passed **117 tests** on Python 3.12.13; **8 frontend regression tests** passed. JavaScript syntax, Python compilation, wheel and plugin ZIP builds passed.
 - Ordinary session restoration no longer enters upgrade exclusion. A real upgrade unlocks from the durable installation result instead of a one-shot ready file; real subprocess upgrade and failed-start rollback both verify that settings can be saved afterward.
