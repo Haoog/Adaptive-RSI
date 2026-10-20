@@ -1,8 +1,10 @@
 'use strict';
 let state, projectId = localStorage.getItem('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
 const $ = id => document.getElementById(id);
-const statusNames = {deferred:'已暂缓',rejected:'不采纳',queued:'排队中',planning:'规划中',executing:'实现中',evaluating:'评估中',awaiting_approval:'待交付',pr_open:'PR 已创建',completed:'已完成',obsolete:'已过时',blocked:'已阻塞',failed:'未通过',interrupted:'已中断',cancelled:'已取消',insufficient_evidence:'证据不足',stable:'稳定使用',superseded:'历史稳定版',ready:'等待晋升',pass:'通过',fail:'未通过',rolled_back:'已回退'};
-const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量巡检',system_deep:'深度巡检',system_issues:'Issues 同步',system_evolve:'策略改进',system_publish:'批准交付'};
+const evaluationNames={baseline:'原始基线',candidate:'冻结回归',candidate_full:'候选完整测试',acceptance_baseline:'基线独立验收',acceptance_candidate:'候选独立验收'};
+const deliveryNames={waiting:'等待可合并状态',waiting_review:'等待必需评审',waiting_ci:'等待 CI',ci_failed:'CI 失败',stale:'基线或候选已变化',merged:'已合并',merge_submitted:'已提交合并',closed:'已关闭',unverified_merge:'外部合并包含未经验证的改动',ready:'可合并'};
+const statusNames = {unverified_merge:'未经验证的外部合并',reverted:'已回退',merged:'已合并',pr_closed:'PR 已关闭',verified:'合并后验证通过',regressed:'合并后出现回归',deferred:'已暂缓',rejected:'不采纳',queued:'排队中',planning:'规划中',executing:'实现中',evaluating:'评估中',awaiting_approval:'待交付',pr_open:'PR 已创建',completed:'已完成',obsolete:'已过时',blocked:'已阻塞',failed:'未通过',interrupted:'已中断',cancelled:'已取消',insufficient_evidence:'证据不足',stable:'稳定使用',superseded:'历史稳定版',ready:'等待晋升',pass:'通过',fail:'未通过',rolled_back:'已回退'};
+const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量巡检',system_deep:'深度巡检',system_issues:'Issues 同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 巡检',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
@@ -11,7 +13,7 @@ async function api(path,body){ const options=body===undefined?{}:{method:'POST',
 function currentProject(){return state.projects.find(p=>p.id===projectId);}
 function scoped(rows){return rows.filter(row=>row.project===projectId);}
 function stamp(seconds){return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
-function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
+function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
 async function safe(fn){try{await fn();}catch(error){toast(error.message,true);}}
 async function refresh(){const next=await api('state');if(state&&state.version!==next.version){location.reload();return;}state=next; $('connection').textContent=t('已连接'); $('version').textContent='Adaptive RSI '+state.version;
@@ -23,7 +25,7 @@ function render(){const project=currentProject(), tasks=scoped(state.tasks), run
  $('pause-button').disabled=!project; $('pause-button').textContent=!project||project.paused?t('启用项目'):t('暂停项目'); $('project-status').textContent=!project?t('尚未接入'):project.paused?t('已暂停'):t('运行中');
  $('project-status').className='badge '+(project&&!project.paused?'good':'neutral');
  const queue=tasks.filter(t=>t.state==='queued').length; $('stat-queue').textContent=String(queue).padStart(2,'0'); $('queue-count').textContent=queue;
- $('stat-active').textContent=String(runs.filter(r=>!r.ended).length).padStart(2,'0'); $('stat-pass').textContent=String(tasks.filter(t=>['awaiting_approval','pr_open'].includes(t.state)).length).padStart(2,'0');
+ $('stat-active').textContent=String(runs.filter(r=>!r.ended).length).padStart(2,'0'); $('stat-pass').textContent=String(tasks.filter(t=>['awaiting_approval','pr_open','merged'].includes(t.state)).length).padStart(2,'0');
  const usage=state.usage.find(u=>u.project===(projectId||'model-center')); $('stat-calls').textContent=String(usage?.calls||0).padStart(2,'0'); $('stat-tokens').textContent=(usage?.tokens||0).toLocaleString()+t(' tokens · 实际记录');
  const config=project?.config||state.config;
  for(const kind of ['light','issues','deep']){const mins=config.schedule[kind+'_minutes']; let number=mins,unit=t('分钟');if(mins%1440===0){number=mins/1440;unit=t('天');}else if(mins%60===0){number=mins/60;unit=t('小时');} if(language==='en'&&number===1)unit={minutes:'minute',hours:'hour',days:'day'}[unit]; const node=$(kind+'-interval');node.replaceChildren(document.createTextNode(number+' '),el('small',unit+t(' / 次')));
@@ -35,7 +37,7 @@ function render(){const project=currentProject(), tasks=scoped(state.tasks), run
 function renderTelemetry(){
  const summary=$('quality-summary');summary.replaceChildren();const quality=state.quality?.find(q=>q.project===projectId);
  const rate=(n,d)=>d?Math.round(n/d*100)+'% ('+n+'/'+d+')':t('暂无样本');
- for(const [label,value]of [['验收与评审通过率',rate(quality?.passed||0,quality?.evaluated||0)],['评审阻断率',rate(quality?.review_blocked||0,quality?.reviewed||0)],['重复失败任务',quality?.repeat_failures||0]]){const card=el('div');card.append(el('small',t(label)),el('strong',String(value)));summary.append(card);}
+ for(const [label,value]of [['验收与评审通过率',rate(quality?.passed||0,quality?.evaluated||0)],['评审阻断率',rate(quality?.review_blocked||0,quality?.reviewed||0)],['重复失败任务',quality?.repeat_failures||0],['合并后验证通过',quality?.postmerge_verified||0],['合并后出现回归',quality?.postmerge_regressed||0]]){const card=el('div');card.append(el('small',t(label)),el('strong',String(value)));summary.append(card);}
  const usage=$('usage-summary');usage.replaceChildren();const usageScope=projectId||'model-center',rows=(state.model_usage||[]).filter(u=>u.project===usageScope);
  const total=(state.usage||[]).find(u=>u.project===usageScope);usage.append(el('p',t('近 24 小时')+' · '+(total?.calls||0)+' '+t('次调用')+' · '+Math.round(total?.seconds||0)+'s · '+(total?.tokens||0)+' tokens'));
  const estimate=total?.estimate==null?t('未知'):('$'+total.estimate.toFixed(4));usage.append(el('p',t('估算费用')+' · '+estimate+' USD · '+(total?.unpriced||0)+' '+t('次调用缺少价格'),'muted'));
@@ -70,10 +72,13 @@ async function showTask(task){detailTask=task;$('detail-title').textContent=task
    for(const finding of review.findings||[]){const card=el('div',undefined,'provider-card');card.append(el('strong',t(reviewNames[finding.severity]||finding.severity)+' · '+finding.title),el('p',finding.path+':'+finding.line),el('p',finding.reason),el('p',t('修改建议')+'：'+finding.suggestion));report.append(card);}
    section.append(report);
   }
+  if(data.result.evaluation){const report=el('div',undefined,'review-report');report.append(el('h3',t('独立验收')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=el('details');detail.append(el('summary',t(evaluationNames[label]||label)+' · '+rows.filter(r=>r.passed).length+'/'+rows.length),el('pre',JSON.stringify(rows,null,2)));report.append(detail);}section.append(report);}
+  if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
+  if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   if(data.result.files){const link=el('a',t('查看候选补丁 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';section.append(link);}
   if(run.state==='awaiting_approval')section.append(action(t('批准推送并创建 PR'),async()=>{if(!window.confirm(t('这会把候选分支推送到关联 GitHub 仓库，并创建 PR。确认批准？')))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
   if(run.pr){const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';section.append(link);}}
-  if(run.state==='pr_open')section.append(action(t('生成这次改动的回退候选'),async()=>{await api('revert-code',{run:run.id});toast(t('回退任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
+  if(['pr_open','merged'].includes(run.state))section.append(action(t('生成这次改动的回退候选'),async()=>{await api('revert-code',{run:run.id});toast(t('回退任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   body.append(section);}
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整候选')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=scoped(state.cases).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}
@@ -86,6 +91,7 @@ function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typ
 function renderSettings(){settingsBaseline=structuredClone($('config-scope').value==='global'?state.config:(currentProject()?.config||state.config));
  document.querySelectorAll('[data-path]').forEach(node=>{const value=getPath(settingsBaseline,node.dataset.path);if(node.type==='checkbox')node.checked=value;else node.value=value;});
  document.querySelector('[data-path="limits.concurrency"]').disabled=$('config-scope').value!=='global';
+ document.querySelectorAll('[data-path^="delivery."]').forEach(node=>node.disabled=$('config-scope').value!=='project'||!projectId);
  document.querySelectorAll('[data-path^="updates."]').forEach(node=>node.disabled=$('config-scope').value!=='global');
  renderUpdate();
  $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';

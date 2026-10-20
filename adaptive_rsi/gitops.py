@@ -6,7 +6,10 @@ from .process import checked, scrub_tree
 
 
 def git(root, *args):
-    return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-C", str(root)] + list(args))
+    environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_TERMINAL_PROMPT": "0"}
+    return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                    "-C", str(root)] + list(args), env=environment)
 
 
 def repository(path):

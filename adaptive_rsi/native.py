@@ -158,7 +158,7 @@ class WorkspaceTools:
             self.changed = True
             sandbox = Sandbox(self.state, self.config)
             result = sandbox.check({"name": "model tool", **args}, self.workspace, self.cancel,
-                                   hidden=self.protected)
+                                   protected=[self.workspace / ".git"], hidden=self.protected)
             scrub_tree(self.workspace)
             return {k: result[k] for k in ["exit_code", "stdout", "stderr", "error"]}
         raise ValueError("Unknown tool")

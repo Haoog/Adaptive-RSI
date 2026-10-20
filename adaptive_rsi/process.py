@@ -4,6 +4,7 @@ import platform
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -50,8 +51,8 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
         return result
 
 
-def checked(argv, cwd=None, timeout=60):
-    result = run_process(argv, cwd, timeout)
+def checked(argv, cwd=None, timeout=60, env=None):
+    result = run_process(argv, cwd, timeout, env=env)
     if result["exit_code"] or result["error"]:
         raise RuntimeError((result["stderr"] or result["error"] or result["stdout"])[-2000:])
     return result["stdout"].rstrip("\n")
@@ -97,6 +98,8 @@ class Sandbox:
         workspace = Path(workspace).resolve()
         profile = '(version 1)(allow default)'
         profile += '(deny file-read* file-write* (subpath %s))' % quote_sb(self.state)
+        # Codex 启动需要检查父目录元数据；控制器文件内容和目录枚举仍不可读。
+        profile += '(allow file-read-metadata (subpath %s))' % quote_sb(self.state)
         profile += '(allow file-read* file-write* (subpath %s))' % quote_sb(workspace)
         if read_only:
             profile += '(deny file-write* (subpath %s))' % quote_sb(workspace)
@@ -108,6 +111,26 @@ class Sandbox:
         profile += '(deny file-read* (subpath %s)(subpath %s))' % (quote_sb(Path.home() / ".ssh"), quote_sb(Path.home() / ".aws"))
         # CLI applies workspace-write/read-only too; outer sandbox hides controller state.
         return ["sandbox-exec", "-p", profile] + argv
+
+    def codex_permissions(self, workspace, protected=(), read_only=False):
+        if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
+            raise RuntimeError("Codex workers require macOS Seatbelt")
+        workspace = Path(workspace).resolve()
+        paths = {str(self.state): "deny", str(workspace): "read" if read_only else "write",
+                 str(workspace / ".git"): "read"}
+        for path in list(protected) + [Path.home() / ".ssh", Path.home() / ".aws", Path.home() / ".codex",
+                                        Path.home() / ".config/gh"]:
+            paths[str(Path(path).resolve())] = "deny"
+        binary = shutil.which("codex")
+        if binary:
+            paths[str(Path.home() / ".codex/packages")] = "read"
+            paths[str(Path(binary).resolve())] = "read"
+        # 使用 Codex 自身的单层 Seatbelt；旧 CLI 不支持命名权限时会明确失败。
+        table = "{extends=\":read-only\",filesystem={" + ",".join(
+            json.dumps(path) + "=" + json.dumps(mode) for path, mode in paths.items()) + "}}"
+        return ["-c", "permissions.rsi=" + table, "-c", 'default_permissions="rsi"',
+                "-c", 'shell_environment_policy.inherit="all"',
+                "-c", 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","TMPDIR"]']
 
     def command(self, argv, workspace, cwd=".", protected=(), hidden=()):
         workspace = Path(workspace).resolve()
@@ -136,7 +159,7 @@ class Sandbox:
             return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",
-                   "/private/etc", "/Applications", str(workspace), str(Path.home() / ".local/share/uv")]
+                   "/private/etc", "/Applications", str(workspace), str(Path.home() / ".local/share/uv"), sys.base_prefix]
         profile = '(version 1)(deny default)(allow process*)(allow sysctl-read)(allow mach-lookup)(allow file-read-metadata)'
         profile += '(allow file-read* (literal "/"))'
         profile += '(allow file-read* ' + " ".join('(subpath %s)' % quote_sb(p) for p in allowed) + ')'

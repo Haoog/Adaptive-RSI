@@ -38,6 +38,7 @@ class Runtime:
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi")
         self.futures = set()
         self.import_lock = threading.Lock()
+        self.baseline_lock = threading.RLock()
         self.dispatch_lock = threading.RLock()
         from .updates import UpdateManager
         self.updates = UpdateManager(self)
@@ -117,6 +118,8 @@ class Runtime:
     def configure(self, values, project=None):
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
+        if not project and (values.get("delivery", {}).get("mode", "local") != "local" or values.get("delivery", {}).get("auto_merge")):
+            raise ValueError("Automatic delivery must be explicitly enabled per project")
         if project and "concurrency" in values.get("limits", {}):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
         if project and "updates" in values:
@@ -152,6 +155,8 @@ class Runtime:
         self.project(project)
         if not isinstance(text, str) or not text.strip() or len(text) > 30000:
             raise ValueError("Goal must contain 1..30000 characters")
+        if "delivery" in (overrides or {}):
+            raise ValueError("Task overrides cannot grant delivery permissions")
         validate(merge(self.config(project), overrides or {}))
         task = self.store.add_task(project, "goal", uid(), text.strip().splitlines()[0], text,
                                    [{"source": "user"}], priority=100, overrides=overrides)
@@ -159,7 +164,7 @@ class Runtime:
         return task
 
     def request(self, project, kind, priority=90):
-        if kind not in ["light", "deep", "issues", "evolve"]:
+        if kind not in ["light", "deep", "issues", "evolve", "reassess"]:
             raise ValueError("Unknown inspection type")
         self.project(project)
         # Coalesce manual and timer triggers for the same system job.
@@ -191,7 +196,7 @@ class Runtime:
         self.store.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (time.time(), task))
         self.store.event("cancelled", "Cancellation requested", row["project"])
 
-    def deliver(self, run_id):
+    def deliver(self, run_id, automatic=False):
         original = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
         if not original or original["state"] != "awaiting_approval":
             raise ValueError("Only a verified candidate awaiting approval can be delivered")
@@ -199,13 +204,13 @@ class Runtime:
         if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
             raise ValueError("Independent gates have not passed")
         task = self.store.add_task(original["project"], "system_publish", "publish:" + run_id,
-                                   "Publish approved candidate", run_id, priority=100)
+                                   "Publish approved candidate", run_id, evidence=[{"authorization": "project_policy" if automatic else "per_candidate"}], priority=100)
         self.wake.set()
         return task
 
     def revert_code(self, run_id):
         original = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
-        if not original or original["state"] not in ["pr_open", "awaiting_approval"]:
+        if not original or original["state"] not in ["pr_open", "awaiting_approval", "merged"]:
             raise ValueError("No verified code candidate to revert")
         outcome = json.loads(original["result"])
         task = self.store.add_task(original["project"], "rollback", "rollback:" + run_id,
@@ -223,6 +228,7 @@ class Runtime:
             self.lockfile.close()
             raise RuntimeError("Another runtime already owns this state directory")
         self.store.recover()
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
         self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
         self.thread.start()
 
@@ -250,16 +256,18 @@ class Runtime:
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
         key = "deferred-check:" + project
         if now - self.store.setting(key, 0) >= config["schedule"]["light_minutes"] * 60:
-            rows = self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,))
-            head = git(self.project(project)["path"], "rev-parse", "HEAD") if rows else None
-            for task in rows:
-                run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],))
-                prior = json.loads(run["result"]) if run else {}
-                signature = fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})
-                if head != prior.get("base") or signature != prior.get("triage_input"):
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=? AND state='deferred'", (now, task["id"]))
-                    self.store.event("triage_recheck", "New evidence or baseline; deferred task queued for reassessment", project)
+            if self.store.one("SELECT 1 FROM tasks WHERE project=? AND state='deferred'", (project,)):
+                self.request(project, "reassess", priority=40)
             self.store.put_setting(key, now)
+
+    def reassess_deferred(self, project, config, head):
+        for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
+            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],))
+            prior = json.loads(run["result"]) if run else {}
+            signature = fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})
+            if head != prior.get("base") or signature != prior.get("triage_input"):
+                self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=? AND state='deferred'", (time.time(), task["id"]))
+                self.store.event("triage_recheck", "New evidence or execution baseline; deferred task queued for reassessment", project)
 
     def loop(self):
         while not self.stop.is_set():
@@ -275,23 +283,70 @@ class Runtime:
                 self.updates.tick()
                 self.maintenance()
                 self.futures = {f for f in self.futures if not f.done()}
+                from .delivery import schedule as schedule_delivery
+                schedule_delivery(self)
+                eligible = []
                 for project in self.store.query("SELECT * FROM projects WHERE paused=0 ORDER BY created"):
                     config = self.config(project["id"])
                     hour = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).hour
                     start, end = config["schedule"]["working_hours"]
-                    if not start <= hour < end:
-                        continue
-                    self.schedule(project["id"], config)
-                    if len(self.futures) >= self.config()["limits"]["concurrency"]:
-                        break
-                    with self.dispatch_lock:
-                        run = None if self.updates.installing else self.store.claim(project["id"], config)
-                    if run:
-                        self.futures.add(self.pool.submit(self.process, run))
+                    if start <= hour < end:
+                        self.schedule(project["id"], config)
+                        eligible.append((project, config))
+                self.dispatch(eligible)
+
             except Exception as exc:
                 self.store.event("scheduler_error", str(exc))
             self.wake.wait(timeout=5)
             self.wake.clear()
+
+    def dispatch(self, eligible):
+        # 持久化虚拟服务量：权重越高增长越慢，等待项目可持续获得执行机会。
+        while len(self.futures) < self.config()["limits"]["concurrency"]:
+            ready = []
+            now = time.time()
+            for project, config in eligible:
+                if self.store.one("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project["id"],)):
+                    continue
+                task = self.store.one("SELECT min(created) AS oldest FROM tasks WHERE project=? AND state='queued' AND available<=?", (project["id"], now))
+                if task and task["oldest"] is not None:
+                    ready.append((project, config))
+            if not ready:
+                return
+            services = self.store.setting("fair-service", {})
+            clock = self.store.setting("fair-clock", max(services.values(), default=0))
+            waiting = self.store.setting("fair-waiting", {})
+            active = {p["id"] for p, _ in ready}
+            waiting = {key: value for key, value in waiting.items() if key in active}
+            for key in active:
+                if key not in waiting:
+                    services[key] = clock
+                else:
+                    services[key] = min(clock + 2, max(clock - 2, services.get(key, clock)))
+                waiting.setdefault(key, now)
+            project, config = min(ready, key=lambda pair: services[pair[0]["id"]] -
+                                  min(2, (now - waiting[pair[0]["id"]]) / 3600))
+            with self.dispatch_lock:
+                run = None if self.updates.installing else self.store.claim(project["id"], config)
+                if not run:
+                    return
+                services[project["id"]] += 1 / config["schedule"]["weight"]
+                self.store.put_setting("fair-service", services)
+                self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
+                waiting[project["id"]] = now
+                self.store.put_setting("fair-waiting", waiting)
+                self.futures.add(self.pool.submit(self.process, run))
+
+    def outcomes(self, project):
+        rows = self.store.query("SELECT id,result FROM runs WHERE project=? AND state IN ('merged','pr_closed','reverted','unverified_merge') ORDER BY started DESC LIMIT 20", (project,))
+        result = []
+        for row in rows:
+            data = json.loads(row["result"])
+            item = {"run": row["id"], **{key: data[key] for key in ["value", "summary", "delivery_status", "merged_sha"] if key in data}}
+            if data.get("feedback"):
+                item["feedback"] = {key: data["feedback"][key] for key in ["state", "head", "checked_at"] if key in data["feedback"]}
+            result.append(item)
+        return result
 
     def is_cancelled(self, run):
         row = self.store.one("SELECT t.state,p.paused FROM runs r JOIN tasks t ON r.task=t.id "
@@ -322,8 +377,11 @@ class Runtime:
     def invoke(self, role, text, workspace, run):
         protected = [p["path"] for p in self.store.query("SELECT path FROM projects")]
         protected += [json.loads(c["spec"])["repository"] for c in self.store.query("SELECT spec FROM cases")]
+        config = json.loads(run["config"])
+        if role == "acceptance":
+            config["models"][role] = config["models"]["planning"]
         return self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
-                                 json.loads(run["config"]), lambda: self.is_cancelled(run), protected)
+                                 config, lambda: self.is_cancelled(run), protected)
 
     def process(self, run):
         project = self.project(run["project"])
@@ -335,6 +393,13 @@ class Runtime:
         try:
             if self.is_cancelled(run):
                 raise Cancelled("Project paused or run cancelled")
+            if task["source"] == "system_delivery":
+                from .delivery import tick
+                tick(self, project_id=project["id"], active_run=run["id"])
+                if self.is_cancelled(run):
+                    raise Cancelled("Delivery tracking cancelled")
+                self.store.transition(run["id"], "completed", {"reason": "PR tracking and post-merge verification completed"}, True)
+                return
             if task["source"] == "system_issues":
                 self.sync_issues(project, config)
                 self.store.transition(run["id"], "completed", {"reason": "Issues synchronized"}, True)
@@ -344,23 +409,41 @@ class Runtime:
                 if not original:
                     raise ValueError("Approved run not found")
                 outcome = json.loads(original["result"])
+                if original["state"] in ["pr_open", "merged"] and outcome.get("pr"):
+                    self.store.transition(run["id"], "completed", {"reason": "Existing delivery recovered", "pr": outcome["pr"]}, True)
+                    return
                 candidate = Path(original["path"]) / "candidate"
                 changes(candidate)
                 patch = git(candidate, "diff", original["base"], "--binary", "--no-ext-diff", "--no-textconv")
                 if fingerprint(patch) != outcome.get("patch_hash"):
                     raise RuntimeError("Candidate changed after evaluation; delivery refused")
                 source_task = self.store.one("SELECT * FROM tasks WHERE id=?", (original["task"],))
-                url = self.publish(project, source_task, original, candidate, config)
+                from .delivery import StaleCandidate
+                try:
+                    url = self.publish(project, source_task, original, candidate, config)
+                except StaleCandidate as exc:
+                    outcome["reason"] = str(exc)
+                    self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), original["id"]))
+                    state = "queued" if source_task["attempts"] <= config["limits"]["retries"] else "blocked"
+                    self.store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=?", (state, time.time(), original["task"]))
+                    raise
                 outcome["pr"] = url
                 self.store.execute("UPDATE runs SET state='pr_open',result=? WHERE id=?", (encode(outcome), original["id"]))
                 self.store.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=?", (time.time(), original["task"]))
                 self.store.transition(run["id"], "completed", {"reason": "Approved PR created", "pr": url}, True)
                 return
-            base = git(project["path"], "rev-parse", "HEAD")
+            from .delivery import baseline as remote_baseline
+            source, base, base_branch = remote_baseline(self, project, config)
             self.store.execute("UPDATE runs SET base=? WHERE id=?", (base, run["id"]))
+            self.store.put_setting("run-baseline:" + run["id"], {"repository": config["github"]["repository"],
+                                   "branch": base_branch, "sha": base})
+            self.reassess_deferred(project["id"], config, base)
+            if task["source"] == "system_reassess":
+                self.store.transition(run["id"], "completed", {"reason": "Deferred tasks compared against current execution baseline"}, True)
+                return
             strategies = self.active_strategies(project["id"], config)
             self.store.execute("UPDATE runs SET strategy=? WHERE id=?", (encode(strategies), run["id"]))
-            workspace = snapshot(project["path"], directory / "workspace", base)
+            workspace = snapshot(source, directory / "workspace", base)
             if task["source"] in ["system_light", "system_deep"]:
                 self.inspect(project, workspace, task["source"].split("_")[1], run, strategies)
                 self.store.transition(run["id"], "completed", {"reason": "Inspection completed"}, True)
@@ -375,7 +458,7 @@ class Runtime:
                 return
             context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
                        "stable_strategies": strategies, "skills": self.memories(project["id"], task["body"]),
-                       "toolchains": detect(workspace), "baseline": base,
+                       "toolchains": detect(workspace), "baseline": base, "postmerge_outcomes": self.outcomes(project["id"]),
                        "open_prs": self.store.setting("prs:" + project["id"], []),
                        "known_tasks": self.store.query("SELECT id,title,state FROM tasks WHERE project=? AND id<>? "
                                                        "AND source NOT LIKE 'system_%' LIMIT 100", (project["id"], task["id"])),
@@ -391,12 +474,14 @@ class Runtime:
                 plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
                         "scope": prior_result["files"], "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
             else:
-                plan = self.invoke("planning", "First decide whether this work is worth doing, including user goals. Do not automatically implement every suggestion. "
+                plan = self.invoke("planning", "You are the PLANNER ONLY. Inspect and plan; do not implement or change files. "
+                               "Your read-only workspace is intentional and does not block a ready decision: a separate writable executor implements ready plans. "
+                               "First decide whether this work is worth doing, including user goals. Do not automatically implement every suggestion. "
                                "Assess evidenced impact, benefit, cost/effort, confidence and what happens if nothing is changed. "
                                "Use deferred for weak evidence, unclear requirements or low current priority; rejected for cosmetic churn, disproportionate cost or incompatible direction. "
                                "Only ready authorizes implementation. Evidence must cite concrete current-code behavior or a specific user requirement. "
                                "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
-                               "If ready, define narrow file/directory scope and observable acceptance criteria. "
+                               "If ready, scope must contain ONLY literal relative file/directory paths (e.g. calculator.py, tests), without annotations or descriptions. Define observable acceptance criteria separately. "
                                    "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes.\n" +
                                    encode({"value_policy": config["triage"]["policy"], **context}), workspace, run)
                 validate_output(plan, SCHEMAS["planning"])
@@ -415,14 +500,28 @@ class Runtime:
                 return
             if not plan["scope"] or not plan["acceptance"]:
                 raise RuntimeError("Plan lacks scope or acceptance criteria")
+            from pathlib import PurePosixPath
+            plan["scope"] = [str(PurePosixPath(relative_path(path))) for path in plan["scope"]]
             for path in plan["scope"]:
                 relative_path(path)
-                if path == ".":
+                if path == "." or any(char in path for char in [":", "：", "\n", "*", "?", "["]):
                     raise RuntimeError("Plan must name narrower scope than the entire repository")
+            (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
             checks = config["checks"] or detect(workspace)["checks"]
             if not checks:
                 self.store.transition(run["id"], "insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
                 return
+            from .acceptance import seal
+            acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
+            spec = self.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
+                "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
+                "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
+                "Use python3 for Python checks; do not assume a python executable alias exists. "
+                "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
+                "No network, credentials, dependency installs or changes to application files. The host seals these files away from the implementer.\n" +
+                encode({"task": context["task"], "plan": plan}), acceptance_workspace, run)
+            acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
+            (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
             self.store.transition(run["id"], "executing")
             from .environment import capture, restore
             seeds = directory / "dependencies"
@@ -448,19 +547,22 @@ class Runtime:
                     raise RuntimeError("Change escaped planned scope: " + path)
             (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
             # Seal the exact patch outside the executor's writable subtree before evaluation.
-            workspace = snapshot(project["path"], directory / "candidate", base)
+            workspace = snapshot(source, directory / "candidate", base)
             git(workspace, "apply", "--index", str(directory / "candidate.patch"))
             self.store.transition(run["id"], "evaluating")
-            baseline = snapshot(project["path"], directory / "baseline", base)
+            baseline = snapshot(source, directory / "baseline", base)
             evaluation = self.evaluator.evaluate(baseline, workspace, checks, directory / "evaluation", config,
-                                                 lambda: self.is_cancelled(run), seeds=seeds)
+                                                 lambda: self.is_cancelled(run), seeds=seeds, acceptance=acceptance)
             if evaluation["decision"] != "pass":
                 self.finish_failure(run, task, {**evaluation, "evaluation": evaluation}, config)
                 return
             self.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
                                    "compatibility": compatibility(config), "at": time.time()})
             review = self.invoke("review", REVIEW_PROMPT +
+                                 "Also review the independent acceptance specification for meaningful behavioral coverage. "
+                                 "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
                                  encode({"task": context["task"], "plan": plan, "evaluation": evaluation,
+                                         "independent_acceptance": acceptance["spec"],
                                          "summary": result["summary"]}), workspace, run)
             review = enforce_review(review, config)
             (directory / "review.json").write_text(encode(review), encoding="utf-8")
@@ -471,12 +573,14 @@ class Runtime:
             if review["decision"] != "pass":
                 self.finish_failure(run, task, {**outcome, "decision": review["decision"]}, config)
                 return
-            if git(project["path"], "rev-parse", "HEAD") != base:
+            if remote_baseline(self, project, config)[1] != base:
                 self.store.transition(run["id"], "blocked", {**outcome, "reason": "Project HEAD changed; retry against the new baseline."}, True)
                 return
             if self.is_cancelled(run):
                 raise Cancelled("Cancelled before delivery")
             self.store.transition(run["id"], "awaiting_approval", outcome, True)
+            if config["delivery"]["mode"] == "pr" and self.config(project["id"])["delivery"]["mode"] == "pr":
+                self.deliver(run["id"], automatic=True)
             self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                                (uid(), project["id"], task["id"], "observation", encode([task["title"]]),
                                 result["summary"], encode({"run": run["id"], "base": base}), time.time() + 30 * 86400, time.time()))
@@ -504,12 +608,13 @@ class Runtime:
         ci = self.store.setting("ci:" + project["id"], [])
         recent_failed_ids = self.store.query("SELECT id FROM runs WHERE project=? AND state='failed' ORDER BY started DESC LIMIT 5", (project["id"],))
         inspection_signature = fingerprint({"head": head, "ci": ci, "failures": recent_failed_ids,
+                                             "postmerge_outcomes": self.outcomes(project["id"]),
                                              "strategy": [s["id"] for s in strategies],
                                              "model": json.loads(run["config"])["models"]["analysis"]})
         if kind == "light" and self.store.setting(key) == inspection_signature:
             self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
             return
-        backlog = self.store.query("SELECT title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
+        backlog = self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
                                    "ORDER BY created DESC LIMIT 100", (project["id"],))
         history = self.store.query("SELECT state,result FROM runs WHERE project=? AND state IN ('failed','blocked') "
                                    "ORDER BY started DESC LIMIT 8", (project["id"],))
@@ -523,7 +628,7 @@ class Runtime:
                                "priority 1..100. Avoid existing tasks and PRs. Deep inspection focuses on selected module.\n" +
                                encode({"kind": kind, "modules": modules, "selected_module": selected, "tasks": backlog,
                                        "recent_failures": history, "open_prs": self.store.setting("prs:" + project["id"], []),
-                                       "ci": ci,
+                                       "ci": ci, "postmerge_outcomes": self.outcomes(project["id"]),
                                        "stable_strategies": strategies}), workspace, run)
         added = 0
         for item in findings["findings"][:5]:
@@ -533,11 +638,20 @@ class Runtime:
                 path.relative_to(workspace)
                 if not item["quote"].strip() or item["quote"] not in path.read_text(errors="replace") or not item["acceptance"]:
                     continue
+                finding_key = fingerprint({"path": item["path"], "quote": item["quote"]})
+                prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], finding_key))
+                if prior and prior["state"] == "merged":
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
+                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
+                                                 "source": "reported_recurrence"}]), time.time(), prior["id"]))
+                    self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
+                    added += 1
+                    continue
                 duplicate = any(fingerprint(item["title"].strip().lower()) == fingerprint(r["title"].strip().lower()) for r in backlog)
                 if duplicate:
                     continue
                 evidence = {"path": item["path"], "quote": item["quote"], "base": head, "source": "inspection"}
-                self.store.add_task(project["id"], "inspection", fingerprint({"path": item["path"], "quote": item["quote"]}),
+                self.store.add_task(project["id"], "inspection", finding_key,
                                     item["title"], item["body"], [evidence], item["acceptance"], max(1, min(70, item["priority"])))
                 added += 1
             except (ValueError, OSError):
@@ -595,42 +709,14 @@ class Runtime:
         return row["state"] == "OPEN"
 
     def publish(self, project, task, run, workspace, config):
-        approval = self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_publish' AND body=? AND state='planning'",
-                                  (project["id"], run["id"]))
-        if not approval or run["state"] != "awaiting_approval":
-            raise RuntimeError("Publishing requires explicit approval for this verified candidate")
-        repo = config["github"]["repository"]
-        if not repo or repo != origin_repository(project["path"]):
-            raise RuntimeError("PR repository must match the project's GitHub origin")
-        current = self.store.one("SELECT base FROM runs WHERE id=?", (run["id"],))
-        if git(project["path"], "rev-parse", "HEAD") != current["base"]:
-            raise RuntimeError("Source HEAD changed before delivery")
-        branch = "adaptive-rsi/" + run["id"]
-        existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--json", "url"]))
-        if existing:
-            return existing[0]["url"]
-        if git(workspace, "branch", "--show-current") != branch:
-            git(workspace, "checkout", "-b", branch)
-            git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost", "commit", "-m", task["title"])
-        sha = git(workspace, "rev-parse", "HEAD")
-        remote = git(project["path"], "remote", "get-url", "origin")
-        git(workspace, "remote", "set-url", "origin", remote)
-        git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
-        body = Path(workspace).parent / "pr-body.md"
-        body.write_text("Fixes task: " + task["title"] + "\n\nIndependent checks and model review passed.\n\n"
-                        "Run: `" + run["id"] + "`\nBaseline: `" + str(self.store.one("SELECT base FROM runs WHERE id=?", (run["id"],))["base"]) + "`\n", encoding="utf-8")
-        args = ["gh", "pr", "create", "--repo", repo, "--head", branch, "--title", task["title"], "--body-file", str(body)]
-        if config["delivery"]["base_branch"]:
-            args += ["--base", config["delivery"]["base_branch"]]
-        url = checked(args, timeout=60)
-        self.store.event("pr", "PR created", project["id"], run["id"], {"url": url, "head": sha})
-        return url
+        from .delivery import publish
+        return publish(self, project, task, run, workspace, config)
 
     def maybe_evolve(self, project, config):
         if not config["evolution"]["enabled"]:
             return
         count = self.store.one("SELECT count(*) AS n FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
-                               "AND state IN ('awaiting_approval','pr_open','completed')", (project,))["n"]
+                               "AND state IN ('awaiting_approval','pr_open','merged','completed')", (project,))["n"]
         if count and count % config["evolution"]["every_completed"] == 0:
             if self.store.setting("last-evolution:" + project) != count:
                 self.request(project, "evolve", priority=30)
@@ -652,10 +738,12 @@ class Runtime:
         for project in self.store.query("SELECT * FROM projects"):
             config = self.config(project["id"])
             cutoff = now - config["limits"]["retention_days"] * 86400
-            for run in self.store.query("SELECT id,path,state,task FROM runs WHERE project=? AND ended<? AND path IS NOT NULL", (project["id"], cutoff)):
+            for run in self.store.query("SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL", (project["id"], cutoff)):
+                if run["state"] == "pr_open" or run["state"] == "merged" and not json.loads(run["result"]).get("monitoring_completed"):
+                    continue
                 directory = Path(run["path"])
                 directory.relative_to(self.store.root / "runs")
-                for name in ["workspace", "candidate", "baseline", "evaluation", "experiments", "dependencies"]:
+                for name in ["workspace", "candidate", "baseline", "evaluation", "experiments", "dependencies", "acceptance-design"]:
                     target = directory / name
                     if target.is_dir() and not target.is_symlink():
                         shutil.rmtree(target)

@@ -21,12 +21,14 @@ SCHEMAS = {
         "title": TEXT, "body": TEXT, "path": TEXT, "quote": TEXT,
         "acceptance": STRINGS, "priority": {"type": "integer"}})}}),
     "planning": object_schema({"decision": {"type": "string", "enum": ["ready", "obsolete", "blocked", "deferred", "rejected"]},
-                               "reason": TEXT, "scope": STRINGS, "acceptance": STRINGS,
+                               "reason": TEXT, "scope": {"type": "array", "items": {"type": "string", "description": "A literal repository-relative file or directory path only. No descriptions, colons, globs, or annotations."}}, "acceptance": STRINGS,
                                "value": object_schema({"impact": {"type": "string", "enum": ["low", "medium", "high"]},
                                    "effort": {"type": "string", "enum": ["low", "medium", "high"]},
                                    "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
                                    "benefit": TEXT, "cost": TEXT, "inaction": TEXT, "evidence": STRINGS}),
                                "risk": {"type": "string", "enum": ["low", "medium", "high"]}}),
+    "acceptance": object_schema({"files": {"type": "array", "items": object_schema({"path": TEXT, "content": TEXT})},
+        "checks": {"type": "array", "items": object_schema({"name": TEXT, "argv": STRINGS, "criteria": {"type": "array", "items": {"type": "integer"}}})}}),
     "implementation": object_schema({"summary": TEXT}),
     "review": object_schema({"decision": VERDICT, "reason": TEXT,
         "assessments": {"type": "array", "items": object_schema({
@@ -145,13 +147,13 @@ class CodexAgent:
                 argv += ["-c", 'shell_environment_policy.exclude=["RSI_PROVIDER_API_KEY"]']
             if route["effort"] != "default":
                 argv += ["-c", "model_reasoning_effort=" + json.dumps(route["effort"])]
-            argv += ["--sandbox", mode, "-c", "sandbox_workspace_write.network_access=false",
+            argv += sandbox.codex_permissions(workspace, protected, read_only=role != "implementation")
+            argv += ["-c", "sandbox_workspace_write.network_access=false",
                      "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
                      "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
                      "--json", "--color", "never", "--output-schema", str(schema_path),
                      "--output-last-message", str(output_path), "-C", str(workspace),
                      "Read the task in " + str(prompt_path) + ". Follow its instructions; return the requested JSON."]
-            argv = sandbox.worker(argv, workspace, protected, read_only=role != "implementation", output_dir=agent_dir)
             self.store.event("model", role + ": " + route.get("provider", "openai") + " / " + route["model"] + " / " + route["effort"], project, run)
             result = run_process(argv, workspace, config["limits"]["run_seconds"], cancel,
                                  config["limits"]["max_output_mb"], environment)

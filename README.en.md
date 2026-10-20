@@ -2,7 +2,7 @@
 
 [简体中文](README.md) | **English**
 
-A local autonomous improvement runtime for Codex: **code inspection, user goals, and GitHub Issues → task queue → value assessment → planning → isolated implementation → independent checks and review → local candidate → per-run PR confirmation → memory and the next round**.
+A local autonomous improvement runtime for Codex: **code inspection, user goals, and GitHub Issues → task queue → value assessment → planning → isolated implementation → independent checks and review → local candidate → project-authorized delivery → post-merge verification → memory and the next round**.
 
 Includes a plugin entry point, persistent scheduler, SQLite state and call budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
@@ -18,14 +18,17 @@ flowchart TD
     M[Memory: evidence, failures, verified strategies] --> P[Planner: benefit, evidence, cost, risk and inaction]
     Q --> P
     P --> B{Worth doing with sufficient evidence?}
-    B -->|Execute| W[Executor: isolated snapshot at a fixed commit]
+    B -->|Execute| W[Independent acceptance design → executor at latest base commit]
     B -->|Defer or reject| Z[Save decision and evidence]
     Z --> M
-    W --> T[Host checks: frozen harness, baseline and candidate regression]
+    W --> T[Host checks: frozen regression, full candidate suite, independent acceptance]
     T --> R[Independent review: correctness, security, maintainability, architecture, tests, scope]
     R --> D{Both checks and review pass?}
     D -->|Yes| C[Local patch and verification evidence]
-    C --> A[Create PR only after per-run user confirmation]
+    C --> A[Project-authorized PR or per-candidate confirmation]
+    A --> J[Verify exact head, current base, CI and required reviews]
+    J --> K[Authorized merge and post-merge verification]
+    K --> M
     T -->|Failure or insufficient evidence| F[Keep evidence, bounded retry or attention]
     D -->|No| F
     A --> M
@@ -39,7 +42,7 @@ flowchart TD
     N --> M
 ```
 
-The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. **PRs are never created automatically; merging is manual.** Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
+The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. Delivery defaults to local candidates. Projects can explicitly authorize automatic PRs and merging. Missing or failed CI, required reviews, changed commits and conflicts block merging; admin bypass is never used. Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
 
 ## Code quality gates
 
@@ -147,7 +150,10 @@ State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_
 - **Task sources:** discovered tasks require verifiable references to existing code. User goals can enter at any time. Issues support label filters, update cursors, deduplication, closed-Issue checks, and existing PR context. Issue text does not grant permissions.
 - **Isolation and verification:** each run uses clones of a fixed Git commit and leaves the user's worktree untouched. Implementation and review use separate sessions. The host freezes check commands and reruns baseline and candidate checks independently. Original tests and build entry points are restored from the baseline and protected against writes during checks. Model claims do not establish success. Missing checks, zero tests, or insufficient evidence block delivery.
 - **State and budgets:** service/project locks, atomic task claims, frozen configuration, reserved model calls, daily/per-run limits, run and command timeouts, output limits, bounded backoff retries, pause/cancel, and fresh-snapshot recovery after crashes. Actual tokens and elapsed time are recorded; dollar costs are not invented. Codex counts CLI sessions, while native routes count HTTP requests; neither is a strict monetary budget.
-- **Delivery:** keep patches and evidence locally after verification. Confirm each run in task details or use `deliver RUN_ID` before a branch is pushed and a PR created. No automatic merging. Legacy automatic PR/merge settings migrate to local-only delivery. The runtime does not rewrite the user repository or discard uncommitted work.
+- **Delivery:** local candidates by default. Enable automatic PRs and merging explicitly per project. Both the saved run policy and current policy must authorize merging; revocation takes effect immediately. Global defaults and task overrides cannot grant delivery permissions. Legacy authorizations are revoked once; subsequent explicit project settings survive restarts.
+- **Baseline:** each GitHub run fetches the configured/default branch into an isolated cache. Execution and evaluation use the same SHA without changing the user's checkout or dirty files. Changed baselines stop old candidates and trigger bounded replanning.
+- **Fair scheduling:** persistent weighted rotation with waiting-time aging; project weights 1–10, default 1. All eligible projects update schedules before dispatch. Global concurrency and one active run per project remain enforced.
+- **Outcome feedback:** save merge SHA and recheck after merge and subsequent mainline changes (daily by default, minimum five minutes). Verified success, regression, insufficient evidence and reverts feed future value assessments. Reported recurrence reopens assessment; model reports do not become verified regressions. Investigation tasks carry bounded excerpts, and failed enqueue retries preserve completed feedback. Observation uses the artifact retention window, 30 days by default.
 - **Strategy evolution:** execution strategies, meta-strategies, and adapter guidance evolve as retrieved instructions. Candidates cannot change the controller, permissions, budgets, or evaluator. Validation and holdout tasks compare stable and candidate strategies in paired runs. Promotion requires improved quality, no observed regression, and acceptable time/token costs. Early monitored failures restore the previous stable strategy and invalidate its learned skills. Observations, verified skills, and failed candidates are stored separately.
 
 ## Environment and boundaries
@@ -251,3 +257,11 @@ node --check adaptive_rsi/web/i18n.js
 Tests substitute the model interface while running real Git snapshots, SQLite concurrency, macOS sandbox checks, and regression checks. They do not consume model sessions or write to GitHub. Browser checks cover desktop/mobile layout and settings persistence. Live model authorization, long-running operation, and remote PR integration require a real project.
 
 See [the validation report](VALIDATION.en.md) and [contribution guide](CONTRIBUTING.en.md).
+
+## Autonomous delivery loop
+
+Before implementation, a separate call using the planning model generates executable acceptance criteria. The host seals them outside implementer access. Frozen original regression, full candidate tests (including changed/new tests), and independent acceptance all must pass. Every planned criterion needs coverage. Model-generated acceptance can still be incomplete; review and real-task validation remain necessary.
+
+The repository, resolved target branch and SHA are sealed when a run starts. Changing targets cannot reuse old authorization; stale candidates replan within retry limits. Branches use `feat/rsi-*` or `fix/rsi-*`; commits and PR descriptions are Chinese. Squash merging requires the exact evaluated head, a current base, successful CI, GitHub mergeability and required reviews. GitHub rules remain the final gate. Enable strict required checks or a merge queue to close the race between checking the base and requesting merge. Failed CI retains the PR; stale PRs close and replan within retry limits. Restart recovery tracks existing PRs and resumes idempotent publishing without reusing interrupted, unverified implementation.
+
+Codex CLI must support named `permissions` profiles. macOS workers use Codex's own single Seatbelt layer; command tools cannot read controller data, other projects, Codex authentication or GitHub credentials, write `.git`, or access the network. Unsupported CLIs block explicitly rather than disabling isolation. Actual live evidence is recorded in [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md).

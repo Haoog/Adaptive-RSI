@@ -65,18 +65,21 @@ class Store:
                 db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
             if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                 db.execute("ALTER TABLE calls ADD COLUMN unit_price REAL")
-            # Earlier versions exposed automatic delivery. Upgrades always revoke it.
-            for row in db.execute("SELECT id,config FROM projects").fetchall():
-                config = json.loads(row["config"])
-                if config.get("delivery", {}).get("mode", "local") != "local" or config.get("delivery", {}).get("auto_merge"):
-                    config["delivery"] = {**config["delivery"], "mode": "local", "auto_merge": False}
-                    db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
-            row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
-            if row:
-                config = json.loads(row["value"])
-                if config.get("delivery", {}).get("mode", "local") != "local" or config.get("delivery", {}).get("auto_merge"):
-                    config["delivery"] = {**config["delivery"], "mode": "local", "auto_merge": False}
-                    db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))
+            # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
+            migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
+            if not migration:
+                for row in db.execute("SELECT id,config FROM projects").fetchall():
+                    config = json.loads(row["config"])
+                    if "delivery" in config:
+                        config["delivery"].update(mode="local", auto_merge=False)
+                        db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
+                row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+                if row:
+                    config = json.loads(row["value"])
+                    if "delivery" in config:
+                        config["delivery"].update(mode="local", auto_merge=False)
+                        db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))
+                db.execute("INSERT INTO settings VALUES ('delivery-policy-v2','true')")
 
     @contextlib.contextmanager
     def connect(self):

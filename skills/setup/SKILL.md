@@ -19,8 +19,7 @@ If the user asks to connect a project, register its Git root through
 `python3 <plugin-root>/scripts/rsi add <repository-root>`.
 Add `--enable` only when the user asks to activate autonomous work. Registration alone
 leaves it paused. Enabling permits local model calls and isolated local edits; the default
-delivery is a retained local candidate. Each PR requires explicit confirmation for that run;
-there is no automatic PR creation or merging. Multiple GitHub URLs can be imported with
+delivery is a retained local candidate. Projects can separately authorize automatic PRs and merging in project settings; do not enable them without user authorization. All independent gates and GitHub rules remain mandatory. Multiple GitHub URLs can be imported with
 `python3 <plugin-root>/scripts/rsi import <url> ...`; each starts paused with separate state.
 New project registration waits until active runs finish to preserve isolation boundaries.
 Global update policy is available in the panel. Runtime updates do not hot-reload Codex skills;

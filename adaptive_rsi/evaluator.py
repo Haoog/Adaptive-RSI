@@ -53,11 +53,12 @@ class Evaluator:
     def __init__(self, store):
         self.store = store
 
-    def evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None):
+    def evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
+                 acceptance=None):
         if not checks:
             return {"decision": "insufficient_evidence", "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": []}
         results = {}
-        for label, source in [("baseline", baseline), ("candidate", candidate)]:
+        for label, source in [("baseline", baseline), ("candidate", candidate), ("candidate_full", candidate)]:
             target = copy_source(source, Path(directory) / label)
             if seeds:
                 from .environment import restore
@@ -69,7 +70,7 @@ class Evaluator:
                         else:
                             shutil.rmtree(seeded)
                 restore(seeds, target, config)
-            protected = freeze_harness(Path(baseline), target)
+            protected = freeze_harness(Path(candidate if label == "candidate_full" else baseline), target)
             if overlay:
                 from .process import scrub_tree
                 scrub_tree(overlay)
@@ -89,7 +90,13 @@ class Evaluator:
                 result = sandbox.check(setup, target, cancel, protected, hidden)
                 if result["exit_code"] or result["error"]:
                     return {"decision": "insufficient_evidence", "reason": "Isolated dependency preparation failed", "setup": result}
-            for check in checks:
+            effective_checks = list(checks)
+            if label == "candidate_full":
+                from .adapters import detect
+                for check in detect(target)["checks"]:
+                    if not any(row["argv"] == check["argv"] and row.get("cwd", ".") == check.get("cwd", ".") for row in effective_checks):
+                        effective_checks.append(check)
+            for check in effective_checks:
                 result = sandbox.check(check, target, cancel, protected, hidden)
                 text = result["stdout"] + result["stderr"]
                 empty = empty_test_run(text)
@@ -97,10 +104,41 @@ class Evaluator:
                 result["empty_tests"] = empty
                 rows.append(result)
             results[label] = rows
-        passing = all(row["passed"] for row in results["candidate"])
-        data = {"decision": "pass" if passing else "fail",
-                "reason": "Frozen checks passed" if passing else "Candidate failed independent checks",
+        if acceptance:
+            from .config import relative_path
+            for label, source in [("acceptance_baseline", baseline), ("acceptance_candidate", candidate)]:
+                target = copy_source(source, Path(directory) / label)
+                if (target / ".rsi-acceptance").exists():
+                    raise RuntimeError("Candidate overlaps independent acceptance namespace")
+                protected = []
+                for item in acceptance["spec"]["files"]:
+                    dst = target / relative_path(item["path"])
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    dst.write_text(item["content"], encoding="utf-8")
+                    protected.append(dst)
+                if seeds:
+                    from .environment import restore
+                    restore(seeds, target, config)
+                sandbox = Sandbox(self.store.root, config)
+                rows = []
+                for check in config["environment"]["setup"] + acceptance["checks"]:
+                    result = sandbox.check(check, target, cancel, protected, hidden)
+                    result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
+                    rows.append(result)
+                results[label] = rows
+        passing = all(row["passed"] for label in ["candidate", "candidate_full", "acceptance_candidate"]
+                      for row in results.get(label, []))
+        unavailable = any(not row["passed"] and re.search(
+            r"execvp\(\).*No such file|executable file not found|exec:.*not found", row["stderr"], re.I)
+            for label in ["candidate", "candidate_full", "acceptance_candidate"] for row in results.get(label, []))
+        data = {"decision": "insufficient_evidence" if unavailable else "pass" if passing else "fail",
+                "reason": "Regression, full candidate and independent acceptance passed" if passing else "Candidate failed independent checks",
                 "harness_hash": fingerprint(checks), "checks": results}
+        if acceptance:
+            data["acceptance_hash"] = acceptance["hash"]
+            data["criteria"] = acceptance["criteria"]
+        if unavailable:
+            data["reason"] = "Required check executable is unavailable; candidate remains unverified"
         Path(directory).mkdir(parents=True, exist_ok=True)
         (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data

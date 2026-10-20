@@ -89,11 +89,15 @@ class ValueAndIsolationTest(unittest.TestCase):
         config = self.runtime.config(self.project)
         now = time.time()
         self.runtime.schedule(self.project, config, now)
+        recheck = self.store.claim(self.project, config)
+        self.runtime.process(recheck)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "deferred")
         (self.repo / "calculator.py").write_text("def add(a,b): return a+b\n")
         git(self.repo, "add", ".")
         git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "new evidence")
         self.runtime.schedule(self.project, config, now + config["schedule"]["light_minutes"] * 60 + 1)
+        recheck = self.store.claim(self.project, config)
+        self.runtime.process(recheck)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
         self.assertEqual([role for role, _ in self.runtime.agent.roles], ["planning"])
 
@@ -152,17 +156,20 @@ class ValueAndIsolationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 github_url(bad)
 
-    def test_automatic_prs_disabled_and_legacy_settings_revoked(self):
-        for values in [{"mode": "pr"}, {"auto_merge": True}]:
-            with self.assertRaises(ValueError):
-                self.runtime.configure({"delivery": values})
+    def test_automatic_delivery_is_explicit_per_project_and_persists(self):
+        with self.assertRaises(ValueError):
+            self.runtime.configure({"delivery": {"mode": "pr", "auto_merge": True}})
+        with self.assertRaises(ValueError):
+            self.runtime.configure({"delivery": {"auto_merge": True}}, self.project)
         with self.assertRaisesRegex(RuntimeError, "explicit approval"):
             self.runtime.publish(self.runtime.project(self.project), {}, {"id": "fake", "state": "awaiting_approval"}, self.repo, DEFAULTS)
-        self.store.put_setting("config", {"delivery": {"mode": "pr", "auto_merge": True}})
-        self.store.execute("UPDATE projects SET config=? WHERE id=?", (encode({"delivery": {"mode": "pr"}}), self.project))
+        self.runtime.configure({"delivery": {"mode": "pr", "auto_merge": True}}, self.project)
         Store(self.store.root)
-        self.assertEqual(self.runtime.config(self.project)["delivery"]["mode"], "local")
-        self.assertFalse(self.runtime.config()["delivery"]["auto_merge"])
+        self.assertEqual(self.runtime.config(self.project)["delivery"]["mode"], "pr")
+        self.assertTrue(self.runtime.config(self.project)["delivery"]["auto_merge"])
+        self.assertEqual(self.runtime.config()["delivery"]["mode"], "local")
+        with self.assertRaises(ValueError):
+            self.runtime.goal(self.project, "test", {"delivery": {"mode": "pr"}})
 
 
 def release(target="0.2.1"):

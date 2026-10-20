@@ -13,7 +13,7 @@ BUILTIN_PROVIDERS = [
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
     "schedule": {"light_minutes": 120, "issues_minutes": 60, "deep_minutes": 4320,
-                 "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
+                 "weight": 1, "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
     "providers": [],
     "models": {
         "analysis": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
@@ -32,7 +32,7 @@ DEFAULTS = {
                 "cpus": 2, "pids": 128},
     "github": {"repository": "", "labels": [], "exclude_labels": ["wontfix", "duplicate"],
                "max_issues": 100},
-    "delivery": {"mode": "local", "auto_merge": False, "base_branch": ""},
+    "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -148,8 +148,16 @@ def validate(config):
     for field in ["labels", "exclude_labels"]:
         if not all(isinstance(x, str) and len(x) <= 100 for x in config["github"][field]):
             raise ValueError("Invalid issue labels")
-    if config["delivery"]["mode"] != "local" or config["delivery"]["auto_merge"]:
-        raise ValueError("Delivery requires explicit approval per candidate; automatic PRs and merges are disabled")
+    if not 1 <= config["schedule"]["weight"] <= 10:
+        raise ValueError("Project weight must be 1..10")
+    delivery = config["delivery"]
+    if delivery["mode"] not in ["local", "pr"] or delivery["auto_merge"] and delivery["mode"] != "pr":
+        raise ValueError("Automatic merge requires PR delivery")
+    if not 5 <= delivery["feedback_minutes"] <= 525600:
+        raise ValueError("Feedback interval must be at least 5 minutes")
+    if delivery["base_branch"] and (delivery["base_branch"].startswith("-") or
+            not re.fullmatch(r"[A-Za-z0-9._/-]+", delivery["base_branch"]) or ".." in delivery["base_branch"]):
+        raise ValueError("Invalid base branch")
     for path in config["environment"]["seed_paths"]:
         relative_path(path)
         if path in [".", ""]:

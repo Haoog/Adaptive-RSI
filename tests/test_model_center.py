@@ -271,7 +271,7 @@ class ModelCenterTest(unittest.TestCase):
                 output = Path(argv[argv.index("--output-last-message") + 1])
                 output.write_text(json.dumps({"summary": nonce}))
                 return {"exit_code": 0, "error": None, "stdout": "codex-private-test-key", "stderr": ""}
-            with patch("adaptive_rsi.agent.shutil.which", return_value="/mock/codex"), patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), patch("adaptive_rsi.agent.run_process", side_effect=fake_process):
+            with patch("adaptive_rsi.agent.shutil.which", return_value="/mock/codex"), patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), patch("adaptive_rsi.agent.run_process", side_effect=fake_process):
                 result = self.center.probe("gateway", "coder-a")
             self.assertEqual(result["calls"][0]["state"], "completed")
 

@@ -23,7 +23,7 @@ Keep temporary UI-check projects paused to avoid unintended model calls. Store r
 - Start every change on a new working branch. Do not commit or push directly to `main`. Automated improvements to this repository must also pass checks, code review, and a PR before merging.
 - Use branch prefixes such as `feat/`, `fix/`, `refactor/`, `docs/`, or `chore/` according to the change type. Do not use `codex/`.
 - The maintainer has granted standing authorization for this repository: assess value before implementation, then require relevant tests, runtime checks, and code review without blocking findings before pushing the branch, creating a PR, and merging without per-change confirmation. GitHub required checks and reviews must still pass. Stop merging on failures, conflicts, or insufficient evidence.
-- This maintenance authorization applies only to this repository. The current product still requires per-candidate PR confirmation and disables automatic merging for managed projects; repository development instructions do not change those delivery settings.
+- This maintenance authorization applies only to this repository. The product defaults to local candidates. Other projects require their own explicit automatic PR/merge authorization; repository development instructions do not grant it.
 - These instructions do not configure GitHub branch protection. Maintainers should also configure rules for `main` requiring PRs, checks, and reviews on GitHub.
 - Use Chinese commit messages describing the behavior change, for example: `修复巡检任务重复入队的问题` (fix duplicate inspection tasks).
 - PR descriptions can be Chinese or English. Explain the problem, behavior change, verification, and known limitations.
@@ -37,6 +37,6 @@ Do not commit credentials, authenticated session URLs, local state, databases, b
 
 For scheduler, isolation, budget, acceptance, or promotion changes, explain their effect on existing boundaries. Model success claims cannot replace fixed checks. Candidates must not modify protected evaluators. Do not claim recursive capability gains without independent evaluation.
 
-For bundles and update assets, see [RELEASING.en.md](RELEASING.en.md). Each candidate requires explicit user approval before PR creation.
+For bundles and update assets, see [RELEASING.en.md](RELEASING.en.md). Automatic PRs and merging require explicit project authorization and all delivery gates.
 
 Contributions are provided under the repository's MIT license.

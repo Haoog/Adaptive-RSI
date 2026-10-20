@@ -10,12 +10,15 @@ def quality_summary(store):
         if run["source"].startswith("system_"):
             continue
         item = projects.setdefault(run["project"], {"project": run["project"], "runs": 0, "passed": 0,
-                                                    "evaluated": 0, "reviewed": 0, "review_blocked": 0, "repeat_failures": 0})
+                                                    "evaluated": 0, "reviewed": 0, "review_blocked": 0, "repeat_failures": 0, "postmerge_verified": 0, "postmerge_regressed": 0})
         item["runs"] += 1
         if run["state"] in ["failed", "blocked", "insufficient_evidence"]:
             key = (run["project"], run["task"])
             failures[key] = failures.get(key, 0) + 1
         result = json.loads(run["result"])
+        feedback = result.get("feedback", {}).get("state")
+        if feedback in ["verified", "regressed"]:
+            item["postmerge_" + feedback] += 1
         if result.get("evaluation"):
             item["evaluated"] += 1
         if result.get("evaluation", {}).get("decision") == "pass" and result.get("review", {}).get("decision") == "pass":

@@ -4,6 +4,20 @@
 
 Version: 0.2.0. Host: macOS / Python 3.9.6 / Node 20.20.2 / Git 2.54.0.
 
+
+## Autonomous delivery acceptance (current final result)
+
+- **111 tests passed** in the complete suite, including pause-control, pinned-target and stale-candidate regressions; JavaScript syntax, Python compilation, plugin ZIP and wheel builds passed.
+- The final targeted independent review passed with no remaining blockers; [review evidence](docs/validation/code-review-20261020.json). Additional fixes seal delivery targets, reject external merges into other branches, normalize historical scheduling credits, persist long failure reports and pin post-merge monitoring to its original branch.
+- Independent review found and prompted fixes for writable native Git metadata, lost merge metadata after feedback errors, local/remote deferred-baseline mismatch and PR retargeting. Regression checks cover real sandbox isolation, host Git filters, retryable feedback failures, remote baselines and changed PR targets.
+- Frozen original regression, full candidate tests and sealed pre-implementation acceptance run together; newly failing tests cannot disappear under harness freezing. Acceptance design runs in a separate snapshot whose artifacts never enter the implementer workspace.
+- PR tracking, post-merge checks and deferred reassessment share project locks and global fair scheduling through queued jobs, keeping expensive checks out of the scheduler thread.
+- **Two real-model / GitHub CI / automatic PR / automatic merge / post-merge verification rounds completed.** Round two starts from round one's merge SHA. The independent private fixture repository is paused afterward; no projects were enabled in the user's service. See [live validation](LIVE_VALIDATION.en.md) and [sanitized evidence](docs/validation/autonomous-loop-20261020.json).
+- Playwright verified saved project delivery modes, merge authorization and weights; English at 390 pixels has no horizontal overflow. Screenshot: `output/playwright/delivery-controls-mobile-en.png`. Earlier visual checks remain below.
+
+The following sections preserve earlier-stage observations. Their old delivery boundaries and statements that no real models were called describe those earlier stages; this section and the live-validation report describe the current result.
+
+
 ## Executed checks
 
 - `python3 -m unittest discover -v`: **83 tests passed**. Raw output is in `output/test-results.txt` in the development checkout.
