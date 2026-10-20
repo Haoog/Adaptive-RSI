@@ -4,10 +4,16 @@ import re
 from urllib.parse import urlsplit
 
 
+BUILTIN_PROVIDERS = [
+    {"id": "openai", "name": "Codex", "protocol": "codex_login", "base_url": "", "env_key": ""},
+    {"id": "ollama", "name": "Ollama", "protocol": "ollama", "base_url": "http://127.0.0.1:11434", "env_key": ""},
+    {"id": "lmstudio", "name": "LM Studio", "protocol": "chat_completions", "base_url": "http://127.0.0.1:1234/v1", "env_key": ""},
+]
+
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
     "schedule": {"light_minutes": 120, "issues_minutes": 60, "deep_minutes": 4320,
-                 "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
+                 "weight": 1, "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
     "providers": [],
     "models": {
         "analysis": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
@@ -17,6 +23,8 @@ DEFAULTS = {
         "evolution": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
     },
     "review": {"block_on": "medium"},
+    "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
+    "updates": {"mode": "notify", "interval_minutes": 1440},
     "limits": {"daily_calls": 30, "run_calls": 5, "run_seconds": 1800,
                "command_seconds": 300, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 40, "retention_days": 30},
@@ -24,7 +32,7 @@ DEFAULTS = {
                 "cpus": 2, "pids": 128},
     "github": {"repository": "", "labels": [], "exclude_labels": ["wontfix", "duplicate"],
                "max_issues": 100},
-    "delivery": {"mode": "local", "auto_merge": False, "base_branch": ""},
+    "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -64,8 +72,8 @@ def validate(config):
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
     for provider in config["providers"]:
-        if not isinstance(provider, dict) or set(provider) != {"id", "name", "base_url", "env_key"}:
-            raise ValueError("Provider requires only id, name, base_url, env_key; never store API keys")
+        if not isinstance(provider, dict) or set(provider) - {"id", "name", "base_url", "env_key", "protocol", "credential", "secret_ref"} or not {"id", "name", "base_url", "env_key"}.issubset(provider):
+            raise ValueError("Provider requires id, name, base_url, env_key and optional protocol; never store API keys")
         if not all(isinstance(value, str) for value in provider.values()):
             raise ValueError("Provider fields must be strings")
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", provider["id"]) or provider["id"] in providers:
@@ -81,6 +89,16 @@ def validate(config):
             raise ValueError("Provider requires a short display name")
         if provider["env_key"] and not re.fullmatch(r"[A-Z_][A-Z0-9_]*", provider["env_key"]):
             raise ValueError("env_key must be an environment variable name, not a secret")
+        if provider.get("protocol", "codex") not in ["codex", "responses", "chat_completions", "anthropic", "gemini", "ollama"]:
+            raise ValueError("Unsupported model protocol")
+        mode = provider.get("credential", "env")
+        if mode not in ["env", "keychain", "session", "none"]:
+            raise ValueError("Unsupported credential mode")
+        if mode in ["keychain", "session"]:
+            if provider["env_key"] or not re.fullmatch(r"[a-f0-9]{32}", provider.get("secret_ref", "")):
+                raise ValueError("Stored credentials require a reference, not an environment variable or key")
+        elif provider.get("secret_ref"):
+            raise ValueError("Unexpected credential reference")
     for role, route in config["models"].items():
         for item in [route, route.get("fallback")]:
             if item is None:
@@ -98,6 +116,10 @@ def validate(config):
                 raise ValueError("Luna supports max, not ultra")
     if config["review"]["block_on"] not in ["low", "medium", "high"]:
         raise ValueError("Review blocking threshold must be low, medium or high")
+    if not config["triage"]["policy"].strip() or len(config["triage"]["policy"]) > 4000:
+        raise ValueError("Triage policy requires 1..4000 characters")
+    if config["updates"]["mode"] not in ["manual", "notify", "automatic"] or not 60 <= config["updates"]["interval_minutes"] <= 525600:
+        raise ValueError("Invalid update mode or interval (minimum 60 minutes)")
     for name in ["light_minutes", "issues_minutes", "deep_minutes"]:
         if not 5 <= config["schedule"][name] <= 525600:
             raise ValueError(name + " must be between 5 and 525600")
@@ -126,10 +148,16 @@ def validate(config):
     for field in ["labels", "exclude_labels"]:
         if not all(isinstance(x, str) and len(x) <= 100 for x in config["github"][field]):
             raise ValueError("Invalid issue labels")
-    if config["delivery"]["mode"] not in ["local", "pr"]:
-        raise ValueError("Delivery mode must be local or pr")
-    if config["delivery"]["auto_merge"] and config["delivery"]["mode"] != "pr":
-        raise ValueError("Auto merge requires PR delivery")
+    if not 1 <= config["schedule"]["weight"] <= 10:
+        raise ValueError("Project weight must be 1..10")
+    delivery = config["delivery"]
+    if delivery["mode"] not in ["local", "pr"] or delivery["auto_merge"] and delivery["mode"] != "pr":
+        raise ValueError("Automatic merge requires PR delivery")
+    if not 5 <= delivery["feedback_minutes"] <= 525600:
+        raise ValueError("Feedback interval must be at least 5 minutes")
+    if delivery["base_branch"] and (delivery["base_branch"].startswith("-") or
+            not re.fullmatch(r"[A-Za-z0-9._/-]+", delivery["base_branch"]) or ".." in delivery["base_branch"]):
+        raise ValueError("Invalid base branch")
     for path in config["environment"]["seed_paths"]:
         relative_path(path)
         if path in [".", ""]:

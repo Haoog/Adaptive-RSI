@@ -1,0 +1,226 @@
+{
+  "date": "2026-10-20",
+  "fixture_repository": "Haoog/adaptive-rsi-validation-20261020",
+  "visibility": "private",
+  "runs": [
+    {
+      "id": "3130ce7f9cd64518",
+      "base": "87e5cd5a95badbe2378df314531fea2b540d2158",
+      "calls": 4,
+      "tokens": 573678,
+      "pr": "https://github.com/Haoog/adaptive-rsi-validation-20261020/pull/1",
+      "merged_sha": "b9ef6307ab42f55a769e7e97e9eba763d3ece11f",
+      "evaluation": "pass",
+      "check_groups": {
+        "acceptance_baseline": [
+          {
+            "name": "Public addition behavior and preserved signature",
+            "passed": false
+          },
+          {
+            "name": "Project regression tests pass correct addition and reject subtraction and category-specific faults",
+            "passed": false
+          },
+          {
+            "name": "Required unittest discovery command passes",
+            "passed": true
+          },
+          {
+            "name": "CI workflow matches baseline bytes",
+            "passed": true
+          }
+        ],
+        "acceptance_candidate": [
+          {
+            "name": "Public addition behavior and preserved signature",
+            "passed": true
+          },
+          {
+            "name": "Project regression tests pass correct addition and reject subtraction and category-specific faults",
+            "passed": true
+          },
+          {
+            "name": "Required unittest discovery command passes",
+            "passed": true
+          },
+          {
+            "name": "CI workflow matches baseline bytes",
+            "passed": true
+          }
+        ],
+        "baseline": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ],
+        "candidate": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ],
+        "candidate_full": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ]
+      },
+      "review": "pass",
+      "feedback": {
+        "state": "verified",
+        "head": "50a5c818aa08944722e028d03319ecfa736419e1",
+        "checked_at": 1792464526.0437
+      },
+      "models": [
+        {
+          "role": "planning",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 101734,
+          "seconds": 24.539928197860718
+        },
+        {
+          "role": "acceptance",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 174612,
+          "seconds": 100.99897885322571
+        },
+        {
+          "role": "implementation",
+          "model": "gpt-6-luna",
+          "effort": "max",
+          "state": "completed",
+          "tokens": 143554,
+          "seconds": 29.75994372367859
+        },
+        {
+          "role": "review",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 153778,
+          "seconds": 32.903411865234375
+        }
+      ]
+    },
+    {
+      "id": "e538afc002374ac1",
+      "base": "b9ef6307ab42f55a769e7e97e9eba763d3ece11f",
+      "calls": 4,
+      "tokens": 515960,
+      "pr": "https://github.com/Haoog/adaptive-rsi-validation-20261020/pull/2",
+      "merged_sha": "50a5c818aa08944722e028d03319ecfa736419e1",
+      "evaluation": "pass",
+      "check_groups": {
+        "acceptance_baseline": [
+          {
+            "name": "Public subtraction returns correct signed, zero, and decimal results",
+            "passed": false
+          },
+          {
+            "name": "Repository regression tests exercise every required subtraction case and reject incorrect results",
+            "passed": false
+          },
+          {
+            "name": "Addition behavior and all five original addition tests remain effective",
+            "passed": true
+          },
+          {
+            "name": "Standard unittest discovery succeeds",
+            "passed": true
+          },
+          {
+            "name": "CI workflow configuration matches the inspected baseline",
+            "passed": true
+          }
+        ],
+        "acceptance_candidate": [
+          {
+            "name": "Public subtraction returns correct signed, zero, and decimal results",
+            "passed": true
+          },
+          {
+            "name": "Repository regression tests exercise every required subtraction case and reject incorrect results",
+            "passed": true
+          },
+          {
+            "name": "Addition behavior and all five original addition tests remain effective",
+            "passed": true
+          },
+          {
+            "name": "Standard unittest discovery succeeds",
+            "passed": true
+          },
+          {
+            "name": "CI workflow configuration matches the inspected baseline",
+            "passed": true
+          }
+        ],
+        "baseline": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ],
+        "candidate": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ],
+        "candidate_full": [
+          {
+            "name": "项目完整测试",
+            "passed": true
+          }
+        ]
+      },
+      "review": "pass",
+      "feedback": {
+        "state": "verified",
+        "head": "50a5c818aa08944722e028d03319ecfa736419e1",
+        "checked_at": 1792464526.0437
+      },
+      "models": [
+        {
+          "role": "planning",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 82766,
+          "seconds": 26.85997486114502
+        },
+        {
+          "role": "acceptance",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 125914,
+          "seconds": 103.52512216567993
+        },
+        {
+          "role": "implementation",
+          "model": "gpt-6-luna",
+          "effort": "max",
+          "state": "completed",
+          "tokens": 166245,
+          "seconds": 25.071030139923096
+        },
+        {
+          "role": "review",
+          "model": "gpt-6.1-sol",
+          "effort": "high",
+          "state": "completed",
+          "tokens": 141035,
+          "seconds": 40.32843089103699
+        }
+      ]
+    }
+  ],
+  "scope": "Small controlled Python fixtures, real model sessions and GitHub CI/PR/merge. Local fault injection is separate from live provider validation."
+}

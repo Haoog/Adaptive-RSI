@@ -33,8 +33,8 @@ def doctor():
     if result["sandbox-exec"]:
         probe = run_process(["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "/usr/bin/true"], timeout=5)
         result["seatbelt_working"] = probe["exit_code"] == 0
-    result["models"] = "Validated per invocation by Codex; no paid probe or silent substitution"
-    result["worker_support"] = "macOS Seatbelt; other platforms currently analysis/config only"
+    result["models"] = "Codex and native protocol routes validated per invocation; no paid probe or silent substitution"
+    result["worker_support"] = "Codex: macOS Seatbelt; native APIs: host-controlled tools with Seatbelt/Docker for commands and checks"
     return result
 
 
@@ -44,7 +44,7 @@ def api(root, path, data=None):
     if data is not None:
         headers.update({"Content-Type": "application/json", "Origin": session["origin"], "X-RSI-CSRF": session["csrf"]})
     request = urllib.request.Request(session["origin"] + path, data=json.dumps(data).encode() if data is not None else None, headers=headers)
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=200 if path == "/api/projects/import" else 20) as response:
         return json.load(response)
 
 
@@ -56,6 +56,14 @@ def main(argv=None):
     serve = sub.add_parser("serve", help="Run scheduler and authenticated local control panel")
     serve.add_argument("--port", type=int, default=0)
     serve.add_argument("--open", action="store_true")
+    serve.add_argument("--restart-session", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("update-worker", help=argparse.SUPPRESS)
+    update = sub.add_parser("update", help="Check or apply an official release")
+    update.add_argument("action", choices=["check", "apply"])
+    update.add_argument("--confirm", action="store_true")
+    imports = sub.add_parser("import", help="Import separate projects from GitHub URLs (paused)")
+    imports.add_argument("urls", nargs="+")
+    imports.add_argument("--directory")
     sub.add_parser("doctor")
     sub.add_parser("open")
     sub.add_parser("status")
@@ -94,12 +102,21 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "update-worker":
+            from .updates import supervise_restart
+            supervise_restart(root)
+            return
         if args.command == "serve":
             store = Store(root)
             runtime = Runtime(store)
+            session = None
+            if args.restart_session:
+                session = json.loads((root / "restart-session.json").read_text())
+                (root / "restart-session.json").unlink()
+                runtime.updates.installing = True
             runtime.start()
             try:
-                server = Server(runtime, args.port)
+                server = Server(runtime, args.port, session=session)
                 session = {"origin": server.origin, "cookie": server.cookie, "token": server.token, "csrf": server.csrf, "url": server.url, "pid": os.getpid()}
                 session_file = root / "server.json"
                 session_file.write_text(json.dumps(session))
@@ -110,13 +127,27 @@ def main(argv=None):
                 def shutdown(*unused):
                     runtime.stop.set()
                     threading.Thread(target=server.shutdown, daemon=True).start()
+                runtime.updates.shutdown = shutdown
                 signal.signal(signal.SIGTERM, shutdown)
                 signal.signal(signal.SIGINT, shutdown)
                 server.serve_forever(poll_interval=0.3)
                 server.server_close()
             finally:
                 runtime.close()
-                (root / "server.json").unlink(missing_ok=True)
+                session_file = root / "server.json"
+                if session_file.exists() and json.loads(session_file.read_text()).get("pid") == os.getpid():
+                    session_file.unlink(missing_ok=True)
+            return
+        if args.command == "import":
+            results = []
+            for url in args.urls:
+                results.append({"url": url, **api(root, "/api/projects/import", {"url": url, "directory": args.directory})})
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+            return
+        if args.command == "update":
+            if args.action == "apply" and not args.confirm:
+                raise ValueError("Use update apply --confirm to install and restart when idle")
+            print(json.dumps(api(root, "/api/updates/" + args.action, {"confirm": args.confirm}), ensure_ascii=False))
             return
         if args.command == "open":
             session = json.loads((root / "server.json").read_text())

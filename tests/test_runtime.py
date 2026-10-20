@@ -53,7 +53,13 @@ class FakeAgent:
         self.roles.append((role, config["models"][role]))
         if role == "planning":
             return {"decision": "ready", "reason": "Verified arithmetic defect", "scope": ["calculator.py", "tests"],
-                    "acceptance": ["2 + 3 equals 5"], "risk": "low"}
+                    "acceptance": ["2 + 3 equals 5"], "risk": "low", "value": {
+                        "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Restore arithmetic correctness",
+                        "cost": "One operator change and regression verification", "inaction": "Addition continues returning wrong values",
+                        "evidence": ["calculator.py:2 subtracts; 2 + 3 returns -1"]}}
+        if role == "acceptance":
+            return {"files": [{"path": ".rsi-acceptance/check.py", "content": "from calculator import add\nassert add(2, 3) == 5\n"}],
+                    "checks": [{"name": "independent addition", "argv": ["python3", "-c", "exec(open('.rsi-acceptance/check.py').read())"], "criteria": [0]}]}
         if role == "implementation":
             if self.malicious:
                 (workspace / "tests/test_calculator.py").write_text("import unittest\nclass Fake(unittest.TestCase):\n    def test_fake(self): pass\n")
@@ -185,9 +191,9 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(evaluation["checks"]["candidate"][0]["passed"])
         self.assertEqual((self.repo / "notes.txt").read_text(), "uncommitted user work")
         self.assertIn("a - b", (self.repo / "calculator.py").read_text())
-        self.assertEqual([r[0] for r in self.agent.roles], ["planning", "implementation", "review"])
-        self.assertEqual(self.agent.roles[1][1]["model"], "gpt-6-luna")
-        self.assertEqual(self.agent.roles[1][1]["effort"], "max")
+        self.assertEqual([r[0] for r in self.agent.roles], ["planning", "acceptance", "implementation", "review"])
+        self.assertEqual(self.agent.roles[2][1]["model"], "gpt-6-luna")
+        self.assertEqual(self.agent.roles[2][1]["effort"], "max")
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_fake_agent_success_cannot_replace_original_tests(self):
@@ -320,6 +326,7 @@ Path(%r).write_text('allowed output')
             self.runtime.sync_issues(self.runtime.project(self.project), config)
             self.assertEqual(len(self.store.query("SELECT * FROM tasks WHERE source='issue'")), 1)
             self.assertIn("--search", [args for args in calls if args[1] == "issue"][1])
+            self.store.execute("UPDATE tasks SET state='deferred' WHERE source='issue'")
             issue["state"] = "CLOSED"
             self.runtime.sync_issues(self.runtime.project(self.project), config)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE source='issue'")["state"], "obsolete")
@@ -483,7 +490,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                 "models": {"implementation": {"provider": "gateway", "model": "qwen/coder:latest", "effort": "default"}}})
             with patch.dict(os.environ, {"RSI_MODEL_KEY": "test-secret-never-in-arguments"}), \
                  patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
-                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
                  patch("adaptive_rsi.agent.run_process", side_effect=provider):
                 agent = CodexAgent(store)
                 agent.invoke("implementation", "task", workspace, "project", "run", config)
@@ -512,13 +519,13 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                 return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
             config = validate({"models": {"implementation": {"fallback": {"provider": "lmstudio", "model": "other-coder", "effort": "default"}}}})
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
-                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
                  patch("adaptive_rsi.agent.run_process", side_effect=provider):
                 CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", config)
             self.assertEqual([c["state"] for c in store.query("SELECT state FROM calls ORDER BY rowid")], ["failed", "completed"])
             self.assertIn("lmstudio", commands[1])
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
-                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=RuntimeError("sandbox unavailable")):
+                 patch("adaptive_rsi.agent.Sandbox.codex_permissions", side_effect=RuntimeError("sandbox unavailable")):
                 with self.assertRaisesRegex(RuntimeError, "sandbox unavailable"):
                     CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
             self.assertEqual(store.query("SELECT state FROM calls ORDER BY rowid")[-1]["state"], "failed")
@@ -526,7 +533,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                 Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":42}')
                 return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
-                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
                  patch("adaptive_rsi.agent.run_process", side_effect=malformed_output):
                 with self.assertRaisesRegex(RuntimeError, "invalid structured output"):
                     CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
@@ -544,14 +551,15 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                 output.write_text('{"summary":"done"}')
                 return {"exit_code": 0, "error": None, "stderr": "", "stdout": '{"type":"turn.completed","usage":{"input_tokens":50,"output_tokens":10}}\n'}
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
-                 patch("adaptive_rsi.agent.Sandbox.worker", side_effect=lambda argv, *a, **kw: argv), \
+                 patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
                  patch("adaptive_rsi.agent.run_process", side_effect=provider):
                 result = CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
             self.assertEqual(result, {"summary": "done"})
             args = commands[0]
             self.assertEqual(args[args.index("--model") + 1], "gpt-6-luna")
             self.assertIn('model_reasoning_effort="max"', args)
-            self.assertEqual(args[args.index("--sandbox") + 1], "workspace-write")
+            self.assertIn('default_permissions="rsi"', args)
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
             self.assertIn("--ignore-user-config", args)
             self.assertEqual(store.one("SELECT tokens FROM calls")["tokens"], 60)
 
@@ -572,6 +580,16 @@ class ServerTest(unittest.TestCase):
 
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
+
+    def test_loopback_startup_does_not_depend_on_reverse_dns(self):
+        with patch("socket.getfqdn", side_effect=OSError("reverse DNS unavailable")):
+            server = Server(self.runtime)
+        try:
+            self.assertEqual(server.server_name, "localhost")
+            self.assertGreater(server.server_port, 0)
+            self.assertEqual(server.origin, "http://127.0.0.1:" + str(server.server_port))
+        finally:
+            server.server_close()
 
     def test_local_api_requires_authentication_origin_and_csrf(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:

@@ -2,9 +2,9 @@
 
 [简体中文](README.md) | **English**
 
-A local autonomous improvement runtime for Codex: **code inspection, user goals, and GitHub Issues → task queue → planning → isolated implementation → independent verification → local candidate / PR → memory and the next round**.
+A local autonomous improvement runtime for Codex: **code inspection, user goals, and GitHub Issues → task queue → value assessment → planning → isolated implementation → independent checks and review → local candidate → project-authorized delivery → post-merge verification → memory and the next round**.
 
-Includes a plugin entry point, persistent scheduler, SQLite state and session budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
+Includes a plugin entry point, persistent scheduler, SQLite state and call budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
 ## Workflow
 
@@ -15,14 +15,20 @@ flowchart TD
     U[User goals at any time] --> Q[Task queue: verify, deduplicate, prioritize]
     I --> Q
     G --> Q
-    M[Memory: evidence, failures, verified strategies] --> P[Planner: acceptance, scope, risk]
+    M[Memory: evidence, failures, verified strategies] --> P[Planner: benefit, evidence, cost, risk and inaction]
     Q --> P
-    P --> W[Executor: isolated snapshot at a fixed commit]
-    W --> T[Host checks: frozen harness, baseline and candidate regression]
+    P --> B{Worth doing with sufficient evidence?}
+    B -->|Execute| W[Independent acceptance design → executor at latest base commit]
+    B -->|Defer or reject| Z[Save decision and evidence]
+    Z --> M
+    W --> T[Host checks: frozen regression, full candidate suite, independent acceptance]
     T --> R[Independent review: correctness, security, maintainability, architecture, tests, scope]
     R --> D{Both checks and review pass?}
-    D -->|Yes| C[Local candidate / create PR]
-    C --> A[Human approval or controlled auto-merge]
+    D -->|Yes| C[Local patch and verification evidence]
+    C --> A[Project-authorized PR or per-candidate confirmation]
+    A --> J[Verify exact head, current base, CI and required reviews]
+    J --> K[Authorized merge and post-merge verification]
+    K --> M
     T -->|Failure or insufficient evidence| F[Keep evidence, bounded retry or attention]
     D -->|No| F
     A --> M
@@ -36,7 +42,7 @@ flowchart TD
     N --> M
 ```
 
-The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. Automatic PR creation and merging are separate settings. Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
+The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. Delivery defaults to local candidates. Projects can explicitly authorize automatic PRs and merging. Missing or failed CI, required reviews, changed commits and conflicts block merging; admin bypass is never used. Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
 
 ## Code quality gates
 
@@ -46,28 +52,55 @@ The default threshold blocks **medium and above**, configurable to high or low. 
 
 Maintainability review covers duplication, unnecessary abstraction, complex branches, coupling, naming and project conventions. It targets introduced issues without demanding unrelated refactoring. Add project lint, type, complexity or dependency checks to `checks` for deterministic gates alongside tests; the runtime does not automatically impose a static-analysis tool suite. Model review can miss problems and cannot guarantee code quality.
 
-Both ordinary tasks and strategy replay use these gates. Paired experiments review both variants and count review costs symmetrically. The default experiment session cap is now 40; the project daily cap remains 30. Check both before a formal experiment. Exhaustion stops work without silently increasing limits.
+Both ordinary tasks and strategy replay use these gates. Paired experiments review both variants and count review costs symmetrically. The default experiment call cap is 40; the project daily cap remains 30. Check both before a formal experiment. Exhaustion stops work without silently increasing limits.
 
-## Non-GPT models and providers
+## Decide whether work is worthwhile
 
-Codex CLI still supplies execution tools, while each role can choose its own model and provider, including non-GPT models:
+User goals, inspections and Issues share one value gate. Planning checks current behavior, duplicates and existing fixes, then records benefit, impact, cost, confidence, concrete evidence and the consequence of doing nothing:
 
-| Route | Configuration | Requirements |
+- **Execute:** evidence and value justify the cost, with bounded scope and observable acceptance criteria.
+- **Defer:** unclear requirements, weak evidence or low current priority. Reassess only after a baseline commit, evidence or value-policy change, avoiding repeated model spending.
+- **Reject:** cosmetic churn, disproportionate cost or conflicting direction. Keep the reason; the user may explicitly reconsider it.
+
+The host holds execution suggestions with low confidence, missing evidence or low impact combined with high effort. Edit the policy in Settings and inspect decisions in task details. Model judgment can still be wrong; this gate does not guarantee objective benefit.
+
+## Official APIs, gateways and local models
+
+Choose models per role using either Codex execution or host-controlled native API execution:
+
+| Protocol / route | Services | Example base URL |
 | --- | --- | --- |
-| OpenAI / Codex | `provider: "openai"`, default | Existing Codex authentication |
-| Local Ollama | `provider: "ollama"` | Codex OSS mode, available local model and tool use |
-| Local LM Studio | `provider: "lmstudio"` | Same; start the service first |
-| Third-party gateway / self-hosted service | Register a provider, then select its ID | Responses streaming protocol, tools and structured output |
+| Codex CLI | Default OpenAI/Codex, Codex-compatible gateways, local OSS | Codex authentication or compatible Responses endpoint |
+| Responses | OpenAI API, compatible gateways | `https://api.openai.com/v1` |
+| Chat Completions | DeepSeek, compatible Qwen/other endpoints, gateways, LM Studio | `https://api.deepseek.com` |
+| Anthropic Messages | Anthropic API, compatible gateways | `https://api.anthropic.com/v1` |
+| Gemini GenerateContent | Google API, compatible gateways | `https://generativelanguage.googleapis.com/v1beta` |
+| Native Ollama | Local tool-capable models | `http://127.0.0.1:11434` |
 
-Native Anthropic Messages, Gemini GenerateContent and Chat-Completions-only endpoints are **not directly connected**; they need a compatible gateway. A model name alone does not establish support for specific Claude, Gemini, DeepSeek or Qwen versions. The first real invocation establishes compatibility; no silent substitution occurs.
+Native routes supply host-controlled read, search, edit and sandbox command tools without requiring Codex CLI. Planning and review are read-only; implementation can write and execute. Models must support tools and the required structured result. Text-only models cannot execute these roles. **Protocol support does not establish tested compatibility with every vendor, model version or gateway.** Non-standard APIs still need adapters.
 
-In **Settings → Models & reasoning effort**, add providers, edit endpoints, choose each role's provider/model, and set the review threshold. Prefer `default` for local or third-party models to omit the explicit GPT reasoning-effort parameter. Explicit effort settings must be supported by the service.
+**Model center** in the sidebar has **Providers & models** and **Role assignments** pages. Add multiple independent connections for official APIs, gateways or local services. Presets fill the endpoint and protocol; advanced settings support custom protocols.
 
-Example configuration (use the model ID offered by your service):
+1. Add a connection with a name, endpoint and API key, then **Save & fetch models**. macOS defaults to Keychain; other systems can use process memory or environment variables. Keys entered in the UI are available immediately without restart. The form clears after submission; keys are not placed in browser local storage or returned in API responses.
+2. Fetch a shared directory per connection, search, enable models or add custom IDs. Directories, timestamps and preferences persist in local state across reloads and restarts. Failed refreshes keep the old directory. Missing models are marked without replacing existing assignments. Endpoint, protocol or credential-version changes invalidate old directories and test evidence.
+3. In **Role assignments**, choose from searchable provider groups and save. Supported efforts from directory metadata are shown when available; unknown support defaults to provider settings. Responses / Chat Completions / Codex routes allow explicit effort overrides and fallback routes in advanced parameters. Native Anthropic, Gemini and Ollama retain `default`. Default planning/review remains `gpt-6.1-sol / high`, implementation `gpt-6-luna / max`.
+4. Select global defaults or project overrides using **Scope**. Directory preferences and assignments are saved independently per project. Saving **Inherit global configuration** removes project role overrides so later global changes propagate. Connections referenced by a role or fallback cannot be removed.
+
+The default Codex route reads [App Server `model/list`](https://developers.openai.com/codex/app-server#list-models-modellist). Responses, Chat Completions, Codex-compatible gateways and Anthropic use `/models`; Gemini uses `/models` and filters entries explicitly lacking `generateContent`; Ollama uses `/api/tags`; LM Studio uses `/v1/models`. Pagination fetches up to 1,000 entries per refresh while retaining prior and custom entries. Explicit image/embedding and other non-coding types cannot be enabled; unknown capabilities are not assumed to be supported.
+
+Fetching a directory starts no inference task and consumes no model-call budget. **Test** explicitly runs a basic tool-call and structured-output check. Its dialog explains possible charges; calls count toward the current project or global test scope's daily limit and record actual tokens. No project code is sent; software updates wait for tests to finish. Credentials, directory and test states are distinct. **Passing this check does not establish real project capability or support for other effort settings.**
+
+Model lists support favorites, enabled-only filtering, search and 20 entries per page; role pickers also filter by provider. Advanced parameters provide visual fallback provider/model/effort controls, and role drafts can be discarded. Each role shows draft inheritance, fallback routing and the tool-test status for its exact effort.
+
+Tool-test outcomes are retained per effort with timestamps. Failure invalidates only that effort's old pass proof. Authentication, rate limits, connection errors, missing models and tool-format failures have distinct diagnostics. Three consecutive authentication/rate-limit/connection failures pause further inference for that project and connection version, including across restarts. Check the connection and explicitly resume it in Model Center. Budgets, code checks and tool-format failures do not count as provider outages. Directory requests remain available for diagnosis. Connection changes start separate health records. Explicit fallbacks retain workspace and delivery protections.
+
+Optional blended USD prices per million total tokens are frozen on each call. Blank means unknown; later price edits do not alter history. Estimates do not separate input/output/cache rates, establish a hard monetary limit, or represent invoices; missing provider usage can understate costs. The overview separates 24-hour calls, tokens, duration, failures and estimates, showing unpriced calls. Without a project it shows global model-test usage.
+
+Task cards expose planned benefit, cost, evidence and scope, retained through execution. Thirty-day quality indicators use runs with acceptance evidence, reviewed runs and repeatedly failing tasks; system inspections are excluded from code-task successes. These statistics do not establish improved capabilities. See [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md) for live validation.
 
 ```json
 {
-  "providers": [{"id":"gateway","name":"My model gateway","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],
+  "providers": [{"id":"gateway","name":"My model gateway","protocol":"chat_completions","base_url":"https://models.example.com/v1","env_key":"RSI_MODEL_API_KEY"}],
   "models": {
     "implementation": {"provider":"gateway","model":"your-coder-model","effort":"default"},
     "review": {"provider":"openai","model":"gpt-6.1-sol","effort":"high"}
@@ -75,17 +108,19 @@ Example configuration (use the model ID offered by your service):
 }
 ```
 
-`env_key` is an **environment variable name**, never a key value. Supply it through the runtime service's launch environment; restart an existing service to inherit changes. Provider settings, database fields and command arguments do not store key values. Model workers inherit the launch environment; project checks use isolated environments. Do not paste keys into project files or the dashboard. Remote endpoints require HTTPS; loopback permits HTTP. An unauthenticated local service may use an empty `env_key`. Provider lists replace the entire list and IDs must be unique.
+The JSON example uses an environment variable: `env_key` is its **name**, never a key value. Changing the service environment still requires restart. Keychain/session modes store only `credential` and a random `secret_ref` in configuration. Session keys must be entered again after restart. Keychain storage is namespaced by local state directory; raw keys are not written to settings, database, events or command arguments. Native command tools/checks do not inherit keys. Codex-compatible routes receive them through a dedicated process environment variable. Remote endpoints require HTTPS; loopback allows HTTP. Select **No key required** for anonymous local services. Provider lists replace the entire list; IDs must be unique. Legacy providers without `protocol` retain Codex routing.
 
-Explicit fallback routes can cross providers, for example:
+Explicit cross-provider fallback is available through advanced configuration:
 
 ```json
 {"models":{"implementation":{"fallback":{"provider":"ollama","model":"your-local-coder","effort":"default"}}}}
 ```
 
-Only provider/model availability or rate-limit errors trigger fallback. Failed checks and reviews cannot be bypassed by switching models. Each session records actual provider, model, effort and usage. Changing models, endpoints or review rules invalidates previous strategy compatibility evidence and requires revalidation.
+Only availability/rate-limit errors trigger fallback. Native execution cannot fall back after mutating tools, avoiding mixed partial implementations. Check/review failures cannot be bypassed by switching models. Calls record actual provider, model, effort and usage. Model, endpoint or review changes invalidate previous strategy compatibility evidence.
 
-Configuration reference: [official Codex advanced configuration](https://developers.openai.com/codex/config-advanced/). Parameter routing and deterministic substitutes have been tested; live third-party/local model execution has not.
+**Budget units differ:** Codex counts CLI sessions; native routes count each HTTP request, including tool round trips. Native execution usually needs higher per-run/daily limits. The existing default of 5 per run may be insufficient; adjust it deliberately. Limits never expand automatically, and paid connection tests never start automatically.
+
+Protocol references: [Responses tools](https://developers.openai.com/api/docs/guides/function-calling), [Anthropic tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [Gemini function calling](https://ai.google.dev/gemini-api/docs/function-calling). Local protocol fixtures pass; live vendor invocations remain unverified.
 
 ## Quick start
 
@@ -102,7 +137,7 @@ python3 -m adaptive_rsi serve --open
 python3 scripts/rsi doctor
 ```
 
-In **Add project**, enter the root of a Git repository with an existing commit. Review settings, then enable it. Projects start paused; registering one does not invoke a model. No initial goal is required.
+In **Add project**, choose a local Git repository or **GitHub URLs**, one repository per line. GitHub import uses your authenticated `gh`, clones separately and starts paused. Local repositories need an existing commit. Review settings, then enable each project. No initial goal is required.
 
 The dashboard defaults to Chinese. Select **English** in the top bar; the browser remembers the choice. Task content, model output, raw logs, and evidence retain their original language. CLI commands and configuration keys remain English.
 
@@ -111,20 +146,23 @@ State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_
 ## The improvement loop
 
 - **Scheduling:** light inspection every 120 minutes, incremental Issues sync every 60 minutes, and deep inspection every 4320 minutes. Configure time zone and working hours. Ready tasks continue without waiting for the next inspection. Light inspection skips model calls when the committed snapshot is unchanged; deep inspection rotates modules. Resume does not replay every missed trigger.
-- **Models:** analysis, planning, review, and improvement proposals use `gpt-6.1-sol / high`; implementation uses `gpt-6-luna / max`. CLI arguments enforce these routes. Fallbacks must be explicitly configured; failures are recorded. There is no paid availability probe: actual availability is established by the first invocation.
+- **Models:** analysis, planning, review, and improvement proposals use `gpt-6.1-sol / high`; implementation uses `gpt-6-luna / max`. The selected protocol enforces these routes. Fallbacks must be explicitly configured; failures are recorded. Paid probes never start automatically. Explicit tests are available in Model center; project acceptance still establishes real task capability.
 - **Task sources:** discovered tasks require verifiable references to existing code. User goals can enter at any time. Issues support label filters, update cursors, deduplication, closed-Issue checks, and existing PR context. Issue text does not grant permissions.
 - **Isolation and verification:** each run uses clones of a fixed Git commit and leaves the user's worktree untouched. Implementation and review use separate sessions. The host freezes check commands and reruns baseline and candidate checks independently. Original tests and build entry points are restored from the baseline and protected against writes during checks. Model claims do not establish success. Missing checks, zero tests, or insufficient evidence block delivery.
-- **State and budgets:** service/project locks, atomic task claims, frozen configuration, reserved Codex sessions, daily/per-run limits, run and command timeouts, output limits, bounded backoff retries, pause/cancel, and fresh-snapshot recovery after crashes. Actual tokens and elapsed time are recorded; dollar costs are not invented. Limits count CLI sessions, each of which can include several reasoning turns, rather than individual API requests or a strict monetary budget.
-- **Delivery:** keep patches and verification evidence locally by default. Approve PR delivery per run or explicitly enable automatic PR creation. High-risk plans wait locally. Auto-merge requires a separate setting and uses GitHub auto-merge with commit matching. The runtime does not rewrite the user's repository or discard uncommitted work.
+- **State and budgets:** service/project locks, atomic task claims, frozen configuration, reserved model calls, daily/per-run limits, run and command timeouts, output limits, bounded backoff retries, pause/cancel, and fresh-snapshot recovery after crashes. Actual tokens and elapsed time are recorded; dollar costs are not invented. Codex counts CLI sessions, while native routes count HTTP requests; neither is a strict monetary budget.
+- **Delivery:** local candidates by default. Enable automatic PRs and merging explicitly per project. Both the saved run policy and current policy must authorize merging; revocation takes effect immediately. Global defaults and task overrides cannot grant delivery permissions. Legacy authorizations are revoked once; subsequent explicit project settings survive restarts.
+- **Baseline:** each GitHub run fetches the configured/default branch into an isolated cache. Execution and evaluation use the same SHA without changing the user's checkout or dirty files. Changed baselines stop old candidates and trigger bounded replanning.
+- **Fair scheduling:** persistent weighted rotation with waiting-time aging; project weights 1–10, default 1. All eligible projects update schedules before dispatch. Global concurrency and one active run per project remain enforced.
+- **Outcome feedback:** save merge SHA and recheck after merge and subsequent mainline changes (daily by default, minimum five minutes). Verified success, regression, insufficient evidence and reverts feed future value assessments. Reported recurrence reopens assessment; model reports do not become verified regressions. Investigation tasks carry bounded excerpts, and failed enqueue retries preserve completed feedback. Observation uses the artifact retention window, 30 days by default.
 - **Strategy evolution:** execution strategies, meta-strategies, and adapter guidance evolve as retrieved instructions. Candidates cannot change the controller, permissions, budgets, or evaluator. Validation and holdout tasks compare stable and candidate strategies in paired runs. Promotion requires improved quality, no observed regression, and acceptable time/token costs. Early monitored failures restore the previous stable strategy and invalidate its learned skills. Observations, verified skills, and failed candidates are stored separately.
 
 ## Environment and boundaries
 
-Full **model-worker execution currently requires macOS Seatbelt**, layered with Codex's workspace sandbox. Deterministic checks support Seatbelt or Docker. Linux and other POSIX hosts can serve the dashboard and detect code, but model workers are deliberately blocked. Windows hosting is not supported. Docker checks require a running daemon and a pre-pulled trusted image; containers have no network or host credentials and have CPU, memory, and process limits. The runtime does not automatically pull images or install dependencies.
+The fully supported execution environment is currently **macOS Seatbelt**. Codex workers require Seatbelt; native command tools and deterministic checks use Seatbelt or Docker. Linux can serve the dashboard, but native Docker execution has not been validated on a real Linux host and Codex workers are blocked. Windows hosting is unsupported. Docker requires a running daemon and pre-pulled trusted image, disables network/host credentials and limits resources. Images and dependencies are never fetched automatically.
 
 Adapters recognize Java/Kotlin (Maven, Gradle), JavaScript/TypeScript (npm, pnpm, Yarn), Python, Go, Rust, C/C++, .NET, PHP, Ruby, Swift/Objective-C, and Dart/Flutter, and analyze SQL, Shell, PowerShell, HTML/CSS, Docker, and CI configuration. Capability states distinguish unverified, analysis-only, and environment-blocked projects. Xcode, Make, and other project-specific builds need explicit commands. Uncached dependencies require environment preparation. Detection does not certify all builds for a language.
 
-Acceptance relies on fixed project checks. Configure appropriate checks where missing; model review cannot replace tests. Frozen tests, separate sessions, and OS sandboxes reduce tampering risk but are not a formal security proof against arbitrary malicious code. Codex CLI handles model authentication and networking. Code context goes to the selected provider under that provider's data policy. The runtime does not independently publish local dashboard data, logs, or memory.
+Acceptance relies on fixed project checks. Configure appropriate checks where missing; model review cannot replace tests. Frozen tests, separate sessions, and OS sandboxes reduce tampering risk but are not a formal security proof against arbitrary malicious code. The selected execution route handles model authentication and networking. Code context goes to the selected provider under that provider's data policy. The runtime does not independently publish local dashboard data, logs, or memory.
 
 Long-term recursive improvement requires real tasks and sustained experiments; this release does not claim to have demonstrated it. Without protected evaluation cases, candidates can be proposed and archived but **cannot be automatically promoted**. Scheduling is periodic or manual. There is no OS startup service or native Codex settings page.
 
@@ -134,6 +172,7 @@ Precedence: **task overrides > project overrides > global defaults**. Active run
 
 ```sh
 python3 scripts/rsi add /path/to/repository
+python3 scripts/rsi import https://github.com/owner/project-a https://github.com/owner/project-b
 python3 scripts/rsi status
 python3 scripts/rsi resume PROJECT_ID
 python3 scripts/rsi goal PROJECT_ID 'Fix pagination boundaries and add regression checks'
@@ -145,6 +184,8 @@ python3 scripts/rsi goal PROJECT_ID 'Improve error handling' --overrides '{"limi
 python3 scripts/rsi deliver RUN_ID
 python3 scripts/rsi retry TASK_ID
 python3 scripts/rsi rollback CANDIDATE_ID
+python3 scripts/rsi update check
+python3 scripts/rsi update apply --confirm
 ```
 
 Fixed checks use argument arrays, not shell concatenation:
@@ -160,6 +201,22 @@ Prepare dependencies in a trusted container image or explicitly select untracked
 ```
 
 `setup` accepts offline preparation commands in the same format as `checks`. External symlinks, missing dependencies, or failed preparation block execution. A pnpm directory linked to a global store or a virtual environment pointing outside the project may require a self-contained image. The runtime does not expose the entire home directory for compatibility.
+
+## Multiple isolated projects
+
+Each GitHub URL gets a project ID, separate clone, task queue, Issue cursor, configuration, daily budget, run evidence, memory and strategies. The default import location is `adaptive-rsi-projects/owner--repo` beside the state directory. Reimporting the same repository returns its existing project.
+
+Switch projects in the top bar. Global defaults and concurrency are shared; project overrides are separate. Nested directories are rejected. Model/check processes cannot read other registered repositories; command tools do not inherit provider secrets. Wait for active runs to finish before registering another project so every running worker has consistent isolation boundaries. This remains one local user/service, rather than a multi-tenant system.
+
+## User software updates
+
+Global update settings offer manual checks, notifications (default: every 1440 minutes), or automatic stable patch updates while idle. Automatic installation stays within one major/minor series, such as `0.2.0 → 0.2.1`; other versions require confirmation. Active work waits until idle.
+
+The updater downloads official ZIP/SHA-256 assets from this repository's GitHub Releases, validates paths/version/state compatibility, installs versioned directories, backs up SQLite, restarts and checks health. Failed startup restores previous code and database. Configuration, projects and history are preserved. Source checkouts are never updated with `git pull`. Checksums verify integrity; independent release signing is not implemented.
+
+This updates the runtime. Already loaded Codex skills/metadata still require marketplace refresh and a Codex restart. A lasting local marketplace installation may point at `~/.local/share/adaptive-rsi/installations/current`, available after the first successful managed update. Existing wheel entry points are not replaced: use plugin `scripts/rsi` / `scripts/start.py` or update the pip package. Local updater tests pass; **users receive an update only after a maintainer publishes the required release assets**. Power loss and supervisor crashes are outside the verified recovery scope.
+
+Maintainer instructions: [RELEASING.en.md](RELEASING.en.md).
 
 ## Independent evaluation cases
 
@@ -197,6 +254,14 @@ node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 ```
 
-Tests substitute the model interface while running real Git snapshots, SQLite concurrency, macOS sandbox checks, and regression checks. They do not consume model sessions or write to GitHub. Browser checks cover desktop/mobile layout and settings persistence. Live model authorization, long-running operation, and remote PR integration require a real project.
+The automated tests above substitute the model interface while running real Git snapshots, SQLite concurrency, macOS sandbox checks, and regression checks. They do not consume model sessions or write to GitHub. Browser checks cover desktop/mobile layout and settings persistence. Separately, an isolated Python fixture completed two rounds of real model calls, remote CI, automatic PR merging and post-merge checks. Other providers, languages and long-running operation still require scenario-specific validation.
 
 See [the validation report](VALIDATION.en.md) and [contribution guide](CONTRIBUTING.en.md).
+
+## Autonomous delivery loop
+
+Before implementation, a separate call using the planning model generates executable acceptance criteria. The host seals them outside implementer access. Frozen original regression, full candidate tests (including changed/new tests), and independent acceptance all must pass. Every planned criterion needs coverage. Model-generated acceptance can still be incomplete; review and real-task validation remain necessary.
+
+The repository, resolved target branch and SHA are sealed when a run starts. Changing targets cannot reuse old authorization; stale candidates replan within retry limits. Branches use `feat/rsi-*` or `fix/rsi-*`; commits and PR descriptions are Chinese. Squash merging requires the exact evaluated head, a current base, successful CI, GitHub mergeability and required reviews. GitHub rules remain the final gate. Enable strict required checks or a merge queue to close the race between checking the base and requesting merge. Failed CI retains the PR; stale PRs close and replan within retry limits. Restart recovery tracks existing PRs and resumes idempotent publishing without reusing interrupted, unverified implementation.
+
+Codex CLI must support named `permissions` profiles. macOS workers use Codex's own single Seatbelt layer; command tools cannot read controller data, other projects, Codex authentication or GitHub credentials, write `.git`, or access the network. Unsupported CLIs block explicitly rather than disabling isolation. Actual live evidence is recorded in [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md).

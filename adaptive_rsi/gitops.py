@@ -6,7 +6,10 @@ from .process import checked, scrub_tree
 
 
 def git(root, *args):
-    return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-C", str(root)] + list(args))
+    environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_TERMINAL_PROMPT": "0"}
+    return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
+                    "-C", str(root)] + list(args), env=environment)
 
 
 def repository(path):
@@ -55,3 +58,13 @@ def origin_repository(root):
         return match.group(1) if match else ""
     except RuntimeError:
         return ""
+
+
+def github_url(value):
+    import re
+    if not isinstance(value, str):
+        raise ValueError("Expected a GitHub repository URL")
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?", value.strip())
+    if not match or any(part in [".", ".."] for part in match.group(1).split("/")):
+        raise ValueError("Use a GitHub repository URL such as https://github.com/owner/repository")
+    return match.group(1), "https://github.com/" + match.group(1) + ".git"

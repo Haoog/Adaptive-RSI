@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 import sys
+import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from adaptive_rsi.cli import default_state
+from adaptive_rsi.updates import installed_root
+bootstrap = argparse.ArgumentParser(add_help=False)
+bootstrap.add_argument("--state-dir", type=Path, default=default_state())
+settings, _ = bootstrap.parse_known_args()
+sys.path.insert(0, str(installed_root(settings.state_dir.expanduser().resolve(), Path(__file__).resolve().parents[1])))
+# Import the managed version rather than the bootstrap package already loaded above.
+for name in list(sys.modules):
+    if name == "adaptive_rsi" or name.startswith("adaptive_rsi."):
+        del sys.modules[name]
 from adaptive_rsi.cli import main
 
 main()
