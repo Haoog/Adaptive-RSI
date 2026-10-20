@@ -113,7 +113,7 @@ def main(argv=None):
             if args.restart_session:
                 session = json.loads((root / "restart-session.json").read_text())
                 (root / "restart-session.json").unlink()
-                runtime.updates.installing = True
+                runtime.updates.restore_startup()
             runtime.start()
             try:
                 server = Server(runtime, args.port, session=session)

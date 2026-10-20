@@ -272,11 +272,7 @@ class Runtime:
     def loop(self):
         while not self.stop.is_set():
             try:
-                ready = self.store.root / "update-ready"
-                if ready.exists():
-                    ready.unlink()
-                    self.updates.installing = False
-                if self.updates.installing:
+                if self.updates.is_busy():
                     self.wake.wait(timeout=1)
                     self.wake.clear()
                     continue
@@ -327,7 +323,7 @@ class Runtime:
             project, config = min(ready, key=lambda pair: services[pair[0]["id"]] -
                                   min(2, (now - waiting[pair[0]["id"]]) / 3600))
             with self.dispatch_lock:
-                run = None if self.updates.installing else self.store.claim(project["id"], config)
+                run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
                 if not run:
                     return
                 services[project["id"]] += 1 / config["schedule"]["weight"]

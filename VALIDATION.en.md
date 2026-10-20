@@ -5,7 +5,16 @@
 Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
 
 
-## Autonomous delivery acceptance (current final result)
+## Hot settings fix (latest result)
+
+- The full backend suite passed **117 tests** on Python 3.12.13; **8 frontend regression tests** passed. JavaScript syntax, Python compilation, wheel and plugin ZIP builds passed.
+- Ordinary session restoration no longer enters upgrade exclusion. A real upgrade unlocks from the durable installation result instead of a one-shot ready file; real subprocess upgrade and failed-start rollback both verify that settings can be saved afterward.
+- Two separate paused projects were imported and inspection intervals, budgets and weights saved within the same server process. A new provider with session credentials immediately fetched a local fixture directory without restart.
+- Browser and frontend regressions cover original-payload retry with fresh CSRF after explicit upgrade rejection, retained pages across version changes, newer drafts within/across projects, acknowledged settings baselines, saving a restored original value, edits during acknowledgement refresh, and no replay after an ambiguous write failure.
+- Chinese/English switching and the English layout at 390 pixels passed without horizontal overflow; screenshots are in `output/playwright/hot-*.png`. Simulated upgrade rejection and connection failure produce expected network errors, rather than page-script exceptions.
+- See [review and execution evidence](docs/validation/hot-settings-review-20261020.json). Browser verification used local Git and HTTP fixtures; this fix created no GitHub repositories and did not run real-project model tasks.
+
+## Autonomous delivery acceptance (previous result)
 
 - **112 tests passed** in the complete suite, including pause-control, pinned-target, stale-candidate and reverse-DNS-independent startup regressions; JavaScript syntax, Python compilation, plugin ZIP and wheel builds passed.
 - Startup review also passed: the loopback listener skips unnecessary reverse DNS, and isolation tests use the current interpreter and verify that it actually runs.
