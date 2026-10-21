@@ -113,9 +113,20 @@ class Runtime:
                     shutil.rmtree(target)
                 raise
 
-    def configure(self, values, project=None):
+    def configure(self, values, project=None, inherit=None):
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
+        allowed = {"schedule.light_minutes", "schedule.issues_minutes", "schedule.deep_minutes",
+                   "sources.inspection", "sources.issues"}
+        if inherit is None:
+            inherit = []
+        if (not isinstance(inherit, list) or any(not isinstance(path, str) or path not in allowed for path in inherit)
+                or (inherit and not project)):
+            raise ValueError("Only project scan settings can inherit global defaults")
+        for path in inherit:
+            group, key = path.split(".")
+            if key in values.get(group, {}):
+                raise ValueError("An inherited setting cannot also have an override")
         if not project and (values.get("delivery", {}).get("mode", "local") != "local" or values.get("delivery", {}).get("auto_merge")):
             raise ValueError("Automatic delivery must be explicitly enabled per project")
         if project and "concurrency" in values.get("limits", {}):
@@ -123,7 +134,12 @@ class Runtime:
         if project and "updates" in values:
             raise ValueError("Software updates are a global setting")
         previous = json.loads(self.project(project)["config"]) if project else self.store.setting("config", {})
+        projects = [self.project(project)] if project else self.store.query("SELECT * FROM projects")
+        schedules = {row["id"]: self.config(row["id"])["schedule"] for row in projects}
         updated = merge(previous, values)
+        for path in inherit:
+            group, key = path.split(".")
+            updated.get(group, {}).pop(key, None)
         validate(merge(self.store.setting("config", {}) if project else {}, updated))
         if project:
             self.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(updated), project))
@@ -134,11 +150,12 @@ class Runtime:
             self.store.put_setting("config", updated)
         self.store.event("config", "Settings saved; active runs retain their snapshot", project,
                          data={"before": previous, "after": updated})
-        if "schedule" in values:
-            projects = [self.project(project)] if project else self.store.query("SELECT * FROM projects")
+        if "schedule" in values or inherit:
             for row in projects:
                 effective = self.config(row["id"])
                 for kind in ["light", "issues", "deep"]:
+                    if effective["schedule"][kind + "_minutes"] == schedules[row["id"]][kind + "_minutes"]:
+                        continue
                     self.store.execute("UPDATE schedules SET due=? WHERE project=? AND kind=?",
                                        (time.time() + effective["schedule"][kind + "_minutes"] * 60, row["id"], kind))
         self.wake.set()

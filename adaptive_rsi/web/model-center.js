@@ -26,7 +26,7 @@ window.RSIModelCenter = (() => {
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_routes:'角色配置不完整，请重新选择。'
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
-  const drafts = new Map(), jobs = new Set();
+  const drafts = new Map(), baselines = new Map(), jobs = new Set();
   let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, picking=null, busy=false, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null;
   const pageSize=20;
@@ -57,7 +57,13 @@ window.RSIModelCenter = (() => {
     catch(error){if(ticket===sequence){loading=false;setStatus(message(error),true);}throw error;}
     if(ticket!==sequence||requested!==scope)return;
     data=snapshot;loading=false;
-    if((typeof reset==='function'?reset():reset)||!drafts.has(scopeKey()))drafts.set(scopeKey(),structuredClone(data.models));
+    const key=scopeKey(),previous=baselines.get(key),draft=drafts.get(key);
+    if((typeof reset==='function'?reset():reset)||!draft)drafts.set(key,structuredClone(data.models));
+    else if(previous)for(const role of Object.keys(data.models)){
+      // 保留真正编辑过的分工；尚未修改的角色继续跟随最新的通用配置。
+      if(JSON.stringify(draft[role])===JSON.stringify(previous[role]))draft[role]=structuredClone(data.models[role]);
+    }
+    baselines.set(key,structuredClone(data.models));
     if(!selected())active=data.providers[0].id;
     render();
   }
@@ -162,17 +168,28 @@ window.RSIModelCenter = (() => {
       const simpleTitle={planning:'思考与规划',implementation:'代码实现',review:'代码评审'}[role]||title;
       label.append(el('strong',t(simpleTitle)),el('small',t(purpose[role])));
       if(scope)label.append(el('small',t(JSON.stringify(route)===JSON.stringify(data.global_models[role])?'跟随通用设置':'此项目单独设置')));
-      const button=action('',()=>openPicker(role),'mc-role-model');button.setAttribute('aria-label',t(simpleTitle)+' · '+t('选择模型'));
+      const modelField=el('div',undefined,'mc-model-field'),select=el('select');select.id='mc-role-model-'+role;select.className='mc-role-select';select.setAttribute('aria-label',t(simpleTitle)+' · '+t('选择模型'));
+      for(const service of data.providers){
+        const group=el('optgroup');group.label=service.name;
+        const models=service.catalog.models.filter(model=>model.enabled&&!model.missing&&!model.kind||service.id===route.provider&&model.id===route.model);
+        if(service.id===route.provider&&!models.some(model=>model.id===route.model))models.push({id:route.model,name:route.model});
+        for(const model of models){const option=el('option',model.name);option.value=JSON.stringify([service.id,model.id]);group.append(option);}
+        if(group.children.length)select.append(group);
+      }
+      select.value=JSON.stringify([route.provider,route.model]);
+      select.addEventListener('change',()=>{const [provider,model]=JSON.parse(select.value);routes()[role]={...route,provider,model,effort:provider===route.provider&&model===route.model?route.effort:'default'};renderRoles();$(select.id).focus();});
       const provider=data.providers.find(p=>p.id===route.provider),copy=el('span');
-      const name=findModel(route)?.name||route.model;copy.append(el('strong',name),el('small',(provider?.name||route.provider)+(name!==route.model?' · '+route.model:'')));
+      const name=findModel(route)?.name||route.model;copy.append(el('small',(provider?.name||route.provider)+(name!==route.model?' · '+route.model:'')));
       const proof=findModel(route)?.probes?.[route.effort];copy.append(info(t(proof?.state==='pass'?'当前强度工具测试通过':proof?.state==='fail'?'当前强度测试失败':'当前强度尚未测试'),proof?.state==='fail'?'mc-warning':'mc-secondary'));
       if(scope&&JSON.stringify(route)===JSON.stringify(data.models[role]))copy.append(info(t(data.task_proofs?.[role]?'已通过真实任务验证':'尚未通过真实任务验证'),'mc-secondary'));
       if(route.fallback)copy.append(info(t('备用')+' · '+(data.providers.find(p=>p.id===route.fallback.provider)?.name||route.fallback.provider)+' / '+route.fallback.model+' · '+route.fallback.effort));
       if(findModel(route)?.missing)copy.append(info(t('目录中已失效'),'mc-warning'));
-      button.append(copy,info('⌄'));
-      const control=el('div',undefined,'mc-effort-wrap');control.append(effortControl(route,t(simpleTitle),value=>{route.effort=value;updateDirty();}));
+      const proofDetails=el('details',undefined,'mc-route-proof');proofDetails.append(el('summary',t('验证与备用模型')),copy);
+      modelField.append(select,action(t('搜索模型'),()=>openPicker(role),'mc-text-button'),proofDetails);
+      if(findModel(route)?.missing||proof?.state==='fail'||provider?.health.paused)modelField.append(el('p',t(findModel(route)?.missing?'目录中已失效':provider?.health.paused?'连续失败已暂停':'当前强度测试失败'),'mc-warning'));
+      const control=el('div',undefined,'mc-effort-wrap'),effort=effortControl(route,t(simpleTitle),value=>{route.effort=value;renderRoles();$('mc-role-effort-'+role).focus();});effort.id='mc-role-effort-'+role;control.append(el('span',t('思考深度'),'mc-secondary'),effort);
       const advanced=action(t('高级参数'),()=>openAdvanced(role),'mc-text-button');control.append(advanced);
-      row.append(label,button,control);(['analysis','evolution'].includes(role)?extra:container).append(row);
+      row.append(label,modelField,control);(['analysis','evolution'].includes(role)?extra:container).append(row);
     }
     $('mc-inheritance').textContent=scope?(Object.keys(data.overrides).length?t('这个项目已单独选择模型。'):t('这个项目跟随通用模型设置。')):t('没有单独选模型的项目，会使用通用设置。');
     $('mc-reset-inheritance').hidden=!scope;
@@ -230,9 +247,10 @@ window.RSIModelCenter = (() => {
     $('mc-input-name').value=t(preset.name);$('mc-input-url').value=preset.base_url;$('mc-input-protocol').value=preset.protocol;$('mc-input-env').value=preset.env_key;
     $('mc-input-auth').value=preset.env_key?(data.keychain?'keychain':'session'):'none';syncAuth();
   }
-  function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-session-hint').hidden=mode!=='session';}
+  function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session'].includes(mode);$('mc-input-key').disabled=!['keychain','session'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
   function openEditor(provider=null){
     editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
+    $('mc-connection-advanced').open=false;
     $('mc-provider-preset-field').hidden=!!provider;
     $('mc-input-auth').querySelector('[value="keychain"]').disabled=!data.keychain;
     if(provider){$('mc-input-name').value=provider.name;$('mc-input-url').value=provider.base_url;$('mc-input-protocol').value=provider.protocol;$('mc-input-env').value=provider.env_key;$('mc-input-auth').value=provider.credential||'env';syncAuth();}
@@ -271,11 +289,17 @@ window.RSIModelCenter = (() => {
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
     $('mc-fetch').addEventListener('click',()=>safe(()=>fetchProvider()));
     $('mc-provider-dialog').addEventListener('close',()=>{$('mc-input-key').value='';});
+    $('mc-provider-form').addEventListener('invalid',event=>{const detail=event.target.closest('details');if(detail)detail.open=true;},true);
     $('mc-provider-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-      const button=$('mc-provider-submit'),project=scope,unchanged=unchangedForm(event.target);button.disabled=true;$('mc-provider-error').textContent='';
+      const button=$('mc-provider-submit'),project=scope,unchanged=unchangedForm(event.target);if(button.disabled)return;button.disabled=true;$('mc-provider-error').textContent='';
       try{const provider={name:$('mc-input-name').value.trim(),base_url:$('mc-input-url').value.trim(),protocol:$('mc-input-protocol').value,env_key:$('mc-input-env').value.trim()};if(editing)provider.id=editing.id;
+        const models=[...new Set($('mc-input-models').value.split(/\r?\n/).map(id=>id.trim()).filter(Boolean))];
+        if(models.some(id=>id.length>256)||models.length>50)throw Error(t('最多添加 50 个模型，每个模型 ID 不超过 256 个字符。'));
+        if(models.some(id=>!(/^[a-zA-Z0-9._/:-]+$/).test(id)))throw Error(t('模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。'));
         const authentication={mode:$('mc-input-auth').value,value:$('mc-input-key').value};$('mc-input-key').value='';
         const result=await api('model-center/provider',{project,provider,authentication});
+        if(unchanged()&&scope===project)editing={...provider,id:result.id};
+        for(const id of models)await api('model-center/model',{project,provider:result.id,model:{id,name:id.slice(0,160),manual:true}});
         if(scope===project){await refresh();await load();if(unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
         await fetchProvider(result.id,project);
       }catch(error){$('mc-provider-error').textContent=message(error);}finally{button.disabled=false;}
@@ -283,7 +307,7 @@ window.RSIModelCenter = (() => {
     $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{await request('remove',{provider:active});await load();await refresh();setStatus(t('连接已移除。'));}));
     $('mc-add-model').addEventListener('click',()=>{$('mc-custom-form').reset();$('mc-custom-error').textContent='';$('mc-custom-dialog').showModal();});
     $('mc-custom-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{const unchanged=unchangedForm(event.target);try{const id=$('mc-custom-id').value.trim();await request('model',{provider:active,model:{id,name:$('mc-custom-name').value.trim()||id,manual:true}});if(unchanged())$('mc-custom-dialog').close();await load();}catch(error){$('mc-custom-error').textContent=message(error);}});});
-    $('mc-save-routes').addEventListener('click',()=>safe(async()=>{const project=scope,models=structuredClone(routes()),unchanged=()=>JSON.stringify(routes())===JSON.stringify(models);$('mc-save-routes').disabled=true;try{await api('model-center/routes',{project,models});if(scope===project){await load({reset:unchanged});await refresh();setStatus(t(unchanged()?'模型分工已保存，从下一轮任务生效。':'已保存提交的配置，后续修改仍未保存。'));}}catch(error){setStatus(message(error),true);updateDirty();}}));
+    $('mc-save-routes').addEventListener('click',()=>safe(async()=>{const project=scope,models=structuredClone(routes()),unchanged=()=>JSON.stringify(routes())===JSON.stringify(models);$('mc-save-routes').disabled=true;setStatus(t('正在保存模型分工…'));try{await api('model-center/routes',{project,models});if(scope===project){await load({reset:unchanged});await refresh();setStatus(t(unchanged()?'模型分工已保存，从下一轮任务生效。':'已保存提交的配置，后续修改仍未保存。'));}}catch(error){setStatus(message(error),true);updateDirty();}}));
     $('mc-reset-inheritance').addEventListener('click',()=>{drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
     $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
     $('mc-probe-start').addEventListener('click',()=>safe(async()=>{
@@ -303,8 +327,9 @@ window.RSIModelCenter = (() => {
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
     if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);}
   }
-  return {show:(requested=null)=>{
+  return {show:(requested=null,reload=false)=>{
     const next=requested||null,changed=scope!==next;scope=next;
-    if(!data||changed||data.project!==scope)safe(()=>load());else render();
+    if(loading&&!changed)return;
+    if(!data||changed||data.project!==scope||reload)safe(()=>load());
   },translate,load};
 })();

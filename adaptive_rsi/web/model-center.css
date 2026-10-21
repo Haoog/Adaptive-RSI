@@ -30,3 +30,123 @@
 .model-center .page-heading h1{font-size:28px}.mc-layout{grid-template-columns:180px minmax(0,1fr);gap:24px}.mc-model-row{padding:14px 0}.mc-connection{margin:16px 0;padding:13px 16px}.mc-model-actions{flex-wrap:nowrap;gap:18px;max-width:none}.mc-provider-detail .mc-model-copy small{font-size:12px}.mc-provider-detail .mc-model-copy strong{font-size:14px}.model-more{position:relative;margin:0}.model-more summary{font-size:13px;font-weight:400}.model-more[open]>summary{margin-bottom:8px}.model-more-actions{position:absolute;right:0;top:30px;min-width:145px;z-index:3;padding:10px 16px;display:grid;background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:0 10px 25px #203a2218}.model-more-actions button{white-space:nowrap}.mc-role-title small{line-height:1.5}.mc-role-title strong{font-size:15px}.mc-scope-note{font-size:13px}.mc-tab{font-size:14px}.mc-health{font-size:13px}.mc-pagination{margin:14px 0}.mc-route-footer .task-actions button{font-size:14px}.mc-route-footer .button.primary{color:white}.mc-role-list:empty{border:0}.model-center #mc-extra-roles{margin-top:25px}.mc-directory-footer{font-size:13px}.mc-providers-panel{min-width:0}.model-center .mc-feedback:empty{min-height:0;margin:0}
 @media(max-width:900px){.mc-layout{grid-template-columns:1fr}.mc-provider-list{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:700px){.model-center .page-heading h1{font-size:26px}.mc-model-actions{max-width:100px;align-items:flex-end;gap:5px;flex-direction:column}.mc-model-row{gap:15px}.mc-provider-list{grid-template-columns:repeat(2,minmax(0,1fr))}.mc-role-row{grid-template-columns:minmax(0,1fr) 100px;gap:12px}.mc-effort{font-size:14px}.mc-role-title strong{font-size:15px}.mc-top-tools .button{font-size:14px}.mc-route-footer .task-actions{justify-content:flex-start}.mc-route-footer .task-actions button{font-size:13px}.mc-route-footer .task-actions .button{padding:9px 12px}.mc-dialog input,.mc-dialog select{font-size:16px}.model-more-actions{right:0}.mc-dialog .field-grid{grid-template-columns:1fr}.mc-feedback{font-size:13px}.mc-role-model strong{font-size:14px}}
+
+.mc-role-row {
+  grid-template-columns:155px minmax(0,1fr) 155px;
+  gap:18px;
+  padding:16px 0;
+}
+.mc-model-field {
+  min-width:0;
+}
+.mc-role-select {
+  width:100%;
+  font-size:14px;
+  min-width:0;
+}
+.mc-model-field>.mc-text-button {
+  font-size:12px;
+  margin-right:14px;
+}
+.mc-route-proof {
+  display:inline-block;
+  vertical-align:top;
+  max-width:100%;
+  margin-top:6px;
+}
+.mc-route-proof summary {
+  font-size:12px;
+  font-weight:400;
+}
+.mc-route-proof[open] {
+  display:block;
+}
+.mc-route-proof small,.mc-route-proof span span {
+  display:block;
+  overflow-wrap:anywhere;
+}
+.mc-route-proof[open]>summary {
+  margin-bottom:6px;
+}
+.mc-effort-wrap {
+  padding:0;
+  min-width:0;
+}
+.mc-effort-wrap>.mc-secondary {
+  display:block;
+  margin-bottom:4px;
+}
+.mc-effort {
+  margin:0;
+  min-height:40px;
+}
+.mc-role-title {
+  padding-top:8px;
+}
+.mc-connection {
+  background:#f5f8f6;
+}
+.mc-provider[aria-pressed=true] {
+  background:#e7f0e9;
+}
+.mc-role-list {
+  border-top:0;
+}
+.mc-route-footer {
+  position:static;
+  background:var(--surface);
+  border-top:1px solid var(--line);
+  z-index:2;
+}
+.mc-dialog textarea {
+  font-size:14px;
+}
+.mc-tabs {
+  margin-bottom:16px;
+}
+.mc-scope-note {
+  margin-bottom:12px;
+}
+.mc-effort-wrap .mc-text-button {
+  margin-top:4px;
+}
+@media(max-width:900px) {
+  .mc-role-row {
+    grid-template-columns:125px minmax(0,1fr) 135px;
+    gap:12px;
+  }
+}
+@media(max-width:700px) {
+  .mc-role-row {
+    grid-template-columns:minmax(0,1fr) 116px;
+    gap:10px;
+  }
+  .mc-role-title {
+    grid-column:1/-1;
+    padding:0;
+  }
+  .mc-role-select {
+    font-size:13px;
+    padding:9px;
+    gap:5px;
+  }
+  .mc-model-field>.mc-text-button {
+    margin-right:8px;
+  }
+  .mc-effort-wrap>.mc-secondary {
+    display:none;
+  }
+  .mc-effort {
+    font-size:13px;
+    padding:9px;
+  }
+  .mc-route-proof summary {
+    font-size:11px;
+  }
+  .mc-dialog textarea {
+    font-size:16px;
+  }
+  .mc-top-tools .button {
+    font-size:13px;
+  }
+}
