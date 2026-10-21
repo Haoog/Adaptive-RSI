@@ -45,6 +45,10 @@ def fixture(root):
 
 class FakeAgent:
     """Only the model is substituted; Git isolation and evaluation remain real."""
+    @staticmethod
+    def available(provider):
+        return True
+
     def __init__(self, malicious=False):
         self.roles = []
         self.malicious = malicious

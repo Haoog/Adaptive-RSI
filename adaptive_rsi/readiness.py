@@ -43,8 +43,8 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
     providers = {p["id"]: p for p in BUILTIN_PROVIDERS + config["providers"]}
     def route_ready(route):
         provider = providers[route.get("provider", "openai")]
-        protocol = provider.get("protocol", "codex")
-        ready = bool(shutil.which("codex")) if protocol in ["codex", "codex_login"] else True
+        from .agent import CodexAgent
+        ready = getattr(runtime.agent, "available", CodexAgent.available)(provider)
         if provider.get("credential", "env") == "env" and provider.get("env_key"):
             ready = ready and bool(os.environ.get(provider["env_key"]))
         if provider.get("credential") in ["keychain", "session"]:

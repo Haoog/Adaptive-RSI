@@ -22,6 +22,7 @@
     {"area": "scope", "decision": "pass", "reason": "Changes implement the seven approved areas with bilingual docs. No new remote repository, paid inference or public release is part of verification."}
   ],
   "resolved_findings": [
+    "Simulated executors must report their own availability in CI without skipping the real Codex executor's binary requirement, credentials or budgets.",
     "Task pagination metadata must invalidate rendering even when the first page's rows do not change.",
     "Postmerge verification and explicit reverts must use preservation rather than require another improvement.",
     "A revision held by an active Issue run must survive later synchronization watermarks.",

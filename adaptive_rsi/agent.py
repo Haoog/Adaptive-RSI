@@ -86,6 +86,10 @@ class CodexAgent:
     def __init__(self, store):
         self.store = store
 
+    @staticmethod
+    def available(provider):
+        return provider.get("protocol", "codex") not in ["codex", "codex_login"] or bool(shutil.which("codex"))
+
     def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
         from .provider_health import ProviderHealth, ProviderPaused
         from .native import ProviderUnavailable

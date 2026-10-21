@@ -7,12 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge
+from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.context import code_map, related
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.discovery import related_task, value_priority
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import git, snapshot
-from adaptive_rsi.readiness import budget
+from adaptive_rsi.readiness import budget, inspect as readiness
 from adaptive_rsi.recovery import failure
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
@@ -55,6 +56,18 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.runtime.agent.roles, [])
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertFalse(next(i for i in result["readiness"]["items"] if i["code"] == "dependencies")["ready"])
+
+    def test_injected_transport_is_available_without_bypassing_real_codex_requirement(self):
+        import shutil
+        system_which = shutil.which
+        with patch("adaptive_rsi.agent.shutil.which", side_effect=lambda name: None if name == "codex" else system_which(name)):
+            simulated = readiness(self.runtime, self.runtime.project(self.project))
+            self.assertTrue(all(i["ready"] for i in simulated["items"] if i["code"] == "model"))
+            self.runtime.agent = CodexAgent(self.store)
+            real = readiness(self.runtime, self.runtime.project(self.project))
+            self.assertTrue(all(not i["ready"] for i in real["items"] if i["code"] == "model"))
+            self.assertFalse(real["ready"])
+        self.assertEqual(self.store.query("SELECT * FROM calls"), [])
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_review_outage_reuses_plan_acceptance_and_patch_but_reruns_checks(self):
