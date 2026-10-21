@@ -39,7 +39,7 @@ function browser() {
     createTextNode: text => ({textContent: text})
   };
   const context = vm.createContext({
-    document, window: {}, initialState: snapshot(), structuredClone,
+    document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
     localStorage: {getItem: () => null}, t: value => value,
     fetch: () => new Promise(() => {}),
     setInterval() {}, clearTimeout() {},
@@ -72,7 +72,7 @@ test('settings edited during the acknowledgement refresh keep the saved baseline
   page.node('checks-json').value = '[]';
   vm.runInContext('view="settings"; settingsBaseline={limits:{daily_calls:20},schedule:{working_hours:[0,24]},github:{labels:[]},checks:[]}; renderSettings=()=>{$("call-limit").value="30";}', page.context);
   let finishRefresh;
-  page.context.fetch = async (url) => url.endsWith('/state')
+  page.context.fetch = async (url) => url.split('?')[0].endsWith('/state')
     ? new Promise(resolve => { finishRefresh = () => resolve(response(snapshot())); })
     : response({saved: true, config: {limits: {daily_calls: 30}}});
   const pending = page.submit('settings-form');
@@ -89,7 +89,7 @@ test('settings edited during the acknowledgement refresh keep the saved baseline
 test('an explicit update rejection retries the original payload with fresh CSRF', async () => {
   const page = browser(), posts = [];
   page.context.fetch = async (url, options) => {
-    if (url.endsWith('/state')) return response(snapshot('0.2.1', 'fresh-csrf'));
+    if (url.split('?')[0].endsWith('/state')) return response(snapshot('0.2.1', 'fresh-csrf'));
     posts.push({body: JSON.parse(options.body), csrf: options.headers['X-RSI-CSRF']});
     return posts.length === 1 ? rejected() : response({saved: true});
   };
@@ -119,7 +119,7 @@ test('a periodic refresh seeing the new version retains a queued submission', as
   const page = browser();
   let posts = 0;
   page.context.fetch = async (url) => {
-    if (url.endsWith('/state')) return response(snapshot('0.2.1'));
+    if (url.split('?')[0].endsWith('/state')) return response(snapshot('0.2.1'));
     return ++posts === 1 ? rejected() : response({saved: true});
   };
   const pending = page.context.api('config', {project: 'a', values: {}});
@@ -135,7 +135,7 @@ for (const switchProject of [false, true]) {
     const page = browser(), posts = [];
     page.node('goal-text').value = 'Original task';
     page.context.fetch = async (url, options) => {
-      if (url.endsWith('/state')) return response(snapshot());
+      if (url.split('?')[0].endsWith('/state')) return response(snapshot());
       posts.push(JSON.parse(options.body));
       return posts.length === 1 ? rejected() : response({id: 'task'});
     };
@@ -163,7 +163,7 @@ test(`delayed settings retain draft ${nextValue} against the acknowledged saved 
   page.node('checks-json').value = '[]';
   vm.runInContext('settingsBaseline={limits:{daily_calls:20},schedule:{working_hours:[0,24]},github:{labels:[]},checks:[]}', page.context);
   page.context.fetch = async (url, options) => {
-    if (url.endsWith('/state')) return response(snapshot());
+    if (url.split('?')[0].endsWith('/state')) return response(snapshot());
     posts.push(JSON.parse(options.body));
     return posts.length === 1 ? rejected() : response({saved: true, config: {
       limits: {daily_calls: posts.at(-1).values.limits.daily_calls},
@@ -241,12 +241,15 @@ test('out-of-order task details cannot attach cancellation for the previous task
   let finishA;
   const detail = {config: {models: {}}, result: {}};
   page.context.fetch = async (url, options) => {
+    if (url.includes('task-runs?task=a')) return response([{id:'ra',task:'a',project:'a'}]);
+    if (url.includes('task-runs?task=b')) return response([{id:'rb',task:'b',project:'a'}]);
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
     if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
     return response(snapshot());
   };
   const pendingA = page.context.showTask(a);
+  await new Promise(setImmediate);
   await page.context.showTask(b);
   finishA(); await pendingA;
   assert.equal(page.node('detail-title').textContent, 'Task b');
@@ -311,7 +314,7 @@ test('non JSON errors give recovery instructions rather than a parser exception'
 test('one form cannot submit twice while its first write is pending', async () => {
   const page=browser();let release,calls=0;
   page.context.fetch=async url=>{
-    if(url.endsWith('/state'))return response(snapshot());
+    if(url.split('?')[0].endsWith('/state'))return response(snapshot());
     calls++;return new Promise(resolve=>release=()=>resolve(response({added:true})));
   };
   vm.runInContext('safe=fn=>{lastAction=originalSafe(fn,$("goal-form"));return lastAction;}',page.context);

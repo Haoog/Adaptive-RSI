@@ -4,6 +4,8 @@
 
 发布由维护者明确执行；构建插件不会推送 Git、创建 PR 或发布 Release。
 
+可在 Actions 手动触发「准备正式发布草稿」：运行完整检查、Chromium 表单流程及 ZIP/wheel 构建后上传 Release 草稿。维护者审阅后才发布；推送 main 不会自动发布。打包脚本同时校验四处版本，后台和静态界面另外使用内容构建标识，避免同版本不同界面无法识别。
+
 ## 发布包契约
 
 - 同步 `plugin.json`、`pyproject.toml`、`adaptive_rsi/__init__.py` 和 `update.json` 的版本号。

@@ -14,10 +14,15 @@ node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
 node --test tests/web_requests.cjs
+npm ci --ignore-scripts
+npx playwright install chromium
+npm run test:browser
 python3 scripts/start.py
 ```
 
 Keep temporary UI-check projects paused to avoid unintended model calls. Store runtime state outside managed repositories.
+
+`test:browser` creates two paused temporary projects and uses real Chromium to exercise forms, pagination, project switching, languages, and mobile layouts without invoking models. Set `RSI_BROWSER_CHANNEL=chrome` to use installed Chrome. Playwright is a development dependency only.
 
 ## Commits and documentation
 

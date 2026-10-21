@@ -3,10 +3,12 @@ import json
 import time
 
 
-def quality_summary(store):
+def quality_summary(store, project=None):
     projects = {}
     failures = {}
-    for run in store.query("SELECT r.project,r.task,r.state,r.result,t.source FROM runs r JOIN tasks t ON t.id=r.task WHERE r.ended IS NOT NULL AND r.started>?", (time.time() - 30 * 86400,)):
+    for run in store.query("SELECT r.project,r.task,r.state,r.result,t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                           "WHERE r.ended IS NOT NULL AND r.started>?" + (" AND r.project=?" if project else ""),
+                           (time.time() - 30 * 86400, project) if project else (time.time() - 30 * 86400,)):
         if run["source"].startswith("system_"):
             continue
         item = projects.setdefault(run["project"], {"project": run["project"], "runs": 0, "passed": 0,

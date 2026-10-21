@@ -14,10 +14,15 @@ node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
 node --test tests/web_requests.cjs
+npm ci --ignore-scripts
+npx playwright install chromium
+npm run test:browser
 python3 scripts/start.py
 ```
 
 使用临时项目检查界面时，保持项目暂停，避免意外调用模型。状态目录应放在受管仓库之外。
+
+`test:browser` 自动创建两个暂停的临时项目，使用真实 Chromium 操作表单、分页、项目切换和中英文手机布局，不调用模型。已安装 Chrome 时可设置 `RSI_BROWSER_CHANNEL=chrome`。开发用 Playwright 不属于运行器依赖。
 
 ## 提交与文档
 

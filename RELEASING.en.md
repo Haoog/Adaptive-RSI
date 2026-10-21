@@ -4,6 +4,8 @@
 
 Maintainers explicitly publish releases. Building a plugin does not push Git, create PRs or publish releases.
 
+Manually trigger the draft-release workflow in Actions to run full checks, Chromium form flows, and ZIP/wheel builds before uploading a release draft. Maintainers review and publish it; pushing main does not publish. Packaging checks all four version declarations, while backend and static UI also share a content identity to detect different builds of one version.
+
 ## Bundle contract
 
 - Keep versions in `plugin.json`, `pyproject.toml`, `adaptive_rsi/__init__.py` and `update.json` aligned.

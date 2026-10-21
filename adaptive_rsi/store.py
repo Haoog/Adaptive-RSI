@@ -58,6 +58,13 @@ class Store:
                     id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
                     state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL,
                     provider TEXT DEFAULT 'openai');
+                CREATE TABLE IF NOT EXISTS stages (
+                    run TEXT REFERENCES runs(id), stage TEXT, signature TEXT, data TEXT, created REAL,
+                    PRIMARY KEY(run,stage));
+                CREATE INDEX IF NOT EXISTS project_tasks ON tasks(project,updated DESC);
+                CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
+                CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
+                CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
                 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
             """)
             db.execute("BEGIN IMMEDIATE")
@@ -65,6 +72,8 @@ class Store:
                 db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
             if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                 db.execute("ALTER TABLE calls ADD COLUMN unit_price REAL")
+            if "unit" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+                db.execute("ALTER TABLE calls ADD COLUMN unit TEXT DEFAULT 'unknown'")
             # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
             migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
             if not migration:
@@ -140,7 +149,7 @@ class Store:
             if not p or p["paused"] or busy:
                 return None
             task = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
-                              "ORDER BY priority DESC,created LIMIT 1", (project, now)).fetchone()
+                              "ORDER BY (priority + min(20, (? - created)/86400.0)) DESC,created,id LIMIT 1", (project, now, now)).fetchone()
             if not task:
                 return None
             from .config import merge, validate
@@ -158,7 +167,7 @@ class Store:
             if not row or row["ended"] is not None:
                 return False
             previous = json.loads(row["result"])
-            result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision"] if key in previous}, **(result or {})}
+            result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
             db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
@@ -193,9 +202,11 @@ class Store:
             used = db.execute("SELECT count(*) FROM calls WHERE project=? AND created>=?", (project, midnight)).fetchone()[0]
             run_used = db.execute("SELECT count(*) FROM calls WHERE run=?", (run,)).fetchone()[0]
             if used >= config["limits"]["daily_calls"] or run_used >= config["limits"]["run_calls"]:
-                raise RuntimeError("Model call budget exhausted")
+                from .recovery import BudgetExhausted
+                raise BudgetExhausted("Model call budget exhausted")
             call = uid()
-            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                       (call, project, run, role, route["model"], route["effort"], "reserved", now, provider_id, price))
+            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price,unit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       (call, project, run, role, route["model"], route["effort"], "reserved", now, provider_id, price,
+                        "codex_session" if provider.get("protocol", "codex") in ["codex", "codex_login"] else "http_request"))
             db.execute("UPDATE runs SET calls=calls+1 WHERE id=?", (run,))
         return call

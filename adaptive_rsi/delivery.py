@@ -71,6 +71,8 @@ def publish(runtime, project, task, run, workspace, config):
     if authorization and authorization[0].get("authorization") == "project_policy" and (
             json.loads(run["config"])["delivery"]["mode"] != "pr" or runtime.config(project["id"])["delivery"]["mode"] != "pr"):
         raise RuntimeError("Automatic PR authorization was revoked")
+    if task["source"] == "issue" and not runtime.issue_still_open(project, task, config):
+        raise StaleCandidate("Issue closed before delivery; synchronize before retrying")
     outcome = json.loads(run["result"])
     if outcome.get("evaluation", {}).get("decision") != "pass" or outcome.get("review", {}).get("decision") != "pass":
         raise RuntimeError("Delivery gates did not pass")
@@ -239,6 +241,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     from .adapters import detect
     acceptance_path = Path(run["path"]) / "acceptance.json"
     acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
+    if acceptance:
+        acceptance["change_kind"] = "preservation"
     checks = json.loads(run["config"])["checks"] or detect(baseline_tree)["checks"]
     saved = json.loads(run["config"])
     effective = {**config, "environment": saved["environment"]}

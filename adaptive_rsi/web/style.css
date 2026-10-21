@@ -58,3 +58,15 @@ footer{display:flex;justify-content:space-between;padding:24px 0;font-size:12px;
 
 #toast.error { padding-right: 48px; }
 .toast-close { position: absolute; right: 8px; top: 5px; border: 0; background: transparent; color: inherit; font-size: 24px; padding: 4px 8px; cursor: pointer; }
+
+.readiness-panel{border-left:3px solid var(--green)}
+.readiness-panel .panel-title{margin-bottom:8px}
+.readiness-panel p{font-size:14px;margin:8px 0}
+.readiness-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:8px 0;border-top:1px solid var(--line);font-size:14px}
+.task-pagination{display:flex;align-items:center;justify-content:flex-end;gap:16px;margin:16px 0;font-size:13px}
+.stage-progress{list-style:none;display:flex;flex-wrap:wrap;gap:8px;padding:0;margin:18px 0;font-size:12px;color:var(--muted)}
+.stage-progress li{padding:6px 10px;border:1px solid var(--line);border-radius:4px}
+.stage-progress .done{color:var(--green);background:#edf3e9;border-color:#aebfa4}
+@media(max-width:700px){.readiness-row{align-items:flex-start}.readiness-row .text-button{flex:none}.task-pagination{justify-content:space-between;gap:8px}.stage-progress{gap:5px}}
+
+.stage-progress .stage-failed{color:#913e2e;border-color:#c79e96;background:#fff1ed}

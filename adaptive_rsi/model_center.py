@@ -71,8 +71,17 @@ class ModelCenter:
             items.append({**provider, "builtin": builtin, "credential_status": "login" if provider["id"] == "openai"
                           else self.credentials.status(provider), "catalog": directory,
                           "health": ProviderHealth(self.store).status(config, provider["id"], project or "model-center")})
+        task_proofs = {}
+        if project:
+            for role, route in config["models"].items():
+                provider = self.provider(route.get("provider", "openai"), project)
+                call = {"role": role, "provider": provider["id"], "model": route["model"], "effort": route["effort"]}
+                key = "task-proof:" + project + ":" + fingerprint({"call": call, "provider": self.signature(provider)})
+                proof = self.store.setting(key)
+                if proof:
+                    task_proofs[role] = proof
         override = self.store.one("SELECT config FROM projects WHERE id=?", (project,)) if project else None
-        return {"providers": items, "models": config["models"], "overrides": json.loads(override["config"]).get("models", {}) if override else {},
+        return {"providers": items, "models": config["models"], "task_proofs": task_proofs, "overrides": json.loads(override["config"]).get("models", {}) if override else {},
                 "keychain": platform.system() == "Darwin", "project": project,
                 "global_models": self.runtime.config()["models"]}
 

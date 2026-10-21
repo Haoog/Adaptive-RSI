@@ -6,6 +6,8 @@ A local autonomous improvement runtime for Codex: **code inspection, user goals,
 
 Includes a plugin entry point, persistent scheduler, SQLite state and call budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
+Version 0.2.1 adds readiness checks, recoverable stage records, durable Issue pagination, task improvement evidence, and stricter strategy experiments. See [Reliable improvement loop](RELIABILITY.en.md) for usage, budget estimates, and evidence boundaries.
+
 ## Workflow
 
 ```mermaid
@@ -16,7 +18,8 @@ flowchart TD
     I --> Q
     G --> Q
     M[Memory: evidence, failures, verified strategies] --> P[Planner: benefit, evidence, cost, risk and inaction]
-    Q --> P
+    Q --> O[Readiness: environment, dependencies, model settings and budget]
+    O --> P
     P --> B{Worth doing with sufficient evidence?}
     B -->|Execute| W[Independent acceptance design → executor at latest base commit]
     B -->|Defer or reject| Z[Save decision and evidence]
@@ -35,7 +38,7 @@ flowchart TD
     C --> M
     F --> M
     M --> E[Strategy proposal: paired stable and candidate replay]
-    E --> V[Validation and protected holdout: checks and code review]
+    E --> V[Paired production replay: validation first, protected holdout only after passing]
     V --> H{Quality and cost acceptable?}
     H -->|Yes| N[Promote and monitor, restore parent on failure]
     H -->|No| M
@@ -52,7 +55,7 @@ The default threshold blocks **medium and above**, configurable to high or low. 
 
 Maintainability review covers duplication, unnecessary abstraction, complex branches, coupling, naming and project conventions. It targets introduced issues without demanding unrelated refactoring. Add project lint, type, complexity or dependency checks to `checks` for deterministic gates alongside tests; the runtime does not automatically impose a static-analysis tool suite. Model review can miss problems and cannot guarantee code quality.
 
-Both ordinary tasks and strategy replay use these gates. Paired experiments review both variants and count review costs symmetrically. The default experiment call cap is 40; the project daily cap remains 30. Check both before a formal experiment. Exhaustion stops work without silently increasing limits.
+Both ordinary tasks and strategy replay use these gates. Paired experiments review both variants and include review costs. Three cases per split and two repetitions require at least 97 calls; the default experiment cap of 40 and daily cap of 30 are insufficient, so preflight stops before proposing. Configure appropriate cases and budgets explicitly. Limits never increase silently, and repeated runs are not independent samples.
 
 ## Decide whether work is worthwhile
 

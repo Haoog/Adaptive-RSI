@@ -1,0 +1,1 @@
+{"name":"adaptive-rsi-browser-checks","private":true,"scripts":{"test:browser":"node tests/browser_smoke.cjs"},"devDependencies":{"playwright":"1.58.2"}}

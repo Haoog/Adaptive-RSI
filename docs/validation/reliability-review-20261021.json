@@ -1,0 +1,38 @@
+{
+  "date": "2026-10-21",
+  "review_type": "author_self_review",
+  "base": "2e51cf8",
+  "value_assessment": {
+    "decision": "ready",
+    "benefit": "Prevent repeated paid work, missed Issue revisions, unsupported improvement claims and cross-project dashboard omissions while keeping three main UI destinations.",
+    "cost": "An additive state migration, a shared candidate pipeline and stricter evidence requirements; old insufficient experiment budgets now explicitly block promotion.",
+    "evidence": [
+      "Task retries previously repeated all model stages.",
+      "Global task limits could hide a project's older records.",
+      "Strategy experiments needed the same task pipeline and independent-family evidence as real executions."
+    ]
+  },
+  "decision": "pass",
+  "assessments": [
+    {"area": "correctness", "decision": "pass", "reason": "Reviewed stage invalidation, patch replay, Issue continuation/revision handling, budget waiting, filter parity and preservation versus improvement contracts."},
+    {"area": "security", "decision": "pass", "reason": "Candidate patches still pass frozen checks and read-only review. Protected overlays stay outside model workspaces. Authentication, per-project authorization and credentials remain separate from readiness detection."},
+    {"area": "maintainability", "decision": "pass", "reason": "Real tasks and experiments use one candidate function; readiness, discovery, recovery, context and dashboard queries have separate modules without new runtime dependencies."},
+    {"area": "architecture", "decision": "pass", "reason": "Experiments cannot deliver. Validation precedes holdout exposure; family-level repeated wins and cost gates control promotion. Monitoring uses recorded strategy IDs and refuses ambiguous rollback attribution."},
+    {"area": "tests", "decision": "pass", "reason": "Backend behavior, frontend requests, real Chromium interactions, startup recovery and packaging are exercised. Synthetic model fixtures verify the controller, not real model capability gains."},
+    {"area": "scope", "decision": "pass", "reason": "Changes implement the seven approved areas with bilingual docs. No new remote repository, paid inference or public release is part of verification."}
+  ],
+  "resolved_findings": [
+    "Task pagination metadata must invalidate rendering even when the first page's rows do not change.",
+    "Postmerge verification and explicit reverts must use preservation rather than require another improvement.",
+    "A revision held by an active Issue run must survive later synchronization watermarks.",
+    "Budget waiting must appear in both frontend and server attention filters.",
+    "A rejected checked patch must not remain eligible for unchanged recovery replay.",
+    "Multiple participating strategies do not provide sufficient attribution to roll all of them back."
+  ],
+  "remaining_limits": [
+    "This is author self-review, not an independent external review.",
+    "Provider protocol fixtures do not establish compatibility with every live provider account.",
+    "Independent task families and trustworthy acceptance checks remain prerequisites for meaningful strategy evidence.",
+    "The default evolution budget is intentionally below the stricter experiment minimum; users must supply cases and explicitly adjust limits."
+  ]
+}

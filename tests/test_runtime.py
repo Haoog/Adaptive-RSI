@@ -316,16 +316,17 @@ Path(%r).write_text('allowed output')
 
     def test_github_sync_uses_incremental_cursor_dedupes_and_closes(self):
         config = merge(self.runtime.config(self.project), {"github": {"repository": "owner/repo"}})
-        issue = {"number": 1, "title": "Fix addition", "body": "task data", "labels": [], "state": "OPEN", "updatedAt": "2026-10-19", "url": "https://github.com/owner/repo/issues/1"}
+        issue = {"number": 1, "title": "Fix addition", "body": "task data", "labels": [], "state": "OPEN", "updated_at": "2099-10-19", "html_url": "https://github.com/owner/repo/issues/1"}
         calls = []
         def gh(args, **kwargs):
             calls.append(args)
-            return json.dumps([issue]) if args[1] == "issue" else "[]"
+            return json.dumps([issue]) if args[1] == "api" else "[]"
         with patch("adaptive_rsi.runtime.checked", side_effect=gh):
             self.runtime.sync_issues(self.runtime.project(self.project), config)
             self.runtime.sync_issues(self.runtime.project(self.project), config)
             self.assertEqual(len(self.store.query("SELECT * FROM tasks WHERE source='issue'")), 1)
-            self.assertIn("--search", [args for args in calls if args[1] == "issue"][1])
+            self.assertIn("page=1", [args for args in calls if args[1] == "api"][1])
+            self.assertTrue(self.store.setting("issue-sync:" + self.project)["since"])
             self.store.execute("UPDATE tasks SET state='deferred' WHERE source='issue'")
             issue["state"] = "CLOSED"
             self.runtime.sync_issues(self.runtime.project(self.project), config)
@@ -338,8 +339,19 @@ Path(%r).write_text('allowed output')
         (second / "tests/test_calculator.py").write_text("import unittest\nfrom calculator import multiply\nclass Regression(unittest.TestCase):\n    def test_multiply(self):\n        self.assertEqual(multiply(2, 3), 6)\n")
         git(second, "add", ".")
         git(second, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "independent multiply defect")
-        for family, split, repo, text in [("addition", "validation", self.repo, "Correct addition"),
-                                         ("multiply", "holdout", second, "Protected multiply acceptance task")]:
+        cases = [("addition", "validation", self.repo, "Correct addition"),
+                 ("multiply", "holdout", second, "Protected multiply acceptance task")]
+        for index, (name, expression, expected) in enumerate([
+                ("subtract", "a + b", "-1"), ("divide", "a * b", "2 / 3"),
+                ("maximum", "min(a, b)", "3"), ("minimum", "max(a, b)", "2")]):
+            repo = fixture(self.root / name)
+            (repo / "calculator.py").write_text("def " + name + "(a, b):\n    return " + expression + "\n")
+            (repo / "tests/test_calculator.py").write_text("import unittest\nfrom calculator import " + name +
+                "\nclass Regression(unittest.TestCase):\n    def test_operation(self):\n        self.assertEqual(" + name + "(2, 3), " + expected + ")\n")
+            git(repo, "add", ".")
+            git(repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", name)
+            cases.append((name, "validation" if index % 2 else "holdout", repo, "Correct " + name))
+        for family, split, repo, text in cases:
             Evolution(self.runtime).import_case(self.project, {"family": family, "split": split,
                 "repository": str(repo), "base": "HEAD", "task": text, "checks": CHECKS, "source": "synthetic"})
         store = self.store
@@ -355,15 +367,23 @@ Path(%r).write_text('allowed output')
                 if role == "implementation":
                     if "Reproduce arithmetic boundary cases before editing" in prompt:
                         path = workspace / "calculator.py"
-                        path.write_text(path.read_text().replace("a - b", "a + b").replace("a / b", "a * b"))
+                        function = path.read_text().split("(")[0].split()[1]
+                        expression = {"add": "a + b", "multiply": "a * b", "subtract": "a - b", "divide": "a / b",
+                                      "maximum": "max(a, b)", "minimum": "min(a, b)"}[function]
+                        path.write_text("def " + function + "(a, b):\n    return " + expression + "\n")
                     return {"summary": "Applied supplied strategy"}
                 result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == "acceptance":
+                    function = (workspace / "calculator.py").read_text().split("(")[0].split()[1]
+                    expected = {"add": "5", "multiply": "6", "subtract": "-1", "divide": "2 / 3", "maximum": "3", "minimum": "2"}[function]
+                    result["files"][0]["content"] = "from calculator import " + function + "\nassert " + function + "(2, 3) == " + expected + "\n"
                 if role == "review" and self.reject_reviews:
                     result["assessments"][2]["decision"] = "fail"
                 return result
         self.runtime.agent = GuidedProvider()
-        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10,
-                                                "max_cost_ratio": 10}}, self.project)
+        self.runtime.configure({"limits": {"daily_calls": 400, "run_seconds": 1800},
+                                "evolution": {"enabled": True, "min_cases_per_split": 3, "max_calls": 200,
+                                              "repeats": 2, "max_cost_ratio": 10}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.request(self.project, "evolve")
         run = self.store.claim(self.project, self.runtime.config(self.project))
@@ -371,7 +391,7 @@ Path(%r).write_text('allowed output')
         candidates = self.store.query("SELECT * FROM candidates")
         self.assertEqual(candidates[0]["status"], "stable", candidates)
         self.assertNotIn("Protected multiply acceptance task", proposal_prompts[0])
-        self.assertEqual(len(json.loads(candidates[0]["evidence"])["trials"]), 2)
+        self.assertEqual(len(json.loads(candidates[0]["evidence"])["trials"]), 12)
         self.assertEqual(len(self.runtime.memories(self.project, "add")), 1)
         self.runtime.agent.reject_reviews = True
         self.runtime.request(self.project, "evolve")
@@ -387,7 +407,10 @@ Path(%r).write_text('allowed output')
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
         self.runtime.configure({"models": {"implementation": {"model": "gpt-6-luna"}}}, self.project)
         self.assertEqual(len(self.runtime.active_strategies(self.project)), 1)
-        self.runtime.monitor_strategy(self.project, False)
+        self.store.execute("UPDATE runs SET strategy=? WHERE id=?", (encode([{"id": candidates[0]["id"]}]), run["id"]))
+        # Monitoring is tied to the actual run's strategy and execution compatibility.
+        self.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(self.runtime.config(self.project)), run["id"]))
+        self.runtime.monitor_strategy(self.project, False, run, attributable=True)
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
 
@@ -468,7 +491,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
         def trial(split, before, after, tokens=100):
             return {"split": split, "stable": {"pass": before, "tokens": 100, "seconds": 10},
                     "candidate": {"pass": after, "tokens": tokens, "seconds": 10}}
-        self.assertEqual(Evolution.decide([trial("validation", False, True), trial("holdout", False, True)], DEFAULTS)["decision"], "pass")
+        self.assertEqual(Evolution.decide([trial("validation", False, True), trial("holdout", False, True)], DEFAULTS)["decision"], "insufficient_evidence")
         self.assertEqual(Evolution.decide([trial("validation", False, True), trial("holdout", True, False)], DEFAULTS)["decision"], "fail")
         self.assertEqual(Evolution.decide([trial("validation", False, True), trial("holdout", True, True)], DEFAULTS)["decision"], "insufficient_evidence")
         self.assertEqual(Evolution.decide([trial("validation", False, True, 0), trial("holdout", False, True, 0)], DEFAULTS)["decision"], "insufficient_evidence")
