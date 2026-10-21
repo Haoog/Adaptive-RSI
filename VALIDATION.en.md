@@ -14,6 +14,7 @@ Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54
 - Screenshots: `output/playwright/usability-workspace.png`, `usability-workspace-mobile.png`, `usability-inline-error.png`, `session-recovery.png`. Expected unauthenticated 401 and invalid-import 400 responses are not page-script failures.
 - Interaction references: [GOV.UK form errors](https://design-system.service.gov.uk/components/error-summary/) and [Open WebUI connections](https://docs.openwebui.com/getting-started/quick-start/connect-a-provider/). No extra framework or permission-model change was introduced.
 - The independent review's import-selection and cross-scope feedback findings were fixed and verified with delayed browser requests and regressions. All six final assessment areas passed; remaining English fragments and the queued-action translation were also corrected. See [review and resolution evidence](docs/validation/usability-review-20261020.json).
+- GitHub PR checks exposed timing noise in the macOS evolution test. Only that test fixture's temporary cost ratio is set to the supported maximum; runtime defaults are unchanged. The targeted test and independent six-area review pass; PR CI will re-run.
 
 ## Simplified workspace acceptance (previous result)
 

@@ -14,6 +14,7 @@
 - 截图：`output/playwright/usability-workspace.png`、`usability-workspace-mobile.png`、`usability-inline-error.png`、`session-recovery.png`。预期的未认证 401、无效导入 400 不计作页面脚本异常。
 - 交互参考 [GOV.UK 表单错误提示](https://design-system.service.gov.uk/components/error-summary/)与 [Open WebUI 连接管理](https://docs.openwebui.com/getting-started/quick-start/connect-a-provider/)，不引入额外框架或改变权限模型。
 - 独立评审发现的导入选择与跨范围报错问题已修复，并通过慢请求浏览器复现及回归测试；最终六个维度通过，英文残留与排队按钮译文也已修正。见[评审与修复证据](docs/validation/usability-review-20261020.json)。
+- GitHub PR 检查发现自我改进测试受 macOS 计时波动影响；仅将该测试临时项目的成本倍率上限设为允许的最大值，运行器默认策略未变。目标测试本机通过，新改动经独立六维评审通过，PR CI 将重新验证。
 
 ## 简洁工作台验收（此前结果）
 

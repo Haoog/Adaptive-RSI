@@ -362,7 +362,8 @@ Path(%r).write_text('allowed output')
                     result["assessments"][2]["decision"] = "fail"
                 return result
         self.runtime.agent = GuidedProvider()
-        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10}}, self.project)
+        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10,
+                                                "max_cost_ratio": 10}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.request(self.project, "evolve")
         run = self.store.claim(self.project, self.runtime.config(self.project))

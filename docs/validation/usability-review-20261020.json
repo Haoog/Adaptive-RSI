@@ -56,5 +56,15 @@
     "python_tests": 118,
     "frontend_tests": 25,
     "browser": "Two isolated paused projects, local Git/model directory fixtures; primary pages zh-CN/en at widths1440/390/320; slow import with polling, stale settings rejection, preserved activity expansion, goal pending feedback. No page-script errors."
+  },
+  "ci_followup": {
+    "finding": "PR CI exposed a timing-sensitive failure in the macOS evolution promotion fixture: wall-clock ratio was 1.49 against the default 1.25, although both candidate variants passed their checks and the parallel push run passed.",
+    "change": "The promotion/retrieval/rollback fixture now sets only its temporary project max_cost_ratio to the supported maximum 10. It does not change runtime defaults or test cost-limit behavior.",
+    "verification": {
+      "targeted_test": "python3 -m unittest tests.test_runtime.RuntimeTest.test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance -v",
+      "result": "passed in 21.9 seconds",
+      "independent_review": "six-area pass; no findings",
+      "full_ci": "rerun on the updated PR commit"
+    }
   }
 }
