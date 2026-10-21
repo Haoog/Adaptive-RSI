@@ -2,6 +2,13 @@
 
 [简体中文](CHANGELOG.md) | **English**
 
+## 0.2.3
+
+- Protect common test filenames across more languages and configured check entrypoints from candidate weakening.
+- Give read-only review the host-sealed patch; cancellation or timeout now stops subsequent auto-merge side effects.
+- Recheck Issue state, revision and labels before auto-merge; stale candidates wait for synchronization before reassessment.
+- Refuse Codex fallback after primary implementation edits, and keep goal drafts scoped to the displayed project.
+
 ## 0.2.2
 
 - Default-deny reads outside Codex snapshots while allowing system toolchains.

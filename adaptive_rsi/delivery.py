@@ -170,8 +170,18 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     if now - store.setting(tick_key, 0) < 60:
         return
     store.put_setting(tick_key, now)
-    for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') ORDER BY started"):
+
+    def tracking_cancelled():
         if runtime.stop.is_set():
+            return True
+        if not active_run:
+            return False
+        active_id = active_run["id"] if isinstance(active_run, dict) else active_run
+        current = store.one("SELECT * FROM runs WHERE id=?", (active_id,))
+        return not current or runtime.is_cancelled(current)
+
+    for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') ORDER BY started"):
+        if tracking_cancelled():
             return
         if project_id and run["project"] != project_id:
             continue
@@ -226,17 +236,43 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     authorized = authorized and sealed_target
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         _, remote, branch = baseline(runtime, project, config)
+                        if remote == policy["base"] and branch == policy["branch"]:
+                            task = store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
+                            if task and task["source"] == "issue":
+                                try:
+                                    issue_current = runtime.issue_still_open(project, task, config)
+                                except StaleCandidate as exc:
+                                    issue_current = False
+                                    outcome["issue_stale_reason"] = str(exc)
+                                if not issue_current:
+                                    if tracking_cancelled():
+                                        return
+                                    if not outcome.get("issue_stale_reason"):
+                                        outcome["issue_stale_reason"] = "Issue is closed or no longer matches configured labels"
+                                    outcome["delivery_status"] = "issue_changed"
+                                    outcome["replanned"] = True
+                                    store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+                                    # Issue sync will refresh evidence and requeue this task if it is still eligible.
+                                    store.execute("UPDATE tasks SET state='blocked',available=0,updated=? WHERE id=?", (now, run["task"]))
+                                    if tracking_cancelled():
+                                        return
+                                    checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
+                                    continue
                         if (remote == policy["base"] and branch == policy["branch"] and
                                 runtime.config(project["id"])["delivery"]["auto_merge"] and
-                                not runtime.project(project["id"])["paused"] and not runtime.stop.is_set()):
+                                not runtime.project(project["id"])["paused"] and not tracking_cancelled()):
                             checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
                                      "--match-head-commit", policy["head"]])
                             outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
+                        if tracking_cancelled():
+                            return
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
                         state = "queued" if task["attempts"] <= config["limits"]["retries"] else "blocked"
                         store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=?", (state, now, run["task"]))
                         outcome["replanned"] = True
+                        if tracking_cancelled():
+                            return
                         checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
                         store.execute("UPDATE runs SET state='superseded' WHERE id=?", (run["id"],))
                 store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))

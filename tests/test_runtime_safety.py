@@ -7,9 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.config import BUILTIN_PROVIDERS, merge
+from adaptive_rsi.config import BUILTIN_PROVIDERS, fingerprint, merge
 from adaptive_rsi.dashboard import records
-from adaptive_rsi.delivery import feedback, merge_gate, publish, schedule, tick
+from adaptive_rsi.delivery import StaleCandidate, feedback, merge_gate, publish, schedule, tick
 from adaptive_rsi.discovery import sync
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import changes, git, snapshot
@@ -85,6 +85,110 @@ class RuntimeSafetyTest(unittest.TestCase):
                 publish(self.runtime, project, task, run, workspace, self.runtime.config(self.project))
             push.assert_called_once()
             self.assertFalse(any("create" in call.args[0] for call in command.call_args_list))
+
+    def test_review_receives_the_exact_sealed_patch_and_fails_closed_when_missing_or_oversized(self):
+        class CaptureAgent(FakeAgent):
+            prompt = None
+            def invoke(self, role, prompt, *args, **kwargs):
+                self.prompt = prompt
+                return {"summary": "review evidence captured"}
+
+        agent = CaptureAgent()
+        self.runtime.agent = agent
+        workspace = self.root / "review-run" / "candidate"
+        workspace.mkdir(parents=True)
+        patch_path = workspace.parent / "candidate.patch"
+        patch_text = "diff --git a/calculator.py b/calculator.py\n@@ -1 +1 @@\n-return a-b\n+return a+b\n"
+        patch_path.write_text(patch_text)
+        run = {"id": "review-run", "project": self.project,
+               "config": encode(self.runtime.config(self.project)), "started": time.time()}
+
+        self.runtime.invoke("review", "Review this candidate", workspace, run)
+        self.assertIn(patch_text, agent.prompt)
+        self.assertIn("untrusted evidence", agent.prompt)
+
+        patch_path.unlink()
+        with self.assertRaisesRegex(RuntimeError, "diff is unavailable"):
+            self.runtime.invoke("review", "Review this candidate", workspace, run)
+        patch_path.write_bytes(b"x" * (256 * 1024 + 1))
+        with self.assertRaisesRegex(RuntimeError, "256 KiB"):
+            self.runtime.invoke("review", "Review this candidate", workspace, run)
+        self.assertEqual(agent.prompt.count(patch_text), 1)
+
+    def test_cancelled_delivery_tracker_never_submits_a_merge_after_baseline_fetch(self):
+        project, task, run, _, job = self.candidate()
+        config = self.runtime.config(self.project)
+        config["delivery"]["auto_merge"] = True
+        self.runtime.configure({"delivery": {"auto_merge": True}}, self.project)
+        self.store.execute("UPDATE runs SET state='pr_open',ended=?,config=?,result=? WHERE id=?",
+                           (time.time(), encode(config), encode({"pr": "https://github.com/example/project/pull/1"}), run["id"]))
+        self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (task["id"],))
+        self.store.put_setting("delivery:" + run["id"], {"head": "candidate-head", "base": run["base"], "branch": "main"})
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "main", "sha": run["base"]})
+        pr = {"state": "OPEN", "headRefOid": "candidate-head", "baseRefOid": run["base"],
+              "baseRefName": "main", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+              "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+
+        def cancel_during_fetch(*args):
+            self.runtime.cancel_task(job["task"])
+            return str(self.repo), run["base"], "main"
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", side_effect=cancel_during_fetch) as fetch, \
+                patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime, now=time.time() + 61, project_id=self.project, active_run=job["id"])
+
+        fetch.assert_called_once()
+        self.assertFalse(any("merge" in call.args[0] for call in remote.call_args_list))
+
+    def test_issue_revision_change_blocks_and_closes_the_old_auto_merge_candidate(self):
+        project, task, run, _, job = self.candidate()
+        config = self.runtime.config(self.project)
+        config["delivery"]["auto_merge"] = True
+        self.store.execute("UPDATE runs SET state='pr_open',ended=?,config=?,result=? WHERE id=?",
+                           (time.time(), encode(config), encode({"pr": "https://github.com/example/project/pull/2"}), run["id"]))
+        self.store.execute("UPDATE tasks SET state='pr_open',source='issue',evidence=? WHERE id=?",
+                           (encode([{"number": 42, "updated": "2026-10-21T10:00:00Z"}]), task["id"]))
+        self.runtime.configure({"delivery": {"auto_merge": True}}, self.project)
+        self.store.transition(job["id"], "completed", {}, True)
+        self.store.put_setting("delivery:" + run["id"], {"head": "candidate-head", "base": run["base"], "branch": "main"})
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "main", "sha": run["base"]})
+        pr = {"state": "OPEN", "headRefOid": "candidate-head", "baseRefOid": run["base"],
+              "baseRefName": "main", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+              "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), run["base"], "main")), \
+                patch.object(self.runtime, "issue_still_open", return_value=False) as issue, \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, now=time.time() + 61, project_id=self.project)
+
+        issue.assert_called_once()
+        self.assertFalse(any("merge" in call.args[0] for call in remote.call_args_list))
+        self.assertTrue(any(call.args[0][1:3] == ["pr", "close"] for call in remote.call_args_list))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+
+    def test_issue_delivery_gate_checks_revision_and_label_policy(self):
+        self.runtime.configure({"github": {"repository": "example/project", "labels": ["bug"],
+                                            "exclude_labels": ["wontfix"]}}, self.project)
+        task_id = self.store.add_task(self.project, "issue", "issue:42", "Fix a bug", "body",
+                                      [{"number": 42, "updated": "2026-10-21T10:00:00Z"}])
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        responses = [
+            {"state": "OPEN", "updatedAt": "2026-10-21T10:00:00Z", "labels": [{"name": "bug"}]},
+            {"state": "OPEN", "updatedAt": "2026-10-21T10:00:00Z", "labels": [{"name": "bug"}, {"name": "wontfix"}]},
+            {"state": "OPEN", "updatedAt": "2026-10-21T11:00:00Z", "labels": [{"name": "bug"}]},
+        ]
+        with patch("adaptive_rsi.runtime.checked", side_effect=[encode(item) for item in responses]):
+            self.assertTrue(self.runtime.issue_still_open(self.runtime.project(self.project), task,
+                                                          self.runtime.config(self.project)))
+            self.assertFalse(self.runtime.issue_still_open(self.runtime.project(self.project), task,
+                                                           self.runtime.config(self.project)))
+            with self.assertRaises(StaleCandidate):
+                self.runtime.issue_still_open(self.runtime.project(self.project), task,
+                                              self.runtime.config(self.project))
 
     def test_publish_resumes_commit_after_branch_was_created_before_interruption(self):
         project, task, run, workspace, _ = self.candidate()
@@ -177,6 +281,43 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task["id"],))
         sync(self.runtime, self.runtime.project(self.project), config, lambda *a, **kw: "[]")
         self.assertEqual(json.loads(self.store.one("SELECT evidence FROM tasks WHERE id=?", (task["id"],))["evidence"])[0]["updated"], issue["updated_at"])
+
+    def test_changed_issue_invalidates_waiting_candidate_and_applies_held_revision(self):
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"mode": "pr"}, "limits": {"retries": 3}}, self.project)
+        task = self.store.add_task(self.project, "issue", "issue:91", "Fix addition", "old requirements",
+                                   [{"number": 91, "updated": "2026-10-20T10:00:00Z"}])
+        original = self.store.claim(self.project, self.runtime.config(self.project))
+        base = git(self.repo, "rev-parse", "HEAD")
+        run_dir = self.root / "awaiting-approval"
+        candidate = snapshot(self.repo, run_dir / "candidate")
+        (candidate / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+        git(candidate, "add", ".")
+        candidate_patch = git(candidate, "diff", base, "--binary", "--no-ext-diff", "--no-textconv")
+        outcome = {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"},
+                   "summary": "fixed", "patch_hash": fingerprint(candidate_patch)}
+        self.store.execute("UPDATE runs SET path=?,base=? WHERE id=?", (str(run_dir), base, original["id"]))
+        self.store.transition(original["id"], "awaiting_approval", outcome, True)
+        self.runtime.deliver(original["id"])
+        publishing = self.store.claim(self.project, self.runtime.config(self.project))
+        newer = "2026-10-21T11:00:00Z"
+
+        with patch("adaptive_rsi.runtime.checked", return_value=encode({
+                "state": "OPEN", "updatedAt": newer, "labels": []})):
+            self.runtime.process(publishing)
+
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+        issue = {"number": 91, "title": "Updated issue", "body": "new requirements", "labels": [],
+                 "state": "open", "updated_at": newer,
+                 "html_url": "https://github.com/example/project/issues/91"}
+        sync(self.runtime, self.runtime.project(self.project), self.runtime.config(self.project),
+             lambda *args, **kwargs: encode([issue]))
+        refreshed = self.store.one("SELECT state,title,body,evidence FROM tasks WHERE id=?", (task,))
+        self.assertEqual((refreshed["state"], refreshed["title"], refreshed["body"]),
+                         ("queued", "Updated issue", "new requirements"))
+        self.assertEqual(json.loads(refreshed["evidence"])[0]["updated"], newer)
 
     def test_closed_issue_revision_stays_durable_until_active_task_can_be_obsoleted(self):
         config = merge(self.runtime.config(self.project), {"github": {"repository": "example/project", "max_issues": 1}})

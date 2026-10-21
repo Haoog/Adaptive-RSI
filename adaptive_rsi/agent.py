@@ -80,6 +80,54 @@ def provider_arguments(route, config, environment=None):
     return argv
 
 
+def workspace_signature(workspace, max_bytes):
+    """Fingerprint tracked edits and new source files before considering a fallback."""
+    import hashlib
+    import os
+    from .gitops import git
+
+    root = Path(workspace).resolve()
+    digest = hashlib.sha256()
+    remaining = max_bytes
+    try:
+        changed = git(root, "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "HEAD", "--").split("\0")
+        files = [name for name in git(root, "ls-files", "--others", "--exclude-standard", "-z").split("\0") if name]
+        files = sorted(set(changed) | set(files))
+    except RuntimeError:
+        # Standalone executor tests and probes may use a plain directory instead of a project snapshot.
+        files = []
+        for parent, dirs, names in os.walk(root, followlinks=False):
+            dirs[:] = [name for name in dirs if name != ".git" and not name.startswith(".rsi-")]
+            files.extend((Path(parent) / name).relative_to(root).as_posix() for name in names
+                         if not name.startswith(".rsi-"))
+    for name in sorted(files):
+        if not name:
+            continue
+        if any(part.startswith(".rsi-") for part in Path(name).parts):
+            continue
+        path = root / name
+        digest.update(name.encode("utf-8", "surrogateescape"))
+        if path.is_symlink():
+            digest.update(b"symlink\0" + os.readlink(path).encode("utf-8", "surrogateescape"))
+            continue
+        if not path.exists():
+            digest.update(b"missing\0")
+            continue
+        resolved = path.resolve()
+        resolved.relative_to(root)
+        if not resolved.is_file():
+            continue
+        digest.update(str(resolved.stat().st_mode & 0o777).encode())
+        size = resolved.stat().st_size
+        if size > remaining:
+            raise RuntimeError("Workspace output is too large to compare safely before fallback")
+        remaining -= size
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 class CodexAgent:
     def __init__(self, store):
         self.store = store
@@ -94,6 +142,8 @@ class CodexAgent:
         health = ProviderHealth(self.store)
         primary = config["models"][role]
         routes = [primary] + ([primary["fallback"]] if primary.get("fallback") else [])
+        workspace_before = (workspace_signature(workspace, config["limits"]["max_output_mb"] * 1024 * 1024)
+                            if role == "implementation" and len(routes) > 1 else None)
         for index, route in enumerate(routes):
             provider_id = route.get("provider", "openai")
             try:
@@ -105,7 +155,12 @@ class CodexAgent:
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
                 codex_unavailable = str(exc).startswith("Codex call failed:") and any(
                     text in str(exc).lower() for text in ["model not found", "not supported", "does not exist", "rate limit", "usage limit"])
-                if index + 1 < len(routes) and (isinstance(exc, (ProviderUnavailable, ProviderPaused)) or codex_unavailable):
+                can_fallback = index + 1 < len(routes) and (
+                    isinstance(exc, (ProviderUnavailable, ProviderPaused)) or codex_unavailable)
+                if can_fallback and workspace_before is not None and \
+                        workspace_signature(workspace, config["limits"]["max_output_mb"] * 1024 * 1024) != workspace_before:
+                    raise RuntimeError("Primary implementation failed after changing the workspace; fallback refused to prevent mixing partial edits") from None
+                if can_fallback:
                     self.store.event("fallback", "Primary provider unavailable; using configured fallback", project, run)
                     continue
                 raise

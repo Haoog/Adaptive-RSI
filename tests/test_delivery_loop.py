@@ -10,9 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.acceptance import seal
+from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
 from adaptive_rsi.delivery import baseline, merge_gate, tick
-from adaptive_rsi.evaluator import Evaluator
+from adaptive_rsi.evaluator import Evaluator, freeze_harness
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.process import Sandbox, run_process
@@ -37,6 +38,59 @@ class DeliveryLoopTest(unittest.TestCase):
     def tearDown(self):
         self.runtime.close()
         self.tmp.cleanup()
+
+    def test_frozen_harness_restores_modern_test_names_and_configured_check_files(self):
+        baseline_root = self.root / "harness-baseline"
+        target = self.root / "harness-target"
+        for relative, content in {
+                "src/math.test.cjs": "assert.equal(add(2, 3), 5)\n",
+                "src/math.spec.tsx": "expect(add(2, 3)).toBe(5)\n",
+                "qa/verify_behavior.py": "assert add(2, 3) == 5\n"}.items():
+            path = baseline_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        shutil.copytree(baseline_root, target)
+        (target / "src/math.test.cjs").write_text("assert.equal(add(2, 3), 0)\n")
+        (target / "qa/verify_behavior.py").write_text("assert add(2, 3) == 0\n")
+        (target / "src/new-feature.test.tsx").write_text("expect(newFeature()).toBe(true)\n")
+
+        protected = freeze_harness(baseline_root, target, [
+            {"cwd": ".", "argv": ["python3", "qa/verify_behavior.py"]}])
+
+        self.assertEqual((target / "src/math.test.cjs").read_text(), "assert.equal(add(2, 3), 5)\n")
+        self.assertEqual((target / "qa/verify_behavior.py").read_text(), "assert add(2, 3) == 5\n")
+        self.assertTrue((target / "src/new-feature.test.tsx").is_file())
+        self.assertTrue(any(str(path).endswith("qa/verify_behavior.py") for path in protected))
+        for name in ["math.test.cjs", "math.spec.tsx", "math.test.jsx", "math.spec.mjs", "foo_test.py",
+                     "FooTest.java", "TestWidget.cs", "math_test.exs", "math_test.dart", "test.py"]:
+            self.assertTrue(test_path(name), name)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_candidate_cannot_weaken_a_modern_test_file_to_hide_a_regression(self):
+        baseline_root = self.root / "javascript-baseline"
+        test_pathname = baseline_root / "src/math.test.cjs"
+        test_pathname.parent.mkdir(parents=True)
+        (baseline_root / "src/math.cjs").write_text(
+            "exports.add = (a, b) => a - b;\nexports.multiply = (a, b) => a * b;\n")
+        original_test = ('const test = require("node:test");\n'
+                         'const assert = require("node:assert/strict");\n'
+                         'const {multiply} = require("./math.cjs");\n'
+                         'test("multiplication remains correct", () => assert.equal(multiply(2, 3), 6));\n')
+        test_pathname.write_text(original_test)
+        candidate = self.root / "javascript-candidate"
+        shutil.copytree(baseline_root, candidate)
+        (candidate / "src/math.cjs").write_text(
+            "exports.add = (a, b) => a + b;\nexports.multiply = () => 0;\n")
+        (candidate / "src/math.test.cjs").write_text(original_test.replace("), 6));", "), 0));"))
+        checks = [{"name": "JavaScript regression", "argv": ["node", "--test", "src/math.test.cjs"]}]
+
+        result = Evaluator(self.store).evaluate(baseline_root, candidate, checks,
+            self.root / "javascript-evaluation", self.runtime.config(self.project))
+
+        self.assertTrue(all(check["passed"] for check in result["checks"]["baseline"]))
+        self.assertFalse(all(check["passed"] for check in result["checks"]["candidate"]))
+        self.assertTrue(all(check["passed"] for check in result["checks"]["candidate_full"]))
+        self.assertEqual(result["decision"], "fail")
 
     def test_independent_acceptance_requires_complete_coverage_and_safe_paths(self):
         for edit in [lambda s: s["checks"][0].update(criteria=[]),
