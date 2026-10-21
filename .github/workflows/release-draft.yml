@@ -1,0 +1,35 @@
+name: 准备正式发布草稿
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  prepare:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -v
+      - run: node --test tests/web_requests.cjs
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - run: python3 scripts/package.py
+      - run: python3 -m pip install build
+      - run: python3 -m build --wheel
+      - name: 上传经过检查的发布草稿
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          release_version=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
+          gh release create "v${release_version}" --draft --target "$GITHUB_SHA" \
+            --title "Adaptive RSI ${release_version}" --notes-file CHANGELOG.md \
+            "dist/adaptive-rsi-${release_version}-plugin.zip" \
+            "dist/adaptive-rsi-${release_version}-plugin.zip.sha256" dist/*.whl

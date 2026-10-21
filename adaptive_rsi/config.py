@@ -36,7 +36,7 @@ DEFAULTS = {
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
-                  "min_cases_per_split": 3, "repeats": 1, "max_calls": 40,
+                  "min_cases_per_split": 3, "repeats": 2, "max_calls": 40,
                   "max_cost_ratio": 1.25, "max_holdout_uses": 3,
                   "monitor_tasks": 5, "archive_limit": 50},
 }

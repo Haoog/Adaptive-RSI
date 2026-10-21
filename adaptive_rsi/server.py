@@ -13,6 +13,8 @@ from socketserver import TCPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
+from .build import BUILD_ID
+from .dashboard import records
 from .adapters import detect
 from .catalog import CatalogError, list_models
 from .credentials import CredentialError
@@ -36,6 +38,7 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, runtime, port=0, session=None):
         self.runtime = runtime
+        self.assets = {p.name: p.read_bytes() for p in (Path(__file__).parent / "web").iterdir() if p.is_file()}
         self.token = secrets.token_urlsafe(32)
         self.csrf = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), Handler)
@@ -109,40 +112,38 @@ class Handler(BaseHTTPRequestHandler):
             runtime = self.server.runtime
             store = runtime.store
             if parsed.path == "/api/health":
-                self.respond({"version": __version__, "pid": os.getpid()})
+                self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid()})
             elif parsed.path == "/api/state":
                 projects = store.query("SELECT * FROM projects ORDER BY created")
                 for project in projects:
                     project["overrides"] = json.loads(project["config"])
                     project["config"] = runtime.config(project["id"])
-                tasks = store.query("SELECT * FROM tasks ORDER BY updated DESC LIMIT 300")
-                runs = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs ORDER BY started DESC LIMIT 100")
-                for row in runs:
-                    result = json.loads(row.pop("result"))
-                    row["summary"] = result.get("summary", "")
-                    row["reason"] = result.get("reason", "")
-                    row["pr"] = result.get("pr")
-                    row["value"] = result.get("value")
-                    row["plan_reason"] = result.get("plan_reason", "")
-                    row["plan_decision"] = result.get("plan_decision")
-                    row["scope"] = result.get("scope", result.get("files", []))
-                    row["review_decision"] = result.get("review", {}).get("decision")
-                    row["evaluation_decision"] = result.get("evaluation", {}).get("decision")
-                candidates = store.query("SELECT * FROM candidates ORDER BY created DESC LIMIT 100")
+                selected = params.get("project", [None])[0] or (projects[0]["id"] if projects else None)
+                if selected not in {p["id"] for p in projects}:
+                    selected = projects[0]["id"] if projects else None
+                rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
+                               params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
+                candidates = store.query("SELECT * FROM candidates " + ("WHERE project=? " if selected else "") + "ORDER BY created DESC LIMIT 100", (selected,) if selected else ())
                 for candidate in candidates:
                     evidence = json.loads(candidate.pop("evidence"))
                     candidate["content"] = json.loads(candidate["content"])
                     candidate["reason"] = evidence.get("reason", "")
                     candidate["trial_count"] = len(evidence.get("trials", []))
                     candidate["monitor"] = evidence.get("monitor", {})
-                self.respond({"version": __version__, "csrf": self.server.csrf, "projects": projects, "tasks": tasks,
-                              "runs": runs, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.snapshot(),
-                              "events": store.query("SELECT * FROM events ORDER BY seq DESC LIMIT 100"),
+                self.respond({"version": __version__, "build": BUILD_ID, "selected_project": selected, "csrf": self.server.csrf, "projects": projects, **rows, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.snapshot(),
                               "schedules": store.query("SELECT * FROM schedules"),
                               "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
-                              "quality": quality_summary(store),
+                              "quality": quality_summary(store, selected),
                               "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
-                              "model_usage": store.query("SELECT project,provider,model,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model", (time.time() - 86400,))})
+                              "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+            elif parsed.path == "/api/readiness":
+                from .readiness import inspect
+                self.respond(inspect(runtime, runtime.project(params.get("project", [""])[0])))
+            elif parsed.path == "/api/task-runs":
+                task = store.one("SELECT project FROM tasks WHERE id=?", (params.get("task", [""])[0],))
+                if not task or task["project"] != params.get("project", [""])[0]:
+                    raise ValueError("Task not found")
+                self.respond(store.query("SELECT id,project,task,state,started,ended FROM runs WHERE task=? ORDER BY started DESC LIMIT 100", (params["task"][0],)))
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
                 data = detect(project["path"])
@@ -162,6 +163,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run not found")
                 run["result"] = json.loads(run["result"])
                 run["config"] = json.loads(run["config"])
+                run["stages"] = store.query("SELECT stage,created FROM stages WHERE run=? ORDER BY created", (run["id"],))
+                for stage in run["stages"]:
+                    saved = store.one("SELECT data FROM stages WHERE run=? AND stage=?", (run["id"], stage["stage"]))
+                    stage["decision"] = json.loads(saved["data"]).get("decision")
                 self.respond(run)
             elif parsed.path == "/api/patch":
                 run = store.one("SELECT path FROM runs WHERE id=?", (params.get("id", [""])[0],))
@@ -172,7 +177,10 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
-                self.respond(path.read_bytes(), content_type=(mimetypes.guess_type(str(path))[0] or "application/octet-stream") + "; charset=utf-8")
+                payload = self.server.assets[name]
+                if name == "index.html":
+                    payload = payload.replace(b'<html lang=', ('<html data-build="' + BUILD_ID + '" lang=').encode(), 1)
+                self.respond(payload, content_type=(mimetypes.guess_type(str(path))[0] or "application/octet-stream") + "; charset=utf-8")
             else:
                 self.respond({"error": "Not found"}, 404)
         except (ValueError, OSError, RuntimeError) as exc:

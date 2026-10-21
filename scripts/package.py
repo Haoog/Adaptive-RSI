@@ -2,6 +2,7 @@
 """Build a local plugin ZIP without sessions, credentials, caches or test output."""
 import hashlib
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -11,9 +12,14 @@ destination.mkdir(exist_ok=True)
 version = json.loads((root / "plugin.json").read_text())["version"]
 if json.loads((root / "update.json").read_text())["version"] != version:
     raise SystemExit("Plugin and update versions must match")
+for filename, pattern in [("pyproject.toml", r'^version = "([^"]+)"'),
+                          ("adaptive_rsi/__init__.py", r'^__version__ = "([^"]+)"')]:
+    found = re.search(pattern, (root / filename).read_text(), re.M)
+    if not found or found.group(1) != version:
+        raise SystemExit("Release versions must match: " + filename)
 bundle = destination / ("adaptive-rsi-" + version + "-plugin.zip")
-files = [root / name for name in ["plugin.json", "update.json", "pyproject.toml", "README.md", "README.en.md", "CONTRIBUTING.md", "CONTRIBUTING.en.md", "VALIDATION.md", "VALIDATION.en.md", "LIVE_VALIDATION.md", "LIVE_VALIDATION.en.md", "RELEASING.md", "RELEASING.en.md", "AGENTS.md", "LICENSE", ".gitignore", "启动 Adaptive RSI.command", ".agents/plugins/marketplace.json"]]
-for folder in ["adaptive_rsi", "scripts", "skills", "tests"]:
+files = [root / name for name in ["plugin.json", "update.json", "pyproject.toml", "package.json", "package-lock.json", "CHANGELOG.md", "CHANGELOG.en.md", "RELIABILITY.md", "RELIABILITY.en.md", "README.md", "README.en.md", "CONTRIBUTING.md", "CONTRIBUTING.en.md", "VALIDATION.md", "VALIDATION.en.md", "LIVE_VALIDATION.md", "LIVE_VALIDATION.en.md", "RELEASING.md", "RELEASING.en.md", "AGENTS.md", "LICENSE", ".gitignore", "启动 Adaptive RSI.command", ".agents/plugins/marketplace.json"]]
+for folder in ["adaptive_rsi", "scripts", "skills", "tests", "docs"]:
     files += [path for path in (root / folder).rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"]
 with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
     for path in sorted(files):

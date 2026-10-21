@@ -1,0 +1,236 @@
+"""Shared, isolated candidate pipeline used by tasks and strategy experiments."""
+import json
+import time
+from pathlib import Path
+
+from .adapters import detect
+from .agent import SCHEMAS, validate_output
+from .config import compatibility, fingerprint, relative_path
+from .gitops import changes, git, snapshot
+from .process import scrub_tree
+from .review import REVIEW_PROMPT, enforce_review
+from .store import encode
+
+
+def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False):
+    """One production path for real tasks and paired experiments; experiments never deliver."""
+    config = json.loads(run["config"])
+    from .workflow import change_kind
+    def transition(state, result=None, terminal=False):
+        if not experiment:
+            runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal)
+    from .readiness import inspect as readiness
+    check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
+    if not check["budget"]["ready"]:
+        from .recovery import BudgetExhausted
+        raise BudgetExhausted("Model call budget exhausted before planning")
+    if not check["ready"]:
+        transition("insufficient_evidence", {"reason": "Project readiness checks need attention", "readiness": check,
+                   "failure": {"code": "budget" if not check["budget"]["ready"] else "environment",
+                               "action": "check_readiness"}}, True)
+        return {"decision": "insufficient_evidence", "reason": "Project readiness checks need attention", "readiness": check}
+    from .environment import capture, restore
+    seeds = directory / "dependencies"
+    environment = capture(Path(project["path"]), seeds, config)
+    runtime.store.event("environment", "Dependency snapshot frozen", project["id"], run["id"], environment)
+    restore(seeds, workspace, config)
+    from .process import Sandbox
+    for setup in config["environment"]["setup"]:
+        prepared = Sandbox(runtime.store.root, config).check(setup, workspace, lambda: runtime.is_cancelled(run),
+                     hidden=[p["path"] for p in runtime.store.query("SELECT path FROM projects")])
+        if prepared["exit_code"] or prepared["error"]:
+            raise RuntimeError("Dependency preparation failed before planning: " + prepared["stderr"])
+    from .context import code_map
+    from .recovery import signature, cached, save
+    stage_key = fingerprint({"inputs": signature(run, task, base, strategies), "dependencies": environment["sha256"],
+                             "outcomes": runtime.outcomes(project["id"]), "prs": runtime.store.setting("prs:" + project["id"], [])})
+    saved_plan = None if experiment else cached(runtime, run, "planning", stage_key)
+    saved_acceptance = None if experiment else cached(runtime, run, "acceptance", stage_key)
+    saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", stage_key)
+    from .readiness import budget
+    remaining = budget(runtime.store, project["id"], config, 4 - sum(x is not None for x in [saved_plan, saved_acceptance, saved_candidate]), run["id"])
+    if not remaining["ready"]:
+        from .recovery import BudgetExhausted
+        raise BudgetExhausted("Model call budget cannot cover remaining pipeline stages")
+    context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
+               "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
+               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": runtime.outcomes(project["id"]),
+               "open_prs": runtime.store.setting("prs:" + project["id"], []),
+               "known_tasks": runtime.store.query("SELECT id,title,state FROM tasks WHERE project=? AND id<>? "
+                                               "AND source NOT LIKE 'system_%' LIMIT 100", (project["id"], task["id"])),
+               "previous_attempts": runtime.store.query("SELECT state,result FROM runs WHERE task=? AND ended IS NOT NULL "
+                                                      "ORDER BY started DESC LIMIT 2", (task["id"],))}
+    if experiment:
+        guide_ids = {g.get("id") for g in strategies if g.get("id")}
+        context["skills"] = [m for m in context["skills"] if m["evidence"].get("candidate") in guide_ids]
+    context["previous_attempts"] = [{"state": r["state"], **{k: v for k, v in json.loads(r["result"]).items()
+                                    if k in ["reason", "failure", "summary"]}} for r in context["previous_attempts"]]
+    if task["source"] == "rollback":
+        prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (json.loads(task["evidence"])[0]["run"], project["id"]))
+        if not prior:
+            raise RuntimeError("Original run missing")
+        prior_result = json.loads(prior["result"])
+        patch_path = Path(prior["path"]) / "candidate.patch"
+        git(workspace, "apply", "--reverse", "--check", str(patch_path))
+        plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
+                "scope": prior_result["files"], "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
+    else:
+        plan = saved_plan
+        if plan is None:
+            plan = runtime.invoke("planning", "You are the PLANNER ONLY. Inspect and plan; do not implement or change files. "
+                       "Your read-only workspace is intentional and does not block a ready decision: a separate writable executor implements ready plans. "
+                       "First decide whether this work is worth doing, including user goals. Do not automatically implement every suggestion. "
+                       "Assess evidenced impact, benefit, cost/effort, confidence and what happens if nothing is changed. "
+                       "Use deferred for weak evidence, unclear requirements or low current priority; rejected for cosmetic churn, disproportionate cost or incompatible direction. "
+                       "Only ready authorizes implementation. Evidence must cite concrete current-code behavior or a specific user requirement. "
+                       "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
+                       "If ready, scope must contain ONLY literal relative file/directory paths (e.g. calculator.py, tests), without annotations or descriptions. Define observable acceptance criteria separately. "
+                           "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes.\n" +
+                           encode({"value_policy": config["triage"]["policy"], **context}), workspace, run)
+        validate_output(plan, SCHEMAS["planning"])
+        value = plan["value"]
+        if plan["decision"] == "ready" and (value["confidence"] == "low" or not any(e.strip() for e in value["evidence"]) or
+                not all(value[k].strip() for k in ["benefit", "cost", "inaction"]) or
+                value["impact"] == "low" and value["effort"] == "high"):
+            plan["decision"] = "deferred"
+            plan["reason"] = "Value gate held: insufficient evidence or disproportionate effort. " + plan["reason"]
+    if plan.get("value") and not experiment:
+        from .discovery import value_priority
+        rank = value_priority(plan["value"], plan["risk"])
+        runtime.store.execute("UPDATE tasks SET priority=? WHERE id=?", (rank, task["id"]))
+    (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
+    transition("planning", {"value": plan.get("value"), "scope": plan.get("scope", []),
+                          "plan_reason": plan.get("reason", ""), "plan_decision": plan["decision"]})
+    if plan["decision"] != "ready":
+        transition(plan["decision"], {"reason": plan["reason"], "value": plan.get("value"), "base": base,
+            "triage_input": fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})}, True)
+        return {"decision": "insufficient_evidence", "reason": plan["reason"]} if experiment else None
+    if not plan["scope"] or not plan["acceptance"]:
+        raise RuntimeError("Plan lacks scope or acceptance criteria")
+    from pathlib import PurePosixPath
+    plan["scope"] = [str(PurePosixPath(relative_path(path))) for path in plan["scope"]]
+    for path in plan["scope"]:
+        relative_path(path)
+        if path == "." or any(char in path for char in [":", "：", "\n", "*", "?", "["]):
+            raise RuntimeError("Plan must name narrower scope than the entire repository")
+    (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
+    if not experiment:
+        save(runtime, run, "planning", plan, stage_key)
+        if saved_plan is None and plan.get("value"):
+            higher = runtime.store.one("SELECT id FROM tasks WHERE project=? AND id<>? AND state='queued' "
+                                       "AND source NOT LIKE 'system_%' AND available<=? AND priority>? LIMIT 1",
+                                       (project["id"], task["id"], time.time(), rank))
+            if higher:
+                transition("assessed", {"reason": "Value assessment saved; higher-priority work runs first"}, True)
+                runtime.store.execute("UPDATE tasks SET state='queued',attempts=max(0,attempts-1),available=0,updated=? WHERE id=?",
+                                      (time.time(), task["id"]))
+                return None
+    stages_left = 3 - sum(x is not None for x in [saved_acceptance, saved_candidate]) + (plan["risk"] == "high")
+    if not budget(runtime.store, project["id"], config, stages_left, run["id"])["ready"]:
+        from .recovery import BudgetExhausted
+        raise BudgetExhausted("Model call budget cannot cover acceptance, implementation and risk-appropriate reviews")
+    checks = config["checks"] or detect(workspace)["checks"]
+    if not checks:
+        transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
+        return None
+    from .acceptance import seal
+    acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
+    restore(seeds, acceptance_workspace, config)
+    spec = saved_acceptance
+    if spec is None:
+        spec = runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
+        "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
+        "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
+        "Use python3 for Python checks; do not assume a python executable alias exists. "
+        "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
+        "For new APIs or modules, handle absence and assert the missing public behavior explicitly; import/setup errors alone are not improvement evidence. "
+        "For performance tasks use reproducible benchmark assertions with explicit tolerances. "
+        "For refactors cover preserved behavior and observable maintainability criteria. "
+        "High-risk changes require negative, permission-boundary and failure-path checks. "
+        "No network, credentials, dependency installs or changes to application files. The host seals these files away from the implementer.\n" +
+        encode({"task": context["task"], "plan": plan}), acceptance_workspace, run)
+    acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
+    if not experiment:
+        save(runtime, run, "acceptance", spec, stage_key)
+    acceptance["change_kind"] = "refactor" if task["source"] == "rollback" else change_kind(task)
+    (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
+    transition("executing")
+    if saved_candidate:
+        result = {"summary": saved_candidate["summary"]}
+        patch = saved_candidate["patch"]
+        if fingerprint(patch) != saved_candidate["patch_hash"]:
+            raise RuntimeError("Saved candidate evidence changed; retry refused")
+        (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
+        git(workspace, "apply", "--index", str(directory / "resume.patch"))
+    elif task["source"] == "rollback":
+        git(workspace, "apply", "--reverse", str(patch_path))
+        result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
+    else:
+        result = runtime.invoke("implementation", "Implement this verified plan. Add appropriate regression coverage. "
+                             "Do not modify files outside scope. No publishing.\n" + encode({"plan": plan, **context}), workspace, run)
+    scrub_tree(workspace)
+    files, patch = changes(workspace)
+    if not files and not experiment:
+        transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
+        return None
+    if len(files) > config["limits"]["max_changed_files"]:
+        raise RuntimeError("Changed file limit exceeded")
+    for path in files:
+        relative_path(path)
+        if not any(path == s.rstrip("/") or path.startswith(s.rstrip("/") + "/") for s in plan["scope"]):
+            raise RuntimeError("Change escaped planned scope: " + path)
+    (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
+    # Seal the exact patch outside the executor's writable subtree before evaluation.
+    workspace = snapshot(source, directory / "candidate", base)
+    if patch:
+        git(workspace, "apply", "--index", str(directory / "candidate.patch"))
+    if not experiment:
+        save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, stage_key)
+    transition("evaluating")
+    baseline = snapshot(source, directory / "baseline", base)
+    evaluation = runtime.evaluator.evaluate(baseline, workspace, checks, directory / "evaluation", config,
+                                         lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance)
+    if not experiment:
+        save(runtime, run, "evaluation", evaluation, stage_key)
+    if evaluation["decision"] != "pass" and not experiment:
+        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (stage_key, task["id"]))
+        return {**evaluation, "evaluation": evaluation}
+    if not experiment and evaluation["decision"] == "pass":
+        runtime.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
+                               "compatibility": compatibility(config), "at": time.time()})
+    if not experiment:
+        save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, stage_key)
+    transition("evaluating", {"stage": "review"})
+    review = runtime.invoke("review", REVIEW_PROMPT +
+                         "Also review the independent acceptance specification for meaningful behavioral coverage. "
+                         "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
+                         encode({"task": context["task"], "plan": plan, "evaluation": evaluation,
+                                 "independent_acceptance": acceptance["spec"],
+                                 "summary": result["summary"]}), workspace, run)
+    review = enforce_review(review, config)
+    risk_review = None
+    if plan["risk"] == "high" and review["decision"] == "pass":
+        risk_review = enforce_review(runtime.invoke("review", REVIEW_PROMPT +
+            "This is an additional high-risk review in a fresh session. Focus on permission boundaries, "
+            "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
+            "Missing negative-path verification must be reported as insufficient evidence. "
+            "Do not rely on another reviewer's assessment.\n" +
+            encode({"task": context["task"], "plan": plan, "evaluation": evaluation,
+                    "independent_acceptance": acceptance["spec"]}), workspace, run), config)
+        (directory / "risk-review.json").write_text(encode(risk_review), encoding="utf-8")
+        if not experiment:
+            save(runtime, run, "risk_review", risk_review, stage_key)
+        if risk_review["decision"] != "pass":
+            review = risk_review
+    (directory / "review.json").write_text(encode(review), encoding="utf-8")
+    if not experiment:
+        save(runtime, run, "review", review, stage_key)
+        if review["decision"] != "pass":
+            # A rejected patch must be implemented again, not replayed unchanged.
+            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (stage_key, task["id"]))
+    outcome = {"decision": review["decision"] if evaluation["decision"] == "pass" else evaluation["decision"], "reason": review["reason"], "summary": result["summary"], "files": files,
+               "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
+               "risk_review": risk_review,
+               "value": plan.get("value"),
+               "patch_hash": fingerprint(patch)}
+    return outcome

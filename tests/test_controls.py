@@ -174,13 +174,13 @@ class ValueAndIsolationTest(unittest.TestCase):
             self.runtime.goal(self.project, "test", {"delivery": {"mode": "pr"}})
 
 
-def release(target="0.2.1"):
+def release(target="0.2.2"):
     prefix = "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + target + "/"
     name = "adaptive-rsi-" + target + "-plugin.zip"
     return {"tag_name": "v" + target, "assets": [{"name": n, "browser_download_url": prefix + n} for n in [name, name + ".sha256"]]}
 
 
-def bundle(target="0.2.1", extra=None):
+def bundle(target="0.2.2", extra=None):
     data = io.BytesIO()
     files = {"update.json": json.dumps({"format": 1, "version": target, "python_min": [3, 9], "state_schema": 1}),
              "plugin.json": json.dumps({"version": target}), "adaptive_rsi/cli.py": "", "scripts/start.py": ""}
@@ -269,13 +269,13 @@ class UpdatesTest(unittest.TestCase):
                 state = root / "state"
                 store = Store(state)
                 store.put_setting("config", {"updates": {"mode": "manual"}})
-                store.put_setting("update-status", {"state": "restarting", "version": "0.2.1", "current": __version__})
+                store.put_setting("update-status", {"state": "restarting", "version": "0.2.2", "current": __version__})
                 store.put_setting("sentinel", {"project": "keep-me", "settings": [1, 2, 3]})
                 installs = state / "installations"
                 installs.mkdir()
                 candidate = installs / "candidate"
                 shutil.copytree(source / "adaptive_rsi", candidate / "adaptive_rsi", ignore=shutil.ignore_patterns("__pycache__"))
-                (candidate / "adaptive_rsi/__init__.py").write_text('__version__ = "0.2.1"\n')
+                (candidate / "adaptive_rsi/__init__.py").write_text('__version__ = "0.2.2"\n')
                 if not healthy:
                     (candidate / "adaptive_rsi/__main__.py").write_text(
                         "import sqlite3, os\nfrom pathlib import Path\n"
@@ -288,7 +288,7 @@ class UpdatesTest(unittest.TestCase):
                     port = listener.getsockname()[1]
                 session = {"origin": "http://127.0.0.1:" + str(port), "cookie": "rsi_" + str(port),
                            "token": "fixture-only-token", "csrf": "fixture-only-csrf", "url": "http://127.0.0.1:" + str(port) + "/?token=fixture-only-token", "pid": -1}
-                (installs / "restart.json").write_text(json.dumps({"candidate": str(candidate), "previous": str(source), "target": "0.2.1", "pid": -1, "session": session}))
+                (installs / "restart.json").write_text(json.dumps({"candidate": str(candidate), "previous": str(source), "target": "0.2.2", "pid": -1, "session": session}))
                 children = []
                 real_popen = subprocess.Popen
                 def spawn(*args, **kwargs):
@@ -298,7 +298,7 @@ class UpdatesTest(unittest.TestCase):
                 try:
                     with patch.dict(os.environ, {"RSI_TEST_RESTART_STATE": str(state)}), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=spawn):
                         supervise_restart(state)
-                    expected = "0.2.1" if healthy else __version__
+                    expected = "0.2.2" if healthy else __version__
                     deadline = time.monotonic() + 10
                     while True:
                         try:
@@ -339,24 +339,24 @@ class UpdatesTest(unittest.TestCase):
         self.assertFalse(release_info(release("0.3.0"))["patch"])
         self.assertEqual(release_info(release("0.1.0"))["state"], "up_to_date")
         data = release()
-        data["assets"][0]["browser_download_url"] = "https://github.com/other/repo/releases/download/v0.2.1/bundle.zip"
+        data["assets"][0]["browser_download_url"] = "https://github.com/other/repo/releases/download/v0.2.2/bundle.zip"
         with self.assertRaisesRegex(ValueError, "another repository"):
             release_info(data)
         with self.assertRaises(ValueError):
-            release_info({"tag_name": "v0.2.1"})
+            release_info({"tag_name": "v0.2.2"})
 
     def test_archive_verifies_hash_paths_and_migration_contract(self):
         import hashlib
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             data = bundle()
-            installed = extract_bundle(data, hashlib.sha256(data).hexdigest(), root / "valid", "0.2.1")
+            installed = extract_bundle(data, hashlib.sha256(data).hexdigest(), root / "valid", "0.2.2")
             self.assertTrue((installed / "update.json").is_file())
             with self.assertRaisesRegex(ValueError, "SHA-256"):
-                extract_bundle(data, "0" * 64, root / "bad-hash", "0.2.1")
+                extract_bundle(data, "0" * 64, root / "bad-hash", "0.2.2")
             malicious = bundle(extra=("adaptive-rsi/../../escaped", "bad"))
             with self.assertRaisesRegex(ValueError, "Unsafe"):
-                extract_bundle(malicious, hashlib.sha256(malicious).hexdigest(), root / "bad-path", "0.2.1")
+                extract_bundle(malicious, hashlib.sha256(malicious).hexdigest(), root / "bad-path", "0.2.2")
             self.assertFalse((root / "escaped").exists())
             with self.assertRaisesRegex(ValueError, "manifest"):
                 extract_bundle(data, hashlib.sha256(data).hexdigest(), root / "wrong-version", "0.3.0")
@@ -368,7 +368,7 @@ class UpdatesTest(unittest.TestCase):
                 manager = runtime.updates
                 manager.shutdown = lambda: None
                 runtime.configure({"updates": {"mode": "automatic"}})
-                for target, count in [("0.2.1", 1), ("0.3.0", 0)]:
+                for target, count in [("0.2.2", 1), ("0.3.0", 0)]:
                     runtime.store.put_setting("update-status", {**release_info(release(target)), "checked": time.time()})
                     with patch.object(manager, "apply_async") as apply:
                         manager.tick()

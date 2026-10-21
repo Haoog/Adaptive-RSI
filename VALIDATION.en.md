@@ -1,8 +1,22 @@
-# Local validation / 2026-10-20
+# Local validation
 
 [简体中文](VALIDATION.md) | **English**
 
-Version: 0.2.0. Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
+## Reliable improvement loop / 0.2.1 / 2026-10-21
+
+- macOS / Python 3.9.6: the first full run passed **137 backend tests**, along with **25 frontend request tests** and syntax checks for all three JavaScript files.
+- Real Chrome exercised two isolated temporary projects: hot settings saves, retained drafts, task pagination/filtering, project switching, Chinese/English and mobile layouts. The five durable stages of an actual fixture task were checked. Both projects finished paused with zero paid model calls.
+- Added behavioral coverage for readiness, budget waiting/resumption, recovery of checked patches with fresh evaluation, baseline invalidation, value-based yielding, extra high-risk review, Issue continuation and revisions across watermarks, server filters, project isolation, experiment preflight, withholding holdout after unsuccessful validation, monitoring attribution and context bounds.
+- The paired-strategy integration test uses six distinct synthetic defect families and two repetitions, running planning, acceptance, implementation, checks and review through the production function. It verifies controller behavior, not real model capability gains. The full suite still includes real service recovery of previous code and database after a failed startup.
+- ZIP and wheel builds passed, with all four version fields aligned and matching documentation/review evidence packaged. Playwright is a development dependency; the runtime still needs no third-party Python packages.
+- This round used author self-review, without independent external review. The review fixed Issue revision watermark omissions, budget-wait filter parity and pagination refresh. See the [value assessment and review record](docs/validation/reliability-review-20261021.json). Live provider accounts, paid calls, long-term gains and publication of a formal Release were outside this validation.
+- The first cloud run found that simulated executors were incorrectly blocked by the local Codex executable check. Connection availability now belongs to the actual executor, with a regression for environments without Codex. The production Codex executor still requires its binary; credentials and budgets are still checked. Final cloud results are available in the corresponding PR checks.
+
+The following preserves historical 0.2.0 validation. Old experiment settings and test counts apply only to that version. Current behavior is documented in the [reliable improvement loop](RELIABILITY.en.md).
+
+## Historical validation / 0.2.0 / 2026-10-20
+
+Host: macOS / Python 3.9.6 and 3.12.13 / Node 20.20.2 / Git 2.54.0.
 
 
 ## Usability and reliability fixes (latest result)

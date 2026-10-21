@@ -121,7 +121,11 @@ class Evaluator:
                     restore(seeds, target, config)
                 sandbox = Sandbox(self.store.root, config)
                 rows = []
-                for check in config["environment"]["setup"] + acceptance["checks"]:
+                for setup in config["environment"]["setup"]:
+                    result = sandbox.check(setup, target, cancel, protected, hidden)
+                    if result["exit_code"] or result["error"]:
+                        return {"decision": "insufficient_evidence", "reason": "Independent acceptance environment preparation failed", "setup": result}
+                for check in acceptance["checks"]:
                     result = sandbox.check(check, target, cancel, protected, hidden)
                     result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
                     rows.append(result)
@@ -135,6 +139,10 @@ class Evaluator:
                 "reason": "Regression, full candidate and independent acceptance passed" if passing else "Candidate failed independent checks",
                 "harness_hash": fingerprint(checks), "checks": results}
         if acceptance:
+            from .workflow import improvement
+            data["improvement"] = improvement(results, acceptance)
+            if passing and data["improvement"]["decision"] != "pass":
+                data.update(decision="insufficient_evidence", reason="Checks passed but task-specific improvement is unproven")
             data["acceptance_hash"] = acceptance["hash"]
             data["criteria"] = acceptance["criteria"]
         if unavailable:

@@ -166,6 +166,7 @@ window.RSIModelCenter = (() => {
       const provider=data.providers.find(p=>p.id===route.provider),copy=el('span');
       const name=findModel(route)?.name||route.model;copy.append(el('strong',name),el('small',(provider?.name||route.provider)+(name!==route.model?' · '+route.model:'')));
       const proof=findModel(route)?.probes?.[route.effort];copy.append(info(t(proof?.state==='pass'?'当前强度工具测试通过':proof?.state==='fail'?'当前强度测试失败':'当前强度尚未测试'),proof?.state==='fail'?'mc-warning':'mc-secondary'));
+      if(scope&&JSON.stringify(route)===JSON.stringify(data.models[role]))copy.append(info(t(data.task_proofs?.[role]?'已通过真实任务验证':'尚未通过真实任务验证'),'mc-secondary'));
       if(route.fallback)copy.append(info(t('备用')+' · '+(data.providers.find(p=>p.id===route.fallback.provider)?.name||route.fallback.provider)+' / '+route.fallback.model+' · '+route.fallback.effort));
       if(findModel(route)?.missing)copy.append(info(t('目录中已失效'),'mc-warning'));
       button.append(copy,info('⌄'));

@@ -4,9 +4,8 @@ import time
 from pathlib import Path
 
 from .config import compatibility, fingerprint, merge, validate
-from .gitops import changes, git, repository, snapshot
+from .gitops import git, repository, snapshot
 from .process import Cancelled, scrub_tree
-from .review import REVIEW_PROMPT, enforce_review
 from .store import encode, uid
 
 
@@ -64,10 +63,25 @@ class Evolution:
         config = merge(config, {"limits": {"run_calls": config["evolution"]["max_calls"]}})
         run = {**run, "config": encode(config)}
         self.store.execute("UPDATE runs SET config=? WHERE id=?", (run["config"], run["id"]))
+        cases = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
+                                 "AND uses<? ORDER BY created,id", (project["id"], config["evolution"]["max_holdout_uses"]))
+        minimum = config["evolution"]["min_cases_per_split"]
+        from .readiness import budget
+        required = 1 + 2 * minimum * 2 * config["evolution"]["repeats"] * 4
+        usage = budget(self.store, project["id"], config, required, run["id"])
+        if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]) or not usage["ready"]:
+            reason = "Need independent validation/holdout cases and sufficient experiment/daily budget before proposing"
+            candidate = uid()
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
+                 encode({"reason": reason, "budget": usage}), time.time()))
+            return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence", "budget": usage}
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
-                                        "ORDER BY created DESC LIMIT 20", (project["id"],))
-        failures = self.store.query("SELECT state,result FROM runs WHERE project=? AND state='failed' "
-                                    "ORDER BY started DESC LIMIT 10", (project["id"],))
+                                        "ORDER BY created DESC LIMIT 10", (project["id"],))
+        failures = self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
+                                    "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
+                                    "ORDER BY r.started DESC LIMIT 5", (project["id"],))
+        failures = [{"state": r["state"], "reason": json.loads(r["result"]).get("reason", "")[:1000]} for r in failures]
         development = [json.loads(row["spec"])["task"] for row in self.store.query(
             "SELECT spec FROM cases WHERE project=? AND split='development' LIMIT 10", (project["id"],))]
         current = self.runtime.active_strategies(project["id"])
@@ -90,61 +104,51 @@ class Evolution:
         evidence = {"run": run["id"], "config_hash": fingerprint(config), "compatibility": compatibility(config),
                     "trials": [], "monitor": {"passed": 0, "failed": 0}}
         try:
-            cases = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
-                                     "AND uses<? ORDER BY created", (project["id"], config["evolution"]["max_holdout_uses"]))
-            minimum = config["evolution"]["min_cases_per_split"]
-            if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
-                evidence.update(decision="insufficient_evidence", reason="Need independent validation and protected holdout cases; stable strategy unchanged")
-                self.save(candidate, "insufficient_evidence", evidence)
-                return {"reason": evidence["reason"], "candidate": candidate}
-            selected = []
             for split in ["validation", "holdout"]:
-                selected += [c for c in cases if c["split"] == split][:minimum]
-            # Consume protected tasks on exposure, including interrupted/failed experiments.
-            for case in selected:
-                self.store.execute("UPDATE cases SET uses=uses+1 WHERE id=?", (case["id"],))
-            for repetition in range(config["evolution"]["repeats"]):
+                selected = [c for c in cases if c["split"] == split][:minimum]
                 for case in selected:
-                    spec = json.loads(case["spec"])
-                    trial = {"case": case["id"], "split": case["split"], "source": spec["source"], "repetition": repetition}
-                    # Alternate order to reduce cache/time bias between variants.
-                    order = ["stable", "candidate"] if (len(evidence["trials"]) + repetition) % 2 == 0 else ["candidate", "stable"]
-                    for variant in order:
-                        if self.runtime.is_cancelled(run):
-                            raise Cancelled("Evolution cancelled")
-                        guide = current if variant == "stable" else [c for c in current if c["kind"] != proposal["kind"]] + [{"kind": proposal["kind"], "content": proposal}]
-                        trial_dir = directory / "experiments" / (case["id"] + "-" + str(repetition)) / variant
-                        trial_dir.mkdir(parents=True)
-                        worker = snapshot(spec["repository"], trial_dir / "workspace", spec["base"])
-                        before = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
-                        started = time.time()
-                        plan = None
-                        if proposal["kind"] == "meta_strategy":
-                            plan = self.runtime.invoke("planning", "Verify and plan this evaluation task using the supplied strategy.\n" +
-                                                       encode({"task": spec["task"], "strategy": guide}), worker, run)
-                        self.runtime.invoke("implementation", "Solve this evaluation task. Do not access holdout tests.\n" +
-                                            encode({"task": spec["task"], "strategy": guide, "plan": plan}), worker, run)
-                        _, patch = changes(worker)
-                        sealed = snapshot(spec["repository"], trial_dir / "candidate", spec["base"])
-                        if patch:
-                            patch_file = trial_dir / "candidate.patch"
-                            patch_file.write_text(patch + "\n", encoding="utf-8")
-                            git(sealed, "apply", "--index", str(patch_file))
-                        baseline = snapshot(spec["repository"], trial_dir / "baseline", spec["base"])
-                        result = self.runtime.evaluator.evaluate(baseline, sealed, spec["checks"], trial_dir / "evaluation", config,
-                                                                 lambda: self.runtime.is_cancelled(run), spec.get("overlay"))
-                        # Both variants pay for the same review gate, including failing baselines.
-                        review = enforce_review(self.runtime.invoke("review", REVIEW_PROMPT +
-                            encode({"task": spec["task"], "plan": plan,
-                                    "check_decision": result["decision"]}), sealed, run), config)
-                        (trial_dir / "review.json").write_text(encode(review), encoding="utf-8")
-                        after = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
-                        trial[variant] = {"pass": result["decision"] == "pass" and review["decision"] == "pass",
-                                          "review": review, "seconds": time.time() - started,
-                                          "tokens": after - before, "report": str(trial_dir / "evaluation" / "report.json")}
-                    evidence["trials"].append(trial)
-                    # Persist detailed evidence in protected state, never in proposal prompts.
-                    self.save(candidate, "evaluating", evidence)
+                    # Exposure is charged just before first use; untouched holdouts stay protected.
+                    self.store.execute("UPDATE cases SET uses=uses+1 WHERE id=?", (case["id"],))
+                    for repetition in range(config["evolution"]["repeats"]):
+                        spec = json.loads(case["spec"])
+                        trial = {"case": case["id"], "split": split, "source": spec["source"], "repetition": repetition}
+                        order = ["stable", "candidate"] if (len(evidence["trials"]) + repetition) % 2 == 0 else ["candidate", "stable"]
+                        for variant in order:
+                            if self.runtime.is_cancelled(run):
+                                raise Cancelled("Evolution cancelled")
+                            guide = current if variant == "stable" else [c for c in current if c["kind"] != proposal["kind"]] + [{"kind": proposal["kind"], "content": proposal}]
+                            trial_dir = directory / "experiments" / (case["id"] + "-" + str(repetition)) / variant
+                            trial_dir.mkdir(parents=True)
+                            worker = snapshot(spec["repository"], trial_dir / "workspace", spec["base"])
+                            before = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
+                            started = time.monotonic()
+                            trial_config = merge(config, {"checks": spec["checks"]})
+                            trial_run = {**run, "config": encode(trial_config)}
+                            trial_task = {"id": run["task"], "title": spec["task"].splitlines()[0], "body": spec["task"],
+                                          "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
+                            outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
+                                trial_task, spec["repository"], spec["base"], trial_dir, worker, guide, experiment=True)
+                            # A case overlay is host-owned and remains outside model-visible workspaces.
+                            if spec.get("overlay") and (trial_dir / "candidate").exists():
+                                overlay_result = self.runtime.evaluator.evaluate(
+                                    trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
+                                    trial_dir / "protected-evaluation", trial_config,
+                                    lambda: self.runtime.is_cancelled(run), overlay=spec["overlay"])
+                                if overlay_result["decision"] != "pass":
+                                    outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
+                            after = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
+                            trial[variant] = {"pass": bool(outcome and outcome.get("decision") == "pass"),
+                                "review": (outcome or {}).get("review", {}), "reason": (outcome or {}).get("reason", "No change"),
+                                "seconds": time.monotonic() - started, "tokens": after - before,
+                                "report": str(trial_dir / "evaluation" / "report.json")}
+                        evidence["trials"].append(trial)
+                        self.save(candidate, "evaluating", evidence)
+                if split == "validation":
+                    validation = self.split_decision(evidence["trials"], config)
+                    if validation["decision"] != "pass":
+                        evidence.update(validation)
+                        self.save(candidate, validation["decision"], evidence)
+                        return {"reason": evidence["reason"], "candidate": candidate, "status": evidence["decision"]}
             evidence.update(self.decide(evidence["trials"], config))
             state = evidence["decision"]
             if state == "pass" and config["evolution"]["auto_promote"]:
@@ -171,40 +175,78 @@ class Evolution:
             raise
 
     @staticmethod
-    def decide(trials, config):
+    def split_decision(trials, config):
         if not trials or any("stable" not in t or "candidate" not in t for t in trials):
             return {"decision": "insufficient_evidence", "reason": "Incomplete paired trials"}
-        regressions = any(t["stable"]["pass"] and not t["candidate"]["pass"] for t in trials)
-        improvements = all(any(not t["stable"]["pass"] and t["candidate"]["pass"] for t in trials if t["split"] == split)
-                           for split in ["validation", "holdout"])
-        stable_tokens = sum(t["stable"]["tokens"] for t in trials)
-        candidate_tokens = sum(t["candidate"]["tokens"] for t in trials)
-        stable_time = sum(t["stable"]["seconds"] for t in trials)
-        candidate_time = sum(t["candidate"]["seconds"] for t in trials)
-        cost_known = stable_tokens > 0 and candidate_tokens > 0
-        affordable = cost_known and candidate_tokens <= stable_tokens * config["evolution"]["max_cost_ratio"] and \
-            candidate_time <= stable_time * config["evolution"]["max_cost_ratio"]
-        if regressions:
+        if any(t["stable"]["pass"] and not t["candidate"]["pass"] for t in trials):
             return {"decision": "fail", "reason": "Candidate regressed on previously passing cases"}
-        if not improvements or not cost_known:
-            return {"decision": "insufficient_evidence", "reason": "No demonstrated improvement on both splits, or usage data unavailable"}
-        if not affordable:
-            return {"decision": "fail", "reason": "Quality gain exceeded time/token cost allowance"}
-        return {"decision": "pass", "reason": "Paired quality improved on both splits without observed regressions and within cost limits"}
+        for split in {t["split"] for t in trials}:
+            group = [t for t in trials if t["split"] == split]
+            if not any(not t["stable"]["pass"] and t["candidate"]["pass"] for t in group):
+                return {"decision": "insufficient_evidence", "reason": "No demonstrated improvement on each evaluated split"}
+            for metric in ["tokens", "seconds"]:
+                stable = sum(t["stable"][metric] for t in group)
+                candidate = sum(t["candidate"][metric] for t in group)
+                if stable <= 0 or candidate <= 0:
+                    return {"decision": "insufficient_evidence", "reason": "Usage or timing data unavailable"}
+                if candidate > stable * config["evolution"]["max_cost_ratio"]:
+                    return {"decision": "fail", "reason": "Quality gain exceeded time/token cost allowance"}
+        return {"decision": "pass", "reason": "Paired quality improved within cost limits"}
+
+    @staticmethod
+    def decide(trials, config):
+        result = Evolution.split_decision(trials, config)
+        if result["decision"] != "pass":
+            return result
+        if {t["split"] for t in trials} != {"validation", "holdout"}:
+            return {"decision": "insufficient_evidence", "reason": "Both validation and holdout are required"}
+        families = {}
+        for i, trial in enumerate(trials):
+            families.setdefault(trial.get("case", str(i)), []).append(trial)
+        expected = set(range(config["evolution"]["repeats"]))
+        complete = all(len(g) == len(expected) and {t.get("repetition") for t in g} == expected and
+                       len({t["split"] for t in g}) == 1 for g in families.values())
+        enough = all(sum(g[0]["split"] == split for g in families.values()) >= config["evolution"]["min_cases_per_split"]
+                     for split in ["validation", "holdout"])
+        wins = sum(all(not t["stable"]["pass"] and t["candidate"]["pass"] for t in group) for group in families.values())
+        # Families, not repeated executions, are the independent units. With no losses,
+        # a one-sided exact sign test still needs at least five consistent wins.
+        probability = 0.5 ** wins
+        repeated = config["evolution"]["repeats"] >= 2 and complete and enough
+        if probability > 0.05 or not repeated:
+            return {"decision": "insufficient_evidence", "reason": "Too few independent, repeated improvements for promotion",
+                    "consistent_family_wins": wins, "sign_test_p": probability}
+        return {**result, "consistent_family_wins": wins, "sign_test_p": probability,
+                "reason": "Repeated paired improvement on both splits without observed regressions"}
 
     def save(self, candidate, status, evidence):
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))
 
-    def monitor(self, project, passed):
+    def monitor(self, project, passed, run=None, attributable=False):
         config = self.runtime.config(project)
-        active = {c["id"] for c in self.runtime.active_strategies(project)}
+        if not run or not (passed or attributable):
+            return
+        recorded = self.store.one("SELECT strategy,config FROM runs WHERE id=? AND project=?", (run["id"], project))
+        if not recorded:
+            return
+        active = {c["id"] for c in json.loads(recorded["strategy"] or "[]") if c.get("id")}
+        if not passed and len(active) != 1:
+            self.store.event("strategy_inconclusive", "Regression cannot be attributed to a single strategy; no automatic rollback",
+                             project, run["id"], {"strategies": sorted(active)})
+            return
         for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
             if row["id"] not in active:
                 continue
             evidence = json.loads(row["evidence"])
+            if evidence.get("compatibility") and evidence["compatibility"] != compatibility(json.loads(recorded["config"])):
+                continue
             monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
+            seen = monitor.setdefault("runs", [])
+            if run["id"] in seen:
+                continue
             if monitor["passed"] >= config["evolution"]["monitor_tasks"]:
                 continue
+            seen.append(run["id"])
             monitor["passed" if passed else "failed"] += 1
             self.save(row["id"], "stable", evidence)
             if not passed:
