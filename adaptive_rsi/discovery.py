@@ -38,6 +38,12 @@ def sync(runtime, project, config, checked):
         if issue["state"].lower() != "open" or not allowed:
             if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence"]:
                 store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
+            elif existing and existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
+                pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
+                pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
+                if not held or held["updated_at"] != issue["updated_at"]:
+                    store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project["id"],
+                                data={"task": existing["id"], "updated": issue["updated_at"]})
             return
         evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"]}]
         if existing:

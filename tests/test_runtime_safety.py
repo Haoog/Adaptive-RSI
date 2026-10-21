@@ -178,6 +178,28 @@ class RuntimeSafetyTest(unittest.TestCase):
         sync(self.runtime, self.runtime.project(self.project), config, lambda *a, **kw: "[]")
         self.assertEqual(json.loads(self.store.one("SELECT evidence FROM tasks WHERE id=?", (task["id"],))["evidence"])[0]["updated"], issue["updated_at"])
 
+    def test_closed_issue_revision_stays_durable_until_active_task_can_be_obsoleted(self):
+        config = merge(self.runtime.config(self.project), {"github": {"repository": "example/project", "max_issues": 1}})
+        task = self.store.add_task(self.project, "issue", "issue:73", "Active issue", "old body",
+                                   [{"number": 73, "updated": "2026-10-20T10:00:00Z"}])
+        self.store.execute("UPDATE tasks SET state='executing' WHERE id=?", (task,))
+        issue = {"number": 73, "title": "Closed issue", "body": "closed while running", "labels": [], "state": "closed",
+                 "updated_at": "2026-10-21T10:00:00Z", "html_url": "https://github.com/example/project/issues/73"}
+        def gh(args, **kwargs):
+            if args[1] != "api":
+                return "[]"
+            page = next(a for a in args if a.startswith("page="))
+            return encode([issue]) if page == "page=1" else "[]"
+        with patch("adaptive_rsi.runtime.checked", side_effect=gh):
+            self.runtime.sync_issues(self.runtime.project(self.project), config)
+        self.assertIn("73", self.store.setting("issue-sync:" + self.project)["pending"])
+        self.assertEqual(self.store.one("SELECT body FROM tasks WHERE id=?", (task,))["body"], "old body")
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        with patch("adaptive_rsi.runtime.checked", side_effect=gh):
+            self.runtime.sync_issues(self.runtime.project(self.project), config)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "obsolete")
+        self.assertNotIn("73", self.store.setting("issue-sync:" + self.project)["pending"])
+
     def test_production_evolution_orders_are_balanced_and_recorded(self):
         self.runtime.configure({"limits": {"daily_calls": 200}, "evolution": {"min_cases_per_split": 1, "max_calls": 200}}, self.project)
         evolution = Evolution(self.runtime)

@@ -29,6 +29,11 @@ async function main() {
     await page.goto(url);
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();
     assert.equal(await page.locator('#project-status').innerText(), '已暂停');
+    await page.locator('#activity').evaluate(node=>{node.closest('details').open=true;});
+    await page.locator('#activity .activity-row').filter({hasText:'运行期间 Issue 已关闭或被排除'}).waitFor();
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#activity .activity-row').filter({hasText:'Issue closed or excluded during execution'}).waitFor();
+    await page.locator('#language-select').selectOption('zh-CN');
     await page.locator('#goal-text').fill('验证保留用户输入');
     await page.locator('#readiness-summary').click();
     await page.locator('#readiness-check').click();

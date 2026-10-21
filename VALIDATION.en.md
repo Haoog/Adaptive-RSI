@@ -8,7 +8,8 @@
 - All **25 frontend request tests passed**, along with syntax checks for all three JavaScript files. Real Chromium verified failed GitHub checks under Needs your attention, Chinese/English switching, and project isolation. Fixture projects remained paused with zero model calls.
 - Plugin ZIP, SHA-256 sidecar, and wheel built successfully. Version `0.2.2` matches plugin, runtime, and update manifests.
 - GitHub `main` now requires a PR, the `verify` check against the latest main, resolved conversations, and applies the rules to administrators. There is one maintainer, so a second-person approval is not required.
-- Author self-review completed; no independent human review was available. Limits include in-flight remote requests cannot be recalled, and live provider calls were not tested. See the [self-review record](docs/validation/runtime-safety-review-20261021.json). No formal Release has been published; the updater only accepts published stable releases.
+- Automated PR review found a closed-while-active Issue watermark omission. The revision is now retained until the task can safely stop, and its regression test passes separately. The PR check runs the complete suite for the latest branch.
+- Author self-review and automated review follow-up completed; no independent human review was available. Limits include in-flight remote requests cannot be recalled, and live provider calls were not tested. See the [self-review record](docs/validation/runtime-safety-review-20261021.json). No formal Release has been published; the updater only accepts published stable releases.
 
 ## Reliable improvement loop / 0.2.1 / 2026-10-21
 

@@ -62,6 +62,7 @@ def main():
             runtime.store.execute("INSERT INTO runs(id,task,project,state,config,result,started,ended) "
                                   "VALUES ('browser-ci',?,?,'pr_open','{}',?,1,2)",
                                   (failed_ci, project, json.dumps({"delivery_status": "ci_failed"})))
+            runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print("Browser fixture: console ready", file=sys.stderr, flush=True)

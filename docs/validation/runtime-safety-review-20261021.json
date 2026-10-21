@@ -31,8 +31,15 @@
     "No paid model calls, real GitHub writes to target projects, or real provider compatibility claims were used for regression tests.",
     "Plugin ZIP with checksum and wheel built for 0.2.2."
   ],
+  "automated_review_findings": [
+    {
+      "severity": "P2",
+      "finding": "A closed or newly excluded Issue revision could be removed from the pending cursor while its task was still active, then disappear after the update watermark advanced.",
+      "resolution": "Retain the bounded revision snapshot while the task is active or still awaiting a delivery decision; obsolete it when synchronization reaches a state that can safely stop the task. Added a restart-safe regression test."
+    }
+  ],
   "residual_limits": [
-    "This is author self-review, not an independent human review; the repository has one maintainer and does not require a second approval.",
+    "This is author self-review plus an automated Codex Review; no independent human review was available. The repository has one maintainer and does not require a second approval.",
     "A remote request already issued cannot be recalled by a later pause or cancellation.",
     "Live provider behavior, long-term monitoring, and real-model capability changes were not tested."
   ]
