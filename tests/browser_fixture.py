@@ -57,6 +57,12 @@ def main():
             for index in range(55):
                 runtime.store.add_task(project, "goal", str(index), "历史任务 " + str(index))
             runtime.store.add_task(other, "goal", "other", "另一个项目专属任务")
+            failed_ci = runtime.store.add_task(project, "goal", "failed-ci", "等待修复线上检查")
+            runtime.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (failed_ci,))
+            runtime.store.execute("INSERT INTO runs(id,task,project,state,config,result,started,ended) "
+                                  "VALUES ('browser-ci',?,?,'pr_open','{}',?,1,2)",
+                                  (failed_ci, project, json.dumps({"delivery_status": "ci_failed"})))
+            runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print("Browser fixture: console ready", file=sys.stderr, flush=True)

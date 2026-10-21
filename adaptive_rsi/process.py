@@ -112,22 +112,28 @@ class Sandbox:
         # CLI applies workspace-write/read-only too; outer sandbox hides controller state.
         return ["sandbox-exec", "-p", profile] + argv
 
-    def codex_permissions(self, workspace, protected=(), read_only=False):
+    def codex_permissions(self, workspace, protected=(), read_only=False, output_file=None):
         if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
             raise RuntimeError("Codex workers require macOS Seatbelt")
         workspace = Path(workspace).resolve()
-        paths = {str(self.state): "deny", str(workspace): "read" if read_only else "write",
+        paths = {":root": "deny", ":minimal": "read", str(self.state): "deny", str(workspace): "read" if read_only else "write",
                  str(workspace / ".git"): "read"}
+        for path in ["/System", "/usr", "/bin", "/sbin", "/Library/Developer/CommandLineTools", "/opt", "/private/var/db", "/private/var/select",
+                     "/private/etc", Path.home() / ".local/share/uv", sys.base_prefix]:
+            paths[str(Path(path).resolve())] = "read"
+        if read_only and output_file:
+            output = Path(output_file).resolve()
+            output.relative_to(workspace)
+            paths[str(output)] = "write"
         for path in list(protected) + [Path.home() / ".ssh", Path.home() / ".aws", Path.home() / ".codex",
                                         Path.home() / ".config/gh"]:
             paths[str(Path(path).resolve())] = "deny"
         binary = shutil.which("codex")
         if binary:
-            paths[str(Path.home() / ".codex/packages")] = "read"
             paths[str(Path(binary).resolve())] = "read"
         # 使用 Codex 自身的单层 Seatbelt；旧 CLI 不支持命名权限时会明确失败。
-        table = "{extends=\":read-only\",filesystem={" + ",".join(
-            json.dumps(path) + "=" + json.dumps(mode) for path, mode in paths.items()) + "}}"
+        table = "{filesystem={" + ",".join(
+            json.dumps(path) + "=" + json.dumps(mode) for path, mode in paths.items()) + "},network={enabled=false}}"
         return ["-c", "permissions.rsi=" + table, "-c", 'default_permissions="rsi"',
                 "-c", 'shell_environment_policy.inherit="all"',
                 "-c", 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","TMPDIR"]']

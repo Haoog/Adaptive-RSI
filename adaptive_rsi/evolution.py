@@ -112,7 +112,8 @@ class Evolution:
                     for repetition in range(config["evolution"]["repeats"]):
                         spec = json.loads(case["spec"])
                         trial = {"case": case["id"], "split": split, "source": spec["source"], "repetition": repetition}
-                        order = ["stable", "candidate"] if (len(evidence["trials"]) + repetition) % 2 == 0 else ["candidate", "stable"]
+                        order = ["stable", "candidate"] if len(evidence["trials"]) % 2 == 0 else ["candidate", "stable"]
+                        trial["order"] = order
                         for variant in order:
                             if self.runtime.is_cancelled(run):
                                 raise Cancelled("Evolution cancelled")

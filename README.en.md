@@ -6,7 +6,7 @@ A local autonomous improvement runtime for Codex: **code inspection, user goals,
 
 Includes a plugin entry point, persistent scheduler, SQLite state and call budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
-Version 0.2.1 adds readiness checks, recoverable stage records, durable Issue pagination, task improvement evidence, and stricter strategy experiments. See [Reliable improvement loop](RELIABILITY.en.md) for usage, budget estimates, and evidence boundaries.
+Version 0.2.2 fixes filesystem isolation, delivery revocation/retries, local model routing, failed-check visibility, incremental Issue sync, experiment ordering and completed monitoring. See [Reliable improvement loop](RELIABILITY.en.md) for usage, budget estimates, and evidence boundaries.
 
 ## Workflow
 
@@ -73,7 +73,7 @@ Choose models per role using either Codex execution or host-controlled native AP
 
 | Protocol / route | Services | Example base URL |
 | --- | --- | --- |
-| Codex CLI | Default OpenAI/Codex, Codex-compatible gateways, local OSS | Codex authentication or compatible Responses endpoint |
+| Codex CLI | Default OpenAI/Codex and Codex-compatible gateways | Codex authentication or compatible Responses endpoint |
 | Responses | OpenAI API, compatible gateways | `https://api.openai.com/v1` |
 | Chat Completions | DeepSeek, compatible Qwen/other endpoints, gateways, LM Studio | `https://api.deepseek.com` |
 | Anthropic Messages | Anthropic API, compatible gateways | `https://api.anthropic.com/v1` |
@@ -171,7 +171,7 @@ State defaults to `~/.local/share/adaptive-rsi`. Override it with `ADAPTIVE_RSI_
 - **Task sources:** discovered tasks require verifiable references to existing code. User goals can enter at any time. Issues support label filters, update cursors, deduplication, closed-Issue checks, and existing PR context. Issue text does not grant permissions.
 - **Isolation and verification:** each run uses clones of a fixed Git commit and leaves the user's worktree untouched. Implementation and review use separate sessions. The host freezes check commands and reruns baseline and candidate checks independently. Original tests and build entry points are restored from the baseline and protected against writes during checks. Model claims do not establish success. Missing checks, zero tests, or insufficient evidence block delivery.
 - **State and budgets:** service/project locks, atomic task claims, frozen configuration, reserved model calls, daily/per-run limits, run and command timeouts, output limits, bounded backoff retries, pause/cancel, and fresh-snapshot recovery after crashes. Actual tokens and elapsed time are recorded; dollar costs are not invented. Codex counts CLI sessions, while native routes count HTTP requests; neither is a strict monetary budget.
-- **Delivery:** local candidates by default. Enable automatic PRs and merging explicitly per project. Both the saved run policy and current policy must authorize merging; revocation takes effect immediately. Global defaults and task overrides cannot grant delivery permissions. Legacy authorizations are revoked once; subsequent explicit project settings survive restarts.
+- **Delivery:** local candidates by default. Enable automatic PRs and merging explicitly per project. Both saved and current policy must authorize merging. Pause or revocation blocks subsequent unissued pushes, PR creation and merges; requests already issued cannot be recalled. Global defaults and task overrides cannot grant delivery permissions. Legacy authorizations are revoked once; subsequent explicit project settings survive restarts.
 - **Baseline:** each GitHub run fetches the configured/default branch into an isolated cache. Execution and evaluation use the same SHA without changing the user's checkout or dirty files. Changed baselines stop old candidates and trigger bounded replanning.
 - **Fair scheduling:** persistent weighted rotation with waiting-time aging; project weights 1–10, default 1. All eligible projects update schedules before dispatch. Global concurrency and one active run per project remain enforced.
 - **Outcome feedback:** save merge SHA and recheck after merge and subsequent mainline changes (daily by default, minimum five minutes). Verified success, regression, insufficient evidence and reverts feed future value assessments. Reported recurrence reopens assessment; model reports do not become verified regressions. Investigation tasks carry bounded excerpts, and failed enqueue retries preserve completed feedback. Observation uses the artifact retention window, 30 days by default.
@@ -285,4 +285,4 @@ Before implementation, a separate call using the planning model generates execut
 
 The repository, resolved target branch and SHA are sealed when a run starts. Changing targets cannot reuse old authorization; stale candidates replan within retry limits. Branches use `feat/rsi-*` or `fix/rsi-*`; commits and PR descriptions are Chinese. Squash merging requires the exact evaluated head, a current base, successful CI, GitHub mergeability and required reviews. GitHub rules remain the final gate. Enable strict required checks or a merge queue to close the race between checking the base and requesting merge. Failed CI retains the PR; stale PRs close and replan within retry limits. Restart recovery tracks existing PRs and resumes idempotent publishing without reusing interrupted, unverified implementation.
 
-Codex CLI must support named `permissions` profiles. macOS workers use Codex's own single Seatbelt layer; command tools cannot read controller data, other projects, Codex authentication or GitHub credentials, write `.git`, or access the network. Unsupported CLIs block explicitly rather than disabling isolation. Actual live evidence is recorded in [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md).
+Codex CLI must support named `permissions` profiles. macOS workers use Codex's own single Seatbelt layer; command tools default to denying reads outside the snapshot and system toolchains, including unregistered user files, controller data, other projects, Codex authentication and GitHub credentials. They cannot write `.git` or access the network. Unsupported CLIs block explicitly rather than disabling isolation. Actual live evidence is recorded in [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md).

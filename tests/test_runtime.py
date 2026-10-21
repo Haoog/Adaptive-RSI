@@ -549,7 +549,8 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             with patch.dict(os.environ, {"RSI_MODEL_KEY": "test-secret-never-in-arguments"}), \
                  patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
                  patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
-                 patch("adaptive_rsi.agent.run_process", side_effect=provider):
+                 patch("adaptive_rsi.agent.run_process", side_effect=provider), \
+                 patch("adaptive_rsi.native.post_json", return_value={"message": {"tool_calls": [{"function": {"name": "finish", "arguments": {"summary": "done"}}}]}}):
                 agent = CodexAgent(store)
                 agent.invoke("implementation", "task", workspace, "project", "run", config)
                 local = merge(config, {"models": {"implementation": {"provider": "ollama"}}})
@@ -559,8 +560,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             self.assertIn('model_providers.gateway.env_key="RSI_MODEL_KEY"', commands[0])
             self.assertFalse(any("model_reasoning_effort" in arg for arg in commands[0]))
             self.assertNotIn("test-secret-never-in-arguments", json.dumps(commands))
-            self.assertIn("--oss", commands[1])
-            self.assertEqual(commands[1][commands[1].index("--local-provider") + 1], "ollama")
+            self.assertEqual(len(commands), 1)
             self.assertEqual([c["provider"] for c in store.query("SELECT provider FROM calls ORDER BY rowid")], ["gateway", "ollama"])
 
     def test_provider_fallback_and_failed_setup_are_accounted_for(self):
@@ -578,10 +578,11 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             config = validate({"models": {"implementation": {"fallback": {"provider": "lmstudio", "model": "other-coder", "effort": "default"}}}})
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
                  patch("adaptive_rsi.agent.Sandbox.codex_permissions", return_value=["-c", 'default_permissions="rsi"']), \
-                 patch("adaptive_rsi.agent.run_process", side_effect=provider):
+                 patch("adaptive_rsi.agent.run_process", side_effect=provider), \
+                 patch("adaptive_rsi.native.post_json", return_value={"choices": [{"message": {"tool_calls": [{"id": "done", "function": {"name": "finish", "arguments": '{"summary":"done"}'}}]}}]}):
                 CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", config)
             self.assertEqual([c["state"] for c in store.query("SELECT state FROM calls ORDER BY rowid")], ["failed", "completed"])
-            self.assertIn("lmstudio", commands[1])
+            self.assertEqual(len(commands), 1)
             with patch("adaptive_rsi.agent.shutil.which", return_value="/usr/bin/codex"), \
                  patch("adaptive_rsi.agent.Sandbox.codex_permissions", side_effect=RuntimeError("sandbox unavailable")):
                 with self.assertRaisesRegex(RuntimeError, "sandbox unavailable"):

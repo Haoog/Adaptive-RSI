@@ -13,6 +13,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
+from adaptive_rsi import __version__
 from adaptive_rsi.config import DEFAULTS, merge, validate
 from adaptive_rsi.gitops import git, github_url
 from adaptive_rsi.process import Sandbox, checked
@@ -174,7 +175,10 @@ class ValueAndIsolationTest(unittest.TestCase):
             self.runtime.goal(self.project, "test", {"delivery": {"mode": "pr"}})
 
 
-def release(target="0.2.2"):
+def release(target=None):
+    if target is None:
+        major, minor, patch = map(int, __version__.split("."))
+        target = f"{major}.{minor}.{patch + 1}"
     prefix = "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + target + "/"
     name = "adaptive-rsi-" + target + "-plugin.zip"
     return {"tag_name": "v" + target, "assets": [{"name": n, "browser_download_url": prefix + n} for n in [name, name + ".sha256"]]}
@@ -343,7 +347,7 @@ class UpdatesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "another repository"):
             release_info(data)
         with self.assertRaises(ValueError):
-            release_info({"tag_name": "v0.2.2"})
+            release_info({"tag_name": "v99.0.0"})
 
     def test_archive_verifies_hash_paths_and_migration_contract(self):
         import hashlib
@@ -368,7 +372,7 @@ class UpdatesTest(unittest.TestCase):
                 manager = runtime.updates
                 manager.shutdown = lambda: None
                 runtime.configure({"updates": {"mode": "automatic"}})
-                for target, count in [("0.2.2", 1), ("0.3.0", 0)]:
+                for target, count in [(None, 1), ("0.3.0", 0)]:
                     runtime.store.put_setting("update-status", {**release_info(release(target)), "checked": time.time()})
                     with patch.object(manager, "apply_async") as apply:
                         manager.tick()

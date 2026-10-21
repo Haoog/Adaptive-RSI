@@ -24,6 +24,8 @@ Keep temporary UI-check projects paused to avoid unintended model calls. Store r
 
 `test:browser` creates two paused temporary projects and uses real Chromium to exercise forms, pagination, project switching, languages, and mobile layouts without invoking models. Set `RSI_BROWSER_CHANNEL=chrome` to use installed Chrome. Playwright is a development dependency only.
 
+GitHub main-branch protection requires a PR, successful `verify` checks against the latest main, and resolved conversations, including administrators. With only one maintainer, a second human approval is not required; this does not establish independent human review.
+
 ## Commits and documentation
 
 - Start every change on a new working branch. Do not commit or push directly to `main`. Automated improvements to this repository must also pass checks, code review, and a PR before merging.

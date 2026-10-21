@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .config import merge
 from .gitops import git, origin_repository, snapshot
-from .process import checked
+from .process import Cancelled, checked
 from .store import encode
 
 
@@ -43,21 +43,20 @@ def pr_view(repo, url):
 def merge_gate(pr, head, base):
     if pr["headRefOid"] != head or pr["baseRefOid"] != base:
         return "stale"
-    if pr.get("isDraft") or pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") != "CLEAN":
-        return "waiting"
-    if pr.get("reviewDecision") not in ["", "APPROVED", None]:
-        return "waiting_review"
     checks = pr.get("statusCheckRollup") or []
     if not checks:
         return "waiting_ci"
-    for check in checks:
-        status = check.get("conclusion") or check.get("state") or check.get("status")
-        if status in ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"]:
-            return "ci_failed"
-        if status not in ["SUCCESS", "NEUTRAL", "SKIPPED"]:
-            return "waiting_ci"
+    statuses = {check.get("conclusion") or check.get("state") or check.get("status") for check in checks}
+    if statuses & {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}:
+        return "ci_failed"
+    if statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+        return "waiting_ci"
     if not any((c.get("conclusion") or c.get("state")) == "SUCCESS" for c in checks):
         return "waiting_ci"
+    if pr.get("reviewDecision") not in ["", "APPROVED", None]:
+        return "waiting_review"
+    if pr.get("isDraft") or pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") != "CLEAN":
+        return "waiting"
     return "ready"
 
 
@@ -68,9 +67,22 @@ def publish(runtime, project, task, run, workspace, config):
     if not approval or run["state"] != "awaiting_approval":
         raise RuntimeError("Publishing requires explicit approval or persisted project policy")
     authorization = json.loads(approval["evidence"])
-    if authorization and authorization[0].get("authorization") == "project_policy" and (
-            json.loads(run["config"])["delivery"]["mode"] != "pr" or runtime.config(project["id"])["delivery"]["mode"] != "pr"):
-        raise RuntimeError("Automatic PR authorization was revoked")
+    def authorize_write():
+        live = runtime.config(project["id"])
+        job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
+        pending = store.one("SELECT state FROM tasks WHERE id=?", (approval["id"],))
+        if (runtime.stop.is_set() or runtime.project(project["id"])["paused"] or
+                not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
+            raise Cancelled("Publishing cancelled or project paused")
+        if not authorization or authorization[0].get("authorization") not in ["project_policy", "per_candidate"]:
+            raise RuntimeError("Publishing authorization is missing")
+        if authorization[0]["authorization"] == "project_policy" and (
+                json.loads(run["config"])["delivery"]["mode"] != "pr" or live["delivery"]["mode"] != "pr"):
+            raise RuntimeError("Automatic PR authorization was revoked")
+        if (live["github"]["repository"] != config["github"]["repository"] or
+                live["delivery"]["base_branch"] != config["delivery"]["base_branch"]):
+            raise StaleCandidate("Delivery target changed before publishing")
+    authorize_write()
     if task["source"] == "issue" and not runtime.issue_still_open(project, task, config):
         raise StaleCandidate("Issue closed before delivery; synchronize before retrying")
     outcome = json.loads(run["result"])
@@ -88,6 +100,7 @@ def publish(runtime, project, task, run, workspace, config):
     branch = prefix + "/rsi-" + run["id"]
     if git(workspace, "branch", "--show-current") != branch:
         git(workspace, "checkout", "-b", branch)
+    if git(workspace, "diff", "--cached", "--name-only"):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + task["title"])
     sha = git(workspace, "rev-parse", "HEAD")
@@ -99,10 +112,12 @@ def publish(runtime, project, task, run, workspace, config):
             raise RuntimeError("Existing PR head differs from evaluated candidate")
     else:
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
+        authorize_write()
         github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
         body = Path(workspace).parent / "pr-body.md"
         body.write_text("完成任务：" + task["title"] + "\n\n价值评估、原始回归、候选完整测试、独立验收和代码评审已通过。\n\n"
                         "运行：`" + run["id"] + "`\n基线：`" + run["base"] + "`\n", encoding="utf-8")
+        authorize_write()
         url = checked(["gh", "pr", "create", "--repo", repo, "--head", branch, "--base", base_branch,
                        "--title", "完成任务：" + task["title"], "--body-file", str(body)])
     store.put_setting("delivery:" + run["id"], {"head": sha, "base": run["base"], "branch": base_branch,
@@ -111,12 +126,30 @@ def publish(runtime, project, task, run, workspace, config):
     return url
 
 
+def monitoring_due(outcome, config, now):
+    if outcome.get("feedback", {}).get("investigation_pending"):
+        return True
+    if outcome.get("monitoring_completed"):
+        return False
+    return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
+            now - outcome.get("feedback_polled_at", outcome.get("feedback", {}).get("checked_at", 0)) >=
+            config["delivery"]["feedback_minutes"] * 60)
+
+
 def schedule(runtime, now=None):
     now = now or time.time()
     store = runtime.store
-    for project in store.query("SELECT DISTINCT r.project FROM runs r JOIN projects p ON p.id=r.project "
-                               "WHERE r.state IN ('pr_open','merged') AND p.paused=0"):
-        project_id = project["project"]
+    if now - store.setting("delivery-scan", 0) < 60:
+        return
+    store.put_setting("delivery-scan", now)
+    projects = set()
+    for run in store.query("SELECT r.project,r.state,r.result FROM runs r JOIN projects p ON p.id=r.project "
+                           "WHERE p.paused=0 AND (r.state='pr_open' OR (r.state='merged' AND "
+                           "(coalesce(json_extract(r.result,'$.monitoring_completed'),0)=0 OR "
+                           "json_extract(r.result,'$.feedback.investigation_pending')=1)))"):
+        if run["state"] == "pr_open" or monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now):
+            projects.add(run["project"])
+    for project_id in projects:
         if now - store.setting("delivery-scheduled:" + project_id, 0) < 60:
             continue
         key = "system:delivery"
@@ -217,13 +250,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
 
 
 def feedback(runtime, project, run, outcome, config, now, cancel=None):
+    if not monitoring_due(outcome, config, now):
+        return
     if outcome.get("feedback", {}).get("investigation_pending"):
         investigate(runtime, project, run, outcome)
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
+        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     previous = outcome.get("feedback", {})
-    if now - previous.get("checked_at", 0) < config["delivery"]["feedback_minutes"] * 60:
+    if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
     if not identity or not identity.get("repository") or not identity.get("branch"):
@@ -234,6 +270,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if branch != identity["branch"]:
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
     if previous.get("head") == head:
+        outcome["feedback_polled_at"] = now
+        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     directory = Path(run["path"]) / "feedback" / str(int(now))
     baseline_tree = snapshot(source, directory / "baseline", outcome["merged_sha"])
@@ -248,6 +286,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     effective = {**config, "environment": saved["environment"]}
     result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, directory / "evaluation", effective,
                                        cancel=cancel, acceptance=acceptance, seeds=Path(run["path"]) / "dependencies")
+    outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state,
                            "head": head, "checked_at": now, "evaluation": result}

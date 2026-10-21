@@ -29,6 +29,11 @@ async function main() {
     await page.goto(url);
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();
     assert.equal(await page.locator('#project-status').innerText(), '已暂停');
+    await page.locator('#activity').evaluate(node=>{node.closest('details').open=true;});
+    await page.locator('#activity .activity-row').filter({hasText:'运行期间 Issue 已关闭或被排除'}).waitFor();
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#activity .activity-row').filter({hasText:'Issue closed or excluded during execution'}).waitFor();
+    await page.locator('#language-select').selectOption('zh-CN');
     await page.locator('#goal-text').fill('验证保留用户输入');
     await page.locator('#readiness-summary').click();
     await page.locator('#readiness-check').click();
@@ -114,6 +119,10 @@ async function main() {
     await page.locator('[data-task-filter="active"]').click();
     await page.locator('#tasks-page').filter({hasText: '56'}).waitFor().catch(async error=>{console.error('Task page:',await page.locator('#tasks-page').innerText());console.error('Counts:',await page.evaluate(async()=>{const s=await(await fetch('/api/state')).json();return s.task_counts;}));throw error;});
     await page.locator('[data-task-filter="attention"]').click();
+    await page.locator('#tasks-list .task-row').filter({hasText:'等待修复线上检查'}).filter({hasText:'线上检查未通过'}).waitFor();
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#tasks-list .task-row').filter({hasText:'等待修复线上检查'}).filter({hasText:'GitHub checks failed'}).waitFor();
+    await page.locator('#language-select').selectOption('zh-CN');
     await page.locator('#tasks-list .task-title').filter({hasText: 'Fix addition'}).click();
     await page.locator('#detail-dialog[open] .stage-progress .done').first().waitFor();
     assert.equal(await page.locator('#detail-dialog .stage-progress .done').count(), 5);
@@ -127,6 +136,7 @@ async function main() {
     assert.equal(await page.locator('#tasks-list .task-row').count(), 6);
     await page.locator('#project-select').selectOption({label: '另一个独立项目'});
     await page.locator('#tasks-list').filter({hasText: '另一个项目专属任务'}).waitFor();
+    assert.equal(await page.locator('#tasks-list .task-row').filter({hasText:'等待修复线上检查'}).count(),0);
     assert.equal(await page.locator('#tasks-list .task-row').count(), 1);
     await page.locator('#edit-schedule').click();
     assert.equal(await page.locator('#schedule-mode').inputValue(), 'inherit');

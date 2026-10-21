@@ -63,6 +63,8 @@ class Store:
                     PRIMARY KEY(run,stage));
                 CREATE INDEX IF NOT EXISTS project_tasks ON tasks(project,updated DESC);
                 CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
+                CREATE INDEX IF NOT EXISTS task_runs ON runs(task,started DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS delivery_runs ON runs(state,project);
                 CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
                 CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
                 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);

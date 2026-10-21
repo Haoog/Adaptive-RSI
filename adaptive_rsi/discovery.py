@@ -21,50 +21,69 @@ def sync(runtime, project, config, checked):
     if not progress.get("started"):
         progress.update(started=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), page=1)
     consumed, complete = 0, False
+    pending = progress.get("pending", {})
+
+    def apply(issue):
+        nonlocal consumed
+        if "pull_request" in issue:
+            return
+        number = int(issue["number"])
+        held = pending.pop(str(number), None)
+        existing = store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], "issue:" + str(number)))
+        previous = json.loads(existing["evidence"]) if existing else []
+        revised = not previous or previous[0].get("updated") != issue["updated_at"]
+        labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
+        allowed = not set(config["github"]["exclude_labels"]) & labels and (
+            not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
+        if issue["state"].lower() != "open" or not allowed:
+            if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence"]:
+                store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
+            elif existing and existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
+                pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
+                pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
+                if not held or held["updated_at"] != issue["updated_at"]:
+                    store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project["id"],
+                                data={"task": existing["id"], "updated": issue["updated_at"]})
+            return
+        evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"]}]
+        if existing:
+            if existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "completed", "merged", "pr_closed"] and revised:
+                store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
+                    (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
+            elif revised:
+                # Keep active runs' evidence immutable. The new revision remains visible for next sync.
+                pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
+                pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
+                if not held or held["updated_at"] != issue["updated_at"]:
+                    store.event("issue_revision", "Issue changed during execution; recheck before delivery", project["id"],
+                                data={"task": existing["id"], "updated": issue["updated_at"]})
+        else:
+            store.add_task(project["id"], "issue", "issue:" + str(number), issue["title"], issue["body"] or "", evidence, priority=60)
+        consumed += 1
+
+    for issue in list(pending.values()):
+        apply(issue)
     # Drain a bounded number of pages per turn, then continue on the next scheduled run.
     size = min(100, config["github"]["max_issues"])
     for _ in range(max(1, config["github"]["max_issues"] // size)):
         args = ["gh", "api", "--method", "GET", "repos/" + repo + "/issues", "-f", "state=all",
                 "-f", "sort=created", "-f", "direction=asc", "-f", "per_page=" + str(size),
                 "-f", "page=" + str(progress["page"])]
-        # Creation order is stable when an Issue is edited/closed while pages drain.
+        if progress.get("since"):
+            args += ["-f", "since=" + progress["since"]]
+        # A fixed since filter and creation order keep edits from moving existing rows.
+        # The next cycle overlaps this cycle start to catch newly matching older Issues.
         rows = json.loads(checked(args, timeout=60))
         if not isinstance(rows, list):
             raise RuntimeError("Unexpected GitHub Issue response")
         for issue in rows:
-            if "pull_request" in issue:
-                continue
-            number = int(issue["number"])
-            existing = store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], "issue:" + str(number)))
-            previous = json.loads(existing["evidence"]) if existing else []
-            revised = not previous or previous[0].get("updated") != issue["updated_at"]
-            # Revisit revisions held by active runs even after the cycle watermark advances.
-            if progress.get("since") and issue["updated_at"] < progress["since"] and not (existing and revised):
-                continue
-            labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
-            allowed = not set(config["github"]["exclude_labels"]) & labels and (
-                not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
-            if issue["state"].lower() != "open" or not allowed:
-                if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence"]:
-                    store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
-                continue
-            evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"]}]
-            if existing:
-                if existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "completed", "merged", "pr_closed"] and revised:
-                    store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
-                        (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
-                elif revised:
-                    # Keep active runs' evidence immutable. The new revision remains visible for next sync.
-                    store.event("issue_revision", "Issue changed during execution; recheck before delivery", project["id"],
-                                data={"task": existing["id"], "updated": issue["updated_at"]})
-            else:
-                store.add_task(project["id"], "issue", "issue:" + str(number), issue["title"], issue["body"] or "", evidence, priority=60)
-            consumed += 1
+            apply(issue)
         progress["page"] += 1
         if len(rows) < size:
             complete = True
             # Overlap catches updates made while this cycle was draining.
             progress = {"repository": repo, "policy": policy, "since": progress["started"], "page": 1}
+        progress["pending"] = pending
         store.put_setting(key, progress)
         if complete:
             break

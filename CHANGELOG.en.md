@@ -2,6 +2,16 @@
 
 [简体中文](CHANGELOG.md) | **English**
 
+## 0.2.2
+
+- Default-deny reads outside Codex snapshots while allowing system toolchains.
+- Recheck pause, cancellation and current authorization before pushes and PR creation; allow fresh manual approval of failed deliveries.
+- Route built-in Ollama and LM Studio through native APIs, aligning execution, readiness, model probes and accounting.
+- Surface failed GitHub checks under Needs your attention while retaining recovery and PR tracking.
+- Filter Issues server-side by update time while preserving pagination, overlapping watermarks and active revisions.
+- Alternate and record paired experiment order; poll post-merge checks on schedule and stop after retention.
+- Protect main with PRs, successful up-to-date checks and resolved conversations, including administrators.
+
 ## 0.2.1
 
 - Simplify task outcomes; add readiness, recovery suggestions, project pagination, and preserved forms.
