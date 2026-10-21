@@ -212,14 +212,28 @@ class Runtime:
         self.store.event("cancelled", "Cancellation requested", row["project"])
 
     def deliver(self, run_id, automatic=False):
+        with self.dispatch_lock:
+            return self._deliver(run_id, automatic)
+
+    def _deliver(self, run_id, automatic=False):
         original = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
         if not original or original["state"] != "awaiting_approval":
             raise ValueError("Only a verified candidate awaiting approval can be delivered")
         result = json.loads(original["result"])
         if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
             raise ValueError("Independent gates have not passed")
-        task = self.store.add_task(original["project"], "system_publish", "publish:" + run_id,
-                                   "Publish approved candidate", run_id, evidence=[{"authorization": "project_policy" if automatic else "per_candidate"}], priority=100)
+        evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
+        prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (original["project"], "publish:" + run_id))
+        if prior:
+            task = prior["id"]
+            if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
+                self.store.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
+                                   (encode(evidence), time.time(), task))
+            elif not automatic and prior["state"] == "queued":
+                self.store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?", (encode(evidence), time.time(), task))
+        else:
+            task = self.store.add_task(original["project"], "system_publish", "publish:" + run_id,
+                                       "Publish approved candidate", run_id, evidence=evidence, priority=100)
         self.wake.set()
         return task
 

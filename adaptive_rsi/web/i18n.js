@@ -1,6 +1,7 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+  "线上检查未通过": "GitHub checks failed",
   "正在保存模型分工…": "Saving model assignments…",
   "模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。": "Model IDs may contain letters, digits, dots, underscores, slashes, colons and hyphens only.",
   "只能让项目扫描设置跟随通用设置。": "Only project scan settings can inherit global defaults.",

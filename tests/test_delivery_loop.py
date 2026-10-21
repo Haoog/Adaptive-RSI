@@ -194,6 +194,8 @@ class DeliveryLoopTest(unittest.TestCase):
         workspace = snapshot(self.repo, self.store.root / "worker")
         secret = self.store.root / "secret.txt"
         secret.write_text("controller secret")
+        unrelated = self.root / "unregistered-private.txt"
+        unrelated.write_text("unregistered private marker")
         code = """import errno, os, socket
 from pathlib import Path
 blocked = %r
@@ -219,13 +221,26 @@ else:
 assert 'RSI_TEST_SECRET' not in os.environ
 Path('allowed.txt').write_text('isolated write succeeds')
 print('BOUNDARIES_OK')
-""" % [str(secret), str(self.repo / "calculator.py")]
+""" % [str(secret), str(self.repo / "calculator.py"), str(unrelated)]
         permissions = Sandbox(self.store.root, DEFAULTS).codex_permissions(workspace, [self.repo])
         import os
         result = run_process(["codex"] + permissions + ["sandbox", "-P", "rsi", "-C", str(workspace), "python3", "-c", code],
                              workspace, env={**os.environ, "RSI_TEST_SECRET": "must-not-leak"})
         self.assertEqual(result["exit_code"], 0, result)
         self.assertIn("BOUNDARIES_OK", result["stdout"])
+        readonly = Sandbox(self.store.root, DEFAULTS).codex_permissions(workspace, [self.repo], read_only=True)
+        code = "from pathlib import Path\nassert Path('allowed.txt').read_text()\ntry:\n Path('denied.txt').write_text('no')\nexcept PermissionError:\n print('READ_ONLY_OK')\nelse:\n raise AssertionError('read-only write succeeded')"
+        result = run_process(["codex"] + readonly + ["sandbox", "-P", "rsi", "-C", str(workspace), "python3", "-c", code], workspace)
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertIn("READ_ONLY_OK", result["stdout"])
+        output = workspace / ".rsi-agent" / "review-result.json"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        readonly = Sandbox(self.store.root, DEFAULTS).codex_permissions(
+            workspace, [self.repo], read_only=True, output_file=output)
+        code = "from pathlib import Path\nPath(%r).write_text('{}')\ntry:\n Path('review-edit.txt').write_text('no')\nexcept PermissionError:\n print('OUTPUT_ONLY_OK')\nelse:\n raise AssertionError('review edited project')" % str(output)
+        result = run_process(["codex"] + readonly + ["sandbox", "-P", "rsi", "-C", str(workspace), "python3", "-c", code], workspace)
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertIn("OUTPUT_ONLY_OK", result["stdout"])
 
     def test_project_policy_revocation_blocks_remote_merge(self):
         git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")

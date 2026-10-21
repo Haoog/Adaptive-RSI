@@ -63,8 +63,6 @@ def validate_output(value, schema):
 
 def provider_arguments(route, config, environment=None):
     provider_id = route.get("provider", "openai")
-    if provider_id in ["ollama", "lmstudio"]:
-        return ["--oss", "--local-provider", provider_id]
     if provider_id == "openai":
         return ["-c", 'model_provider="openai"']
     provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
@@ -116,8 +114,9 @@ class CodexAgent:
 
     def _invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
         route = config["models"][role]
-        provider = next((p for p in config["providers"] if p["id"] == route.get("provider")), None)
-        if provider and provider.get("protocol", "codex") != "codex":
+        from .config import BUILTIN_PROVIDERS
+        provider = next((p for p in [*config["providers"], *BUILTIN_PROVIDERS] if p["id"] == route.get("provider", "openai")), None)
+        if provider and provider.get("protocol", "codex") not in ["codex", "codex_login"]:
             from .native import NativeAgent
             return NativeAgent(self.store).invoke(role, prompt, workspace, project, run,
                                                  config, route, provider, cancel, protected)
@@ -151,7 +150,8 @@ class CodexAgent:
                 argv += ["-c", 'shell_environment_policy.exclude=["RSI_PROVIDER_API_KEY"]']
             if route["effort"] != "default":
                 argv += ["-c", "model_reasoning_effort=" + json.dumps(route["effort"])]
-            argv += sandbox.codex_permissions(workspace, protected, read_only=role != "implementation")
+            argv += sandbox.codex_permissions(workspace, protected, read_only=role != "implementation",
+                                              output_file=output_path if role != "implementation" else None)
             argv += ["-c", "sandbox_workspace_write.network_access=false",
                      "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
                      "-c", "sandbox_workspace_write.exclude_slash_tmp=true",

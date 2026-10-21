@@ -253,7 +253,7 @@ class ModelCenter:
             with tempfile.TemporaryDirectory(prefix="rsi-model-test-") as workspace:
                 expected = "RSI_OK"
                 prompt = 'Call finish with {"summary":"RSI_OK"}. Do not read files or run commands.'
-                if provider["id"] in {p["id"] for p in BUILTINS} or provider.get("protocol", "codex") == "codex":
+                if provider.get("protocol", "codex") in ["codex", "codex_login"]:
                     expected = uuid.uuid4().hex
                     (Path(workspace) / "probe.txt").write_text(expected)
                     prompt = 'Read probe.txt using a file-reading tool. Return JSON with summary equal to its exact content. Do not modify files or run other commands.'

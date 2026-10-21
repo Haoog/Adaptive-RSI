@@ -19,7 +19,7 @@ The flow is readiness → verification, deduplication and value assessment → c
 
 ## Discovery and value ordering
 
-Issue synchronization has a durable cursor per project. A turn processes at most the configured quantity and continues next time. A completed cycle starts another. Creation order avoids page movement caused by edits, while update timestamps filter previously processed content. For large repositories, discovery latency depends on the complete traversal cycle; the scan interval does not guarantee immediate synchronization of every Issue.
+Initial Issue import uses a durable cursor per project. Subsequent cycles send an update-time `since` filter to GitHub and page only new or revised entries. Each cycle fixes its starting watermark and creation ordering; the next cycle overlaps its start to capture older Issues newly matching the filter. Revisions held by active runs are persisted separately across restarts and watermark advancement. Each turn remains bounded; initial imports and large update batches may need multiple turns.
 
 Skip PR entries; handle closing, reopening, label changes, and revisions. Active runs keep their original evidence. Delivery checks Issue state and revision again; changes require synchronization and reassessment. Changing repositories, label policy, or page size restarts synchronization.
 
@@ -39,7 +39,7 @@ Explicitly titled refactors use behavior-preservation checks, with maintainabili
 
 1. Check independent cases and budget before proposing. The minimum call estimate is `1 + 16 × cases per split × repetitions`; native tool round trips can cost more. Defaults of three cases per split and two repetitions require at least 97 calls, exceeding the default experiment cap of 40 and daily cap of 30. Stop explicitly until the user adjusts limits; never increase them silently.
 2. Stable and candidate variants share the production execution function: planning, independent acceptance, implementation, checks, and review. Experiments cannot create PRs. Stop before exposing holdouts if validation lacks improvement or regresses.
-3. Both splits require improvements, no observed regressions, and separate time/token limits. Repeated executions are not independent samples. Group by task family and count families winning consistently across repetitions. A one-sided sign test uses `p = 0.5^winning families`, requires `p ≤ 0.05`, and at least two repetitions.
+3. Stable and candidate executions alternate their first position by actual trial index and record that order as evidence to reduce fixed-order bias. Both splits require improvements, no observed regressions, and separate time/token limits. Repeated executions are not independent samples. Group by task family and count families winning consistently across repetitions. A one-sided sign test uses `p = 0.5^winning families`, requires `p ≤ 0.05`, and at least two repetitions.
 4. This conservative finite-sample gate depends on family independence, check quality, and measurement conditions. It does not establish generalization. Synthetic tests verify controller behavior, not improved real-model capability.
 5. Operational monitoring uses only strategy IDs recorded in each actual run. Infrastructure and insufficient-evidence failures do not count; each run counts once. Regressions that cannot be attributed to a unique used strategy retain diagnostics without rolling every strategy back.
 
@@ -47,11 +47,19 @@ Evolution improves working strategies, prompts, and project guidance. It does no
 
 ## Models, context, and cost
 
-Retain Codex, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions.
+Retain Codex, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions. Built-in Ollama and LM Studio use native APIs without Codex; readiness, basic tool probes and billing units match execution.
 
 Context adds task-relevant code paths and declaration anchors with bounded file counts and declaration lengths. Recent history includes concise failure causes. Verified memories are retrieved by relevance under a character budget while preserving original evidence. Expired, rolled-back, or configuration-incompatible guidance is excluded.
 
 Each call freezes its counting unit: Codex session or native HTTP request. Historical records with no unit remain unknown. Tool round trips consume budget. User-supplied blended prices are estimates, not bills.
+
+## Authorization, delivery and monitoring
+
+Before each push and PR creation, recheck pause, cancellation, shutdown, automatic PR authorization and delivery target. Requests already issued cannot be recalled; pausing blocks subsequent unissued operations. Approving a failed delivery requeues its job and records fresh per-candidate authorization instead of retaining a revoked automatic policy. Active deliveries are not duplicated.
+
+Failed GitHub checks appear directly under Needs your attention; successful reruns return to In progress while PR tracking continues. Post-merge checks respect the configured interval and record poll times even when the head is unchanged. Completed observation windows stop scheduling; pending regression investigations still retry.
+
+Codex tools use a single default-deny filesystem permission profile, allowing the snapshot and system toolchains. Other user files, controller data, evaluation cases and other projects are unreadable. Implementation writes only its snapshot; planning and review are read-only, Git metadata is not writable, and tool networking is disabled. See [Codex permissions](https://developers.openai.com/codex/permissions). Unlisted toolchains must fail explicitly rather than granting the whole home directory.
 
 ## Engineering and updates
 

@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-21",
+  "version": "0.2.2",
+  "review_type": "author_self_review",
+  "value_assessment": {
+    "decision": "ready",
+    "benefit": "Close verified workspace escape, revoked delivery, stuck retry, hidden CI failure, repeated Issue history, biased paired order, local route mismatch, and unbounded monitoring findings.",
+    "scope": [
+      "Default-deny Codex filesystem reads with one-file review output exception",
+      "Recheck delivery authorization before remote writes and make explicit reapproval retryable",
+      "Align built-in local model execution, readiness, probing, and accounting",
+      "Show failed CI in project-scoped attention views and recover after reruns",
+      "Use durable server-side Issue update filtering with overlap and held revisions",
+      "Balance and persist strategy trial order",
+      "Schedule post-merge checks by due time and stop after retention",
+      "Protect main with required PR, current-base CI, and conversation resolution"
+    ]
+  },
+  "assessments": {
+    "correctness": "pass",
+    "security": "pass",
+    "maintainability": "pass",
+    "architecture": "pass",
+    "tests": "pass",
+    "scope": "pass"
+  },
+  "evidence": [
+    "149 Python unittest cases passed on macOS with Python 3.9.6.",
+    "25 frontend request tests, JavaScript syntax checks, and Chromium workbench checks passed.",
+    "The installed Codex sandbox denied unregistered files, registered project files, and controller state; network and project writes were denied for review roles, while one structured result file remained writable.",
+    "No paid model calls, real GitHub writes to target projects, or real provider compatibility claims were used for regression tests.",
+    "Plugin ZIP with checksum and wheel built for 0.2.2."
+  ],
+  "residual_limits": [
+    "This is author self-review, not an independent human review; the repository has one maintainer and does not require a second approval.",
+    "A remote request already issued cannot be recalled by a later pause or cancellation.",
+    "Live provider behavior, long-term monitoring, and real-model capability changes were not tested."
+  ]
+}
