@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.config import validate
+from adaptive_rsi.gitops import git
 from adaptive_rsi.native import Conversation, WorkspaceTools, tools_for
 from adaptive_rsi.store import Store
 
@@ -139,6 +140,34 @@ class NativeProtocolsTest(unittest.TestCase):
             calls = self.store.query("SELECT provider,state FROM calls ORDER BY created")
             self.assertEqual(calls[0], {"provider": "native", "state": "failed"})
             self.assertEqual(calls[-1], {"provider": "fallback", "state": "completed"})
+
+    def test_codex_fallback_is_allowed_only_when_primary_left_workspace_unchanged(self):
+        workspace = self.root / "fallback-workspace"
+        workspace.mkdir()
+        source = workspace / "source.py"
+        source.write_text("original\n")
+        git(workspace, "init", "--quiet")
+        git(workspace, "add", "source.py")
+        git(workspace, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "base")
+        config = validate({"models": {"implementation": {
+            "provider": "openai", "model": "primary", "effort": "default",
+            "fallback": {"provider": "openai", "model": "fallback", "effort": "default"}}}})
+        agent = CodexAgent(self.store)
+        with patch.object(CodexAgent, "_invoke", side_effect=[
+                RuntimeError("Codex call failed: rate limit exceeded"), {"summary": "fallback result"}]) as call:
+            result = agent.invoke("implementation", "task", workspace, "fallback-safe", "no-edit", config)
+        self.assertEqual(result, {"summary": "fallback result"})
+        self.assertEqual(call.call_count, 2)
+
+        def partial_edit(role, prompt, current, *args, **kwargs):
+            source.write_text("partial primary edit\n")
+            raise RuntimeError("Codex call failed: rate limit exceeded")
+
+        with patch.object(CodexAgent, "_invoke", side_effect=partial_edit) as call:
+            with self.assertRaisesRegex(RuntimeError, "fallback refused"):
+                agent.invoke("implementation", "task", workspace, "fallback-safe", "partial-edit", config)
+        call.assert_called_once()
+        self.assertEqual(source.read_text(), "partial primary edit\n")
 
     def test_workspace_tools_cannot_escape_or_write_during_review(self):
         config = validate({})

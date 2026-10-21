@@ -21,7 +21,7 @@ The flow is readiness → verification, deduplication and value assessment → c
 
 Initial Issue import uses a durable cursor per project. Subsequent cycles send an update-time `since` filter to GitHub and page only new or revised entries. Each cycle fixes its starting watermark and creation ordering; the next cycle overlaps its start to capture older Issues newly matching the filter. Revisions held by active runs are persisted separately across restarts and watermark advancement. Each turn remains bounded; initial imports and large update batches may need multiple turns.
 
-Skip PR entries; handle closing, reopening, label changes, and revisions. Active runs keep their original evidence. Delivery checks Issue state and revision again; changes require synchronization and reassessment. Changing repositories, label policy, or page size restarts synchronization.
+Skip PR entries; handle closing, reopening, label changes, and revisions. Active runs keep their original evidence. Delivery and auto-merge recheck Issue state, revision, and labels. If an Issue changes while a candidate awaits delivery or PR checks, the old candidate is stopped until synchronization refreshes its evidence and value is reassessed; stale requirements are not retried directly. Changing repositories, label policy, or page size restarts synchronization.
 
 Inspection findings require real file paths and literal existing quotes. Matching problem anchors deduplicate; matching titles with different evidence are not automatically collapsed. Planning receives tasks from other sources and open PRs to assess semantic overlap. Model-based semantic deduplication cannot guarantee detection of every paraphrase.
 
@@ -47,7 +47,7 @@ Evolution improves working strategies, prompts, and project guidance. It does no
 
 ## Models, context, and cost
 
-Retain Codex, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions. Built-in Ollama and LM Studio use native APIs without Codex; readiness, basic tool probes and billing units match execution.
+Retain Codex, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions; every implementation protocol refuses fallback after workspace edits to avoid mixing partial work. Built-in Ollama and LM Studio use native APIs without Codex; readiness, basic tool probes and billing units match execution.
 
 Context adds task-relevant code paths and declaration anchors with bounded file counts and declaration lengths. Recent history includes concise failure causes. Verified memories are retrieved by relevance under a character budget while preserving original evidence. Expired, rolled-back, or configuration-incompatible guidance is excluded.
 
@@ -55,7 +55,9 @@ Each call freezes its counting unit: Codex session or native HTTP request. Histo
 
 ## Authorization, delivery and monitoring
 
-Before each push and PR creation, recheck pause, cancellation, shutdown, automatic PR authorization and delivery target. Requests already issued cannot be recalled; pausing blocks subsequent unissued operations. Approving a failed delivery requeues its job and records fresh per-candidate authorization instead of retaining a revoked automatic policy. Active deliveries are not duplicated.
+Before each push and PR creation, recheck pause, cancellation, shutdown, automatic PR authorization and delivery target. Before auto-merge, recheck that the checks/review, baseline, and Issue still match; cancelled, timed-out, or stopped delivery tracking does not continue to merge or close PRs. Requests already issued cannot be recalled; pausing blocks subsequent unissued operations. Approving a failed delivery requeues its job and records fresh per-candidate authorization instead of retaining a revoked automatic policy. Active deliveries are not duplicated.
+
+Review receives the host-sealed full patch that matches the evaluated candidate, as untrusted evidence. Common test filenames across languages, test directories, manifests, and configured check entrypoints are restored from the baseline into candidate copies so candidates cannot weaken existing regression gates; candidate-added tests can still run in the full candidate check.
 
 Failed GitHub checks appear directly under Needs your attention; successful reruns return to In progress while PR tracking continues. Post-merge checks respect the configured interval and record poll times even when the head is unchanged. Completed observation windows stop scheduling; pending regression investigations still retry.
 

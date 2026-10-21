@@ -106,5 +106,11 @@ def module(language, manifest, cwd, tool, commands):
 
 def test_path(path):
     p = Path(path)
-    return any(part.lower() in {"test", "tests", "spec", "specs", "__tests__"} for part in p.parts) or \
-        p.name.startswith("test_") or p.name.endswith(("_test.go", ".test.js", ".spec.ts", ".spec.js"))
+    name = p.name.lower()
+    test_directories = {"test", "tests", "spec", "specs", "__tests__"}
+    named_test = p.stem.lower() in {"test", "tests", "spec", "specs"} or \
+        p.stem.startswith(("Test", "test_", "test-")) or p.stem.endswith(("Test", "Tests", "TestCase"))
+    return any(part.lower() in test_directories for part in p.parts) or named_test or name.endswith((
+        "_test.py", "_test.go", "_test.rs", "_test.rb", "_test.ts", "_test.tsx", "_test.js", "_test.jsx", "_test.cjs", "_test.mjs",
+        "_test.exs", "_test.dart", ".test.py", ".test.ts", ".test.tsx", ".test.js", ".test.jsx", ".test.cjs", ".test.mjs",
+        ".spec.py", ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx", ".spec.cjs", ".spec.mjs"))

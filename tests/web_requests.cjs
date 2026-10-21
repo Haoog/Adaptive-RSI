@@ -41,7 +41,7 @@ function browser() {
   };
   const context = vm.createContext({
     document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
-    localStorage: {getItem: () => null}, t: value => value,
+    localStorage: {getItem: () => null, setItem() {}}, t: value => value,
     fetch: () => new Promise(() => {}),
     setInterval() {}, clearTimeout() {},
     setTimeout(callback, delay) { if (delay === 1000) timers.push(callback); },
@@ -53,7 +53,7 @@ function browser() {
   node('project-select').options = [{value: 'a', text: 'A'}, {value: 'b', text: 'B'}];
   return {
     context, node, document,
-    input(id, form) { const target = node(id); target.form = node(form); listeners.get('input')({target}); },
+    input(id, form) { const target = node(id); target.form = node(form); listeners.get('input')({target}); target.handlers.input?.({target}); },
     submit(form) { node(form).handlers.submit({target: node(form), preventDefault() {}}); return context.lastAction; },
     async resume() {
       await new Promise(setImmediate);
@@ -376,6 +376,23 @@ test('an import form remains unchanged when polling auto-selects a newly importe
   assert.equal(vm.runInContext('importInputUnchanged()',page.context),false);
 });
 
+test('goal drafts stay with their project and submit only to that project', async () => {
+  const page=browser(),posts=[];
+  page.context.refresh=()=>Promise.resolve();
+  page.context.fetch=async(url,options)=>{posts.push(JSON.parse(options.body));return response({id:'task'});};
+  page.node('goal-text').value='Only project A: update the guide';page.input('goal-text','goal-form');
+  page.node('project-select').value='b';page.node('project-select').handlers.change({target:page.node('project-select')});
+  assert.equal(page.node('goal-text').value,'');
+  page.node('goal-text').value='Only project B: fix a typo';page.input('goal-text','goal-form');
+  page.node('project-select').value='a';page.node('project-select').handlers.change({target:page.node('project-select')});
+  assert.equal(page.node('goal-text').value,'Only project A: update the guide');
+  await page.submit('goal-form');
+  assert.deepEqual(posts[0],{project:'a',text:'Only project A: update the guide'});
+  assert.equal(page.node('goal-text').value,'');
+  page.node('project-select').value='b';page.node('project-select').handlers.change({target:page.node('project-select')});
+  assert.equal(page.node('goal-text').value,'Only project B: fix a typo');
+});
+
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
   for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
     const page=browser();page.node('config-scope').value='project';
@@ -392,4 +409,5 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
   for(const [key,value] of Object.entries(english))assert.doesNotMatch(value,/[\u4e00-\u9fff]/,key);
   assert.equal(english['安排检查'],'Schedule check');
+  assert.equal(english['Issue 已变化，等待同步后重评'],'Issue changed; waiting for sync and reassessment');
 });

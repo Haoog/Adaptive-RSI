@@ -22,15 +22,40 @@ def empty_test_run(text):
     return bool(empty and not positive)
 
 
-def freeze_harness(baseline, target):
+def configured_check_files(baseline, checks):
+    root = Path(baseline).resolve()
+    files = set()
+    for check in checks:
+        cwd = (root / check.get("cwd", ".")).resolve()
+        try:
+            cwd.relative_to(root)
+        except ValueError:
+            raise RuntimeError("Configured check directory escapes the project") from None
+        for argument in check["argv"]:
+            if not isinstance(argument, str) or not argument or argument.startswith("-"):
+                continue
+            candidate = Path(argument)
+            path = (candidate if candidate.is_absolute() else cwd / candidate).resolve()
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
+            if path.is_file():
+                files.add(relative)
+    return files
+
+
+def freeze_harness(baseline, target, checks=()):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
     protected = set()
+    explicit_checks = configured_check_files(baseline, checks)
     for parent, dirs, files in os.walk(baseline, followlinks=False):
         dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
         for name in files:
             src = Path(parent) / name
             relative = src.relative_to(baseline)
-            if not (test_path(relative) or name in MANIFESTS or name.endswith((".csproj", ".fsproj", ".sln"))):
+            if not (test_path(relative) or relative in explicit_checks or name in MANIFESTS or
+                    name.endswith((".csproj", ".fsproj", ".sln"))):
                 continue
             dst = target / relative
             # Reject directory/symlink tricks before the host copies protected files.
@@ -70,7 +95,9 @@ class Evaluator:
                         else:
                             shutil.rmtree(seeded)
                 restore(seeds, target, config)
-            protected = freeze_harness(Path(candidate if label == "candidate_full" else baseline), target)
+            # The candidate stage validates the original harness; full checks must retain candidate-added tests.
+            harness = candidate if label == "candidate_full" else baseline
+            protected = freeze_harness(harness, target, checks)
             if overlay:
                 from .process import scrub_tree
                 scrub_tree(overlay)

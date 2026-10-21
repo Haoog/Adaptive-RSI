@@ -6,7 +6,7 @@ A local autonomous improvement runtime for Codex: **code inspection, user goals,
 
 Includes a plugin entry point, persistent scheduler, SQLite state and call budgets, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
-Version 0.2.2 fixes filesystem isolation, delivery revocation/retries, local model routing, failed-check visibility, incremental Issue sync, experiment ordering and completed monitoring. See [Reliable improvement loop](RELIABILITY.en.md) for usage, budget estimates, and evidence boundaries.
+Version 0.2.3 strengthens regression-test protection, independent review evidence, delivery gates for changed Issues and cancellation, and per-project goal drafts. See [Reliable improvement loop](RELIABILITY.en.md) for usage, budget estimates, and evidence boundaries.
 
 ## Workflow
 
