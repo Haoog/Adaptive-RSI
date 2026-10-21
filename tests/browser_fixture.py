@@ -2,13 +2,23 @@
 import tempfile
 import threading
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from pathlib import Path
 
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store
 from tests.test_runtime import FakeAgent, fixture, CHECKS
+
+
+class DirectoryServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # 临时目录服务也使用回环地址，不需要反向 DNS 查询。
+        TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 
 def main():
@@ -26,7 +36,8 @@ def main():
             def log_message(self, *args):
                 pass
 
-        directory = ThreadingHTTPServer(("127.0.0.1", 0), Directory)
+        print("Browser fixture: starting local model directory", file=sys.stderr, flush=True)
+        directory = DirectoryServer(("127.0.0.1", 0), Directory)
         threading.Thread(target=directory.serve_forever, daemon=True).start()
         server = None
         try:
@@ -34,6 +45,7 @@ def main():
                 {"name": "测试目录服务", "protocol": "responses",
                  "base_url": "http://127.0.0.1:" + str(directory.server_port), "env_key": ""}, {"mode": "none"})
             runtime.model_center.fetch(connection["id"])
+            print("Browser fixture: preparing isolated task evidence", file=sys.stderr, flush=True)
             project = runtime.add_project(fixture(root / "project"), "浏览器验证项目")
             runtime.configure({"checks": CHECKS, "sources": {"inspection": False, "issues": False},
                                "evolution": {"enabled": False}}, project)
@@ -47,6 +59,7 @@ def main():
             runtime.store.add_task(other, "goal", "other", "另一个项目专属任务")
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()
+            print("Browser fixture: console ready", file=sys.stderr, flush=True)
             print(server.url, flush=True)
             input()
         finally:
