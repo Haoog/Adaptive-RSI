@@ -23,6 +23,8 @@ function browser() {
       replaceChildren(...children) { this.options = children; this.children = children; },
       append(...children) { this.children.push(...children); },
       querySelectorAll() { return []; },
+      querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
+      setAttribute(name,value) { this[name]=value; },
       showModal() { this.open = true; },
       close() { this.open = false; this.handlers.close?.(); }
     });
@@ -31,6 +33,7 @@ function browser() {
   const document = {
     getElementById: node,
     querySelectorAll: () => [],
+    querySelector: () => null,
     addEventListener(type, handler) { listeners.set(type, handler); },
     createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase()}),
     createTextNode: text => ({textContent: text})
@@ -45,7 +48,7 @@ function browser() {
     lastAction: null
   });
   vm.runInContext(source, context);
-  vm.runInContext('state=initialState; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
+  vm.runInContext('originalSafe=safe; state=initialState; scopeInitialized=true; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
   node('project-select').options = [{value: 'a', text: 'A'}, {value: 'b', text: 'B'}];
   return {
     context, node, document,
@@ -108,7 +111,7 @@ test('an ambiguous connection failure after a write is never replayed', async ()
   const page = browser();
   let calls = 0;
   page.context.fetch = async () => { calls++; throw new TypeError('connection lost'); };
-  await assert.rejects(page.context.api('projects/import', {url: 'https://github.com/example/project'}), /connection lost/);
+  await assert.rejects(page.context.api('projects/import', {url: 'https://github.com/example/project'}), /无法连接本地服务/);
   assert.equal(calls, 1);
 });
 
@@ -280,4 +283,109 @@ test('settings drafts retain independent baselines and duration units across pro
   vm.runInContext('projectId="b"', page.context);page.context.restoreSettingsDraft();
   assert.equal(field.value, '52'); assert.equal(unit.value, '1440');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
+});
+
+test('an older state response cannot replace a newer snapshot', async () => {
+  const page=browser();
+  let first,second;
+  page.context.fetch=()=>new Promise(resolve=>{if(!first)first=resolve;else second=resolve;});
+  const older=vm.runInContext('refresh()',page.context),newer=vm.runInContext('refresh()',page.context);
+  second(response(snapshot('new')));await newer;
+  first(response(snapshot('old')));await older;
+  assert.equal(vm.runInContext('state.version',page.context),'new');
+});
+
+test('expired authentication is actionable and never retries a mutation', async () => {
+  const page=browser();let calls=0;
+  page.context.fetch=async()=>{calls++;return response({error:'internal auth message'},401);};
+  await assert.rejects(vm.runInContext('api("goal",{project:"a",text:"keep me"})',page.context),error=>error.code==='session_required'&&error.message.includes('输入已保留'));
+  assert.equal(calls,1);
+});
+
+test('non JSON errors give recovery instructions rather than a parser exception', async () => {
+  const page=browser();
+  page.context.fetch=async()=>({ok:false,status:502,json:async()=>{throw new SyntaxError('HTML error page');}});
+  await assert.rejects(vm.runInContext('api("state")',page.context),/无法识别的结果/);
+});
+
+test('one form cannot submit twice while its first write is pending', async () => {
+  const page=browser();let release,calls=0;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/state'))return response(snapshot());
+    calls++;return new Promise(resolve=>release=()=>resolve(response({added:true})));
+  };
+  vm.runInContext('safe=fn=>{lastAction=originalSafe(fn,$("goal-form"));return lastAction;}',page.context);
+  page.node('goal-text').value='one goal';
+  const first=page.submit('goal-form');await page.submit('goal-form');
+  assert.equal(calls,1);release();await first;
+  page.node('goal-text').value='next goal';
+  const next=page.submit('goal-form');assert.equal(calls,2);release();await next;
+});
+
+test('form errors stay next to preserved input and clear on retry', async () => {
+  const page=browser();
+  page.node('goal-text').value='preserve input';
+  await vm.runInContext('originalSafe(async()=>{throw new SyntaxError("bad JSON");},$("goal-form"))',page.context);
+  const feedback=page.node('goal-form').children[0];
+  assert.equal(feedback.role,'alert');assert.match(feedback.textContent,/JSON 格式有误/);
+  assert.equal(page.node('goal-text').value,'preserve input');
+  assert.equal(page.node('toast').hidden,false);
+  await vm.runInContext('originalSafe(async()=>{},$("goal-form"))',page.context);
+  assert.equal(feedback.hidden,true);
+});
+
+test('toolchain results from the previous project cannot appear in current settings', async () => {
+  const page=browser();let finishA,finishB;
+  page.context.fetch=url=>new Promise(resolve=>{if(url.endsWith('project=a'))finishA=resolve;else finishB=resolve;});
+  const first=vm.runInContext('renderCapabilities()',page.context);
+  const second=vm.runInContext('projectId="b";renderCapabilities()',page.context);
+  finishB(response({modules:[{language:'B language',manifest:'b.json',status:'executable'}]}));await second;
+  finishA(response({modules:[{language:'A language',manifest:'a.json',status:'executable'}]}));await first;
+  const rows=page.node('capabilities').children;
+  assert.equal(rows.length,1);assert.equal(rows[0].children[0].textContent,'B language');
+});
+
+test('unchanged polling retains DOM state, but project or language changes invalidate it', () => {
+  const page=browser();
+  page.context.language='zh-CN';
+  assert.equal(vm.runInContext('changedList($("activity"),[{id:1}])',page.context),true);
+  assert.equal(vm.runInContext('changedList($("activity"),[{id:1}])',page.context),false);
+  assert.equal(vm.runInContext('projectId="b";changedList($("activity"),[{id:1}])',page.context),true);
+  assert.equal(vm.runInContext('language="en";changedList($("activity"),[{id:1}])',page.context),true);
+});
+
+test('project settings are the initial default without overriding an explicit global choice', async () => {
+  const page=browser();page.context.fetch=async()=>response(snapshot());
+  page.node('config-scope').value='global';vm.runInContext('scopeInitialized=false',page.context);
+  await vm.runInContext('refresh()',page.context);
+  assert.equal(page.node('config-scope').value,'project');
+  page.node('config-scope').value='global';vm.runInContext('scopeChosen=true',page.context);
+  await vm.runInContext('refresh()',page.context);
+  assert.equal(page.node('config-scope').value,'global');
+});
+
+test('an import form remains unchanged when polling auto-selects a newly imported project', () => {
+  const page=browser();
+  vm.runInContext('projectId="";importInputUnchanged=unchangedForm($("project-form"),{projectSensitive:false});projectId="new-project";',page.context);
+  assert.equal(vm.runInContext('importInputUnchanged()',page.context),true);
+  page.input('project-urls','project-form');
+  assert.equal(vm.runInContext('importInputUnchanged()',page.context),false);
+});
+
+test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
+  for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
+    const page=browser();page.node('config-scope').value='project';
+    let fail;page.context.rejectLater=()=>new Promise((_,reject)=>fail=()=>reject(new Error('old scope failure')));
+    const pending=vm.runInContext('originalSafe(rejectLater,$("settings-form"))',page.context);
+    vm.runInContext(change,page.context);fail();await pending;
+    assert.equal(page.node('settings-form').children.length,0);
+    assert.match(page.node('toast').textContent,/先前的提交未成功/);
+  }
+});
+
+test('English UI copy has no accidentally translated Chinese fragments and preserves scheduled-check meaning', () => {
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  for(const [key,value] of Object.entries(english))assert.doesNotMatch(value,/[\u4e00-\u9fff]/,key);
+  assert.equal(english['安排检查'],'Schedule check');
 });

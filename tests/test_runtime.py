@@ -362,7 +362,8 @@ Path(%r).write_text('allowed output')
                     result["assessments"][2]["decision"] = "fail"
                 return result
         self.runtime.agent = GuidedProvider()
-        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10}}, self.project)
+        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1, "max_calls": 10,
+                                                "max_cost_ratio": 10}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.request(self.project, "evolve")
         run = self.store.claim(self.project, self.runtime.config(self.project))
@@ -580,6 +581,24 @@ class ServerTest(unittest.TestCase):
 
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
+
+    def test_missing_browser_session_has_safe_recovery_page_but_api_stays_private(self):
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(self.server.origin + "/")
+        self.assertEqual(denied.exception.code, 401)
+        page = denied.exception.read().decode()
+        self.assertIn("需要重新登录", page)
+        self.assertIn("python3 scripts/rsi open", page)
+        self.assertNotIn(self.server.token, page)
+        self.assertNotIn(self.server.csrf, page)
+        self.assertIn("default-src 'self'", denied.exception.headers["Content-Security-Policy"])
+        with urllib.request.urlopen(self.server.origin + "/login.css") as response:
+            self.assertIn("text/css", response.headers["Content-Type"])
+        for path in ["/api/state", "/app.js", "/style.css"]:
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(self.server.origin + path)
+            self.assertEqual(denied.exception.code, 401)
+            self.assertEqual(json.load(denied.exception)["error_code"], "session_required")
 
     def test_update_gate_rejects_before_mutation_with_a_retryable_code(self):
         self.runtime.updates.installing = True

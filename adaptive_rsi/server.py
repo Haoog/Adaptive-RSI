@@ -79,13 +79,19 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             token = ""
         if not hmac.compare_digest(token, self.server.token):
-            self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open"}, 401)
+            if self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+                self.respond((Path(__file__).parent / "web" / "login.html").read_bytes(), 401, "text/html; charset=utf-8")
+            else:
+                self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
             return False
         return True
 
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+        if parsed.path == "/login.css" and self.headers.get("Host") == self.server.origin.split("//")[1]:
+            self.respond((Path(__file__).parent / "web" / "login.css").read_bytes(), content_type="text/css; charset=utf-8")
+            return
         if parsed.path == "/" and "token" in params:
             if self.headers.get("Host") != self.server.origin.split("//")[1] or not hmac.compare_digest(params["token"][0], self.server.token):
                 self.respond({"error": "Invalid login"}, 403)
