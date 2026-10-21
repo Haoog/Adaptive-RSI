@@ -135,6 +135,36 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(json.loads(run["config"])["schedule"]["light_minutes"], 480)
         self.assertEqual(self.runtime.config(self.project)["schedule"]["light_minutes"], 600)
 
+    def test_scan_inheritance_removes_only_requested_project_overrides(self):
+        self.runtime.configure({"schedule": {"light_minutes": 360, "deep_minutes": 10080},
+                                "delivery": {"mode": "pr"}}, self.project)
+        self.runtime.configure({}, self.project, ["schedule.light_minutes", "sources.inspection"])
+        self.runtime.configure({"schedule": {"light_minutes": 720}})
+        config = self.runtime.config(self.project)
+        self.assertEqual(config["schedule"]["light_minutes"], 720)
+        self.assertEqual(config["schedule"]["deep_minutes"], 10080)
+        self.assertTrue(config["sources"]["inspection"])
+        self.assertFalse(config["sources"]["issues"])
+        self.assertEqual(config["delivery"]["mode"], "pr")
+        for project, paths, values in [(None, ["schedule.light_minutes"], {}),
+                                       (self.project, ["delivery.auto_merge"], {}),
+                                       (self.project, "schedule.light_minutes", {}),
+                                       (self.project, ["schedule.light_minutes"], {"schedule": {"light_minutes": 5}})]:
+            with self.assertRaises(ValueError):
+                self.runtime.configure(values, project, paths)
+
+    def test_global_schedule_change_preserves_overridden_and_unrelated_deadlines(self):
+        self.runtime.configure({"sources": {"inspection": True, "issues": True},
+                                "schedule": {"light_minutes": 360},
+                                "github": {"repository": "owner/project"}}, self.project)
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100)
+        before = {row["kind"]: row["due"] for row in self.store.query("SELECT * FROM schedules")}
+        self.runtime.configure({"schedule": {"light_minutes": 720, "issues_minutes": 240}})
+        after = {row["kind"]: row["due"] for row in self.store.query("SELECT * FROM schedules")}
+        self.assertEqual(after["light"], before["light"])
+        self.assertEqual(after["deep"], before["deep"])
+        self.assertGreater(after["issues"], before["issues"])
+
     def test_claim_is_atomic_and_project_locked(self):
         self.runtime.goal(self.project, "one")
         self.runtime.goal(self.project, "two")

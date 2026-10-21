@@ -7,7 +7,7 @@ const statusNames = {waiting_budget:'等待调用额度',assessed:'价值已评�
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量检查',system_deep:'深度检查',system_issues:'GitHub 问题同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
-const formRevisions=new WeakMap(), settingsDrafts=new Map();
+const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap();
 let settingsContext='',settingsGeneration=0;
 let refreshSequence=0,capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
@@ -27,6 +27,8 @@ const apiErrors={
  "Goal must contain 1..30000 characters": "目标不能为空，且不能超过 30000 个字符。",
  "Wait until active runs finish before importing projects": "还有任务正在运行，请等任务结束后再接入项目。",
  "Wait until active runs finish before registering projects so every worker uses the same isolation boundaries": "还有任务正在运行，请等任务结束后再接入项目。",
+ "Only project scan settings can inherit global defaults": "只能让项目扫描设置跟随通用设置。",
+ "An inherited setting cannot also have an override": "跟随通用的扫描项不能同时填写 JSON 覆盖，请先选择单独设置。",
  "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
@@ -85,19 +87,20 @@ async function safe(fn,form){
   toast(message,true);
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submit.textContent=label;}}
 }
-async function refresh(){const ticket=++refreshSequence,query=new URLSearchParams({project:projectId,limit:'50',offset:String(view==='tasks'?taskOffset:0),filter:view==='tasks'?$('task-filter').value:'all',system:view==='tasks'?String($('show-system-tasks').checked):'true'}),next=await api('state?'+query);if(ticket!==refreshSequence)return;if(bootBuild&&next.build&&bootBuild!==next.build)$('reload-ui').hidden=false;if(state&&state.version!==next.version)toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));state=next; $('connection').textContent=t('已连接'); $('version').textContent='Adaptive RSI '+state.version;
+async function refresh(){const ticket=++refreshSequence,taskView=['overview','tasks'].includes(view),query=new URLSearchParams({project:projectId,limit:'50',offset:String(taskView?taskOffset:0),filter:taskView?$('task-filter').value:'all',system:taskView?String($('show-system-tasks').checked):'true'}),next=await api('state?'+query);if(ticket!==refreshSequence)return;if(bootBuild&&next.build&&bootBuild!==next.build)$('reload-ui').hidden=false;if(state&&state.version!==next.version)toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));state=next; $('connection').textContent=t('已连接'); $('version').textContent='Adaptive RSI '+state.version;
  const select=$('project-select'); const old=projectId; if(!state.projects.some(p=>p.id===projectId))projectId=state.projects[0]?.id||'';
  if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,p.name]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',p.name);o.value=p.id;return o;})); if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
  if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
  select.value=projectId; if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localStorage.setItem('rsi-project',projectId);}
  render();}
-function parentView(name){return name==='models'?'settings':name==='evolution'?'tasks':name;}
+function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
  const parent=parentView(view),configScope=$('config-scope').value;
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
- document.querySelectorAll('.section-tabs [data-view]').forEach(node=>{node.classList.toggle('active',node.dataset.view===view);node.setAttribute('aria-current',node.dataset.view===view?'page':'false');});
- $('settings-tabs').hidden=parent!=='settings';$('tasks-tabs').hidden=parent!=='tasks';$('settings-context').hidden=parent!=='settings';
- $('page-name').textContent=t({overview:'工作台',tasks:'任务',settings:'设置'}[parent]);
+ $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
+ $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录'}[parent]);
+ $('project-settings').hidden=parent==='settings'||!projectId;$('back-workspace').hidden=parent==='overview';
+ $('global-settings').classList.toggle('active',parent==='settings'&&configScope==='global');
  $('settings-context-title').textContent=configScope==='global'?t('通用默认设置'):(currentProject()?.name||t('当前项目'))+' · '+t('项目设置');
  $('settings-context-note').textContent=t(configScope==='global'?'未单独设置的项目会沿用这里的配置。':'仅修改当前项目，其他项目不受影响。');
  document.querySelectorAll('[data-settings-scope]').forEach(node=>{node.classList.toggle('active',node.dataset.settingsScope===configScope);node.setAttribute('aria-pressed',String(node.dataset.settingsScope===configScope));node.disabled=node.dataset.settingsScope==='project'&&!projectId;});
@@ -116,7 +119,7 @@ function render(){
  if(!project&&$('config-scope').value==='project'){$('config-scope').value='global';settingsBaseline=null;}
  renderNavigation();$('onboarding').hidden=!!project;$('project-workspace').hidden=!project;$('pause-button').hidden=!project;
  $('pause-button').disabled=!project;$('pause-button').textContent=t(!project||project.paused?'开始运行':'暂停运行');
- $('workspace-title').textContent=t(project?'项目工作台':'从一个项目开始');
+ $('workspace-title').textContent=project?.name||t('从一个项目开始');
  $('workspace-description').hidden=!!project;
  $('workspace-description').textContent=t(project?'自主发现，也随时接受你的目标。':'连接项目与模型，让它持续发现值得做的改进。');
  $('project-status').textContent=t(!project||project.paused?'已暂停':'运行中');$('project-status').className='badge '+(project&&!project.paused?'good':'neutral');
@@ -128,10 +131,6 @@ function render(){
  const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(['light','deep'].includes(row.kind)&&config.sources.inspection))).sort((a,b)=>a.due-b.due)[0];
  $('next-check').textContent=t(project?.paused?'启动后开始':!next?'未安排自动检查':'下次 ')+(project&&!project.paused&&next?stamp(next.due):'');
  const attention=counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(tasks,'attention',true).length;$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
- const recent=$('recent-tasks'),latest=visibleTasks(tasks,'all').slice(0,3);
- if(changedList(recent,latest)){recent.replaceChildren();
- if(!latest.length)recent.append(el('p',t('还没有任务。可以输入目标，或启动自动检查。'),'empty-copy'));
- for(const task of latest){const row=el('div',undefined,'recent-task');row.append(action(task.title,()=>showTask(task),'task-title'),badge(task.state));recent.append(row);}}
  for(const kind of ['light','issues','deep']){
   const mins=config.schedule[kind+'_minutes'],factor=mins%1440===0?1440:mins%60===0?60:1;
   $(kind+'-interval').textContent=(mins/factor)+' '+t(factor===1440?'天':factor===60?'小时':'分钟');
@@ -139,6 +138,7 @@ function render(){
   const schedule=state.schedules.find(row=>row.project===projectId&&row.kind===kind);
   $(kind+'-due').textContent=t(!enabled?'未启用':project?.paused?'项目已暂停':schedule?'下次 ':'等待首次检查')+(enabled&&!project?.paused&&schedule?stamp(schedule.due):'');
  }
+ $('scan-summary').textContent=['light','issues','deep'].map(kind=>t({light:'项目扫描',issues:'GitHub 问题同步',deep:'深度检查'}[kind])+' '+($(kind+'-due').textContent===t('未启用')?t('未启用'):t('每')+' '+$(kind+'-interval').textContent)).join(' · ');
  document.querySelectorAll('[data-inspect]').forEach(button=>button.disabled=!project);
  const activity=$('activity'),events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,6);
  if(changedList(activity,events)){activity.replaceChildren();
@@ -146,7 +146,7 @@ function render(){
  for(const event of events){const row=el('div',undefined,'activity-row');row.append(el('time',stamp(event.created)),el('span',eventCopy(event)));if(language!=='en'&&eventCopy(event)!==event.message){const raw=el('details');raw.append(el('summary',t('原文')),el('p',event.message));row.append(raw);}activity.append(row);}}
  $('delivery-summary').textContent=t(config.delivery.mode==='local'?'当前交付：保存在本地，确认后创建 PR。':config.delivery.auto_merge?'当前交付：检查和评审通过后自动提交并合并。':'当前交付：检查通过后自动提交修改，等待合并。');
  if(project&&!readinessCache.has(project.id))safe(()=>checkReadiness());else renderReadiness();
- renderTelemetry();renderUpdate();if(view==='tasks')renderTasks();if(view==='evolution')renderEvolution();if(view==='settings'&&!settingsBaseline)renderSettings();
+ renderTelemetry();renderUpdate();if(['overview','tasks'].includes(view))renderTasks();if(view==='evolution')renderEvolution();if(view==='settings'){if(!settingsBaseline)renderSettings();window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);}
 }
 function renderTelemetry(){
  const summary=$('quality-summary');summary.replaceChildren();const quality=state.quality?.find(q=>q.project===projectId);
@@ -168,9 +168,10 @@ function valueReport(value,reason,scope){
 function showView(name){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models'].includes(name))return;
+ const models=name==='models';name=name==='tasks'?'overview':models?'settings':name;
  view=name;document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
- if(name==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);
- render();if(['tasks','overview'].includes(name))safe(refresh);window.scrollTo(0,0);
+ render();if(name==='overview')safe(refresh);if(name==='settings')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
+ if(models)$('view-models').scrollIntoView({block:'start'});
 }
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
@@ -192,11 +193,26 @@ function renderTasks(){
 }
 let detailTask,detailSequence=0;
 function closeTaskDetail(){detailSequence++;detailTask=null;if($('detail-dialog').open)$('detail-dialog').close();}
-async function showTask(task){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));const description=el('p',task.body,'muted');body.append(description);
- const evidence=el('details',undefined,'detail-section');evidence.append(el('summary',t('来源与证据')),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
+function taskOutcome(data){
+ const result=data.result,outcome=el('section',undefined,'task-outcome');outcome.append(el('h3',t('这次的结果')));
+ outcome.append(el('p',result.summary||result.reason||t('还没有完成结果。')));
+ if(result.failure)outcome.append(el('p',failureCopy(result.failure),'form-error'));
+ if(result.files?.length)outcome.append(el('p',t('修改文件')+' · '+result.files.join(', '),'muted'));
+ for(const [key,title]of [['evaluation','运行检查'],['review','代码评审']]){const row=el('p');row.append(el('strong',t(title)+' · '),result[key]?badge(result[key].decision):document.createTextNode(t('尚未完成')));outcome.append(row);}
+ const next=result.delivery_status?t(deliveryNames[result.delivery_status]||result.delivery_status):t(statusNames[data.state]||data.state);
+ outcome.append(el('p',t('交付状态')+' · '+next));
+ const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
+ if(guidance)outcome.append(el('p',t(guidance),'muted'));
+ outcome.append(stageProgress(data));return outcome;
+}
+async function showTask(task){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
+ if(!$('detail-dialog').open)$('detail-dialog').showModal();
+ const evidence=el('details',undefined,'detail-section');evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
  const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(ticket!==detailSequence||projectId!==project)return;
- for(const run of history){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;const section=el('section',undefined,'detail-section');section.append(el('h3',t('运行 ')+run.id+' · '+(t(statusNames[run.state]||run.state))),el('p',data.result.failure?failureCopy(data.result.failure):data.result.reason,'muted'));
-  section.append(stageProgress(data));
+ for(const [index,run] of history.entries()){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
+  if(index===0)body.insertBefore(taskOutcome(data),evidence);
+  const section=el('details',undefined,'detail-section');section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id),el('p',data.result.failure?failureCopy(data.result.failure):data.result.reason,'muted'));
+  if(index>0)section.append(stageProgress(data));
   const raw=el('details');raw.append(el('summary',t('原始运行记录')),el('pre',JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));section.append(raw);
   if(data.result.value){const report=el('details',undefined,'review-report');report.append(el('summary',t('为什么值得做')),valueReport(data.result.value,data.result.plan_reason,data.result.scope));section.append(report);}
   if(data.result.review){
@@ -208,10 +224,12 @@ async function showTask(task){const ticket=++detailSequence,project=projectId;de
   if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=el('details');detail.append(el('summary',t(evaluationNames[label]||label)+' · '+rows.filter(r=>r.passed).length+'/'+rows.length),el('pre',JSON.stringify(rows,null,2)));report.append(detail);}section.append(report);}
   if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
-  if(data.result.files){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';section.append(link);}
-  if(run.state==='awaiting_approval')section.append(action(t('批准推送并创建 PR'),async()=>{if(!window.confirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？')))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
-  if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';section.append(link);}}
-  if(['pr_open','merged'].includes(run.state))section.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
+  const delivery=el('div',undefined,'task-actions');
+  if(data.result.files){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}
+  if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!window.confirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？')))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
+  if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
+  if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
+  if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
   body.append(section);}
  if(ticket!==detailSequence||projectId!==project)return;
  if(['queued','planning','executing','evaluating'].includes(task.state))body.append(action(t('取消任务'),async()=>{if(ticket!==detailSequence||projectId!==project)return;await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
@@ -225,9 +243,11 @@ function getPath(obj,path){return path.split('.').reduce((v,k)=>v?.[k],obj);}
 function setPath(obj,path,value){const keys=path.split('.');let node=obj;keys.slice(0,-1).forEach(k=>node=node[k]??={});node[keys.at(-1)]=value;}
 function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typeof value==='object'&&!Array.isArray(value))a[key]=deepMerge(a[key]||{},value);else a[key]=value;}return a;}
 function settingsKey(){return $('config-scope').value==='global'?'global':projectId;}
+function settingsValues(){return [...$('settings-form').querySelectorAll('input,textarea,select')].map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked}));}
 function stashSettings(){
  if(!settingsBaseline||!settingsContext)return;
- const values=[...$('settings-form').querySelectorAll('input,textarea,select')].map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked}));
+ const values=settingsValues();
+ if(JSON.stringify(values)===settingsClean.get(settingsContext)){settingsDrafts.delete(settingsContext);return;}
  settingsDrafts.set(settingsContext,{baseline:settingsBaseline,values});
 }
 function restoreSettingsDraft(){
@@ -252,10 +272,24 @@ function syncDelivery(){
  $('delivery-note').textContent=t($('delivery-choice').disabled?'通用设置不能替所有项目授权提交代码，请切换到具体项目设置。':{local:'修改完成后只保存在本机，不会上传到 GitHub。你确认后再提交。',pr:'检查通过后会在 GitHub 创建修改申请（PR），由你决定何时合并。',auto:'检查通过后会提交并自动合并；GitHub 要求的检查和审核仍必须通过。',custom:'保留原来的特殊设置。选择其他选项后，才会改变提交方式。'}[$('delivery-choice').value]);
 }
 function changeSettingsScope(scope){
+ if(!state)return;
  scopeChosen=true;
  stashSettings();$('config-scope').value=scope;settingsBaseline=null;
  if(view==='models')window.RSIModelCenter?.show(scope==='project'?projectId:null);
- else renderSettings();renderNavigation();
+ else renderSettings();renderNavigation();window.RSIModelCenter?.show(scope==='project'?projectId:null);
+}
+const schedulePaths=['schedule.light_minutes','schedule.issues_minutes','schedule.deep_minutes','sources.inspection','sources.issues'];
+function syncScheduleMode(){
+ const global=$('config-scope').value==='global',inherit=!global&&$('schedule-mode').value==='inherit';
+ $('schedule-mode-field').hidden=global;
+ for(const path of schedulePaths){const node=document.querySelector('[data-path="'+path+'"]');node.disabled=inherit;
+  if(inherit){const value=getPath(state.config,path);if(node.type==='checkbox')node.checked=value;else{const unit=document.querySelector('[data-unit-for="'+path+'"]'),factor=value%1440===0?1440:value%60===0?60:1;unit.value=String(factor);unit.dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}}
+ }
+ document.querySelectorAll('[data-unit-for], [data-schedule-preset]').forEach(node=>node.disabled=inherit);
+ syncSchedulePresets();
+}
+function syncSchedulePresets(){
+ document.querySelectorAll('[data-schedule-preset]').forEach(select=>{const input=document.querySelector('[data-path="schedule.'+select.dataset.schedulePreset+'_minutes"]'),minutes=Number(input.value)*durationUnit(input);select.value=[...select.options].some(o=>o.value===String(minutes))?String(minutes):'custom';});
 }
 function renderSettings(){settingsGeneration++;const feedback=$('settings-form').querySelector('[data-form-error]');if(feedback)feedback.hidden=true;settingsBaseline=structuredClone($('config-scope').value==='global'?state.config:(currentProject()?.config||state.config));
  document.querySelectorAll('[data-path]').forEach(node=>{const value=getPath(settingsBaseline,node.dataset.path);if(node.type==='checkbox')node.checked=value;else node.value=value;if(node.dataset.duration){const factor=value%1440===0?1440:value%60===0?60:1;document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value=String(factor);document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}});
@@ -263,7 +297,9 @@ function renderSettings(){settingsGeneration++;const feedback=$('settings-form')
  document.querySelectorAll('[data-path^="delivery."]').forEach(node=>node.disabled=$('config-scope').value!=='project'||!projectId);
  document.querySelectorAll('[data-path^="updates."]').forEach(node=>node.disabled=$('config-scope').value!=='global');
  renderUpdate();
- $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';settingsContext=settingsKey();restoreSettingsDraft();syncDelivery();
+ $('schedule-mode').value=schedulePaths.some(path=>getPath(currentProject()?.overrides,path)!==undefined)?'custom':'inherit';
+ settingsModes.set(settingsBaseline,$('schedule-mode').value);
+ $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';settingsContext=settingsKey();syncDelivery();syncScheduleMode();settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();syncDelivery();syncScheduleMode();
  safe(renderCapabilities);}
 async function renderCapabilities(){
  const ticket=++capabilitySequence,project=projectId,target=$('capabilities');target.replaceChildren();if(!project){target.append(el('p',t('接入项目后识别运行环境。'),'muted'));return;}const capabilities=await api('capabilities?project='+encodeURIComponent(project));if(ticket!==capabilitySequence||project!==projectId)return;if(!capabilities.modules.length)target.append(el('p',t('未识别到标准构建清单。可手动配置验收命令。'),'muted'));for(const module of capabilities.modules){const row=el('div',undefined,'capability-row');row.append(el('strong',module.language),el('code',module.manifest),el('span',{executable:t('检查可执行 · 已验证'),unverified:t('待隔离验证'),analysis_only:t('可分析 · 需配置检查'),environment_blocked:t('环境缺少工具')}[module.status],'badge '+(module.status==='environment_blocked'?'warn':module.status==='executable'?'good':'neutral')));target.append(row);}
@@ -280,6 +316,8 @@ async function checkReadiness(force=false){
 }
 function renderReadiness(){
  const result=readinessCache.get(projectId);if(!result)return;$('readiness-check').disabled=!!result.loading;
+ $('readiness-panel').classList.toggle('needs-attention',!result.loading&&!result.ready);
+ if(!result.loading&&!result.ready)$('readiness-panel').open=true;
  $('readiness-summary').textContent=t(result.loading?'正在检查运行条件…':result.ready?'基础条件已就绪，实际效果将在任务中验证。':'还有运行条件需要处理，请按提示设置。');
  const list=$('readiness-items');list.replaceChildren();if(result.loading)return;
  for(const item of result.items){if(item.ready)continue;const row=el('div',undefined,'readiness-row');row.append(el('span',t(readinessNames[item.code]||item.code)+(item.role?' · '+t(roleNames[item.role]):'')));
@@ -297,6 +335,13 @@ $('reload-ui').addEventListener('click',()=>{if(confirm(t('刷新会清除当前
 
 document.querySelector('.brand')?.addEventListener('click',event=>{event.preventDefault();showView('overview');});
 document.querySelectorAll('[data-view]').forEach(node=>node.addEventListener('click',()=>showView(node.dataset.view)));
+$('project-settings').addEventListener('click',()=>{changeSettingsScope('project');showView('settings');});
+$('global-settings').addEventListener('click',()=>{changeSettingsScope('global');showView('settings');});
+$('edit-schedule').addEventListener('click',()=>{changeSettingsScope('project');showView('settings');$('schedule-settings').scrollIntoView({block:'start'});$('schedule-mode').focus({preventScroll:true});});
+document.querySelectorAll('[data-settings-anchor]').forEach(button=>button.addEventListener('click',()=>$(button.dataset.settingsAnchor).scrollIntoView({block:'start'})));
+$('schedule-mode').addEventListener('change',syncScheduleMode);
+document.querySelectorAll('[data-schedule-preset]').forEach(select=>select.addEventListener('change',()=>{if(select.value==='custom')return;const node=document.querySelector('[data-path="schedule.'+select.dataset.schedulePreset+'_minutes"]'),unit=document.querySelector('[data-unit-for="'+node.dataset.duration+'"]'),value=Number(select.value),factor=value%1440===0?1440:60;unit.value=String(factor);unit.dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}));
+document.querySelectorAll('[data-duration]').forEach(node=>node.addEventListener('input',syncSchedulePresets));
 $('delivery-project-settings').addEventListener('click',()=>changeSettingsScope('project'));
 $('detail-dialog').addEventListener('close',()=>{detailSequence++;detailTask=null;});
 document.querySelectorAll('[data-settings-scope]').forEach(button=>button.addEventListener('click',()=>changeSettingsScope(button.dataset.settingsScope)));
@@ -336,7 +381,11 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  const hours=[Number($('work-start').value),Number($('work-end').value)];if(JSON.stringify(hours)!==JSON.stringify(settingsBaseline.schedule.working_hours))setPath(patch,'schedule.working_hours',hours);
  const labels=$('issue-labels').value.split(',').map(x=>x.trim()).filter(Boolean);if(JSON.stringify(labels)!==JSON.stringify(settingsBaseline.github.labels))setPath(patch,'github.labels',labels);
  const checks=JSON.parse($('checks-json').value);if(JSON.stringify(checks)!==JSON.stringify(settingsBaseline.checks))patch.checks=checks;
- patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const saved=await api('config',{project:scope==='project'?project:null,values:patch}),acknowledged=saved.config||deepMerge(structuredClone(baseline),patch);
+ const inherit=scope==='project'&&$('schedule-mode').value==='inherit'?schedulePaths:[];
+ const scheduleMode=$('schedule-mode').value;
+ if(scope==='project'&&scheduleMode==='custom'&&settingsModes.get(baseline)==='inherit')for(const path of schedulePaths){const node=document.querySelector('[data-path="'+path+'"]');setPath(patch,path,fieldValue(node));}
+ patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=saved.config||deepMerge(structuredClone(baseline),patch);
+ settingsModes.set(acknowledged,scheduleMode);
  const draft=settingsDrafts.get(key);if(draft?.baseline===baseline)draft.baseline=acknowledged;
  if(settingsBaseline===baseline&&projectId===project&&$('config-scope').value===scope)settingsBaseline=acknowledged;
  readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'){settingsDrafts.delete(key);renderSettings();}

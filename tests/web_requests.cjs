@@ -22,6 +22,7 @@ function browser() {
       closest() { return this.id.endsWith('-form') ? this : this.form; },
       replaceChildren(...children) { this.options = children; this.children = children; },
       append(...children) { this.children.push(...children); },
+      insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
       querySelectorAll() { return []; },
       querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
       setAttribute(name,value) { this[name]=value; },

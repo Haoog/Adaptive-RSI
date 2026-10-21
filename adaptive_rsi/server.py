@@ -250,7 +250,7 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.updates.apply_async()
                     result = {"started": True}
                 elif path == "/api/config":
-                    runtime.configure(body["values"], body.get("project"))
+                    runtime.configure(body["values"], body.get("project"), body.get("inherit"))
                     result = {"saved": True, "config": runtime.config(body.get("project"))}
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
