@@ -110,12 +110,14 @@ def prepare():
         else:
             output(mode="publish", sha=head, version=current)
             return
+    # 合并不等于发版；只有明确启动稳定批次，才创建新的版本 PR。
+    if os.environ.get("PREPARE_RELEASE") != "true":
+        output(mode="idle", reason="Changes accumulated; start a stable release batch explicitly")
+        return
+    level = os.environ.get("RELEASE_LEVEL", "patch")
+    if level not in ["major", "minor", "patch"]:
+        raise ValueError("Release level must be major, minor or patch")
     # A single stable branch and all-state PR lookup prevent duplicate version PRs.
-    merged = gh("commits/" + head + "/pulls")
-    source = next((item for item in merged if item.get("merged_at")), {})
-    labels = {item["name"] for item in source.get("labels", [])}
-    level = next((name for name in ["major", "minor", "patch"] if "release:" + name in labels),
-                 "minor" if source.get("head", {}).get("ref", "").startswith("feat/") else "patch")
     major, minor, patch = map(int, current.split("."))
     target = f"{major + 1}.0.0" if level == "major" else f"{major}.{minor + 1}.0" if level == "minor" else f"{major}.{minor}.{patch + 1}"
     release_branch = "chore/release-v" + target + "-" + head[:12]

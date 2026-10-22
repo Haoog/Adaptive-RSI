@@ -119,7 +119,10 @@ class Handler(BaseHTTPRequestHandler):
             runtime = self.server.runtime
             store = runtime.store
             if parsed.path == "/api/health":
-                self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid()})
+                self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid(), "api_version": 1})
+            elif parsed.path == "/api/usage":
+                from .usage_report import report
+                self.respond(report(store, params))
             elif parsed.path == "/api/state":
                 legacy = "sections" not in params
                 requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
@@ -242,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/auth.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]

@@ -183,16 +183,10 @@ window.RSIModelCenter = (() => {
       const simpleTitle={planning:'思考与规划',implementation:'代码实现',review:'代码评审'}[role]||title;
       label.append(el('strong',t(simpleTitle)),el('small',t(purpose[role])));
       if(scope)label.append(el('small',t(JSON.stringify(route)===JSON.stringify(data.global_models[role])?'跟随通用设置':'此项目单独设置')));
-      const modelField=el('div',undefined,'mc-model-field'),select=el('select');select.id='mc-role-model-'+role;select.className='mc-role-select';select.setAttribute('aria-label',t(simpleTitle)+' · '+t('选择模型'));
-      for(const service of data.providers){
-        const group=el('optgroup');group.label=service.name;
-        const models=service.catalog.models.filter(model=>model.enabled&&!model.missing&&!model.kind||service.id===route.provider&&model.id===route.model);
-        if(service.id===route.provider&&!models.some(model=>model.id===route.model))models.push({id:route.model,name:route.model});
-        for(const model of models){const option=el('option',model.name);option.value=JSON.stringify([service.id,model.id]);group.append(option);}
-        if(group.children.length)select.append(group);
-      }
-      select.value=JSON.stringify([route.provider,route.model]);
-      select.addEventListener('change',()=>{const [provider,model]=JSON.parse(select.value);routes()[role]={...route,provider,model,effort:provider===route.provider&&model===route.model?route.effort:'default'};renderRoles();$(select.id).focus();});
+      const modelField=el('div',undefined,'mc-model-field'),select=action('',()=>openPicker(role),'mc-role-select mc-route-picker');
+      select.id='mc-role-model-'+role;select.value=JSON.stringify([route.provider,route.model]);
+      select.setAttribute('aria-label',t(simpleTitle)+' · '+t('选择模型'));select.setAttribute('aria-haspopup','dialog');
+      select.append(el('strong',findModel(route)?.name||route.model),el('small',data.providers.find(p=>p.id===route.provider)?.name||route.provider),el('span','⌄','mc-picker-arrow'));
       const provider=data.providers.find(p=>p.id===route.provider),copy=el('span');
       const name=findModel(route)?.name||route.model;copy.append(el('small',(provider?.name||route.provider)+(name!==route.model?' · '+route.model:'')));
       const proof=findModel(route)?.probes?.[route.effort];copy.append(info(t(proof?.state==='pass'?'当前强度工具测试通过':proof?.state==='fail'?'当前强度测试失败':'当前强度尚未测试'),proof?.state==='fail'?'mc-warning':'mc-secondary'));
@@ -200,7 +194,7 @@ window.RSIModelCenter = (() => {
       if(route.fallback)copy.append(info(t('备用')+' · '+(data.providers.find(p=>p.id===route.fallback.provider)?.name||route.fallback.provider)+' / '+route.fallback.model+' · '+route.fallback.effort));
       if(findModel(route)?.missing)copy.append(info(t('目录中已失效'),'mc-warning'));
       const proofDetails=el('details',undefined,'mc-route-proof');proofDetails.append(el('summary',t('验证与备用模型')),copy);
-      modelField.append(select,action(t('搜索模型'),()=>openPicker(role),'mc-text-button'),proofDetails);
+      modelField.append(select,proofDetails);
       if(findModel(route)?.missing||proof?.state==='fail'||provider?.health.paused)modelField.append(el('p',t(findModel(route)?.missing?'目录中已失效':provider?.health.paused?'连续失败已暂停':'当前强度测试失败'),'mc-warning'));
       const control=el('div',undefined,'mc-effort-wrap'),effort=effortControl(route,t(simpleTitle),value=>{route.effort=value;renderRoles();$('mc-role-effort-'+role).focus();});effort.id='mc-role-effort-'+role;control.append(el('span',t('思考深度'),'mc-secondary'),effort);
       const advanced=action(t('高级参数'),()=>openAdvanced(role),'mc-text-button');control.append(advanced);
@@ -229,7 +223,7 @@ window.RSIModelCenter = (() => {
       const models=visible.filter(item=>item.provider.id===provider.id).map(item=>item.model);
       if(!models.length)continue;
       list.append(el('h3',provider.name));
-      for(const model of models){const button=action('',()=>{const old=routes()[picking];routes()[picking]={...old,provider:provider.id,model:model.id,effort:old.provider===provider.id&&old.model===model.id?old.effort:'default'};$('mc-picker-dialog').close();renderRoles();},'mc-picker-option');
+      for(const model of models){const button=action('',()=>{const old=routes()[picking];routes()[picking]={...old,provider:provider.id,model:model.id,effort:old.provider===provider.id&&old.model===model.id?old.effort:'default'};$('mc-picker-dialog').close();renderRoles();$('mc-role-model-'+picking)?.focus();},'mc-picker-option');
         const copy=el('span');copy.append(el('strong',model.name));if(model.name!==model.id)copy.append(el('small',model.id));button.append(copy,info(model.verified||Object.values(model.probes||{}).some(p=>p.state==='pass')?t('已测试'):t('待验证')));list.append(button);}
     }
     if(!list.children.length)list.append(el('p',t('没有已启用的匹配模型，请先到模型服务页面获取或添加。'),'mc-empty'));

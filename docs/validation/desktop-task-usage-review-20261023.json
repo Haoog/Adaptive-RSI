@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-23",
+  "reviewer": "Primary agent self-review, not independent human review",
+  "decision": "No remaining local blocker found. Exact GitHub head checks must pass before merging.",
+  "checks": {
+    "full_python": {
+      "tests": 297,
+      "skipped": 10,
+      "result": "passed"
+    },
+    "desktop_usage_targeted": {
+      "tests": 7,
+      "result": "passed"
+    },
+    "release_and_cadence": {
+      "tests": 28,
+      "result": "passed"
+    },
+    "node_requests": {
+      "tests": 35,
+      "result": "passed"
+    },
+    "rust_bridge": {
+      "tests": 2,
+      "result": "passed"
+    },
+    "chromium": "Existing forms, authorization, project isolation, mobile, English, usage filtering and unknown-detail checks passed.",
+    "native": "Actual app startup, temporary task details, window-close residency, single-instance restore and owned shutdown verified. Original independent service remains healthy.",
+    "bundle": "macOS ARM64 app/DMG build, ad-hoc integrity and standalone engine startup passed."
+  },
+  "reviewed_boundaries": [
+    "Only owned startup pauses projects; attaching never stops independent services.",
+    "Credentials remain in native memory. API path escape and redirects rejected.",
+    "Local transport and public CSRF origin separated for reverse proxies.",
+    "Unknown usage remains unknown. Failed calls and retries retained.",
+    "Ordinary merges no longer create versions. Explicit batches and mechanical release continuation separated.",
+    "Source ZIP includes desktop sources and bilingual docs, excludes credentials and build directories."
+  ],
+  "limits": [
+    "Ad-hoc signatures only; no Developer ID or notarization.",
+    "No real provider OAuth or public-server deployment verification.",
+    "No new formal release or user runtime upgrade in this task."
+  ],
+  "sha256": {
+    "adaptive_rsi/desktop.py": "828a57495c144dfe6a92433647f3cdf6286fd5ab7cd2f363967ecb4cfa4815f1",
+    "adaptive_rsi/usage_report.py": "d10fe79fb53cd540adbfda0ad0c48f873b91b690ad666e90d725bc9bb7ceb007",
+    "adaptive_rsi/web/desktop.js": "f3ab46c092a5112284d634bafd67f3d79d7300dd887911d2abb4253e2f2525f3",
+    "adaptive_rsi/web/usage.js": "7638cc13fcd4d7a96e5d5dd5a4507b8269cac1076cd42233bec9e0d0aa60f0fa",
+    "desktop/src-tauri/src/main.rs": "2a54a69696482e30597567903f99df978055125197d3e85dd99394d02a8579d2",
+    "scripts/release.py": "3e127fb898fb4ea25a4b32811eec53a0bddaa53c8f38a10495ff0ef4e52e7a60",
+    ".github/workflows/release.yml": "f61c2d22443b8cf61ad54a48eda77a7e9aad751529c67e707e9d40b04f305c6d"
+  }
+}

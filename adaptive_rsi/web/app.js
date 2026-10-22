@@ -18,11 +18,11 @@ const loadedStateSections={analyticsProject:null,analyticsAt:0,candidatesProject
 const pendingForms=new WeakSet(),listSnapshots=new WeakMap();
 function changedList(node,rows){const signature=JSON.stringify([projectId,language,rows]);if(listSnapshots.get(node)===signature)return false;listSnapshots.set(node,signature);return true;}
 const draftStore=(()=>{
- const storageKey='rsi-ui-drafts',version=1,ttl=7*24*60*60*1000;
- function read(){try{const saved=JSON.parse(sessionStorage.getItem(storageKey)||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
- function get(kind,scope){const data=read(),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(storageKey,JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
- function set(kind,scope,value){const data=read();data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};try{sessionStorage.setItem(storageKey,JSON.stringify(data));}catch{}}
- function remove(kind,scope){const data=read();if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];try{sessionStorage.setItem(storageKey,JSON.stringify(data));}catch{}}
+ const storageKey=()=> 'rsi-ui-drafts'+(window.__RSI_MACHINE_KEY__?':'+window.__RSI_MACHINE_KEY__:''),version=1,ttl=7*24*60*60*1000;
+ function read(){try{const saved=JSON.parse(sessionStorage.getItem(storageKey())||'null');if(saved?.version===version&&saved.entries)return saved;}catch{}return{version,entries:{}};}
+ function get(kind,scope){const data=read(),entry=data.entries[kind]?.[scope];if(!entry)return null;if(entry.version!==version||entry.expiresAt<Date.now()){delete data.entries[kind][scope];try{sessionStorage.setItem(storageKey(),JSON.stringify(data));}catch{}return null;}return structuredClone(entry.value);}
+ function set(kind,scope,value){const data=read();data.entries[kind]??={};data.entries[kind][scope]={version,savedAt:Date.now(),expiresAt:Date.now()+ttl,value:structuredClone(value)};try{sessionStorage.setItem(storageKey(),JSON.stringify(data));}catch{}}
+ function remove(kind,scope){const data=read();if(!data.entries[kind])return;delete data.entries[kind][scope];if(!Object.keys(data.entries[kind]).length)delete data.entries[kind];try{sessionStorage.setItem(storageKey(),JSON.stringify(data));}catch{}}
  return{get,set,remove};
 })();
 window.RSIDraftStore=draftStore;
@@ -157,7 +157,7 @@ function renderNavigation(){
  const parent=parentView(view),configScope=$('config-scope').value;
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
- $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录'}[parent]);
+ $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录',usage:'记录与用量'}[parent]);
  $('project-settings').hidden=parent==='settings'||!projectId;$('back-workspace').hidden=parent==='overview';
  $('global-settings').classList.toggle('active',parent==='settings'&&configScope==='global');
  $('settings-context-title').textContent=configScope==='global'?t('通用默认设置'):(currentProject()?.name||t('当前项目'))+' · '+t('项目设置');
@@ -237,10 +237,11 @@ function valueReport(value,reason,scope){
 }
 function showView(name){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
- if(!['overview','tasks','evolution','settings','models'].includes(name))return;
+ if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':models?'settings':name;
  view=name;if(models)window.RSIModelCenter?.connections();document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
  render();if(['overview','evolution'].includes(name))safe(refresh);if(name==='settings')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
+ if(name==='usage')window.RSIUsage?.show();
  if(models)$('view-models').scrollIntoView({block:'start'});
 }
 function renderTasks(){
@@ -576,7 +577,7 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
  if(event.target.checked&&!document.querySelector('[data-path="delivery.'+kind+'.sha"]').value){event.target.checked=false;$('release-authorization-feedback').textContent=t('请先选择工作流并点击授权。');$('release-workflow-list').focus();}syncDelivery();
 });
 
-function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'');$('apply-update').disabled=!['available','waiting_idle'].includes(update.state);$('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);}
+function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'');$('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);if(update.desktop_managed)$('update-status').textContent=t('桌面版请安装新版软件，项目和记录会保留。');$('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);}
 $('check-update').addEventListener('click',()=>safe(async()=>{await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!confirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？')))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
@@ -590,5 +591,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  if(!state)return;
  render();if(settingsBaseline)syncDelivery();
  window.RSIModelCenter?.translate();
+ window.RSIUsage?.translate();
+ window.RSIDesktop?.translate?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));

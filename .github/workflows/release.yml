@@ -1,8 +1,18 @@
-name: 自动版本 PR 与正式发布
+name: 稳定批次版本 PR 与正式发布
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      prepare_release:
+        description: '集中发布已稳定的一批改动（普通主线合并不涨版本）'
+        type: boolean
+        default: false
+      release_level:
+        description: '本批次的版本升级级别'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 permissions:
   contents: read
 concurrency:
@@ -28,6 +38,8 @@ jobs:
       - id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
+          PREPARE_RELEASE: ${{ inputs.prepare_release }}
+          RELEASE_LEVEL: ${{ inputs.release_level }}
         run: python3 scripts/release.py prepare
       - name: 显式触发版本 PR 的精确 SHA 检查
         if: steps.prepare.outputs.mode == 'verify'

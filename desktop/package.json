@@ -1,0 +1,1 @@
+{"name":"adaptive-rsi-desktop","private":true,"scripts":{"dev":"node scripts/build.mjs dev","build":"node scripts/build.mjs build"},"devDependencies":{"@tauri-apps/cli":"^2.0.0"}}
