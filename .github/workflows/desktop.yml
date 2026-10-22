@@ -4,6 +4,9 @@ on:
     paths:
       - 'desktop/**'
       - 'adaptive_rsi/**'
+      - 'scripts/package_desktop.py'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-verify.yml'
       - '.github/workflows/desktop.yml'
   workflow_dispatch:
 permissions:
@@ -29,8 +32,12 @@ jobs:
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
+          python3 scripts/package_desktop.py
+          VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
+          hdiutil verify "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+          (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: adaptive-rsi-macos-${{ runner.arch }}-adhoc
-          path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          path: dist/adaptive-rsi-*-macos-arm64-adhoc.dmg*
           if-no-files-found: error

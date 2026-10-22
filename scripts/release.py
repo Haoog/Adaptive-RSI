@@ -86,6 +86,20 @@ def verify_generated(base, head):
     return target
 
 
+def release_assets(directory, target):
+    files = {path.name: path for path in Path(directory).glob("*")
+             if path.is_file() and not path.is_symlink()}
+    wheels = [path for name, path in files.items()
+              if name.startswith("adaptive_rsi-" + target + "-") and name.endswith(".whl")]
+    expected = ["adaptive-rsi-" + target + "-plugin.zip",
+                "adaptive-rsi-" + target + "-plugin.zip.sha256",
+                "adaptive-rsi-" + target + "-macos-arm64-adhoc.dmg",
+                "adaptive-rsi-" + target + "-macos-arm64-adhoc.dmg.sha256"]
+    if len(wheels) != 1 or any(name not in files for name in expected):
+        raise ValueError("Expected plugin ZIP, checksums, one wheel and one macOS ARM64 desktop DMG")
+    return sorted([files[name] for name in expected] + wheels)
+
+
 def output(**fields):
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
@@ -149,7 +163,7 @@ def prepare():
     run("git", "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost", "commit", "-m", "准备正式版本 " + target)
     run("git", "push", "origin", "HEAD:refs/heads/" + release_branch)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
-        body.write("同步四处版本及中英文版本记录。\n\n价值：将已合入主线并通过检查的改进交付给用户。发布前独立重建版本补丁、完整检查、ZIP/wheel 构建及安装/升级 smoke。\n\n基线：`" + head + "`。必须遵守所有必需检查与评审规则；不得绕过审批。")
+        body.write("同步四处版本及中英文版本记录。\n\n价值：将已合入主线并通过检查的改进交付给用户。发布前独立重建版本补丁、完整检查、ZIP/wheel/macOS ARM64 桌面 DMG 构建及安装/升级 smoke。DMG 使用临时 ad-hoc 签名，尚未 Apple 公证。\n\n基线：`" + head + "`。必须遵守所有必需检查与评审规则；不得绕过审批。")
         body.flush()
         url = run("gh", "pr", "create", "--repo", os.environ["GITHUB_REPOSITORY"], "--base", branch, "--head", release_branch,
                   "--title", "准备正式版本 " + target, "--body-file", body.name)
@@ -187,11 +201,7 @@ def publish():
         gh("git/refs", "POST", ref="refs/tags/" + tag, sha=head)
     releases = gh("releases?per_page=100")
     previous = next((item for item in releases if item["tag_name"] == tag), None)
-    assets = sorted((ROOT / "dist").glob("*"))
-    assets = [path for path in assets if path.is_file() and (path.name.startswith("adaptive_rsi-" + target + "-") and path.suffix == ".whl" or
-                                                          path.name in ["adaptive-rsi-" + target + "-plugin.zip", "adaptive-rsi-" + target + "-plugin.zip.sha256"])]
-    if len(assets) != 3:
-        raise ValueError("Expected exactly ZIP, SHA-256 and wheel assets")
+    assets = release_assets(ROOT / "dist", target)
     if previous and not previous["draft"]:
         if {item["name"] for item in previous.get("assets", [])} != {path.name for path in assets}:
             raise ValueError("Existing release asset list differs; refusing to claim a complete immutable release")

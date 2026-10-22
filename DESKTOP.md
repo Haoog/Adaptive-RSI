@@ -20,7 +20,7 @@
 
 ## 构建
 
-当前已提供 macOS ARM64 构建路径；其他平台尚未完成安装验证，Windows 本机运行器暂不支持。
+正式版本会提供 macOS ARM64 安装包 `adaptive-rsi-版本号-macos-arm64-adhoc.dmg` 和对应 `.dmg.sha256`，从 GitHub Release 下载。其他平台尚未完成安装验证，Windows 本机运行器暂不支持。
 
 ```sh
 # 需要 Node.js、Rust、uv，以及平台的 Tauri 构建依赖
@@ -32,4 +32,4 @@ npm run --prefix desktop dev
 
 构建脚本下载 Python 3.12、安装 PyInstaller，并将运行器打包为独立进程。版本读取 Python 包版本，不维护第二套发布版本号。安装包位于 `desktop/src-tauri/target/release/bundle/`。
 
-当前构建仅使用本地 ad-hoc 临时签名，未配置 Apple Developer ID 签名或公证，不能当作受信任的正式安装包分发。桌面版更新需要退出后安装新软件，不使用服务器的源码热更新，以免界面和引擎版本错配；数据目录不随软件替换。
+当前构建仅使用本地 ad-hoc 临时签名，未配置 Apple Developer ID 签名或公证；macOS 可能显示安全警告，不能宣称为已公证安装包。桌面版更新需要从 GitHub Release 手动下载并退出后替换软件，不使用服务器的源码热更新，以免界面和引擎版本错配；数据目录不随软件替换。

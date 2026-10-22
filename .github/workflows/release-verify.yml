@@ -63,6 +63,21 @@ jobs:
       - run: python3 scripts/release_smoke.py
         env:
           GH_TOKEN: ${{ github.token }}
+      - uses: astral-sh/setup-uv@v6
+      - name: 安装 macOS ARM64 桌面构建工具
+        run: |
+          rustup default stable
+          npm ci --prefix desktop
+      - name: 构建、验证并收集桌面安装包
+        run: |
+          npm run --prefix desktop build
+          cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+          codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
+          "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
+          python3 scripts/package_desktop.py
+          VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
+          hdiutil verify "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+          (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
   report:
     if: always() && needs.gate.result == 'success'
     needs: [gate, verify]
@@ -82,7 +97,7 @@ jobs:
             -f name=verify -f head_sha="$PR_SHA" -f status=completed -f conclusion="$conclusion" \
             -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f 'output[title]=版本 PR 独立检查' \
-            -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel 安装升级。'
+            -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel/桌面安装包。'
   merge:
     needs: [gate, verify, report]
     runs-on: ubuntu-latest
