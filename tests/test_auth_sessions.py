@@ -406,6 +406,7 @@ os._exit(0)
 _PROTOCOL_FIXTURE = r'''#!/usr/bin/env python3
 import base64,json,os,pathlib,sys
 from http.server import BaseHTTPRequestHandler,HTTPServer
+from socketserver import TCPServer
 home=pathlib.Path(os.environ['HOME'])
 assert os.environ['CODEX_HOME']==str(home/'.codex')
 assert 'OPENAI_API_KEY' not in os.environ
@@ -436,7 +437,7 @@ else:
    if self.headers.get('Authorization')!=expected:
     self.send_response(401);self.end_headers();return
    value=True
-   if self.path=='/global/health': value={'healthy':True}
+   if self.path=='/global/health': value={'healthy':True,'python':list(sys.version_info[:2])}
    if self.path=='/provider/auth': value={'openai':[{'type':'oauth','label':'ChatGPT (headless)'},{'type':'api','label':'API key'}]}
    if self.command=='POST':
     body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))))
@@ -448,8 +449,13 @@ else:
    self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps(value).encode())
   do_GET=request
   do_POST=request
+ class LoopbackServer(HTTPServer):
+  def server_bind(self):
+   TCPServer.server_bind(self)
+   self.server_name='localhost'
+   self.server_port=self.server_address[1]
  port=int(sys.argv[sys.argv.index('--port')+1])
- HTTPServer(('127.0.0.1',port),Handler).serve_forever()
+ LoopbackServer(('127.0.0.1',port),Handler).serve_forever()
 '''
 
 
@@ -459,7 +465,7 @@ class AuthProtocolTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         for binary in ("codex", "opencode"):
             script = self.root / binary
-            script.write_text(_PROTOCOL_FIXTURE)
+            script.write_text(_PROTOCOL_FIXTURE.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1))
             script.chmod(0o700)
         self.original_which = __import__("shutil").which
         self.which = patch("adaptive_rsi.auth_sessions.shutil.which", side_effect=lambda name:
@@ -508,6 +514,21 @@ class AuthProtocolTests(unittest.TestCase):
             home = worker.home
             worker.close()
         self.assertFalse(home.exists())
+
+    def test_loopback_fixture_skips_reverse_dns_and_uses_current_python(self):
+        script = self.root / "opencode"
+        fixture = script.read_text().replace(
+            "from socketserver import TCPServer",
+            "from socketserver import TCPServer\nimport socket\n"
+            "def forbidden_lookup(*args): raise OSError('reverse DNS unavailable')\n"
+            "socket.getfqdn=forbidden_lookup", 1)
+        script.write_text(fixture)
+        worker = OpenCodeAuth()
+        try:
+            self.assertEqual(worker.http("GET", "/global/health")["python"], list(sys.version_info[:2]))
+            self.assertEqual(worker.providers()[0]["id"], "openai")
+        finally:
+            worker.close()
 
     def test_invalid_protocol_input_never_starts_authorization(self):
         worker = OpenCodeAuth()

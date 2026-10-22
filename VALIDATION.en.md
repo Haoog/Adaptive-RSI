@@ -4,7 +4,7 @@
 
 ## Browser account connections and automatic releases / 2026-10-22
 
-- **26 authentication tests pass**, including read-only real Codex/OpenCode CLI and Docker checks and cleanup after the authentication parent's abrupt exit. Regressions cover cancellation, late writes after shutdown and credential-lock contention. No real account OAuth or paid model call is performed.
+- **27 authentication tests pass**, including read-only real Codex/OpenCode CLI and Docker checks and cleanup after the authentication parent's abrupt exit. Regressions cover cancellation, late writes after shutdown and credential-lock contention. No real account OAuth or paid model call is performed.
 - **42 release, deployment and recovery tests pass**, including real successful service upgrades, code and SQLite restoration after failed startup, and first reads of static WAL backups. A read-only installed 0.3.0 supervisor also successfully handed off to a temporary copy of the current implementation marked 0.3.1, retaining its database. This is separate from upgrading official release assets. Controlled protocols exercise GitHub dispatch, health endpoints and rollback states; they do not demonstrate a real user deployment.
 - **10 related-work and HTTP-route checks pass**, covering distinct defects at one code location, legacy fingerprints, project isolation, replanning when related results change and plan reuse when they do not.
 - **26 frontend request tests pass**, with syntax checks for four JavaScript files. Real Chromium full flows and focused authentication checks cover retained authorization input, refresh recovery, provider switching, model-directory-only refresh, conditional deployment fields and English mobile layouts. Fixture projects remain paused.

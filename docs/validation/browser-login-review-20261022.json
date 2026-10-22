@@ -1,6 +1,6 @@
 {
   "review": "browser-login-independent-review",
-  "frozen_at": "2026-10-22T04:00:22.277660+00:00",
+  "frozen_at": "2026-10-22T04:22:01.893246+00:00",
   "reviewer": "simple_ui agent; authentication backend implemented by browser_login agent",
   "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
   "source_sha256": {
@@ -10,7 +10,7 @@
     "adaptive_rsi/agent.py": "be137f944e852209abc47ba8502a38f67a2d7b334e22ce867b19fb0f722153b4",
     "adaptive_rsi/opencode.py": "4628dd80e6c80538f9112f38c495afffba8308755476626a253f548d78a81952",
     "adaptive_rsi/cli_worker.py": "def9219311072a7e85ed3d1d3e6ed794b80045d6d0af29d1735dde2a042b971a",
-    "tests/test_auth_sessions.py": "e3d2288ac08f61db7737277d716eb1c2766ced9062763932f88b656a1e9a93ca",
+    "tests/test_auth_sessions.py": "4acfb6886fd44a26f961dc47965f98de42faabd11123b3bd293aa83bf4afd00c",
     "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a"
   },
   "scope": [
@@ -112,5 +112,41 @@
     "设备授权期间供应商真实网络瞬态错误、实际token发行与刷新未在本次审查触发；真实工具只验证隔离account/read和内置登录方法发现。",
     "并发状态机和凭据落盘正确性使用受控协议进程/fixture验证，不冒充供应商端认证。",
     "外部CLI与页面均显式发起新登录时采用最后完成者写入的实现约定；本次只验证外部文件变化可被状态接口及时读取。"
-  ]
+  ],
+  "ci_compatibility_followup": {
+    "reviewed_at": "2026-10-22T04:22:01.893246+00:00",
+    "base_commit": "bc29449b28f46bd27233e4cb34da6d2044700ab0",
+    "changed_files": [
+      "tests/test_auth_sessions.py"
+    ],
+    "outcome": "independently reviewed; no unresolved P1/P2 findings; authentication backend and UI unchanged",
+    "ci_evidence": "PR10 macOS Python 3.12.10 job failed in three OpenCode protocol fixture startups after roughly 25 seconds each; Codex fixture succeeded. Remote runner DNS stack was not captured.",
+    "mechanism": "Python 3.12 HTTPServer.server_bind invokes socket.getfqdn even for a literal loopback address; a resolver failure was reproduced deterministically. This supports the fixture reverse-DNS diagnosis without claiming a captured remote DNS timeout.",
+    "fix": "Test-only LoopbackServer binds through TCPServer.server_bind and sets fixed localhost/server_port; generated fixture shebang pins sys.executable. No runtime authentication behavior or readiness timeout changed.",
+    "regression": "test_loopback_fixture_skips_reverse_dns_and_uses_current_python injects a child-process getfqdn that raises; authenticated health and provider discovery still work and report matching parent Python major/minor.",
+    "validation": [
+      {
+        "command": "RSI_AUTH_CLI_TESTS=1 RSI_AUTH_DOCKER_TESTS=1 python3.12 -m unittest tests.test_auth_sessions -v",
+        "environment": "local macOS; Python 3.12.13",
+        "result": "27 passed; 0 skipped; 9.658 seconds; real tool checks read-only, no account authorization or inference"
+      },
+      {
+        "command": "python3 -m unittest tests.test_auth_sessions.AuthProtocolTests -v",
+        "environment": "local macOS; Python 3.9.6",
+        "result": "5 passed; 0 skipped; 2.225 seconds"
+      },
+      {
+        "method": "independent minimal Python3.12 HTTPServer test with socket.getfqdn raising",
+        "result": "default HTTPServer attempted reverse DNS exactly once, reproducing the blocked/failing resolver dependency"
+      },
+      {
+        "method": "source diff and SHA256 audit against previous frozen authentication review",
+        "result": "only tests/test_auth_sessions.py differs among previously hashed sources; runtime authentication sources unchanged"
+      }
+    ],
+    "limits": [
+      "Local Python 3.12.13 verification is not a substitute for the pending hosted macOS Python 3.12.10 CI run.",
+      "No real supplier account OAuth success or paid model quality is claimed."
+    ]
+  }
 }
