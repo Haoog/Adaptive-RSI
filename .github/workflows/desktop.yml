@@ -1,0 +1,36 @@
+name: Desktop package
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - 'adaptive_rsi/**'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop-macos:
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - name: 安装桌面构建工具
+        run: |
+          rustup default stable
+          npm ci --prefix desktop
+      - name: 构建应用和安装包
+        run: npm run --prefix desktop build
+      - name: 验证桥接边界与独立引擎
+        run: |
+          cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+          codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
+          "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-rsi-macos-arm64-unsigned
+          path: desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error

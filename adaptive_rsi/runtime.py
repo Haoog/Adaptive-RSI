@@ -328,13 +328,15 @@ class Runtime:
         self.wake.set()
         return task
 
-    def start(self):
+    def start(self, paused=False):
         self.lockfile = (self.store.root / "runtime.lock").open("a+")
         try:
             fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             self.lockfile.close()
             raise RuntimeError("Another runtime already owns this state directory")
+        if paused:
+            self.store.execute("UPDATE projects SET paused=1")
         self.updates.restore_startup()
         self.store.recover()
         self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")

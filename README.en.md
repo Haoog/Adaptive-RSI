@@ -296,3 +296,7 @@ Before implementation, a separate call using the planning model generates execut
 The repository, resolved target branch and SHA are sealed when a run starts. Changing targets cannot reuse old authorization; stale candidates replan within retry limits. Branches use `feat/rsi-*` or `fix/rsi-*`; commits and PR descriptions are Chinese. Squash merging requires the exact evaluated head, a current base, successful CI, GitHub mergeability and required reviews. GitHub rules remain the final gate. Enable strict required checks or a merge queue to close the race between checking the base and requesting merge. Failed CI retains the PR; stale PRs close and replan within retry limits. Restart recovery tracks existing PRs and resumes idempotent publishing without reusing interrupted, unverified implementation.
 
 Codex CLI must support named `permissions` profiles. macOS workers use Codex's own single Seatbelt layer; command tools default to denying reads outside the snapshot and system toolchains, including unregistered user files, controller data, other projects, Codex authentication and GitHub credentials. They cannot write `.git` or access the network. Unsupported CLIs block explicitly rather than disabling isolation. Actual live evidence is recorded in [LIVE_VALIDATION.en.md](LIVE_VALIDATION.en.md).
+
+## Desktop App
+
+A bundled local engine, menu-bar lifecycle, explicit project start, server connections and task-based usage reporting are available. See the [desktop guide](DESKTOP.en.md) for lifecycle, builds and current platform limitations.

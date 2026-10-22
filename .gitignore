@@ -8,8 +8,14 @@ dist/
 output/
 .playwright-cli/
 node_modules/
+desktop/.generated/
+desktop/src-tauri/target/
+desktop/src-tauri/binaries/
+desktop/src-tauri/icons/
 
 .DS_Store
 .env
 .env.*
 !.env.example
+
+desktop/src-tauri/gen/

@@ -241,13 +241,15 @@ class UpdateManager:
 
     def snapshot(self):
         busy = self.is_busy()
-        return {**self.status(), "busy": busy}
+        return {**self.status(), "busy": busy, "desktop_managed": getattr(self, "desktop_managed", False)}
 
     def require_ready(self):
         if self.is_busy():
             raise UpdateInProgress("Software update in progress")
 
     def tick(self):
+        if getattr(self, "desktop_managed", False):
+            return
         config = self.runtime.config()["updates"]
         status = self.status()
         if config["mode"] != "manual" and time.time() - status.get("checked", 0) >= config["interval_minutes"] * 60:
@@ -290,6 +292,8 @@ class UpdateManager:
             self.runtime.wake.set()
 
     def apply_async(self, requested=True):
+        if getattr(self, "desktop_managed", False):
+            raise ValueError("This runtime is bundled with the desktop app; update the desktop package")
         if self.shutdown is None:
             raise RuntimeError("Updates require a running service with restart supervision")
         if not self.lock.acquire(False):

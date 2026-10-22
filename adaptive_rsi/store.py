@@ -80,6 +80,8 @@ class Store:
             for field in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]:
                 if field not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                     db.execute("ALTER TABLE calls ADD COLUMN " + field + " INTEGER DEFAULT 0")
+            db.execute("CREATE INDEX IF NOT EXISTS run_calls ON calls(run,created)")
+            db.execute("CREATE INDEX IF NOT EXISTS created_calls ON calls(created)")
             # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
             migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
             if not migration:

@@ -68,6 +68,7 @@ def main(argv=None):
     sub.add_parser("doctor")
     sub.add_parser("open")
     sub.add_parser("status")
+    sub.add_parser("desktop-runtime", help=argparse.SUPPRESS)
     add = sub.add_parser("add")
     add.add_argument("path")
     add.add_argument("--name")
@@ -103,6 +104,10 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "desktop-runtime":
+            from .desktop import run
+            run(root)
+            return
         if args.command == "update-worker":
             from .updates import supervise_restart
             supervise_restart(root)
