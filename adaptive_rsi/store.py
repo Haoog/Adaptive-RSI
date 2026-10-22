@@ -4,6 +4,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 
 def uid():
@@ -155,12 +156,34 @@ class Store:
             busy = db.execute("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project,)).fetchone()
             if not p or p["paused"] or busy:
                 return None
-            task = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
-                              "ORDER BY (priority + min(20, (? - created)/86400.0)) DESC,created,id LIMIT 1", (project, now, now)).fetchone()
-            if not task:
-                return None
             from .config import merge, validate
-            effective = validate(merge(config, json.loads(task["overrides"])))
+            task = None
+            effective = None
+            while True:
+                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
+                                       "ORDER BY (priority + min(20, (? - created)/86400.0)) DESC,created,id LIMIT 1",
+                                       (project, now, now)).fetchone()
+                if not candidate:
+                    return None
+                try:
+                    overrides = json.loads(candidate["overrides"])
+                    if not isinstance(overrides, dict):
+                        raise ValueError("Task configuration overrides must be an object")
+                    effective = validate(merge(config, overrides))
+                except ZoneInfoNotFoundError:
+                    reason = "Unknown schedule timezone"
+                except (ValueError, TypeError, AttributeError) as exc:
+                    reason = str(exc)[:300] or "Invalid task configuration overrides"
+                else:
+                    task = candidate
+                    break
+                db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
+                           (now, candidate["id"]))
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (project, None, "task_configuration_error",
+                            "Task was blocked because its configuration overrides are invalid: " + reason,
+                            encode({"task": candidate["id"], "reason": reason}), now))
+                continue
             run = uid()
             db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
             db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",

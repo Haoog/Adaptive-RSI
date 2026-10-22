@@ -146,21 +146,23 @@ def schedule(runtime, now=None):
     from .release import pending
     for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
                            "WHERE p.paused=0 AND r.state IN ('pr_open','merged')"):
-        if (run["state"] == "pr_open" or pending(runtime, run) or
-                monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now)):
-            projects.add(run["project"])
+        with runtime.scheduler_scope("delivery_run", run["project"], run["id"]):
+            if (run["state"] == "pr_open" or pending(runtime, run) or
+                    monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now)):
+                projects.add(run["project"])
     for project_id in projects:
-        if now - store.setting("delivery-scheduled:" + project_id, 0) < 60:
-            continue
-        key = "system:delivery"
-        task = store.one("SELECT id,state FROM tasks WHERE project=? AND fingerprint=?", (project_id, key))
-        if task and task["state"] in ["queued", "planning"]:
-            continue
-        if task:
-            store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (now, task["id"]))
-        else:
-            store.add_task(project_id, "system_delivery", key, "PR tracking and post-merge verification", priority=110)
-        store.put_setting("delivery-scheduled:" + project_id, now)
+        with runtime.scheduler_scope("delivery_project", project_id):
+            if now - store.setting("delivery-scheduled:" + project_id, 0) < 60:
+                continue
+            key = "system:delivery"
+            task = store.one("SELECT id,state FROM tasks WHERE project=? AND fingerprint=?", (project_id, key))
+            if task and task["state"] in ["queued", "planning"]:
+                continue
+            if task:
+                store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (now, task["id"]))
+            else:
+                store.add_task(project_id, "system_delivery", key, "PR tracking and post-merge verification", priority=110)
+            store.put_setting("delivery-scheduled:" + project_id, now)
 
 
 def tick(runtime, now=None, project_id=None, active_run=None):

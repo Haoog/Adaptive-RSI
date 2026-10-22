@@ -5,6 +5,7 @@ const test = require('node:test');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/app.js'), 'utf8');
+const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/auth.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
 const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
@@ -12,12 +13,13 @@ const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
   projects: [{id: 'a', name: 'A', paused: true}, {id: 'b', name: 'B', paused: true}]
 });
 
-function browser() {
-  const nodes = new Map(), listeners = new Map(), timers = [];
-  let created = 0;
+function browser(savedSession = new Map()) {
+  const nodes = new Map(), listeners = new Map(), timers = [], local = new Map(), session = savedSession;
+  let created = 0, nextTimer = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
       id, value: '', dataset: {}, handlers: {}, options: [], children: [], disabled: false,
+      attributes: {}, classList: {toggle() {}, add() {}, remove() {}}, isConnected: true,
       addEventListener(type, handler) { this.handlers[type] = handler; },
       closest() { return this.id.endsWith('-form') ? this : this.form; },
       replaceChildren(...children) { this.options = children; this.children = children; },
@@ -25,7 +27,9 @@ function browser() {
       insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
       querySelectorAll() { return []; },
       querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
-      setAttribute(name,value) { this[name]=value; },
+      setAttribute(name,value) { this.attributes[name]=value; this[name]=value; },
+      hasAttribute(name) { return Object.hasOwn(this.attributes, name) || name==='data-unit-for' && !!this.dataset.unitFor; },
+      focus() {}, scrollIntoView() {},
       showModal() { this.open = true; },
       close() { this.open = false; this.handlers.close?.(); }
     });
@@ -35,30 +39,51 @@ function browser() {
     getElementById: node,
     querySelectorAll: () => [],
     querySelector: () => null,
+    activeElement: null,
     addEventListener(type, handler) { listeners.set(type, handler); },
     createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase()}),
     createTextNode: text => ({textContent: text})
   };
+  const storage = values => ({
+    getItem(key) { return values.has(key) ? values.get(key) : null; },
+    setItem(key, value) { values.set(key, String(value)); },
+    removeItem(key) { values.delete(key); },
+    clear() { values.clear(); }
+  });
+  const defaultFetch = (_url, {signal} = {}) => new Promise((_resolve, reject) => {
+    if (!signal) return;
+    if (signal.aborted) reject(new DOMException('Aborted', 'AbortError'));
+    else signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
+  });
   const context = vm.createContext({
     document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
-    localStorage: {getItem: () => null, setItem() {}}, t: value => value,
-    fetch: () => new Promise(() => {}),
-    setInterval() {}, clearTimeout() {},
-    setTimeout(callback, delay) { if (delay === 1000) timers.push(callback); },
+    localStorage: storage(local), sessionStorage: storage(session), t: value => value,
+    AbortController, DOMException, queueMicrotask,
+    fetch: defaultFetch,
+    setInterval() {}, clearInterval() {},
+    setTimeout(callback, delay) { const timer = {id: ++nextTimer, callback, delay, active: true}; timers.push(timer); return timer.id; },
+    clearTimeout(id) { const timer = timers.find(value => value.id === id); if (timer) timer.active = false; },
     location: {reload() { throw new Error('A version change must retain pending forms'); }},
     lastAction: null
   });
   vm.runInContext(source, context);
+  // The app starts a boot refresh; abort its isolated request so each test owns its fetches.
+  vm.runInContext('refreshController?.abort();refreshSequence++;refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;refreshQueued=false;refreshWaiters.splice(0);clearTimeout(refreshPollTimer);', context);
   vm.runInContext('originalSafe=safe; state=initialState; scopeInitialized=true; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
   node('project-select').options = [{value: 'a', text: 'A'}, {value: 'b', text: 'B'}];
   return {
-    context, node, document,
+    context, node, document, timers, sessionData: session,
     input(id, form) { const target = node(id); target.form = node(form); listeners.get('input')({target}); target.handlers.input?.({target}); },
     submit(form) { node(form).handlers.submit({target: node(form), preventDefault() {}}); return context.lastAction; },
     async resume() {
       await new Promise(setImmediate);
-      assert.equal(timers.length, 1, 'one pending update wait');
-      timers.shift()();
+      const waits = timers.filter(timer => timer.active && timer.delay === 1000);
+      assert.equal(waits.length, 1, 'one pending update wait');
+      waits[0].active = false; waits[0].callback();
+    },
+    fireTimer(delay) {
+      const timer = timers.find(value => value.active && value.delay === delay);
+      assert.ok(timer, `pending ${delay}ms timer`); timer.active = false; timer.callback();
     }
   };
 }
@@ -277,26 +302,150 @@ test('settings drafts retain independent baselines and duration units across pro
   page.node('settings-form').querySelectorAll = () => [field, unit];
   page.document.querySelectorAll = () => [];
   page.node('config-scope').value = 'project';
-  vm.runInContext('settingsContext="a";settingsBaseline={limits:{daily_calls:40}}', page.context);
+  vm.runInContext('settingsContext="a";settingsBaseline={limits:{daily_calls:40}};settingsModes.set(settingsBaseline,"inherit")', page.context);
   page.context.stashSettings();
-  vm.runInContext('projectId="b";settingsContext="b";settingsBaseline={limits:{daily_calls:30}}', page.context);
+  vm.runInContext('projectId="b";settingsContext="b";settingsBaseline={limits:{daily_calls:30}};settingsModes.set(settingsBaseline,"inherit")', page.context);
   field.value = '52'; unit.value = '1440'; page.context.stashSettings();
-  vm.runInContext('projectId="a"', page.context);page.context.restoreSettingsDraft();
+  vm.runInContext('projectId="a";settingsBaseline={limits:{daily_calls:40}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
   assert.equal(field.value, '41'); assert.equal(unit.value, '60');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 40);
-  vm.runInContext('projectId="b"', page.context);page.context.restoreSettingsDraft();
+  vm.runInContext('projectId="b";settingsBaseline={limits:{daily_calls:30}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
   assert.equal(field.value, '52'); assert.equal(unit.value, '1440');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
 });
 
-test('an older state response cannot replace a newer snapshot', async () => {
-  const page=browser();
-  let first,second;
-  page.context.fetch=()=>new Promise(resolve=>{if(!first)first=resolve;else second=resolve;});
-  const older=vm.runInContext('refresh()',page.context),newer=vm.runInContext('refresh()',page.context);
-  second(response(snapshot('new')));await newer;
-  first(response(snapshot('old')));await older;
+test('safe settings and schedule mode survive reload without persisting secrets', () => {
+  const storage = new Map(), first = browser(storage);
+  const baseline = {schedule:{light_minutes:60,issues_minutes:120,timezone:'UTC',working_hours:[0,24],weight:1},sources:{inspection:true,issues:true},github:{labels:[]},checks:[],delivery:{mode:'local',auto_merge:false}};
+  const configure = page => {
+    const interval=page.node('light-interval'),mode=page.node('schedule-mode'),key=page.node('api-key'),code=page.node('oauth-code');
+    Object.assign(interval,{type:'number',value:'120',dataset:{path:'schedule.light_minutes'}});
+    Object.assign(mode,{value:'custom'});
+    Object.assign(key,{type:'password',value:'NEVER-PERSIST-THIS-API-KEY',dataset:{path:'auth.api_key'}});
+    Object.assign(code,{type:'text',value:'NEVER-PERSIST-THIS-OAUTH-CODE'});
+    const form=page.node('settings-form');
+    form.querySelectorAll=selector=>selector==='[data-path]'?[interval,key]:selector==='input,textarea,select'?[interval,key,code,mode]:[];
+    page.node('config-scope').value='project';
+    vm.runInContext(`settingsContext="a";settingsBaseline=${JSON.stringify(baseline)};settingsModes.set(settingsBaseline,"inherit");settingsClean.set("a","[]")`,page.context);
+    return {interval,mode,key,code};
+  };
+  const firstFields=configure(first);first.context.stashSettings();
+  const stored=JSON.stringify([...storage.values()]);
+  assert.doesNotMatch(stored,/NEVER-PERSIST-THIS-(?:API-KEY|OAUTH-CODE)/);
+  const entries=JSON.parse(storage.get('rsi-ui-drafts')).entries.settings.a.value.values;
+  assert.deepEqual(entries.map(entry=>entry.id).sort(),['light-interval','schedule-mode']);
+  assert.equal(entries.find(entry=>entry.id==='schedule-mode').baselineValue,'inherit');
+
+  const second=browser(storage),restored=configure(second);
+  restored.interval.value='60';restored.mode.value='inherit';
+  vm.runInContext('restoreSettingsDraft()',second.context);
+  assert.equal(restored.interval.value,'120');
+  assert.equal(restored.mode.value,'custom');
+  assert.equal(vm.runInContext('settingsBaseline.schedule.light_minutes',second.context),60);
+});
+
+test('scheduled check times use and label the project timezone', () => {
+  const page=browser();page.context.language='en';
+  const instant=Date.parse('2026-10-22T00:00:00Z')/1000;
+  const utc=vm.runInContext(`scheduleStamp(${instant},"UTC")`,page.context);
+  const losAngeles=vm.runInContext(`scheduleStamp(${instant},"America/Los_Angeles")`,page.context);
+  assert.notEqual(utc,losAngeles);
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  assert.equal(english['项目时区'],'Project timezone');
+});
+
+test('a slow refresh merges same-scope manual and periodic requests into one GET', async () => {
+  const page=browser();let finish,calls=0;
+  page.context.fetch=(url,{signal}={})=>{
+    if(!url.split('?')[0].endsWith('/state'))return response({});
+    calls++;
+    return new Promise((resolve,reject)=>{
+      finish=()=>resolve(response({...snapshot('new'),selected_project:'a',sections:['core']}));
+      signal?.addEventListener('abort',()=>reject(new DOMException('Aborted','AbortError')),{once:true});
+    });
+  };
+  vm.runInContext('view="settings";state={...initialState,selected_project:"a",version:"old"}',page.context);
+  const first=vm.runInContext('refresh()',page.context);
+  await new Promise(setImmediate);
+  const sameScope=vm.runInContext('refresh()',page.context);
+  vm.runInContext('scheduleRefreshPoll(5000)',page.context);
+  page.fireTimer(5000);
+  await new Promise(setImmediate);
+  assert.equal(calls,1,'a slow GET must not be invalidated or duplicated');
+  finish();await Promise.all([first,sameScope]);
   assert.equal(vm.runInContext('state.version',page.context),'new');
+});
+
+test('switching projects aborts the old GET and waits for the new project state', async () => {
+  const page=browser(),requests=[];let oldSignal;
+  page.context.fetch=(url,{signal}={})=>{
+    const project=new URLSearchParams(url.split('?')[1]).get('project');requests.push(project);
+    if(project==='a'){
+      oldSignal=signal;
+      return new Promise((_resolve,reject)=>signal.addEventListener('abort',()=>reject(new DOMException('Aborted','AbortError')),{once:true}));
+    }
+    return Promise.resolve(response({...snapshot('b'),selected_project:'b',sections:['core']}));
+  };
+  vm.runInContext('view="settings";state={...initialState,selected_project:"a",version:"old"}',page.context);
+  const old=vm.runInContext('refresh()',page.context);await new Promise(setImmediate);
+  vm.runInContext('projectId="b"',page.context);
+  await vm.runInContext('refresh()',page.context);
+  await old;
+  assert.equal(oldSignal.aborted,true);
+  assert.deepEqual(requests,['a','b']);
+  assert.equal(vm.runInContext('state.version',page.context),'b');
+  assert.equal(vm.runInContext('projectId',page.context),'b');
+});
+
+test('core-only state keeps loaded analytics, then evolution requests missing sections', async () => {
+  const page=browser(),urls=[];
+  page.context.fetch=async url=>{
+    urls.push(url);
+    if(url.includes('sections=core%2Ccandidates%2Canalytics'))return response({
+      ...snapshot('full'),selected_project:'a',sections:['core','candidates','analytics'],
+      candidates:[{id:'c1'}],cases:[{project:'a',split:'development',count:4}],
+      quality:[{project:'a'}],usage:[{project:'a',tokens:10}],model_usage:[]
+    });
+    return response({...snapshot('core'),selected_project:'a',sections:['core']});
+  };
+  vm.runInContext('view="settings";state={...initialState,selected_project:"a",usage:[{project:"a",tokens:7}],cases:[{project:"a",split:"development",count:3}],candidates:[{id:"old"}]};loadedStateSections.analyticsProject="a";loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject="a";loadedStateSections.candidatesAt=Date.now()',page.context);
+  await vm.runInContext('refresh()',page.context);
+  assert.equal(vm.runInContext('state.usage[0].tokens',page.context),7);
+  assert.equal(vm.runInContext('state.cases[0].count',page.context),3);
+  assert.equal(vm.runInContext('state.candidates[0].id',page.context),'old');
+  vm.runInContext('view="evolution";loadedStateSections.analyticsProject=null;loadedStateSections.candidatesProject=null',page.context);
+  await vm.runInContext('refresh()',page.context);
+  assert.match(urls[1],/sections=core%2Ccandidates%2Canalytics/);
+  assert.equal(vm.runInContext('state.cases[0].count',page.context),4);
+  assert.equal(vm.runInContext('state.candidates[0].id',page.context),'c1');
+});
+
+for(const staleFails of [false,true]){
+test(`an outdated readiness ${staleFails?'failure':'success'} cannot erase the newer result`,async()=>{
+  const page=browser(),pending=[];
+  page.context.renderReadiness=()=>{};
+  page.context.fetch=()=>new Promise(resolve=>pending.push(resolve));
+  const older=page.context.checkReadiness(),newer=page.context.checkReadiness(true);
+  pending[1](response({ready:true,items:[]}));await newer;
+  pending[0](response(staleFails?{error:'outdated readiness error'}:{ready:false,items:[]},staleFails?500:200));await older;
+  assert.equal(vm.runInContext('readinessCache.get("a").ready',page.context),true);
+  assert.notEqual(page.node('readiness-summary').textContent,'outdated readiness error');
+});
+}
+
+test('a late readiness error in another project leaves the current check pending',async()=>{
+  const page=browser(),pending=[];
+  page.context.renderReadiness=()=>{};
+  page.context.fetch=()=>new Promise(resolve=>pending.push(resolve));
+  const older=page.context.checkReadiness();
+  vm.runInContext('projectId="b"',page.context);
+  const current=page.context.checkReadiness();
+  pending[0](response({error:'outdated project error'},500));await older;
+  assert.equal(vm.runInContext('readinessCache.has("a")',page.context),false);
+  assert.equal(vm.runInContext('readinessCache.get("b").loading',page.context),true);
+  pending[1](response({ready:true,items:[]}));await current;
+  assert.equal(vm.runInContext('readinessCache.get("b").ready',page.context),true);
 });
 
 test('expired authentication is actionable and never retries a mutation', async () => {
@@ -306,10 +455,42 @@ test('expired authentication is actionable and never retries a mutation', async 
   assert.equal(calls,1);
 });
 
+test('temporary auth polling failures preserve authorization; explicit expiry stops polling', async () => {
+  const visibleText=node=>[node.textContent||'',...(node.children||[]).map(visibleText)].join(' ');
+  async function authPage(sessionReply){
+    const page=browser();let sessionCalls=0;
+    page.context.safe=page.context.originalSafe;
+    page.context.fetch=async url=>{
+      if(url.endsWith('/api/auth/status'))return response({sessions:[{backend:'codex',provider:null,id:'session-1',state:'awaiting_authorization'}],codex:{available:true,state:'signed_out'}});
+      if(url.includes('/api/auth/session?id=session-1')){
+        sessionCalls++;
+        return sessionCalls===1?response({id:'session-1',backend:'codex',state:'awaiting_authorization',method:'auto'}):sessionReply;
+      }
+      return response({});
+    };
+    vm.runInContext(authSource,page.context);
+    page.context.window.RSIAuth.show('openai',()=>Promise.resolve());
+    await new Promise(setImmediate);await new Promise(setImmediate);
+    return {page,sessionCalls:()=>sessionCalls,visibleText};
+  }
+  const temporary=await authPage(response({error:'gateway unavailable'},503));
+  temporary.page.fireTimer(1500);await new Promise(setImmediate);await new Promise(setImmediate);
+  const temporaryText=temporary.visibleText(temporary.page.node('mc-auth'));
+  assert.match(temporaryText,/授权状态已保留/);
+  assert.doesNotMatch(temporaryText,/登录失败/);
+  assert.equal(temporary.sessionCalls(),2);
+
+  const terminal=await authPage(response({error_code:'unknown_session',error:'Session no longer exists'},404));
+  terminal.page.fireTimer(1500);await new Promise(setImmediate);await new Promise(setImmediate);
+  const terminalText=terminal.visibleText(terminal.page.node('mc-auth'));
+  assert.match(terminalText,/登录已中断/);
+  assert.equal(terminal.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
 test('non JSON errors give recovery instructions rather than a parser exception', async () => {
   const page=browser();
   page.context.fetch=async()=>({ok:false,status:502,json:async()=>{throw new SyntaxError('HTML error page');}});
-  await assert.rejects(vm.runInContext('api("state")',page.context),/无法识别的结果/);
+  await assert.rejects(vm.runInContext('api("state")',page.context),error=>error.status===502&&/无法识别的结果/.test(error.message));
 });
 
 test('one form cannot submit twice while its first write is pending', async () => {
@@ -389,8 +570,21 @@ test('goal drafts stay with their project and submit only to that project', asyn
   await page.submit('goal-form');
   assert.deepEqual(posts[0],{project:'a',text:'Only project A: update the guide'});
   assert.equal(page.node('goal-text').value,'');
+  assert.equal(vm.runInContext('window.RSIDraftStore.get("goal","a")',page.context),null);
   page.node('project-select').value='b';page.node('project-select').handlers.change({target:page.node('project-select')});
   assert.equal(page.node('goal-text').value,'Only project B: fix a typo');
+});
+
+test('a successful goal save clears only its submitted draft and preserves newer input', async () => {
+  const page=browser();let finish;
+  page.context.refresh=()=>Promise.resolve();
+  page.context.fetch=()=>new Promise(resolve=>{finish=()=>resolve(response({id:'created'}));});
+  page.node('goal-text').value='Submitted goal';page.input('goal-text','goal-form');
+  const pending=page.submit('goal-form');await new Promise(setImmediate);
+  page.node('goal-text').value='New goal typed while saving';page.input('goal-text','goal-form');
+  finish();await pending;
+  assert.equal(page.node('goal-text').value,'New goal typed while saving');
+  assert.equal(vm.runInContext('window.RSIDraftStore.get("goal","a")',page.context),'New goal typed while saving');
 });
 
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
