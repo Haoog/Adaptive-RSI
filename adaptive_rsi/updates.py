@@ -33,6 +33,14 @@ def version(value):
     return tuple(int(x) for x in value.lstrip("v").split("."))
 
 
+def automatic_allowed(status, policy="patch"):
+    if not status.get("version"):
+        return False
+    current, target = version(status.get("current", __version__)), version(status["version"])
+    return target > current and (policy == "stable" or policy == "minor" and target[0] == current[0] or
+                                 policy == "patch" and target[:2] == current[:2])
+
+
 def download(url, limit):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname not in ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"] or parsed.username or parsed.query:
@@ -96,6 +104,19 @@ def atomic_json(path, data):
     os.replace(temp, path)
 
 
+def supervisor_active(state):
+    import fcntl
+    try:
+        with (state / "installations/supervisor.lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return False
+            except BlockingIOError:
+                return True
+    except FileNotFoundError:
+        return False
+
+
 def installed_root(state, fallback):
     marker = state / "installations/active.json"
     if not marker.exists():
@@ -115,18 +136,47 @@ class UpdateManager:
         self.installing = False
         self.restart_target = None
         self.shutdown = None
+        self.recovering = False
 
     def status(self):
         return self.store.setting("update-status", {"state": "unchecked", "current": __version__})
 
     def restore_startup(self):
         status = self.status()
+        if status.get("state") == "recovery_required":
+            self.installing = True
+        if status.get("state") == "downloading":
+            self.store.put_setting("update-status", {**status, "state": "error", "reason": "Installation interrupted before restart; retry is safe"})
         # 恢复登录会话不代表正在升级；仅新版本等待监督进程确认安装。
         if status.get("state") == "restarting" and status.get("version") == __version__:
             self.restart_target = __version__
             self.installing = True
+        plan_path = self.store.root / "installations/restart.json"
+        if status.get("state") == "restarting" and plan_path.exists():
+            self.installing = True
+            self.recovering = not supervisor_active(self.store.root)
+        elif status.get("state") == "restarting":
+            self.installing = True
+            self.store.put_setting("update-status", {**status, "state": "recovery_required", "reason": "Restart plan is missing; inspect installations before admitting work"})
 
     def is_busy(self):
+        status = self.status()
+        if (self.installing and status.get("state") == "restarting" and time.time() - status.get("checked", time.time()) > 5 and
+                (self.store.root / "installations/restart.json").exists() and not supervisor_active(self.store.root)):
+            self.recovering = True
+        if self.recovering and self.shutdown is not None:
+            with self.runtime.dispatch_lock:
+                self.recovering = False
+                plan_file = self.store.root / "installations/restart.json"
+                plan = json.loads(plan_file.read_text())
+                # A replacement supervisor waits for this guarded service to release its lock.
+                plan["pid"] = os.getpid()
+                atomic_json(plan_file, plan)
+                with (self.store.root / "update.log").open("ab") as log:
+                    subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(self.store.root), "update-worker"],
+                                     cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+                if plan.get("candidate_pid") != os.getpid():
+                    self.shutdown()
         if self.restart_target:
             with self.runtime.dispatch_lock:
                 status = self.status()
@@ -150,9 +200,16 @@ class UpdateManager:
         status = self.status()
         if config["mode"] != "manual" and time.time() - status.get("checked", 0) >= config["interval_minutes"] * 60:
             self.check_async()
-        elif status.get("state") in ["available", "waiting_idle"] and (status.get("requested") or config["mode"] == "automatic" and status.get("patch")):
-            if not self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") and not getattr(getattr(self.runtime, "model_center", None), "busy", 0):
-                self.apply_async()
+        elif (status.get("state") in ["available", "waiting_idle"] or
+              status.get("state") == "error" and status.get("version") and status.get("failures", 0) < 3 and time.time() >= status.get("retry_after", 0)) and (
+                status.get("requested") or config["mode"] == "automatic" and automatic_allowed(status, config["auto_policy"])):
+            if not self.work_busy():
+                self.apply_async(requested=bool(status.get("requested")))
+
+    def work_busy(self):
+        return (self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or
+                getattr(getattr(self.runtime, "model_center", None), "busy", 0) or
+                getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))
 
     def check_async(self):
         if self.lock.locked():
@@ -175,16 +232,16 @@ class UpdateManager:
             self.lock.release()
             self.runtime.wake.set()
 
-    def apply_async(self):
+    def apply_async(self, requested=True):
         if self.shutdown is None:
             raise RuntimeError("Updates require a running service with restart supervision")
         if not self.lock.acquire(False):
             raise ValueError("An update check or installation is already in progress")
         status = self.status()
-        if status.get("state") not in ["available", "waiting_idle"]:
+        if status.get("state") not in ["available", "waiting_idle", "error"] or not status.get("version"):
             self.lock.release()
             raise ValueError("Check for an available release first")
-        status = {**status, "requested": True}
+        status = {**status, "requested": requested}
         with self.runtime.dispatch_lock:
             self.installing = True
         threading.Thread(target=self.apply, args=(status,), daemon=True, name="rsi-update-install").start()
@@ -192,7 +249,7 @@ class UpdateManager:
     def apply(self, status):
         staging = None
         try:
-            if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or getattr(getattr(self.runtime, "model_center", None), "busy", 0):
+            if self.work_busy():
                 self.store.put_setting("update-status", {**status, "state": "waiting_idle"})
                 return
             self.store.put_setting("update-status", {**status, "state": "downloading"})
@@ -200,6 +257,10 @@ class UpdateManager:
             fresh = release_info(json.loads(download(RELEASE_API, 2 * 1024 * 1024)))
             if fresh.get("version") != status.get("version"):
                 raise ValueError("Release changed; check again before installing")
+            policy = self.runtime.config()["updates"]
+            if not status.get("requested") and (policy["mode"] != "automatic" or not automatic_allowed(fresh, policy["auto_policy"])):
+                self.store.put_setting("update-status", {**fresh, "state": "available", "checked": time.time(), "reason": "Automatic update authorization changed"})
+                return
             checksum = download(fresh["checksum"], 4096).decode("ascii").split()[0]
             data = download(fresh["asset"], 64 * 1024 * 1024)
             installs = self.store.root / "installations"
@@ -209,12 +270,20 @@ class UpdateManager:
             candidate = extract_bundle(data, checksum, staging, fresh["version"])
             final = installs / (fresh["version"] + "-" + checksum[:12])
             if final.exists():
-                raise ValueError("This release was already staged; inspect the previous update result")
-            os.replace(candidate, final)
+                if final.is_symlink():
+                    raise ValueError("Managed installation directory cannot be a symlink")
+                def contents(directory):
+                    return {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+                            for p in directory.rglob("*") if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
+                if contents(candidate) != contents(final):
+                    raise ValueError("Previously staged installation differs from the verified bundle")
+            else:
+                os.replace(candidate, final)
             previous = Path(__file__).resolve().parents[1]
             self.store.put_setting("update-status", {**fresh, "checked": time.time(), "state": "restarting"})
             session = json.loads((self.store.root / "server.json").read_text())
-            plan = {"candidate": str(final), "previous": str(previous), "target": fresh["version"], "pid": os.getpid(), "session": session}
+            plan = {"candidate": str(final), "previous": str(previous), "target": fresh["version"], "pid": os.getpid(), "session": session,
+                    "phase": "prepared", "state_schema": 1}
             plan_file = installs / "restart.json"
             atomic_json(plan_file, plan)
             log = (self.store.root / "update.log").open("ab")
@@ -226,7 +295,9 @@ class UpdateManager:
                 log.close()
             self.shutdown()
         except Exception as exc:
-            self.store.put_setting("update-status", {**status, "state": "error", "reason": str(exc)[:500]})
+            failures = status.get("failures", 0) + 1
+            self.store.put_setting("update-status", {**status, "state": "error", "reason": str(exc)[:500],
+                                                    "failures": failures, "retry_after": time.time() + min(3600, 60 * 2 ** failures)})
             self.installing = False
         finally:
             if staging:
@@ -238,6 +309,74 @@ class UpdateManager:
 
 def supervise_restart(state):
     """Run from the old installation; recover even when the new version cannot import."""
+    import fcntl
+    installs = state / "installations"
+    with (installs / "supervisor.lock").open("a+") as supervisor_lock:
+        try:
+            fcntl.flock(supervisor_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        if not (installs / "restart.json").exists():
+            return
+        _supervise_restart(state)
+
+
+def candidate_health(plan):
+    session = plan["session"]
+    try:
+        request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health",
+            headers={"Cookie": session["cookie"] + "=" + session["token"]})
+        with urllib.request.urlopen(request, timeout=1) as response:
+            health = json.load(response)
+        return isinstance(health, dict) and health.get("version") == plan["target"] and health.get("pid") == plan.get("candidate_pid")
+    except (OSError, ValueError):
+        return False
+
+
+def process_present(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def recovery_required(state, reason):
+    from .store import Store
+    Store(state).put_setting("update-status", {"state": "recovery_required", "current": __version__,
+                                              "reason": reason, "checked": time.time()})
+
+
+def valid_backup(path):
+    try:
+        with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as source:
+            return source.execute("PRAGMA quick_check").fetchone()[0] == "ok" and source.execute("SELECT count(*) FROM settings").fetchone() is not None
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def commit_installation(state, plan):
+    from .store import Store
+    installs = state / "installations"
+    atomic_json(installs / "active.json", {"path": plan["candidate"], "version": plan["target"], "previous": plan["previous"]})
+    link = installs / "current.next"
+    link.unlink(missing_ok=True)
+    link.symlink_to(plan["candidate"], target_is_directory=True)
+    os.replace(link, installs / "current")
+    plan["phase"] = "committed"
+    atomic_json(installs / "restart.json", plan)
+    Store(state).put_setting("update-status", {"state": "installed", "current": plan["target"], "checked": time.time()})
+    try:
+        (state / "update-ready").write_text("ready")
+    except OSError:
+        pass
+
+
+def _supervise_restart(state):
     from .store import Store
     import fcntl
     installs = state / "installations"
@@ -245,6 +384,40 @@ def supervise_restart(state):
     plan = json.loads(plan_path.read_text())
     if plan["pid"] == os.getpid():
         raise RuntimeError("Restart supervisor must be a separate process")
+    if plan.get("state_schema", 1) != 1:
+        recovery_required(state, "Unsupported state migration; refusing automatic rollback")
+        return
+    status = Store(state).setting("update-status", {})
+    if status.get("state") == "installed":
+        # Work may already have been admitted. An old journal never authorizes rollback.
+        plan_path.unlink(missing_ok=True)
+        return
+    if status.get("state") == "recovery_required":
+        return
+    plan["supervisor_pid"] = os.getpid()
+    atomic_json(plan_path, plan)
+    phase = plan.get("phase", "prepared")
+    if phase == "committed":
+        if candidate_health(plan):
+            commit_installation(state, plan)
+            plan_path.unlink(missing_ok=True)
+        else:
+            recovery_required(state, "Committed candidate cannot be verified; preserve current database and inspect the retained restart plan")
+        return
+    if phase == "health_check" and process_present(plan.get("candidate_pid")):
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and process_present(plan.get("candidate_pid")):
+            if candidate_health(plan):
+                commit_installation(state, plan)
+                plan_path.unlink(missing_ok=True)
+                return
+            time.sleep(0.2)
+        if process_present(plan.get("candidate_pid")):
+            recovery_required(state, "An unverified candidate is still running; preserve database and inspect the retained restart plan")
+            return
+    elif phase not in ["prepared", "health_check"]:
+        recovery_required(state, "Unknown restart phase; refusing to overwrite state")
+        return
     # Wait for the old runtime to release its lock, rather than trusting a reused PID.
     with (state / "runtime.lock").open("a+") as lock:
         deadline = time.monotonic() + 45
@@ -254,12 +427,18 @@ def supervise_restart(state):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    Store(state).put_setting("update-status", {"state": "error", "reason": "Old service did not stop; update aborted", "current": __version__})
+                    recovery_required(state, "A service still owns runtime.lock; inspect the retained restart plan before recovery")
                     return
                 time.sleep(0.2)
         backup = installs / "state-before-update.sqlite3"
-        with contextlib.closing(sqlite3.connect(state / "state.sqlite3")) as source, contextlib.closing(sqlite3.connect(backup)) as destination:
-            source.backup(destination)
+        if not plan.get("backup_ready"):
+            with contextlib.closing(sqlite3.connect(state / "state.sqlite3")) as source, contextlib.closing(sqlite3.connect(backup)) as destination:
+                source.backup(destination)
+            plan["backup_ready"] = True
+            atomic_json(plan_path, plan)
+        if not valid_backup(backup):
+            recovery_required(state, "Recovery backup is missing or corrupt; refusing an unsafe database rollback")
+            return
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     session = plan["session"]
@@ -275,6 +454,8 @@ def supervise_restart(state):
         atomic_json(state / "restart-session.json", session)
         child = subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
                                  cwd=plan["candidate"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        plan.update(phase="health_check", candidate_pid=child.pid)
+        atomic_json(plan_path, plan)
         deadline = time.monotonic() + 25
         healthy = False
         while time.monotonic() < deadline and child.poll() is None:
@@ -290,14 +471,12 @@ def supervise_restart(state):
             time.sleep(0.2)
         if not healthy:
             raise RuntimeError("New version failed its startup health check")
-        atomic_json(installs / "active.json", {"path": plan["candidate"], "version": plan["target"], "previous": plan["previous"]})
-        link = installs / "current.next"
-        link.unlink(missing_ok=True)
-        link.symlink_to(plan["candidate"], target_is_directory=True)
-        os.replace(link, installs / "current")
-        Store(state).put_setting("update-status", {"state": "installed", "current": plan["target"], "checked": time.time()})
-        (state / "update-ready").write_text("ready")
+        commit_installation(state, plan)
     except Exception:
+        if plan.get("phase") == "committed" or Store(state).setting("update-status", {}).get("state") == "installed":
+            if Store(state).setting("update-status", {}).get("state") != "installed":
+                recovery_required(state, "Installation commit was interrupted; preserve current database and restart plan")
+            return
         if child and child.poll() is None:
             child.terminate()
             try:
@@ -312,14 +491,27 @@ def supervise_restart(state):
         current_link.unlink(missing_ok=True)
         if previous_link is not None:
             current_link.symlink_to(previous_link, target_is_directory=True)
-        for suffix in ["-wal", "-shm"]:
-            Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
-        shutil.copy2(backup, state / "state.sqlite3")
-        Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "New version failed startup; previous code and database restored"})
+        # Restore only while no runtime owns the database; never overwrite a live service.
+        with (state / "runtime.lock").open("a+") as recovery_lock:
+            try:
+                fcntl.flock(recovery_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                recovery_required(state, "Another runtime owns the database; recovery plan and database were preserved")
+                return
+            if not valid_backup(backup):
+                recovery_required(state, "Recovery backup is corrupt; current database was preserved")
+                return
+            restore = installs / "state-restore.sqlite3"
+            shutil.copy2(backup, restore)
+            for suffix in ["-wal", "-shm"]:
+                Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
+            os.replace(restore, state / "state.sqlite3")
+            Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
         atomic_json(state / "restart-session.json", session)
         subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
                          cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
         (state / "update-ready").write_text("ready")
     finally:
-        plan_path.unlink(missing_ok=True)
+        if Store(state).setting("update-status", {}).get("state") in ["installed", "rolled_back"]:
+            plan_path.unlink(missing_ok=True)
         log.close()

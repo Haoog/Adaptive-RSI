@@ -1,0 +1,95 @@
+name: 自动版本 PR 与正式发布
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: adaptive-rsi-release-main
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    outputs:
+      mode: ${{ steps.prepare.outputs.mode }}
+      sha: ${{ steps.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py prepare
+      - name: 显式触发版本 PR 的精确 SHA 检查
+        if: steps.prepare.outputs.mode == 'verify'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.prepare.outputs.pr }}
+          PR_SHA: ${{ steps.prepare.outputs.sha }}
+        run: gh workflow run release-verify.yml --ref main -f pr="$PR_NUMBER" -f sha="$PR_SHA"
+      - name: 阻断需要人工处理的版本 PR
+        if: steps.prepare.outputs.mode == 'blocked'
+        run: exit 1
+  verify:
+    if: needs.prepare.outputs.mode == 'publish'
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -v
+      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
+      - run: node --check adaptive_rsi/web/auth.js
+      - run: node --test tests/web_requests.cjs
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - run: python3 scripts/package.py
+      - run: python3 -m pip install build
+      - run: python3 -m build --wheel
+        env:
+          SOURCE_DATE_EPOCH: '1577836800'
+      - name: 真实 ZIP 与 wheel 安装升级检查
+        run: python3 scripts/release_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.prepare.outputs.sha }}
+          path: dist/*
+  publish:
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.prepare.outputs.sha }}
+          path: dist
+      - name: 发布精确已验证提交的不可变资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py publish

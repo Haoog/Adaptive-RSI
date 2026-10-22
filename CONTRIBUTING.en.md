@@ -13,6 +13,7 @@ python3 -m unittest discover -v
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
+node --check adaptive_rsi/web/auth.js
 node --test tests/web_requests.cjs
 npm ci --ignore-scripts
 npx playwright install chromium

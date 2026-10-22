@@ -1,0 +1,96 @@
+{
+  "review": "experience-independent-review",
+  "frozen_at": "2026-10-22T04:00:22.338756+00:00",
+  "reviewer": "simple_ui agent; reviewed implementation owned by parent agent",
+  "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
+  "source_sha256": {
+    "adaptive_rsi/discovery.py": "722001a244433e22e0d8f293251ef30f6363a15f9c9a17725eecdba4d61dee83",
+    "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
+    "adaptive_rsi/pipeline.py": "a9b704d99ee83f0029317961c363c351e8b77a46ec81f3c105e0bf573f42108a",
+    "adaptive_rsi/dashboard.py": "4452ed0a5883292c3e918cd7626cfa1a6807aeb8b320b500070bf25a6bd3e96f",
+    "adaptive_rsi/server.py": "7cd25fb858f7164f04570798b7a673ac2e5f4e1cadd3bb89ddc09bb5105525c4",
+    "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a",
+    "tests/test_reliability.py": "3ad7dfbb5658858ce882f0b5f62e4eae2b4cec62fdc38cffc0055d42bab3e2a5"
+  },
+  "scope": [
+    "finding identity and legacy source-anchor compatibility",
+    "same-project related work evidence and retry cache invalidation",
+    "workspace automation state projection",
+    "authentication and release routes: authentication, CSRF, update window and project/run ownership"
+  ],
+  "outcome": "no unresolved P1/P2 findings in reviewed scope",
+  "findings": [
+    {
+      "id": "EXP-01",
+      "priority": "P2",
+      "status": "fixed and independently reverified",
+      "location": "adaptive_rsi/dashboard.py:16",
+      "issue": "A merged task with successful release and deployment waiting_target was projected as completed history, hiding an unfinished deployment.",
+      "before": {
+        "deployment": "waiting_target",
+        "display_state": "merged",
+        "active_count": 0,
+        "history_count": 1
+      },
+      "after": {
+        "deployment_states": [
+          "waiting_target",
+          "waiting_verification",
+          "waiting_release"
+        ],
+        "display_state": "deploying",
+        "history_count": 0
+      },
+      "resolution": "Add all three deployment waiting states to the active-state projection; preserve persisted task state and automation evidence.",
+      "regression_test": "tests.test_experience.RelatedWorkTest.test_workspace_results_keep_automation_evidence"
+    }
+  ],
+  "validation": [
+    {
+      "command": "python3 -m unittest tests.test_experience tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry -v",
+      "result": "10 passed; 16.855 seconds; zero skipped"
+    },
+    {
+      "method": "independent legacy fingerprint Runtime.inspect reproducer in isolated temporary repository",
+      "result": {
+        "same_problem_reuses_original_and_requeues": true,
+        "different_problem_at_same_anchor_creates_second_task": true,
+        "distinct_fingerprints": true
+      }
+    },
+    {
+      "method": "independent real Runtime/pipeline retry with fixture model throwing implementation timeout, then changed related merged-task summary/PR evidence",
+      "result": {
+        "planning_before_change": 1,
+        "planning_after_retry": 2,
+        "paid_calls": 0
+      },
+      "regression_test": "tests.test_experience.RelatedWorkTest.test_changed_related_result_invalidates_retry_planning_cache"
+    },
+    {
+      "method": "cache reuse control with unrelated second task; no changed related evidence",
+      "result": "existing reliability test still reuses first task plan; two plans across two tasks, not three"
+    },
+    {
+      "method": "same-anchor HTTP401/HTTP429 identities, related-work project isolation, persisted latest result and automation projection tests",
+      "result": "passed"
+    },
+    {
+      "method": "actual local HTTP server route tests with mocked auth-session backend",
+      "result": "anonymous authentication and release-workflow GET denied; missing CSRF/wrong origin denied before auth start; update window denied; dynamic inputs forwarded without task/event storage; cross-project release-status run rejected"
+    },
+    {
+      "command": "RSI_BROWSER_AUTH_ONLY=1 RSI_SCREENSHOT_DIR=/tmp/adaptive-rsi-ui-review npm run test:browser",
+      "result": "passed; login poll retains typed code/focus, restored pending session can cancel, provider switch isolates pending response, official completion refreshes catalog without probe, key draft cleared, deployment health/rollback section hidden when unchecked, English mobile no horizontal overflow"
+    },
+    {
+      "method": "manual screenshot inspection of /tmp/adaptive-rsi-ui-review/release-settings.png",
+      "result": "current screenshot shows release enabled and deploy unchecked; health URL/rollback controls absent; advanced evidence remains collapsed"
+    }
+  ],
+  "limits": [
+    "Fixture model and HTTP-auth backend responses verify control flow, not a real supplier account login or paid model quality.",
+    "The route tests assume the product single trusted controller/operator access model; they do not establish a multi-tenant authorization boundary.",
+    "Release workflow execution and actual health-check/rollback integration are outside this review scope and are covered separately by the release implementer/reviewer."
+  ]
+}

@@ -2,11 +2,11 @@
 
 [简体中文](README.md) | **English**
 
-A local autonomous improvement runtime for Codex: **code inspection, user goals, and GitHub Issues → task queue → value assessment → planning → isolated implementation → independent checks and review → local candidate → project-authorized delivery → post-merge verification → memory and the next round**.
+A multi-project autonomous maintenance system for local machines and persistent Linux servers: **code inspection, user goals, and GitHub Issues → task queue → value assessment → planning → isolated implementation → independent checks and review → project-authorized PR and merge → release, deployment and health checks → memory and the next round**.
 
 Includes a plugin entry point, persistent scheduler, SQLite state and usage, protected evaluator, strategy candidate archive, and a Chinese/English dashboard. Requires Python 3.9+; the runtime has no third-party Python dependencies.
 
-Version 0.3.0 adds OpenCode and Linux Docker workers, removes call, run-duration and changed-file quotas, and simplifies schedules to hourly project inspection and Issue sync. See [Server deployment](SERVER.en.md) and [Reliable improvement loop](RELIABILITY.en.md).
+Connect accounts and choose models for Codex, OpenCode or vendor APIs in the dashboard. Project inspection and Issue sync default to hourly, with no call, run-duration or finding quotas. See [Server deployment](SERVER.en.md), [Releases and updates](RELEASING.en.md) and the evidence boundaries in [Reliable improvement loop](RELIABILITY.en.md).
 
 ## Workflow
 
@@ -31,7 +31,10 @@ flowchart TD
     C --> A[Project-authorized PR or per-candidate confirmation]
     A --> J[Verify exact head, current base, CI and required reviews]
     J --> K[Authorized merge and post-merge verification]
-    K --> M
+    K --> L{Project authorizes release or deployment?}
+    L -->|Yes| Y[Pinned workflow and exact commit, separate release, deployment and health outcomes]
+    L -->|No| M
+    Y --> M
     T -->|Failure or insufficient evidence| F[Keep evidence, bounded retry or attention]
     D -->|No| F
     A --> M
@@ -45,7 +48,7 @@ flowchart TD
     N --> M
 ```
 
-The scheduler waits between scans instead of continuously invoking models; queued tasks proceed when ready. Delivery defaults to local candidates. Projects can explicitly authorize automatic PRs and merging. Missing or failed CI, required reviews, changed commits and conflicts block merging; admin bypass is never used. Local verification does not establish that a change is merged or that deployment works. Strategy evolution runs through a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
+The scheduler waits between scans; queued tasks proceed when ready. Delivery defaults to local candidates. Projects explicitly authorize automatic PRs and merging. Missing or failed CI, required reviews, changed commits and conflicts block merging; admin bypass is never used. Release and deployment require separately authorized pinned workflows; selecting them does not change existing PR or merge settings. Merge checks, release, deployment and health checks have distinct outcomes: a successful workflow does not establish verified deployment health. Strategy evolution uses a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
 
 ## Code quality gates
 
@@ -130,7 +133,9 @@ Protocol references: [Responses tools](https://developers.openai.com/api/docs/gu
 
 ## OpenCode
 
-Select the built-in **OpenCode** connection under **Connections and models**, fetch models, then select a model and its supported variant for each role. Connections use the **running machine's** OpenCode authentication and global provider configuration. Use `opencode auth login` for API or OAuth, or global JSON/JSONC `provider` settings and their explicit environment variables. Plugins, MCP, project agents, permissions and instructions are not imported. Servers can use the worker image without a host CLI. Tested version: OpenCode 1.19.3.
+Select the built-in **OpenCode** connection under **Connections and models**, choose a provider, then use its supported official authorization or API-key method. After the directory refreshes, assign models and supported variants to roles. Connections use the **running machine's** credentials and global provider configuration, without importing another computer's login. CLI login with `opencode auth login` remains available; custom connections support global JSON/JSONC `provider` settings and explicitly referenced environment variables. Project plugins, MCP, agent permissions and instructions are not imported. Servers can use the worker image without a host CLI. Tested version: OpenCode 1.19.3.
+
+The built-in **Codex login** connection starts official device authorization in the dashboard: open the official page, enter the one-time code and finish authorization. The connection and model directory then refresh. Device authorization must be enabled for your account or workspace; API connections remain available otherwise. Cancel, sign out or reconnect in the same panel. Credentials stay on the runtime machine and survive restart; unfinished authorization is marked interrupted and must be started again. Login refreshes the directory without automatically running paid model tests. See [Account connections](docs/accounts.en.md).
 
 ## Quick start
 
@@ -190,7 +195,7 @@ Adapters recognize Java/Kotlin (Maven, Gradle), JavaScript/TypeScript (npm, pnpm
 
 Acceptance relies on fixed project checks. Configure appropriate checks where missing; model review cannot replace tests. Frozen tests, separate sessions, and OS sandboxes reduce tampering risk but are not a formal security proof against arbitrary malicious code. The selected execution route handles model authentication and networking. Code context goes to the selected provider under that provider's data policy. The runtime does not independently publish local dashboard data, logs, or memory.
 
-Long-term recursive improvement requires real tasks and sustained experiments; this release does not claim to have demonstrated it. Without protected evaluation cases, candidates can be proposed and archived but **cannot be automatically promoted**. Scheduling is periodic or manual. There is no OS startup service or native Codex settings page.
+Long-term recursive improvement requires real tasks and sustained experiments; this release does not claim to have demonstrated it. Without protected evaluation cases, candidates can be proposed and archived but **cannot be automatically promoted**. Scheduling is periodic or manual. The dedicated Linux installer can configure a systemd startup service. The browser dashboard is separate from native Codex settings.
 
 ## Configuration and CLI
 
@@ -236,7 +241,7 @@ Switch projects in the top bar. Global defaults and concurrency are shared; proj
 
 ## User software updates
 
-Global update settings offer manual checks, notifications (default: every 1440 minutes), or automatic stable patch updates while idle. Automatic installation stays within one major/minor series, such as `0.2.0 → 0.2.1`; other versions require confirmation. Active work waits until idle.
+General settings offer manual updates, notifications (daily by default), or automatic updates while idle. Select patch-only, updates within the same major version, or all stable versions; patch-only is the default. Releases must satisfy package and state-format compatibility requirements. Installation waits for active tasks and account authorization to finish.
 
 The updater downloads official ZIP/SHA-256 assets from this repository's GitHub Releases, validates paths/version/state compatibility, installs versioned directories, backs up SQLite, restarts and checks health. Failed startup restores previous code and database. Configuration, projects and history are preserved. Source checkouts are never updated with `git pull`. Checksums verify integrity; independent release signing is not implemented.
 

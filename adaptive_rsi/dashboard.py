@@ -2,14 +2,19 @@
 import json
 
 
-ACTIVE = ["queued", "planning", "executing", "evaluating", "pr_open"]
-ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insufficient_evidence", "interrupted", "regressed", "unverified_merge", "ci_failed"]
+ACTIVE = ["queued", "planning", "executing", "evaluating", "pr_open", "releasing", "deploying"]
+ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insufficient_evidence", "interrupted", "regressed", "unverified_merge", "ci_failed", "release_failed", "deploy_failed"]
 
 # Derive attention from the latest attempt without changing the PR tracking state.
 TASKS = """(SELECT t.*, CASE
-    WHEN t.state='pr_open' AND json_extract((SELECT result FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1), '$.delivery_status')='ci_failed' THEN 'ci_failed'
-    WHEN t.state='merged' AND json_extract((SELECT result FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1), '$.feedback.state')='regressed' THEN 'regressed'
-    ELSE t.state END AS display_state FROM tasks t)"""
+    WHEN t.state='pr_open' AND json_extract(r.result, '$.delivery_status')='ci_failed' THEN 'ci_failed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.feedback.state')='regressed' THEN 'regressed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('failed','health_failed','rollback_failed','blocked','blocked_verification','dispatch_unknown') THEN 'deploy_failed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('failed','blocked','blocked_verification','dispatch_unknown') THEN 'release_failed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('pending','dispatching','submitted','queued','running','rerunning','rolling_back','waiting_target','waiting_verification','waiting_release') THEN 'deploying'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('pending','dispatching','submitted','queued','running','rerunning','waiting_verification') THEN 'releasing'
+    ELSE t.state END AS display_state FROM tasks t LEFT JOIN runs r
+    ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1))"""
 
 
 def records(store, project=None, limit=50, offset=0, group="all", include_system=True):
@@ -39,7 +44,7 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"], reverse=True)
     for row in runs:
         result = json.loads(row.pop("result"))
-        for key in ["summary", "reason", "pr", "value", "plan_reason", "plan_decision", "failure", "stage", "delivery_status"]:
+        for key in ["summary", "reason", "pr", "value", "plan_reason", "plan_decision", "failure", "stage", "delivery_status", "automation"]:
             row[key] = result.get(key)
         row["scope"] = result.get("scope", result.get("files", []))
         row["review_decision"] = result.get("review", {}).get("decision")

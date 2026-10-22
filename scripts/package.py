@@ -24,7 +24,11 @@ for folder in ["adaptive_rsi", "scripts", "skills", "tests", "docs", "deploy"]:
     files += [path for path in (root / folder).rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"]
 with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
     for path in sorted(files):
-        archive.write(path, "adaptive-rsi/" + path.relative_to(root).as_posix())
+        info = zipfile.ZipInfo("adaptive-rsi/" + path.relative_to(root).as_posix(), (2020, 1, 1, 0, 0, 0))
+        info.compress_type = zipfile.ZIP_DEFLATED
+        info.create_system = 3
+        info.external_attr = (0o100755 if path.stat().st_mode & 0o111 else 0o100644) << 16
+        archive.writestr(info, path.read_bytes())
 checksum = hashlib.sha256(bundle.read_bytes()).hexdigest()
 bundle.with_suffix(".zip.sha256").write_text(checksum + "  " + bundle.name + "\n")
 print(bundle)

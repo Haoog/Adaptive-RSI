@@ -25,6 +25,7 @@ jobs:
       - run: node --check adaptive_rsi/web/app.js
       - run: node --check adaptive_rsi/web/i18n.js
       - run: node --check adaptive_rsi/web/model-center.js
+      - run: node --check adaptive_rsi/web/auth.js
       - run: node --test tests/web_requests.cjs
       - run: npm ci --ignore-scripts
       - run: npx playwright install chromium
@@ -47,6 +48,7 @@ jobs:
         env:
           RSI_DOCKER_TESTS: '1'
           RSI_OPENCODE_TESTS: '1'
-        run: python3 -m unittest -v tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker
+          RSI_AUTH_DOCKER_TESTS: '1'
+        run: python3 -m unittest -v tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker tests.test_auth_sessions
       - name: 检查服务器安装脚本
         run: bash -n scripts/install-server.sh

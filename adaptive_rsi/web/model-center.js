@@ -108,6 +108,7 @@ window.RSIModelCenter = (() => {
     $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
     $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';
     $('mc-resume').hidden=!provider.health.paused;$('mc-resume').disabled=false;
+    const authProvider=provider.id,authScope=scope;window.RSIAuth?.show(authProvider,()=>fetchProvider(authProvider,authScope));
     renderModels();
   }
   function renderModels(){
@@ -321,7 +322,7 @@ window.RSIModelCenter = (() => {
   }
   init();
   function translate(){
-    if(!data)return;render();setStatus(feedbackKey,feedbackError);
+    if(!data)return;render();window.RSIAuth?.translate();setStatus(feedbackKey,feedbackError);
     if($('mc-picker-dialog').open){renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[picking])+' · '+t('选择模型');renderPicker();}
     if($('mc-provider-dialog').open){$('mc-provider-dialog-title').textContent=t(editing?'连接设置':'添加模型服务');$('mc-input-key').placeholder=t(editing&&['stored','configured'].includes(editing.credential_status)?'留空保留当前密钥':'填写 API Key');}
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
@@ -331,5 +332,5 @@ window.RSIModelCenter = (() => {
     const next=requested||null,changed=scope!==next;scope=next;
     if(loading&&!changed)return;
     if(!data||changed||data.project!==scope||reload)safe(()=>load());
-  },translate,load};
+  },connections:()=>{tab='providers';if(data)render();},translate,load};
 })();

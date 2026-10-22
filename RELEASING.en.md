@@ -1,37 +1,50 @@
-# Releases and user updates
+# Releases, deployments and user updates
 
 [简体中文](RELEASING.md) | **English**
 
-Maintainers explicitly publish releases. Building a plugin does not push Git, create PRs or publish releases.
+Merges to this repository's mainline prepare a version PR. Only a reconstructed version patch, complete verification, and all GitHub required checks and reviews allow normal protected merging and a formal GitHub Release. Building a plugin has no push or publish side effects. Publishing the product does not deploy any user's server.
 
-Manually trigger the draft-release workflow in Actions to run full checks, Chromium form flows, and ZIP/wheel builds before uploading a release draft. Maintainers review and publish it; pushing main does not publish. Packaging checks all four version declarations, while backend and static UI also share a content identity to detect different builds of one version.
+## Repository versions and releases
 
-## Bundle contract
+`.github/workflows/release.yml` prepares a separate version PR after mainline merges. `release:major`, `release:minor` and `release:patch` labels select the increment; without a label, a `feat/` source branch increments minor and other branches increment patch. Commit messages are Chinese. Versions agree in `plugin.json`, `pyproject.toml`, `adaptive_rsi/__init__.py` and `update.json`; bilingual `CHANGELOG` content moves from `Unreleased` into the new version.
 
-- Keep versions in `plugin.json`, `pyproject.toml`, `adaptive_rsi/__init__.py` and `update.json` aligned.
-- Use stable `major.minor.patch` versions and matching `vX.Y.Z` tags. Drafts and prereleases are skipped.
-- The current manifest accepts only `format: 1`, `python_min: [3, 9]` and `state_schema: 1`. Incompatible database changes require a designed migration/rollback path and a protocol change, rather than just a version bump.
-- Each release needs `adaptive-rsi-X.Y.Z-plugin.zip` and its matching `.zip.sha256`. The archive root must be `adaptive-rsi/`.
-- The update source is fixed to the latest stable GitHub Release in `Haoog/Adaptive-RSI`. Independent release signing is not implemented.
+Version branches contain the target version and mainline SHA. When mainline advances, automation closes an old PR only after proving it equals the reconstructed mechanical version patch, then creates one replacement against the new baseline. Manual changes block replacement. Repeated triggers reuse the same PR; a closed identical PR is not automatically reopened.
 
-## Local preparation and verification
+PRs created with the default `GITHUB_TOKEN` do not trigger `pull_request` checks. Preparation therefore explicitly dispatches trusted-mainline `release-verify.yml`: independently verify the repository, target branch and exact PR SHA, reconstruct the expected six-file patch from its baseline, then run the complete tests, browser checks and ZIP/wheel installation and upgrade smoke. Only a separate reporting job receives `checks:write`; it writes the ordinary required `verify` check onto that exact PR SHA. Candidate execution jobs receive read permissions and no write token. Merging uses `--match-head-commit` without administrator bypass; required human reviews, failed checks or conflicts block it.
 
-```sh
-python3 -m unittest discover -v
-node --check adaptive_rsi/web/app.js
-node --check adaptive_rsi/web/i18n.js
-python3 scripts/package.py
-uv build --wheel --out-dir dist
-```
+After a bot merge, the workflow explicitly dispatches formal publication because `GITHUB_TOKEN` merges do not trigger push workflows. The final merged commit is rebuilt and verified. Smoke starts the actual ZIP service in isolated state, checks its version and preserved data, and installs the previous official wheel before upgrading when one exists. With no prior wheel, the first release explicitly reports installation and repeated installation only, rather than claiming a cross-version upgrade. Publication uses the artifacts uploaded by that verification run, creates a fixed tag and draft, uploads all assets, then publishes it. Conflicting tags or differing existing formal assets stop the operation; formal assets and tags are never replaced. Fixed ZIP metadata and wheel `SOURCE_DATE_EPOCH` support reconciliation on retries.
 
-Update both documentation languages, validation records and release notes. Inspect the ZIP for credentials, sessions, local state, caches or project data. Use isolated state to rehearse upgrade, health checks and database recovery after failed startup.
+GitHub must permit Actions to create PRs and grant the declared workflow permissions. Disabled capabilities fail explicitly; no extra PAT is assumed. Administrators must maintain required checks and review policies. Protect release tags and workflow files with repository rules.
 
-Create a draft release on GitHub, upload the two matching assets, verify versions, checksums, notes and validation scope, then explicitly publish. Pushing main alone does not notify users: a stable release matching this contract is required. The project does not automatically publish releases.
+## Managed-project authorization
 
-## User behavior and limits
+New projects keep candidates locally and receive no PR, merge, release or deployment permission. This repository's maintenance authorization does not transfer to other projects. The project panel lists existing GitHub workflows that satisfy the contract. An explicit selection and authorization pins the current default-branch commit using `rsi-workflow/<full-SHA>`. It saves only the selected release or deployment permission and preserves PR mode and auto-merge settings.
 
-The default checks daily and notifies. Automatic mode installs only same-major/minor stable patches while idle, such as `0.2.0 → 0.2.1`. `0.2.x → 0.3.x` needs user confirmation. Calls and tokens are recorded without quotas.
+Both `delivery.release` and `delivery.deploy` contain `enabled`, `workflow`, `ref` and `sha`. Workflow paths are fixed `.github/workflows/*.yml` or `.yaml` files; ref is a lightweight tag pointing to a previously trusted commit. Advanced users may configure the same fixed identity manually. Workflows must implement this contract; see [rsi-delivery-workflow.example.yml](scripts/rsi-delivery-workflow.example.yml):
 
-Updates use version directories and an active pointer, without `git pull` in user source checkouts. Failed startup restores previous code/database; recovery from power loss or supervisor crashes remains unverified. Launch-environment model secrets pass to the new service and are never written into update plans.
+- Top-level `run-name: ${{ inputs.rsi_operation_id }}`.
+- Required string inputs `rsi_operation_id` and `rsi_sha` under `workflow_dispatch.inputs`.
+- Release or deploy the exact full `rsi_sha`; persist `rsi_operation_id` at the target so retries remain idempotent.
+- Maintainers preconfigure commands, targets and secrets in the workflow and GitHub environment. Models cannot select arbitrary commands or secrets or grant release permissions. The example fails until a real target is configured.
 
-Loaded Codex skills/plugin metadata need marketplace refresh and a Codex restart. Runtime updates cannot hot-replace them. After the first successful managed upgrade, `STATE/installations/current` can serve as a stable local marketplace directory. Wheel users must update their pip package or use plugin launch scripts that follow the active pointer.
+The workflow must already exist on that repository's default branch. The controller never promotes model candidates into trusted workflows. After ordinary gates and post-merge verification pass, it dispatches the sealed workflow policy with the actual merged SHA. Before each external action it rechecks project, repository, tag, pause, cancellation and current authorization. Revocation and target changes prevent unissued operations. Workflows already accepted by GitHub may continue and remain subject to the maintainer's GitHub environment rules.
+
+Operation state, exact target SHA, workflow version, stable operation ID, GitHub run ID/attempt, URL and errors persist across service restarts. Timeouts cannot prove GitHub rejected a request: `dispatch_unknown` reconciles by stable ID and never blindly dispatches twice. If reconciliation cannot establish the result, inspect the original workflow rather than forcing another release. Confirmed failed workflows retry through the same GitHub run ID; repeated clicks do not duplicate an unacknowledged rerun.
+
+## Deployment health and rollback
+
+Without `delivery.deploy.health_url`, workflow success remains `workflow_succeeded` with health `unverified`. Users may explicitly configure a fixed HTTPS health URL without credentials, query, fragment or cross-origin redirects. The endpoint must return HTTP 200 and JSON `{"sha":"full deployed SHA","healthy":true}` (`status: "ok"` is also accepted). Only an exact version match becomes `healthy`; timeouts, invalid responses and old SHAs fail health verification.
+
+`delivery.deploy.automatic_rollback` defaults off and requires a health URL. Only SHAs actually verified healthy for the same project, repository and health target qualify. After a health failure, valid current authorization and a previous healthy SHA allow the same pinned deployment workflow to redeploy that SHA, followed by another health check. Workflow success alone cannot claim recovery: only that second health pass becomes `rolled_back`; otherwise the state is `rollback_failed`. Without a healthy historical version, retain `health_failed` with `rollback_unavailable`, rather than claiming a rollback.
+
+Durable ownership serializes deployments to the same project's same target. Once a newer deployment owns the target, an older operation cannot issue a stale rollback. Health failures can retry the check; failed rollback workflows can rerun their original GitHub run. This rollback redeploys known code through a trusted workflow. It is not a database rollback guarantee; application migration and compatibility policies belong to that workflow's maintainer.
+
+## Stable user updates
+
+Daily checks and notifications are the default. `updates.mode` accepts `manual`, `notify` or `automatic`; automatic mode also uses `updates.auto_policy`: `patch` (default, same major/minor), `minor` (same major) or `stable` (any newer stable version). Drafts, prereleases, equal versions and downgrades are never installed. Updates wait for project runs, model probes and browser authorization to become idle. Calls and tokens are recorded without quotas.
+
+The source is fixed to `Haoog/Adaptive-RSI`. Formal releases require `adaptive-rsi-X.Y.Z-plugin.zip` and its `.zip.sha256`; ZIP roots are `adaptive-rsi/`. There is currently no independent signature; checksums are provided by the same GitHub Release. `update.json` only accepts `format: 1`, `python_min: [3, 9]` and `state_schema: 1`. Incompatible state migrations are rejected rather than bypassed by a version change.
+
+The updater uses separate version directories and active pointers, rereads the official feed, verifies SHA-256 and checks archive paths. Identical staged content can resume; differing content stops installation. Interrupted downloads can retry. Automatic failures back off for up to three attempts; users may check again or retry manually. A supervisor uses an exclusive lock, persistent phases and the original database backup. Interrupted supervision resumes after restart while new work and mutations remain blocked. Work is admitted only after startup health passes. Startup failure restores the guarded pre-start snapshot only while no runtime owns the database. Missing backups, incompatible state protocols and disk damage require manual recovery; arbitrary migrations, power loss and external writes cannot be guaranteed reversible.
+
+Already loaded Codex plugin metadata still requires a marketplace refresh and Codex restart. After a managed upgrade, `STATE/installations/current` is a stable entry point. Wheel users update with pip or switch to the bundled launcher.

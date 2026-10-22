@@ -4,6 +4,59 @@ const {createInterface} = require('node:readline');
 const {chromium} = require('playwright');
 const fs = require('node:fs');
 
+async function checkAccountAndReleaseUI(browser,url,errors){
+ const page=await browser.newPage({viewport:{width:1100,height:900}}),requests=[];
+ page.on('pageerror',error=>errors.push(error.message));
+ let signedIn=false,complete=false,authActive=false,releaseStarted;
+ const session={id:'browser-auth-session',backend:'codex',provider:'',state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
+ const reply=(route,data)=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+ await page.route('**/api/auth/**',async route=>{
+  const path=new URL(route.request().url()).pathname,body=route.request().postDataJSON();requests.push({path,body});
+  if(path.endsWith('/status'))return reply(route,{codex:{state:signedIn?'authenticated':'signed_out'},opencode:{state:'signed_out',authenticated_providers:[]},sessions:authActive?[session]:[]});
+  if(path.endsWith('/providers'))return reply(route,[{id:'openai',name:'OpenAI',methods:[{index:0,label:'Official login',type:'oauth',supported:true},{index:1,label:'API key',type:'api'}]},{id:'github-copilot',name:'GitHub Copilot',methods:[{index:0,label:'Device login',type:'oauth',supported:true,prompts:[{type:'select',key:'deployment',message:'Account type',options:[{label:'GitHub.com',value:'public'},{label:'Enterprise',value:'enterprise'}]},{type:'text',key:'domain',message:'Enterprise domain',when:{key:'deployment',op:'eq',value:'enterprise'}}]}]}]);
+  if(path.endsWith('/start')){if(body.backend==='opencode'){await new Promise(resolve=>{releaseStarted=resolve;});return reply(route,{...session,id:'opencode-session',backend:'opencode',provider:body.provider});}complete=false;authActive=true;return reply(route,session);}
+  if(path.endsWith('/session')){if(complete){signedIn=true;authActive=false;}return reply(route,{...session,state:complete?'completed':'awaiting_authorization'});}
+  if(path.endsWith('/complete')){complete=true;return reply(route,{...session,state:'completing'});}
+  if(path.endsWith('/cancel')){authActive=false;return reply(route,{...session,state:'cancelled'});}
+  if(path.endsWith('/logout')){signedIn=false;return reply(route,{ok:true});}
+  return reply(route,{ok:true});
+ });
+ let catalogs=0,probes=0;
+ await page.route('**/api/model-center/fetch',route=>{catalogs++;return reply(route,{ok:true});});
+ await page.route('**/api/model-center/probe',route=>{probes++;return reply(route,{ok:true});});
+ await page.route('**/api/release-workflows?*',route=>reply(route,{workflows:[{workflow:'.github/workflows/release.yml',name:'Release',compatible:true}]}));
+ await page.route('**/api/release-authorize',route=>{requests.push({path:'/api/release-authorize',body:route.request().postDataJSON()});return reply(route,{enabled:true,workflow:'.github/workflows/release.yml',ref:'rsi-workflow-test',sha:'a'.repeat(40)});});
+ try{
+  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
+  await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
+  await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
+  const code=page.locator('[data-auth-field="code:browser-auth-session"]');await code.fill('keep-my-code');await code.focus();await page.waitForTimeout(1800);
+  assert.equal(await code.inputValue(),'keep-my-code');assert(await code.evaluate(node=>document.activeElement===node));
+  if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#mc-auth').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/account-sign-in.png'});
+  await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
+  await page.getByRole('button',{name:'取消登录',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'已取消登录'}).waitFor();
+  await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();await code.fill('official-code');await page.getByRole('button',{name:'完成授权',exact:true}).click();
+  await page.locator('#mc-auth').filter({hasText:'账号已连接'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/complete')).body.code,'official-code');
+  await page.waitForFunction(()=>document.getElementById('mc-feedback').textContent.includes('模型列表已更新'));assert.equal(catalogs,1);assert.equal(probes,0);
+  await page.getByRole('button',{name:'退出账号',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'尚未登录'}).waitFor();
+  await page.getByRole('button',{name:'OpenCode',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('github-copilot');
+  const domain=page.getByLabel('Enterprise domain');assert.equal(await domain.isVisible(),false);await page.getByLabel('Account type').selectOption('enterprise');await domain.fill('github.example.com');
+  await page.getByRole('button',{name:'官方登录 · Device login',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('openai');
+  await page.waitForFunction(()=>document.querySelector('#mc-auth input[type="password"]'));
+  releaseStarted();await page.waitForTimeout(150);
+  assert.equal(await page.locator('.mc-auth-code').count(),0);
+  const started=requests.find(r=>r.body?.backend==='opencode'&&r.path.endsWith('/start'));assert.deepEqual(started.body.inputs,{deployment:'enterprise',domain:'github.example.com'});
+  await page.locator('#mc-auth input[type="password"]').fill('fake-test-key');await page.getByRole('button',{name:'保存供应商密钥',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('#mc-auth input[type="password"]').value==='');assert.equal(requests.find(r=>r.path.endsWith('/key')).body.provider,'openai');
+  assert.equal(await page.locator('#deploy-health-settings').isVisible(),false);
+  await page.locator('#release-workflow-list').selectOption('.github/workflows/release.yml');await page.locator('#release-authorize').click();await page.locator('#release-authorization-feedback').filter({hasText:'工作流已授权'}).waitFor();
+  assert.equal(await page.locator('[data-path="delivery.release.enabled"]').isChecked(),true);assert.equal(await page.locator('[data-path="delivery.release.sha"]').inputValue(),'a'.repeat(40));assert.equal(requests.find(r=>r.path==='/api/release-authorize').body.kind,'release');
+  await page.locator('#deploy-authorize').click();await page.locator('#deploy-health-settings').waitFor();await page.locator('[data-path="delivery.deploy.enabled"]').uncheck();assert.equal(await page.locator('#deploy-health-settings').isVisible(),false);
+  if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#release-settings').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/release-settings.png'});
+  await page.setViewportSize({width:390,height:844});await page.locator('#language-select').selectOption('en');assert.equal(await page.getByRole('heading',{name:'Release and deployment after merge',exact:true}).count(),1);assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));
+ }finally{await page.close();}
+}
+
 async function main() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
@@ -22,10 +75,11 @@ async function main() {
     const saveSettings = async () => {
       const saved = page.waitForResponse(response=>response.url().endsWith('/api/config')&&response.request().method()==='POST');
       await page.locator('#settings-save').click();
-      assert.equal((await saved).status(), 200);
+      const response=await saved;assert.equal(response.status(),200,await response.text());
       await page.waitForFunction(()=>!document.getElementById('settings-save').disabled);
     };
     page.on('pageerror', error => errors.push(error.message));
+    if(process.env.RSI_BROWSER_AUTH_ONLY){await checkAccountAndReleaseUI(browser,url,errors);assert.deepEqual(errors,[]);console.log('Targeted account and release UI checks passed.');return;}
     await page.goto(url);
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();
     assert.equal(await page.locator('#project-status').innerText(), '已暂停');
@@ -216,11 +270,12 @@ async function main() {
       await page.locator('.brand').click();
       await page.screenshot({path: process.env.RSI_SCREENSHOT_DIR + '/desktop-workspace.png', fullPage: true});
     }
+    await checkAccountAndReleaseUI(browser,url,errors);
     assert.deepEqual(errors, []);
     const state = await page.evaluate(async () => (await fetch('/api/state')).json());
     assert(state.projects.every(project => project.paused));
     assert.equal(state.usage.length, 0);
-    console.log('Browser checks passed: forms, hot settings, pagination, project isolation, languages, mobile, zero paid calls.');
+    console.log('Browser checks passed: forms, hot settings, pagination, project isolation, languages, mobile, account authorization, release authorization, zero paid calls.');
   } finally {
     if (browser) await browser.close();
     server.stdin.end('\n');

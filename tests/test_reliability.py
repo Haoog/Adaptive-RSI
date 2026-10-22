@@ -196,7 +196,7 @@ class ReliabilityTest(unittest.TestCase):
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_value_assessment_yields_and_reuses_plan_without_spending_retry(self):
         first, run = self.claim("Fix addition first")
-        second = self.runtime.goal(self.project, "Fix addition second")
+        second = self.runtime.goal(self.project, "Correct arithmetic boundary")
         self.runtime.process(run)
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (first,))
         self.assertEqual(row["state"], "queued")

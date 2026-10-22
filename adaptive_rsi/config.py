@@ -25,7 +25,7 @@ DEFAULTS = {
     },
     "review": {"block_on": "medium"},
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
-    "updates": {"mode": "notify", "interval_minutes": 1440},
+    "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch"},
     "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
                "command_seconds": 0, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30},
@@ -34,7 +34,9 @@ DEFAULTS = {
                 "cpus": 2, "pids": 128},
     "github": {"repository": "", "labels": [], "exclude_labels": ["wontfix", "duplicate"],
                "max_issues": 100},
-    "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440},
+    "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440,
+                 "release": {"enabled": False, "workflow": "", "ref": "", "sha": ""},
+                 "deploy": {"enabled": False, "workflow": "", "ref": "", "sha": "", "health_url": "", "automatic_rollback": False}},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -131,6 +133,8 @@ def validate(config):
         raise ValueError("Triage policy requires 1..4000 characters")
     if config["updates"]["mode"] not in ["manual", "notify", "automatic"] or not 60 <= config["updates"]["interval_minutes"] <= 525600:
         raise ValueError("Invalid update mode or interval (minimum 60 minutes)")
+    if config["updates"]["auto_policy"] not in ["patch", "minor", "stable"]:
+        raise ValueError("Automatic update policy must be patch, minor or stable")
     for name in ["light_minutes", "issues_minutes", "deep_minutes"]:
         if not 5 <= config["schedule"][name] <= 525600:
             raise ValueError(name + " must be between 5 and 525600")
@@ -165,6 +169,24 @@ def validate(config):
     delivery = config["delivery"]
     if delivery["mode"] not in ["local", "pr"] or delivery["auto_merge"] and delivery["mode"] != "pr":
         raise ValueError("Automatic merge requires PR delivery")
+    for kind in ["release", "deploy"]:
+        target = delivery[kind]
+        if target["workflow"] and not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", target["workflow"]):
+            raise ValueError("Automation workflow must be a fixed .github/workflows YAML file")
+        if target["ref"] and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", target["ref"]) or
+                              ".." in target["ref"] or "//" in target["ref"] or target["ref"].endswith("/")):
+            raise ValueError("Automation requires a fixed trusted tag")
+        if target["sha"] and not re.fullmatch(r"[a-f0-9]{40}", target["sha"]):
+            raise ValueError("Automation requires the trusted workflow tag's full commit SHA")
+        if target["enabled"] and (not repo or not all(target[k] for k in ["workflow", "ref", "sha"])):
+            raise ValueError("Release/deploy requires an explicit project and a pinned workflow tag")
+    health = urlsplit(delivery["deploy"]["health_url"])
+    if delivery["deploy"]["health_url"] and (health.scheme != "https" or not health.hostname or health.username is not None or
+            health.password is not None or health.query or health.fragment or
+            any(c.isspace() or ord(c) < 32 for c in delivery["deploy"]["health_url"])):
+        raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
+    if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
+        raise ValueError("Automatic deployment rollback requires an explicit health URL")
     if not 5 <= delivery["feedback_minutes"] <= 525600:
         raise ValueError("Feedback interval must be at least 5 minutes")
     if delivery["base_branch"] and (delivery["base_branch"].startswith("-") or

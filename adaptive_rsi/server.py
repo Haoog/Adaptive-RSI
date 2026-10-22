@@ -146,6 +146,16 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/readiness":
                 from .readiness import inspect
                 self.respond(inspect(runtime, runtime.project(params.get("project", [""])[0])))
+            elif parsed.path == "/api/auth/status":
+                self.respond(runtime.auth_sessions.snapshot())
+            elif parsed.path == "/api/auth/providers":
+                self.respond(runtime.auth_sessions.providers(params.get("backend", ["opencode"])[0]))
+            elif parsed.path == "/api/auth/session":
+                self.respond(runtime.auth_sessions.status(params.get("id", [""])[0]))
+            elif parsed.path == "/api/release-status":
+                self.respond(runtime.release_status(params.get("project", [""])[0], params.get("run", [""])[0]))
+            elif parsed.path == "/api/release-workflows":
+                self.respond(runtime.workflow_choices(params.get("project", [""])[0]))
             elif parsed.path == "/api/task-runs":
                 task = store.one("SELECT project FROM tasks WHERE id=?", (params.get("task", [""])[0],))
                 if not task or task["project"] != params.get("project", [""])[0]:
@@ -181,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/auth.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]
@@ -191,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.respond({"error": "Not found"}, 404)
         except (ValueError, OSError, RuntimeError) as exc:
-            self.respond({"error": str(exc)}, 400)
+            self.respond({"error": str(exc), **({"error_code": exc.code} if hasattr(exc, "code") else {})}, 400)
 
     def do_POST(self):
         if not self.authenticated():
@@ -210,6 +220,25 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Expected an object")
             runtime = self.server.runtime
             path = urlparse(self.path).path
+            if path.startswith("/api/auth/"):
+                with runtime.dispatch_lock:
+                    runtime.updates.require_ready()
+                    auth = runtime.auth_sessions
+                    if path == "/api/auth/start":
+                        result = auth.start(body.get("backend"), body.get("provider"), body.get("method", 0), body.get("inputs"))
+                    elif path == "/api/auth/complete":
+                        result = auth.complete(body.get("id"), body.get("code", ""))
+                    elif path == "/api/auth/cancel":
+                        result = auth.cancel(body.get("id"))
+                    elif path == "/api/auth/logout":
+                        result = auth.logout(body.get("backend"), body.get("provider"))
+                    elif path == "/api/auth/key":
+                        result = auth.set_api_key(body.get("backend"), body.get("provider"), body.get("key"))
+                    else:
+                        self.respond({"error": "Not found"}, 404)
+                        return
+                self.respond(result)
+                return
             if path.startswith("/api/model-center/"):
                 center = runtime.model_center
                 project = body.get("project") or None
@@ -259,6 +288,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/config":
                     runtime.configure(body["values"], body.get("project"), body.get("inherit"))
                     result = {"saved": True, "config": runtime.config(body.get("project"))}
+                elif path == "/api/release-retry":
+                    result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
+                elif path == "/api/release-authorize":
+                    result = runtime.authorize_workflow(body.get("project"), body.get("kind"), body.get("workflow"))
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
                 elif path == "/api/request":
@@ -290,4 +323,5 @@ class Handler(BaseHTTPRequestHandler):
         except (CenterError, CredentialError, CatalogError) as exc:
             self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
         except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
-            self.respond({"error": str(exc)}, 400)
+            status = 409 if getattr(exc, "code", "") == "auth_credentials_busy" else 400
+            self.respond({"error": str(exc), **({"error_code": exc.code} if hasattr(exc, "code") else {})}, status)

@@ -1,0 +1,150 @@
+{
+  "date": "2026-10-22",
+  "model": "gpt-6.1-sol",
+  "effort": "high",
+  "reviewer_role": "Independent read-only release/update/workflow review; this agent implemented authentication, not the release implementation.",
+  "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
+  "scope": "Frozen working-tree release/deployment authorization, durable operation reconciliation, deployment health and rollback, stale deployment prevention, update journal recovery, and release CI exact-SHA privilege separation.",
+  "decision": "pass",
+  "blocking_findings": [],
+  "closed_findings": [
+    {
+      "priority": "P1",
+      "title": "A late older deployment could overwrite a newer healthy target",
+      "original_evidence": "A protocol-substitute reproduction seeded a newer healthy deployment owner and advanced an older undispatched run; the old implementation submitted the older merged SHA.",
+      "resolution": "When another terminal owner exists, GitHub comparison owner.sha...candidate must report ahead; behind, diverged and identical are superseded. The owner is checked again after external validation, before durable intent and dispatch.",
+      "references": [
+        "adaptive_rsi/release.py:345",
+        "adaptive_rsi/release.py:354",
+        "adaptive_rsi/release.py:360",
+        "tests/test_release.py:270"
+      ],
+      "verification": "The independent targeted run passed test_late_old_or_diverged_deployment_cannot_overwrite_newer_healthy_target and test_owner_change_during_health_check_prevents_stale_rollback."
+    },
+    {
+      "priority": "P2",
+      "title": "A valid static WAL backup was rejected by the recovery preflight",
+      "original_evidence": "The first final-increment run executed 34 tests but failed both real supervised service upgrade subcases before server.log creation. An independent Store -> sqlite3.Connection.backup reproduction showed SQLite 3.54.0 rejecting the valid WAL-header backup on initial mode=ro open because sidecars did not exist.",
+      "resolution": "Static backup integrity checks use mode=ro&immutable=1, which validates the closed standalone backup without creating WAL/SHM sidecars. Missing and corrupt backups still stop with recovery_required and preserve the current database.",
+      "references": [
+        "adaptive_rsi/updates.py:354",
+        "tests/test_updates_recovery.py:95",
+        "tests/test_updates_recovery.py:105"
+      ],
+      "verification": "The final 36-test run passes the real static-WAL backup regression, corrupt-backup safety regression, and both real supervised service upgrade/rollback subcases."
+    }
+  ],
+  "assessments": [
+    {
+      "area": "Authorization isolation",
+      "decision": "pass",
+      "reason": "Delivery defaults remain local/disabled; global settings cannot enable project delivery, task overrides cannot grant delivery, and every outgoing workflow operation checks saved and live project policy, repository/origin identity, pause/cancel state and the trusted workflow tag. Workflow authorization does not enable PR or automatic merge. The internal authorization boundary also rejects a run whose project ID differs from the supplied project.",
+      "references": [
+        "adaptive_rsi/config.py:37",
+        "adaptive_rsi/runtime.py:136",
+        "adaptive_rsi/runtime.py:197",
+        "adaptive_rsi/release.py:152",
+        "adaptive_rsi/release.py:167"
+      ]
+    },
+    {
+      "area": "Durable reconciliation and idempotency",
+      "decision": "pass",
+      "reason": "A stable operation ID and dispatch intent are persisted before the remote write. Ambiguous dispatches are reconciled rather than repeated; remote head SHA, workflow path, event and operation title are checked. Confirmed failures rerun the same remote run ID and reconcile run_attempt before another retry. Deployments awaiting an authorized release persist waiting_release and resume only after release success; revoked unissued work stops being scheduled.",
+      "references": [
+        "adaptive_rsi/release.py:175",
+        "adaptive_rsi/release.py:188",
+        "adaptive_rsi/release.py:366",
+        "adaptive_rsi/release.py:391"
+      ]
+    },
+    {
+      "area": "Health and rollback boundaries",
+      "decision": "pass",
+      "reason": "Workflow success without a health target remains explicitly unverified. Health requires the exact application SHA and a positive status; rollback uses only the previously verified SHA for the same project/repository/health target, checks current authorization and ownership, and requires a second health confirmation. Deployment ownership prevents stale health evidence and stale rollback dispatch.",
+      "references": [
+        "adaptive_rsi/release.py:209",
+        "adaptive_rsi/release.py:235",
+        "adaptive_rsi/release.py:252"
+      ]
+    },
+    {
+      "area": "Update recovery and database safety",
+      "decision": "pass",
+      "reason": "Active work, model probes and authentication prevent update admission. Update policy is explicit and does not downgrade. Journals use guarded prepared/health_check/committed phases; installed journals never restore old backups, an existing healthy child is adopted by exact version/PID evidence, and uncertainty preserves the plan/database as recovery_required. Startup rollback terminates the failed child and acquires runtime.lock before restoring the guarded pre-admission database backup. The original backup must pass static read-only SQLite integrity/schema checks before candidate launch and before rollback; corrupt or missing backups preserve current data and require recovery.",
+      "references": [
+        "adaptive_rsi/updates.py:144",
+        "adaptive_rsi/updates.py:207",
+        "adaptive_rsi/updates.py:226",
+        "adaptive_rsi/updates.py:371",
+        "adaptive_rsi/updates.py:468",
+        "adaptive_rsi/updates.py:486",
+        "adaptive_rsi/updates.py:354",
+        "adaptive_rsi/updates.py:439",
+        "adaptive_rsi/updates.py:501"
+      ]
+    },
+    {
+      "area": "Exact-SHA CI privilege separation",
+      "decision": "pass",
+      "reason": "The trusted workflow independently reconstructs the six-file generated release patch and verifies PR identity before any candidate execution. Candidate verification has read-only permissions and no persisted checkout credential; checks:write is isolated in the report job, and merge/publish write permissions are isolated from candidate execution. Merge revalidates the same SHA and uses normal protected-branch merge without an admin bypass. Publish uses artifacts from that workflow verification and rejects moved tags or differing already-published assets.",
+      "references": [
+        "scripts/release.py:78",
+        "scripts/release.py:159",
+        "scripts/release.py:172",
+        ".github/workflows/release-verify.yml:17",
+        ".github/workflows/release-verify.yml:33",
+        ".github/workflows/release-verify.yml:62",
+        ".github/workflows/release-verify.yml:82",
+        ".github/workflows/release.yml:88"
+      ]
+    }
+  ],
+  "verification": [
+    {
+      "kind": "independent targeted execution on final frozen increment",
+      "command": "python3 -m unittest tests.test_release tests.test_updates_recovery tests.test_controls.UpdatesTest -v",
+      "result": "36 tests passed; includes real supervised successful upgrade and failed-start database/code rollback",
+      "duration_seconds": 17.37,
+      "log": "/tmp/rsi-release-independent-review-final.log"
+    },
+    {
+      "kind": "protocol-substitute identity probes",
+      "result": "Valid generated PR accepted; wrong head SHA, fork repository, draft PR, wrong base branch and manual branch rejected before generated-patch validation. Accepted identity passed its exact base/head SHA into verify_generated."
+    },
+    {
+      "kind": "static workflow and artifact review",
+      "result": "Read release/release-verify/checks workflows, deterministic patch/publish scripts, installation smoke, packaging, trusted delivery template, and bilingual release documentation."
+    },
+    {
+      "kind": "intermediate regression detection and resolution",
+      "result": "An intermediate 34-test run failed both real supervised update subcases. The reviewer isolated valid static-WAL backup rejection, the implementation author fixed it and added a real backup regression, and the final 36-test run passed. The intermediate failure is not represented as passing evidence."
+    }
+  ],
+  "boundaries": [
+    "No real project release, deployment, GitHub workflow dispatch, PR merge or external environment mutation was performed by this reviewer.",
+    "GitHub branch protection, required approvals, Actions permission policy and real workflow execution remain remote integration gates; local protocol substitutes do not prove those remote account settings.",
+    "Target-side deployment commands, secret selection, idempotency enforcement and data-migration rollback are explicitly delegated to the reviewed maintainer-owned workflow. The shipped template fails until a real target is configured.",
+    "Update checksums come from the same official GitHub Release and are not an independent release signature. Unknown migration schemas, missing backups or unverifiable committed children require manual recovery rather than unsafe automatic rollback.",
+    "This report reviews the file hashes listed below. Later implementation changes require an appropriate follow-up review."
+  ],
+  "reviewed_file_sha256": {
+    "adaptive_rsi/release.py": "6bc8f78cd9b0f2aa09c54f9838a418a554f1a7819c77963477d9278255a1e5d6",
+    "adaptive_rsi/config.py": "4a311e2825295921f19f1e8584163d99ea499803e60a8adc2e4811927f571b2f",
+    "adaptive_rsi/delivery.py": "998dd5c6c0eceabb69dc87d1245e1b65a55d72a61936799aaf2305e264eb3dd4",
+    "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
+    "adaptive_rsi/updates.py": "22f779c6a953910ef4de0ca219af973dcf41773fdd49275e040d77ff17cd1f2f",
+    "scripts/release.py": "c5da35b699e5d6991096f01a456a6ad0edb72bed5a4165652915cb1dd9629a7d",
+    "scripts/release_smoke.py": "72f3bffd7133cd097445acea6bb29c5b5fd1ba938e66f1577f9167a71fbbd6cf",
+    "scripts/rsi-delivery-workflow.example.yml": "6398610b658886f3d285ed212282008d1b3a16dfbc459875a15e1bbb4c8f0945",
+    "scripts/package.py": "a54fb8a2b8c5a2a6a002e5c61612602eee73fa6acecf132c94ca5aa7452b7a29",
+    ".github/workflows/release.yml": "31c9d4ec53427d0f60bc720f61ce64e92376ea7a74d0ceaf0fe498c82b17f918",
+    ".github/workflows/release-verify.yml": "9b01a07c3b36465542d44e5f1876d711910f755e59a1f2d726380a1ac318b703",
+    ".github/workflows/checks.yml": "3651aeb9fd2583b84abd472d0396990ca99d81bd576285e113e85da477652d8f",
+    "RELEASING.md": "d2763feec41a7e34d8f92a06775b92df3f0a13ba5f6dd0b9f69444bceff71a1c",
+    "RELEASING.en.md": "ed327c8d04c66447683cd8ca91cb0f5705bd27eb1213341819f58bc1bf3769d5",
+    "tests/test_release.py": "708c649bc385022c074f4f537f21e6b48fc5af7939bf07259e451037f026a2cb",
+    "tests/test_updates_recovery.py": "2f0bc2312658644d4de6adba32fce0f64e828068b0b2d4ef1391dea6ff2cd4d6",
+    "tests/test_controls.py": "c3e7afb1436ea9fb3999661869748e3f5015d76982dab7768b7c5f60b466fd15"
+  }
+}

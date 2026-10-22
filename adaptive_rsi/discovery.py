@@ -93,17 +93,56 @@ def sync(runtime, project, config, checked, cancel=None):
                 data={"complete": complete, "next_page": progress["page"]})
 
 
+def problem_title(title):
+    return " ".join(title.split()).casefold()
+
+
+def finding_identity(finding):
+    from .config import fingerprint
+    # 同一行可能包含多个缺陷；代码引用本身不能证明它们是同一个问题。
+    return fingerprint({"path": finding["path"], "quote": finding["quote"],
+                        "title": problem_title(finding["title"])})
+
+
 def related_task(backlog, finding):
-    """Only collapse exact problem titles with matching source anchors."""
-    from .context import terms
-    title = terms(finding["title"])
+    """Only collapse the same problem with matching source anchors."""
+    title = problem_title(finding["title"])
     for row in backlog:
-        if not title or title != terms(row["title"]):
+        if not title or title != problem_title(row["title"]):
             continue
         evidence = json.loads(row["evidence"])
         if any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence):
             return row["id"]
     return None
+
+
+def related_work(store, project, task, limit=12):
+    """Provide evidence of overlapping work without merging distinct reports."""
+    from .context import terms
+    evidence = json.loads(task.get("evidence") or "[]")
+    paths = {item["path"] for item in evidence if item.get("path")}
+    words = terms(task["title"] + " " + task.get("body", ""))
+    rows = store.query("SELECT t.id,t.title,t.state,t.evidence,t.updated,"
+                       "(SELECT result FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1) AS result "
+                       "FROM tasks t WHERE project=? AND id<>? AND source NOT LIKE 'system_%' "
+                       "AND state NOT IN ('rejected','obsolete','cancelled','superseded') ORDER BY updated DESC",
+                       (project, task["id"]))
+    ranked = []
+    for row in rows:
+        result = json.loads(row["result"] or "{}")
+        anchors = json.loads(row["evidence"] or "[]")
+        other_paths = {item["path"] for item in anchors if item.get("path")}
+        other_paths.update(result.get("files", []))
+        shared = sorted(paths & other_paths)
+        overlap = len(words & terms(row["title"]))
+        if not shared and (not words or overlap < 2):
+            continue
+        ranked.append((len(shared) * 10 + overlap, row["updated"],
+                       {"id": row["id"], "title": row["title"], "state": row["state"],
+                        "shared_paths": shared, "summary": str(result.get("summary", ""))[:1500],
+                        "pr": result.get("pr"), "base": result.get("base")}))
+    ranked.sort(key=lambda item: (-item[0], -item[1]))
+    return [item[2] for item in ranked[:limit]]
 
 
 def value_priority(value, risk):
