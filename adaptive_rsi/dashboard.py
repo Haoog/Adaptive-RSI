@@ -9,8 +9,8 @@ ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insuff
 TASKS = """(SELECT t.*, CASE
     WHEN t.state='pr_open' AND json_extract(r.result, '$.delivery_status')='ci_failed' THEN 'ci_failed'
     WHEN t.state='merged' AND json_extract(r.result, '$.feedback.state')='regressed' THEN 'regressed'
-    WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('failed','health_failed','rollback_failed','blocked','blocked_verification','dispatch_unknown') THEN 'deploy_failed'
-    WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('failed','blocked','blocked_verification','dispatch_unknown') THEN 'release_failed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('failed','health_failed','rollback_failed','blocked','blocked_verification','dispatch_unknown','rerun_unknown') THEN 'deploy_failed'
+    WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('failed','blocked','blocked_verification','dispatch_unknown','rerun_unknown') THEN 'release_failed'
     WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('pending','dispatching','submitted','queued','running','rerunning','rolling_back','waiting_target','waiting_verification','waiting_release') THEN 'deploying'
     WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('pending','dispatching','submitted','queued','running','rerunning','waiting_verification') THEN 'releasing'
     ELSE t.state END AS display_state FROM tasks t LEFT JOIN runs r

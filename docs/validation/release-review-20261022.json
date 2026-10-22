@@ -48,6 +48,24 @@
         "tests/test_updates_recovery.py:230"
       ],
       "verification": "The final independent 42-test run includes five handoff/race regressions and execution of the actual read-only installed 0.3.0 supervisor against a temporary candidate copied from the feature implementation with version changed to 0.3.1. Across 48 real HTTP state polls (4 busy), only one serve subprocess was started, no replacement update-worker was started, installation became nonbusy, the journal was removed, and the database sentinel was preserved."
+    },
+    {
+      "priority": "P1",
+      "title": "An explicitly rejected rerun could remain permanently in rerunning",
+      "original_evidence": "retry persisted rerunning before POST. A GitHub rejection left that state in storage, while reconcile refused the unchanged attempt and future retries could not send a corrected request.",
+      "resolution": "The actual gh API subprocess boundary classifies explicit 4xx HTTP rejection except 408. Rejection restores failed, or nested rollback_failed, records the HTTP status and permits a later authorized retry. Network/408/5xx remain uncertain; pending state survives restart and becomes attention state rerun_unknown after five minutes without a new attempt. Manual confirmation reads the same run without reposting; a newer run_attempt confirms the original rerun. The UI separates status confirmation from retry.",
+      "references": [
+        "adaptive_rsi/release.py:20",
+        "adaptive_rsi/release.py:28",
+        "adaptive_rsi/release.py:205",
+        "adaptive_rsi/release.py:422",
+        "adaptive_rsi/dashboard.py:12",
+        "adaptive_rsi/web/app.js:452",
+        "tests/test_release.py:176",
+        "tests/test_release.py:202",
+        "tests/test_release.py:225"
+      ],
+      "verification": "The independent final 51-test run passes actual release.api -> checked -> executable local gh protocol-substitute failures for HTTP403/422 with nonzero exits, then a successful third request; 408/500/network ambiguity, restart persistence, no duplicate reposts, attention projection, nested rollback and attempt-2 reconciliation are covered. Browser validation confirms separate status-only and retry actions. No real GitHub workflow rerun was dispatched."
     }
   ],
   "assessments": [
@@ -66,7 +84,7 @@
     {
       "area": "Durable reconciliation and idempotency",
       "decision": "pass",
-      "reason": "A stable operation ID and dispatch intent are persisted before the remote write. Ambiguous dispatches are reconciled rather than repeated; remote head SHA, workflow path, event and operation title are checked. Confirmed failures rerun the same remote run ID and reconcile run_attempt before another retry. Deployments awaiting an authorized release persist waiting_release and resume only after release success; revoked unissued work stops being scheduled.",
+      "reason": "A stable operation ID and dispatch intent are persisted before the remote write. Ambiguous dispatches are reconciled rather than repeated; remote head SHA, workflow path, event and operation title are checked. Confirmed failures rerun the same remote run ID and reconcile run_attempt before another retry. Deployments awaiting an authorized release persist waiting_release and resume only after release success; revoked unissued work stops being scheduled. Explicit rerun rejection is distinct from an uncertain receipt: known 4xx rejection restores retryable failure; unknown receipts become bounded attention states and manual confirmation never reposts them.",
       "references": [
         "adaptive_rsi/release.py:175",
         "adaptive_rsi/release.py:188",
@@ -127,6 +145,19 @@
         ".github/workflows/release-verify.yml:64",
         "tests/test_release_smoke.py:27"
       ]
+    },
+    {
+      "area": "Unconfirmed rerun attention and UI contract",
+      "decision": "pass",
+      "reason": "rerun_unknown stops automatic tracking, appears in attention, and offers a bilingual confirmation action that only asks the backend to reconcile. Nested rollback uncertainty uses the same rule, while confirmed rollback failure has a separate restoration-retry action. Original errors remain in run evidence; the UI explains uncertain startup in the selected language.",
+      "references": [
+        "adaptive_rsi/dashboard.py:12",
+        "adaptive_rsi/release.py:214",
+        "adaptive_rsi/release.py:456",
+        "adaptive_rsi/web/app.js:452",
+        "adaptive_rsi/web/i18n.js:4",
+        "tests/browser_smoke.cjs:34"
+      ]
     }
   ],
   "verification": [
@@ -175,6 +206,26 @@
       "result": "22 tests passed; five new metadata tests exercised the actual urllib opener with an in-memory HTTPS transport: optional token on the single fixed request, no Authorization on asset download, no redirect follow for 301/302/303/307/308, 404 distinct from 401/403/429/500, and oversized or malformed responses rejected.",
       "duration_seconds": 17.287,
       "log": "/tmp/rsi-release-token-independent-review.log"
+    },
+    {
+      "kind": "independent final combined regression after external review findings",
+      "command": "RSI_LEGACY_SOURCE='/Users/neg-entropy/.local/share/adaptive-rsi/installations/local-0.3.0-server-final-k18r4ute/adaptive-rsi' PYTHONDONTWRITEBYTECODE=1 python3.12 -m unittest tests.test_updates_recovery tests.test_controls.UpdatesTest tests.test_release tests.test_release_smoke -v",
+      "result": "51 tests passed, zero skips. Includes actual legacy-supervisor handoff, rerun rejection/uncertainty regressions, guarded update recovery, and metadata-token boundary tests.",
+      "duration_seconds": 26.827,
+      "log": "/tmp/rsi-release-final-51-independent-review.log",
+      "legacy_evidence": {
+        "candidate_test_version": "0.3.1",
+        "state_polls": 46,
+        "busy_polls": 5,
+        "spawned_serve_processes": 1,
+        "sentinel_preserved": true
+      }
+    },
+    {
+      "kind": "independent release UI follow-up",
+      "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+      "result": "Passed four release UI cases: top-level rerun_unknown, nested rollback rerun_unknown, confirmed failed release, confirmed rollback_failed. Only release status/retry routes are controlled; assertions distinguish confirmation explanations/actions and actual retry actions.",
+      "log": "/tmp/rsi-auth-rerun-ui-independent-review.log"
     }
   ],
   "boundaries": [
@@ -184,10 +235,11 @@
     "Update checksums come from the same official GitHub Release and are not an independent release signature. Unknown migration schemas, missing backups or unverifiable committed children require manual recovery rather than unsafe automatic rollback.",
     "This report reviews the file hashes listed below. Later implementation changes require an appropriate follow-up review.",
     "The real legacy handoff test used temporary state and current feature code with only its copied version metadata changed to 0.3.1. It is not evidence of an official 0.3.0-to-0.4.0 release-asset upgrade or a change to the live user service.",
-    "The metadata-authentication follow-up does not reinterpret an anonymous GitHub 403 as release absence. The parent separately observed authenticated API 404 (no formal release at that time); the final exact-archive real smoke is a separate validation run and is not claimed by the reviewer-owned transport tests."
+    "The metadata-authentication follow-up does not reinterpret an anonymous GitHub 403 as release absence. The parent separately observed authenticated API 404 (no formal release at that time); the final exact-archive real smoke is a separate validation run and is not claimed by the reviewer-owned transport tests.",
+    "Rerun failure verification uses a local executable gh protocol substitute to exercise actual process exit/stderr classification and persistent runtime state. Browser release substitutes prove DOM/request choice only; this reviewer did not request a real GitHub rerun."
   ],
   "reviewed_file_sha256": {
-    "adaptive_rsi/release.py": "6bc8f78cd9b0f2aa09c54f9838a418a554f1a7819c77963477d9278255a1e5d6",
+    "adaptive_rsi/release.py": "f269b4cbffe84cb57cceaf8bcf5f262d1ad294ef6d2f49109db0613cc8972422",
     "adaptive_rsi/config.py": "4a311e2825295921f19f1e8584163d99ea499803e60a8adc2e4811927f571b2f",
     "adaptive_rsi/delivery.py": "998dd5c6c0eceabb69dc87d1245e1b65a55d72a61936799aaf2305e264eb3dd4",
     "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
@@ -199,11 +251,14 @@
     ".github/workflows/release.yml": "75f758331397aa0e2f7d0b1252b150d6a92c46896be0f7d645cd29ed17d47e3b",
     ".github/workflows/release-verify.yml": "d002aa2915f13973b465000dae006c37abdef667c7a3204190e771015cc4e40b",
     ".github/workflows/checks.yml": "3651aeb9fd2583b84abd472d0396990ca99d81bd576285e113e85da477652d8f",
-    "RELEASING.md": "0d270ee80530d9dcba5894369e6b5964ca93f8318cc2f55b5f96413ea8e05103",
-    "RELEASING.en.md": "6347c466e9ff2d57f46eca438a381a7f9571bdfa61dbbe86259040e61140411b",
-    "tests/test_release.py": "708c649bc385022c074f4f537f21e6b48fc5af7939bf07259e451037f026a2cb",
+    "RELEASING.md": "5e9f90c8594f98604b8e0f7a87d75d012ef5171e97c181a44ad2672bd840cc0c",
+    "RELEASING.en.md": "f707614a1f3da61de216df7b3062f540f6bb01ca12d3a4e65327e83fbed0985e",
+    "tests/test_release.py": "e1ef034563380a986813ce06f112ae02e0782129bc9e46d421d04d7d26022261",
     "tests/test_updates_recovery.py": "e48a113f9c485727135ee7de09bef5fc08523991a3dfafd1522693e0da83631e",
     "tests/test_controls.py": "c3e7afb1436ea9fb3999661869748e3f5015d76982dab7768b7c5f60b466fd15",
-    "tests/test_release_smoke.py": "572b9301a26b8e6150925fd6a42b086f044030d6e0a716233d61816dafba244f"
+    "tests/test_release_smoke.py": "572b9301a26b8e6150925fd6a42b086f044030d6e0a716233d61816dafba244f",
+    "adaptive_rsi/dashboard.py": "c2cec1cbb5cfd0c4da456adf001582c3b0782d19f748bd868b9657e18a9223ad",
+    "adaptive_rsi/web/app.js": "52033a191793157db36d7f23bb14a5511542158f85073132899cc21bd0d6e505",
+    "adaptive_rsi/web/i18n.js": "9c10d72d0f0a093d4da49930c95cbcabeb772456ae3fcf2b231f3c1238ffd03b"
   }
 }

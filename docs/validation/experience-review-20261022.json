@@ -1,13 +1,13 @@
 {
   "review": "experience-independent-review",
-  "frozen_at": "2026-10-22T04:00:22.338756+00:00",
+  "frozen_at": "2026-10-22T04:31:47.361611+00:00",
   "reviewer": "simple_ui agent; reviewed implementation owned by parent agent",
   "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
   "source_sha256": {
     "adaptive_rsi/discovery.py": "722001a244433e22e0d8f293251ef30f6363a15f9c9a17725eecdba4d61dee83",
     "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
     "adaptive_rsi/pipeline.py": "a9b704d99ee83f0029317961c363c351e8b77a46ec81f3c105e0bf573f42108a",
-    "adaptive_rsi/dashboard.py": "4452ed0a5883292c3e918cd7626cfa1a6807aeb8b320b500070bf25a6bd3e96f",
+    "adaptive_rsi/dashboard.py": "c2cec1cbb5cfd0c4da456adf001582c3b0782d19f748bd868b9657e18a9223ad",
     "adaptive_rsi/server.py": "7cd25fb858f7164f04570798b7a673ac2e5f4e1cadd3bb89ddc09bb5105525c4",
     "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a",
     "tests/test_reliability.py": "3ad7dfbb5658858ce882f0b5f62e4eae2b4cec62fdc38cffc0055d42bab3e2a5"
@@ -92,5 +92,58 @@
     "Fixture model and HTTP-auth backend responses verify control flow, not a real supplier account login or paid model quality.",
     "The route tests assume the product single trusted controller/operator access model; they do not establish a multi-tenant authorization boundary.",
     "Release workflow execution and actual health-check/rollback integration are outside this review scope and are covered separately by the release implementer/reviewer."
-  ]
+  ],
+  "browser_contract_followup": {
+    "reviewed_at": "2026-10-22T04:31:47.361611+00:00",
+    "trigger": "PR10 review https://github.com/Haoog/Adaptive-RSI/pull/10#discussion_r4344464624 identified Codex provider empty-string request rejected by real AuthSessions.start.",
+    "source_sha256": {
+      "adaptive_rsi/web/auth.js": "27b953be45491ba8dbced9cd1b69471b947c6fb092c1817c8cd82e739132bb29",
+      "adaptive_rsi/web/app.js": "52033a191793157db36d7f23bb14a5511542158f85073132899cc21bd0d6e505",
+      "adaptive_rsi/web/i18n.js": "9c10d72d0f0a093d4da49930c95cbcabeb772456ae3fcf2b231f3c1238ffd03b",
+      "tests/browser_fixture.py": "4dcdbc3329fe1c5eda480d67140ea5555200f2a9621787405ce977e951da3c33",
+      "tests/browser_smoke.cjs": "fdf50d7069afa7d699f6f8187429026d34444b04e7552e55a092155446d5e236"
+    },
+    "prior_gap": "Controlled browser auth route responses verified UI state behavior but did not enforce the real backend Codex provider contract.",
+    "fix": "Codex login and logout requests send provider:null; OpenCode keeps the selected provider ID. Internal session keys preserve existing null/empty metadata recovery behavior.",
+    "http_integration": "Browser clicks the production Codex button and sends actual authenticated/CSRF-protected HTTP through Server and AuthSessions.start. Only the external auth worker is replaced. Isolated CODEX_HOME/XDG_DATA_HOME prevent reading or mutating user accounts. The test verifies HTTP200, provider:null, rendered device code, cancellation and a new login session.",
+    "validation": [
+      {
+        "command": "RSI_BROWSER_CODEX_HTTP_ONLY=1 npm run test:browser",
+        "result": "passed; no auth endpoint interception"
+      },
+      {
+        "method": "browser-only auth.js mutation restoring original empty provider; all auth HTTP remains real",
+        "result": "same new integration test failed as expected with HTTP400 invalid_provider; production files were not changed for mutation"
+      },
+      {
+        "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+        "result": "passed; mocked release-status/retry only; release.rerun_unknown and nested rollback.rerun_unknown show read-only confirmation explanation; each button sends only /api/release-retry; failed release and rollback_failed keep explicit retry actions"
+      },
+      {
+        "command": "npm run test:browser",
+        "result": "passed with all new cases and full existing forms, settings, project isolation, language and mobile checks; zero paid model calls"
+      },
+      {
+        "method": "independent dashboard projection of release/deploy rerun_unknown in temporary Store",
+        "result": "both appear in attention as release_failed/deploy_failed; neither appears in history"
+      },
+      {
+        "command": "node --check adaptive_rsi/web/auth.js; node --check tests/browser_smoke.cjs; git diff --check",
+        "result": "passed"
+      }
+    ],
+    "limits": [
+      "Auth worker replacement verifies UI/HTTP/backend parameter compatibility and lifecycle, not supplier OAuth success.",
+      "Mocked release responses verify DOM actions and HTTP request selection, not GitHub workflow state transitions; release backend review is separate."
+    ],
+    "independent_reverification": {
+      "reviewer": "browser_login agent; did not implement production UI fix",
+      "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+      "result": "passed; includes preceding real HTTP Codex button case and all four release confirmation/retry DOM cases",
+      "source_audit": "independent reviewer confirmed top-level and followup hashes match current source; no blocking findings in auth.js/app.js/i18n.js UI diff",
+      "evidence_log": "/tmp/rsi-auth-rerun-ui-independent-review.log",
+      "mutation_result": "Independent reviewer replaced only browser-loaded auth.js with original empty provider; unmocked auth HTTP rejected it with HTTP400 invalid_provider, and the regression failed as expected.",
+      "mutation_log": "/tmp/rsi-codex-original-provider-mutation.log"
+    }
+  }
 }

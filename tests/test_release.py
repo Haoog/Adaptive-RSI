@@ -2,7 +2,9 @@ import base64
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 import unittest
@@ -10,7 +12,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.gitops import git
-from adaptive_rsi.release import advance, authorize_workflow, health_check, key, pending, retry, workflow_choices
+from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, health_check, key, pending, retry, workflow_choices
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
 from adaptive_rsi.updates import automatic_allowed
@@ -150,12 +152,98 @@ class ReleaseAutomationTest(unittest.TestCase):
             reruns = [item for item in self.commands if item[0].endswith("/rerun")]
             self.assertEqual(len(reruns), 1)
             self.assertEqual(reruns[0][0], "actions/runs/17/rerun")
-            with self.assertRaisesRegex(ValueError, "confirmed failed"):
-                retry(self.runtime, self.project, self.run["id"], "release")
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerunning")
             self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 1)
             self.runtime.configure({"delivery": {"release": {"enabled": False}}}, self.project)
             with self.assertRaisesRegex(ValueError, "revoked"):
                 retry(self.runtime, self.project, self.run["id"], "release")
+
+    def rerun_process_fixture(self):
+        executable = self.root / "gh"
+        executable.write_text("#!" + sys.executable + "\nimport os,sys\n"
+                              "status=os.environ['RSI_RERUN_RESPONSE']\n"
+                              "if status != '204':\n"
+                              "    print('gh: rejected (HTTP '+status+')' if status.isdigit() else 'connection reset after request', file=sys.stderr)\n"
+                              "    sys.exit(1)\n")
+        executable.chmod(0o700)
+        def boundary(repo, endpoint, method="GET", fields=None):
+            result = self.api(repo, endpoint, method, fields)
+            if endpoint.endswith("/rerun"):
+                return real_api(repo, endpoint, method, fields)
+            return result
+        return boundary
+
+    def test_explicit_rerun_rejection_via_real_cli_boundary_restores_failed_and_can_retry(self):
+        boundary = self.rerun_process_fixture()
+        with patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}), patch("adaptive_rsi.release.api", side_effect=boundary):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, conclusion="failure")
+            self.tick()
+            for code in [403, 422]:
+                with self.subTest(code=code), patch.dict(os.environ, {"RSI_RERUN_RESPONSE": str(code)}), self.assertRaises(ApiRejected):
+                    retry(self.runtime, self.project, self.run["id"], "release")
+                saved = self.runtime.store.setting(key(self.run["id"], "release"))
+                self.assertEqual(saved["state"], "failed")
+                self.assertFalse(saved["rerun_pending"])
+                self.assertEqual(saved["rerun_http_status"], code)
+                self.assertEqual(saved["rerun_receipt"], "rejected")
+            with patch.dict(os.environ, {"RSI_RERUN_RESPONSE": "204"}):
+                self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerunning")
+            self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 3)
+
+    def test_timeout_or_server_error_is_not_classified_as_confirmed_rejection(self):
+        self.rerun_process_fixture()
+        for response in ["408", "500", "network"]:
+            with self.subTest(response=response), patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"], "RSI_RERUN_RESPONSE": response}):
+                with self.assertRaises(RuntimeError) as error:
+                    real_api("example/project", "actions/runs/17/rerun", "POST")
+                self.assertNotIsInstance(error.exception, ApiRejected)
+
+    def test_unknown_rerun_is_durable_becomes_attention_and_manual_reconcile_never_reposts(self):
+        from adaptive_rsi.dashboard import records
+        boundary = self.rerun_process_fixture()
+        with patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"], "RSI_RERUN_RESPONSE": "network"}), patch("adaptive_rsi.release.api", side_effect=boundary):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, conclusion="failure")
+            self.tick()
+            with self.assertRaises(RuntimeError):
+                retry(self.runtime, self.project, self.run["id"], "release")
+            self.runtime.close()
+            self.runtime = Runtime(Store(self.root / "state"))
+            self.assertEqual(self.tick()["release"]["state"], "rerunning")
+            with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
+                self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
+            self.assertFalse(pending(self.runtime, self.run))
+            self.assertEqual(records(self.runtime.store, self.project)["tasks"][0]["display_state"], "release_failed")
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerun_unknown")
+            self.remote = self.remote_run(first, attempt=2)
+            reconciled = retry(self.runtime, self.project, self.run["id"], "release")
+            self.assertEqual(reconciled["state"], "workflow_succeeded")
+            self.assertFalse(reconciled["rerun_pending"])
+            self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 1)
+
+    def test_rollback_rerun_rejection_and_unknown_are_not_stuck_rolling_back(self):
+        from adaptive_rsi.release import save
+        self.setup_deployment(rollback=True)
+        boundary = self.rerun_process_fixture()
+        with patch.dict(os.environ, {"PATH": str(self.root) + os.pathsep + os.environ["PATH"]}), patch("adaptive_rsi.release.api", side_effect=boundary):
+            data = self.tick()["deploy"]
+            rollback = {**data, "sha": PREVIOUS, "operation_id": data["operation_id"] + "-rollback", "state": "failed", "workflow_run_id": 17, "attempt": 1}
+            data.update(state="rollback_failed", rollback=rollback)
+            save(self.runtime, self.run, "deploy", data)
+            self.remote = self.remote_run(rollback, conclusion="failure")
+            with patch.dict(os.environ, {"RSI_RERUN_RESPONSE": "403"}), self.assertRaises(ApiRejected):
+                retry(self.runtime, self.project, self.run["id"], "deploy")
+            self.assertEqual(self.runtime.store.setting(key(self.run["id"], "deploy"))["state"], "rollback_failed")
+            with patch.dict(os.environ, {"RSI_RERUN_RESPONSE": "network"}), self.assertRaises(RuntimeError):
+                retry(self.runtime, self.project, self.run["id"], "deploy")
+            with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
+                result = self.tick()["deploy"]
+            self.assertEqual(result["state"], "rollback_failed")
+            self.assertEqual(result["rollback"]["state"], "rerun_unknown")
+            self.assertFalse(pending(self.runtime, self.run))
+            retry(self.runtime, self.project, self.run["id"], "deploy")
+            self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 2)
 
     def test_authorization_is_not_inherited_or_granted_by_task_overrides(self):
         with self.assertRaisesRegex(ValueError, "per project"):

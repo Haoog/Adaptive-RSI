@@ -33,6 +33,8 @@ The workflow must already exist on that repository's default branch. The control
 
 Operation state, exact target SHA, workflow version, stable operation ID, GitHub run ID/attempt, URL and errors persist across service restarts. Timeouts cannot prove GitHub rejected a request: `dispatch_unknown` reconciles by stable ID and never blindly dispatches twice. If reconciliation cannot establish the result, inspect the original workflow rather than forcing another release. Confirmed failed workflows retry through the same GitHub run ID; repeated clicks do not duplicate an unacknowledged rerun.
 
+An explicit GitHub 4xx rerun rejection (except 408 timeout) restores failure and records the HTTP status, allowing another retry after the cause is addressed. Network errors, 408 and 5xx cannot prove rejection; only a newer attempt on the same run confirms execution. After five minutes without one, `rerun_unknown` stops automatic polling and requires inspection on GitHub. Manual reconciliation only reads the result and never resends an uncertain request. The same rules apply to rollback workflows.
+
 ## Deployment health and rollback
 
 Without `delivery.deploy.health_url`, workflow success remains `workflow_succeeded` with health `unverified`. Users may explicitly configure a fixed HTTPS health URL without credentials, query, fragment or cross-origin redirects. The endpoint must return HTTP 200 and JSON `{"sha":"full deployed SHA","healthy":true}` (`status: "ok"` is also accepted). Only an exact version match becomes `healthy`; timeouts, invalid responses and old SHAs fail health verification.

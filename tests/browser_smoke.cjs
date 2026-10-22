@@ -4,11 +4,68 @@ const {createInterface} = require('node:readline');
 const {chromium} = require('playwright');
 const fs = require('node:fs');
 
+async function checkCodexHTTPLogin(browser,url,errors){
+ const page=await browser.newPage({viewport:{width:1100,height:900}});
+ page.on('pageerror',error=>errors.push(error.message));
+ try{
+  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();
+  await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
+  const start=async()=>{
+   const response=page.waitForResponse(response=>response.url().endsWith('/api/auth/start')&&response.request().method()==='POST');
+   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
+   const started=await response;assert.equal(started.status(),200,await started.text());
+   assert.deepEqual(started.request().postDataJSON(),{backend:'codex',provider:null,method:0,inputs:{}});
+   const session=await started.json();assert.equal(session.backend,'codex');assert.equal(session.provider,null);
+   await page.locator('.mc-auth-code').filter({hasText:'HTTP-TEST-CODE'}).waitFor();return session.id;
+  };
+  const cancel=async(id)=>{
+   const response=page.waitForResponse(response=>response.url().endsWith('/api/auth/cancel')&&response.request().method()==='POST');
+   await page.getByRole('button',{name:'取消登录',exact:true}).click();const cancelled=await response;
+   assert.equal(cancelled.status(),200,await cancelled.text());assert.equal((await cancelled.json()).id,id);
+   await page.locator('#mc-auth').filter({hasText:'已取消登录'}).waitFor();
+  };
+  const first=await start();await cancel(first);const second=await start();assert.notEqual(second,first);await cancel(second);
+ }finally{await page.close();}
+}
+
+async function checkReleaseRetryUI(browser,url,errors){
+ const page=await browser.newPage({viewport:{width:1100,height:900}}),writes=[];
+ let automation={};
+ page.on('pageerror',error=>errors.push(error.message));
+ page.on('request',request=>{if(request.method()==='POST')writes.push({path:new URL(request.url()).pathname,body:request.postDataJSON()});});
+ const reply=(route,data)=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+ await page.route('**/api/release-status?*',route=>reply(route,automation));
+ await page.route('**/api/release-retry',route=>reply(route,{ok:true}));
+ try{
+  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.locator('[data-task-filter="attention"]').click();
+  const project=await page.locator('#project-select').inputValue();
+  for(const test of [
+   {kind:'release',operation:{state:'rerun_unknown',workflow_run_id:17},label:'重新确认状态',explanation:true},
+   {kind:'deploy',operation:{state:'rollback_failed',rollback:{state:'rerun_unknown',workflow_run_id:18}},label:'重新确认状态',explanation:true},
+   {kind:'release',operation:{state:'failed',workflow_run_id:19},label:'重试 · 发布'},
+   {kind:'deploy',operation:{state:'rollback_failed',rollback:{state:'failed',workflow_run_id:20}},label:'重试恢复旧版本'}
+  ]){
+   automation={[test.kind]:test.operation};
+   await page.locator('#tasks-list .task-title').filter({hasText:'等待修复线上检查'}).click();
+   const section=page.locator('#detail-dialog .release-outcome');await section.getByRole('button',{name:test.label,exact:true}).waitFor();
+   if(test.explanation)assert.match(await section.innerText(),/重新确认只查询状态，不会再次启动/);
+   const before=writes.length,response=page.waitForResponse(response=>response.url().endsWith('/api/release-retry')),refreshed=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/release-status');
+   await section.getByRole('button',{name:test.label,exact:true}).click();assert.equal((await response).status(),200);
+   await refreshed;
+   await section.getByRole('button',{name:test.label,exact:true}).waitFor();
+   assert.deepEqual(writes.slice(before),[{path:'/api/release-retry',body:{project,run:'browser-ci',kind:test.kind}}]);
+   await page.locator('#detail-dialog .close-dialog').click();
+  }
+ }finally{await page.close();}
+}
+
 async function checkAccountAndReleaseUI(browser,url,errors){
  const page=await browser.newPage({viewport:{width:1100,height:900}}),requests=[];
  page.on('pageerror',error=>errors.push(error.message));
  let signedIn=false,complete=false,authActive=false,releaseStarted;
- const session={id:'browser-auth-session',backend:'codex',provider:'',state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
+ const session={id:'browser-auth-session',backend:'codex',provider:null,state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
  const reply=(route,data)=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
  await page.route('**/api/auth/**',async route=>{
   const path=new URL(route.request().url()).pathname,body=route.request().postDataJSON();requests.push({path,body});
@@ -38,7 +95,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();await code.fill('official-code');await page.getByRole('button',{name:'完成授权',exact:true}).click();
   await page.locator('#mc-auth').filter({hasText:'账号已连接'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/complete')).body.code,'official-code');
   await page.waitForFunction(()=>document.getElementById('mc-feedback').textContent.includes('模型列表已更新'));assert.equal(catalogs,1);assert.equal(probes,0);
-  await page.getByRole('button',{name:'退出账号',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'尚未登录'}).waitFor();
+  await page.getByRole('button',{name:'退出账号',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'尚未登录'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/logout')).body.provider,null);
   await page.getByRole('button',{name:'OpenCode',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('github-copilot');
   const domain=page.getByLabel('Enterprise domain');assert.equal(await domain.isVisible(),false);await page.getByLabel('Account type').selectOption('enterprise');await domain.fill('github.example.com');
   await page.getByRole('button',{name:'官方登录 · Device login',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('openai');
@@ -79,6 +136,10 @@ async function main() {
       await page.waitForFunction(()=>!document.getElementById('settings-save').disabled);
     };
     page.on('pageerror', error => errors.push(error.message));
+    await checkCodexHTTPLogin(browser,url,errors);
+    if(process.env.RSI_BROWSER_CODEX_HTTP_ONLY){assert.deepEqual(errors,[]);console.log('Real HTTP Codex button checks passed.');return;}
+    await checkReleaseRetryUI(browser,url,errors);
+    if(process.env.RSI_BROWSER_RELEASE_RETRY_ONLY){assert.deepEqual(errors,[]);console.log('Release confirmation and retry UI checks passed.');return;}
     if(process.env.RSI_BROWSER_AUTH_ONLY){await checkAccountAndReleaseUI(browser,url,errors);assert.deepEqual(errors,[]);console.log('Targeted account and release UI checks passed.');return;}
     await page.goto(url);
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();

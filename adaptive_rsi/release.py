@@ -13,14 +13,29 @@ from .store import encode
 
 
 KINDS = ("release", "deploy")
-TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked"}
+TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked", "rerun_unknown"}
+RERUN_CONFIRM_SECONDS = 300
+
+
+class ApiRejected(RuntimeError):
+    """GitHub explicitly rejected a request before accepting its side effect."""
+
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
 
 
 def api(repo, endpoint, method="GET", fields=None):
     argv = ["gh", "api", "repos/" + repo + "/" + endpoint, "--method", method]
     for key, value in (fields or {}).items():
         argv += ["-f", key + "=" + str(value)]
-    output = checked(argv)
+    try:
+        output = checked(argv)
+    except RuntimeError as exc:
+        status = re.search(r"\(HTTP (\d{3})\)", str(exc))
+        if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
+            raise ApiRejected(str(exc), int(status[1])) from exc
+        raise
     return json.loads(output) if output.strip() else {}
 
 
@@ -125,7 +140,7 @@ def pending(runtime, run):
         if data.get("state") == "health_failed":
             if data.get("rollback_unavailable") or not delivery[kind].get("automatic_rollback"):
                 continue
-        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "rolled_back", "rollback_failed", "superseded"}:
+        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "rolled_back", "rollback_failed", "superseded", "rerun_unknown"}:
             return True
     return False
 
@@ -196,8 +211,14 @@ def reconcile(runtime, run, kind, data, persist=True):
     if (remote.get("head_sha") != data["workflow_sha"] or remote.get("display_title") != data["operation_id"] or
             remote.get("event") != "workflow_dispatch" or remote.get("path", "").split("@")[0] != data["workflow"]):
         raise ValueError("Workflow run identity differs from the authorized operation")
-    if data.get("state") == "rerunning" and remote.get("run_attempt", 1) <= data.get("previous_attempt", 1):
-        return data
+    if data.get("rerun_pending") or data.get("state") in {"rerunning", "rerun_unknown"}:
+        if remote.get("run_attempt", 1) <= data.get("previous_attempt", 1):
+            requested = data.setdefault("rerun_requested_at", data.get("checked_at", time.time()))
+            data.update(rerun_pending=True, checked_at=time.time())
+            if time.time() - requested >= RERUN_CONFIRM_SECONDS:
+                data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
+            return save(runtime, run, kind, data) if persist else data
+        data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
     data.update(workflow_run_id=remote["id"], url=remote.get("html_url", ""),
                 attempt=remote.get("run_attempt", 1), checked_at=time.time(), conclusion=remote.get("conclusion"))
     if remote.get("status") == "completed":
@@ -302,8 +323,10 @@ def deployment_health(runtime, project, run, data, policy, cancel):
     if data["state"] == "rolling_back":
         rollback = reconcile(runtime, run, "deploy", data["rollback"], persist=False)
         data["rollback"] = rollback
-        if rollback["state"] == "failed":
+        if rollback["state"] in {"failed", "rerun_unknown"}:
             data["state"] = "rollback_failed"
+            if rollback["state"] == "rerun_unknown":
+                data["error"] = rollback["error"]
         elif rollback["state"] == "workflow_succeeded":
             authorized(runtime, project, run, "deploy", policy, cancel)
             rollback["health"] = health_check(policy["health_url"], rollback["sha"])
@@ -327,7 +350,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                 data = {"state": state, "error": "Post-merge verification must pass before release/deploy"}
                 result[kind] = save(runtime, run, kind, data)
                 continue
-            if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning"}:
+            if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}:
                 data = reconcile(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
                 data = deployment_health(runtime, project, run, data, policy, cancel)
@@ -430,15 +453,37 @@ def retry(runtime, project_id, run_id, kind):
                 save(runtime, run, kind, data)
                 runtime.wake.set()
                 return data
+        unconfirmed_rerun = target.get("rerun_pending") or target.get("state") in {"rerunning", "rerun_unknown"}
         target = reconcile(runtime, run, kind, target, persist=False)
+        if unconfirmed_rerun:
+            if target is not data:
+                data.update(state="rollback_failed" if target["state"] in {"failed", "rerun_unknown"} else "rolling_back", rollback=target, error=target.get("error", ""))
+            save(runtime, run, kind, data)
+            runtime.wake.set()
+            return data
         if target.get("state") != "failed" or not target.get("workflow_run_id"):
             raise ValueError("Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation")
         validate_pin(repo, policy)
         authorized(runtime, project, run, kind, policy)
-        target.update(state="rerunning", error="", previous_attempt=target.get("attempt", 1))
+        target.update(state="rerunning", error="", previous_attempt=target.get("attempt", 1),
+                      rerun_pending=True, rerun_receipt="pending", rerun_requested_at=time.time())
         if target is not data:
             data.update(state="rolling_back", rollback=target)
         save(runtime, run, kind, data)
-        api(repo, "actions/runs/" + str(target["workflow_run_id"]) + "/rerun", "POST")
+        try:
+            api(repo, "actions/runs/" + str(target["workflow_run_id"]) + "/rerun", "POST")
+        except ApiRejected as exc:
+            target.update(state="failed", error=str(exc)[:500], rerun_pending=False, rerun_receipt="rejected", rerun_http_status=exc.status)
+            if target is not data:
+                data.update(state="rollback_failed", error=target["error"], rollback=target)
+            save(runtime, run, kind, data)
+            raise
+        except Exception as exc:
+            target.update(error=str(exc)[:500], rerun_receipt="unknown")
+            save(runtime, run, kind, data)
+            runtime.wake.set()
+            raise
+        target["rerun_receipt"] = "accepted"
+        save(runtime, run, kind, data)
         runtime.wake.set()
         return data

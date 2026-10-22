@@ -34,7 +34,7 @@ window.RSIAuth = (() => {
     if(next.state==='completed'){readinessCache.clear();await status(true);await session.refresh();}render();schedule();
   }
   async function start(method,inputs={}){
-    const current={...context},session=await mutate('start',{backend:current.backend,provider:current.provider,method:method.index,inputs});
+    const current={...context},session=await mutate('start',{backend:current.backend,provider:current.backend==='codex'?null:current.provider,method:method.index,inputs});
     sessions.set(current.backend+':'+(current.provider||''),{...session,refresh:current.refresh});render();schedule();
   }
   function render(){
@@ -74,7 +74,7 @@ window.RSIAuth = (() => {
       if(session.error)box.append(el('p',t(authErrors[session.error]||session.error),'mc-error'));
     }
     if(running)return;
-    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
+    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
     const methods=backend==='codex'?[{index:0,type:'oauth',supported:true,label:t('前往 Codex 官方登录')}]:providers?.find(p=>p.id===context.provider)?.methods||[];
     for(const method of methods){
       if(method.type==='api'){

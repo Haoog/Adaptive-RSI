@@ -33,6 +33,8 @@ GitHub 必须允许 Actions 创建 PR，并允许既定工作流申请对应仓�
 
 操作状态、精确目标 SHA、工作流版本、稳定操作 ID、GitHub run ID/attempt、URL 和错误持久保存。服务重启后按稳定 ID 对账。超时不能证明请求未到达 GitHub，因此 `dispatch_unknown` 会继续查询，绝不盲目重复触发；无法对账时应检查原工作流，不能用“重试”强行创建第二次发布。确认失败的工作流通过同一个 run ID 的 GitHub rerun 重试；重复点击不会重复发出尚未确认的 rerun。
 
+GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并保留 HTTP 状态，可修正原因后再重试。网络中断、408 或 5xx 不能证明请求未被接受，系统只核对同一 run 的 attempt；五分钟仍无新 attempt 则进入 `rerun_unknown`，停止自动轮询并提示到 GitHub 核对。此时“对账”只读取结果，绝不重新发送不确定的请求；回退工作流同样适用。
+
 ## 部署健康与回退
 
 没有 `delivery.deploy.health_url` 时，成功状态仅为 `workflow_succeeded`，健康证据为 `unverified`。用户可明确配置固定 HTTPS 健康地址，不接受 URL 凭据、query、fragment 或跨 origin 重定向。端点必须返回 HTTP 200 和 JSON `{"sha":"完整部署SHA","healthy":true}`（也接受 `status: "ok"`），只有精确版本匹配才记为 `healthy`。网络超时、无效响应或旧 SHA 都记为健康失败。

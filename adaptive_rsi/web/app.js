@@ -422,7 +422,7 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{button.disabled=false;}},event.target);});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));},event.target);});
 const updateNames={recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
-const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
+const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
 let releaseWorkflowSequence=0;
 async function loadReleaseWorkflows(){
  const project=projectId,ticket=++releaseWorkflowSequence;if(!project||$('config-scope').value!=='project')return;
@@ -449,12 +449,14 @@ async function renderReleaseOutcome(node,run,project){
  if(project!==projectId||!node.isConnected)return;
  const section=el('section',undefined,'release-outcome');section.append(el('h4',t('发布与上线')));
  for(const [kind,title]of [['release','发布'],['deploy','部署']]){const operation=automation[kind];if(!operation)continue;const row=el('div',undefined,'release-status-row');row.append(el('strong',t(title)+' · '),el('span',t(releaseStates[operation.state]||operation.state)));
-  if(operation.error)row.append(el('p',t(apiErrors[operation.error]||operation.error),'form-error'));
+  const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown';
+  if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),'form-error'));
   if(kind==='deploy'&&operation.state==='workflow_succeeded')row.append(el('p',t('部署工作流已完成，服务健康状态尚未验证。'),'muted'));
   if(operation.rollback_unavailable)row.append(el('p',t('没有已验证的历史版本可恢复，请人工检查服务。'),'form-error'));
   if(operation.rollback){const rollback=operation.rollback;row.append(el('p',t('恢复旧版本')+' · '+t(releaseStates[rollback.state]||rollback.state)));}
   if(operation.url&&/^https:\/\/github\.com\//.test(operation.url)){const link=el('a',t('查看 GitHub 工作流'));link.href=operation.url;link.target='_blank';link.rel='noreferrer';row.append(link);}
-  if(operation.state==='failed'&&operation.workflow_run_id)row.append(action(t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
+  if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));
+  if(rerunUnknown||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
   if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{$('detail-dialog').close();changeSettingsScope('project');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
   section.append(row);
  }node.append(section);

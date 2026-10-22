@@ -1,6 +1,6 @@
 {
   "review": "browser-login-independent-review",
-  "frozen_at": "2026-10-22T04:22:01.893246+00:00",
+  "frozen_at": "2026-10-22T04:35:53.390449+00:00",
   "reviewer": "simple_ui agent; authentication backend implemented by browser_login agent",
   "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
   "source_sha256": {
@@ -11,7 +11,10 @@
     "adaptive_rsi/opencode.py": "4628dd80e6c80538f9112f38c495afffba8308755476626a253f548d78a81952",
     "adaptive_rsi/cli_worker.py": "def9219311072a7e85ed3d1d3e6ed794b80045d6d0af29d1735dde2a042b971a",
     "tests/test_auth_sessions.py": "4acfb6886fd44a26f961dc47965f98de42faabd11123b3bd293aa83bf4afd00c",
-    "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a"
+    "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a",
+    "adaptive_rsi/web/auth.js": "27b953be45491ba8dbced9cd1b69471b947c6fb092c1817c8cd82e739132bb29",
+    "tests/browser_fixture.py": "4dcdbc3329fe1c5eda480d67140ea5555200f2a9621787405ce977e951da3c33",
+    "tests/browser_smoke.cjs": "fdf50d7069afa7d699f6f8187429026d34444b04e7552e55a092155446d5e236"
   },
   "scope": [
     "认证会话与凭据写入",
@@ -66,6 +69,31 @@
       "regression_tests": [
         "test_delayed_provider_lookup_cannot_save_key_after_service_closes"
       ]
+    },
+    {
+      "id": "AUTH-03",
+      "priority": "P1",
+      "status": "fixed and independently reverified",
+      "reviewer": "browser_login agent independently reviewed the simple_ui-authored UI and browser integration patch; browser_login implemented the original backend.",
+      "original_location": "adaptive_rsi/web/auth.js:37",
+      "issue": "Codex login sent an empty provider string, which real AuthSessions.start rejected with HTTP400 invalid_provider; controlled browser auth responses had not enforced that backend contract.",
+      "before": {
+        "negative_control": "Intercepting only auth.js to restore the original provider-empty expression makes the new integration test fail with real backend HTTP400 invalid_provider. No auth endpoint interception."
+      },
+      "after": {
+        "http_status": 200,
+        "provider": null,
+        "device_code_rendered": true,
+        "cancel_and_relogin_with_new_session": true
+      },
+      "resolution": "Codex start/logout send provider:null; OpenCode preserves its selected provider ID. The browser fixture uses the actual Server and AuthSessions, replacing only the external auth worker and isolating credential directories. Internal session keys remain compatible.",
+      "regression_tests": [
+        "tests/browser_smoke.cjs::checkCodexHTTPLogin"
+      ],
+      "evidence_logs": [
+        "/tmp/rsi-auth-rerun-ui-independent-review.log",
+        "/tmp/rsi-codex-original-provider-mutation.log"
+      ]
     }
   ],
   "validation": [
@@ -105,6 +133,12 @@
     {
       "method": "source inspection plus secret-marked test fixtures",
       "result": "transient device code/URL/callback code absent from session metadata and snapshot; designated credential files mode0600; temporary HOME isolation; stderr/access logging suppression and authenticated loopback OpenCode HTTP checked"
+    },
+    {
+      "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+      "reviewer": "browser_login agent",
+      "result": "Independent real Codex HTTP integration and release DOM cases passed; original empty-provider browser-source mutation was rejected by the real backend as expected.",
+      "log": "/tmp/rsi-auth-rerun-ui-independent-review.log"
     }
   ],
   "limits": [
@@ -147,6 +181,23 @@
     "limits": [
       "Local Python 3.12.13 verification is not a substitute for the pending hosted macOS Python 3.12.10 CI run.",
       "No real supplier account OAuth success or paid model quality is claimed."
+    ]
+  },
+  "browser_contract_followup": {
+    "reviewed_at": "2026-10-22T04:35:53.390449+00:00",
+    "decision": "pass",
+    "reviewer": "browser_login agent",
+    "source_sha256": {
+      "adaptive_rsi/web/auth.js": "27b953be45491ba8dbced9cd1b69471b947c6fb092c1817c8cd82e739132bb29",
+      "tests/browser_fixture.py": "4dcdbc3329fe1c5eda480d67140ea5555200f2a9621787405ce977e951da3c33",
+      "tests/browser_smoke.cjs": "fdf50d7069afa7d699f6f8187429026d34444b04e7552e55a092155446d5e236"
+    },
+    "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+    "result": "Passed. This selector first executes the real authenticated/CSRF-protected Codex HTTP integration with no auth endpoint interception, then separate release DOM cases. Actual backend accepts provider:null, renders the worker device code, cancels, and creates a new login session.",
+    "negative_control": "Independently intercepted only auth.js and restored the original empty-provider expression. The same test failed with real backend HTTP400 invalid_provider. No production file mutation.",
+    "limits": [
+      "The external worker is replaced; this verifies UI/HTTP/backend compatibility and lifecycle, not real supplier OAuth issuance.",
+      "Logout null normalization is source-reviewed and asserted by the existing controlled-response browser logout case."
     ]
   }
 }

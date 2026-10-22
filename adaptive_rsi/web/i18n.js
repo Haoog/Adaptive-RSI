@@ -1,6 +1,10 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+  "重试是否启动仍待确认": "Retry startup is still unconfirmed",
+  "GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。": "GitHub has not confirmed the retry. Check the workflow. Confirming again only reads its status and does not start another run.",
+  "重新确认状态": "Check status again",
+  "重试恢复旧版本": "Retry restoring the previous version",
   "连接工作的模型": "Connect your working model",
   "在页面登录 Codex、OpenCode，或填写 API 密钥。": "Sign in to Codex or OpenCode here, or enter an API key.",
   "连接模型": "Connect a model",
