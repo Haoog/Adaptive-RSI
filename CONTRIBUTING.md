@@ -6,7 +6,7 @@
 
 ## 本地开发
 
-需要 Python 3.9+。完整执行验证环境为 macOS；模型可走已认证的 Codex CLI，或支持工具调用的原生 API。GitHub 导入、同步及确认后的交付使用已登录的 `gh`。日常测试通过替代模型接口运行，不需要付费调用。
+需要 Python 3.9+。支持 macOS Seatbelt 和 Linux Docker；模型可走 Codex、OpenCode CLI 或支持工具调用的原生 API。GitHub 导入、同步及确认后的交付使用已登录的 `gh`。日常测试通过替代模型接口运行，不需要付费调用。
 
 ```sh
 python3 -m unittest discover -v

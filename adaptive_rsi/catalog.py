@@ -228,6 +228,8 @@ def codex_models():
 
 def list_models(provider, key=None):
     if isinstance(provider, str):
+        if provider == "opencode":
+            return opencode_models()
         if provider == "openai":
             models, truncated = codex_models()
             return {"models": models, "truncated": truncated}
@@ -242,3 +244,43 @@ def list_models(provider, key=None):
         raise CatalogError("invalid_provider") from None
     models, truncated = http_models(provider, key)
     return {"models": models, "truncated": truncated}
+
+
+def opencode_models():
+    from pathlib import Path
+    from .cli_worker import cli_home, clean_environment, run_cli
+    from .config import DEFAULTS
+    from .opencode import prepare_home
+    from .process import run_process
+    with tempfile.TemporaryDirectory(prefix="rsi-opencode-models-") as directory:
+        with cli_home(directory) as home:
+            environment, _ = prepare_home(home)
+            binary = shutil.which("opencode")
+            argv = [binary or "opencode", "--pure", "models", "--verbose"]
+            if binary:
+                environment.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+                                    "XDG_DATA_HOME": str(home / ".local/share"), "XDG_CACHE_HOME": str(home / ".cache"),
+                                    "XDG_STATE_HOME": str(home / ".local/state")})
+                result = run_process(argv, directory, timeout=TIMEOUT, env={**clean_environment(), **environment})
+            elif shutil.which("docker"):
+                result = run_cli(argv, directory, home, DEFAULTS, environment=environment, read_only=True, timeout=TIMEOUT)
+            else:
+                raise CatalogError("opencode_missing")
+            if result["exit_code"] or result["error"]:
+                raise CatalogError("opencode_error")
+            text, models = result["stdout"], []
+            decoder = json.JSONDecoder()
+            while text.strip():
+                line, separator, text = text.lstrip().partition("\n")
+                if not re.fullmatch(r"[a-zA-Z0-9._/:-]+/[a-zA-Z0-9._/:-]+", line):
+                    continue
+                try:
+                    metadata, end = decoder.raw_decode(text.lstrip())
+                    text = text.lstrip()[end:]
+                except ValueError:
+                    raise CatalogError("invalid_response") from None
+                if metadata.get("capabilities", {}).get("toolcall") is False:
+                    continue
+                variants = metadata.get("variants", {})
+                models.append({"id": line, "name": metadata.get("providerID", line.split("/")[0]) + " / " + metadata.get("name", line), "efforts": sorted(variants)})
+            return {"models": models, "truncated": False}

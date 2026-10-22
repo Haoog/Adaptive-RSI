@@ -1,0 +1,8 @@
+FROM node:22-bookworm
+ARG CODEX_VERSION=0.163.0
+ARG OPENCODE_VERSION=1.19.3
+RUN python3 --version && git --version \
+    && npm install -g @openai/codex@${CODEX_VERSION} opencode-ai@${OPENCODE_VERSION} \
+    && npm cache clean --force
+ENV PYTHONDONTWRITEBYTECODE=1 CI=1
+WORKDIR /workspace

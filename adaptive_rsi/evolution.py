@@ -59,23 +59,16 @@ class Evolution:
 
     def propose_and_evaluate(self, project, workspace, directory, run):
         config = json.loads(run["config"])
-        # Evolution uses its own per-experiment budget, still bounded by the project's daily budget.
-        config = merge(config, {"limits": {"run_calls": config["evolution"]["max_calls"]}})
-        run = {**run, "config": encode(config)}
-        self.store.execute("UPDATE runs SET config=? WHERE id=?", (run["config"], run["id"]))
         cases = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
                                  "AND uses<? ORDER BY created,id", (project["id"], config["evolution"]["max_holdout_uses"]))
         minimum = config["evolution"]["min_cases_per_split"]
-        from .readiness import budget
-        required = 1 + 2 * minimum * 2 * config["evolution"]["repeats"] * 4
-        usage = budget(self.store, project["id"], config, required, run["id"])
-        if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]) or not usage["ready"]:
-            reason = "Need independent validation/holdout cases and sufficient experiment/daily budget before proposing"
+        if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
+            reason = "Need independent validation/holdout cases before proposing"
             candidate = uid()
             self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
                 (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
-                 encode({"reason": reason, "budget": usage}), time.time()))
-            return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence", "budget": usage}
+                 encode({"reason": reason}), time.time()))
+            return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence"}
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
                                         "ORDER BY created DESC LIMIT 10", (project["id"],))
         failures = self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
@@ -185,14 +178,7 @@ class Evolution:
             group = [t for t in trials if t["split"] == split]
             if not any(not t["stable"]["pass"] and t["candidate"]["pass"] for t in group):
                 return {"decision": "insufficient_evidence", "reason": "No demonstrated improvement on each evaluated split"}
-            for metric in ["tokens", "seconds"]:
-                stable = sum(t["stable"][metric] for t in group)
-                candidate = sum(t["candidate"][metric] for t in group)
-                if stable <= 0 or candidate <= 0:
-                    return {"decision": "insufficient_evidence", "reason": "Usage or timing data unavailable"}
-                if candidate > stable * config["evolution"]["max_cost_ratio"]:
-                    return {"decision": "fail", "reason": "Quality gain exceeded time/token cost allowance"}
-        return {"decision": "pass", "reason": "Paired quality improved within cost limits"}
+        return {"decision": "pass", "reason": "Paired quality improved without observed regressions; usage recorded separately"}
 
     @staticmethod
     def decide(trials, config):

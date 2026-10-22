@@ -261,12 +261,9 @@ class NativeAgent:
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
         began = time.monotonic()
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
-        for _ in range(32):
-            remaining = config["limits"]["run_seconds"] - (time.monotonic() - began)
+        while True:
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
-            if remaining <= 0:
-                raise RuntimeError("Native model session timed out")
             suffix, payload = conversation.request()
             if len(json.dumps(payload).encode()) > max_bytes:
                 raise RuntimeError("Native model context exceeds output budget")
@@ -274,15 +271,15 @@ class NativeAgent:
             started = time.monotonic()
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
             try:
-                response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, min(30, remaining), max_bytes)
+                response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, 30, max_bytes)
                 calls, tokens = conversation.receive(response)
                 if tokens < 0:
                     raise ValueError("Invalid token usage")
-                self.store.execute("UPDATE calls SET tokens=?,seconds=? WHERE id=?", (tokens, time.monotonic() - started, call))
-                self.store.execute("UPDATE runs SET tokens=tokens+? WHERE id=?", (tokens, run))
+                from .usage import native_usage
+                self.store.record_usage(call, run, native_usage(protocol, response), time.monotonic() - started)
                 if cancel and cancel():
                     raise Cancelled("Cancelled after model response")
-                if not calls or len(calls) > 20:
+                if not calls:
                     raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
                 final = [args for _, name, args in calls if name == "finish"]
                 if final:
@@ -310,4 +307,3 @@ class NativeAgent:
             except Exception:
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
                 raise
-        raise RuntimeError("Native model tool-turn limit exceeded")

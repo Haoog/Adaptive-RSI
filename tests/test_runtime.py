@@ -162,7 +162,7 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.configure({"schedule": {"light_minutes": 720, "issues_minutes": 240}})
         after = {row["kind"]: row["due"] for row in self.store.query("SELECT * FROM schedules")}
         self.assertEqual(after["light"], before["light"])
-        self.assertEqual(after["deep"], before["deep"])
+        self.assertNotIn("deep", after)
         self.assertGreater(after["issues"], before["issues"])
 
     def test_claim_is_atomic_and_project_locked(self):
@@ -179,8 +179,8 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.schedule(self.project, config, now=1000000)
         self.runtime.schedule(self.project, config, now=1000000)
         rows = self.store.query("SELECT * FROM tasks WHERE source LIKE 'system_%'")
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(len(self.store.query("SELECT * FROM schedules")), 2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(self.store.query("SELECT * FROM schedules")), 1)
 
     def test_recovery_retains_artifacts_and_requires_fresh_retry(self):
         task, run = self.claim()
@@ -190,12 +190,12 @@ class RuntimeTest(unittest.TestCase):
         new = self.store.claim(self.project, self.runtime.config(self.project))
         self.assertNotEqual(new["id"], run["id"])
 
-    def test_daily_budget_is_atomic(self):
+    def test_calls_are_recorded_without_daily_quotas(self):
         config = merge(self.runtime.config(self.project), {"limits": {"daily_calls": 1}})
         route = config["models"]["planning"]
         self.store.reserve_call(self.project, "run1", "planning", route, config)
-        with self.assertRaisesRegex(RuntimeError, "budget"):
-            self.store.reserve_call(self.project, "run2", "planning", route, config)
+        self.store.reserve_call(self.project, "run2", "planning", route, config)
+        self.assertEqual(len(self.store.query("SELECT * FROM calls")), 2)
 
     def test_read_only_registration_does_not_enable_project(self):
         self.assertEqual(self.runtime.project(self.project)["paused"], 1)

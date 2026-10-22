@@ -24,7 +24,7 @@ session_file = state / "server.json"
 def live_session():
     try:
         session = json.loads(session_file.read_text())
-        request = urllib.request.Request(session["origin"] + "/api/state", headers={"Cookie": session["cookie"] + "=" + session["token"]})
+        request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/state", headers={"Cookie": session["cookie"] + "=" + session["token"]})
         with urllib.request.urlopen(request, timeout=2) as response:
             if response.status == 200:
                 return session

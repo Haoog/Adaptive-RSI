@@ -68,7 +68,7 @@ class ModelCenter:
                                                     "manual": False, "missing": bool(directory["fetched"]), "configured": True})
                         known.add(item["model"])
             builtin = provider["id"] in {p["id"] for p in BUILTINS}
-            items.append({**provider, "builtin": builtin, "credential_status": "login" if provider["id"] == "openai"
+            items.append({**provider, "builtin": builtin, "credential_status": "opencode" if provider["id"] == "opencode" else "login" if provider["id"] == "openai"
                           else self.credentials.status(provider), "catalog": directory,
                           "health": ProviderHealth(self.store).status(config, provider["id"], project or "model-center")})
         task_proofs = {}
@@ -95,7 +95,7 @@ class ModelCenter:
         provider.setdefault("id", "provider_" + uid()[:10])
         old = next((p for p in config["providers"] if p["id"] == provider["id"]), None)
         mode = authentication.get("mode", "none")
-        if mode not in ["keychain", "session", "env", "none"]:
+        if mode not in ["keychain", "session", "file", "env", "none"]:
             raise CenterError("invalid_mode")
         provider["credential"] = mode
         provider["env_key"] = provider.get("env_key", "") if mode == "env" else ""
@@ -103,7 +103,7 @@ class ModelCenter:
         if not isinstance(secret, str):
             raise CredentialError("invalid_key")
         fresh = False
-        if mode in ["keychain", "session"]:
+        if mode in ["keychain", "session", "file"]:
             if secret:
                 provider["secret_ref"] = uuid.uuid4().hex
                 fresh = True
@@ -242,8 +242,6 @@ class ModelCenter:
         signature = self.signature(provider)
         config = copy.deepcopy(config)
         config["models"]["probe"] = route
-        config["limits"]["run_seconds"] = min(60, config["limits"]["run_seconds"])
-        config["limits"]["run_calls"] = 1
         run = "model-test-" + uid()
         with self.runtime.dispatch_lock:
             if self.runtime.updates.is_busy():
@@ -253,7 +251,7 @@ class ModelCenter:
             with tempfile.TemporaryDirectory(prefix="rsi-model-test-") as workspace:
                 expected = "RSI_OK"
                 prompt = 'Call finish with {"summary":"RSI_OK"}. Do not read files or run commands.'
-                if provider.get("protocol", "codex") in ["codex", "codex_login"]:
+                if provider.get("protocol", "codex") in ["codex", "codex_login", "opencode"]:
                     expected = uuid.uuid4().hex
                     (Path(workspace) / "probe.txt").write_text(expected)
                     prompt = 'Read probe.txt using a file-reading tool. Return JSON with summary equal to its exact content. Do not modify files or run other commands.'

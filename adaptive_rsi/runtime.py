@@ -181,6 +181,7 @@ class Runtime:
     def request(self, project, kind, priority=90):
         if kind not in ["light", "deep", "issues", "evolve", "reassess"]:
             raise ValueError("Unknown inspection type")
+        kind = "light" if kind == "deep" else kind
         self.project(project)
         # Coalesce manual and timer triggers for the same system job.
         key = "system:" + kind
@@ -272,15 +273,15 @@ class Runtime:
 
     def schedule(self, project, config, now=None):
         now = now or time.time()
-        mapping = [("light", "inspection"), ("deep", "inspection"), ("issues", "issues")]
+        mapping = [("light", "inspection"), ("issues", "issues")]
         for kind, source in mapping:
             if not config["sources"][source] or (kind == "issues" and not config["github"]["repository"]):
                 continue
             row = self.store.one("SELECT * FROM schedules WHERE project=? AND kind=?", (project, kind))
             interval = config["schedule"][kind + "_minutes"] * 60
             if not row or row["due"] <= now:
-                if row or kind != "deep":
-                    self.request(project, kind, priority=20)
+                # 到期检查先于普通待办，避免无限量 Issues 让小时同步长期饥饿。
+                self.request(project, kind, priority=90)
                 self.store.execute("INSERT INTO schedules(project,kind,due) VALUES (?,?,?) "
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
         key = "deferred-check:" + project
@@ -299,13 +300,9 @@ class Runtime:
                 self.store.event("triage_recheck", "New evidence or execution baseline; deferred task queued for reassessment", project)
 
     def resume_budget(self, project, config):
-        from .readiness import budget
-        for task in self.store.query("SELECT id,overrides FROM tasks WHERE project=? AND state='waiting_budget'", (project,)):
-            effective = validate(merge(config, json.loads(task["overrides"])))
-            if budget(self.store, project, effective, required=4)["ready"]:
-                self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=? AND state='waiting_budget'",
-                                   (time.time(), task["id"]))
-                self.store.event("budget_resumed", "Call budget available; task queued for safe recovery", project)
+        # 兼容升级前等待额度的任务，下一次调度即可恢复。
+        self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE project=? AND state='waiting_budget'",
+                           (time.time(), project))
 
     def loop(self):
         while not self.stop.is_set():
@@ -386,8 +383,7 @@ class Runtime:
     def is_cancelled(self, run):
         row = self.store.one("SELECT t.state,p.paused FROM runs r JOIN tasks t ON r.task=t.id "
                              "JOIN projects p ON p.id=r.project WHERE r.id=?", (run["id"],))
-        return self.stop.is_set() or not row or row["paused"] or row["state"] == "cancelled" or \
-            time.time() - run["started"] > json.loads(run["config"])["limits"]["run_seconds"]
+        return self.stop.is_set() or not row or row["paused"] or row["state"] == "cancelled"
 
     def active_strategies(self, project, config=None):
         rows = self.store.query("SELECT id,kind,content FROM candidates WHERE project=? AND status='stable'", (project,))
@@ -449,7 +445,7 @@ class Runtime:
                 self.store.transition(run["id"], "completed", {"reason": "PR tracking and post-merge verification completed"}, True)
                 return
             if task["source"] == "system_issues":
-                self.sync_issues(project, config)
+                self.sync_issues(project, config, run)
                 self.store.transition(run["id"], "completed", {"reason": "Issues synchronized"}, True)
                 return
             if task["source"] == "system_publish":
@@ -576,9 +572,6 @@ class Runtime:
                                              "postmerge_outcomes": self.outcomes(project["id"]),
                                              "strategy": [s["id"] for s in strategies],
                                              "model": json.loads(run["config"])["models"]["analysis"]})
-        if kind == "light" and self.store.setting(key) == inspection_signature:
-            self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
-            return
         backlog = self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
                                    "ORDER BY created DESC LIMIT 100", (project["id"],))
         history = self.store.query("SELECT state,result FROM runs WHERE project=? AND state IN ('failed','blocked') "
@@ -586,17 +579,22 @@ class Runtime:
         modules = detect(workspace)
         rotation = int(self.store.setting("rotation:" + project["id"], 0))
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
+        selected_key = key + ":" + fingerprint(selected)
+        self.store.put_setting("rotation:" + project["id"], rotation + 1)
+        if self.store.setting(selected_key) == inspection_signature:
+            self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
+            return
         findings = self.invoke("analysis", "Autonomously inspect this project for concrete, useful improvements. "
                                "No user goal is required. Find reproducible defects, failing CI, missing essential regression coverage, "
                                "or evidenced performance/maintenance problems. Do not turn every TODO/style preference into a task. "
-                               "Return at most 5 findings; each needs a literal existing-code quote and path, meaningful acceptance, "
-                               "priority 1..100. Avoid existing tasks and PRs. Deep inspection focuses on selected module.\n" +
+                               "Return all evidenced findings you discover; there is no finding-count quota. Each needs a literal existing-code quote and path, meaningful acceptance, "
+                               "priority 1..100. Find bugs, useful improvements, usability, performance and maintenance issues. Avoid existing tasks and PRs. Focus this round on the selected module while considering project-wide failures.\n" +
                                encode({"kind": kind, "modules": modules, "selected_module": selected, "tasks": backlog,
                                        "recent_failures": history, "open_prs": self.store.setting("prs:" + project["id"], []),
                                        "ci": ci, "postmerge_outcomes": self.outcomes(project["id"]),
                                        "stable_strategies": strategies}), workspace, run)
         added = 0
-        for item in findings["findings"][:5]:
+        for item in findings["findings"]:
             try:
                 relative_path(item["path"])
                 path = (workspace / item["path"]).resolve()
@@ -621,17 +619,15 @@ class Runtime:
                 added += 1
             except (ValueError, OSError):
                 continue
-        self.store.put_setting(key, inspection_signature)
-        if kind == "deep":
-            self.store.put_setting("rotation:" + project["id"], rotation + 1)
+        self.store.put_setting(selected_key, inspection_signature)
         self.store.event("inspection", str(added) + " evidenced findings considered", project["id"], run["id"])
 
-    def sync_issues(self, project, config):
+    def sync_issues(self, project, config, run=None):
         repo = config["github"]["repository"]
         if not repo:
             raise ValueError("No GitHub repository configured")
         from .discovery import sync
-        sync(self, project, config, checked)
+        sync(self, project, config, checked, cancel=(lambda: self.is_cancelled(run)) if run else None)
         prs = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
                                   "--json", "number,title,headRefName,url"], timeout=60))
         self.store.put_setting("prs:" + project["id"], prs)

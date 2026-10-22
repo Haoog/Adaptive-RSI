@@ -92,12 +92,10 @@ class OperabilityTest(unittest.TestCase):
             self.assertNotIn("verified", model)
             self.assertFalse(self.center.snapshot()["providers"][-1]["health"]["paused"])
             self.runtime.configure({"limits": {"daily_calls": 3}})
-            with self.assertRaises(CenterError) as caught:
-                self.center.probe("gateway", "coder-a", "default")
-            self.assertEqual(caught.exception.code, "budget_exhausted")
+            fixture.tool = True
+            self.center.probe("gateway", "coder-a", "default")
             model = self.center.directory(self.center.provider("gateway"))["models"][0]
             self.assertEqual(model["probes"]["default"]["state"], "pass")
-            self.assertEqual(model["last_attempt"]["code"], "budget_exhausted")
 
     def test_outage_after_edit_counts_failure_without_using_fallback(self):
         with DirectoryServer() as fixture:

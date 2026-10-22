@@ -6,7 +6,7 @@ Report bugs and propose improvements through Issues, or contribute through a Pul
 
 ## Local development
 
-Requires Python 3.9+. The fully tested execution environment is macOS. Models can use authenticated Codex CLI or a tool-capable native API. GitHub import, sync and approved delivery use authenticated `gh`. Routine tests substitute the model interface and require no paid model calls.
+Requires Python 3.9+. Execution uses macOS Seatbelt or Linux Docker. Models can use Codex, OpenCode CLI or tool-capable native APIs. GitHub import, sync and approved delivery use authenticated `gh`. Routine tests substitute the model interface and require no paid model calls.
 
 ```sh
 python3 -m unittest discover -v

@@ -222,7 +222,7 @@ class ModelCenterTest(unittest.TestCase):
             self.assertEqual(error.exception.code, "connection_changed")
             self.assertEqual(self.center.directory(self.center.provider("gateway"))["models"], [])
 
-    def test_probe_uses_real_budget_and_text_only_response_cannot_pass(self):
+    def test_probe_records_usage_without_quota_and_text_only_response_cannot_pass(self):
         with DirectoryServer() as fixture:
             self.save(fixture, "none", value="")
             fixture.tool = False
@@ -232,9 +232,8 @@ class ModelCenterTest(unittest.TestCase):
             self.assertEqual(self.runtime.store.one("SELECT state FROM calls")["state"], "failed")
             self.runtime.configure({"limits": {"daily_calls": 1}})
             fixture.tool = True
-            with self.assertRaises(CenterError):
-                self.center.probe("gateway", "coder-a")
-            self.assertEqual(len(fixture.requests), 1)
+            self.center.probe("gateway", "coder-a")
+            self.assertEqual(len(fixture.requests), 2)
 
     def test_explicit_non_agent_types_are_not_enabled_and_efforts_are_preserved(self):
         with DirectoryServer() as fixture:

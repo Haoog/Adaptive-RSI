@@ -40,14 +40,10 @@ class ReliabilityTest(unittest.TestCase):
         task = self.runtime.goal(self.project, text)
         return task, self.store.claim(self.project, self.runtime.config(self.project))
 
-    def test_insufficient_budget_is_found_before_any_model_call(self):
+    def test_legacy_budget_settings_no_longer_block_readiness(self):
         self.runtime.configure({"limits": {"daily_calls": 3}}, self.project)
-        task, run = self.claim()
-        self.runtime.process(run)
-        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
-        self.assertEqual(result["failure"]["code"], "budget")
-        self.assertEqual(self.runtime.agent.roles, [])
-        self.assertEqual(budget(self.store, self.project, self.runtime.config(self.project), 4)["minimum"], 4)
+        self.assertTrue(budget(self.store, self.project, self.runtime.config(self.project), 400)["ready"])
+        self.assertEqual(self.runtime.config(self.project)["limits"]["daily_calls"], 0)
 
     def test_missing_dependencies_block_before_planning(self):
         self.runtime.configure({"environment": {"seed_paths": ["missing-dependencies"]}}, self.project)
@@ -141,7 +137,7 @@ class ReliabilityTest(unittest.TestCase):
         with patch("adaptive_rsi.runtime.checked", side_effect=gh):
             self.runtime.sync_issues(self.runtime.project(self.project), config)
             self.runtime.sync_issues(self.runtime.project(self.project), config)
-            self.assertEqual(requests, [1, 2])
+            self.assertEqual(requests, [1, 1])
             row = self.store.one("SELECT * FROM tasks WHERE source='issue'")
             self.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (row["id"],))
             issue["updated_at"] = "2099-01-02T00:00:00Z"
@@ -174,7 +170,7 @@ class ReliabilityTest(unittest.TestCase):
                                   [{"number": 1, "updated": "2020-01-01T00:00:00Z"}])
         self.store.execute("UPDATE tasks SET state='executing' WHERE id=?", (task,))
         self.store.put_setting("issue-sync:" + self.project,
-                               {"repository": "owner/repo", "policy": fingerprint({"labels": [], "exclude": config["github"]["exclude_labels"], "size": 100}),
+                               {"repository": "owner/repo", "policy": fingerprint({"labels": [], "exclude": config["github"]["exclude_labels"]}),
                                 "since": "2025-01-01T00:00:00Z", "page": 1})
         issue = {"number": 1, "title": "Revised issue", "body": "new", "labels": [], "state": "open",
                  "updated_at": "2024-01-01T00:00:00Z", "html_url": "https://github.com/owner/repo/issues/1"}
@@ -188,12 +184,12 @@ class ReliabilityTest(unittest.TestCase):
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
         self.assertEqual((row["state"], row["body"]), ("queued", "new"))
 
-    def test_budget_wait_resumes_only_when_configured_limits_allow(self):
+    def test_legacy_budget_wait_resumes_without_quota(self):
         task, run = self.claim()
         self.store.transition(run["id"], "waiting_budget", {"failure": {"code": "budget"}}, True)
         low = merge(self.runtime.config(self.project), {"limits": {"daily_calls": 3}})
         self.runtime.resume_budget(self.project, low)
-        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "waiting_budget")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
         self.runtime.resume_budget(self.project, self.runtime.config(self.project))
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
 

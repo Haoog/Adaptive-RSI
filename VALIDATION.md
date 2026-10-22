@@ -2,6 +2,15 @@
 
 **简体中文** | [English](VALIDATION.en.md)
 
+## 服务器与 OpenCode / 0.3.0 / 2026-10-22
+
+- macOS / Python 3.9.6：后端全量 **173 项通过，4 项可选测试跳过**。随后专项验证覆盖 Docker 完整候选验收、工作区隔离、真实 OpenCode/Codex CLI、OAuth 刷新、小时调度、无额度调用、205 条 Issues 分页及原生协议。
+- 前端请求 **25 项通过**，JavaScript 语法检查、真实 Chromium 表单与中英文/手机流程通过；界面只保留两种扫描计划，OpenCode 可选择，调用额度字段已移除。
+- 真实 OpenCode 1.19.3 完成读取、修改、结构化结果及 45 tokens 记录；Codex 0.163.0 在 Linux 容器返回结构化结果及 15 tokens。模型服务使用本地 HTTP/SSE 替身，没有调用付费厂商，也不证明能力提升。
+- Linux 执行镜像实际构建并运行；新增 Linux CI。systemd 安装脚本通过语法检查，服务监督健康端点及 PID 核对通过测试；没有实际用户服务器，未验证远端 systemd、DNS 或 TLS 部署。
+- 0.3.0 的 ZIP、SHA-256 与 wheel 构建通过，双语服务器说明和部署文件进入插件包。正式 Release 未发布。
+- 完成作者自检，无已知阻断项，未进行独立人工评审。见 [自检记录](docs/validation/server-opencode-review-20261022.json)。
+
 ## 运行安全与交付修复 / 0.2.2 / 2026-10-21
 
 - macOS / Python 3.9.6：完整后端 **149 项通过**，包括本机 Codex 沙箱实测：未注册目录、已接入项目、控制器状态不可读；网络关闭；实现只写工作副本，审查只写一个结果文件。
