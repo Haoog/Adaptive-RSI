@@ -22,7 +22,7 @@ from adaptive_rsi.gitops import git, snapshot
 from adaptive_rsi.process import Sandbox, checked, run_process
 from adaptive_rsi.review import enforce_review
 from adaptive_rsi.runtime import Runtime
-from adaptive_rsi.server import Server
+from adaptive_rsi.server import Handler, Server
 from adaptive_rsi.store import Store, encode, uid
 
 
@@ -639,6 +639,27 @@ class ServerTest(unittest.TestCase):
 
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
+
+    def test_aborted_response_does_not_escape_as_server_error(self):
+        class ClosedConnection:
+            close_connection = False
+            wfile = None
+
+            def send_response(self, code):
+                self.code = code
+
+            def headers_common(self):
+                pass
+
+            def send_header(self, name, value):
+                pass
+
+            def end_headers(self):
+                raise BrokenPipeError("browser cancelled request")
+
+        handler = ClosedConnection()
+        Handler.respond(handler, {"ok": True})
+        self.assertTrue(handler.close_connection)
 
     def test_missing_browser_session_has_safe_recovery_page_but_api_stays_private(self):
         with self.assertRaises(urllib.error.HTTPError) as denied:

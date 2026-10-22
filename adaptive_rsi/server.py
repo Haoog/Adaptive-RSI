@@ -71,12 +71,16 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
         if isinstance(payload, str):
             payload = payload.encode()
-        self.send_response(code)
-        self.headers_common()
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(code)
+            self.headers_common()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Aborted browser fetches are normal during navigation; do not retry a response to a closed socket.
+            self.close_connection = True
 
     def authenticated(self):
         if self.headers.get("Host") not in self.server.allowed_hosts:
