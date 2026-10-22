@@ -1,6 +1,7 @@
 import base64
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import threading
 import time
@@ -152,6 +153,132 @@ class BackendHardeningTest(unittest.TestCase):
         self.assertNotEqual(key(refreshed), key(changed_comment))
         incomplete = {**refreshed, "complete": False, "warning": "Older comments were omitted"}
         self.assertNotEqual(key(refreshed), key(incomplete))
+
+
+class ConfigRepairHTTPTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
+        self.runtime = Runtime(Store(self.root / "state"), object())
+        self.repo = fixture(self.root / "project")
+        self.project = self.runtime.add_project(self.repo, enabled=True)
+        self.server = Server(self.runtime)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(3)
+        self.runtime.close()
+        self.temp.cleanup()
+
+    def post(self, path, payload):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
+        try:
+            body = json.dumps(payload).encode()
+            connection.request("POST", path, body=body, headers={
+                "Content-Type": "application/json", "Content-Length": str(len(body)),
+                "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+                "Cookie": self.server.cookie + "=" + self.server.token})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def get(self, path):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
+        try:
+            connection.request("GET", path, headers={"Cookie": self.server.cookie + "=" + self.server.token})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_explicit_repair_backs_up_invalid_overrides_and_requires_manual_enable(self):
+        from adaptive_rsi.store import encode
+        invalid = ["{", "[]", json.dumps({"schedule": {"light_minutes": 1}}),
+                   json.dumps({"schedule": {"timezone": "Invalid/Zone"}})]
+        expected_backups = 0
+
+        self.runtime.store.execute("UPDATE projects SET config=?,paused=0 WHERE id=?", (invalid[0], self.project))
+        status, _ = self.post("/api/config/repair", {"project": self.project, "confirmation": "reset"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.runtime.project(self.project)["config"], invalid[0])
+        self.assertEqual(self.runtime.project(self.project)["paused"], 0)
+
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.runtime.store.execute("UPDATE projects SET config=?,paused=0 WHERE id=?", (raw, self.project))
+                status, state = self.get("/api/state")
+                self.assertEqual(status, 200)
+                shown = next(project for project in state["projects"] if project["id"] == self.project)
+                self.assertTrue(shown["configuration_error"])
+                self.assertTrue(shown["paused"])
+                self.assertFalse(shown["configured_paused"])
+                status, result = self.post("/api/config/repair", {
+                    "project": self.project,
+                    "confirmation": "reset-invalid-overrides-to-global-defaults"})
+                self.assertEqual(status, 200, result)
+                self.assertEqual(result, {"saved": True, "repaired": True, "paused": True})
+                repaired = self.runtime.project(self.project)
+                self.assertEqual((repaired["config"], repaired["paused"]), ("{}", 1))
+                self.runtime.config(self.project)
+                status, state = self.get("/api/state")
+                self.assertEqual(status, 200)
+                shown = next(project for project in state["projects"] if project["id"] == self.project)
+                self.assertNotIn("configuration_error", shown)
+                self.assertTrue(shown["paused"])
+                expected_backups += 1
+
+                backups = self.runtime.store.query(
+                    "SELECT key,value FROM settings WHERE key LIKE ? ORDER BY key",
+                    ("project-config-repair-backup:" + self.project + ":%",))
+                self.assertEqual(len(backups), expected_backups)
+                backup = next(json.loads(item["value"]) for item in backups
+                              if json.loads(item["value"])["sha256"] == hashlib.sha256(raw.encode()).hexdigest())
+                self.assertEqual(backup["raw"], raw)
+                self.assertEqual(backup["sha256"], hashlib.sha256(raw.encode()).hexdigest())
+                event = self.runtime.store.one(
+                    "SELECT message,data FROM events WHERE kind='config_repaired' AND project=? ORDER BY seq DESC LIMIT 1",
+                    (self.project,))
+                self.assertNotIn(raw, event["message"])
+                self.assertEqual(set(json.loads(event["data"])), {"backup_key", "sha256"})
+
+                status, result = self.post("/api/config", {
+                    "project": self.project, "values": {"schedule": {"light_minutes": 120}}})
+                self.assertEqual(status, 200, result)
+                self.assertEqual(self.runtime.project(self.project)["paused"], 1)
+                status, result = self.post("/api/pause", {"project": self.project, "paused": False})
+                self.assertEqual(status, 200, result)
+                self.assertEqual(self.runtime.project(self.project)["paused"], 0)
+
+        valid = encode({"schedule": {"light_minutes": 90}})
+        self.runtime.store.execute("UPDATE projects SET config=?,paused=1 WHERE id=?", (valid, self.project))
+        backup_count = len(self.runtime.store.query(
+            "SELECT key FROM settings WHERE key LIKE ?", ("project-config-repair-backup:" + self.project + ":%",)))
+        status, _ = self.post("/api/config/repair", {
+            "project": self.project, "confirmation": "reset-invalid-overrides-to-global-defaults"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.runtime.project(self.project)["config"], valid)
+        self.assertEqual(self.runtime.project(self.project)["paused"], 1)
+        self.assertEqual(len(self.runtime.store.query(
+            "SELECT key FROM settings WHERE key LIKE ?", ("project-config-repair-backup:" + self.project + ":%",))), backup_count)
+
+    def test_repair_requires_valid_global_configuration(self):
+        raw = "{"
+        self.runtime.store.execute("UPDATE projects SET config=?,paused=0 WHERE id=?", (raw, self.project))
+        self.runtime.store.put_setting("config", {"invalid": True})
+        status, _ = self.post("/api/config/repair", {
+            "project": self.project, "confirmation": "reset-invalid-overrides-to-global-defaults"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.runtime.project(self.project)["config"], raw)
+        self.assertEqual(self.runtime.project(self.project)["paused"], 0)
+        self.assertEqual(self.runtime.store.query(
+            "SELECT key FROM settings WHERE key LIKE ?", ("project-config-repair-backup:" + self.project + ":%",)), [])
 
 
 class ImportAdmissionTest(unittest.TestCase):

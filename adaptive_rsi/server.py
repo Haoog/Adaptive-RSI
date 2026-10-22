@@ -341,6 +341,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/config":
                     runtime.configure(body["values"], body.get("project"), body.get("inherit"))
                     result = {"saved": True, "config": runtime.config(body.get("project"))}
+                elif path == "/api/config/repair":
+                    result = runtime.repair_project_config(body["project"], body.get("confirmation"))
                 elif path == "/api/release-retry":
                     result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
                 elif path == "/api/release-authorize":

@@ -9,6 +9,7 @@ const reviewNames = {correctness:'正确性',security:'安全性',maintainabilit
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
 const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), goalDrafts=new Map();
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
+let configurationRepairBusy=false;
 let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshWaiters=[],refreshPollTimer=null;
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
@@ -72,7 +73,7 @@ async function sendApi(path,body,signal){
  let data;
  try{data=await response.json();}catch(error){const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;throw invalid;}
  if(!response.ok){const error=Error(t(apiErrors[data.error]||data.error||String(response.status)));error.code=data.error_code||data.catalog_error;error.status=response.status;throw error;}
- if(body!==undefined&&(path==='config'||path.startsWith('model-center/')))readinessCache.clear();
+ if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
 }
 async function api(path,body,{signal}={}){
@@ -178,7 +179,12 @@ function render(){
  renderNavigation();$('onboarding').hidden=!!project;$('project-workspace').hidden=!project;$('pause-button').hidden=!project;
  const configError=project?.configuration_error,configErrorText=typeof configError==='string'?configError:configError?.message||configError?.error||'';
  $('pause-button').disabled=!project||!!(configError&&project.paused);$('pause-button').textContent=t(!project||project.paused?'开始运行':'暂停运行');
- $('project-config-error').hidden=!configError;$('project-config-error').textContent=configError?t('项目配置异常，已暂停运行。请修复后再启动。')+(configErrorText?' '+configErrorText:''):'';
+ $('project-config-error').hidden=!configError;$('project-config-error').textContent=configError?t('项目配置异常，已暂停运行。请修复后再启动。')+(configErrorText?' '+configErrorText:'')+' '+t('重置会丢弃项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要手动启动。'):'';
+ if(configError){const repair=el('button',t('重置损坏设置'),'text-button');repair.type='button';repair.disabled=configurationRepairBusy;repair.addEventListener('click',()=>safe(async()=>{
+  if(configurationRepairBusy)return;const project=projectId;if(!project||!confirm(t('确认重置损坏设置？这会删除当前项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要你手动启动。')))return;
+  configurationRepairBusy=true;repair.disabled=true;let result;try{result=await api('config/repair',{project,confirmation:'reset-invalid-overrides-to-global-defaults'});}finally{configurationRepairBusy=false;repair.disabled=false;}
+  if(result.repaired){await refresh();toast(t('项目设置已修复为通用默认，项目仍保持暂停。'));}
+ }));$('project-config-error').append(repair);}
  $('workspace-title').textContent=project?.name||t('从一个项目开始');
  $('goal-project-target').textContent=project?.name||t('尚未接入项目');
  $('workspace-description').hidden=!!project;
@@ -316,7 +322,8 @@ function settingsKey(){return $('config-scope').value==='global'?'global':projec
 function sensitiveField(node){return node.type==='password'||/(?:api.?key|oauth|secret|password|credential|authorization|token)/i.test([node.id,node.name,node.dataset.path,node.autocomplete].join(' '));}
 function settingsValues(){return [...$('settings-form').querySelectorAll('input,textarea,select')].filter(node=>!sensitiveField(node)&&!node.hasAttribute('data-unit-for')).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));}
 function draftSettingPath(path){return !!path&&!sensitiveField({id:'',name:'',dataset:{path},autocomplete:''})&&path!=='delivery.deploy.health_url';}
-function persistentSettingsValues(){const values=[...$('settings-form').querySelectorAll('[data-path]')].filter(node=>draftSettingPath(node.dataset.path)).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));values.push({id:'schedule-mode',value:$('schedule-mode').value});return values;}
+function persistentSettingsValues(){const values=[...$('settings-form').querySelectorAll('[data-path]')].filter(node=>draftSettingPath(node.dataset.path)).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));for(const id of ['work-start','work-end','issue-labels']){const node=$(id);values.push({id,value:node.value,checked:node.checked});}values.push({id:'schedule-mode',value:$('schedule-mode').value});return values;}
+function persistableDraftEntry(entry){return !!(entry.path&&draftSettingPath(entry.path)||['schedule-mode','work-start','work-end','issue-labels'].includes(entry.id));}
 function settingBaselineValue(entry,baseline,mode){
  if(entry.path)return getPath(baseline,entry.path);
  if(entry.id==='work-start')return baseline.schedule.working_hours[0];
@@ -331,7 +338,7 @@ function settingBaselineValue(entry,baseline,mode){
 function sameValue(a,b){return JSON.stringify(a)===JSON.stringify(b);}
 function writePersistentSettingsDraft(scope,values,baseline,mode){
  const clean=JSON.parse(settingsClean.get(scope)||'[]'),cleanByPath=new Map(clean.map(v=>[v.path||v.id,v]));
- const saved=values.filter(v=>(v.path&&draftSettingPath(v.path)||v.id==='schedule-mode')&&!sameValue(v,cleanByPath.get(v.path||v.id))).map(v=>({...v,baselineValue:settingBaselineValue(v,baseline,mode)}));
+ const saved=values.filter(v=>persistableDraftEntry(v)&&!sameValue(v,cleanByPath.get(v.path||v.id))).map(v=>({...v,baselineValue:settingBaselineValue(v,baseline,mode)}));
  if(saved.length)draftStore.set('settings',scope,{values:saved,mode});else draftStore.remove('settings',scope);
 }
 function stashSettings(){

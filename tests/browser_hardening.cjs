@@ -113,7 +113,15 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#schedule-mode').selectOption('custom');
     const interval=page.locator('[data-path="schedule.light_minutes"]');
     await interval.fill('125');
+    await page.locator('#advanced-settings > summary').click();
+    await page.locator('#work-start').fill('8');
+    await page.locator('#work-end').fill('17');
+    await page.locator('#issue-labels').fill('bug, urgent');
+    const checks=page.locator('#checks-json'),serverChecks=await checks.inputValue();
+    await checks.fill('["RAW-CHECKS-MUST-NOT-PERSIST"]');
     await page.waitForFunction(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('125'));
+    assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('bug, urgent')||false),true);
+    assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('RAW-CHECKS-MUST-NOT-PERSIST')||false),false);
     const secretField=page.locator('[data-mc-tab="providers"]');
     await secretField.click();
     await page.locator('#mc-add-provider').click();
@@ -127,6 +135,12 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#schedule-mode').waitFor();
     assert.equal(await page.locator('#schedule-mode').inputValue(),'custom');
     assert.equal(await page.locator('[data-path="schedule.light_minutes"]').inputValue(),'125');
+    await page.locator('#advanced-settings > summary').click();
+    assert.equal(await page.locator('#work-start').inputValue(),'8');
+    assert.equal(await page.locator('#work-end').inputValue(),'17');
+    assert.equal(await page.locator('#issue-labels').inputValue(),'bug, urgent');
+    assert.equal(await page.locator('#checks-json').inputValue(),serverChecks);
+    assert.doesNotMatch(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')||''),/RAW-CHECKS-MUST-NOT-PERSIST/);
 
     await page.locator('#back-workspace').click();
     const saved=page.waitForResponse(response=>response.url().endsWith('/api/goal')&&response.request().method()==='POST');
@@ -136,6 +150,40 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.reload();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'');
+  }finally{await page.close();}
+}
+
+async function checkInvalidConfigRepair(browser,url,errors) {
+  const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+  let invalid=true;const repairs=[];
+  await page.route('**/api/state*',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    if(invalid){const project=data.projects.find(row=>row.id===data.selected_project)||data.projects[0];project.configuration_error='Malformed fixture override';project.paused=true;}
+    await route.fulfill({response,body:JSON.stringify(data)});
+  });
+  await page.route('**/api/config/repair',async route=>{
+    repairs.push(route.request().postDataJSON());invalid=false;
+    await reply(route,{saved:true,repaired:true,paused:true});
+  });
+  try{
+    await page.goto(url);
+    await page.locator('#project-config-error').filter({hasText:'项目配置异常'}).waitFor();
+    const button=page.locator('#project-config-error').getByRole('button',{name:'重置损坏设置'});
+    await button.waitFor();
+    const warning=await page.locator('#project-config-error').textContent();
+    assert.match(warning,/本地审计备份/);assert.match(warning,/仍保持暂停/);
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#project-config-error').getByRole('button',{name:'Reset damaged settings'}).waitFor();
+    assert.match(await page.locator('#project-config-error').textContent(),/local audit backup/);
+    await page.locator('#language-select').selectOption('zh-CN');
+    let confirmation='';page.once('dialog',async dialog=>{confirmation=dialog.message();await dialog.accept();});
+    await button.click();
+    await page.locator('#project-config-error').waitFor({state:'hidden'});
+    assert.match(confirmation,/原始配置仅保存在本地审计备份/);assert.match(confirmation,/需要你手动启动/);
+    assert.equal(repairs.length,1);
+    assert.equal(repairs[0].project,await page.locator('#project-select').inputValue());
+    assert.equal(repairs[0].confirmation,'reset-invalid-overrides-to-global-defaults');
+    assert.equal(await page.locator('#pause-button').textContent(),'开始运行');
   }finally{await page.close();}
 }
 
@@ -174,6 +222,7 @@ async function main() {
     await checkReadinessInstallAction(browser,url,errors);
     await checkModelForms(browser, url, errors);
     await checkDraftRecovery(browser,url,errors);
+    await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);
     console.log('Delayed readiness and model form checks passed.');
   } finally {

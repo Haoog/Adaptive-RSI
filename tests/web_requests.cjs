@@ -302,14 +302,14 @@ test('settings drafts retain independent baselines and duration units across pro
   page.node('settings-form').querySelectorAll = () => [field, unit];
   page.document.querySelectorAll = () => [];
   page.node('config-scope').value = 'project';
-  vm.runInContext('settingsContext="a";settingsBaseline={limits:{daily_calls:40}};settingsModes.set(settingsBaseline,"inherit")', page.context);
+  vm.runInContext('settingsContext="a";settingsBaseline={limits:{daily_calls:40},schedule:{working_hours:[0,24]},github:{labels:[]}};settingsModes.set(settingsBaseline,"inherit")', page.context);
   page.context.stashSettings();
-  vm.runInContext('projectId="b";settingsContext="b";settingsBaseline={limits:{daily_calls:30}};settingsModes.set(settingsBaseline,"inherit")', page.context);
+  vm.runInContext('projectId="b";settingsContext="b";settingsBaseline={limits:{daily_calls:30},schedule:{working_hours:[0,24]},github:{labels:[]}};settingsModes.set(settingsBaseline,"inherit")', page.context);
   field.value = '52'; unit.value = '1440'; page.context.stashSettings();
-  vm.runInContext('projectId="a";settingsBaseline={limits:{daily_calls:40}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
+  vm.runInContext('projectId="a";settingsBaseline={limits:{daily_calls:40},schedule:{working_hours:[0,24]},github:{labels:[]}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
   assert.equal(field.value, '41'); assert.equal(unit.value, '60');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 40);
-  vm.runInContext('projectId="b";settingsBaseline={limits:{daily_calls:30}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
+  vm.runInContext('projectId="b";settingsBaseline={limits:{daily_calls:30},schedule:{working_hours:[0,24]},github:{labels:[]}};settingsModes.set(settingsBaseline,"inherit")', page.context);page.context.restoreSettingsDraft();
   assert.equal(field.value, '52'); assert.equal(unit.value, '1440');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
 });
@@ -319,28 +319,33 @@ test('safe settings and schedule mode survive reload without persisting secrets'
   const baseline = {schedule:{light_minutes:60,issues_minutes:120,timezone:'UTC',working_hours:[0,24],weight:1},sources:{inspection:true,issues:true},github:{labels:[]},checks:[],delivery:{mode:'local',auto_merge:false}};
   const configure = page => {
     const interval=page.node('light-interval'),mode=page.node('schedule-mode'),key=page.node('api-key'),code=page.node('oauth-code');
+    const start=page.node('work-start'),end=page.node('work-end'),labels=page.node('issue-labels'),checks=page.node('checks-json');
     Object.assign(interval,{type:'number',value:'120',dataset:{path:'schedule.light_minutes'}});
     Object.assign(mode,{value:'custom'});
     Object.assign(key,{type:'password',value:'NEVER-PERSIST-THIS-API-KEY',dataset:{path:'auth.api_key'}});
     Object.assign(code,{type:'text',value:'NEVER-PERSIST-THIS-OAUTH-CODE'});
+    Object.assign(start,{type:'number',value:'8'});Object.assign(end,{type:'number',value:'17'});
+    Object.assign(labels,{type:'text',value:'bug, urgent'});Object.assign(checks,{type:'textarea',value:'["RAW-CHECKS-MUST-NOT-PERSIST"]'});
     const form=page.node('settings-form');
-    form.querySelectorAll=selector=>selector==='[data-path]'?[interval,key]:selector==='input,textarea,select'?[interval,key,code,mode]:[];
+    form.querySelectorAll=selector=>selector==='[data-path]'?[interval,key]:selector==='input,textarea,select'?[interval,key,code,mode,start,end,labels,checks]:[];
     page.node('config-scope').value='project';
     vm.runInContext(`settingsContext="a";settingsBaseline=${JSON.stringify(baseline)};settingsModes.set(settingsBaseline,"inherit");settingsClean.set("a","[]")`,page.context);
-    return {interval,mode,key,code};
+    return {interval,mode,key,code,start,end,labels,checks};
   };
   const firstFields=configure(first);first.context.stashSettings();
   const stored=JSON.stringify([...storage.values()]);
-  assert.doesNotMatch(stored,/NEVER-PERSIST-THIS-(?:API-KEY|OAUTH-CODE)/);
+  assert.doesNotMatch(stored,/NEVER-PERSIST-THIS-(?:API-KEY|OAUTH-CODE)|RAW-CHECKS-MUST-NOT-PERSIST/);
   const entries=JSON.parse(storage.get('rsi-ui-drafts')).entries.settings.a.value.values;
-  assert.deepEqual(entries.map(entry=>entry.id).sort(),['light-interval','schedule-mode']);
+  assert.deepEqual(entries.map(entry=>entry.id).sort(),['issue-labels','light-interval','schedule-mode','work-end','work-start']);
   assert.equal(entries.find(entry=>entry.id==='schedule-mode').baselineValue,'inherit');
 
   const second=browser(storage),restored=configure(second);
-  restored.interval.value='60';restored.mode.value='inherit';
+  restored.interval.value='60';restored.mode.value='inherit';restored.start.value='0';restored.end.value='24';restored.labels.value='';restored.checks.value='';
   vm.runInContext('restoreSettingsDraft()',second.context);
   assert.equal(restored.interval.value,'120');
   assert.equal(restored.mode.value,'custom');
+  assert.equal(restored.start.value,'8');assert.equal(restored.end.value,'17');assert.equal(restored.labels.value,'bug, urgent');
+  assert.equal(restored.checks.value,'');
   assert.equal(vm.runInContext('settingsBaseline.schedule.light_minutes',second.context),60);
 });
 

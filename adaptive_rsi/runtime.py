@@ -2,6 +2,7 @@ import concurrent.futures
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import threading
@@ -140,6 +141,35 @@ class Runtime:
     def configure(self, values, project=None, inherit=None):
         with self.dispatch_lock:
             return self._configure(values, project, inherit)
+
+    def repair_project_config(self, project, confirmation):
+        if confirmation != "reset-invalid-overrides-to-global-defaults":
+            raise ValueError("Explicit confirmation is required to reset invalid project settings")
+        with self.dispatch_lock:
+            row = self.project(project)
+            global_config = self.store.setting("config", {})
+            effective_global = validate(merge(DEFAULTS, global_config))
+            raw = row["config"]
+            try:
+                overrides = json.loads(raw)
+                if not isinstance(overrides, dict):
+                    raise ValueError("Project configuration must be a JSON object")
+                validate(merge(effective_global, overrides))
+            except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
+                reason = str(exc)[:300] or "Invalid project configuration"
+            else:
+                raise ValueError("Project configuration is valid; reset is unavailable")
+
+            raw_text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            backup_key = "project-config-repair-backup:" + project + ":" + uid()
+            self.store.put_setting(backup_key, {"raw": raw, "sha256": digest, "reason": reason,
+                                                "created": time.time(), "paused_before": bool(row["paused"])})
+            self.store.execute("UPDATE projects SET config=?,paused=1 WHERE id=?", (encode({}), project))
+            self.store.event("config_repaired", "Invalid project overrides reset to global defaults; project remains paused",
+                             project, data={"backup_key": backup_key, "sha256": digest})
+        self.wake.set()
+        return {"saved": True, "repaired": True, "paused": True}
 
     def _configure(self, values, project=None, inherit=None):
         if not isinstance(values, dict):
