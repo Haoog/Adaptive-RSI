@@ -6,7 +6,7 @@
 
 ## 本仓库的版本与发布
 
-`.github/workflows/release.yml` 的主线触发仅识别已经核验的机械版本提交并继续正式发布，普通代码合并不创建版本 PR。准备好一批稳定改动后，在 Actions 手动运行该流程，勾选 `prepare_release`，选择 `release_level`（minor、patch 或 major）；缺省不勾选时不准备新版本。紧急修复可单独选择 patch，不按提交次数涨版本。此前的 `release:*` PR 标签不再触发发版或决定级别。自动测试、版本 PR 门禁、打包和正式发布保持自动化；这个节奏只约束本仓库，不修改受管项目的交付授权。
+`.github/workflows/release.yml` 的主线触发仅识别已经核验的机械版本提交并继续正式发布，普通代码合并不创建版本 PR。准备好一批稳定改动后，在 Actions 手动运行该流程，勾选 `prepare_release`，选择 `release_level`（默认 patch，也可明确选择 minor 或 major）；缺省不勾选时不准备新版本。紧急修复可单独选择 patch，不按提交次数涨版本。普通修复和体验优化只递增末位，明显的阶段升级才选择 minor，破坏性升级才选择 major。此前的 `release:*` PR 标签不再触发发版或决定级别。自动测试、版本 PR 门禁、打包和正式发布保持自动化；这个节奏只约束本仓库，不修改受管项目的交付授权。
 
 四处版本为 `plugin.json`、`pyproject.toml`、`adaptive_rsi/__init__.py`、`update.json`，中英文 `CHANGELOG` 的 `Unreleased` 内容移入相应版本；提交标题使用中文。
 

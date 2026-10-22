@@ -468,7 +468,7 @@ if __name__ == "__main__":
 
 
 class ReleaseBatchCadenceTest(unittest.TestCase):
-    def prepare(self, requested='false', notes='## Unreleased\n', level='minor', generated=False):
+    def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False):
         from scripts import release as module
         head='b'*40
         def command(*args, **kwargs):
@@ -494,6 +494,11 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         result,calls=self.prepare(requested='true')
         self.assertEqual(result['mode'],'verify')
         self.assertEqual(result['pr'],9)
+        self.assertTrue(any('chore/release-v1.2.4-' in str(call) for call in calls))
+
+    def test_minor_increment_requires_explicit_selection(self):
+        result,calls=self.prepare(requested='true',level='minor')
+        self.assertEqual(result['mode'],'verify')
         self.assertTrue(any('chore/release-v1.3.0-' in str(call) for call in calls))
 
     def test_mechanical_version_commit_still_publishes_without_new_batch(self):

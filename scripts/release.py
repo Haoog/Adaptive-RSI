@@ -114,7 +114,7 @@ def prepare():
     if os.environ.get("PREPARE_RELEASE") != "true":
         output(mode="idle", reason="Changes accumulated; start a stable release batch explicitly")
         return
-    level = os.environ.get("RELEASE_LEVEL", "minor")
+    level = os.environ.get("RELEASE_LEVEL", "patch")
     if level not in ["major", "minor", "patch"]:
         raise ValueError("Release level must be major, minor or patch")
     # A single stable branch and all-state PR lookup prevent duplicate version PRs.

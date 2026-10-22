@@ -11,8 +11,8 @@ on:
       release_level:
         description: '本批次的版本升级级别'
         type: choice
-        options: [minor, patch, major]
-        default: minor
+        options: [patch, minor, major]
+        default: patch
 permissions:
   contents: read
 concurrency:
