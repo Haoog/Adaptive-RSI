@@ -1,0 +1,75 @@
+{
+  "review": "release-repository-metadata-endpoint-followup",
+  "reviewed_at": "2026-10-22T04:52:31.727216+00:00",
+  "reviewer": "browser_login agent; independent read-only review of automatic_release-authored fix",
+  "base_commit": "21aeacc30723531e3fa5fd796573f26349c1243c",
+  "branch": "fix/release-metadata-endpoint",
+  "decision": "pass",
+  "blocking_findings": [],
+  "scope": [
+    "scripts/release.py gh() repository-root API path used by prepare and gate",
+    "adaptive_rsi/release.py api() repository-root path used by workflow_choices",
+    "Exact CLI argv regression tests, adjacent nonempty endpoint preservation, and real read-only GitHub endpoint contrast"
+  ],
+  "closed_findings": [
+    {
+      "priority": "P1",
+      "title": "Empty endpoint added a trailing slash to repository metadata requests",
+      "evidence": "Actual authenticated gh GET repos/Haoog/Adaptive-RSI/ returned HTTP404, while GET repos/Haoog/Adaptive-RSI returned the correct repository and default_branch main. The release script calls gh(\"\") from prepare and gate. Independent inspection found the same construction in the product helper used by workflow_choices.",
+      "resolution": "Both helpers append slash plus endpoint only when endpoint is nonempty. Nonempty paths, query strings, methods and fields retain the previous exact argument sequence.",
+      "references": [
+        "scripts/release.py:22",
+        "scripts/release.py:101",
+        "scripts/release.py:164",
+        "adaptive_rsi/release.py:28",
+        "adaptive_rsi/release.py:83",
+        "tests/test_release_endpoints.py:10"
+      ],
+      "prior_test_gap": "Higher-level release tests replaced gh/api and accepted the empty logical endpoint without inspecting the physical gh CLI repository path. The new tests assert exact argv for both helpers, and actual read-only calls verify the GitHub contract."
+    }
+  ],
+  "verification": [
+    {
+      "kind": "independent targeted execution",
+      "command": "python3.12 -m unittest tests.test_release_endpoints tests.test_release -v",
+      "result": "23 tests passed, zero skips",
+      "duration_seconds": 22.71,
+      "log": "/tmp/rsi-release-endpoint-independent-review.log"
+    },
+    {
+      "kind": "independent actual GitHub root-path contrast",
+      "result": "Trailing-slash repository root returned HTTP404; canonical root returned full_name Haoog/Adaptive-RSI and default_branch main. Both requests were GET.",
+      "log": "/tmp/rsi-release-root-endpoint-readonly-contrast.json"
+    },
+    {
+      "kind": "independent actual fixed-helper read contract",
+      "result": "Called each modified helper with empty endpoint, commits/main, and releases?per_page=100. Both helpers returned correct repository metadata, the expected main commit, and a release list. All six helper calls were GET and no remote write occurred.",
+      "main_sha": "21aeacc30723531e3fa5fd796573f26349c1243c",
+      "observed_release_count": 1,
+      "log": "/tmp/rsi-release-endpoint-independent-read-contract.json"
+    },
+    {
+      "kind": "implementation-author actual read-only workflow discovery evidence, independently inspected",
+      "result": "Actual workflow_choices returned three workflows, all correctly incompatible with the RSI delivery contract. Adjacent commit, associated-PR, matching-ref and release list reads succeeded. Temporary Runtime project was paused, release/deploy disabled, not started; recorded API wrapper allowed GET with no fields only.",
+      "formal_releases": 0,
+      "draft_releases": 1,
+      "log": "/tmp/rsi-release-metadata-read-contract.json"
+    },
+    {
+      "kind": "static path audit and unit boundary checks",
+      "result": "Reviewed all gh calls in the release script: prepare and gate share the corrected root helper; commits, pull requests, matching refs and release queries retain nonempty endpoints. Nonempty POST git/refs fields and method are asserted at mocked subprocess boundaries without making any remote write. git diff --check passed."
+    }
+  ],
+  "limits": [
+    "No real prepare, authorization, tag creation, workflow dispatch, rerun, PR mutation, merge or publication was performed by this reviewer. Actual helper checks were read-only GET requests.",
+    "Repository workflows being readable does not mean any is compatible with managed-project delivery; this snapshot returned three incompatible workflows and no compatible choice.",
+    "The observed draft/formal release counts are a point-in-time read, not evidence of a successful formal publication.",
+    "This follow-up covers the minimal path fix and affected tests. Full hosted CI and actual release continuation remain separate gates.",
+    "The previous frozen release review report is historical and was not edited for this follow-up."
+  ],
+  "reviewed_file_sha256": {
+    "scripts/release.py": "cf382a4de2e3cc44734cb8f4d070a30f624831e81b1bc06cb37ebf07b3b27f35",
+    "adaptive_rsi/release.py": "419b134c34c86300995311e454ac50d7f8d4a41c16d4afdc911f105d9d8f39cc",
+    "tests/test_release_endpoints.py": "aa0fe739839a758eeb69d1fd73313dea31ac8bd86e1cbe9e94a22c374a65893a"
+  }
+}

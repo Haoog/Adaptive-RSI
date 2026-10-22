@@ -26,7 +26,8 @@ class ApiRejected(RuntimeError):
 
 
 def api(repo, endpoint, method="GET", fields=None):
-    argv = ["gh", "api", "repos/" + repo + "/" + endpoint, "--method", method]
+    path = "repos/" + repo + ("/" + endpoint if endpoint else "")
+    argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
         argv += ["-f", key + "=" + str(value)]
     try:

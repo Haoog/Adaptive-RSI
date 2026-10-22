@@ -20,7 +20,8 @@ def run(*args, cwd=None):
 
 
 def gh(endpoint, method="GET", **fields):
-    args = ["gh", "api", "repos/" + os.environ["GITHUB_REPOSITORY"] + "/" + endpoint, "--method", method]
+    path = "repos/" + os.environ["GITHUB_REPOSITORY"] + ("/" + endpoint if endpoint else "")
+    args = ["gh", "api", path, "--method", method]
     for key, value in fields.items():
         args += ["-f", key + "=" + str(value)]
     output = run(*args)
