@@ -27,11 +27,27 @@
       "original_evidence": "The first final-increment run executed 34 tests but failed both real supervised service upgrade subcases before server.log creation. An independent Store -> sqlite3.Connection.backup reproduction showed SQLite 3.54.0 rejecting the valid WAL-header backup on initial mode=ro open because sidecars did not exist.",
       "resolution": "Static backup integrity checks use mode=ro&immutable=1, which validates the closed standalone backup without creating WAL/SHM sidecars. Missing and corrupt backups still stop with recovery_required and preserve the current database.",
       "references": [
-        "adaptive_rsi/updates.py:354",
-        "tests/test_updates_recovery.py:95",
-        "tests/test_updates_recovery.py:105"
+        "adaptive_rsi/updates.py:406",
+        "tests/test_updates_recovery.py:103",
+        "tests/test_updates_recovery.py:113"
       ],
       "verification": "The final 36-test run passes the real static-WAL backup regression, corrupt-backup safety regression, and both real supervised service upgrade/rollback subcases."
+    },
+    {
+      "priority": "P1",
+      "title": "The 0.3.0 supervisor handoff could be mistaken for interrupted modern supervision",
+      "original_evidence": "The real installed 0.3.0 supervisor has no supervisor.lock, phase journal or candidate_pid and deletes restart.json after installation. The previous candidate startup logic treated the absent lock as interrupted supervision, allowing a replacement worker/candidate shutdown or a read of the already-deleted plan during status polling.",
+      "resolution": "Legacy plans receive a bounded 90-second completion window and never trigger automatic worker takeover or candidate shutdown. Completion is checked before recovery and rechecked after plan reads; missing journals are handled without an uncaught file error. An unconfirmed legacy handoff preserves state and requires manual recovery. Historical installed status cannot unlock a newly admitted installation.",
+      "references": [
+        "adaptive_rsi/updates.py:145",
+        "adaptive_rsi/updates.py:155",
+        "adaptive_rsi/updates.py:161",
+        "adaptive_rsi/updates.py:171",
+        "adaptive_rsi/updates.py:194",
+        "tests/test_updates_recovery.py:180",
+        "tests/test_updates_recovery.py:230"
+      ],
+      "verification": "The final independent 42-test run includes five handoff/race regressions and execution of the actual read-only installed 0.3.0 supervisor against a temporary candidate copied from the feature implementation with version changed to 0.3.1. Across 48 real HTTP state polls (4 busy), only one serve subprocess was started, no replacement update-worker was started, installation became nonbusy, the journal was removed, and the database sentinel was preserved."
     }
   ],
   "assessments": [
@@ -71,17 +87,16 @@
     {
       "area": "Update recovery and database safety",
       "decision": "pass",
-      "reason": "Active work, model probes and authentication prevent update admission. Update policy is explicit and does not downgrade. Journals use guarded prepared/health_check/committed phases; installed journals never restore old backups, an existing healthy child is adopted by exact version/PID evidence, and uncertainty preserves the plan/database as recovery_required. Startup rollback terminates the failed child and acquires runtime.lock before restoring the guarded pre-admission database backup. The original backup must pass static read-only SQLite integrity/schema checks before candidate launch and before rollback; corrupt or missing backups preserve current data and require recovery.",
+      "reason": "Active work, model probes and authentication prevent update admission. Update policy is explicit and does not downgrade. Journals use guarded prepared/health_check/committed phases; installed journals never restore old backups, an existing healthy child is adopted by exact version/PID evidence, and uncertainty preserves the plan/database as recovery_required. Startup rollback terminates the failed child and acquires runtime.lock before restoring the guarded pre-admission database backup. The original backup must pass static read-only SQLite integrity/schema checks before candidate launch and before rollback; corrupt or missing backups preserve current data and require recovery. Legacy 0.3.0 handoff is distinguished from modern journal recovery: the absent modern lock does not authorize takeover, and timeout preserves state for manual recovery.",
       "references": [
-        "adaptive_rsi/updates.py:144",
-        "adaptive_rsi/updates.py:207",
-        "adaptive_rsi/updates.py:226",
-        "adaptive_rsi/updates.py:371",
-        "adaptive_rsi/updates.py:468",
-        "adaptive_rsi/updates.py:486",
-        "adaptive_rsi/updates.py:354",
-        "adaptive_rsi/updates.py:439",
-        "adaptive_rsi/updates.py:501"
+        "adaptive_rsi/updates.py:145",
+        "adaptive_rsi/updates.py:161",
+        "adaptive_rsi/updates.py:171",
+        "adaptive_rsi/updates.py:194",
+        "adaptive_rsi/updates.py:406",
+        "adaptive_rsi/updates.py:431",
+        "adaptive_rsi/updates.py:491",
+        "adaptive_rsi/updates.py:553"
       ]
     },
     {
@@ -102,11 +117,11 @@
   ],
   "verification": [
     {
-      "kind": "independent targeted execution on final frozen increment",
-      "command": "python3 -m unittest tests.test_release tests.test_updates_recovery tests.test_controls.UpdatesTest -v",
-      "result": "36 tests passed; includes real supervised successful upgrade and failed-start database/code rollback",
-      "duration_seconds": 17.37,
-      "log": "/tmp/rsi-release-independent-review-final.log"
+      "kind": "independent targeted execution on final legacy-compatible frozen increment",
+      "command": "RSI_LEGACY_SOURCE='/Users/neg-entropy/.local/share/adaptive-rsi/installations/local-0.3.0-server-final-k18r4ute/adaptive-rsi' PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_updates_recovery tests.test_controls.UpdatesTest tests.test_release -v",
+      "result": "42 tests passed, zero skips; includes actual legacy-supervisor handoff, real supervised successful upgrade, and failed-start database/code rollback",
+      "duration_seconds": 20.758,
+      "log": "/tmp/rsi-release-legacy-independent-review.log"
     },
     {
       "kind": "protocol-substitute identity probes",
@@ -119,6 +134,26 @@
     {
       "kind": "intermediate regression detection and resolution",
       "result": "An intermediate 34-test run failed both real supervised update subcases. The reviewer isolated valid static-WAL backup rejection, the implementation author fixed it and added a real backup regression, and the final 36-test run passed. The intermediate failure is not represented as passing evidence."
+    },
+    {
+      "kind": "actual installed legacy source provenance and handoff",
+      "source": "/Users/neg-entropy/.local/share/adaptive-rsi/installations/local-0.3.0-server-final-k18r4ute/adaptive-rsi",
+      "source_version": "0.3.0",
+      "source_file_sha256": {
+        "adaptive_rsi/updates.py": "bfedbff0acbcee0d29a79791367029a976d0791e7936607985ca769bdcd8dab0",
+        "adaptive_rsi/store.py": "d164eee222daec91b2abd6764bbdcc30d869b3513ca69eabb87878cab8ccdcde"
+      },
+      "provenance": "Both files independently compared byte-for-byte equal to git base 3043dde814492bec7ef7464fad66132625e8b949. The source was read-only and PYTHONDONTWRITEBYTECODE=1 was inherited by its child.",
+      "candidate_test_version": "0.3.1",
+      "state_polls": 48,
+      "busy_polls": 4,
+      "spawned_serve_processes": 1,
+      "spawned_replacement_workers": 0,
+      "database_sentinel_preserved": true
+    },
+    {
+      "kind": "additional independent recovery-boundary probes",
+      "result": "Legacy handoff waits without spawning; installed status with an already-deleted journal clears stale recovery; stale historical installed status preserves a newly admitted installation gate; expired legacy wait preserves the database and plan without worker launch or service shutdown."
     }
   ],
   "boundaries": [
@@ -126,14 +161,15 @@
     "GitHub branch protection, required approvals, Actions permission policy and real workflow execution remain remote integration gates; local protocol substitutes do not prove those remote account settings.",
     "Target-side deployment commands, secret selection, idempotency enforcement and data-migration rollback are explicitly delegated to the reviewed maintainer-owned workflow. The shipped template fails until a real target is configured.",
     "Update checksums come from the same official GitHub Release and are not an independent release signature. Unknown migration schemas, missing backups or unverifiable committed children require manual recovery rather than unsafe automatic rollback.",
-    "This report reviews the file hashes listed below. Later implementation changes require an appropriate follow-up review."
+    "This report reviews the file hashes listed below. Later implementation changes require an appropriate follow-up review.",
+    "The real legacy handoff test used temporary state and current feature code with only its copied version metadata changed to 0.3.1. It is not evidence of an official 0.3.0-to-0.4.0 release-asset upgrade or a change to the live user service."
   ],
   "reviewed_file_sha256": {
     "adaptive_rsi/release.py": "6bc8f78cd9b0f2aa09c54f9838a418a554f1a7819c77963477d9278255a1e5d6",
     "adaptive_rsi/config.py": "4a311e2825295921f19f1e8584163d99ea499803e60a8adc2e4811927f571b2f",
     "adaptive_rsi/delivery.py": "998dd5c6c0eceabb69dc87d1245e1b65a55d72a61936799aaf2305e264eb3dd4",
     "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
-    "adaptive_rsi/updates.py": "22f779c6a953910ef4de0ca219af973dcf41773fdd49275e040d77ff17cd1f2f",
+    "adaptive_rsi/updates.py": "9778fefdd37c0061f496ec38761a7160f640984514ba92f670f1350aa111b556",
     "scripts/release.py": "c5da35b699e5d6991096f01a456a6ad0edb72bed5a4165652915cb1dd9629a7d",
     "scripts/release_smoke.py": "72f3bffd7133cd097445acea6bb29c5b5fd1ba938e66f1577f9167a71fbbd6cf",
     "scripts/rsi-delivery-workflow.example.yml": "6398610b658886f3d285ed212282008d1b3a16dfbc459875a15e1bbb4c8f0945",
@@ -141,10 +177,10 @@
     ".github/workflows/release.yml": "31c9d4ec53427d0f60bc720f61ce64e92376ea7a74d0ceaf0fe498c82b17f918",
     ".github/workflows/release-verify.yml": "9b01a07c3b36465542d44e5f1876d711910f755e59a1f2d726380a1ac318b703",
     ".github/workflows/checks.yml": "3651aeb9fd2583b84abd472d0396990ca99d81bd576285e113e85da477652d8f",
-    "RELEASING.md": "d2763feec41a7e34d8f92a06775b92df3f0a13ba5f6dd0b9f69444bceff71a1c",
-    "RELEASING.en.md": "ed327c8d04c66447683cd8ca91cb0f5705bd27eb1213341819f58bc1bf3769d5",
+    "RELEASING.md": "924eb3d327f371ba6f15695046948214fd031b31615ed88dae253734abf59c93",
+    "RELEASING.en.md": "9de23608a47cbbb86531b93353722b1efa762dc9c9bb3607be2668c66bcf4315",
     "tests/test_release.py": "708c649bc385022c074f4f537f21e6b48fc5af7939bf07259e451037f026a2cb",
-    "tests/test_updates_recovery.py": "2f0bc2312658644d4de6adba32fce0f64e828068b0b2d4ef1391dea6ff2cd4d6",
+    "tests/test_updates_recovery.py": "e48a113f9c485727135ee7de09bef5fc08523991a3dfafd1522693e0da83631e",
     "tests/test_controls.py": "c3e7afb1436ea9fb3999661869748e3f5015d76982dab7768b7c5f60b466fd15"
   }
 }

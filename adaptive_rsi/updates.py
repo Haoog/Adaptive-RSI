@@ -137,12 +137,41 @@ class UpdateManager:
         self.restart_target = None
         self.shutdown = None
         self.recovering = False
+        self.legacy_deadline = None
 
     def status(self):
         return self.store.setting("update-status", {"state": "unchecked", "current": __version__})
 
+    def completed(self, status):
+        awaiting_restart = self.restart_target is not None or self.recovering or self.legacy_deadline is not None
+        if awaiting_restart and status.get("state") == "installed" and status.get("current") == (self.restart_target or __version__):
+            self.installing = False
+            self.restart_target = None
+            self.recovering = False
+            self.legacy_deadline = None
+            return True
+        return False
+
+    def restart_plan(self):
+        try:
+            return json.loads((self.store.root / "installations/restart.json").read_text())
+        except FileNotFoundError:
+            return None
+
+    def observe_plan(self, plan):
+        if "phase" not in plan or "state_schema" not in plan:
+            # 0.3.0 supervisors have neither our lock nor a recoverable phase journal.
+            self.recovering = False
+            if self.legacy_deadline is None:
+                self.legacy_deadline = time.monotonic() + 90
+            return False
+        self.legacy_deadline = None
+        return True
+
     def restore_startup(self):
         status = self.status()
+        if self.completed(status):
+            return
         if status.get("state") == "recovery_required":
             self.installing = True
         if status.get("state") == "downloading":
@@ -151,41 +180,64 @@ class UpdateManager:
         if status.get("state") == "restarting" and status.get("version") == __version__:
             self.restart_target = __version__
             self.installing = True
-        plan_path = self.store.root / "installations/restart.json"
-        if status.get("state") == "restarting" and plan_path.exists():
+        if status.get("state") == "restarting":
             self.installing = True
-            self.recovering = not supervisor_active(self.store.root)
-        elif status.get("state") == "restarting":
-            self.installing = True
-            self.store.put_setting("update-status", {**status, "state": "recovery_required", "reason": "Restart plan is missing; inspect installations before admitting work"})
+            plan = self.restart_plan()
+            if self.completed(self.status()):
+                return
+            if plan is None:
+                self.recovering = False
+                recovery_required(self.store.root, "Restart plan is missing; inspect installations before admitting work")
+            elif self.observe_plan(plan):
+                self.recovering = not supervisor_active(self.store.root)
 
     def is_busy(self):
-        status = self.status()
-        if (self.installing and status.get("state") == "restarting" and time.time() - status.get("checked", time.time()) > 5 and
-                (self.store.root / "installations/restart.json").exists() and not supervisor_active(self.store.root)):
-            self.recovering = True
-        if self.recovering and self.shutdown is not None:
-            with self.runtime.dispatch_lock:
+        with self.runtime.dispatch_lock:
+            status = self.status()
+            # Completion can precede journal deletion or race an earlier recovery decision.
+            if self.completed(status):
+                (self.store.root / "update-ready").unlink(missing_ok=True)
+                return False
+            if status.get("state") != "restarting":
                 self.recovering = False
-                plan_file = self.store.root / "installations/restart.json"
-                plan = json.loads(plan_file.read_text())
+            if self.installing and status.get("state") == "restarting":
+                plan = self.restart_plan()
+                status = self.status()
+                if self.completed(status):
+                    return False
+                if status.get("state") != "restarting":
+                    self.recovering = False
+                elif plan is None:
+                    self.recovering = False
+                    recovery_required(self.store.root, "Restart plan disappeared before completion; preserve current state and inspect installations")
+                elif not self.observe_plan(plan):
+                    if time.monotonic() >= self.legacy_deadline:
+                        latest = self.status()
+                        if self.completed(latest):
+                            return False
+                        if latest.get("state") == "restarting":
+                            recovery_required(self.store.root, "Legacy supervisor did not confirm installation within 90 seconds; preserve current database and inspect installations")
+                elif time.time() - status.get("checked", time.time()) > 5 and not supervisor_active(self.store.root):
+                    self.recovering = True
+            if self.recovering and self.shutdown is not None:
+                plan = self.restart_plan()
+                latest = self.status()
+                if self.completed(latest):
+                    return False
+                self.recovering = False
+                if latest.get("state") != "restarting" or plan is None or not self.observe_plan(plan):
+                    return self.installing
                 # A replacement supervisor waits for this guarded service to release its lock.
                 plan["pid"] = os.getpid()
-                atomic_json(plan_file, plan)
+                atomic_json(self.store.root / "installations/restart.json", plan)
                 with (self.store.root / "update.log").open("ab") as log:
                     subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(self.store.root), "update-worker"],
                                      cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
                 if plan.get("candidate_pid") != os.getpid():
                     self.shutdown()
-        if self.restart_target:
-            with self.runtime.dispatch_lock:
-                status = self.status()
-                if status.get("state") == "installed" and status.get("current") == self.restart_target:
-                    self.installing = False
-                    self.restart_target = None
-        if not self.installing:
-            (self.store.root / "update-ready").unlink(missing_ok=True)
-        return self.installing
+            if not self.installing:
+                (self.store.root / "update-ready").unlink(missing_ok=True)
+            return self.installing
 
     def snapshot(self):
         busy = self.is_busy()
