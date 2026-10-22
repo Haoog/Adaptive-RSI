@@ -20,7 +20,7 @@ Real call records are grouped by task, including failures and retries. Filter by
 
 ## Build
 
-A macOS ARM64 build path is available. Installation on other platforms has not been verified; the local runtime is not supported on Windows yet.
+Future formal releases will include a macOS ARM64 installer named `adaptive-rsi-version-macos-arm64-adhoc.dmg` and its `.dmg.sha256` checksum on GitHub Releases. Installation on other platforms has not been verified; the local runtime is not supported on Windows yet.
 
 ```sh
 # Requires Node.js, Rust, uv and platform-specific Tauri build dependencies
@@ -32,4 +32,4 @@ npm run --prefix desktop dev
 
 The build downloads Python 3.12, installs PyInstaller and packages a standalone engine. The app version comes from the Python package rather than a second release-version source. Bundles are under `desktop/src-tauri/target/release/bundle/`.
 
-Builds use local ad-hoc signatures only. Apple Developer ID signing and notarization are not configured; do not present these as trusted official installers. To update, quit and install the new desktop package. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
+Builds use local ad-hoc signatures only. Apple Developer ID signing and notarization are not configured; macOS may show a security warning, and the package is not notarized. To update, download the new asset from GitHub Releases, quit, then replace the app manually. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.

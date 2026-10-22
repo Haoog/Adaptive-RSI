@@ -299,4 +299,4 @@ Codex CLI must support named `permissions` profiles. macOS workers use Codex's o
 
 ## Desktop App
 
-A bundled local engine, menu-bar lifecycle, explicit project start, server connections and task-based usage reporting are available. See the [desktop guide](DESKTOP.en.md) for lifecycle, builds and current platform limitations.
+A bundled local engine, menu-bar lifecycle, explicit project start, server connections and task-based usage reporting are available. Future stable releases will include a macOS ARM64 DMG; its temporary signature is not Apple-notarized. See the [desktop guide](DESKTOP.en.md) for limitations, lifecycle and platform support.
