@@ -42,6 +42,8 @@ class Runtime:
         self.updates = UpdateManager(self)
         from .model_center import ModelCenter
         self.model_center = ModelCenter(self)
+        from .auth_sessions import AuthSessions
+        self.auth_sessions = AuthSessions(self.store.root, config=lambda: self.config())
 
     def config(self, project=None):
         override = {}
@@ -114,6 +116,10 @@ class Runtime:
                 raise
 
     def configure(self, values, project=None, inherit=None):
+        with self.dispatch_lock:
+            return self._configure(values, project, inherit)
+
+    def _configure(self, values, project=None, inherit=None):
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
         allowed = {"schedule.light_minutes", "schedule.issues_minutes", "schedule.deep_minutes",
@@ -127,7 +133,8 @@ class Runtime:
             group, key = path.split(".")
             if key in values.get(group, {}):
                 raise ValueError("An inherited setting cannot also have an override")
-        if not project and (values.get("delivery", {}).get("mode", "local") != "local" or values.get("delivery", {}).get("auto_merge")):
+        if not project and (values.get("delivery", {}).get("mode", "local") != "local" or values.get("delivery", {}).get("auto_merge") or
+                any(values.get("delivery", {}).get(kind, {}).get("enabled") for kind in ["release", "deploy"])):
             raise ValueError("Automatic delivery must be explicitly enabled per project")
         if project and "concurrency" in values.get("limits", {}):
             raise ValueError("Parallel project limit is a global setting; select global defaults")
@@ -161,10 +168,27 @@ class Runtime:
         self.wake.set()
 
     def pause(self, project, paused):
-        self.project(project)
-        self.store.execute("UPDATE projects SET paused=? WHERE id=?", (bool(paused), project))
+        with self.dispatch_lock:
+            self.project(project)
+            self.store.execute("UPDATE projects SET paused=? WHERE id=?", (bool(paused), project))
         self.store.event("paused" if paused else "resumed", "Project paused" if paused else "Project enabled", project)
         self.wake.set()
+
+    def release_status(self, project, run):
+        from .release import status
+        return status(self, project, run)
+
+    def retry_release(self, project, run, kind):
+        from .release import retry
+        return retry(self, project, run, kind)
+
+    def workflow_choices(self, project):
+        from .release import workflow_choices
+        return workflow_choices(self, project)
+
+    def authorize_workflow(self, project, kind, workflow):
+        from .release import authorize_workflow
+        return authorize_workflow(self, project, kind, workflow)
 
     def goal(self, project, text, overrides=None):
         self.project(project)
@@ -257,6 +281,7 @@ class Runtime:
         except BlockingIOError:
             self.lockfile.close()
             raise RuntimeError("Another runtime already owns this state directory")
+        self.updates.restore_startup()
         self.store.recover()
         self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
         self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
@@ -265,6 +290,7 @@ class Runtime:
     def close(self):
         self.stop.set()
         self.wake.set()
+        self.auth_sessions.close()
         if self.thread:
             self.thread.join(timeout=10)
         self.pool.shutdown(wait=True)
@@ -312,6 +338,8 @@ class Runtime:
                     self.wake.clear()
                     continue
                 self.updates.tick()
+                if self.updates.is_busy():
+                    continue
                 self.maintenance()
                 self.futures = {f for f in self.futures if not f.done()}
                 from .delivery import schedule as schedule_delivery
@@ -601,8 +629,15 @@ class Runtime:
                 path.relative_to(workspace)
                 if not item["quote"].strip() or item["quote"] not in path.read_text(errors="replace") or not item["acceptance"]:
                     continue
-                finding_key = fingerprint({"path": item["path"], "quote": item["quote"]})
+                from .discovery import finding_identity, related_task
+                finding_key = finding_identity(item)
                 prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], finding_key))
+                if not prior:
+                    legacy = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                                            (project["id"], fingerprint({"path": item["path"], "quote": item["quote"]})))
+                    if legacy and related_task([legacy], item):
+                        prior = legacy
+                        finding_key = legacy["fingerprint"]
                 if prior and prior["state"] == "merged":
                     self.store.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
                                        (encode([{"path": item["path"], "quote": item["quote"], "base": head,
@@ -610,7 +645,6 @@ class Runtime:
                     self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
                     added += 1
                     continue
-                from .discovery import related_task
                 if related_task(backlog, item):
                     continue
                 evidence = {"path": item["path"], "quote": item["quote"], "base": head, "source": "inspection"}

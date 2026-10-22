@@ -1,0 +1,203 @@
+{
+  "review": "browser-login-independent-review",
+  "frozen_at": "2026-10-22T04:35:53.390449+00:00",
+  "reviewer": "simple_ui agent; authentication backend implemented by browser_login agent",
+  "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
+  "source_sha256": {
+    "adaptive_rsi/auth_sessions.py": "e373c66f6870058d77634d90b956e40df5f455bb260b18e4b75c6ce0783d2528",
+    "adaptive_rsi/server.py": "7cd25fb858f7164f04570798b7a673ac2e5f4e1cadd3bb89ddc09bb5105525c4",
+    "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
+    "adaptive_rsi/agent.py": "be137f944e852209abc47ba8502a38f67a2d7b334e22ce867b19fb0f722153b4",
+    "adaptive_rsi/opencode.py": "4628dd80e6c80538f9112f38c495afffba8308755476626a253f548d78a81952",
+    "adaptive_rsi/cli_worker.py": "def9219311072a7e85ed3d1d3e6ed794b80045d6d0af29d1735dde2a042b971a",
+    "tests/test_auth_sessions.py": "4acfb6886fd44a26f961dc47965f98de42faabd11123b3bd293aa83bf4afd00c",
+    "tests/test_experience.py": "228811ca1c0ab3a42963c987126aa238edf739901bd27971414de5987953b82a",
+    "adaptive_rsi/web/auth.js": "27b953be45491ba8dbced9cd1b69471b947c6fb092c1817c8cd82e739132bb29",
+    "tests/browser_fixture.py": "4dcdbc3329fe1c5eda480d67140ea5555200f2a9621787405ce977e951da3c33",
+    "tests/browser_smoke.cjs": "fdf50d7069afa7d699f6f8187429026d34444b04e7552e55a092155446d5e236"
+  },
+  "scope": [
+    "认证会话与凭据写入",
+    "启动、取消、过期、退出、关闭与重启恢复",
+    "宿主与Docker进程清理",
+    "认证HTTP权限、CSRF与更新窗口",
+    "秘密在专用凭据文件、瞬态API与元数据之间的边界"
+  ],
+  "outcome": "reviewed; no unresolved P1/P2 findings in frozen authentication sources",
+  "findings": [
+    {
+      "id": "AUTH-01",
+      "priority": "P2",
+      "status": "fixed and independently reverified",
+      "original_location": "adaptive_rsi/auth_sessions.py:632 (original _run manager-lock scope), :657/:663 (original credential lock wait)",
+      "issue": "登录完成时在manager锁内等待模型执行器长期持有的凭据锁，阻塞取消、状态、关闭；HTTP退出还会持dispatch_lock阻塞项目暂停。",
+      "before": {
+        "cancel_blocked": true,
+        "terminal_after_cancel": "completed",
+        "credentials_saved": true,
+        "project_pause_blocked_by_logout": true
+      },
+      "after": {
+        "cancel_blocked": false,
+        "terminal_after_cancel": "cancelled",
+        "credentials_saved": false,
+        "logout_http_status_when_model_busy": 409,
+        "project_pause_blocked_by_logout": false
+      },
+      "resolution": "凭据锁在manager锁外可中止等待；取得锁后再次检查会话、取消、关闭与过期；snapshot原子读取不等模型执行锁；退出/密钥操作在忙时快速拒绝。",
+      "regression_tests": [
+        "test_waiting_for_model_credentials_does_not_block_cancel_status_or_close",
+        "test_snapshot_and_mutations_never_wait_for_running_model_credential_lock"
+      ]
+    },
+    {
+      "id": "AUTH-02",
+      "priority": "P2",
+      "status": "fixed and independently reverified",
+      "original_location": "adaptive_rsi/auth_sessions.py:735 (original set_api_key final write section)",
+      "issue": "providers查询在服务关闭后才返回时，set_api_key未重查closed而仍可写入新密钥。",
+      "before": {
+        "manager_closed": true,
+        "credentials_written_after_close": true
+      },
+      "after": {
+        "manager_closed": true,
+        "credentials_written_after_close": false,
+        "error": "AuthError"
+      },
+      "resolution": "最终写入锁内重新检查closed。",
+      "regression_tests": [
+        "test_delayed_provider_lookup_cannot_save_key_after_service_closes"
+      ]
+    },
+    {
+      "id": "AUTH-03",
+      "priority": "P1",
+      "status": "fixed and independently reverified",
+      "reviewer": "browser_login agent independently reviewed the simple_ui-authored UI and browser integration patch; browser_login implemented the original backend.",
+      "original_location": "adaptive_rsi/web/auth.js:37",
+      "issue": "Codex login sent an empty provider string, which real AuthSessions.start rejected with HTTP400 invalid_provider; controlled browser auth responses had not enforced that backend contract.",
+      "before": {
+        "negative_control": "Intercepting only auth.js to restore the original provider-empty expression makes the new integration test fail with real backend HTTP400 invalid_provider. No auth endpoint interception."
+      },
+      "after": {
+        "http_status": 200,
+        "provider": null,
+        "device_code_rendered": true,
+        "cancel_and_relogin_with_new_session": true
+      },
+      "resolution": "Codex start/logout send provider:null; OpenCode preserves its selected provider ID. The browser fixture uses the actual Server and AuthSessions, replacing only the external auth worker and isolating credential directories. Internal session keys remain compatible.",
+      "regression_tests": [
+        "tests/browser_smoke.cjs::checkCodexHTTPLogin"
+      ],
+      "evidence_logs": [
+        "/tmp/rsi-auth-rerun-ui-independent-review.log",
+        "/tmp/rsi-codex-original-provider-mutation.log"
+      ]
+    }
+  ],
+  "validation": [
+    {
+      "command": "RSI_AUTH_CLI_TESTS=1 RSI_AUTH_DOCKER_TESTS=1 python3 -m unittest tests.test_auth_sessions -v",
+      "result": "26 passed; 0 skipped; 11.264 seconds",
+      "actual_tools": "宿主Codex account/read；默认OpenCode因宿主缺失走Docker；显式Docker Codex/OpenCode；Docker父进程崩溃清理。所有真实工具检查只读，不发起账号授权。"
+    },
+    {
+      "command": "python3 -m unittest tests.test_experience.ConnectionAndReleaseRoutesTest -v",
+      "result": "4 passed; authenticated GET, POST CSRF, dynamic inputs, update window and cross-project release status checked"
+    },
+    {
+      "command": "node --test tests/web_requests.cjs",
+      "result": "26 passed"
+    },
+    {
+      "command": "RSI_BROWSER_AUTH_ONLY=1 npm run test:browser",
+      "result": "passed after deployment UI simplification; controlled auth API responses only"
+    },
+    {
+      "method": "reviewer-owned temporary lock-race, late-shutdown-write and real Server/Runtime route reproducers",
+      "result": "original two P2 findings reproduced before fix; all three reproducers independently passed after fix; HTTP busy status confirmed 409"
+    },
+    {
+      "method": "final provider discovery lifecycle source inspection and test_service_close_stops_active_provider_discovery_process",
+      "result": "close tracks and closes temporary discovery workers; finally unregisters and closes them; final enabled authentication suite includes this regression"
+    },
+    {
+      "method": "external credential replacement/removal in isolated temporary HOME",
+      "result": "snapshot immediately reflected first provider, replacement provider and sign-out"
+    },
+    {
+      "method": "_url malformed authorization URL checks",
+      "result": "5/5 invalid cases rejected (HTTP, javascript, embedded credentials, no host, overlong); HTTPS device URL accepted"
+    },
+    {
+      "method": "source inspection plus secret-marked test fixtures",
+      "result": "transient device code/URL/callback code absent from session metadata and snapshot; designated credential files mode0600; temporary HOME isolation; stderr/access logging suppression and authenticated loopback OpenCode HTTP checked"
+    },
+    {
+      "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+      "reviewer": "browser_login agent",
+      "result": "Independent real Codex HTTP integration and release DOM cases passed; original empty-provider browser-source mutation was rejected by the real backend as expected.",
+      "log": "/tmp/rsi-auth-rerun-ui-independent-review.log"
+    }
+  ],
+  "limits": [
+    "未使用用户真实账号完成OAuth，不宣称真实账号登录成功或付费模型能力提升。",
+    "设备授权期间供应商真实网络瞬态错误、实际token发行与刷新未在本次审查触发；真实工具只验证隔离account/read和内置登录方法发现。",
+    "并发状态机和凭据落盘正确性使用受控协议进程/fixture验证，不冒充供应商端认证。",
+    "外部CLI与页面均显式发起新登录时采用最后完成者写入的实现约定；本次只验证外部文件变化可被状态接口及时读取。"
+  ],
+  "ci_compatibility_followup": {
+    "reviewed_at": "2026-10-22T04:22:01.893246+00:00",
+    "base_commit": "bc29449b28f46bd27233e4cb34da6d2044700ab0",
+    "changed_files": [
+      "tests/test_auth_sessions.py"
+    ],
+    "outcome": "independently reviewed; no unresolved P1/P2 findings; authentication backend and UI unchanged",
+    "ci_evidence": "PR10 macOS Python 3.12.10 job failed in three OpenCode protocol fixture startups after roughly 25 seconds each; Codex fixture succeeded. Remote runner DNS stack was not captured.",
+    "mechanism": "Python 3.12 HTTPServer.server_bind invokes socket.getfqdn even for a literal loopback address; a resolver failure was reproduced deterministically. This supports the fixture reverse-DNS diagnosis without claiming a captured remote DNS timeout.",
+    "fix": "Test-only LoopbackServer binds through TCPServer.server_bind and sets fixed localhost/server_port; generated fixture shebang pins sys.executable. No runtime authentication behavior or readiness timeout changed.",
+    "regression": "test_loopback_fixture_skips_reverse_dns_and_uses_current_python injects a child-process getfqdn that raises; authenticated health and provider discovery still work and report matching parent Python major/minor.",
+    "validation": [
+      {
+        "command": "RSI_AUTH_CLI_TESTS=1 RSI_AUTH_DOCKER_TESTS=1 python3.12 -m unittest tests.test_auth_sessions -v",
+        "environment": "local macOS; Python 3.12.13",
+        "result": "27 passed; 0 skipped; 9.658 seconds; real tool checks read-only, no account authorization or inference"
+      },
+      {
+        "command": "python3 -m unittest tests.test_auth_sessions.AuthProtocolTests -v",
+        "environment": "local macOS; Python 3.9.6",
+        "result": "5 passed; 0 skipped; 2.225 seconds"
+      },
+      {
+        "method": "independent minimal Python3.12 HTTPServer test with socket.getfqdn raising",
+        "result": "default HTTPServer attempted reverse DNS exactly once, reproducing the blocked/failing resolver dependency"
+      },
+      {
+        "method": "source diff and SHA256 audit against previous frozen authentication review",
+        "result": "only tests/test_auth_sessions.py differs among previously hashed sources; runtime authentication sources unchanged"
+      }
+    ],
+    "limits": [
+      "Local Python 3.12.13 verification is not a substitute for the pending hosted macOS Python 3.12.10 CI run.",
+      "No real supplier account OAuth success or paid model quality is claimed."
+    ]
+  },
+  "browser_contract_followup": {
+    "reviewed_at": "2026-10-22T04:35:53.390449+00:00",
+    "decision": "pass",
+    "reviewer": "browser_login agent",
+    "source_sha256": {
+      "adaptive_rsi/web/auth.js": "27b953be45491ba8dbced9cd1b69471b947c6fb092c1817c8cd82e739132bb29",
+      "tests/browser_fixture.py": "4dcdbc3329fe1c5eda480d67140ea5555200f2a9621787405ce977e951da3c33",
+      "tests/browser_smoke.cjs": "fdf50d7069afa7d699f6f8187429026d34444b04e7552e55a092155446d5e236"
+    },
+    "command": "RSI_BROWSER_RELEASE_RETRY_ONLY=1 npm run test:browser",
+    "result": "Passed. This selector first executes the real authenticated/CSRF-protected Codex HTTP integration with no auth endpoint interception, then separate release DOM cases. Actual backend accepts provider:null, renders the worker device code, cancels, and creates a new login session.",
+    "negative_control": "Independently intercepted only auth.js and restored the original empty-provider expression. The same test failed with real backend HTTP400 invalid_provider. No production file mutation.",
+    "limits": [
+      "The external worker is replaced; this verifies UI/HTTP/backend compatibility and lifecycle, not real supplier OAuth issuance.",
+      "Logout null normalization is source-reviewed and asserted by the existing controlled-response browser logout case."
+    ]
+  }
+}

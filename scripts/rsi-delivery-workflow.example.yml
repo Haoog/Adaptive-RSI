@@ -1,0 +1,43 @@
+# Copy through a reviewed PR into .github/workflows/, then explicitly authorize
+# that existing workflow in the project panel. This template cannot deploy as-is.
+name: Maintainer configured deployment
+run-name: ${{ inputs.rsi_operation_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      rsi_operation_id:
+        description: Stable idempotency key; persist it at the deployment target
+        required: true
+        type: string
+      rsi_sha:
+        description: Exact application commit to release or deploy
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: configured-production-target
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.rsi_sha }}
+          persist-credentials: false
+      - name: Validate the exact target
+        env:
+          EXPECTED_SHA: ${{ inputs.rsi_sha }}
+        run: |
+          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Maintainer must configure the real delivery and idempotency here
+        run: |
+          echo 'No deployment target has been configured. This template must fail.'
+          exit 1
+# Apply each rsi_operation_id at most once, including reruns.
+# A health URL returns {"sha":"<deployed full commit>","healthy":true}.
+# Support deployment of a prior known-good SHA before enabling automatic_rollback.
+# Keep secrets in GitHub environments.

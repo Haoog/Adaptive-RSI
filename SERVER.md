@@ -31,8 +31,8 @@ ssh -N -L 6090:127.0.0.1:6090 用户@服务器
 ## 模型与项目环境
 
 - API：页面添加官方或兼容服务；Linux 默认以 0600 私有文件保存密钥，重启后继续使用。也可使用环境变量或仅会话密钥。
-- OpenCode：镜像已包含 1.19.3。可在服务器安装相同版本，执行 `opencode auth login`，或配置 `~/.config/opencode/opencode.jsonc` 的 `provider`；然后在页面内置 OpenCode 连接获取模型。无宿主 CLI 时，目录查询也使用执行镜像。
-- Codex：镜像包含 0.163.0。默认登录读取服务账号的 `~/.codex/auth.json`；也可在页面使用 Responses API 或兼容服务，不依赖订阅登录。
+- OpenCode：镜像已包含 1.19.3。在页面选择 OpenCode 及实际供应商，使用其支持的官方登录或密钥连接；无需宿主 CLI，认证和模型目录均可使用执行镜像。也可使用 `opencode auth login` 或全局 `provider` 配置。
+- Codex：镜像包含 0.163.0。在页面发起设备授权，在个人电脑浏览器打开官方地址并输入一次性验证码；凭据写入服务器服务账号的 `~/.codex/auth.json`。也可使用 Responses API 或兼容服务。操作及故障恢复见 [账号连接](docs/accounts.md)。
 - 依赖：默认检查镜像是 `python:3.12-slim`，需事先 `docker pull python:3.12-slim`；本项目可把项目高级 JSON 设为 `{"sandbox":{"image":"adaptive-rsi-worker:local"}}`。其他语言请构建包含对应工具链和缓存依赖的可信镜像。需要下载依赖时在受信任的准备环境完成，检查容器不联网。
 
 CLI 容器只挂载该次工作区与独立 HOME；不挂载控制器、其他项目、评估集、SSH/GitHub 凭据或 Docker socket。只读角色不能修改源代码，所有角色不能写 Git 元数据。CLI 为调用模型需要联网，独立检查和原生命令工具不联网。CLI 能访问执行所需的所选模型连接凭据；这不构成对任意恶意程序的机密计算隔离。

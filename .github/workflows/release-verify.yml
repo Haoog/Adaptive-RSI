@@ -1,0 +1,109 @@
+name: 版本 PR 精确提交检查
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-pr-${{ inputs.pr }}
+  cancel-in-progress: false
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 独立重建版本补丁并核对 PR 身份
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr }}
+          PR_SHA: ${{ inputs.sha }}
+        run: python3 scripts/release.py gate --pr "$PR_NUMBER" --sha "$PR_SHA"
+  verify:
+    needs: gate
+    runs-on: macos-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -v
+      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
+      - run: node --check adaptive_rsi/web/auth.js
+      - run: node --test tests/web_requests.cjs
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - run: npm run test:browser
+      - run: python3 scripts/package.py
+      - run: python3 -m pip install build
+      - run: python3 -m build --wheel
+        env:
+          SOURCE_DATE_EPOCH: '1577836800'
+      - run: python3 scripts/release_smoke.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+  report:
+    if: always() && needs.gate.result == 'success'
+    needs: [gate, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: 为经过验证的 PR SHA 写入正常必需检查
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_SHA: ${{ needs.gate.outputs.sha }}
+          CHECK_RESULT: ${{ needs.verify.result }}
+        run: |
+          conclusion=failure
+          if [ "$CHECK_RESULT" = success ]; then conclusion=success; fi
+          gh api "repos/$GITHUB_REPOSITORY/check-runs" --method POST \
+            -f name=verify -f head_sha="$PR_SHA" -f status=completed -f conclusion="$conclusion" \
+            -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            -f 'output[title]=版本 PR 独立检查' \
+            -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel 安装升级。'
+  merge:
+    needs: [gate, verify, report]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 重查身份并按正常分支保护合并
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr }}
+          PR_SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          python3 scripts/release.py gate --pr "$PR_NUMBER" --sha "$PR_SHA"
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash --match-head-commit "$PR_SHA"
+      - name: 显式继续正式发布（机器人合并不会触发 push 工作流）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref main

@@ -39,8 +39,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             raise RuntimeError("Dependency preparation failed before planning: " + prepared["stderr"])
     from .context import code_map
     from .recovery import signature, cached, save
+    from .discovery import related_work
+    overlaps = related_work(runtime.store, project["id"], task)
     stage_key = fingerprint({"inputs": signature(run, task, base, strategies), "dependencies": environment["sha256"],
-                             "outcomes": runtime.outcomes(project["id"]), "prs": runtime.store.setting("prs:" + project["id"], [])})
+                             "outcomes": runtime.outcomes(project["id"]), "prs": runtime.store.setting("prs:" + project["id"], []),
+                             "related_work": overlaps})
     saved_plan = None if experiment else cached(runtime, run, "planning", stage_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", stage_key)
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", stage_key)
@@ -48,6 +51,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
                "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": runtime.outcomes(project["id"]),
                "open_prs": runtime.store.setting("prs:" + project["id"], []),
+               "related_work": overlaps,
                "known_tasks": runtime.store.query("SELECT id,title,state FROM tasks WHERE project=? AND id<>? "
                                                "AND source NOT LIKE 'system_%' LIMIT 100", (project["id"], task["id"])),
                "previous_attempts": runtime.store.query("SELECT state,result FROM runs WHERE task=? AND ended IS NOT NULL "
@@ -76,6 +80,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                        "Use deferred for weak evidence, unclear requirements or low current priority; rejected for cosmetic churn, disproportionate cost or incompatible direction. "
                        "Only ready authorizes implementation. Evidence must cite concrete current-code behavior or a specific user requirement. "
                        "Inspect the current code and verify the report still applies. Deduplicate already fixed work. "
+                       "Check related_work against this baseline and open PRs. Related paths are hints, not proof of the same defect: "
+                       "do not duplicate an existing fix, and do not discard a distinct problem merely because it shares a file. "
                        "If ready, scope must contain ONLY literal relative file/directory paths (e.g. calculator.py, tests), without annotations or descriptions. Define observable acceptance criteria separately. "
                            "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes.\n" +
                            encode({"value_policy": config["triage"]["policy"], **context}), workspace, run)

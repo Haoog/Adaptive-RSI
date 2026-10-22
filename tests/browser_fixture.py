@@ -3,11 +3,14 @@ import tempfile
 import threading
 import json
 import sys
+import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from pathlib import Path
 
 from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.auth_sessions import AuthSessions
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store
 from tests.test_runtime import FakeAgent, fixture, CHECKS
@@ -21,10 +24,38 @@ class DirectoryServer(ThreadingHTTPServer):
         self.server_port = self.server_address[1]
 
 
+class BrowserAuthWorker:
+    """Replace only the external CLI, keeping real session and HTTP validation."""
+    def __init__(self, backend):
+        self.home = tempfile.TemporaryDirectory(prefix="rsi-browser-auth-")
+        self.credentials = Path(self.home.name) / "auth.json"
+        self.closed = threading.Event()
+
+    def start(self, provider=None, method=0, inputs=None):
+        return {"verification_url": "https://example.test/device", "user_code": "HTTP-TEST-CODE",
+                "method": "auto", "instructions": "Browser integration fixture"}
+
+    def wait(self, stop, deadline):
+        while not stop.wait(0.01) and not self.closed.is_set() and time.time() < deadline:
+            pass
+        return False
+
+    def providers(self):
+        return []
+
+    def close(self):
+        self.closed.set()
+        self.home.cleanup()
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="rsi-browser-") as directory:
         root = Path(directory).resolve()
+        os.environ["CODEX_HOME"] = str(root / "credentials/codex")
+        os.environ["XDG_DATA_HOME"] = str(root / "credentials/data")
         runtime = Runtime(Store(root / "state"), FakeAgent())
+        runtime.auth_sessions.close()
+        runtime.auth_sessions = AuthSessions(root / "state", factory=BrowserAuthWorker)
         class Directory(BaseHTTPRequestHandler):
             def do_GET(self):
                 payload = json.dumps({"data": [{"id": "fixture-planner"}, {"id": "fixture-coder"}]}).encode()

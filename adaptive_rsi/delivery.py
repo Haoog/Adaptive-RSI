@@ -143,11 +143,11 @@ def schedule(runtime, now=None):
         return
     store.put_setting("delivery-scan", now)
     projects = set()
-    for run in store.query("SELECT r.project,r.state,r.result FROM runs r JOIN projects p ON p.id=r.project "
-                           "WHERE p.paused=0 AND (r.state='pr_open' OR (r.state='merged' AND "
-                           "(coalesce(json_extract(r.result,'$.monitoring_completed'),0)=0 OR "
-                           "json_extract(r.result,'$.feedback.investigation_pending')=1)))"):
-        if run["state"] == "pr_open" or monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now):
+    from .release import pending
+    for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
+                           "WHERE p.paused=0 AND r.state IN ('pr_open','merged')"):
+        if (run["state"] == "pr_open" or pending(runtime, run) or
+                monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now)):
             projects.add(run["project"])
     for project_id in projects:
         if now - store.setting("delivery-scheduled:" + project_id, 0) < 60:
@@ -280,6 +280,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
                 feedback(runtime, project, run, outcome, config, now,
                          (lambda: runtime.is_cancelled(active)) if active else None)
+                from .release import advance
+                outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
             store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
