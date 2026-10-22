@@ -9,7 +9,7 @@
 - 真实 OpenCode 1.19.3 完成读取、修改、结构化结果及 45 tokens 记录；Codex 0.163.0 在 Linux 容器返回结构化结果及 15 tokens。模型服务使用本地 HTTP/SSE 替身，没有调用付费厂商，也不证明能力提升。
 - Linux 执行镜像实际构建并运行；新增 Linux CI。systemd 安装脚本通过语法检查，服务监督健康端点及 PID 核对通过测试；没有实际用户服务器，未验证远端 systemd、DNS 或 TLS 部署。
 - 0.3.0 的 ZIP、SHA-256 与 wheel 构建通过，双语服务器说明和部署文件进入插件包。正式 Release 未发布。
-- 完成作者自检，无已知阻断项，未进行独立人工评审。见 [自检记录](docs/validation/server-opencode-review-20261022.json)。
+- 完成作者自检与 GitHub Codex 自动评审。自动评审发现 CLI 容器遗漏资源隔离配置，现已补齐内存、CPU、进程数及临时文件容量保护，并通过真实 cgroup 和文件系统核验；没有独立人工评审。见 [自检记录](docs/validation/server-opencode-review-20261022.json)。
 
 ## 运行安全与交付修复 / 0.2.2 / 2026-10-21
 

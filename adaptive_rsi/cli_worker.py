@@ -86,10 +86,13 @@ def run_cli(argv, workspace, home, config, cancel=None, protected=(), read_only=
     import uuid
     name = "adaptive-rsi-worker-" + uuid.uuid4().hex[:16]
     root = str(Path(workspace).resolve())
+    limits = config["sandbox"]
     command = ["docker", "run", "--rm", "--name", name, "--read-only", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--user", str(os.getuid()) + ":" + str(os.getgid()),
+               "--pids-limit=" + str(limits["pids"]), "--memory=" + str(limits["memory_mb"]) + "m",
+               "--cpus=" + str(limits["cpus"]),
                "--add-host", "host.docker.internal:host-gateway",
-               "--tmpfs", "/tmp:rw,nosuid", "--mount", "type=bind,src=" + root + ",dst=" + root +
+               "--tmpfs", "/tmp:rw,nosuid,size=256m", "--mount", "type=bind,src=" + root + ",dst=" + root +
                (",readonly" if read_only else ""), "-w", root]
     # 只读角色仅允许将 CLI 输出写入内部目录，不可写项目代码。
     if read_only:

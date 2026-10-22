@@ -9,7 +9,7 @@
 - OpenCode 1.19.3 performs actual reads/edits and returns structured output with 45 recorded tokens. Codex 0.163.0 returns structured output and 15 tokens inside Linux Docker. Local HTTP/SSE fixtures replace paid model services; this does not demonstrate capability improvement.
 - The Linux worker image is built and exercised, and Linux CI is added. Installer shell syntax, supervisor health checks and PID verification are tested. No user server is available, so remote systemd, DNS and TLS deployment remain untested.
 - Version 0.3.0 ZIP, SHA-256 and wheel builds pass; the plugin contains bilingual server documentation and deployment files. No official Release is published.
-- Author self-review finds no known blockers; no independent human review is performed. See the [review record](docs/validation/server-opencode-review-20261022.json).
+- Author self-review and GitHub Codex automated review are performed. Automated review identified missing CLI container resource controls; memory, CPU, process-count and temporary-filesystem protections are added and checked through actual cgroups and filesystem capacity. No independent human review is performed. See the [review record](docs/validation/server-opencode-review-20261022.json).
 
 ## Runtime safety and delivery fixes / 0.2.2 / 2026-10-21
 

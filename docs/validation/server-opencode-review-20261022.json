@@ -1,7 +1,7 @@
 {
   "version": "0.3.0",
   "date": "2026-10-22",
-  "review_type": "作者自检，未进行独立人工评审",
+  "review_type": "作者自检与 GitHub Codex 自动代码评审，未进行独立人工评审",
   "value_assessment": {
     "decision": "实施",
     "reason": "满足用户对 OpenCode、服务器常驻、用量记录及两种小时检查计划的明确需求，复用现有价值与交付门禁。"
@@ -32,7 +32,8 @@
     "systemd 监督使用健康端点核验真实运行 PID",
     "插件包包含双语服务器说明和部署文件",
     "到期小时检查优先于普通 Issues 待办，避免大量待办长期阻塞同步；用户目标优先级仍更高",
-    "Codex 登录在容器中刷新后按原字段写回；自定义 API 不导入无关的订阅凭据"
+    "Codex 登录在容器中刷新后按原字段写回；自定义 API 不导入无关的订阅凭据",
+    "GitHub 自动评审发现 CLI 容器未应用资源隔离；补齐 memory、CPU、pids 与临时文件系统保护，并以真实 cgroup 与文件系统容量核验"
   ],
   "remaining_boundaries": [
     "没有用户 Linux 服务器，未执行真实主机的 systemd、DNS 或 HTTPS 部署",
@@ -46,6 +47,7 @@
     "frontend_requests": "25 项通过",
     "browser": "真实 Chromium：设置热更新、两种计划、无额度字段、OpenCode 入口、项目隔离、中英文、手机布局",
     "build": "0.3.0 ZIP 与 wheel 已构建；最终打包再次核验版本一致性",
-    "cli": "真实 OpenCode 1.19.3 与 Codex 0.163.0，使用本地协议替身"
+    "cli": "真实 OpenCode 1.19.3 与 Codex 0.163.0，使用本地协议替身",
+    "container_resources": "真实 Docker 容器内读取 cgroup memory.max、pids.max、cpu.max 及 /tmp 容量，核验配置实际生效"
   }
 }

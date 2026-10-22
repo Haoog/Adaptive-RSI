@@ -247,7 +247,13 @@ class DockerExecutionTest(unittest.TestCase):
         secret.write_text("hidden evaluation data")
         began = time.monotonic()
         with cli_home(self.repo) as home:
-            script = "from pathlib import Path; assert not Path(" + repr(str(secret)) + ").exists(); assert not Path('/var/run/docker.sock').exists(); Path('calculator.py').write_text('forbidden')"
+            script = ("from pathlib import Path; import os; "
+                      "assert Path('/sys/fs/cgroup/memory.max').read_text().strip() == '2147483648'; "
+                      "assert Path('/sys/fs/cgroup/pids.max').read_text().strip() == '128'; "
+                      "quota,period=map(int,Path('/sys/fs/cgroup/cpu.max').read_text().split()); assert quota == 2*period; "
+                      "tmp=os.statvfs('/tmp'); assert tmp.f_blocks*tmp.f_frsize <= 256*1024*1024; "
+                      "assert not Path(" + repr(str(secret)) + ").exists(); "
+                      "assert not Path('/var/run/docker.sock').exists(); Path('calculator.py').write_text('forbidden')")
             result = run_cli(["python3", "-c", script], self.repo, home, config, lambda: time.monotonic() - began > 30,
                              read_only=True, state=self.store.root)
         self.assertNotEqual(result["exit_code"], 0)
