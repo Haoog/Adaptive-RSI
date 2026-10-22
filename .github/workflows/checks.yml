@@ -33,3 +33,20 @@ jobs:
       - run: python3 scripts/package.py
       - run: python3 -m pip install build
       - run: python3 -m build --wheel
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 构建 Linux 执行镜像
+        run: docker build -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .
+      - name: 验证 Linux 隔离、完整候选检查和真实 CLI 协议
+        env:
+          RSI_DOCKER_TESTS: '1'
+          RSI_OPENCODE_TESTS: '1'
+        run: python3 -m unittest -v tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker
+      - name: 检查服务器安装脚本
+        run: bash -n scripts/install-server.sh

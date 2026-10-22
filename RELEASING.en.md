@@ -30,7 +30,7 @@ Create a draft release on GitHub, upload the two matching assets, verify version
 
 ## User behavior and limits
 
-The default checks daily and notifies. Automatic mode installs only same-major/minor stable patches while idle, such as `0.2.0 → 0.2.1`. `0.2.x → 0.3.x` needs user confirmation. Work budgets never increase automatically.
+The default checks daily and notifies. Automatic mode installs only same-major/minor stable patches while idle, such as `0.2.0 → 0.2.1`. `0.2.x → 0.3.x` needs user confirmation. Calls and tokens are recorded without quotas.
 
 Updates use version directories and an active pointer, without `git pull` in user source checkouts. Failed startup restores previous code/database; recovery from power loss or supervisor crashes remains unverified. Launch-environment model secrets pass to the new service and are never written into update plans.
 

@@ -21,12 +21,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal)
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
-    if not check["budget"]["ready"]:
-        from .recovery import BudgetExhausted
-        raise BudgetExhausted("Model call budget exhausted before planning")
     if not check["ready"]:
         transition("insufficient_evidence", {"reason": "Project readiness checks need attention", "readiness": check,
-                   "failure": {"code": "budget" if not check["budget"]["ready"] else "environment",
+                   "failure": {"code": "environment",
                                "action": "check_readiness"}}, True)
         return {"decision": "insufficient_evidence", "reason": "Project readiness checks need attention", "readiness": check}
     from .environment import capture, restore
@@ -47,11 +44,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     saved_plan = None if experiment else cached(runtime, run, "planning", stage_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", stage_key)
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", stage_key)
-    from .readiness import budget
-    remaining = budget(runtime.store, project["id"], config, 4 - sum(x is not None for x in [saved_plan, saved_acceptance, saved_candidate]), run["id"])
-    if not remaining["ready"]:
-        from .recovery import BudgetExhausted
-        raise BudgetExhausted("Model call budget cannot cover remaining pipeline stages")
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
                "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
                "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": runtime.outcomes(project["id"]),
@@ -125,10 +117,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 runtime.store.execute("UPDATE tasks SET state='queued',attempts=max(0,attempts-1),available=0,updated=? WHERE id=?",
                                       (time.time(), task["id"]))
                 return None
-    stages_left = 3 - sum(x is not None for x in [saved_acceptance, saved_candidate]) + (plan["risk"] == "high")
-    if not budget(runtime.store, project["id"], config, stages_left, run["id"])["ready"]:
-        from .recovery import BudgetExhausted
-        raise BudgetExhausted("Model call budget cannot cover acceptance, implementation and risk-appropriate reviews")
     checks = config["checks"] or detect(workspace)["checks"]
     if not checks:
         transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
@@ -173,8 +161,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if not files and not experiment:
         transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
         return None
-    if len(files) > config["limits"]["max_changed_files"]:
-        raise RuntimeError("Changed file limit exceeded")
     for path in files:
         relative_path(path)
         if not any(path == s.rstrip("/") or path.startswith(s.rstrip("/") + "/") for s in plan["scope"]):

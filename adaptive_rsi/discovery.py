@@ -6,7 +6,7 @@ import time
 from .store import encode
 
 
-def sync(runtime, project, config, checked):
+def sync(runtime, project, config, checked, cancel=None):
     repo = config["github"]["repository"]
     if not repo:
         raise ValueError("No GitHub repository configured")
@@ -14,8 +14,7 @@ def sync(runtime, project, config, checked):
     key = "issue-sync:" + project["id"]
     progress = store.setting(key, {})
     from .config import fingerprint
-    policy = fingerprint({"labels": config["github"]["labels"], "exclude": config["github"]["exclude_labels"],
-                          "size": min(100, config["github"]["max_issues"])})
+    policy = fingerprint({"labels": config["github"]["labels"], "exclude": config["github"]["exclude_labels"]})
     if progress.get("repository") != repo or progress.get("policy") != policy:
         progress = {"repository": repo, "policy": policy}
     if not progress.get("started"):
@@ -63,9 +62,12 @@ def sync(runtime, project, config, checked):
 
     for issue in list(pending.values()):
         apply(issue)
-    # Drain a bounded number of pages per turn, then continue on the next scheduled run.
-    size = min(100, config["github"]["max_issues"])
-    for _ in range(max(1, config["github"]["max_issues"] // size)):
+    # API 按页读取并持久化游标，不限制可同步的 Issue 总数。
+    size = 100
+    while True:
+        if cancel and cancel():
+            from .process import Cancelled
+            raise Cancelled("Issue sync cancelled; continuation retained")
         args = ["gh", "api", "--method", "GET", "repos/" + repo + "/issues", "-f", "state=all",
                 "-f", "sort=created", "-f", "direction=asc", "-f", "per_page=" + str(size),
                 "-f", "page=" + str(progress["page"])]

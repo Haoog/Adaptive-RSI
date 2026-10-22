@@ -1,5 +1,6 @@
 import json
 import os
+import platform
 import shutil
 import time
 from pathlib import Path
@@ -55,8 +56,6 @@ def validate_output(value, schema):
         for key, item in value.items():
             validate_output(item, schema["properties"][key])
     if kind == "array":
-        if len(value) > 100:
-            raise RuntimeError("Agent output array is too large")
         for item in value:
             validate_output(item, schema["items"])
 
@@ -134,7 +133,11 @@ class CodexAgent:
 
     @staticmethod
     def available(provider):
-        return provider.get("protocol", "codex") not in ["codex", "codex_login"] or bool(shutil.which("codex"))
+        protocol = provider.get("protocol", "codex")
+        if protocol in ["codex", "codex_login", "opencode"]:
+            return bool(shutil.which("opencode" if protocol == "opencode" else "codex") or
+                        platform.system() == "Linux" and shutil.which("docker"))
+        return True
 
     def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
         from .provider_health import ProviderHealth, ProviderPaused
@@ -171,21 +174,29 @@ class CodexAgent:
         route = config["models"][role]
         from .config import BUILTIN_PROVIDERS
         provider = next((p for p in [*config["providers"], *BUILTIN_PROVIDERS] if p["id"] == route.get("provider", "openai")), None)
+        if provider and provider.get("protocol") == "opencode":
+            from .opencode import OpenCodeAgent
+            return OpenCodeAgent(self.store).invoke(role, prompt, workspace, project, run, config, route, cancel, protected)
         if provider and provider.get("protocol", "codex") not in ["codex", "codex_login"]:
             from .native import NativeAgent
             return NativeAgent(self.store).invoke(role, prompt, workspace, project, run,
                                                  config, route, provider, cancel, protected)
         binary = shutil.which("codex")
-        if not binary:
+        container = platform.system() != "Darwin" or config["sandbox"]["backend"] == "docker"
+        if not binary and not container:
             raise RuntimeError("Codex CLI is not installed for this route")
+        binary = binary or "codex"
         billing_config = config
         environment = None
         secret = ""
-        if provider and provider.get("credential", "env") in ["keychain", "session"]:
+        if provider and provider.get("credential", "env") in ["keychain", "session", "file"]:
             from .credentials import Credentials
             secret = Credentials(self.store.root).get(provider)
             environment = {**os.environ, "RSI_PROVIDER_API_KEY": secret}
             config = {**config, "providers": [{**p, "env_key": "RSI_PROVIDER_API_KEY"} if p["id"] == provider["id"] else p for p in config["providers"]]}
+        if container:
+            from .cli_worker import container_endpoint
+            config = {**config, "providers": [{**p, "base_url": container_endpoint(p["base_url"])} for p in config["providers"]]}
         provider_args = provider_arguments(route, config, environment)
         call = self.store.reserve_call(project, run, role, route, billing_config)
         started = time.time()
@@ -201,12 +212,18 @@ class CodexAgent:
             mode = "workspace-write" if role == "implementation" else "read-only"
             argv = [binary, "-a", "never", "exec", "--ignore-user-config", "--ignore-rules",
                     "--ephemeral", "--model", route["model"]] + provider_args
+            if role == "probe":
+                argv += ["--skip-git-repo-check"]
             if secret:
                 argv += ["-c", 'shell_environment_policy.exclude=["RSI_PROVIDER_API_KEY"]']
             if route["effort"] != "default":
                 argv += ["-c", "model_reasoning_effort=" + json.dumps(route["effort"])]
-            argv += sandbox.codex_permissions(workspace, protected, read_only=role != "implementation",
-                                              output_file=output_path if role != "implementation" else None)
+            if container:
+                argv += ["--sandbox", "danger-full-access", "-c", 'shell_environment_policy.inherit="all"',
+                         "-c", 'shell_environment_policy.include_only=["PATH","HOME","LANG","LC_ALL","TMPDIR"]']
+            else:
+                argv += sandbox.codex_permissions(workspace, protected, read_only=role != "implementation",
+                                                  output_file=output_path if role != "implementation" else None)
             argv += ["-c", "sandbox_workspace_write.network_access=false",
                      "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
                      "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
@@ -214,23 +231,57 @@ class CodexAgent:
                      "--output-last-message", str(output_path), "-C", str(workspace),
                      "Read the task in " + str(prompt_path) + ". Follow its instructions; return the requested JSON."]
             self.store.event("model", role + ": " + route.get("provider", "openai") + " / " + route["model"] + " / " + route["effort"], project, run)
-            result = run_process(argv, workspace, config["limits"]["run_seconds"], cancel,
-                                 config["limits"]["max_output_mb"], environment)
-            if secret:
+            auth_secrets = []
+            if container:
+                import contextlib
+                from .cli_worker import cli_home, codex_home, run_cli, sync_codex_oauth, CODEX_AUTH_LOCK
+                login = provider and provider.get("protocol") == "codex_login"
+                with (CODEX_AUTH_LOCK if login else contextlib.nullcontext()), cli_home(workspace) as home:
+                    original_auth = codex_home(home) if login else {}
+                    (home / ".codex").mkdir(exist_ok=True)
+                    auth_secrets += list((original_auth.get("tokens") or {}).values())
+                    forwarded = {}
+                    if provider and provider.get("env_key"):
+                        key = provider["env_key"]
+                        forwarded[key] = (environment or os.environ).get(key, "")
+                    if secret:
+                        forwarded["RSI_PROVIDER_API_KEY"] = secret
+                    try:
+                        result = run_cli(argv, workspace, home, config, cancel, protected,
+                                         role != "implementation", forwarded, self.store.root)
+                    finally:
+                        if login:
+                            auth_file = home / ".codex/auth.json"
+                            if auth_file.is_file():
+                                auth_secrets += list((json.loads(auth_file.read_text()).get("tokens") or {}).values())
+                            sync_codex_oauth(home, original_auth)
+            else:
+                result = run_process(argv, workspace, 0, cancel,
+                                     config["limits"]["max_output_mb"], environment)
+            for secret_value in [secret, *auth_secrets]:
+                if not isinstance(secret_value, str) or not secret_value:
+                    continue
                 for field in ["stdout", "stderr"]:
-                    result[field] = result[field].replace(secret, "[REDACTED]")
+                    result[field] = result[field].replace(secret_value, "[REDACTED]")
             (agent_dir / "events.jsonl").write_text(result["stdout"], encoding="utf-8")
-            tokens = 0
+            usage = None
             for line in result["stdout"].splitlines():
                 try:
                     event = json.loads(line)
                     if event.get("type") == "turn.completed":
-                        usage = event.get("usage", {})
-                        tokens += int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+                        from .usage import usage as normalized_usage
+                        value = event.get("usage", {})
+                        cached = int(value.get("cached_input_tokens", 0))
+                        current = normalized_usage(max(0, int(value.get("input_tokens", 0)) - cached),
+                                                   int(value.get("output_tokens", 0)), cached)
+                        if usage is None:
+                            usage = current
+                        else:
+                            for key in ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]:
+                                usage[key] += current[key]
                 except (ValueError, TypeError):
                     continue
-            self.store.execute("UPDATE calls SET tokens=?,seconds=? WHERE id=?", (tokens, time.time() - started, call))
-            self.store.execute("UPDATE runs SET tokens=tokens+? WHERE id=?", (tokens, run))
+            self.store.record_usage(call, run, usage, time.time() - started)
             if result["exit_code"] or result["error"]:
                 error = (result["stderr"] or result["error"] or result["stdout"])[-2000:]
                 raise RuntimeError("Codex call failed: " + error)

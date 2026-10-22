@@ -6,13 +6,14 @@ from urllib.parse import urlsplit
 
 BUILTIN_PROVIDERS = [
     {"id": "openai", "name": "Codex", "protocol": "codex_login", "base_url": "", "env_key": ""},
+    {"id": "opencode", "name": "OpenCode", "protocol": "opencode", "base_url": "", "env_key": ""},
     {"id": "ollama", "name": "Ollama", "protocol": "ollama", "base_url": "http://127.0.0.1:11434", "env_key": ""},
     {"id": "lmstudio", "name": "LM Studio", "protocol": "chat_completions", "base_url": "http://127.0.0.1:1234/v1", "env_key": ""},
 ]
 
 DEFAULTS = {
     "sources": {"inspection": True, "issues": True},
-    "schedule": {"light_minutes": 120, "issues_minutes": 60, "deep_minutes": 4320,
+    "schedule": {"light_minutes": 60, "issues_minutes": 60, "deep_minutes": 60,
                  "weight": 1, "working_hours": [0, 24], "timezone": "Asia/Shanghai"},
     "providers": [],
     "models": {
@@ -25,10 +26,11 @@ DEFAULTS = {
     "review": {"block_on": "medium"},
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
     "updates": {"mode": "notify", "interval_minutes": 1440},
-    "limits": {"daily_calls": 30, "run_calls": 5, "run_seconds": 1800,
-               "command_seconds": 300, "concurrency": 1, "retries": 1,
-               "max_output_mb": 12, "max_changed_files": 40, "retention_days": 30},
-    "sandbox": {"backend": "auto", "image": "python:3.12-slim", "memory_mb": 2048,
+    "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
+               "command_seconds": 0, "concurrency": 1, "retries": 1,
+               "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30},
+    "sandbox": {"backend": "auto", "image": "python:3.12-slim",
+                "worker_image": "adaptive-rsi-worker:local", "memory_mb": 2048,
                 "cpus": 2, "pids": 128},
     "github": {"repository": "", "labels": [], "exclude_labels": ["wontfix", "duplicate"],
                "max_issues": 100},
@@ -36,7 +38,7 @@ DEFAULTS = {
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
-                  "min_cases_per_split": 3, "repeats": 2, "max_calls": 40,
+                  "min_cases_per_split": 3, "repeats": 2, "max_calls": 0,
                   "max_cost_ratio": 1.25, "max_holdout_uses": 3,
                   "monitor_tasks": 5, "archive_limit": 50},
 }
@@ -68,7 +70,11 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
-    providers = {"openai", "ollama", "lmstudio"}
+    # 旧额度字段仅用于读取历史配置，不再阻断运行。
+    for key in ["daily_calls", "run_calls", "run_seconds", "command_seconds", "max_changed_files"]:
+        config["limits"][key] = 0
+    config["evolution"]["max_calls"] = 0
+    providers = {"openai", "ollama", "lmstudio", "opencode"}
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
     for provider in config["providers"]:
@@ -92,9 +98,9 @@ def validate(config):
         if provider.get("protocol", "codex") not in ["codex", "responses", "chat_completions", "anthropic", "gemini", "ollama"]:
             raise ValueError("Unsupported model protocol")
         mode = provider.get("credential", "env")
-        if mode not in ["env", "keychain", "session", "none"]:
+        if mode not in ["env", "keychain", "session", "file", "none"]:
             raise ValueError("Unsupported credential mode")
-        if mode in ["keychain", "session"]:
+        if mode in ["keychain", "session", "file"]:
             if provider["env_key"] or not re.fullmatch(r"[a-f0-9]{32}", provider.get("secret_ref", "")):
                 raise ValueError("Stored credentials require a reference, not an environment variable or key")
         elif provider.get("secret_ref"):
@@ -110,7 +116,12 @@ def validate(config):
                 raise ValueError("Unknown model provider for " + role)
             if item is not route and item.get("fallback") is not None:
                 raise ValueError("Nested fallback routes are not supported")
-            if item.get("effort") not in ["default", "low", "medium", "high", "xhigh", "max", "ultra"]:
+            if item.get("provider") == "opencode":
+                if "/" not in item["model"]:
+                    raise ValueError("OpenCode model requires provider/model")
+                if not isinstance(item.get("effort"), str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", item["effort"]):
+                    raise ValueError("Invalid OpenCode model variant for " + role)
+            elif item.get("effort") not in ["default", "low", "medium", "high", "xhigh", "max", "ultra"]:
                 raise ValueError("Invalid reasoning effort for " + role)
             if "luna" in item["model"] and item["effort"] == "ultra":
                 raise ValueError("Luna supports max, not ultra")
@@ -129,14 +140,15 @@ def validate(config):
     from zoneinfo import ZoneInfo
     ZoneInfo(config["schedule"]["timezone"])
     for key, value in config["limits"].items():
-        if value < (0 if key == "retries" else 1) or value > 10000000:
+        if value < (0 if key in ["retries", "daily_calls", "run_calls", "run_seconds", "command_seconds", "max_changed_files"] else 1) or value > 10000000:
             raise ValueError("Invalid positive limit: " + key)
     if config["limits"]["concurrency"] > 4:
         raise ValueError("Maximum concurrency is 4")
     if config["sandbox"]["backend"] not in ["auto", "seatbelt", "docker"]:
         raise ValueError("Unsupported sandbox")
-    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._/:@-]*", config["sandbox"]["image"]):
-        raise ValueError("Invalid container image")
+    for image in [config["sandbox"]["image"], config["sandbox"]["worker_image"]]:
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._/:@-]*", image):
+            raise ValueError("Invalid container image")
     for key in ["memory_mb", "cpus", "pids"]:
         if config["sandbox"][key] < 1:
             raise ValueError("Sandbox limits must be positive")
@@ -173,7 +185,7 @@ def validate(config):
             raise ValueError("Invalid check arguments")
         relative_path(check.get("cwd", "."))
     evo = config["evolution"]
-    for key in ["every_completed", "min_cases_per_split", "repeats", "max_calls",
+    for key in ["every_completed", "min_cases_per_split", "repeats",
                 "max_holdout_uses", "monitor_tasks", "archive_limit"]:
         if not 1 <= evo[key] <= 1000:
             raise ValueError("Invalid evolution limit: " + key)

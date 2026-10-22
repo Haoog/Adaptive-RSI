@@ -20,7 +20,7 @@ window.RSIModelCenter = (() => {
     invalid_key:'密钥格式不正确，请重新填写。',provider_in_use:'此连接仍被角色或备用模型使用，请先更换相关配置。',
     builtin_provider:'内置连接不能移除。',unknown_provider:'此连接已不存在，请刷新列表。',
     connection_changed:'连接配置已经改变，请重新获取或测试。',update_in_progress:'服务正在更新，请稍后重试。',
-    codex_missing:'未找到 Codex CLI，请安装并登录。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。',
+    codex_missing:'未找到 Codex CLI，请安装并登录。',opencode_missing:'未找到 OpenCode，请安装后重新获取模型。',opencode_error:'无法读取 OpenCode 模型，请检查连接配置和 CLI 版本。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。',
     provider_paused:'模型服务连续失败已暂停，请检查配置后恢复请求。',model_missing:'模型不存在或当前账号不可用，请重新获取目录。',tool_format:'模型未返回符合要求的工具结果，请检查协议与模型能力。',probe_failed:'基础能力测试未通过，请检查账号权限、推理参数和模型工具能力。',
     budget_exhausted:'每日模型调用上限已用完，请等待下次额度周期。',default_effort_required:'此接口要求使用服务默认思考深度。',
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_routes:'角色配置不完整，请重新选择。'
@@ -86,7 +86,7 @@ window.RSIModelCenter = (() => {
       button.setAttribute('aria-pressed',String(provider.id===active));button.setAttribute('aria-label',provider.name);
       const symbol=el('span',provider.name.slice(0,1).toUpperCase(),'mc-provider-symbol'),copy=el('span',undefined,'mc-provider-copy');
       copy.append(el('strong',provider.id==='openai'?t('Codex 登录'):provider.name));
-      copy.append(el('small',provider.id==='openai'?t('本机账户'):provider.credential_status==='missing'?t('待配置凭据'):provider.builtin?t('本地服务'):protocolName(provider.protocol)));
+      copy.append(el('small',['openai','opencode'].includes(provider.id)?t('本机账户'):provider.credential_status==='missing'?t('待配置凭据'):provider.builtin?t('本地服务'):protocolName(provider.protocol)));
       button.append(symbol,copy);list.append(button);
     }
   }
@@ -94,8 +94,8 @@ window.RSIModelCenter = (() => {
   function renderProvider(){
     const provider=selected(),catalog=provider.catalog;
     $('mc-provider-name').textContent=provider.id==='openai'?t('Codex 登录'):provider.name;
-    $('mc-provider-address').textContent=provider.base_url||t('沿用本机 Codex 账户');
-    const credential={login:'使用 Codex 登录',configured:'凭据已配置',stored:'密钥已存入钥匙串',missing:'待配置凭据',not_required:'无需密钥'};
+    $('mc-provider-address').textContent=provider.base_url||t(provider.id==='opencode'?'沿用此运行机器的 OpenCode 连接':'沿用本机 Codex 账户');
+    const credential={login:'使用 Codex 登录',opencode:'使用 OpenCode 连接',configured:'凭据已配置',stored:'密钥已存入钥匙串',file:'密钥已保存到本机私有文件',missing:'待配置凭据',not_required:'无需密钥'};
     $('mc-credential-status').textContent=t(credential[provider.credential_status]);
     $('mc-catalog-status').textContent=catalog.fetched?t('已获取模型列表'):t('尚未获取模型列表');
     $('mc-catalog-status').className='badge '+(catalog.fetched?'good':'neutral');
@@ -245,9 +245,9 @@ window.RSIModelCenter = (() => {
   function applyPreset(){
     const preset=presets[$('mc-provider-preset').value];
     $('mc-input-name').value=t(preset.name);$('mc-input-url').value=preset.base_url;$('mc-input-protocol').value=preset.protocol;$('mc-input-env').value=preset.env_key;
-    $('mc-input-auth').value=preset.env_key?(data.keychain?'keychain':'session'):'none';syncAuth();
+    $('mc-input-auth').value=preset.env_key?(data.keychain?'keychain':'file'):'none';syncAuth();
   }
-  function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session'].includes(mode);$('mc-input-key').disabled=!['keychain','session'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
+  function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session','file'].includes(mode);$('mc-input-key').disabled=!['keychain','session','file'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
   function openEditor(provider=null){
     editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
     $('mc-connection-advanced').open=false;

@@ -23,7 +23,7 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
         while process.poll() is None:
             if cancel and cancel():
                 reason = "Cancelled"
-            elif time.monotonic() - started > timeout:
+            elif timeout and time.monotonic() - started > timeout:
                 reason = "Command timed out"
             elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > output_mb * 1024 * 1024:
                 reason = "Command output limit exceeded"
@@ -93,10 +93,18 @@ class Sandbox:
 
     def worker(self, argv, workspace, protected=(), read_only=False, output_dir=None):
         if platform.system() != "Darwin" or not shutil.which("sandbox-exec"):
-            # Codex's workspace sandbox protects writes, but cannot hide the evaluator's holdouts.
-            raise RuntimeError("Model workers currently require macOS Seatbelt for evaluator confidentiality. Docker is supported for checks; Linux workers are blocked.")
+            raise RuntimeError("Use the isolated Docker CLI worker on Linux")
         workspace = Path(workspace).resolve()
-        profile = '(version 1)(allow default)'
+        allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db",
+                   "/private/var/select", "/private/etc", "/Applications", sys.base_prefix, workspace]
+        binary = shutil.which(str(argv[0]))
+        if binary:
+            executable = Path(binary).resolve()
+            packages = next((p for p in executable.parents if p.name == "node_modules"), executable.parent)
+            allowed.append(packages)
+        profile = '(version 1)(deny default)(allow process*)(allow sysctl-read)(allow mach-lookup)(allow network*)'
+        profile += '(allow file-read-metadata)(allow file-read* (literal "/"))'
+        profile += '(allow file-read* ' + " ".join('(subpath %s)' % quote_sb(p) for p in allowed) + ')'
         profile += '(deny file-read* file-write* (subpath %s))' % quote_sb(self.state)
         # Codex 启动需要检查父目录元数据；控制器文件内容和目录枚举仍不可读。
         profile += '(allow file-read-metadata (subpath %s))' % quote_sb(self.state)

@@ -263,7 +263,7 @@ def supervise_restart(state):
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     session = plan["session"]
-    port = urllib.parse.urlsplit(session["origin"]).port
+    port = urllib.parse.urlsplit(session.get("local_origin", session["origin"])).port
     log = (state / "server.log").open("ab")
     (state / "server.log").chmod(0o600)
     active = installs / "active.json"
@@ -279,7 +279,7 @@ def supervise_restart(state):
         healthy = False
         while time.monotonic() < deadline and child.poll() is None:
             try:
-                request = urllib.request.Request(session["origin"] + "/api/health", headers={"Cookie": session["cookie"] + "=" + session["token"]})
+                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health", headers={"Cookie": session["cookie"] + "=" + session["token"]})
                 with urllib.request.urlopen(request, timeout=1) as response:
                     health = json.load(response)
                     healthy = health.get("version") == plan["target"] and health.get("pid") == child.pid

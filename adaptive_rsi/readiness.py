@@ -1,25 +1,19 @@
 """Read-only preflight. Detection is deliberately separate from execution proof."""
-import datetime
 import os
-import platform
 import shutil
 import time
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from .adapters import detect
 from .config import BUILTIN_PROVIDERS, compatibility
+from .agent import CodexAgent
 from .process import Sandbox
 
 
 def budget(store, project, config, required=1, run=None):
-    midnight = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).replace(
-        hour=0, minute=0, second=0, microsecond=0).timestamp()
-    used = store.one("SELECT count(*) AS n FROM calls WHERE project=? AND created>=?", (project, midnight))["n"]
-    run_used = store.one("SELECT count(*) AS n FROM calls WHERE run=?", (run,))["n"] if run else 0
-    remaining = min(config["limits"]["daily_calls"] - used, config["limits"]["run_calls"] - run_used)
-    return {"ready": remaining >= required, "remaining": max(0, remaining), "minimum": required,
-            "unit": "codex_session_or_http_request", "estimate": True}
+    # 保留旧调用方的数据结构；用量只记录，不参与准入判断。
+    return {"ready": True, "remaining": None, "minimum": required,
+            "unit": "recorded_usage", "estimate": False}
 
 
 def inspect(runtime, project, config=None, workspace=None, required=4, run=None):
@@ -28,7 +22,6 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
     modules = detect(root)
     checks = config["checks"] or modules["checks"]
     items = [{"code": "checks", "ready": bool(checks)}]
-    items.append({"code": "worker", "ready": platform.system() == "Darwin" and bool(shutil.which("sandbox-exec"))})
     try:
         backend = Sandbox(runtime.store.root, config).backend()
         items.append({"code": "sandbox", "ready": True, "backend": backend})
@@ -47,7 +40,7 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         ready = getattr(runtime.agent, "available", CodexAgent.available)(provider)
         if provider.get("credential", "env") == "env" and provider.get("env_key"):
             ready = ready and bool(os.environ.get(provider["env_key"]))
-        if provider.get("credential") in ["keychain", "session"]:
+        if provider.get("credential") in ["keychain", "session", "file"]:
             from .credentials import Credentials
             try:
                 ready = ready and bool(Credentials(runtime.store.root).get(provider))
@@ -58,10 +51,18 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         return ready
     for role in ["planning", "implementation", "review"]:
         route = config["models"][role]
-        ready = route_ready(route) or bool(route.get("fallback") and route_ready(route["fallback"]))
+        def executable(item):
+            provider = providers[item.get("provider", "openai")]
+            if not route_ready(item):
+                return False
+            if provider.get("protocol", "codex") in ["codex", "codex_login", "opencode"]:
+                from .cli_worker import worker_available
+                if isinstance(runtime.agent, CodexAgent):
+                    return worker_available(config, "opencode" if provider.get("protocol") == "opencode" else "codex")
+            return True
+        ready = executable(route) or bool(route.get("fallback") and executable(route["fallback"]))
         items.append({"code": "model", "role": role, "ready": ready})
     usage = budget(runtime.store, project["id"], config, required, run)
-    items.append({"code": "budget", **usage})
     proof = runtime.store.setting("verified-checks:" + project["id"])
     from .gitops import git
     verified = bool(proof and proof["base"] == git(root, "rev-parse", "HEAD") and

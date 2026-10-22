@@ -12,10 +12,10 @@ Task details lead with outcomes, stages, and recovery suggestions. Value decisio
 
 The flow is readiness → verification, deduplication and value assessment → completion criteria → isolated implementation → execution and before/after checks → independent review → project-authorized delivery → post-merge checks.
 
-- Before paid calls, check configured commands, tools, isolation, dependency directories, credential settings, and remaining budgets. Freeze dependencies and run configured preparation commands before planning. Preflight cannot prove remote availability, account login, or support for every language environment; execution still records actual failures.
+- Before paid calls, check configured commands, tools, isolation, dependency directories, credential settings. Freeze dependencies and run configured preparation commands before planning. Preflight cannot prove remote availability, account login, or support for every language environment; execution still records actual failures.
 - Persist planning, acceptance design, implementation summaries, checks, and review. Retries can reuse valid plans and acceptance designs. A patch that passed execution checks before a review-service outage can be restored, but all checks and review must run again.
 - Reuse depends on controller build, base commit, original task evidence, configuration, strategies, dependency snapshot, and delivery feedback. Any change invalidates reuse. Patches rejected by checks or review cannot be replayed directly into delivery.
-- Authentication, provider, environment, baseline, code-check, and budget errors have separate recovery suggestions. Budget exhaustion waits; enabled projects resume within working hours once enough budget is available. Manual retry remains available. Limits never increase automatically.
+- Authentication, provider, environment, baseline and code-check failures have separate recovery suggestions. Legacy budget-waiting tasks can requeue without a usage gate.
 
 ## Discovery and value ordering
 
@@ -31,15 +31,15 @@ Value assessment records impact, benefit, cost, confidence, and inaction. Orderi
 
 Ordinary behavioral changes require independent acceptance to fail before the change and pass afterward, alongside regression, full-suite checks, and review. Missing dependencies and import failures do not establish reproduction. Performance tasks require reproducible threshold checks; a single faster pipeline duration does not prove a performance improvement.
 
-High-risk plans require negative-path and permission-boundary acceptance and an additional focused code review in a separate session. Insufficient budget waits, and any failed review blocks delivery. Risk classification and check adequacy still involve model judgment.
+High-risk plans require negative-path and permission-boundary acceptance and an additional focused code review in a separate session. Any failed review blocks delivery. Risk classification and check adequacy still involve model judgment.
 
 Explicitly titled refactors use behavior-preservation checks, with maintainability benefits assessed in review. This does not automatically prove reduced complexity. Reverts and post-merge monitoring check preserved behavior rather than requiring another new improvement. Candidates without sufficient evidence remain undelivered.
 
 ## Strategy experiments
 
-1. Check independent cases and budget before proposing. The minimum call estimate is `1 + 16 × cases per split × repetitions`; native tool round trips can cost more. Defaults of three cases per split and two repetitions require at least 97 calls, exceeding the default experiment cap of 40 and daily cap of 30. Stop explicitly until the user adjusts limits; never increase them silently.
+1. Check independent cases before proposing. Defaults are three tasks per split and two repetitions. Calls, tokens and cost have no quota; actual usage remains recorded.
 2. Stable and candidate variants share the production execution function: planning, independent acceptance, implementation, checks, and review. Experiments cannot create PRs. Stop before exposing holdouts if validation lacks improvement or regresses.
-3. Stable and candidate executions alternate their first position by actual trial index and record that order as evidence to reduce fixed-order bias. Both splits require improvements, no observed regressions, and separate time/token limits. Repeated executions are not independent samples. Group by task family and count families winning consistently across repetitions. A one-sided sign test uses `p = 0.5^winning families`, requires `p ≤ 0.05`, and at least two repetitions.
+3. Stable and candidate executions alternate their first position by actual trial index and record that order as evidence to reduce fixed-order bias. Both splits require improvements, no observed regressions, and sufficient independent quality evidence. Repeated executions are not independent samples. Group by task family and count families winning consistently across repetitions. A one-sided sign test uses `p = 0.5^winning families`, requires `p ≤ 0.05`, and at least two repetitions.
 4. This conservative finite-sample gate depends on family independence, check quality, and measurement conditions. It does not establish generalization. Synthetic tests verify controller behavior, not improved real-model capability.
 5. Operational monitoring uses only strategy IDs recorded in each actual run. Infrastructure and insufficient-evidence failures do not count; each run counts once. Regressions that cannot be attributed to a unique used strategy retain diagnostics without rolling every strategy back.
 
@@ -47,11 +47,11 @@ Evolution improves working strategies, prompts, and project guidance. It does no
 
 ## Models, context, and cost
 
-Retain Codex, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions; every implementation protocol refuses fallback after workspace edits to avoid mixing partial work. Built-in Ollama and LM Studio use native APIs without Codex; readiness, basic tool probes and billing units match execution.
+Retain Codex, OpenCode, Responses, Chat Completions, Anthropic, Gemini, Ollama, and compatible gateways. Catalog visibility, basic tool checks, and successful real project tasks are separate evidence levels. Untested providers have no compatibility guarantee. Fallback follows existing availability and workspace-integrity restrictions; every implementation protocol refuses fallback after workspace edits to avoid mixing partial work. Built-in Ollama and LM Studio use native APIs without Codex; readiness, basic tool probes and billing units match execution.
 
 Context adds task-relevant code paths and declaration anchors with bounded file counts and declaration lengths. Recent history includes concise failure causes. Verified memories are retrieved by relevance under a character budget while preserving original evidence. Expired, rolled-back, or configuration-incompatible guidance is excluded.
 
-Each call freezes its counting unit: Codex session or native HTTP request. Historical records with no unit remain unknown. Tool round trips consume budget. User-supplied blended prices are estimates, not bills.
+Each call freezes its counting unit: Codex/OpenCode session or native HTTP request. Historical records with no unit remain unknown. Tool round trips record actual usage. User-supplied blended prices are estimates, not bills.
 
 ## Authorization, delivery and monitoring
 

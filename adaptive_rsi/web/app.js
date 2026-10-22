@@ -130,18 +130,18 @@ function render(){
  const running=runs.find(run=>!run.ended),queue=counts?.find(r=>r.state==='queued')?.count??tasks.filter(task=>task.state==='queued').length;
  $('queue-count').textContent=queue;$('queue-count').hidden=!queue;
  $('current-work').textContent=running?(tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
- const usage=state.usage.find(u=>u.project===(projectId||'model-center'));$('usage-brief').textContent=(usage?.calls||0)+' '+t('次调用');$('runtime-evidence').hidden=!project&&!usage;
- const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(['light','deep'].includes(row.kind)&&config.sources.inspection))).sort((a,b)=>a.due-b.due)[0];
+ const usage=state.usage.find(u=>u.project===(projectId||'model-center'));$('usage-brief').textContent=(usage?.tokens||0)+' tokens';$('runtime-evidence').hidden=!project&&!usage;
+ const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(row.kind==='light'&&config.sources.inspection))).sort((a,b)=>a.due-b.due)[0];
  $('next-check').textContent=t(project?.paused?'启动后开始':!next?'未安排自动检查':'下次 ')+(project&&!project.paused&&next?stamp(next.due):'');
  const attention=counts?counts.filter(r=>attentionStates.includes(r.state)).reduce((n,r)=>n+r.count,0):visibleTasks(tasks,'attention',true).length;$('attention-banner').hidden=!attention;$('attention-text').textContent=t('需要处理的任务')+' · '+attention;
- for(const kind of ['light','issues','deep']){
+ for(const kind of ['light','issues']){
   const mins=config.schedule[kind+'_minutes'],factor=mins%1440===0?1440:mins%60===0?60:1;
   $(kind+'-interval').textContent=(mins/factor)+' '+t(factor===1440?'天':factor===60?'小时':'分钟');
   const enabled=kind==='issues'?config.sources.issues&&config.github.repository:config.sources.inspection;
   const schedule=state.schedules.find(row=>row.project===projectId&&row.kind===kind);
   $(kind+'-due').textContent=t(!enabled?'未启用':project?.paused?'项目已暂停':schedule?'下次 ':'等待首次检查')+(enabled&&!project?.paused&&schedule?stamp(schedule.due):'');
  }
- $('scan-summary').textContent=['light','issues','deep'].map(kind=>t({light:'项目扫描',issues:'GitHub 问题同步',deep:'深度检查'}[kind])+' '+($(kind+'-due').textContent===t('未启用')?t('未启用'):t('每')+' '+$(kind+'-interval').textContent)).join(' · ');
+ $('scan-summary').textContent=['light','issues'].map(kind=>t({light:'项目扫描',issues:'GitHub 问题同步',deep:'深度检查'}[kind])+' '+($(kind+'-due').textContent===t('未启用')?t('未启用'):t('每')+' '+$(kind+'-interval').textContent)).join(' · ');
  document.querySelectorAll('[data-inspect]').forEach(button=>button.disabled=!project);
  const activity=$('activity'),events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,6);
  if(changedList(activity,events)){activity.replaceChildren();
@@ -158,8 +158,9 @@ function renderTelemetry(){
  const usage=$('usage-summary');usage.replaceChildren();const usageScope=projectId||'model-center',rows=(state.model_usage||[]).filter(u=>u.project===usageScope);
  const total=(state.usage||[]).find(u=>u.project===usageScope);usage.append(el('p',t('近 24 小时')+' · '+(total?.calls||0)+' '+t('次调用')+' · '+Math.round(total?.seconds||0)+'s · '+(total?.tokens||0)+' tokens'));
  const estimate=total?.estimate==null?t('未知'):('$'+total.estimate.toFixed(4));usage.append(el('p',t('估算费用')+' · '+estimate+' USD · '+(total?.unpriced||0)+' '+t('次调用缺少价格'),'muted'));
- usage.append(el('p',t('费用由用户单价估算，不代表账单或金额硬上限。调用按 Codex 会话或原生 HTTP 请求统计。'),'muted'));
- if(rows.length){const table=el('table'),head=el('tr');for(const key of ['模型服务 / 模型','调用','失败','耗时','估算费用'])head.append(el('th',t(key)));const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');for(const row of rows){const tr=el('tr');for(const value of [row.provider+' / '+row.model+' · '+t({codex_session:'Codex 会话',http_request:'HTTP 请求',unknown:'历史统计单位未知'}[row.unit]||'历史统计单位未知'),row.calls,row.failed,Math.round(row.seconds)+'s',row.estimate==null?t('未知'):'$'+row.estimate.toFixed(4)+(row.unpriced?' *':'')])tr.append(el('td',String(value)));body.append(tr);}table.append(body);const wrap=el('div',undefined,'usage-table');wrap.append(table);usage.append(wrap);}
+ usage.append(el('p',t('新输入')+' '+(total?.input_tokens||0)+' · '+t('输出')+' '+(total?.output_tokens||0)+' · '+t('缓存读取')+' '+(total?.cache_read_tokens||0)+' · '+t('缓存写入')+' '+(total?.cache_write_tokens||0)+' tokens'));
+ usage.append(el('p',t('用量未知的调用')+' '+(total?.unknown_usage||0)+' · '+t('用量只记录，不设额度；费用为估算。'),'muted'));
+ if(rows.length){const table=el('table'),head=el('tr');for(const key of ['模型服务 / 模型','调用','tokens','失败','耗时','估算费用'])head.append(el('th',t(key)));const thead=el('thead');thead.append(head);table.append(thead);const body=el('tbody');for(const row of rows){const tr=el('tr');for(const value of [row.provider+' / '+row.model+' · '+t({opencode_session:'OpenCode 会话',codex_session:'Codex 会话',http_request:'HTTP 请求',unknown:'历史统计单位未知'}[row.unit]||'历史统计单位未知'),row.calls,row.tokens,row.failed,Math.round(row.seconds)+'s',row.estimate==null?t('未知'):'$'+row.estimate.toFixed(4)+(row.unpriced?' *':'')])tr.append(el('td',String(value)));body.append(tr);}table.append(body);const wrap=el('div',undefined,'usage-table');wrap.append(table);usage.append(wrap);}
 }
 function valueReport(value,reason,scope){
  const report=el('div',undefined,'value-report');if(reason)report.append(el('p',reason));
@@ -238,7 +239,7 @@ async function showTask(task){const ticket=++detailSequence,project=projectId;de
  if(['queued','planning','executing','evaluating'].includes(task.state))body.append(action(t('取消任务'),async()=>{if(ticket!==detailSequence||projectId!==project)return;await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=scoped(state.cases).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}
- const cfg=currentProject()?.config||state.config,minimum=1+16*cfg.evolution.min_cases_per_split*cfg.evolution.repeats;$('experiment-readiness').textContent=t('实验至少需要的调用预算')+'：'+minimum+' · '+t('样本或预算不足时不会调用模型，也不会声称已经变强。');
+ $('experiment-readiness').textContent=t('改进方案需通过独立样本的前后对照验证；调用与 tokens 只记录用量。');
  const list=$('candidates');list.replaceChildren();const candidates=scoped(state.candidates);if(!candidates.length)list.append(el('p',t('还没有改进方案。积累运行记录后会自动提出，也可以手动发起。'),'empty-copy'));
  for(const c of candidates){const card=el('article',undefined,'panel candidate-card'),top=el('div',undefined,'panel-title');top.append(el('h2',{strategy:t('执行策略'),meta_strategy:t('规划方法'),adapter:t('项目执行说明')}[c.kind]||c.kind),badge(c.status));card.append(top,el('div',(c.parent?c.parent.slice(0,8):'BASELINE')+' → '+c.id.slice(0,8),'lineage'),el('p',c.content.guidance),el('p',c.reason,'muted'),el('small',c.trial_count+t(' 组配对任务 · ')+stamp(c.created),'muted'));
   if(c.status==='stable')card.append(action(t('恢复到上一个已验证版本'),async()=>{await api('rollback',{candidate:c.id});toast(t('策略已恢复旧版本'));await refresh();}));list.append(card);}}
@@ -281,7 +282,7 @@ function changeSettingsScope(scope){
  if(view==='models')window.RSIModelCenter?.show(scope==='project'?projectId:null);
  else renderSettings();renderNavigation();window.RSIModelCenter?.show(scope==='project'?projectId:null);
 }
-const schedulePaths=['schedule.light_minutes','schedule.issues_minutes','schedule.deep_minutes','sources.inspection','sources.issues'];
+const schedulePaths=['schedule.light_minutes','schedule.issues_minutes','sources.inspection','sources.issues'];
 function syncScheduleMode(){
  const global=$('config-scope').value==='global',inherit=!global&&$('schedule-mode').value==='inherit';
  $('schedule-mode-field').hidden=global;
@@ -308,7 +309,7 @@ async function renderCapabilities(){
  const ticket=++capabilitySequence,project=projectId,target=$('capabilities');target.replaceChildren();if(!project){target.append(el('p',t('接入项目后识别运行环境。'),'muted'));return;}const capabilities=await api('capabilities?project='+encodeURIComponent(project));if(ticket!==capabilitySequence||project!==projectId)return;if(!capabilities.modules.length)target.append(el('p',t('未识别到标准构建清单。可手动配置验收命令。'),'muted'));for(const module of capabilities.modules){const row=el('div',undefined,'capability-row');row.append(el('strong',module.language),el('code',module.manifest),el('span',{executable:t('检查可执行 · 已验证'),unverified:t('待隔离验证'),analysis_only:t('可分析 · 需配置检查'),environment_blocked:t('环境缺少工具')}[module.status],'badge '+(module.status==='environment_blocked'?'warn':module.status==='executable'?'good':'neutral')));target.append(row);}
 }
 
-const readinessNames={checks:'项目检查命令',worker:'模型执行隔离（目前需要 macOS）',sandbox:'独立运行环境',dependencies:'项目依赖',tools:'执行工具',model:'模型连接配置',budget:'剩余调用预算'};
+const readinessNames={checks:'项目检查命令',worker:'模型执行环境',sandbox:'独立运行环境',dependencies:'项目依赖',tools:'执行工具',model:'模型连接配置',budget:'剩余调用预算'};
 const failureMessages={checks:'代码检查没有通过，请查看运行与效果检查。',review:'代码评审发现了需要修改的问题，请查看评审建议。',improvement:'修改后的检查通过了，但还缺少解决问题的前后对照证据。',budget:'调用额度不足，等待预算恢复，或到设置调整上限。',credentials:'模型认证失效，请检查模型连接设置。',provider:'模型服务暂不可用，请稍后重试。',environment:'运行条件不完整，请查看运行准备检查。',baseline:'项目内容已更新，请基于最新版本重新执行。',execution:'这次执行没有完成，请展开原始记录查看原因。'};
 function failureCopy(problem){return t(failureMessages[problem.code]||failureMessages.execution);}
 async function checkReadiness(force=false){

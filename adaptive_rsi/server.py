@@ -36,13 +36,19 @@ class Server(ThreadingHTTPServer):
         self.server_name = "localhost"
         self.server_port = self.server_address[1]
 
-    def __init__(self, runtime, port=0, session=None):
+    def __init__(self, runtime, port=0, session=None, public_url=None):
+        if public_url:
+            parsed = urlparse(public_url)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.path not in ["", "/"] or parsed.query or parsed.fragment:
+                raise ValueError("Public URL must be an HTTPS origin without path, credentials or query")
         self.runtime = runtime
         self.assets = {p.name: p.read_bytes() for p in (Path(__file__).parent / "web").iterdir() if p.is_file()}
         self.token = secrets.token_urlsafe(32)
         self.csrf = secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), Handler)
-        self.origin = "http://127.0.0.1:" + str(self.server_port)
+        self.local_origin = "http://127.0.0.1:" + str(self.server_port)
+        self.origin = (public_url or (session or {}).get("public_url") or self.local_origin).rstrip("/")
+        self.allowed_hosts = {urlparse(self.origin).netloc, urlparse(self.local_origin).netloc}
         self.cookie = "rsi_" + str(self.server_port)
         self.url = self.origin + "/?token=" + self.token
         if session:
@@ -73,7 +79,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def authenticated(self):
-        if self.headers.get("Host") != self.server.origin.split("//")[1]:
+        if self.headers.get("Host") not in self.server.allowed_hosts:
             self.respond({"error": "Invalid Host"}, 403)
             return False
         try:
@@ -92,16 +98,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        if parsed.path == "/login.css" and self.headers.get("Host") == self.server.origin.split("//")[1]:
+        if parsed.path == "/login.css" and self.headers.get("Host") in self.server.allowed_hosts:
             self.respond((Path(__file__).parent / "web" / "login.css").read_bytes(), content_type="text/css; charset=utf-8")
             return
         if parsed.path == "/" and "token" in params:
-            if self.headers.get("Host") != self.server.origin.split("//")[1] or not hmac.compare_digest(params["token"][0], self.server.token):
+            if self.headers.get("Host") not in self.server.allowed_hosts or not hmac.compare_digest(params["token"][0], self.server.token):
                 self.respond({"error": "Invalid login"}, 403)
                 return
             self.send_response(303)
             self.headers_common()
-            self.send_header("Set-Cookie", self.server.cookie + "=" + self.server.token + "; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", self.server.cookie + "=" + self.server.token + "; Path=/; HttpOnly; SameSite=Strict" +
+                             ("; Secure" if self.server.origin.startswith("https://") and self.headers.get("Host") == urlparse(self.server.origin).netloc else ""))
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -134,8 +141,8 @@ class Handler(BaseHTTPRequestHandler):
                               "schedules": store.query("SELECT * FROM schedules"),
                               "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
                               "quality": quality_summary(store, selected),
-                              "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
-                              "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+                              "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
+                              "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
             elif parsed.path == "/api/readiness":
                 from .readiness import inspect
                 self.respond(inspect(runtime, runtime.project(params.get("project", [""])[0])))

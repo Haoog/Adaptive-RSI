@@ -23,7 +23,7 @@ def default_state():
 
 def doctor():
     result = {"python": sys.version.split()[0], "platform": platform.system(), "version": __version__}
-    for tool in ["git", "codex", "gh", "docker", "sandbox-exec"]:
+    for tool in ["git", "codex", "opencode", "gh", "docker", "sandbox-exec"]:
         result[tool] = shutil.which(tool)
     if result["codex"]:
         result["codex_authenticated"] = run_process(["codex", "login", "status"], timeout=10)["exit_code"] == 0
@@ -34,7 +34,7 @@ def doctor():
         probe = run_process(["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "/usr/bin/true"], timeout=5)
         result["seatbelt_working"] = probe["exit_code"] == 0
     result["models"] = "Codex and native protocol routes validated per invocation; no paid probe or silent substitution"
-    result["worker_support"] = "Codex: macOS Seatbelt; native APIs: host-controlled tools with Seatbelt/Docker for commands and checks"
+    result["worker_support"] = "Codex/OpenCode: macOS Seatbelt or isolated Docker workers; native APIs: host-controlled tools with Seatbelt/Docker checks"
     return result
 
 
@@ -43,7 +43,7 @@ def api(root, path, data=None):
     headers = {"Cookie": session["cookie"] + "=" + session["token"]}
     if data is not None:
         headers.update({"Content-Type": "application/json", "Origin": session["origin"], "X-RSI-CSRF": session["csrf"]})
-    request = urllib.request.Request(session["origin"] + path, data=json.dumps(data).encode() if data is not None else None, headers=headers)
+    request = urllib.request.Request(session.get("local_origin", session["origin"]) + path, data=json.dumps(data).encode() if data is not None else None, headers=headers)
     with urllib.request.urlopen(request, timeout=200 if path == "/api/projects/import" else 20) as response:
         return json.load(response)
 
@@ -54,7 +54,8 @@ def main(argv=None):
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     serve = sub.add_parser("serve", help="Run scheduler and authenticated local control panel")
-    serve.add_argument("--port", type=int, default=0)
+    serve.add_argument("--port", type=int, default=int(os.environ.get("ADAPTIVE_RSI_PORT", "0")))
+    serve.add_argument("--public-url", default=os.environ.get("ADAPTIVE_RSI_PUBLIC_URL"), help="HTTPS origin served by a local reverse proxy")
     serve.add_argument("--open", action="store_true")
     serve.add_argument("--restart-session", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("update-worker", help=argparse.SUPPRESS)
@@ -116,8 +117,8 @@ def main(argv=None):
                 runtime.updates.restore_startup()
             runtime.start()
             try:
-                server = Server(runtime, args.port, session=session)
-                session = {"origin": server.origin, "cookie": server.cookie, "token": server.token, "csrf": server.csrf, "url": server.url, "pid": os.getpid()}
+                server = Server(runtime, args.port, session=session, public_url=args.public_url)
+                session = {"origin": server.origin, "local_origin": server.local_origin, "public_url": server.origin if server.origin != server.local_origin else None, "cookie": server.cookie, "token": server.token, "csrf": server.csrf, "url": server.url, "pid": os.getpid()}
                 session_file = root / "server.json"
                 session_file.write_text(json.dumps(session))
                 session_file.chmod(0o600)

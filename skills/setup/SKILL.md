@@ -7,9 +7,9 @@ Resolve the plugin root as two directories above this file's containing folder. 
 `python3 <plugin-root>/scripts/rsi doctor`, then
 `python3 <plugin-root>/scripts/start.py` to start or reopen the local panel.
 Use absolute paths and quote paths with spaces. The runtime requires Python 3.9+, Git,
-and either authenticated Codex CLI or a tool-capable native API provider for model work.
-macOS Seatbelt protects Codex workers; Docker or Seatbelt isolates checks and native command tools.
-macOS is the fully tested execution host; Linux native/Docker execution remains unverified.
+and Codex, OpenCode or a tool-capable native API provider for model work.
+macOS Seatbelt or Linux Docker isolates CLI workers; checks and native commands use Seatbelt or network-disabled Docker.
+For Linux installation and persistent operation, follow SERVER.md; build deploy/Dockerfile.worker first.
 
 The plugin supplies skills; it does not add a native Codex settings tab. Settings live in
 the authenticated localhost panel. State lives in `~/.local/share/adaptive-rsi`, or

@@ -35,6 +35,8 @@ class ProtocolFixture:
                 name, args = [("read_file", {"path": "source.py", "start_line": 1, "end_line": 10}),
                               ("replace_text", {"path": "source.py", "old": "return a-b", "new": "return a+b"}),
                               ("finish", {"summary": "Fixed addition"})][min(step - 1, 2)]
+                if fixture.behavior == "long_loop" and step <= 35:
+                    name, args = "read_file", {"path": "source.py", "start_line": 1, "end_line": 10}
                 if fixture.behavior == "text_only":
                     data = {"choices": [{"message": {"role": "assistant", "content": "I am done"}}]}
                 elif fixture.behavior == "bad_finish":
@@ -120,15 +122,23 @@ class NativeProtocolsTest(unittest.TestCase):
                 else:
                     self.assertEqual(second["messages"][2]["role"], "tool")
 
-    def test_budget_stops_tool_loop_and_unsupported_results_fail_closed(self):
-        for behavior in ["normal", "text_only", "bad_finish"]:
+    def test_unsupported_results_fail_closed(self):
+        for behavior in ["text_only", "bad_finish"]:
             with self.subTest(behavior=behavior), ProtocolFixture("chat_completions", behavior) as fixture:
                 config = self.config(fixture, "chat_completions", run_calls=1)
                 with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}), self.assertRaises(RuntimeError):
                     CodexAgent(self.store).invoke("implementation", "task", self.workspace, behavior, behavior, config)
                 self.assertEqual(len(fixture.requests), 1)
                 state = self.store.one("SELECT state FROM calls WHERE project=?", (behavior,))["state"]
-                self.assertEqual(state, "completed" if behavior == "normal" else "failed")
+                self.assertEqual(state, "failed")
+
+    def test_tool_loop_continues_past_old_call_and_turn_limits(self):
+        with ProtocolFixture("chat_completions", "long_loop") as fixture:
+            config = self.config(fixture, "chat_completions", run_calls=1, daily_calls=1)
+            with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}):
+                result = CodexAgent(self.store).invoke("implementation", "task", self.workspace, "long", "long", config)
+            self.assertEqual(result, {"summary": "Fixed addition"})
+            self.assertEqual(len(fixture.requests), 36)
 
     def test_cross_protocol_fallback_records_both_routes(self):
         with ProtocolFixture("responses", "unavailable") as first, ProtocolFixture("anthropic") as second:

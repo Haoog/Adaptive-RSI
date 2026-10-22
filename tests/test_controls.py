@@ -340,7 +340,8 @@ class UpdatesTest(unittest.TestCase):
 
     def test_release_policy_and_asset_identity(self):
         self.assertTrue(release_info(release())["patch"])
-        self.assertFalse(release_info(release("0.3.0"))["patch"])
+        major, minor, _ = map(int, __version__.split("."))
+        self.assertFalse(release_info(release(f"{major}.{minor + 1}.0"))["patch"])
         self.assertEqual(release_info(release("0.1.0"))["state"], "up_to_date")
         data = release()
         data["assets"][0]["browser_download_url"] = "https://github.com/other/repo/releases/download/v0.2.2/bundle.zip"
@@ -372,7 +373,8 @@ class UpdatesTest(unittest.TestCase):
                 manager = runtime.updates
                 manager.shutdown = lambda: None
                 runtime.configure({"updates": {"mode": "automatic"}})
-                for target, count in [(None, 1), ("0.3.0", 0)]:
+                major, minor, _ = map(int, __version__.split("."))
+                for target, count in [(None, 1), (f"{major}.{minor + 1}.0", 0)]:
                     runtime.store.put_setting("update-status", {**release_info(release(target)), "checked": time.time()})
                     with patch.object(manager, "apply_async") as apply:
                         manager.tick()

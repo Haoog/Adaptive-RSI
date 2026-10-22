@@ -216,7 +216,7 @@ class RuntimeSafetyTest(unittest.TestCase):
             self.assertEqual(len(self.store.query("SELECT * FROM tasks WHERE source='system_publish'")), 1)
 
     def test_local_builtin_native_execution_probe_and_accounting_agree_without_codex(self):
-        for provider in BUILTIN_PROVIDERS[1:]:
+        for provider in [p for p in BUILTIN_PROVIDERS if p["id"] in ["ollama", "lmstudio"]]:
             name = provider["id"]
             response = {"tool_calls": [{"id": "finish", "function": {"name": "finish", "arguments": '{"summary":"RSI_OK"}'}}]}
             reply = {"message": response} if name == "ollama" else {"choices": [{"message": response}]}
