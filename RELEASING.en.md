@@ -2,11 +2,13 @@
 
 [简体中文](RELEASING.md) | **English**
 
-Merges to this repository's mainline prepare a version PR. Only a reconstructed version patch, complete verification, and all GitHub required checks and reviews allow normal protected merging and a formal GitHub Release. Building a plugin has no push or publish side effects. Publishing the product does not deploy any user's server.
+Ordinary mainline merges accumulate changes without bumping versions or prompting user updates. A version PR is prepared only when a stable release batch is explicitly started. Only a reconstructed version patch, complete verification, and all GitHub required checks and reviews allow normal protected merging and a formal GitHub Release. Building a plugin has no push or publish side effects. Publishing the product does not deploy any user's server.
 
 ## Repository versions and releases
 
-`.github/workflows/release.yml` prepares a separate version PR after mainline merges. `release:major`, `release:minor` and `release:patch` labels select the increment; without a label, a `feat/` source branch increments minor and other branches increment patch. Commit messages are Chinese. Versions agree in `plugin.json`, `pyproject.toml`, `adaptive_rsi/__init__.py` and `update.json`; bilingual `CHANGELOG` content moves from `Unreleased` into the new version.
+`.github/workflows/release.yml` continues publication automatically for verified mechanical version commits, but ordinary code merges do not create version PRs. When a batch is stable, run the workflow in Actions with `prepare_release` enabled and choose `release_level` (minor, patch or major). With that checkbox off, no new version is prepared. Urgent fixes may use patch; commit count never determines version cadence. Previous `release:*` PR labels no longer trigger releases or select increments. Tests, version-PR gates, packaging and formal publication remain automated. This policy affects this repository only, not managed-project delivery authorization.
+
+Versions agree in `plugin.json`, `pyproject.toml`, `adaptive_rsi/__init__.py` and `update.json`; bilingual `CHANGELOG` content moves from `Unreleased` into the new version. Commit messages are Chinese.
 
 Version branches contain the target version and mainline SHA. When mainline advances, automation closes an old PR only after proving it equals the reconstructed mechanical version patch, then creates one replacement against the new baseline. Manual changes block replacement. Repeated triggers reuse the same PR; a closed identical PR is not automatically reopened.
 

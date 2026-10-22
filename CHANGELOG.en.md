@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- Accumulate ordinary merges without version bumps; prepare version PRs only for explicitly started stable release batches.
 - Add a Tauri desktop app with a bundled local engine, tray lifecycle, explicit project start, native server connection and folder picker.
 - Add task-based usage reporting including failures, retries and unknown usage, with project/date filters and call details.
 - Use one searchable model chooser per role, and add desktop build checks and bilingual documentation.

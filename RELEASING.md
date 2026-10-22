@@ -2,11 +2,13 @@
 
 **简体中文** | [English](RELEASING.en.md)
 
-本仓库合入主线后会准备版本 PR；只有版本补丁检查、完整验证和 GitHub 必需检查及评审全部满足，才按正常分支保护合并并发布正式 GitHub Release。构建插件本身没有推送或发布副作用。发布产品不代表已经部署任何用户服务器。
+本仓库的日常主线合并只累积改动，不自动增加版本号或推送用户更新。明确启动稳定批次发布后才准备版本 PR；只有版本补丁检查、完整验证和 GitHub 必需检查及评审全部满足，才按正常分支保护合并并发布正式 GitHub Release。构建插件本身没有推送或发布副作用。发布产品不代表已经部署任何用户服务器。
 
 ## 本仓库的版本与发布
 
-`.github/workflows/release.yml` 在主线合并后准备独立版本 PR。`release:major`、`release:minor`、`release:patch` 标签控制升级级别；没有标签时，`feat/` 来源分支升级 minor，其他分支升级 patch。提交标题使用中文。四处版本为 `plugin.json`、`pyproject.toml`、`adaptive_rsi/__init__.py`、`update.json`，中英文 `CHANGELOG` 的 `Unreleased` 内容移入相应版本。
+`.github/workflows/release.yml` 的主线触发仅识别已经核验的机械版本提交并继续正式发布，普通代码合并不创建版本 PR。准备好一批稳定改动后，在 Actions 手动运行该流程，勾选 `prepare_release`，选择 `release_level`（minor、patch 或 major）；缺省不勾选时不准备新版本。紧急修复可单独选择 patch，不按提交次数涨版本。此前的 `release:*` PR 标签不再触发发版或决定级别。自动测试、版本 PR 门禁、打包和正式发布保持自动化；这个节奏只约束本仓库，不修改受管项目的交付授权。
+
+四处版本为 `plugin.json`、`pyproject.toml`、`adaptive_rsi/__init__.py`、`update.json`，中英文 `CHANGELOG` 的 `Unreleased` 内容移入相应版本；提交标题使用中文。
 
 版本 PR 的分支包含目标版本和主线 SHA。主线更新后，系统仅在确认旧 PR 完全等于可重建的机械版本补丁时关闭旧 PR，并针对新基线创建一个替代 PR；发现人工改动会阻断。重复触发会复用同一 PR；关闭的相同 PR 不会自动重开。
 

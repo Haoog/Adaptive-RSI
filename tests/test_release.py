@@ -465,3 +465,42 @@ class ReleaseVersionPatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReleaseBatchCadenceTest(unittest.TestCase):
+    def prepare(self, requested='false', notes='## Unreleased\n', level='minor', generated=False):
+        from scripts import release as module
+        head='b'*40
+        def command(*args, **kwargs):
+            if args[:2]==('git','rev-parse'):
+                return head
+            if args[:3]==('gh','pr','list'):
+                return '[]' if 'open' in args else json.dumps([{'number':9,'state':'OPEN','headRefOid':'c'*40}])
+            raise AssertionError('Unexpected side effect: '+repr(args))
+        def api(endpoint):
+            return {'default_branch':'main'} if not endpoint else {'sha':head}
+        def read(sha,name):
+            return '__version__ = "1.2.3"\n' if name.endswith('__init__.py') else notes
+        with patch.dict(os.environ,{'PREPARE_RELEASE':requested,'RELEASE_LEVEL':level,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'output') as output:
+            module.prepare()
+            return output.call_args.kwargs,calls.call_args_list
+
+    def test_ordinary_merges_never_bump_or_create_pr(self):
+        result,calls=self.prepare()
+        self.assertEqual(result['mode'],'idle')
+        self.assertEqual(len(calls),1)
+
+    def test_explicit_stable_batch_reuses_existing_version_pr(self):
+        result,calls=self.prepare(requested='true')
+        self.assertEqual(result['mode'],'verify')
+        self.assertEqual(result['pr'],9)
+        self.assertTrue(any('chore/release-v1.3.0-' in str(call) for call in calls))
+
+    def test_mechanical_version_commit_still_publishes_without_new_batch(self):
+        result,_=self.prepare(notes='<!-- adaptive-rsi-release:1.2.3;base:'+('a'*40)+' -->',generated=True)
+        self.assertEqual(result['mode'],'publish')
+        self.assertEqual(result['version'],'1.2.3')
+
+    def test_invalid_explicit_increment_is_rejected(self):
+        with self.assertRaisesRegex(ValueError,'Release level'):
+            self.prepare(requested='true',level='surprise')
