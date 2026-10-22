@@ -44,6 +44,8 @@ jobs:
     needs: prepare
     runs-on: macos-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +71,8 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: '1577836800'
       - name: 真实 ZIP 与 wheel 安装升级检查
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release_smoke.py
       - uses: actions/upload-artifact@v4
         with:

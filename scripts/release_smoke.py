@@ -2,6 +2,7 @@
 """Exercise built artifacts with a real venv and a supervised local service restart."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -24,6 +25,30 @@ def command(*argv, cwd):
     subprocess.run(list(map(str, argv)), cwd=cwd, check=True, timeout=90)
 
 
+class NoMetadataRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        return None
+
+
+def latest_release():
+    # Credentials belong only to this fixed API request; asset downloads stay anonymous.
+    headers = {"User-Agent": "Adaptive-RSI-release-smoke", "Accept": "application/vnd.github+json"}
+    if os.environ.get("GH_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
+    request = urllib.request.Request(RELEASE_API, headers=headers)
+    opener = urllib.request.build_opener(NoMetadataRedirect())
+    try:
+        with opener.open(request, timeout=20) as response:
+            data = response.read(2 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+        return {}
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("Release metadata exceeds size limit")
+    return json.loads(data)
+
+
 def main():
     wheel = list((ROOT / "dist").glob("adaptive_rsi-" + __version__ + "-*.whl"))
     if len(wheel) != 1:
@@ -37,12 +62,7 @@ def main():
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / "bin/python"
         previous = None
-        try:
-            latest = json.loads(download(RELEASE_API, 2 * 1024 * 1024))
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                raise
-            latest = {}
+        latest = latest_release()
         if latest and version(latest["tag_name"]) < version(__version__):
             asset = next((item for item in latest.get("assets", []) if item["name"].endswith(".whl")), None)
             if not asset:

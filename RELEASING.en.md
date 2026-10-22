@@ -14,6 +14,8 @@ PRs created with the default `GITHUB_TOKEN` do not trigger `pull_request` checks
 
 After a bot merge, the workflow explicitly dispatches formal publication because `GITHUB_TOKEN` merges do not trigger push workflows. The final merged commit is rebuilt and verified. Smoke starts the actual ZIP service in isolated state, checks its version and preserved data, and installs the previous official wheel before upgrading when one exists. With no prior wheel, the first release explicitly reports installation and repeated installation only, rather than claiming a cross-version upgrade. Publication uses the artifacts uploaded by that verification run, creates a fixed tag and draft, uploads all assets, then publishes it. Conflicting tags or differing existing formal assets stop the operation; formal assets and tags are never replaced. Fixed ZIP metadata and wheel `SOURCE_DATE_EPOCH` support reconciliation on retries.
 
+Smoke may use optional `GH_TOKEN` credentials solely for this repository's fixed official latest Release API; workflows supply a read-only token for this step. That request rejects every redirect, and asset downloads receive no token. Only an API 404 means no prior formal release; 403 rate limits and all other errors still block validation.
+
 GitHub must permit Actions to create PRs and grant the declared workflow permissions. Disabled capabilities fail explicitly; no extra PAT is assumed. Administrators must maintain required checks and review policies. Protect release tags and workflow files with repository rules.
 
 ## Managed-project authorization

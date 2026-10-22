@@ -34,6 +34,8 @@ jobs:
     needs: gate
     runs-on: macos-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +61,8 @@ jobs:
         env:
           SOURCE_DATE_EPOCH: '1577836800'
       - run: python3 scripts/release_smoke.py
+        env:
+          GH_TOKEN: ${{ github.token }}
   report:
     if: always() && needs.gate.result == 'success'
     needs: [gate, verify]

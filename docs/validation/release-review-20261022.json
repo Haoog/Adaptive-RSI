@@ -4,7 +4,7 @@
   "effort": "high",
   "reviewer_role": "Independent read-only release/update/workflow review; this agent implemented authentication, not the release implementation.",
   "base_commit": "3043dde814492bec7ef7464fad66132625e8b949",
-  "scope": "Frozen working-tree release/deployment authorization, durable operation reconciliation, deployment health and rollback, stale deployment prevention, update journal recovery, and release CI exact-SHA privilege separation.",
+  "scope": "Frozen working-tree release/deployment authorization, durable operation reconciliation, deployment health and rollback, stale deployment prevention, update journal recovery, and release CI exact-SHA privilege separation. Follow-up: optional read-only metadata authentication for artifact smoke, fixed-URL token scope, redirect rejection, and accurate HTTP failure classification.",
   "decision": "pass",
   "blocking_findings": [],
   "closed_findings": [
@@ -113,6 +113,20 @@
         ".github/workflows/release-verify.yml:82",
         ".github/workflows/release.yml:88"
       ]
+    },
+    {
+      "area": "Release smoke metadata token boundary",
+      "decision": "pass",
+      "reason": "The optional GH_TOKEN is added only to a helper with no URL argument that requests the fixed official repository latest Release API. Its urllib redirect handler refuses every redirect. Asset downloads retain the existing unauthenticated downloader. The two verification jobs explicitly use contents:read and provide github.token only on their smoke step. Only HTTP 404 becomes an empty prior-release result; authentication failures, 403 rate limits, 429 and other errors continue to fail validation. Metadata size and timeout bounds are retained.",
+      "references": [
+        "scripts/release_smoke.py:28",
+        "scripts/release_smoke.py:33",
+        ".github/workflows/release.yml:47",
+        ".github/workflows/release.yml:73",
+        ".github/workflows/release-verify.yml:37",
+        ".github/workflows/release-verify.yml:64",
+        "tests/test_release_smoke.py:27"
+      ]
     }
   ],
   "verification": [
@@ -154,6 +168,13 @@
     {
       "kind": "additional independent recovery-boundary probes",
       "result": "Legacy handoff waits without spawning; installed status with an already-deleted journal clears stale recovery; stale historical installed status preserves a newly admitted installation gate; expired legacy wait preserves the database and plan without worker launch or service shutdown."
+    },
+    {
+      "kind": "independent fixed-metadata authentication follow-up",
+      "command": "python3.12 -m unittest tests.test_release_smoke tests.test_release -v",
+      "result": "22 tests passed; five new metadata tests exercised the actual urllib opener with an in-memory HTTPS transport: optional token on the single fixed request, no Authorization on asset download, no redirect follow for 301/302/303/307/308, 404 distinct from 401/403/429/500, and oversized or malformed responses rejected.",
+      "duration_seconds": 17.287,
+      "log": "/tmp/rsi-release-token-independent-review.log"
     }
   ],
   "boundaries": [
@@ -162,7 +183,8 @@
     "Target-side deployment commands, secret selection, idempotency enforcement and data-migration rollback are explicitly delegated to the reviewed maintainer-owned workflow. The shipped template fails until a real target is configured.",
     "Update checksums come from the same official GitHub Release and are not an independent release signature. Unknown migration schemas, missing backups or unverifiable committed children require manual recovery rather than unsafe automatic rollback.",
     "This report reviews the file hashes listed below. Later implementation changes require an appropriate follow-up review.",
-    "The real legacy handoff test used temporary state and current feature code with only its copied version metadata changed to 0.3.1. It is not evidence of an official 0.3.0-to-0.4.0 release-asset upgrade or a change to the live user service."
+    "The real legacy handoff test used temporary state and current feature code with only its copied version metadata changed to 0.3.1. It is not evidence of an official 0.3.0-to-0.4.0 release-asset upgrade or a change to the live user service.",
+    "The metadata-authentication follow-up does not reinterpret an anonymous GitHub 403 as release absence. The parent separately observed authenticated API 404 (no formal release at that time); the final exact-archive real smoke is a separate validation run and is not claimed by the reviewer-owned transport tests."
   ],
   "reviewed_file_sha256": {
     "adaptive_rsi/release.py": "6bc8f78cd9b0f2aa09c54f9838a418a554f1a7819c77963477d9278255a1e5d6",
@@ -171,16 +193,17 @@
     "adaptive_rsi/runtime.py": "b33d4e84194e5737d3e5df540b419127c36e74c0147158b61159e9340547cd64",
     "adaptive_rsi/updates.py": "9778fefdd37c0061f496ec38761a7160f640984514ba92f670f1350aa111b556",
     "scripts/release.py": "c5da35b699e5d6991096f01a456a6ad0edb72bed5a4165652915cb1dd9629a7d",
-    "scripts/release_smoke.py": "72f3bffd7133cd097445acea6bb29c5b5fd1ba938e66f1577f9167a71fbbd6cf",
+    "scripts/release_smoke.py": "ac99cf1c82e8c48ee5408a12416173a837b03f6d076731e17d6999c9b88ba70a",
     "scripts/rsi-delivery-workflow.example.yml": "6398610b658886f3d285ed212282008d1b3a16dfbc459875a15e1bbb4c8f0945",
     "scripts/package.py": "a54fb8a2b8c5a2a6a002e5c61612602eee73fa6acecf132c94ca5aa7452b7a29",
-    ".github/workflows/release.yml": "31c9d4ec53427d0f60bc720f61ce64e92376ea7a74d0ceaf0fe498c82b17f918",
-    ".github/workflows/release-verify.yml": "9b01a07c3b36465542d44e5f1876d711910f755e59a1f2d726380a1ac318b703",
+    ".github/workflows/release.yml": "75f758331397aa0e2f7d0b1252b150d6a92c46896be0f7d645cd29ed17d47e3b",
+    ".github/workflows/release-verify.yml": "d002aa2915f13973b465000dae006c37abdef667c7a3204190e771015cc4e40b",
     ".github/workflows/checks.yml": "3651aeb9fd2583b84abd472d0396990ca99d81bd576285e113e85da477652d8f",
-    "RELEASING.md": "924eb3d327f371ba6f15695046948214fd031b31615ed88dae253734abf59c93",
-    "RELEASING.en.md": "9de23608a47cbbb86531b93353722b1efa762dc9c9bb3607be2668c66bcf4315",
+    "RELEASING.md": "0d270ee80530d9dcba5894369e6b5964ca93f8318cc2f55b5f96413ea8e05103",
+    "RELEASING.en.md": "6347c466e9ff2d57f46eca438a381a7f9571bdfa61dbbe86259040e61140411b",
     "tests/test_release.py": "708c649bc385022c074f4f537f21e6b48fc5af7939bf07259e451037f026a2cb",
     "tests/test_updates_recovery.py": "e48a113f9c485727135ee7de09bef5fc08523991a3dfafd1522693e0da83631e",
-    "tests/test_controls.py": "c3e7afb1436ea9fb3999661869748e3f5015d76982dab7768b7c5f60b466fd15"
+    "tests/test_controls.py": "c3e7afb1436ea9fb3999661869748e3f5015d76982dab7768b7c5f60b466fd15",
+    "tests/test_release_smoke.py": "572b9301a26b8e6150925fd6a42b086f044030d6e0a716233d61816dafba244f"
   }
 }
