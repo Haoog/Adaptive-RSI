@@ -35,6 +35,32 @@ struct RuntimeState {
     child: Mutex<Option<Child>>,
     error: Mutex<String>,
 }
+
+struct PendingChild(Option<Child>);
+
+impl PendingChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn get_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("pending runtime child")
+    }
+
+    fn take(&mut self) -> Child {
+        self.0.take().expect("pending runtime child")
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Session {
     origin: String,
@@ -159,14 +185,19 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         "PATH",
         std::env::join_paths(paths).map_err(|_| "Cannot prepare tool paths")?,
     );
-    let mut child = command
+    let child = command
         .arg("desktop-runtime")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
         .spawn()
         .map_err(|_| "Cannot start bundled runtime")?;
-    let stdout = child.stdout.take().ok_or("Cannot read runtime handshake")?;
+    let mut child = PendingChild::new(child);
+    let stdout = child
+        .get_mut()
+        .stdout
+        .take()
+        .ok_or("Cannot read runtime handshake")?;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -182,8 +213,6 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         .and_then(Result::ok);
     let session = handshake.and_then(|line| serde_json::from_str::<Session>(&line).ok());
     let Some(session) = session else {
-        let _ = child.kill();
-        let _ = child.wait();
         return Err("Runtime did not return a valid handshake; inspect runtime state".into());
     };
     let origin = session
@@ -214,7 +243,7 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<RuntimeState>();
     *state.local.lock().unwrap() = Some(connection.clone());
     *state.target.lock().unwrap() = Some(connection);
-    *state.child.lock().unwrap() = Some(child);
+    *state.child.lock().unwrap() = Some(child.take());
     Ok(())
 }
 #[tauri::command]
@@ -485,5 +514,45 @@ mod tests {
             200
         );
         worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_runtime_is_killed_and_reaped_on_startup_failure() {
+        use std::process::Command;
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        drop(super::PendingChild::new(child));
+        let result = Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "failed runtime process {pid} was left running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_runtime_is_transferred_out_of_startup_guard() {
+        use std::process::Command;
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let mut pending = super::PendingChild::new(child);
+        let mut accepted = pending.take();
+        drop(pending);
+        let result = Command::new("/bin/kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "accepted runtime process {pid} was terminated by startup cleanup"
+        );
+        let _ = accepted.kill();
+        let _ = accepted.wait();
     }
 }
