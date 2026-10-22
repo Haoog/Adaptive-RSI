@@ -1,0 +1,54 @@
+{
+  "review": "consecutive-automatic-release-changelog-followup",
+  "reviewed_at": "2026-10-22T05:00:03.088566+00:00",
+  "reviewer": "browser_login agent; independent review of automatic_release-authored one-line fallback and Git regression",
+  "base_commit": "a2b0ef563fd8f3f42ed234f8dcad7786a35432e5",
+  "branch": "fix/release-metadata-endpoint",
+  "decision": "pass",
+  "blocking_findings": [],
+  "closed_findings": [
+    {
+      "priority": "P1",
+      "title": "The next automatic release stopped after the first release emptied Unreleased",
+      "original_behavior": "The first generated release moves authored Unreleased content into its version section and preserves an empty Unreleased heading. A later valid mainline change without handwritten notes then caused bump_files to raise instead of generating the next version patch.",
+      "resolution": "Empty or whitespace-only Unreleased content now uses the existing language-specific fixed description referencing the exact base SHA. Nonempty authored notes continue to move unchanged under the new version. The generated marker, strict version consistency, deterministic patch reconstruction and unrelated-file rejection remain intact.",
+      "references": [
+        "scripts/release.py:72",
+        "tests/test_release.py:391"
+      ],
+      "verification": "A real temporary Git repository completes three release cycles: 1.3.0 preserves authored bilingual notes; 1.3.1 and 1.3.2 each follow a separately committed ordinary improvement without adding notes and use their own base SHA in bilingual fallback text. Every cycle commits exactly the six release files and passes verify_generated. Restoring the old empty-notes rejection only in memory makes this new regression fail on the next empty-Unreleased release."
+    }
+  ],
+  "verification": [
+    {
+      "kind": "independent affected test execution",
+      "command": "python3.12 -m unittest tests.test_release.ReleaseVersionPatchTest tests.test_release_endpoints -v",
+      "result": "4 tests passed, zero skips",
+      "duration_seconds": 4.697,
+      "log": "/tmp/rsi-release-continuation-independent-review.log"
+    },
+    {
+      "kind": "real Git continuation regression inspection",
+      "result": "Three cycles with distinct committed baselines; repeated bump_files calls agree byte-for-byte; generated diffs contain exactly RELEASE_FILES; all commits pass verify_generated; authored history persists; later fallback sections contain the current base SHA and do not repeat authored notes."
+    },
+    {
+      "kind": "independent negative control",
+      "result": "Replaced only the one-line fallback in an in-memory module copy with the original empty-notes ValueError. The same new real-Git regression failed with that original error. No production file was mutated.",
+      "log": "/tmp/rsi-release-empty-unreleased-negative-control.log"
+    },
+    {
+      "kind": "scope and formatting review",
+      "result": "Production diff is one fallback expression in bump_files. Previous generated-patch/manual-addition rejection and root/nonempty endpoint argv tests still pass. git diff --check passed."
+    }
+  ],
+  "limits": [
+    "No remote repository write, workflow dispatch, version PR, merge, tag or release publication was performed in this review.",
+    "The continuation evidence uses a real temporary Git repository and local release functions. Full hosted CI and actual multi-release workflow execution remain separate gates.",
+    "Earlier frozen review reports and the metadata-path follow-up report were preserved as historical evidence; this report records the new source hashes."
+  ],
+  "reviewed_file_sha256": {
+    "scripts/release.py": "b499ab979bfb288a9615a3dc0994b2b705a173e74aa6831b707f6ee16436d103",
+    "tests/test_release.py": "59eddec8921b352759a983413c0e32ef2c58d92b53b6170543f7a85c87d3f086",
+    "tests/test_release_endpoints.py": "aa0fe739839a758eeb69d1fd73313dea31ac8bd86e1cbe9e94a22c374a65893a"
+  }
+}
