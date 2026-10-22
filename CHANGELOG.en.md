@@ -11,6 +11,7 @@
 - Reap the desktop runtime on every failed startup path and quietly handle responses to browser-aborted requests.
 - Future formal releases will include a macOS ARM64 desktop DMG and SHA-256; the temporary signature is not Apple-notarized.
 - Complete the usage page's English translations for refresh, search and custom date labels.
+- Close stale usage details on project or filter changes so delayed responses cannot appear under another project.
 
 
 ## 0.4.1
