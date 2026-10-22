@@ -388,6 +388,46 @@ class StableUpdatePolicyTest(unittest.TestCase):
 
 
 class ReleaseVersionPatchTest(unittest.TestCase):
+    def test_consecutive_releases_preserve_authored_notes_then_reconstruct_empty_unreleased(self):
+        from scripts import release as module
+        with tempfile.TemporaryDirectory() as temp, patch.object(module, "ROOT", Path(temp)):
+            root = Path(temp)
+            contents = {"plugin.json": '{"version":"1.2.3"}\n', "update.json": '{"version":"1.2.3"}\n',
+                        "pyproject.toml": 'version = "1.2.3"\n', "adaptive_rsi/__init__.py": '__version__ = "1.2.3"\n',
+                        "CHANGELOG.md": '# 版本\n\n## Unreleased\n\n- 作者记录的具体改进。\n\n## 1.2.3\n\n- 原版。\n',
+                        "CHANGELOG.en.md": '# Changelog\n\n## Unreleased\n\n- Specific improvement recorded by the author.\n\n## 1.2.3\n\n- Old.\n'}
+            for name, text in contents.items():
+                (root / name).parent.mkdir(exist_ok=True)
+                (root / name).write_text(text)
+            git(root, "init", "-q")
+            git(root, "add", ".")
+            git(root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "base")
+            for cycle, target in enumerate(["1.3.0", "1.3.1", "1.3.2"]):
+                if cycle:
+                    (root / "normal-change.py").write_text("value = " + str(cycle) + "\n")
+                    git(root, "add", "normal-change.py")
+                    git(root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "正常改进")
+                base = git(root, "rev-parse", "HEAD")
+                result = module.bump_files(base, target)
+                self.assertEqual(result, module.bump_files(base, target))
+                for name, text in result.items():
+                    (root / name).write_text(text)
+                git(root, "add", "--", *module.RELEASE_FILES)
+                git(root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "准备版本 " + target)
+                head = git(root, "rev-parse", "HEAD")
+                self.assertEqual(set(git(root, "diff", "--name-only", base, head).splitlines()), set(module.RELEASE_FILES))
+                self.assertEqual(module.verify_generated(base, head), target)
+                for name, authored in [("CHANGELOG.md", "- 作者记录的具体改进。"), ("CHANGELOG.en.md", "- Specific improvement recorded by the author.")]:
+                    section = result[name].split("## " + target + "\n", 1)[1].split("\n## ", 1)[0]
+                    self.assertIn("## Unreleased\n\n## " + target, result[name])
+                    self.assertIn(authored, result[name])
+                    if cycle == 0:
+                        self.assertIn(authored, section)
+                    else:
+                        fallback = "- 发布经过检查的主线改进；本版本对应提交 `" + base + "`。" if name == "CHANGELOG.md" else "- Release verified mainline improvements from commit `" + base + "`."
+                        self.assertIn(fallback, section)
+                        self.assertNotIn(authored, section)
+
     def test_version_patch_is_reconstructed_and_manual_additions_block(self):
         spec = importlib.util.spec_from_file_location("release_script", Path(__file__).resolve().parents[1] / "scripts/release.py")
         module = importlib.util.module_from_spec(spec)

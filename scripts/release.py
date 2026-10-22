@@ -69,9 +69,7 @@ def bump_files(base, target):
         if unreleased:
             end = original.find("\n## ", unreleased.end())
             end = len(original) if end < 0 else end
-            notes = original[unreleased.end():end].strip()
-            if not notes:
-                raise ValueError("Unreleased notes must describe the user-visible changes in both languages")
+            notes = original[unreleased.end():end].strip() or note
             result[name] = (original[:unreleased.end()] + "\n\n## " + target + "\n\n" + marker + "\n\n" +
                             notes + "\n" + original[end:])
         else:
