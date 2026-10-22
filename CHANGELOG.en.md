@@ -10,6 +10,7 @@
 - Use one searchable model chooser per role, and add desktop build checks and bilingual documentation.
 - Reap the desktop runtime on every failed startup path and quietly handle responses to browser-aborted requests.
 - Future formal releases will include a macOS ARM64 desktop DMG and SHA-256; the temporary signature is not Apple-notarized.
+- Complete the usage page's English translations for refresh, search and custom date labels.
 
 
 ## 0.4.1
