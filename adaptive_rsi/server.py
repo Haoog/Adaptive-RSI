@@ -121,28 +121,79 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/health":
                 self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid()})
             elif parsed.path == "/api/state":
+                legacy = "sections" not in params
+                requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
+                unknown = requested - {"core", "candidates", "analytics"}
+                if unknown:
+                    raise ValueError("Unknown state section: " + ", ".join(sorted(unknown)))
+                try:
+                    global_config = runtime.config()
+                except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+                    raise ValueError("Global configuration is invalid: " + str(exc)) from None
                 projects = store.query("SELECT * FROM projects ORDER BY created")
+                raw_project_configs = {}
                 for project in projects:
-                    project["overrides"] = json.loads(project["config"])
-                    project["config"] = runtime.config(project["id"])
+                    raw_config = project["config"]
+                    raw_project_configs[project["id"]] = raw_config
+                    overrides = None
+                    try:
+                        overrides = json.loads(raw_config or "{}")
+                        if not isinstance(overrides, dict):
+                            raise ValueError("Project configuration must be a JSON object")
+                        project["overrides"] = overrides
+                        project["config"] = runtime.config(project["id"])
+                    except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+                        project["configuration_error"] = str(exc)
+                        project["configured_paused"] = bool(project["paused"])
+                        project["paused"] = True
+                        project["overrides"] = overrides
+                        project["raw_overrides"] = raw_config
+                        project["config"] = global_config
                 selected = params.get("project", [None])[0] or (projects[0]["id"] if projects else None)
                 if selected not in {p["id"] for p in projects}:
                     selected = projects[0]["id"] if projects else None
                 rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
                                params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
-                candidates = store.query("SELECT * FROM candidates " + ("WHERE project=? " if selected else "") + "ORDER BY created DESC LIMIT 100", (selected,) if selected else ())
-                for candidate in candidates:
-                    evidence = json.loads(candidate.pop("evidence"))
-                    candidate["content"] = json.loads(candidate["content"])
-                    candidate["reason"] = evidence.get("reason", "")
-                    candidate["trial_count"] = len(evidence.get("trials", []))
-                    candidate["monitor"] = evidence.get("monitor", {})
-                self.respond({"version": __version__, "build": BUILD_ID, "selected_project": selected, "csrf": self.server.csrf, "projects": projects, **rows, "candidates": candidates, "config": runtime.config(), "update": runtime.updates.snapshot(),
-                              "schedules": store.query("SELECT * FROM schedules"),
-                              "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
-                              "quality": quality_summary(store, selected),
-                              "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
-                              "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+                schedules = store.query("SELECT * FROM schedules")
+                project_by_id = {project["id"]: project for project in projects}
+                for schedule in schedules:
+                    project = project_by_id.get(schedule["project"])
+                    if project and project.get("configuration_error"):
+                        schedule["next_effective"] = None
+                        continue
+                    try:
+                        schedule["next_effective"] = runtime.next_effective_schedule(schedule["project"], schedule["due"])
+                    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                        if project:
+                            project["configuration_error"] = str(exc)
+                            project["configured_paused"] = bool(project["paused"])
+                            project["paused"] = True
+                            project["raw_overrides"] = raw_project_configs.get(project["id"])
+                            project["config"] = global_config
+                        schedule["next_effective"] = None
+                data = {"version": __version__, "build": BUILD_ID, "selected_project": selected,
+                        "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
+                        "update": runtime.updates.snapshot(), "schedules": schedules}
+                include_candidates = legacy or "candidates" in requested
+                include_analytics = legacy or "analytics" in requested
+                if include_candidates:
+                    candidates = store.query("SELECT * FROM candidates " + ("WHERE project=? " if selected else "") + "ORDER BY created DESC LIMIT 100", (selected,) if selected else ())
+                    for candidate in candidates:
+                        evidence = json.loads(candidate.pop("evidence"))
+                        candidate["content"] = json.loads(candidate["content"])
+                        candidate["reason"] = evidence.get("reason", "")
+                        candidate["trial_count"] = len(evidence.get("trials", []))
+                        candidate["monitor"] = evidence.get("monitor", {})
+                    data["candidates"] = candidates
+                if include_analytics:
+                    data.update({
+                        "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
+                        "quality": quality_summary(store, selected),
+                        "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
+                        "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+                if not legacy:
+                    data["sections"] = ["core", *sorted(requested - {"core"})]
+                self.respond(data)
             elif parsed.path == "/api/readiness":
                 from .readiness import inspect
                 self.respond(inspect(runtime, runtime.project(params.get("project", [""])[0])))
@@ -270,13 +321,15 @@ class Handler(BaseHTTPRequestHandler):
                 except CatalogError as exc:
                     self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
                 return
+            if path == "/api/projects/import":
+                runtime.updates.require_ready()
+                self.respond({"id": runtime.import_project(body["url"], body.get("directory"))})
+                return
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
                 runtime.updates.require_ready()
                 if path == "/api/projects":
                     result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
-                elif path == "/api/projects/import":
-                    result = {"id": runtime.import_project(body["url"], body.get("directory"))}
                 elif path == "/api/updates/check":
                     runtime.updates.check_async()
                     result = {"started": True}
@@ -288,6 +341,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/config":
                     runtime.configure(body["values"], body.get("project"), body.get("inherit"))
                     result = {"saved": True, "config": runtime.config(body.get("project"))}
+                elif path == "/api/config/repair":
+                    result = runtime.repair_project_config(body["project"], body.get("confirmation"))
                 elif path == "/api/release-retry":
                     result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
                 elif path == "/api/release-authorize":

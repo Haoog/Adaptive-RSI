@@ -316,9 +316,15 @@ def deployment_health(runtime, project, run, data, policy, cancel):
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": rollback["operation_id"], "inputs[rsi_sha]": rollback["sha"]})
-                rollback["state"] = "submitted"
-            except Exception:
-                rollback["state"] = "dispatch_unknown"
+                rollback.update(state="submitted", dispatch_receipt="accepted")
+            except ApiRejected as exc:
+                rollback.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                                dispatch_http_status=exc.status)
+                data.update(state="rollback_failed", error=rollback["error"])
+                save(runtime, run, "deploy", data)
+                raise
+            except Exception as exc:
+                rollback.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
                 save(runtime, run, "deploy", data)
                 raise
     if data["state"] == "rolling_back":
@@ -398,10 +404,14 @@ def advance(runtime, project, run, outcome, cancel=None):
                 try:
                     api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                         {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
-                except Exception:
-                    data["state"] = "dispatch_unknown"
+                except ApiRejected as exc:
+                    data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                                dispatch_http_status=exc.status)
                     raise
-                data["state"] = "submitted"
+                except Exception as exc:
+                    data.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
+                    raise
+                data.update(state="submitted", dispatch_receipt="accepted")
                 save(runtime, run, kind, data)
                 runtime.store.event("automation_dispatched", "Authorized " + kind + " workflow submitted", project["id"], run["id"], data)
         except Cancelled:
@@ -454,6 +464,37 @@ def retry(runtime, project_id, run_id, kind):
                 save(runtime, run, kind, data)
                 runtime.wake.set()
                 return data
+        if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
+                not target.get("workflow_run_id")):
+            validate_pin(repo, policy)
+            authorized(runtime, project, run, kind, policy)
+            target.update(state="dispatching", error="", dispatch_receipt="pending")
+            if target is not data:
+                data.update(state="rolling_back", rollback=target, error="")
+            save(runtime, run, kind, data)
+            try:
+                api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
+                    {"ref": policy["ref"], "inputs[rsi_operation_id]": target["operation_id"], "inputs[rsi_sha]": target["sha"]})
+            except ApiRejected as exc:
+                target.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                              dispatch_http_status=exc.status)
+                if target is not data:
+                    data.update(state="rollback_failed", error=target["error"])
+                save(runtime, run, kind, data)
+                raise
+            except Exception as exc:
+                target.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
+                if target is not data:
+                    data.update(state="rolling_back", error=target["error"])
+                save(runtime, run, kind, data)
+                runtime.wake.set()
+                raise
+            target.update(state="submitted", error="", dispatch_receipt="accepted")
+            if target is not data:
+                data.update(state="rolling_back", error="")
+            save(runtime, run, kind, data)
+            runtime.wake.set()
+            return data
         unconfirmed_rerun = target.get("rerun_pending") or target.get("state") in {"rerunning", "rerun_unknown"}
         target = reconcile(runtime, run, kind, target, persist=False)
         if unconfirmed_rerun:

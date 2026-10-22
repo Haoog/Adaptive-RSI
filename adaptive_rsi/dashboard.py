@@ -21,9 +21,10 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     limit = max(1, min(200, int(limit)))
     offset = max(0, int(offset))
     clause, args = ("project=?", [project]) if project else ("1=1", [])
-    task_clause = clause
+    count_clause = clause
     if not include_system:
-        task_clause += " AND source NOT LIKE 'system_%'"
+        count_clause += " AND source NOT LIKE 'system_%'"
+    task_clause = count_clause
     if group in ["active", "attention", "history"]:
         states = ACTIVE if group == "active" else ATTENTION if group == "attention" else ACTIVE + ATTENTION
         task_clause += " AND display_state " + ("NOT " if group == "history" else "") + "IN (" + ",".join("?" for _ in states) + ")"
@@ -52,4 +53,4 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     return {"tasks": tasks, "runs": runs,
             "events": store.query("SELECT * FROM events WHERE " + ("(project=? OR project IS NULL)" if project else "1=1") + " ORDER BY seq DESC LIMIT 100", base_args),
             "pagination": {"total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total},
-            "task_counts": store.query("SELECT display_state AS state,count(*) AS count FROM " + TASKS + " WHERE " + clause + " GROUP BY display_state", base_args)}
+            "task_counts": store.query("SELECT display_state AS state,count(*) AS count FROM " + TASKS + " WHERE " + count_clause + " GROUP BY display_state", base_args)}

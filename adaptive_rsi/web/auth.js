@@ -1,6 +1,6 @@
 'use strict';
 window.RSIAuth = (() => {
-  let snapshot=null,providers=null,context=null,loading=null,pending=false,timer=null;
+  let snapshot=null,providers=null,context=null,loading=null,pending=false,polling=false,pollingStopped=false,timer=null;
   const sessions=new Map(),selections=new Map();
   const authErrors={invalid_response:'登录服务返回格式不兼容，请更新运行机器上的工具后重试。',auth_credentials_busy:'模型正在使用此账号，请暂停项目并等待当前调用结束后重试。',auth_container_unavailable:'服务器的容器服务不可用，请启动 Docker 后重试。',auth_worker_image_missing:'服务器尚未准备认证运行镜像，请先完成运行环境安装。',codex_missing:'请先在运行机器安装 Codex，再返回页面登录。',opencode_missing:'请先在运行机器安装 OpenCode，再返回页面登录。',invalid_provider:'请重新选择供应商。',invalid_auth_method:'请刷新供应商列表后重新选择登录方式。',invalid_auth_inputs:'请填写官方登录需要的信息。',invalid_auth_code:'请重新粘贴官方页面的授权码。',invalid_api_key:'请输入有效的供应商密钥。',unsupported_auth_method:'此登录方式暂不支持远程页面，请使用供应商密钥。',auth_busy:'已有登录正在进行，请先完成或取消。',device_auth_unavailable:'设备登录暂不可用，请在账号设置中启用设备授权后重试。',authorization_failed:'官方授权未完成，请重新登录。',auth_protocol_error:'登录响应无法识别，请更新运行机器上的工具后重试。',auth_timeout:'等待登录超时，请重新登录。',auth_expired:'登录已过期，请重新登录。',process_interrupted:'登录已中断，请重新登录。',invalid_credentials:'账号凭据失效，请重新登录。',unknown_session:'登录会话已结束，请重新登录。',service_closed:'服务正在关闭，请刷新页面后重试。',invalid_auth_state:'此登录步骤已结束，请重新登录。'};
   const terminal=new Set(['completed','cancelled','expired','failed','interrupted']);
@@ -21,20 +21,28 @@ window.RSIAuth = (() => {
   }
   async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;render();}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=t(authErrors[error.code]||error.message);throw error;}finally{pending=false;render();}}
-  function schedule(){clearTimeout(timer);if([...sessions.values()].some(s=>!terminal.has(s.state)))timer=setTimeout(()=>safe(poll),1500);}
+  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)))timer=setTimeout(()=>safe(poll),1500);}
   async function poll(){
-    for(const [id,session] of sessions){if(terminal.has(session.state))continue;
-      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));sessions.set(id,{...next,refresh:session.refresh});
+    if(polling||pollingStopped)return;polling=true;
+    try{for(const [id,session] of sessions){if(terminal.has(session.state))continue;
+      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));sessions.set(id,{...next,refresh:session.refresh,pollMessage:''});
         if(next.state==='completed'){snapshot=null;readinessCache.clear();await status(true);await session.refresh();}
-      }catch(error){sessions.set(id,{...session,state:'failed',error:error.message});}
-    }render();schedule();
+      }catch(error){
+        if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
+        const terminalState={auth_expired:'expired',auth_timeout:'expired',process_interrupted:'interrupted',unknown_session:'interrupted',invalid_auth_state:'interrupted',authorization_failed:'failed'}[error.code];
+        if(terminalState){sessions.set(id,{...session,state:terminalState,error:error.code,pollMessage:''});continue;}
+        if(error instanceof TypeError||error.name==='AbortError'||error.status>=500){sessions.set(id,{...session,pollMessage:'暂时无法连接，授权状态已保留，正在重试。'});continue;}
+        sessions.set(id,{...session,state:'failed',error:error.code||'authorization_failed',pollMessage:''});
+      }
+    }}finally{polling=false;render();schedule();}
   }
   async function completeSession(id,session,code){
     const next=await mutate('complete',{id:session.id,code});sessions.set(id,{...next,refresh:session.refresh});
     if(next.state==='completed'){readinessCache.clear();await status(true);await session.refresh();}render();schedule();
   }
   async function start(method,inputs={}){
-    const current={...context},session=await mutate('start',{backend:current.backend,provider:current.backend==='codex'?null:current.provider,method:method.index,inputs});
+    if(pending||!context)return;const current={...context},existing=sessions.get(current.backend+':'+(current.provider||''));if(existing&&!terminal.has(existing.state))return;
+    const session=await mutate('start',{backend:current.backend,provider:current.backend==='codex'?null:current.provider,method:method.index,inputs});
     sessions.set(current.backend+':'+(current.provider||''),{...session,refresh:current.refresh});render();schedule();
   }
   function render(){
@@ -60,6 +68,7 @@ window.RSIAuth = (() => {
     const running=session&&!terminal.has(session.state);
     if(session){
       const feedback=text('p',labels[session.state]||session.state,session.state==='failed'?'mc-error':'mc-secondary');feedback.setAttribute('role','status');box.append(feedback);
+      if(session.pollMessage)box.append(el('p',t(session.pollMessage),'mc-secondary'));
       if(running){
         const link=external(session.verification_url,'打开官方授权页面');if(link)box.append(link);
         if(session.user_code){const code=el('p',undefined,'mc-auth-code');code.append(text('span','设备验证码'),el('strong',session.user_code));box.append(code);}

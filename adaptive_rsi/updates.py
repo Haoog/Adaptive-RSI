@@ -259,7 +259,8 @@ class UpdateManager:
                 self.apply_async(requested=bool(status.get("requested")))
 
     def work_busy(self):
-        return (self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or
+        return (getattr(self.runtime, "import_in_progress", False) or
+                self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or
                 getattr(getattr(self.runtime, "model_center", None), "busy", 0) or
                 getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))
 
@@ -273,12 +274,16 @@ class UpdateManager:
             return
         try:
             checked = time.time()
+            previous = self.status()
             try:
                 result = release_info(json.loads(download(RELEASE_API, 2 * 1024 * 1024)))
             except urllib.error.HTTPError as exc:
                 result = {"state": "no_release" if exc.code == 404 else "error", "reason": "GitHub HTTP " + str(exc.code)}
             except Exception:
                 result = {"state": "error", "reason": "Unable to verify the official release feed"}
+            if (previous.get("state") == "waiting_idle" and previous.get("requested") is True and
+                    previous.get("version") == result.get("version")):
+                result.update(state="waiting_idle", requested=True)
             self.store.put_setting("update-status", {**result, "current": __version__, "checked": checked})
         finally:
             self.lock.release()

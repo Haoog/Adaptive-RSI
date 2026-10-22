@@ -8,6 +8,8 @@ The dashboard retains three primary destinations: Workspace, Tasks, and Settings
 
 Task details lead with outcomes, stages, and recovery suggestions. Value decisions, checks, reviews, and original records expand on demand. Tasks are filtered and paginated per project on the server. Switching projects resets pagination. Details retrieve run history separately, and Workspace includes the currently active run.
 
+The dashboard polls lightweight work state every five seconds. Strategy candidates load when Improvement records opens; quality, usage, and model statistics refresh only when needed by the page. Clients that omit section parameters still receive the complete legacy state response. A malformed project configuration is isolated, reported, and represented as paused in the response without changing its stored pause state; that project cannot be enabled until its configuration is fixed.
+
 ## Execution and recovery
 
 The flow is readiness → verification, deduplication and value assessment → completion criteria → isolated implementation → execution and before/after checks → independent review → project-authorized delivery → post-merge checks.
@@ -22,6 +24,8 @@ The flow is readiness → verification, deduplication and value assessment → c
 Initial Issue import uses a durable cursor per project. Subsequent cycles send an update-time `since` filter to GitHub and page only new or revised entries. Each cycle fixes its starting watermark and creation ordering; the next cycle overlaps its start to capture older Issues newly matching the filter. Revisions held by active runs are persisted separately across restarts and watermark advancement. Each turn remains bounded; initial imports and large update batches may need multiple turns.
 
 Skip PR entries; handle closing, reopening, label changes, and revisions. Active runs keep their original evidence. Delivery and auto-merge recheck Issue state, revision, and labels. If an Issue changes while a candidate awaits delivery or PR checks, the old candidate is stopped until synchronization refreshes its evidence and value is reassessed; stale requirements are not retried directly. Changing repositories, label policy, or page size restarts synchronization.
+
+When planning an Issue task, the runtime loads comments on demand and adds at most the 20 most recently updated comments as supplemental context. It reads comments incrementally by update time and advances the cursor only after all pages are read; results are briefly cached locally. Permission, authentication, or paging failures explicitly mark comment context as missing, do not masquerade as an empty comment list, and do not advance the cursor. Omitted older comments and incomplete history are identified. Issue bodies and comments are untrusted task data; they grant no permissions and cannot override system constraints.
 
 Inspection findings require real file paths and literal existing quotes. Matching problem anchors deduplicate; matching titles with different evidence are not automatically collapsed. Planning receives tasks from other sources and open PRs to assess semantic overlap. Model-based semantic deduplication cannot guarantee detection of every paraphrase.
 
@@ -69,4 +73,4 @@ Candidate execution, Issue synchronization, dashboard queries, readiness, recove
 
 Backend and frontend share a content build identity. Each server holds its startup assets; changed backend builds prompt users to save input before reloading. Forms are not cleared automatically. Packaging checks all four version declarations. CI covers backend, frontend, real Chromium form flows, ZIP, and wheel builds.
 
-The release workflow runs only when a maintainer triggers it and creates a checked draft. Updaters ignore drafts. A maintainer must review and publish the release. See [Releasing](RELEASING.en.md).
+After each mainline merge, GitHub Actions automatically prepares a version PR. A trusted mainline workflow reconstructs and checks the exact version patch, runs the full tests, browser checks, and ZIP/wheel installation and upgrade checks, then writes the required `verify` check to that exact PR commit. The version PR merges only after normal branch-protection checks, reviews, and conflict checks pass; automation does not bypass protection. The bot then explicitly runs formal publication, verifies the merged commit again, and publishes the immutable assets produced by that verification. Updaters ignore drafts, and local builds do not push or publish. See [Releasing](RELEASING.en.md).

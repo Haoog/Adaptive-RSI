@@ -34,7 +34,7 @@ async function checkReleaseRetryUI(browser,url,errors){
  let automation={};
  page.on('pageerror',error=>errors.push(error.message));
  page.on('request',request=>{if(request.method()==='POST')writes.push({path:new URL(request.url()).pathname,body:request.postDataJSON()});});
- const reply=(route,data)=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+ const reply=(route,data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
  await page.route('**/api/release-status?*',route=>reply(route,automation));
  await page.route('**/api/release-retry',route=>reply(route,{ok:true}));
  try{
@@ -64,15 +64,15 @@ async function checkReleaseRetryUI(browser,url,errors){
 async function checkAccountAndReleaseUI(browser,url,errors){
  const page=await browser.newPage({viewport:{width:1100,height:900}}),requests=[];
  page.on('pageerror',error=>errors.push(error.message));
- let signedIn=false,complete=false,authActive=false,releaseStarted;
+ let signedIn=false,complete=false,authActive=false,releaseStarted,authStarts=0,pollTransientFailure=true;
  const session={id:'browser-auth-session',backend:'codex',provider:null,state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
- const reply=(route,data)=>route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
+ const reply=(route,data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
  await page.route('**/api/auth/**',async route=>{
   const path=new URL(route.request().url()).pathname,body=route.request().postDataJSON();requests.push({path,body});
   if(path.endsWith('/status'))return reply(route,{codex:{state:signedIn?'authenticated':'signed_out'},opencode:{state:'signed_out',authenticated_providers:[]},sessions:authActive?[session]:[]});
   if(path.endsWith('/providers'))return reply(route,[{id:'openai',name:'OpenAI',methods:[{index:0,label:'Official login',type:'oauth',supported:true},{index:1,label:'API key',type:'api'}]},{id:'github-copilot',name:'GitHub Copilot',methods:[{index:0,label:'Device login',type:'oauth',supported:true,prompts:[{type:'select',key:'deployment',message:'Account type',options:[{label:'GitHub.com',value:'public'},{label:'Enterprise',value:'enterprise'}]},{type:'text',key:'domain',message:'Enterprise domain',when:{key:'deployment',op:'eq',value:'enterprise'}}]}]}]);
-  if(path.endsWith('/start')){if(body.backend==='opencode'){await new Promise(resolve=>{releaseStarted=resolve;});return reply(route,{...session,id:'opencode-session',backend:'opencode',provider:body.provider});}complete=false;authActive=true;return reply(route,session);}
-  if(path.endsWith('/session')){if(complete){signedIn=true;authActive=false;}return reply(route,{...session,state:complete?'completed':'awaiting_authorization'});}
+  if(path.endsWith('/start')){authStarts++;if(body.backend==='opencode'){await new Promise(resolve=>{releaseStarted=resolve;});return reply(route,{...session,id:'opencode-session',backend:'opencode',provider:body.provider});}complete=false;authActive=true;return reply(route,session);}
+  if(path.endsWith('/session')){if(authActive&&pollTransientFailure){pollTransientFailure=false;return reply(route,{error_code:'temporary_network_error',error:'temporary network failure'},503);}if(complete){signedIn=true;authActive=false;}return reply(route,{...session,state:complete?'completed':'awaiting_authorization'});}
   if(path.endsWith('/complete')){complete=true;return reply(route,{...session,state:'completing'});}
   if(path.endsWith('/cancel')){authActive=false;return reply(route,{...session,state:'cancelled'});}
   if(path.endsWith('/logout')){signedIn=false;return reply(route,{ok:true});}
@@ -87,7 +87,8 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
   await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
-  const code=page.locator('[data-auth-field="code:browser-auth-session"]');await code.fill('keep-my-code');await code.focus();await page.waitForTimeout(1800);
+  const code=page.locator('[data-auth-field="code:browser-auth-session"]');await code.fill('keep-my-code');await code.focus();await page.locator('#mc-auth').filter({hasText:'暂时无法连接，授权状态已保留'}).waitFor();
+  await page.waitForTimeout(1650);await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();assert.equal(authStarts,1);
   assert.equal(await code.inputValue(),'keep-my-code');assert(await code.evaluate(node=>document.activeElement===node));
   if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#mc-auth').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/account-sign-in.png'});
   await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
