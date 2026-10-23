@@ -20,7 +20,7 @@
 
 ## 构建
 
-正式版本会提供 macOS ARM64 安装包 `adaptive-rsi-版本号-macos-arm64-adhoc.dmg` 和对应 `.dmg.sha256`，从 GitHub Release 下载。其他平台尚未完成安装验证，Windows 本机运行器暂不支持。
+正式版本提供 macOS ARM64 安装包 `adaptive-rsi-版本号-macos-arm64-adhoc.dmg` 和对应 `.dmg.sha256`，从 GitHub Release 下载。其他平台尚未完成安装验证，Windows 本机运行器暂不支持。
 
 ```sh
 # 需要 Node.js、Rust、uv，以及平台的 Tauri 构建依赖
