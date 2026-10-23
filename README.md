@@ -12,6 +12,8 @@ Adaptive RSI 会把项目巡检、用户目标和 GitHub Issues 转成经过价�
 
 [下载桌面版](https://github.com/Haoog/Adaptive-RSI/releases/latest) · [快速开始](#快速开始) · [详细文档](#文档) · [运行边界](#安全与边界)
 
+[手机安装与流程指南](EXPERIENCE.md)
+
 ## 它解决什么
 
 普通的自动编程工具容易把每个建议都当成任务，甚至在没有充分验证时交付改动。Adaptive RSI 在实现前后加入四道约束：

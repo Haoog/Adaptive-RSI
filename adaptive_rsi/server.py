@@ -105,6 +105,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/login.css" and self.headers.get("Host") in self.server.allowed_hosts:
             self.respond((Path(__file__).parent / "web" / "login.css").read_bytes(), content_type="text/css; charset=utf-8")
             return
+        if parsed.path in ["/install", "/install.js", "/install.css", "/i18n.js", "/manifest.webmanifest", "/sw.js", "/icon-192.png", "/icon-512.png", "/favicon.svg"]:
+            if self.headers.get("Host") not in self.server.allowed_hosts:
+                self.respond({"error": "Invalid Host"}, 403)
+                return
+            name = "install.html" if parsed.path == "/install" else parsed.path[1:]
+            self.respond(self.server.assets[name], content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
+            return
         if parsed.path == "/" and "token" in params:
             if self.headers.get("Host") not in self.server.allowed_hosts or not hmac.compare_digest(params["token"][0], self.server.token):
                 self.respond({"error": "Invalid login"}, 403)
@@ -127,6 +134,46 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/usage":
                 from .usage_report import report
                 self.respond(report(store, params))
+            elif parsed.path == "/api/mobile":
+                self.respond({"install_url": self.server.origin + "/install", "remote": self.server.origin.startswith("https://")})
+            elif parsed.path == "/api/attention":
+                data = records(store, group="attention", include_system=False, limit=200)
+                data["projects"] = store.query("SELECT id,name FROM projects ORDER BY created")
+                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.updated,r.id AS run,r.result FROM tasks t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
+                self.respond(data)
+            elif parsed.path == "/api/storage":
+                from .storage_tools import overview
+                self.respond(overview(store))
+            elif parsed.path == "/api/diagnostics":
+                from .storage_tools import diagnostics
+                self.respond(diagnostics(store))
+            elif parsed.path == "/api/backup":
+                identifier = params.get("id", [""])[0]
+                if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
+                    raise ValueError("Invalid backup ID")
+                path = store.root / "backups" / (identifier + ".sqlite3")
+                if params.get("format", [""])[0] == "json":
+                    import base64
+                    offset = int(params.get("offset", [0])[0])
+                    if offset < 0 or offset > path.stat().st_size:
+                        raise ValueError("Invalid backup offset")
+                    with path.open("rb") as stream:
+                        stream.seek(offset)
+                        chunk = stream.read(512 * 1024)
+                    self.respond({"data": base64.b64encode(chunk).decode("ascii"), "size": path.stat().st_size, "offset": offset, "length": len(chunk)})
+                else:
+                    self.respond(path.read_bytes(), content_type="application/vnd.sqlite3")
+            elif parsed.path == "/api/task":
+                task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
+                if not task:
+                    raise ValueError("Task not found")
+                task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id", (task["id"],))
+                task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
+                task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
+                self.respond(task)
+            elif parsed.path == "/api/workflow-metrics":
+                from .telemetry import workflow_metrics
+                self.respond(workflow_metrics(store, params.get("project", [None])[0]))
             elif parsed.path == "/api/state":
                 legacy = "sections" not in params
                 requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
@@ -161,6 +208,14 @@ class Handler(BaseHTTPRequestHandler):
                     selected = projects[0]["id"] if projects else None
                 rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
                                params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
+                for task in rows["tasks"]:
+                    if task.get("wait_reason") in ["ready", "running"] and selected:
+                        try:
+                            opening = runtime.next_effective_schedule(selected, time.time())
+                            if opening > time.time() + 1:
+                                task.update(wait_reason="working_hours", available=opening)
+                        except AttributeError:
+                            pass
                 schedules = store.query("SELECT * FROM schedules")
                 project_by_id = {project["id"]: project for project in projects}
                 for schedule in schedules:
@@ -239,6 +294,7 @@ class Handler(BaseHTTPRequestHandler):
                 run["result"] = json.loads(run["result"])
                 run["config"] = json.loads(run["config"])
                 run["stages"] = store.query("SELECT stage,created FROM stages WHERE run=? ORDER BY created", (run["id"],))
+                run["phases"] = store.query("SELECT phase,started,ended FROM phase_times WHERE run=? ORDER BY id", (run["id"],))
                 for stage in run["stages"]:
                     saved = store.one("SELECT data FROM stages WHERE run=? AND stage=?", (run["id"], stage["stage"]))
                     stage["decision"] = json.loads(saved["data"]).get("decision")
@@ -249,7 +305,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]
@@ -355,7 +411,16 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/release-authorize":
                     result = runtime.authorize_workflow(body.get("project"), body.get("kind"), body.get("workflow"))
                 elif path == "/api/goal":
-                    result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"))}
+                    result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"), body.get("request_id"))}
+                elif path == "/api/task/revise":
+                    runtime.revise_task(body["task"], body["supplement"])
+                    result = {"saved": True}
+                elif path == "/api/task/schedule":
+                    runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0))
+                    result = {"saved": True}
+                elif path == "/api/backup":
+                    from .storage_tools import backup
+                    result = backup(runtime.store)
                 elif path == "/api/request":
                     result = {"id": runtime.request(body["project"], body["kind"])}
                 elif path == "/api/pause":

@@ -79,7 +79,7 @@ class ReliabilityTest(unittest.TestCase):
         task, run = self.claim()
         with patch.object(self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate) as evaluate:
             self.runtime.process(run)
-            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
             self.runtime.retry(task)
             second = self.store.claim(self.project, self.runtime.config(self.project))
             self.runtime.process(second)

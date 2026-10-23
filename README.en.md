@@ -12,6 +12,8 @@ Adaptive RSI turns project inspections, user goals, and GitHub Issues into maint
 
 [Download desktop](https://github.com/Haoog/Adaptive-RSI/releases/latest) · [Quick start](#quick-start) · [Documentation](#documentation) · [Boundaries](#safety-and-boundaries)
 
+[Mobile installation and workflow guide](EXPERIENCE.en.md)
+
 ## Why Adaptive RSI
 
 Autonomous coding tools can treat every suggestion as work and deliver changes with weak evidence. Adaptive RSI adds four constraints around implementation:

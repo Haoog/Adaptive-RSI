@@ -4,6 +4,8 @@
 
 Linux 服务器负责代码、模型执行、检查和交付。个人电脑只打开浏览器，关机不影响服务器任务。macOS 仍可用 `python3 scripts/start.py` 本机运行。
 
+手机使用：在已配置的 HTTPS 控制台地址后加 `/install`，或点击侧栏「手机安装」。详见 [手机安装与流程指南](EXPERIENCE.md)。
+
 ## 安装与访问
 
 准备 Python 3.9+（含 venv）、Git、已登录的 GitHub CLI、可使用的 Docker Engine 和 systemd 用户服务。运行账号需要访问 Docker。请使用单独的服务账号；这是单用户维护工具。

@@ -3,7 +3,7 @@ import json
 
 
 ACTIVE = ["queued", "planning", "executing", "evaluating", "pr_open", "releasing", "deploying"]
-ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insufficient_evidence", "interrupted", "regressed", "unverified_merge", "ci_failed", "release_failed", "deploy_failed"]
+ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insufficient_evidence", "interrupted", "regressed", "unverified_merge", "ci_failed", "release_failed", "deploy_failed", "expired"]
 
 # Derive attention from the latest attempt without changing the PR tracking state.
 TASKS = """(SELECT t.*, CASE
@@ -30,7 +30,15 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         task_clause += " AND display_state " + ("NOT " if group == "history" else "") + "IN (" + ",".join("?" for _ in states) + ")"
         args += states
     total = store.one("SELECT count(*) AS n FROM " + TASKS + " WHERE " + task_clause, args)["n"]
-    tasks = store.query("SELECT * FROM " + TASKS + " WHERE " + task_clause + " ORDER BY updated DESC,id LIMIT ? OFFSET ?", (*args, limit, offset))
+    import time
+    from .experience import queue_status
+    tasks = store.query("SELECT * FROM " + TASKS + " WHERE " + task_clause +
+                        " ORDER BY CASE WHEN state='queued' THEN 0 ELSE 1 END, " + store.queue_order() +
+                        " LIMIT ? OFFSET ?", (*args, time.time(), limit, offset))
+    queue = {row["id"]: row for row in queue_status(store, project)} if project else {}
+    for task in tasks:
+        if task["id"] in queue:
+            task.update({k: queue[task["id"]][k] for k in ["wait_reason", "queue_position", "dependency"]})
     base_args = (project,) if project else ()
     # Include the latest attempt for every visible task, even if it is older than the history window.
     task_ids = [t["id"] for t in tasks]

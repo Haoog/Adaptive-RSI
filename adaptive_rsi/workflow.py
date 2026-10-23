@@ -1,14 +1,17 @@
 """Task evidence contracts shared by production and experiment runs."""
 
 
-def change_kind(task):
+def change_kind(task, plan=None):
     # Only explicit behavior-preserving requests can use the preservation contract.
     title = task["title"].lower()
     if any(word in title for word in ["fix", "bug", "修复", "错误", "缺陷"]):
         return "behavior"
-    if any(word in title for word in ["refactor", "重构"]):
+    declared = (plan or {}).get("change_kind")
+    if declared in ["behavior", "performance", "refactor", "documentation", "configuration", "ui"]:
+        return declared
+    if any(word in title for word in ["refactor", "重构", "保持行为不变"]):
         return "refactor"
-    if any(word in title for word in ["performance", "benchmark", "性能", "提速"]):
+    if any(word in title for word in ["performance", "benchmark", "性能", "提速", "降低", "延迟", "吞吐"]):
         return "performance"
     return "behavior"
 

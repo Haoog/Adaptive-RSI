@@ -58,7 +58,7 @@ function browser(savedSession = new Map()) {
   const context = vm.createContext({
     document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
     localStorage: storage(local), sessionStorage: storage(session), t: value => value,
-    AbortController, DOMException, queueMicrotask,
+    AbortController, DOMException, queueMicrotask, crypto: require('node:crypto').webcrypto,
     fetch: defaultFetch,
     setInterval() {}, clearInterval() {},
     setTimeout(callback, delay) { const timer = {id: ++nextTimer, callback, delay, active: true}; timers.push(timer); return timer.id; },
@@ -173,7 +173,8 @@ for (const switchProject of [false, true]) {
     await page.resume();
     await pending;
     assert.equal(page.node('goal-text').value, 'New unsaved task');
-    assert.deepEqual(posts[1], {project: 'a', text: 'Original task'});
+    assert.deepEqual(posts[1], {project: 'a', text: 'Original task', request_id: posts[0].request_id});
+    assert.match(posts[1].request_id, /^[0-9a-f-]{36}$/);
   });
 }
 
@@ -573,7 +574,8 @@ test('goal drafts stay with their project and submit only to that project', asyn
   page.node('project-select').value='a';page.node('project-select').handlers.change({target:page.node('project-select')});
   assert.equal(page.node('goal-text').value,'Only project A: update the guide');
   await page.submit('goal-form');
-  assert.deepEqual(posts[0],{project:'a',text:'Only project A: update the guide'});
+  assert.deepEqual(posts[0],{project:'a',text:'Only project A: update the guide',request_id:posts[0].request_id});
+  assert.match(posts[0].request_id,/^[0-9a-f-]{36}$/);
   assert.equal(page.node('goal-text').value,'');
   assert.equal(vm.runInContext('window.RSIDraftStore.get("goal","a")',page.context),null);
   page.node('project-select').value='b';page.node('project-select').handlers.change({target:page.node('project-select')});

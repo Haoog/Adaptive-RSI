@@ -69,8 +69,27 @@ class Store:
                 CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
                 CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
                 CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
+                CREATE TABLE IF NOT EXISTS task_decisions (
+                    task TEXT PRIMARY KEY REFERENCES tasks(id), data TEXT NOT NULL, created REAL);
+                CREATE TABLE IF NOT EXISTS task_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT REFERENCES tasks(id),
+                    previous_body TEXT, supplement TEXT, created REAL);
+                CREATE TABLE IF NOT EXISTS task_dependencies (
+                    task TEXT PRIMARY KEY REFERENCES tasks(id), dependency TEXT REFERENCES tasks(id));
+                CREATE TABLE IF NOT EXISTS submissions (
+                    project TEXT, request TEXT, signature TEXT, task TEXT REFERENCES tasks(id),
+                    PRIMARY KEY(project,request));
+                CREATE TABLE IF NOT EXISTS phase_times (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), phase TEXT,
+                    started REAL, ended REAL);
+                CREATE TABLE IF NOT EXISTS remote_waits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), reason TEXT,
+                    started REAL, ended REAL);
             """)
             db.execute("BEGIN IMMEDIATE")
+            for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0")]:
+                if field not in {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}:
+                    db.execute("ALTER TABLE tasks ADD COLUMN " + field + " " + definition)
             if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
                 db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
             if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
@@ -144,17 +163,57 @@ class Store:
                      (project, run, kind, message, encode(data or {}), time.time()))
 
     def add_task(self, project, source, key, title, body="", evidence=None, acceptance=None,
-                 priority=50, overrides=None):
+                 priority=50, overrides=None, request_id=None, request_signature=None):
         task = uid()
         now = time.time()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if request_id:
+                prior = db.execute("SELECT * FROM submissions WHERE project=? AND request=?", (project, request_id)).fetchone()
+                if prior:
+                    if prior["signature"] != request_signature:
+                        raise ValueError("Submission ID was already used with different content")
+                    return prior["task"]
             db.execute("""INSERT OR IGNORE INTO tasks
                 (id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,
                  overrides,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                        (task, project, source, key, title[:300], body[:30000], encode(evidence or []),
                         encode(acceptance or []), "queued", priority, encode(overrides or {}), now, now))
             row = db.execute("SELECT id FROM tasks WHERE project=? AND fingerprint=?", (project, key)).fetchone()
+            if request_id:
+                db.execute("INSERT INTO submissions VALUES (?,?,?,?)", (project, request_id, request_signature, row["id"]))
         return row["id"]
+
+    def defer(self, task, decision):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (task, encode(decision), time.time()))
+            db.execute("UPDATE tasks SET state='deferred',updated=? WHERE id=?", (time.time(), task))
+
+    def phase(self, run, name):
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM runs WHERE id=? AND ended IS NULL", (run,)).fetchone():
+                return
+            active = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
+            if not active or active["phase"] != name:
+                db.execute("UPDATE phase_times SET ended=? WHERE run=? AND ended IS NULL", (now, run))
+                db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, name, now))
+
+    def remote_wait(self, run, reason, now):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            active = db.execute("SELECT reason FROM remote_waits WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
+            if active and active["reason"] == reason:
+                return
+            db.execute("UPDATE remote_waits SET ended=? WHERE run=? AND ended IS NULL", (now, run))
+            if reason:
+                db.execute("INSERT INTO remote_waits(run,reason,started) VALUES (?,?,?)", (run, reason, now))
+
+    @staticmethod
+    def queue_order():
+        return "urgency DESC,(priority + min(20, (? - created)/86400.0)) DESC,created,id"
 
     def claim(self, project, config):
         now = time.time()
@@ -169,7 +228,9 @@ class Store:
             effective = None
             while True:
                 candidate = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
-                                       "ORDER BY (priority + min(20, (? - created)/86400.0)) DESC,created,id LIMIT 1",
+                                       "AND NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.dependency "
+                                       "WHERE d.task=tasks.id AND p.state<>'merged') "
+                                       "ORDER BY " + self.queue_order() + " LIMIT 1",
                                        (project, now, now)).fetchone()
                 if not candidate:
                     return None
@@ -196,6 +257,7 @@ class Store:
             db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
             db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
                        (run, task["id"], project, "planning", encode(effective), now))
+            db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
     def transition(self, run, state, result=None, terminal=False):
@@ -205,10 +267,18 @@ class Store:
             if not row or row["ended"] is not None:
                 return False
             previous = json.loads(row["result"])
+            phase = (result or {}).get("stage", state)
+            active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
+            if not active_phase or active_phase["phase"] != phase or terminal:
+                db.execute("UPDATE phase_times SET ended=? WHERE run=? AND ended IS NULL", (now, run))
+                if not terminal:
+                    db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, phase, now))
             result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
             db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
+            if state == "deferred":
+                db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (row["task"], encode(result), now))
         self.event(state, (result or {}).get("reason", state), row["project"], run, result)
         return True
 

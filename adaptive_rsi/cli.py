@@ -77,6 +77,9 @@ def main(argv=None):
     goal.add_argument("project")
     goal.add_argument("text")
     goal.add_argument("--overrides", help="JSON per-task overrides")
+    goal.add_argument("--request-id", help="Reuse only when retrying the same submission")
+    restore_parser = sub.add_parser("restore", help="Restore a backup into a NEW state directory, paused")
+    restore_parser.add_argument("file", type=Path)
     for command in ["pause", "resume", "inspect", "issues", "evolve"]:
         p = sub.add_parser(command)
         p.add_argument("project")
@@ -104,6 +107,10 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "restore":
+            from .storage_tools import restore
+            print(json.dumps(restore(args.file, root)))
+            return
         if args.command == "desktop-runtime":
             from .desktop import run
             run(root)
@@ -167,7 +174,7 @@ def main(argv=None):
             return
         mapping = {
             "add": ("/api/projects", lambda: {"path": str(Path(args.path).expanduser().resolve()), "name": args.name, "enabled": args.enable}),
-            "goal": ("/api/goal", lambda: {"project": args.project, "text": args.text, "overrides": json.loads(args.overrides) if args.overrides else {}}),
+            "goal": ("/api/goal", lambda: {"project": args.project, "text": args.text, "overrides": json.loads(args.overrides) if args.overrides else {}, "request_id": args.request_id}),
             "pause": ("/api/pause", lambda: {"project": args.project, "paused": True}),
             "resume": ("/api/pause", lambda: {"project": args.project, "paused": False}),
             "inspect": ("/api/request", lambda: {"project": args.project, "kind": "deep" if args.deep else "light"}),

@@ -42,6 +42,9 @@ SCHEMAS = {
                                 "guidance": TEXT, "triggers": STRINGS, "rationale": TEXT}),
 }
 
+# Optional for older adapters; production planners are instructed to return it explicitly.
+SCHEMAS["planning"]["properties"]["change_kind"] = {"type": "string", "enum": ["behavior", "performance", "refactor", "documentation", "configuration", "ui"]}
+
 
 def validate_output(value, schema):
     kind = schema["type"]
@@ -51,7 +54,7 @@ def validate_output(value, schema):
     if "enum" in schema and value not in schema["enum"]:
         raise RuntimeError("Agent returned an unknown decision")
     if kind == "object":
-        if set(value) != set(schema["required"]):
+        if not set(schema["required"]).issubset(value) or not set(value).issubset(schema["properties"]):
             raise RuntimeError("Agent output fields do not match the schema")
         for key, item in value.items():
             validate_output(item, schema["properties"][key])
@@ -205,7 +208,8 @@ class CodexAgent:
             agent_dir = Path(workspace) / ".rsi-agent" / call
             agent_dir.mkdir(parents=True)
             schema_path = agent_dir / "schema.json"
-            schema_path.write_text(json.dumps(SCHEMAS[role]))
+            # Codex structured output requires every declared property in required.
+            schema_path.write_text(json.dumps({**SCHEMAS[role], "required": list(SCHEMAS[role]["properties"])}))
             output_path = agent_dir / "result.json"
             prompt_path = agent_dir / "prompt.txt"
             prompt_path.write_text(prompt, encoding="utf-8")
