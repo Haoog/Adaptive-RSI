@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Support OpenCode 1.19.3 and 2.1.3 with version-aware model/authentication adapters, guided connection steps and actionable compatibility diagnostics.
+- Batch-triage inspection findings and run independent acceptance and evaluation in parallel; reuse baselines across tasks only with the same immutable Docker image and dependencies, never across host toolchain runs.
+- Optimize Issue comment window retrieval, Issue sync time slicing, code context indexing and Docker probe caching.
+- Rebalance CI matrices and add build caches; ordinary code PRs smoke-test the bundled desktop engine, while formal releases prefer verified artifacts from the same source tree.
+
+## 0.5.1
+
+<!-- adaptive-rsi-release:0.5.1;base:6b94286895361bf0273a8af49f0f56482dd98fa7 -->
+
 - Add actionable retry feedback, independent connection backoff, deferral wake conditions, dependency/urgency queues and task-level workflow timing and quality metrics.
 - Restore mobile navigation and provide a PWA installation page with the actual installation URL; add live details, lazy history, acceptance comparisons, attention notifications and idempotent submission.
 - Add same-task requirement revisions, typed evidence contracts, backup/restore and redacted diagnostics while retaining independent acceptance and delivery authorization gates.
@@ -12,10 +21,7 @@
 - Use code content to locate files for Chinese goals, compare similar findings by evidence to avoid duplicates while preserving distinct defects.
 - Show the current stage, elapsed time, latest progress and actionable recovery paths in the workspace; group usage by role and browser timezone, and distinguish configured, tool-tested and real-task-verified models.
 - Expand automatic PR descriptions with the problem, change, verification and residual impact; ordinary releases advance only the patch component unless a new product stage is explicitly confirmed.
-- Support OpenCode 1.19.3 and 2.1.3 with version-aware model/authentication adapters, guided connection steps and actionable compatibility diagnostics.
-- Batch-triage inspection findings and run independent acceptance and evaluation in parallel; reuse baselines across tasks only with the same immutable Docker image and dependencies, never across host toolchain runs.
-- Optimize Issue comment window retrieval, Issue sync time slicing, code context indexing and Docker probe caching.
-- Rebalance CI matrices and add build caches; ordinary code PRs smoke-test the bundled desktop engine, while formal releases prefer verified artifacts from the same source tree.
+
 
 ## 0.5.0
 
