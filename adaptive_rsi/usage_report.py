@@ -51,11 +51,10 @@ def report(store, params):
     scope = " WHERE " + " AND ".join(where)
     background = "(t.id IS NULL OR substr(t.source,1,7)='system_')"
     summary = store.one("SELECT " + TOTALS + ",count(DISTINCT t.id) AS tasks" + JOIN + scope, args)
-    raw_daily = store.query("SELECT c.created,c.tokens,c.input_tokens,c.output_tokens,"
-                            "c.cache_read_tokens,c.cache_write_tokens,c.usage_known,c.state,"
-                            "c.seconds,c.unit_price" + JOIN + scope, args)
     buckets = {}
-    for row in raw_daily:
+    for row in store.stream("SELECT c.created,c.tokens,c.input_tokens,c.output_tokens,"
+                            "c.cache_read_tokens,c.cache_write_tokens,c.usage_known,c.state,"
+                            "c.seconds,c.unit_price" + JOIN + scope, args):
         local = datetime.datetime.fromtimestamp(row["created"], zone).date()
         bucket = buckets.setdefault(local, {
             "calls": 0, "tokens": 0, "input_tokens": 0, "output_tokens": 0,

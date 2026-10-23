@@ -62,3 +62,7 @@ class UsageReportTest(unittest.TestCase):
     def test_invalid_timezone_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'timezone'):
             self.query(timezone='Not/AZone')
+
+    def test_streamed_usage_rows_are_available_without_fetchall(self):
+        rows = list(self.store.stream("SELECT id,tokens FROM calls ORDER BY id"))
+        self.assertEqual([row["id"] for row in rows], ["c1", "c2", "c3", "c4", "c5"])

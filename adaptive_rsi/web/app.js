@@ -101,7 +101,7 @@ function scheduleStamp(seconds,timezone){try{return new Date(seconds*1000).toLoc
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
 function elapsedCopy(seconds){const value=Math.max(0,Math.round(seconds||0));return value<60?value+' '+t('秒'):value<3600?Math.floor(value/60)+' '+t('分钟'):Math.floor(value/3600)+' '+t('小时')+' '+Math.floor(value%3600/60)+' '+t('分钟');}
-function runningStage(run){if(run.last_stage==='review')return t('正在评审改动');return t({planning:'正在判断是否值得做',executing:'正在修改代码',evaluating:'正在运行检查'}[run.state]||'正在处理任务');}
+function runningStage(run){if(run.last_stage==='review'||run.stage==='review')return t('正在评审改动');return t({planning:'正在判断是否值得做',executing:'正在修改代码',evaluating:'正在运行检查'}[run.state]||'正在处理任务');}
 async function safe(fn,form){
  if(form&&pendingForms.has(form))return;
  if(form)pendingForms.add(form);
