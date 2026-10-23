@@ -218,7 +218,8 @@ class OperabilityTest(unittest.TestCase):
             "provider": "opencode", "model": "opencode-go/coder", "effort": "high"}}}, project)
         original_which = __import__("shutil").which
         failure = OpenCodeCompatibilityError("opencode_incompatible_3.0.0", "3.0.0")
-        with patch("adaptive_rsi.readiness.shutil.which",
+        with patch("adaptive_rsi.readiness.platform.system", return_value="Darwin"), patch(
+                "adaptive_rsi.readiness.shutil.which",
                    side_effect=lambda name: "/fake/opencode" if name == "opencode" else original_which(name)), patch(
                 "adaptive_rsi.opencode.detect_opencode", side_effect=failure), patch(
                 "adaptive_rsi.cli_worker.worker_available", return_value=True), patch.object(

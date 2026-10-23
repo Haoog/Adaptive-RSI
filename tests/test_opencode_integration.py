@@ -88,6 +88,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             env = {"XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
                    "XDG_CACHE_HOME": str(root / "cache")}
             with patch.dict(os.environ, env, clear=False), patch(
+                    "adaptive_rsi.opencode.platform.system", return_value="Darwin"), patch(
                     "adaptive_rsi.opencode.shutil.which",
                     side_effect=lambda name: str(script) if name == "opencode" else None), patch(
                     "adaptive_rsi.opencode.run_cli", side_effect=run):
@@ -124,6 +125,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             with patch.dict(os.environ, {
                     "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
                     "XDG_CACHE_HOME": str(root / "cache"), "OPENCODE_CONFIG_CONTENT": content}, clear=False), patch(
+                    "adaptive_rsi.opencode.platform.system", return_value="Darwin"), patch(
                     "adaptive_rsi.opencode.shutil.which",
                     side_effect=lambda name: str(script) if name == "opencode" else None), patch(
                     "adaptive_rsi.opencode.run_cli", return_value={

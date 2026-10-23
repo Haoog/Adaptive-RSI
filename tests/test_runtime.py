@@ -623,6 +623,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
         result = run_process(["python3", "-c", "import time; time.sleep(5)"], timeout=0.1)
         self.assertEqual(result["error"], "Command timed out")
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_custom_and_local_models_route_without_forced_reasoning_or_secret_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")
@@ -652,6 +653,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             self.assertEqual(len(commands), 1)
             self.assertEqual([c["provider"] for c in store.query("SELECT provider FROM calls ORDER BY rowid")], ["gateway", "ollama"])
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_provider_fallback_and_failed_setup_are_accounted_for(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")
@@ -687,6 +689,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                     CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
             self.assertEqual(store.query("SELECT state FROM calls ORDER BY rowid")[-1]["state"], "failed")
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_codex_command_really_routes_model_and_effort_and_records_usage(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")
