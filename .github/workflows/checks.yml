@@ -1,14 +1,114 @@
 name: 项目检查
+
 on:
   push:
     branches: [main]
   pull_request:
+
 permissions:
   contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  verify:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+              base="$BASE_SHA"
+            else
+              git fetch --no-tags origin "$BASE_REF" --depth=1
+              base="$(git rev-parse FETCH_HEAD)"
+            fi
+          elif [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            base="$BEFORE_SHA"
+          else
+            base="$(git rev-parse HEAD^)"
+          fi
+          git diff --name-only "$base" HEAD > /tmp/rsi-changed-paths
+          docs_only=true
+          while IFS= read -r path; do
+            case "$path" in
+              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
+              *) docs_only=false; break ;;
+            esac
+          done < /tmp/rsi-changed-paths
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "Changed paths:"
+          cat /tmp/rsi-changed-paths
+          echo "docs_only=$docs_only"
+
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_docs.py
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: macos-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 控制、恢复与桌面
+            modules: tests.test_controls tests.test_updates_recovery tests.test_desktop_runtime tests.test_desktop_release
+          - name: 运行时、隔离与调度
+            modules: tests.test_runtime tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience
+          - name: 交付、发布与数据
+            modules: tests.test_delivery_loop tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening
+          - name: 服务器、协议与集成
+            modules: tests.test_auth_sessions tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_model_center tests.test_operability tests.test_reliability tests.test_usage_report tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker tests.test_discovery_hardening
+    name: Python · ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest -v ${{ matrix.modules }}
+
+  javascript:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --check adaptive_rsi/web/app.js
+      - run: node --check adaptive_rsi/web/i18n.js
+      - run: node --check adaptive_rsi/web/model-center.js
+      - run: node --check adaptive_rsi/web/auth.js
+      - run: node --test tests/web_requests.cjs
+
+  browser:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,27 +117,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: 启动恢复与隔离预检
-        run: >-
-          python3 -m unittest -v
-          tests.test_controls.UpdatesTest.test_supervised_upgrade_and_failed_start_restore_real_service_and_database
-          tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project
-      - run: python3 -m unittest discover -v
-      - run: node --check adaptive_rsi/web/app.js
-      - run: node --check adaptive_rsi/web/i18n.js
-      - run: node --check adaptive_rsi/web/model-center.js
-      - run: node --check adaptive_rsi/web/auth.js
-      - run: node --test tests/web_requests.cjs
       - run: npm ci --ignore-scripts
       - run: npx playwright install chromium
       - name: 浏览器真实表单与多项目检查
         run: npm run test:browser
+
+  package:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: python3 scripts/package.py
       - run: python3 -m pip install build
       - run: python3 -m build --wheel
+
   linux:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,3 +156,40 @@ jobs:
         run: python3 -m unittest -v tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker tests.test_auth_sessions
       - name: 检查服务器安装脚本
         run: bash -n scripts/install-server.sh
+
+  verify:
+    if: always()
+    needs: [changes, docs, python, javascript, browser, package, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 汇总必需检查
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          PYTHON_RESULT: ${{ needs.python.result }}
+          JAVASCRIPT_RESULT: ${{ needs.javascript.result }}
+          BROWSER_RESULT: ${{ needs.browser.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+        run: |
+          if [ "$CHANGES_RESULT" != success ]; then
+            echo "Change classification failed"
+            exit 1
+          fi
+          if [ "$DOCS_ONLY" = true ]; then
+            if [ "$DOCS_RESULT" != success ]; then
+              echo "Documentation checks failed: $DOCS_RESULT"
+              exit 1
+            fi
+            echo "Documentation checks passed"
+            exit 0
+          fi
+          for result in "$PYTHON_RESULT" "$JAVASCRIPT_RESULT" "$BROWSER_RESULT" "$PACKAGE_RESULT" "$LINUX_RESULT"; do
+            if [ "$result" != success ]; then
+              echo "One or more required jobs failed: $result"
+              exit 1
+            fi
+          done
+          echo "All required checks passed"

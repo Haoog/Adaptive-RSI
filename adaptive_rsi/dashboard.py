@@ -43,6 +43,18 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         runs = sorted({r["id"]: r for r in runs + latest}.values(), key=lambda r: r["started"], reverse=True)
     active = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs WHERE " + clause + " AND ended IS NULL", base_args)
     runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"], reverse=True)
+    if runs:
+        stage_rows = store.query(
+            "SELECT s.run,s.stage,s.created,json_extract(s.data,'$.decision') AS decision "
+            "FROM stages s JOIN (SELECT run,max(rowid) AS rowid FROM stages WHERE run IN ("
+            + ",".join("?" for _ in runs) + ") GROUP BY run) latest ON latest.rowid=s.rowid",
+            tuple(r["id"] for r in runs))
+        latest_stage = {}
+        for stage in stage_rows:
+            latest_stage[stage["run"]] = stage
+        by_run = {run["id"]: latest_stage.get(run["id"]) for run in runs}
+    else:
+        by_run = {}
     for row in runs:
         result = json.loads(row.pop("result"))
         for key in ["summary", "reason", "pr", "value", "plan_reason", "plan_decision", "failure", "stage", "delivery_status", "automation"]:
@@ -50,6 +62,10 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         row["scope"] = result.get("scope", result.get("files", []))
         row["review_decision"] = result.get("review", {}).get("decision")
         row["evaluation_decision"] = result.get("evaluation", {}).get("decision")
+        stage = by_run.get(row["id"])
+        row["last_stage"] = stage["stage"] if stage else None
+        row["last_stage_at"] = stage["created"] if stage else None
+        row["last_stage_decision"] = stage["decision"] if stage else None
     return {"tasks": tasks, "runs": runs,
             "events": store.query("SELECT * FROM events WHERE " + ("(project=? OR project IS NULL)" if project else "1=1") + " ORDER BY seq DESC LIMIT 100", base_args),
             "pagination": {"total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total},

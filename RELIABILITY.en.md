@@ -12,11 +12,11 @@ The dashboard polls lightweight work state every five seconds. Strategy candidat
 
 ## Execution and recovery
 
-The flow is readiness → verification, deduplication and value assessment → completion criteria → isolated implementation → execution and before/after checks → independent review → project-authorized delivery → post-merge checks.
+The flow is readiness → verification, deduplication and value assessment → completion criteria → isolated implementation → execution and before/after checks → independent review → project-authorized delivery → post-merge checks. The Workspace shows the current stage, elapsed time and latest progress; queued work explains that it starts by value after the active task.
 
 - Before paid calls, check configured commands, tools, isolation, dependency directories, credential settings. Freeze dependencies and run configured preparation commands before planning. Preflight cannot prove remote availability, account login, or support for every language environment; execution still records actual failures.
 - Persist planning, acceptance design, implementation summaries, checks, and review. Retries can reuse valid plans and acceptance designs. A patch that passed execution checks before a review-service outage can be restored, but all checks and review must run again.
-- Reuse depends on controller build, base commit, original task evidence, configuration, strategies, dependency snapshot, and delivery feedback. Any change invalidates reuse. Patches rejected by checks or review cannot be replayed directly into delivery.
+- Reuse depends on controller build, base commit, original task evidence, strategies, dependency snapshot, delivery feedback, and only the configuration used by that stage. Scan timing, another role's model, or unrelated UI settings do not invalidate planning and acceptance; dependency or implementation-route changes still invalidate their affected stage. Patches rejected by checks or review cannot be replayed directly into delivery.
 - Authentication, provider, environment, baseline and code-check failures have separate recovery suggestions. Legacy budget-waiting tasks can requeue without a usage gate.
 
 ## Discovery and value ordering

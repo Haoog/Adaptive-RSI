@@ -52,3 +52,17 @@ class UsageReportTest(unittest.TestCase):
         self.assertIsNone(result['summary']['estimated_usd'])
         self.assertEqual(result['summary']['tokens'],0)
         self.assertEqual(result['tasks'],[])
+
+    def test_daily_usage_and_custom_dates_use_requested_timezone(self):
+        result = self.query(project='a', timezone='America/Los_Angeles')
+        self.assertEqual(result['timezone'], 'America/Los_Angeles')
+        self.assertEqual(result['daily'][0]['date'], '1969-12-31')
+        self.assertTrue(result['daily'][0]['date'])
+
+    def test_invalid_timezone_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'timezone'):
+            self.query(timezone='Not/AZone')
+
+    def test_streamed_usage_rows_are_available_without_fetchall(self):
+        rows = list(self.store.stream("SELECT id,tokens FROM calls ORDER BY id"))
+        self.assertEqual([row["id"] for row in rows], ["c1", "c2", "c3", "c4", "c5"])

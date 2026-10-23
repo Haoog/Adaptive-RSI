@@ -44,7 +44,9 @@ def cached(runtime, run, stage, signature):
     return None
 
 
-def signature(run, task, base, strategies):
+def signature(run, task, base, strategies, configuration=None):
     from .build import BUILD_ID
-    return fingerprint({"build": BUILD_ID, "config": json.loads(run["config"]), "base": base, "strategies": strategies,
+    return fingerprint({"build": BUILD_ID,
+                        "config": json.loads(run["config"]) if configuration is None else configuration,
+                        "base": base, "strategies": strategies,
                         "task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]}})

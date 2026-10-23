@@ -610,3 +610,9 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   assert.equal(english['安排检查'],'Schedule check');
   assert.equal(english['Issue 已变化，等待同步后重评'],'Issue changed; waiting for sync and reassessment');
 });
+
+test('the live run stage marks an in-progress review before its stage row exists', () => {
+  const page = browser();
+  assert.equal(vm.runInContext('runningStage({state:"evaluating",stage:"review"})', page.context), '正在评审改动');
+  assert.equal(vm.runInContext('runningStage({state:"evaluating",last_stage:"review"})', page.context), '正在评审改动');
+});

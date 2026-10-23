@@ -1,11 +1,13 @@
 'use strict';
 window.RSIUsage=(()=>{
  let offset=0,sequence=0,detailSequence=0,report=null,timer=null;
+ const usageRoleNames={acceptance:'验收设计'};
  const number=value=>Number(value||0).toLocaleString(language);
  const token=value=>number(value.tokens)+(value.unknown_calls?' + '+t('部分未知'):'');
  const seconds=value=>Math.round(value||0)+' '+t('秒');
- function range(){const days=$('usage-period').value;if(days!=='custom')return {start:days==='all'?0:Date.now()/1000-Number(days)*86400,end:Date.now()/1000};const start=new Date($('usage-start').value).getTime()/1000,end=new Date($('usage-end').value).getTime()/1000+86400;if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)throw Error(t('请选择有效的日期范围。'));return {start,end};}
- function parameters(){return new URLSearchParams({...range(),project:$('usage-scope').value==='all'?'':projectId||'',q:$('usage-search').value,sort:$('usage-sort').value,offset,limit:25});}
+ function localDate(value,nextDay=false){const parts=String(value).split('-').map(Number);if(parts.length!==3||parts.some(n=>!Number.isInteger(n)))return NaN;return new Date(parts[0],parts[1]-1,parts[2]+(nextDay?1:0)).getTime();}
+ function range(){const days=$('usage-period').value;if(days!=='custom')return {start:days==='all'?0:Date.now()/1000-Number(days)*86400,end:Date.now()/1000};const start=localDate($('usage-start').value)/1000,end=localDate($('usage-end').value,true)/1000;if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)throw Error(t('请选择有效的日期范围。'));return {start,end};}
+ function parameters(){return new URLSearchParams({...range(),project:$('usage-scope').value==='all'?'':projectId||'',q:$('usage-search').value,sort:$('usage-sort').value,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC',offset,limit:25});}
  async function load(){
   if(view!=='usage')return;
   const ticket=++sequence;let unsupported=false;$('usage-refresh').disabled=true;
@@ -14,14 +16,15 @@ window.RSIUsage=(()=>{
    if(ticket!==sequence||view!=='usage')return;
    if(error.status!==404)throw error;
    unsupported=true;report=null;
-   for(const id of ['usage-totals','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
+   for(const id of ['usage-totals','usage-role-summary','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
    $('usage-tasks').replaceChildren(el('p',t('当前服务版本尚不支持用量页面，请先升级服务后再刷新。'),'muted'));
    $('usage-prev').disabled=$('usage-next').disabled=true;
-  }finally{if(ticket===sequence)$('usage-refresh').disabled=false;clearTimeout(timer);if(view==='usage'&&!unsupported)timer=setTimeout(()=>safe(load),15000);}
+  }finally{if(ticket===sequence)$('usage-refresh').disabled=false;clearTimeout(timer);if(view==='usage'&&!unsupported)timer=setTimeout(()=>safe(load),document.visibilityState==='hidden'?60000:30000);}
  }
  function metric(label,value,note){const node=el('div',undefined,'usage-metric');node.append(el('span',t(label)),el('strong',value));if(note)node.append(el('small',t(note)));return node;}
  function render(){if(!report)return;const totals=report.summary,summary=$('usage-totals');summary.replaceChildren(metric('已记录 tokens',token(totals)),metric('任务数',number(totals.tasks)),metric('模型运行耗时',seconds(totals.model_seconds)),metric('缓存读取 tokens',number(totals.cache_read_tokens)));
-  const chart=$('usage-chart');chart.replaceChildren();chart.hidden=!report.daily.length;const max=Math.max(1,...report.daily.map(day=>day.tokens));for(const day of report.daily){const column=el('div',undefined,'usage-column'),bar=el('progress');bar.max=max;bar.value=day.tokens;bar.setAttribute('aria-label',new Date(day.day*1000).toISOString().slice(0,10)+' '+token(day));column.title=bar.getAttribute('aria-label');column.append(bar,el('small',new Date(day.day*1000).toISOString().slice(5,10)));chart.append(column);}
+  const roleBox=$('usage-role-summary'),roleTotals={};for(const row of report.roles||[])roleTotals[row.role]=(roleTotals[row.role]||0)+Number(row.tokens||0);const roleOrder=['analysis','planning','acceptance','implementation','review','evolution'],ordered=[...roleOrder.filter(role=>roleTotals[role]>0),...Object.keys(roleTotals).filter(role=>!roleOrder.includes(role)&&roleTotals[role]>0)];roleBox.replaceChildren(...ordered.map(role=>{const item=el('span');item.append(el('small',t(usageRoleNames[role]||roleNames[role]||role)),el('strong',number(roleTotals[role])+' tokens'));return item;}));roleBox.hidden=!roleBox.childElementCount;
+  const chart=$('usage-chart');chart.replaceChildren();chart.hidden=!report.daily.length;chart.setAttribute('aria-label',t('每日用量')+' · '+report.timezone);const max=Math.max(1,...report.daily.map(day=>day.tokens));for(const day of report.daily){const column=el('div',undefined,'usage-column'),bar=el('progress');bar.max=max;bar.value=day.tokens;bar.setAttribute('aria-label',(day.date||new Date(day.day*1000).toISOString().slice(0,10))+' '+token(day));column.title=bar.getAttribute('aria-label');column.append(bar,el('small',(day.date||new Date(day.day*1000).toISOString().slice(0,10)).slice(5)));chart.append(column);}
   $('usage-cost').textContent=t('费用仅为有价格记录的调用估算，不代表账单。')+' '+(totals.estimated_usd==null?t('价格未知'):'USD '+totals.estimated_usd.toFixed(4))+(totals.unpriced_calls?' · '+number(totals.unpriced_calls)+' '+t('次调用未计入估算'):'');
   const list=$('usage-tasks');list.replaceChildren();for(const row of report.tasks){const article=el('article',undefined,'usage-task'),title=el('div');title.append(el('strong',row.background?t('后台检查与连接测试'):(row.title||row.task)),el('small',(state.projects.find(p=>p.id===row.project)?.name||t('通用'))+' · '+t(statusNames[row.state]||row.state||'后台检查')));const metrics=el('div',undefined,'usage-task-numbers');metrics.append(el('strong',token(row)),el('small',seconds(row.model_seconds)+' · '+row.attempts+' '+t('轮尝试')));article.append(title,metrics);if(row.task)article.append(action(t('查看用量明细'),()=>detail(row.task,row.title),'text-button'));else article.append(el('small',row.models||'','muted'));list.append(article);}if(!report.tasks.length)list.append(el('p',t('所选时间没有用量记录。'),'muted'));
   $('usage-page').textContent=number(report.total)+' '+t('条记录')+' · '+number(report.total?offset+1:0)+'–'+number(Math.min(offset+25,report.total));$('usage-prev').disabled=offset===0;$('usage-next').disabled=offset+25>=report.total;

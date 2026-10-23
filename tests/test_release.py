@@ -13,6 +13,7 @@ from unittest.mock import patch
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.gitops import git
 from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, health_check, key, pending, retry, workflow_choices
+from adaptive_rsi.delivery import pr_body
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
 from adaptive_rsi.updates import automatic_allowed
@@ -142,6 +143,21 @@ class ReleaseAutomationTest(unittest.TestCase):
         other = self.runtime.add_project(fixture(self.root / "other"))
         with self.assertRaisesRegex(ValueError, "this project"):
             retry(self.runtime, other, self.run["id"], "release")
+
+    def test_pr_body_describes_behavior_evidence_and_omits_task_body(self):
+        task = {"title": "修复登录重试", "body": "PRIVATE-USER-GOAL"}
+        run = {"id": "run-id", "base": "a" * 40}
+        outcome = {"summary": "限制登录重试次数", "files": ["login.py"],
+                   "evaluation": {"decision": "pass", "improvement": {"decision": "pass"}},
+                   "review": {"decision": "pass"},
+                   "value": {"benefit": "避免重复跳转", "inaction": "用户会陷入循环"}}
+        body = pr_body(task, run, outcome)
+        self.assertIn("## 解决的问题", body)
+        self.assertIn("限制登录重试次数", body)
+        self.assertIn("独立代码评审：通过", body)
+        self.assertIn("避免重复跳转", body)
+        self.assertNotIn("PRIVATE-USER-GOAL", body)
+        self.assertNotIn("@team", pr_body({**task, "title": "@team <b>login</b>"}, run, outcome))
 
     def test_confirmed_failure_retries_same_workflow_run_and_requires_current_permission(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
@@ -468,7 +484,7 @@ if __name__ == "__main__":
 
 
 class ReleaseBatchCadenceTest(unittest.TestCase):
-    def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False):
+    def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False, new_stage='false'):
         from scripts import release as module
         head='b'*40
         def command(*args, **kwargs):
@@ -481,7 +497,8 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
             return {'default_branch':'main'} if not endpoint else {'sha':head}
         def read(sha,name):
             return '__version__ = "1.2.3"\n' if name.endswith('__init__.py') else notes
-        with patch.dict(os.environ,{'PREPARE_RELEASE':requested,'RELEASE_LEVEL':level,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'output') as output:
+        with patch.dict(os.environ,{'PREPARE_RELEASE':requested,'RELEASE_LEVEL':level,
+                                    'NEW_PRODUCT_STAGE':new_stage,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'output') as output:
             module.prepare()
             return output.call_args.kwargs,calls.call_args_list
 
@@ -497,7 +514,9 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         self.assertTrue(any('chore/release-v1.2.4-' in str(call) for call in calls))
 
     def test_minor_increment_requires_explicit_selection(self):
-        result,calls=self.prepare(requested='true',level='minor')
+        with self.assertRaisesRegex(ValueError,'new product stage'):
+            self.prepare(requested='true',level='minor')
+        result,calls=self.prepare(requested='true',level='minor',new_stage='true')
         self.assertEqual(result['mode'],'verify')
         self.assertTrue(any('chore/release-v1.3.0-' in str(call) for call in calls))
 

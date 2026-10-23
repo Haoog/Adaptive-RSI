@@ -70,6 +70,64 @@ footer{display:flex;justify-content:space-between;padding:24px 0;font-size:12px;
 @media(max-width:700px){.readiness-row{align-items:flex-start}.readiness-row .text-button{flex:none}.task-pagination{justify-content:space-between;gap:8px}.stage-progress{gap:5px}}
 
 .stage-progress .stage-failed{color:#913e2e;border-color:#c79e96;background:#fff1ed}
+.current-work-detail {
+  min-height:20px;
+  margin:5px 0 0;
+  color:var(--muted);
+  font-size:13px;
+}
+.readiness-evidence {
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  margin:10px 0;
+  font-size:12px;
+}
+.readiness-evidence-label {
+  width:100%;
+  color:var(--muted);
+}
+.readiness-evidence-item {
+  padding:4px 8px;
+  border:1px solid var(--line);
+  border-radius:999px;
+}
+.readiness-evidence-item.good {
+  color:var(--green);
+  border-color:#aebfa4;
+  background:#edf3e9;
+}
+.readiness-evidence-item.tested {
+  color:#345b4b;
+  border-color:#a9c9bb;
+  background:#edf5f1;
+}
+.readiness-evidence-item.bad {
+  color:#913e2e;
+  border-color:#c79e96;
+  background:#fff1ed;
+}
+.usage-role-summary {
+  display:flex;
+  flex-wrap:wrap;
+  gap:9px;
+  margin:12px 0 2px;
+}
+.usage-role-summary span {
+  display:grid;
+  gap:3px;
+  min-width:130px;
+  padding:10px 13px;
+  border:1px solid var(--line);
+  border-radius:8px;
+  background:#f8faf7;
+}
+.usage-role-summary small {
+  color:var(--muted);
+}
+.usage-role-summary strong {
+  font-variant-numeric:tabular-nums;
+}
 
 /* 工作台只保留状态、目标和任务；次要信息按需展开。 */
 h1 {

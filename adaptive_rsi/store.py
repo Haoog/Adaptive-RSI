@@ -118,6 +118,12 @@ class Store:
         with self.connect() as db:
             return [dict(row) for row in db.execute(sql, args).fetchall()]
 
+    def stream(self, sql, args=()):
+        """Yield rows without materializing an unbounded result set."""
+        with self.connect() as db:
+            for row in db.execute(sql, args):
+                yield dict(row)
+
     def one(self, sql, args=()):
         rows = self.query(sql, args)
         return rows[0] if rows else None

@@ -12,6 +12,36 @@ class StaleCandidate(RuntimeError):
     pass
 
 
+def _public_text(value, limit=4000):
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("@", "＠")
+    return text[:limit]
+
+
+def pr_body(task, run, outcome):
+    """Explain the delivered behavior and evidence without publishing private task text."""
+    value = outcome.get("value") or {}
+    review = outcome.get("review") or {}
+    evaluation = outcome.get("evaluation") or {}
+    files = outcome.get("files") or []
+    lines = ["## 解决的问题", "", _public_text(task["title"], 500), ""]
+    if value.get("benefit"):
+        lines += ["## 预期效果", "", _public_text(value["benefit"]), ""]
+    lines += ["## 改动", "", _public_text(outcome.get("summary")) or "完成经过验证的改进。", ""]
+    if files:
+        lines += ["修改文件：", "", *["- `" + path + "`" for path in files], ""]
+    lines += ["## 验证", "",
+              "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
+              "- 独立验收：" + ("通过" if (evaluation.get("improvement") or {}).get("decision") == "pass" else "见运行记录"),
+              "- 独立代码评审：" + ("通过" if review.get("decision") == "pass" else "未通过"),
+              "", "## 运行信息", "",
+              "- 运行：`" + run["id"] + "`",
+              "- 基线：`" + run["base"] + "`"]
+    if value.get("inaction"):
+        lines += ["", "如果不做这次修改：" + _public_text(value["inaction"])]
+    return "\n".join(lines) + "\n"
+
+
 def github_git(root, *args):
     return git(root, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args)
 
@@ -115,8 +145,7 @@ def publish(runtime, project, task, run, workspace, config):
         authorize_write()
         github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
         body = Path(workspace).parent / "pr-body.md"
-        body.write_text("完成任务：" + task["title"] + "\n\n价值评估、原始回归、候选完整测试、独立验收和代码评审已通过。\n\n"
-                        "运行：`" + run["id"] + "`\n基线：`" + run["base"] + "`\n", encoding="utf-8")
+        body.write_text(pr_body(task, run, outcome), encoding="utf-8")
         authorize_write()
         url = checked(["gh", "pr", "create", "--repo", repo, "--head", branch, "--base", base_branch,
                        "--title", "完成任务：" + task["title"], "--body-file", str(body)])

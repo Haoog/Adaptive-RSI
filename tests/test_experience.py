@@ -32,6 +32,16 @@ class RelatedWorkTest(unittest.TestCase):
         self.assertIsNone(related_task(rows, second))
         self.assertEqual(related_task(rows, {**first, "title": "  Handle HTTP 401   response "}), "first")
 
+    def test_near_identical_titles_are_deduplicated_without_merging_error_variants(self):
+        backlog = [{"id": "retry", "title": "Fix failed login retry loop",
+                    "evidence": encode([{"path": "login.py", "quote": "redirect()"}])}]
+        self.assertEqual(related_task(backlog, {
+            "title": "Failed login retry loop", "path": "login.py", "quote": "retry()"}), "retry")
+        self.assertIsNone(related_task(backlog, {
+            "title": "Fix failed login retry status 429", "path": "login.py", "quote": "retry()"}))
+        self.assertIsNone(related_task(backlog, {
+            "title": "Fix failed login retry loop", "path": "login.py", "quote": "retry()"}))
+
     def test_current_related_results_are_project_scoped_and_invalidate_context(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.store(directory)
@@ -133,6 +143,16 @@ class RelatedWorkTest(unittest.TestCase):
                     store.execute("UPDATE runs SET result=? WHERE id='run'", (encode(outcome),))
                     self.assertEqual(records(store, "first", group="active")["tasks"][0]["display_state"], "deploying")
                     self.assertEqual(records(store, "first", group="history")["tasks"], [])
+
+    def test_dashboard_exposes_latest_stage_and_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.store(directory)
+            task = store.add_task("first", "goal", "stage", "Observe stage")
+            store.execute("UPDATE tasks SET state='evaluating' WHERE id=?", (task,))
+            store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES ('stage-run',?,'first','evaluating','{}',10)", (task,))
+            store.execute("INSERT INTO stages(run,stage,signature,data,created) VALUES ('stage-run','evaluation','s','{}',11)")
+            run = records(store, "first")["runs"][0]
+            self.assertEqual((run["last_stage"], run["last_stage_at"]), ("evaluation", 11))
 
 
 class ConnectionAndReleaseRoutesTest(unittest.TestCase):

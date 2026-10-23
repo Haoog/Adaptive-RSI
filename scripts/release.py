@@ -131,6 +131,8 @@ def prepare():
     level = os.environ.get("RELEASE_LEVEL", "patch")
     if level not in ["major", "minor", "patch"]:
         raise ValueError("Release level must be major, minor or patch")
+    if level != "patch" and os.environ.get("NEW_PRODUCT_STAGE", "false").lower() != "true":
+        raise ValueError("Minor and major releases require an explicit new product stage")
     # A single stable branch and all-state PR lookup prevent duplicate version PRs.
     major, minor, patch = map(int, current.split("."))
     target = f"{major + 1}.0.0" if level == "major" else f"{major}.{minor + 1}.0" if level == "minor" else f"{major}.{minor}.{patch + 1}"
