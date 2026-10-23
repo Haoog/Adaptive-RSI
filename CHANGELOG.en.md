@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.0
+
+<!-- adaptive-rsi-release:0.5.0;base:37537b758a733b95ffe4a3db31deb512ebf185da -->
+
 - Accumulate ordinary merges without version bumps; prepare version PRs only for explicitly started stable release batches.
 - Add a Tauri desktop app with a bundled local engine, tray lifecycle, explicit project start, native server connection and folder picker.
 - Add task-based usage reporting including failures, retries and unknown usage, with project/date filters and call details.
@@ -12,7 +16,6 @@
 - Future formal releases will include a macOS ARM64 desktop DMG and SHA-256; the temporary signature is not Apple-notarized.
 - Complete the usage page's English translations for refresh, search and custom date labels.
 - Close stale usage details on project or filter changes so delayed responses cannot appear under another project.
-
 
 ## 0.4.1
 
