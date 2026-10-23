@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.1
+
+<!-- adaptive-rsi-release:0.5.1;base:6b94286895361bf0273a8af49f0f56482dd98fa7 -->
+
 - Add actionable retry feedback, independent connection backoff, deferral wake conditions, dependency/urgency queues and task-level workflow timing and quality metrics.
 - Restore mobile navigation and provide a PWA installation page with the actual installation URL; add live details, lazy history, acceptance comparisons, attention notifications and idempotent submission.
 - Add same-task requirement revisions, typed evidence contracts, backup/restore and redacted diagnostics while retaining independent acceptance and delivery authorization gates.
@@ -12,6 +16,7 @@
 - Use code content to locate files for Chinese goals, compare similar findings by evidence to avoid duplicates while preserving distinct defects.
 - Show the current stage, elapsed time, latest progress and actionable recovery paths in the workspace; group usage by role and browser timezone, and distinguish configured, tool-tested and real-task-verified models.
 - Expand automatic PR descriptions with the problem, change, verification and residual impact; ordinary releases advance only the patch component unless a new product stage is explicitly confirmed.
+
 ## 0.5.0
 
 <!-- adaptive-rsi-release:0.5.0;base:37537b758a733b95ffe4a3db31deb512ebf185da -->
