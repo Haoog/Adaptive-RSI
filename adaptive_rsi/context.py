@@ -15,12 +15,18 @@ def terms(text):
     """
     value = text.lower()
     result = set(re.findall(r"[a-z_][a-z0-9_]{1,}", value))
+    cjk_terms = set()
     for run in re.findall(r"[\u3400-\u9fff]+", value):
         if len(run) <= 8:
-            result.add(run)
+            cjk_terms.add(run)
         for size in (2, 3):
-            result.update(run[index:index + size] for index in range(max(0, len(run) - size + 1)))
-    return {term for term in result if len(term) >= 2}
+            cjk_terms.update(run[index:index + size] for index in range(max(0, len(run) - size + 1)))
+            if len(cjk_terms) >= 256:
+                break
+        if len(cjk_terms) >= 256:
+            break
+    result.update(sorted(cjk_terms)[:256])
+    return {term for term in sorted(result)[:512] if len(term) >= 2}
 
 
 def code_map(workspace, text, limit=24):
@@ -34,12 +40,14 @@ def code_map(workspace, text, limit=24):
         ".lua", ".m", ".md", ".php", ".pl", ".py", ".rb", ".rs", ".scss", ".sh",
         ".sql", ".swift", ".toml", ".ts", ".tsx", ".vue", ".xml", ".yaml", ".yml",
     }
+    path_words = sorted(words, key=lambda word: (-len(word), word))[:256]
+    content_words = path_words[:128]
     for path in paths:
         if path.startswith((".git/", ".rsi-")):
             continue
         lower_path = path.lower()
-        score = sum(6 for word in words if word in lower_path)
-        if any(word == Path(path).stem.lower() for word in words):
+        score = sum(6 for word in path_words if word in lower_path)
+        if any(word == Path(path).stem.lower() for word in path_words):
             score += 12
         content = ""
         file = Path(workspace) / path
@@ -49,7 +57,7 @@ def code_map(workspace, text, limit=24):
                 if size <= 160000 and size <= content_budget:
                     content = file.read_text(errors="replace").lower()
                     content_budget -= size
-                    score += sum(1 for word in words if word in content)
+                    score += sum(1 for word in content_words if word in content)
             except OSError:
                 content = ""
         ranked.append((-score, path))
@@ -67,7 +75,7 @@ def code_map(workspace, text, limit=24):
                 lowered = file.read_text(errors="replace").lower().splitlines()
                 present = {item["line"] for item in anchors}
                 for n, line in enumerate(lowered, 1):
-                    if n not in present and any(word in line for word in words):
+                    if n not in present and any(word in line for word in content_words):
                         anchors.append({"line": n, "declaration": line[:160]})
                         if len(anchors) >= 12:
                             break

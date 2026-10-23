@@ -254,22 +254,31 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     review_key = fingerprint({"inputs": signature(run, task, base, strategies, review_config),
                               "plan": plan, "evaluation": _review_evidence(evaluation),
                               "summary": result["summary"], "patch_hash": fingerprint(patch)})
-    review = runtime.invoke("review", REVIEW_PROMPT +
-                         "Also review the independent acceptance specification for meaningful behavioral coverage. "
-                         "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
-                         encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
-                                 "independent_acceptance": acceptance["spec"],
-                                 "summary": result["summary"]}), workspace, run)
+    saved_review = None if experiment else cached(runtime, run, "review", review_key)
+    if saved_review and saved_review.get("decision") != "pass":
+        saved_review = None
+    review = saved_review
+    if review is None:
+        review = runtime.invoke("review", REVIEW_PROMPT +
+                             "Also review the independent acceptance specification for meaningful behavioral coverage. "
+                             "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
+                             encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
+                                     "independent_acceptance": acceptance["spec"],
+                                     "summary": result["summary"]}), workspace, run)
     review = enforce_review(review, config)
     risk_review = None
     if plan["risk"] == "high" and review["decision"] == "pass":
-        risk_review = enforce_review(runtime.invoke("review", REVIEW_PROMPT +
-            "This is an additional high-risk review in a fresh session. Focus on permission boundaries, "
-            "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
-            "Missing negative-path verification must be reported as insufficient evidence. "
-            "Do not rely on another reviewer's assessment.\n" +
-            encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
-                    "independent_acceptance": acceptance["spec"]}), workspace, run), config)
+        risk_review = None if experiment else cached(runtime, run, "risk_review", review_key)
+        if risk_review and risk_review.get("decision") != "pass":
+            risk_review = None
+        if risk_review is None:
+            risk_review = enforce_review(runtime.invoke("review", REVIEW_PROMPT +
+                "This is an additional high-risk review in a fresh session. Focus on permission boundaries, "
+                "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
+                "Missing negative-path verification must be reported as insufficient evidence. "
+                "Do not rely on another reviewer's assessment.\n" +
+                encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
+                        "independent_acceptance": acceptance["spec"]}), workspace, run), config)
         (directory / "risk-review.json").write_text(encode(risk_review), encoding="utf-8")
         if not experiment:
             save(runtime, run, "risk_review", risk_review, review_key)

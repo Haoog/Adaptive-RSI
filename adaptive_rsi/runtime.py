@@ -657,7 +657,8 @@ class Runtime:
                     proof_key = "task-proof:" + project["id"] + ":" + fingerprint({"call": call, "provider": self.model_center.signature(provider)})
                     self.store.put_setting(proof_key, {"run": run["id"], "base": base, "at": time.time(), "role": call["role"]})
                     task_proofs[call["role"]] = {"provider": call["provider"], "model": call["model"],
-                                                 "effort": call["effort"], "at": time.time(), "base": base}
+                                                 "effort": call["effort"], "signature": self.model_center.signature(provider),
+                                                 "at": time.time(), "base": base}
                 self.store.put_setting("task-proof-current:" + project["id"], task_proofs)
             if config["delivery"]["mode"] == "pr" and self.config(project["id"])["delivery"]["mode"] == "pr":
                 self.deliver(run["id"], automatic=True)
@@ -782,7 +783,10 @@ class Runtime:
         """Ignore documentation-only commits when deciding whether to rescan code."""
         if not changed_paths:
             return False
-        if all(Path(path).suffix.lower() in {".md", ".png", ".jpg", ".jpeg", ".svg"} for path in changed_paths):
+        documentation_images = {".png", ".jpg", ".jpeg", ".svg"}
+        if all(path.lower().endswith(".md") or
+               (path.startswith("docs/") and Path(path).suffix.lower() in documentation_images)
+               for path in changed_paths):
             return False
         if not selected:
             return True

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge
+from adaptive_rsi.config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.context import code_map, related, terms
 from adaptive_rsi.dashboard import records
@@ -112,6 +112,23 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("acceptance"), 1)
         implementations = [route for role, route in self.runtime.agent.roles if role == "implementation"]
         self.assertEqual([route["effort"] for route in implementations], ["max", "high"])
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_completed_review_is_reused_after_a_post_review_failure(self):
+        task, run = self.claim()
+        triggered = [False]
+        def cancel_after_review(current):
+            if not triggered[0] and self.store.one("SELECT 1 FROM stages WHERE run=? AND stage='review'", (current["id"],)):
+                triggered[0] = True
+                return True
+            return False
+        with patch.object(self.runtime, "is_cancelled", side_effect=cancel_after_review):
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "interrupted")
+        self.runtime.retry(task)
+        self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("review"), 1)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_changed_baseline_invalidates_recovery_cache(self):
@@ -320,6 +337,7 @@ class ReliabilityTest(unittest.TestCase):
         mapping = code_map(self.repo, "修复登录失败", limit=3)
         self.assertEqual(mapping["files"][0]["path"], "login.py")
         self.assertTrue(any(anchor["line"] == 2 for anchor in mapping["files"][0]["anchors"]))
+        self.assertLessEqual(len(terms("登录失败" * 6000)), 512)
 
     def test_stage_cache_keys_only_change_for_relevant_settings(self):
         config = self.runtime.config(self.project)
@@ -343,6 +361,7 @@ class ReliabilityTest(unittest.TestCase):
 
     def test_documentation_commit_does_not_repeat_module_inspection(self):
         self.assertFalse(Runtime._module_changed(None, {"README.md", "docs/diagram.png"}))
+        self.assertTrue(Runtime._module_changed(None, {"desktop/icon.svg"}))
         self.runtime.configure({"sources": {"inspection": True}, "evolution": {"enabled": False}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.request(self.project, "light")
@@ -369,13 +388,23 @@ class ReliabilityTest(unittest.TestCase):
     def test_readiness_separates_configuration_tool_tests_and_real_tasks(self):
         config = self.runtime.config(self.project)
         proof = config["models"]["planning"]
+        provider = next(item for item in BUILTIN_PROVIDERS if item["id"] == proof["provider"])
         self.store.put_setting("task-proof-current:" + self.project, {"planning": {
-            **proof, "at": time.time(), "base": git(self.repo, "rev-parse", "HEAD")}})
+            **proof, "signature": self.runtime.model_center.signature(provider),
+            "at": time.time(), "base": git(self.repo, "rev-parse", "HEAD")}})
         result = readiness(self.runtime, self.runtime.project(self.project), config)
         evidence = {row["role"]: row for row in result["model_evidence"]}
         self.assertTrue(evidence["planning"]["configured"])
         self.assertTrue(evidence["planning"]["task_verified"])
         self.assertFalse(evidence["implementation"]["task_verified"])
+
+        changed_provider = {**provider, "base_url": "https://changed.example.invalid"}
+        self.store.put_setting("task-proof-current:" + self.project, {"planning": {
+            **proof, "signature": self.runtime.model_center.signature(changed_provider),
+            "at": time.time(), "base": git(self.repo, "rev-parse", "HEAD")}})
+        evidence = {row["role"]: row for row in readiness(
+            self.runtime, self.runtime.project(self.project), config)["model_evidence"]}
+        self.assertFalse(evidence["planning"]["task_verified"])
 
 
 class EvidenceContractTest(unittest.TestCase):

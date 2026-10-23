@@ -102,7 +102,7 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
             probe_detail = "The selected effort has a passing tool test."
         return (True, detail + " is configured. " + probe_detail + catalog_warning,
                 "models" if probe.get("state") != "pass" or catalog_warning else None, reason,
-                {**route_fields, "probe": probe})
+                {**route_fields, "probe": probe, "signature": runtime.model_center.signature(provider)})
 
     task_proofs = runtime.store.setting("task-proof-current:" + project["id"], {})
     model_evidence = []
@@ -118,7 +118,8 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         proof = task_proofs.get(role) if isinstance(task_proofs, dict) else None
         task_verified = bool(proof and proof.get("provider") == selected[4]["provider"] and
                              proof.get("model") == selected[4]["model"] and
-                             proof.get("effort") == selected[4]["effort"])
+                             proof.get("effort") == selected[4]["effort"] and
+                             proof.get("signature") == selected[4]["signature"])
         items.append(item("model", ready, detail, selected[2],
                           reason=selected[3], role=role, provider=selected[4]["provider"], model=selected[4]["model"],
                           effort=selected[4]["effort"], probe=selected[4]["probe"], fallback=route.get("fallback")))
