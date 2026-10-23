@@ -306,6 +306,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             return
                         checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
                         store.execute("UPDATE runs SET state='superseded' WHERE id=?", (run["id"],))
+                status = outcome.get("delivery_status")
+                store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
                 store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
             if outcome.get("merged_sha"):
                 active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None

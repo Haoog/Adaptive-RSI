@@ -1,0 +1,72 @@
+:root {
+  color-scheme: light;
+  --green: #225d46;
+  --paper: #f7f9f6;
+  --ink: #21382e;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse at top right, #dfebdf, transparent 65%),
+    var(--paper);
+  color: var(--ink);
+  font:
+    17px/1.65 Avenir,
+    "PingFang SC",
+    sans-serif;
+}
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 40px 24px 80px;
+}
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+select,
+button,
+a.button {
+  font: inherit;
+}
+h1 {
+  font-size: clamp(32px, 7vw, 48px);
+  letter-spacing: -0.04em;
+  line-height: 1.2;
+  margin-top: 48px;
+}
+h2 {
+  font-size: 21px;
+}
+section {
+  margin-top: 32px;
+  border-top: 1px solid #d5e0d6;
+  padding-top: 12px;
+}
+.button {
+  display: inline-block;
+  border: 1px solid var(--green);
+  padding: 10px 18px;
+  border-radius: 9px;
+  color: var(--green);
+  text-decoration: none;
+  background: white;
+}
+.primary {
+  background: var(--green);
+  color: white;
+}
+a {
+  color: var(--green);
+}
+#install-status,
+#origin-note {
+  overflow-wrap: anywhere;
+}
+[hidden] {
+  display: none !important;
+}

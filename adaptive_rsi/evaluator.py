@@ -172,6 +172,8 @@ class Evaluator:
                 data.update(decision="insufficient_evidence", reason="Checks passed but task-specific improvement is unproven")
             data["acceptance_hash"] = acceptance["hash"]
             data["criteria"] = acceptance["criteria"]
+            data["coverage"] = [{"name": check["name"], "criteria": check["criteria"]} for check in acceptance["spec"]["checks"]]
+            data["contract"] = acceptance.get("contract")
         if unavailable:
             data["reason"] = "Required check executable is unavailable; candidate remains unverified"
         Path(directory).mkdir(parents=True, exist_ok=True)

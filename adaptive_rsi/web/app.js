@@ -3,7 +3,7 @@ let state, projectId = localStorage.getItem('rsi-project') || '', view = 'overvi
 const $ = id => document.getElementById(id);
 const evaluationNames={baseline:'修改前的版本',candidate:'原有功能检查',candidate_full:'修改后的完整测试',acceptance_baseline:'修改前的独立检查',acceptance_candidate:'修改后的独立检查'};
 const deliveryNames={waiting:'等待可合并状态',waiting_review:'等待必需评审',waiting_ci:'等待 CI',ci_failed:'线上检查未通过',stale:'基线或待验证改动已变化',issue_changed:'Issue 已变化，等待同步后重评',merged:'已合并',merge_submitted:'已提交合并',closed:'已关闭',unverified_merge:'外部合并包含未经验证的改动',ready:'可合并'};
-const statusNames = {releasing:'正在发布',deploying:'正在部署',release_failed:'发布未完成',deploy_failed:'部署未完成',ci_failed:'线上检查未通过',waiting_budget:'等待模型服务恢复用量',assessed:'价值已评估',unverified_merge:'未经验证的外部合并',reverted:'已恢复旧版本',merged:'已合并',pr_closed:'PR 已关闭',verified:'合并后验证通过',regressed:'合并后出现回归',deferred:'已暂缓',rejected:'不采纳',queued:'排队中',planning:'规划中',executing:'实现中',evaluating:'评估中',awaiting_approval:'待交付',pr_open:'PR 已创建',completed:'已完成',obsolete:'已过时',blocked:'已阻塞',failed:'未通过',interrupted:'已中断',cancelled:'已取消',insufficient_evidence:'证据不足',stable:'稳定使用',superseded:'历史稳定版',ready:'等待启用',pass:'通过',fail:'未通过',rolled_back:'已恢复旧版本'};
+const statusNames = {expired:'候选已过期',releasing:'正在发布',deploying:'正在部署',release_failed:'发布未完成',deploy_failed:'部署未完成',ci_failed:'线上检查未通过',waiting_budget:'等待模型服务恢复用量',assessed:'价值已评估',unverified_merge:'未经验证的外部合并',reverted:'已恢复旧版本',merged:'已合并',pr_closed:'PR 已关闭',verified:'合并后验证通过',regressed:'合并后出现回归',deferred:'已暂缓',rejected:'不采纳',queued:'排队中',planning:'规划中',executing:'实现中',evaluating:'评估中',awaiting_approval:'待交付',pr_open:'PR 已创建',completed:'已完成',obsolete:'已过时',blocked:'已阻塞',failed:'未通过',interrupted:'已中断',cancelled:'已取消',insufficient_evidence:'证据不足',stable:'稳定使用',superseded:'历史稳定版',ready:'等待启用',pass:'通过',fail:'未通过',rolled_back:'已恢复旧版本'};
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量检查',system_deep:'深度检查',system_issues:'GitHub 问题同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
@@ -149,7 +149,7 @@ async function refresh(){
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,p.name]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',p.name);o.value=p.id;return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localStorage.setItem('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
-   render();
+   render();window.RSIExperience?.refreshed();
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
@@ -259,13 +259,14 @@ function renderTasks(){
  for(const task of tasks){
   const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');
   title.append(action(task.title,()=>showTask(task),'task-title'),el('span',t(sourceNames[task.source]||task.source)+' · '+stamp(task.updated),'task-meta'));
+  if(task.wait_reason)title.append(el('p',window.RSIExperience?.queueCopy(task)||'','task-meta'));
   const latest=scoped(state.runs).find(run=>run.task===task.id),reason=latest?.reason||latest?.plan_reason;
   if(reason)title.append(el('p',latest?.failure?failureCopy(latest.failure):reason,'task-reason'));
   if(latest?.summary&&latest.summary!==reason)title.append(el('p',latest.summary,'task-result-summary'));
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
-  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
  }
@@ -286,13 +287,15 @@ function taskOutcome(data){
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
  outcome.append(stageProgress(data));return outcome;
 }
-async function showTask(task){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
+async function showTask(task,restoreView){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
+ window.RSIExperience?.taskOpened(task);
  const evidence=el('details',undefined,'detail-section');evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
  const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(ticket!==detailSequence||projectId!==project)return;
- for(const [index,run] of history.entries()){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
-  if(index===0){const outcome=taskOutcome(data);body.insertBefore(outcome,evidence);await renderReleaseOutcome(outcome,run,project);if(ticket!==detailSequence||projectId!==project)return;}
-  const section=el('details',undefined,'detail-section');section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id),el('p',data.result.failure?failureCopy(data.result.failure):data.result.reason,'muted'));
+ async function loadRun(run,index,section){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
+  section.replaceChildren();
+  if(index===0){const outcome=taskOutcome(data);outcome.id='live-task-outcome';body.insertBefore(outcome,evidence);window.RSIExperience?.enhanceOutcome(outcome,data);await renderReleaseOutcome(outcome,run,project);if(ticket!==detailSequence||projectId!==project)return;}
+  section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id),el('p',data.result.failure?failureCopy(data.result.failure):data.result.reason,'muted'));
   if(index>0)section.append(stageProgress(data));
   const raw=el('details');raw.append(el('summary',t('原始运行记录')),el('pre',JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));section.append(raw);
   if(data.result.value){const report=el('details',undefined,'review-report');report.append(el('summary',t('为什么值得做')),valueReport(data.result.value,data.result.plan_reason,data.result.scope));section.append(report);}
@@ -306,14 +309,18 @@ async function showTask(task){const ticket=++detailSequence,project=projectId;de
   if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
-  if(data.result.files){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}
+  if(data.result.files){delivery.append(action(t('阅读代码差异'),()=>window.RSIExperience?.showDiff(run.id),'text-button'));const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}
   if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!window.confirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？')))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
-  body.append(section);}
+  restoreView?.(body);
+  }
+ for(const [index,run] of history.entries()){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));body.append(section);let loaded=false;section.addEventListener('toggle',()=>{if(section.open&&!loaded){loaded=true;safe(()=>loadRun(run,index,section));}});if(index===0){loaded=true;await loadRun(run,index,section);}}
+
  if(ticket!==detailSequence||projectId!==project)return;
  if(['queued','planning','executing','evaluating'].includes(task.state))body.append(action(t('取消任务'),async()=>{if(ticket!==detailSequence||projectId!==project)return;await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
+ restoreView?.(body);
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null))for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=(state.cases||[]).filter(c=>c.project===projectId).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}else summary.append(el('p',t('验证统计加载中。'),'muted'));
  $('experiment-readiness').textContent=t('改进方案需通过独立样本的前后对照验证；调用与 tokens 只记录用量。');
@@ -516,7 +523,7 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
-$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target),project=projectId,text=$('goal-text').value;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));await api('goal',{project,text});if(unchanged()&&$('goal-text').value===text){$('goal-text').value='';goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
+$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target),project=projectId,text=$('goal-text').value;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const requestKey='rsi-submission:'+project,previous=JSON.parse(sessionStorage.getItem(requestKey)||'null');const submission=previous?.text===text?previous:{text,id:crypto.randomUUID()};sessionStorage.setItem(requestKey,JSON.stringify(submission));await api('goal',{project,text,request_id:submission.id});sessionStorage.removeItem(requestKey);if(unchanged()&&$('goal-text').value===text){$('goal-text').value='';goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
 $('settings-form').addEventListener('invalid',event=>{let detail=event.target.closest('details');while(detail){detail.open=true;detail=detail.parentElement.closest('details');}},true);

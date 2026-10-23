@@ -45,7 +45,7 @@ jobs:
           docs_only=true
           while IFS= read -r path; do
             case "$path" in
-              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
+              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|EXPERIENCE.md|EXPERIENCE.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
               *) docs_only=false; break ;;
             esac
           done < /tmp/rsi-changed-paths
@@ -75,7 +75,7 @@ jobs:
           - name: 控制、恢复与桌面
             modules: tests.test_controls tests.test_updates_recovery tests.test_desktop_runtime tests.test_desktop_release
           - name: 运行时、隔离与调度
-            modules: tests.test_runtime tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience
+            modules: tests.test_runtime tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience tests.test_workflow_experience
           - name: 交付、发布与数据
             modules: tests.test_delivery_loop tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening
           - name: 服务器、协议与集成
@@ -102,6 +102,9 @@ jobs:
       - run: node --check adaptive_rsi/web/i18n.js
       - run: node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
+      - run: node --check adaptive_rsi/web/experience.js
+      - run: node --check adaptive_rsi/web/install.js
+      - run: node --check adaptive_rsi/web/sw.js
       - run: node --test tests/web_requests.cjs
 
   browser:

@@ -4,6 +4,8 @@
 
 A Linux server runs code, model execution, checks and delivery. Your personal computer only opens the dashboard and can be turned off. macOS also supports local operation with `python3 scripts/start.py`.
 
+For phones, append `/install` to the configured HTTPS console origin or choose Install on phone in the sidebar. See [Mobile installation and workflow guide](EXPERIENCE.en.md).
+
 ## Install and connect
 
 Install Python 3.9+ with venv, Git, authenticated GitHub CLI, a working Docker Engine and systemd user services. The service account needs Docker access. Use a dedicated account; this is a single-user maintenance tool.
