@@ -18,14 +18,16 @@ def retry_feedback(row, protected=()):
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
-    sample_fragments = {value[i:i + 24] for value in variants for i in range(len(value) - 23)}
     def excerpt(value, limit=700):
-        text = str(value or "")
-        # A partial or escaped sample quote is unsafe even if it omits the full literal.
-        if any(text[i:i + 24] in sample_fragments for i in range(len(text) - 23)):
-            return "<sealed>"
+        # Bound the matcher by the output size, never by the size of sealed fixtures.
+        text = str(value or "")[:limit + 24]
+        windows = {text[i:i + 24] for i in range(len(text) - 23)}
+        pattern = re.compile("|".join(re.escape(part) for part in windows)) if windows else None
         for fragment in sorted(variants, key=len, reverse=True):
-            if fragment:
+            if len(fragment) >= 24:
+                if pattern and pattern.search(fragment):
+                    return "<sealed>"
+            elif fragment:
                 text = re.sub(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", "<sealed>", text)
         return safe_excerpt(text, limit)
     for key in ["summary", "patch_hash"]:

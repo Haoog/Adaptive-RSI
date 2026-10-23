@@ -272,6 +272,22 @@ class ExperienceTest(unittest.TestCase):
         self.assertNotIn("31415926", json.dumps(feedback))
         self.assertNotIn("31415927", json.dumps(feedback))
 
+    def test_large_sealed_fixtures_do_not_build_an_unbounded_fragment_index(self):
+        import hashlib
+        import tracemalloc
+        from adaptive_rsi.experience import retry_feedback
+        # Eight valid-sized minified fixtures have mostly unique overlapping windows.
+        samples = ["".join(hashlib.sha256(str(index * 1000 + n).encode()).hexdigest() for n in range(1000)) for index in range(8)]
+        row = {"result": json.dumps({"review": {"findings": [{"path": "app.py", "reason": "Handle the empty boundary case"}]}})}
+        tracemalloc.start()
+        try:
+            feedback = retry_feedback(row, samples)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertIn("empty boundary", feedback["review_findings"][0]["reason"])
+        self.assertLess(peak, 12 * 1024 * 1024)
+
     def test_legacy_triage_decision_is_migrated_and_scope_is_not_complete_dependencies(self):
         from adaptive_rsi.gitops import git
         task = self.runtime.goal(self.project, "Wait for backend behavior")
