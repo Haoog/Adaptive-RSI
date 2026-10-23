@@ -54,6 +54,25 @@ const {chromium}=require('playwright');
   const otherProject=await page.locator('#project-select option').evaluateAll(options=>options.find(option=>option.textContent.includes('另一个独立项目')).value);
   await page.locator('#project-select').selectOption(otherProject);await page.waitForFunction(()=>!document.getElementById('usage-refresh').disabled);assert.equal(await page.locator('#usage-detail').isVisible(),false);
   resolveDetail();await page.waitForTimeout(100);assert.equal(await page.locator('#usage-detail').isVisible(),false,'a delayed detail must not reopen after the project changes');
+  const dstContext=await browser.newContext({timezoneId:'America/New_York'}),dstPage=await dstContext.newPage();const requests=[];
+  await dstPage.route('**/api/usage?*',async route=>{
+   requests.push(Object.fromEntries(new URL(route.request().url()).searchParams));
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({summary:{tokens:12,unknown_calls:0,tasks:1,model_seconds:1,cache_read_tokens:0,estimated_usd:null,unpriced_calls:1},daily:[],roles:[{role:'acceptance',tokens:12}],tasks:[],total:0})});
+  });
+  try{
+   assert.equal(await dstPage.evaluate(()=>Intl.DateTimeFormat().resolvedOptions().timeZone),'America/New_York');
+   await dstPage.goto(url);await dstPage.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await dstPage.locator('[data-view="usage"]').click();
+   await dstPage.locator('#usage-role-summary').filter({hasText:'验收设计'}).waitFor();
+   await dstPage.locator('#usage-period').selectOption('custom');
+   await dstPage.locator('#usage-start').fill('2026-11-01');
+   await dstPage.locator('#usage-end').fill('2026-11-01');
+   await dstPage.waitForTimeout(150);
+   const expectedStart=await dstPage.evaluate(()=>new Date(2026,10,1).getTime()/1000);
+   const dst=requests.find(query=>Number(query.start)===expectedStart);
+   assert.ok(dst,'custom usage request was not sent');
+   assert.equal(dst.timezone,'America/New_York');
+   assert.equal(Number(dst.end)-Number(dst.start),25*3600,'fall-back day must end at the next local midnight');
+  }finally{await dstPage.close();await dstContext.close();}
   console.log('Usage page: real API, empty/filter state, English, mobile and no JS errors passed.');
  }finally{if(browser)await browser.close();server.stdin.end('\n');await new Promise(resolve=>server.once('exit',resolve));}
 })().catch(e=>{console.error(e);process.exitCode=1;});

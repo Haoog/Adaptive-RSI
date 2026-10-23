@@ -28,6 +28,7 @@ const english = {
   "需要检查连接": "connection needs attention",
   "每日用量": "Daily usage",
   "后台服务": "Background service",
+  "验收设计": "Acceptance design",
   "当前连接已有本机服务，退出软件不会停止它。": "An existing local service is attached. Quitting this app will not stop it.",
   "本机": "This computer",
   "本机 · 已有服务": "This computer · existing service",
