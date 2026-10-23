@@ -119,7 +119,7 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         task_verified = bool(proof and proof.get("provider") == selected[4]["provider"] and
                              proof.get("model") == selected[4]["model"] and
                              proof.get("effort") == selected[4]["effort"] and
-                             proof.get("signature") == selected[4]["signature"])
+                             proof.get("signature") == selected[4].get("signature"))
         items.append(item("model", ready, detail, selected[2],
                           reason=selected[3], role=role, provider=selected[4]["provider"], model=selected[4]["model"],
                           effort=selected[4]["effort"], probe=selected[4]["probe"], fallback=route.get("fallback")))

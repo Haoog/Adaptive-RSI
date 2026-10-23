@@ -45,8 +45,10 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"], reverse=True)
     if runs:
         stage_rows = store.query(
-            "SELECT s.run,s.stage,s.created,s.data FROM stages s WHERE s.run IN ("
-            + ",".join("?" for _ in runs) + ") ORDER BY s.created,s.rowid", tuple(r["id"] for r in runs))
+            "SELECT s.run,s.stage,s.created,json_extract(s.data,'$.decision') AS decision "
+            "FROM stages s JOIN (SELECT run,max(rowid) AS rowid FROM stages WHERE run IN ("
+            + ",".join("?" for _ in runs) + ") GROUP BY run) latest ON latest.rowid=s.rowid",
+            tuple(r["id"] for r in runs))
         latest_stage = {}
         for stage in stage_rows:
             latest_stage[stage["run"]] = stage
@@ -63,7 +65,7 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         stage = by_run.get(row["id"])
         row["last_stage"] = stage["stage"] if stage else None
         row["last_stage_at"] = stage["created"] if stage else None
-        row["last_stage_decision"] = json.loads(stage["data"]).get("decision") if stage else None
+        row["last_stage_decision"] = stage["decision"] if stage else None
     return {"tasks": tasks, "runs": runs,
             "events": store.query("SELECT * FROM events WHERE " + ("(project=? OR project IS NULL)" if project else "1=1") + " ORDER BY seq DESC LIMIT 100", base_args),
             "pagination": {"total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total},
