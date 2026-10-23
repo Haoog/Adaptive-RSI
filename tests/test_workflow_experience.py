@@ -289,8 +289,12 @@ class ExperienceTest(unittest.TestCase):
         short = "0123456789ABCDEFGH"
         secret = "UNIQUE_SEALED_PRIVATE_SAMPLE_0123456789ABCDEFGHIJ"
         embedded_url = "INPUT https://example.com/long/private/path END_SECRET_79"
+        contextual = "A" * 40 + " PRIVATE_TAIL"
         for reason, samples in [((short + " ") * 37 + secret, [short, secret]),
-                                (embedded_url, [embedded_url])]:
+                                (embedded_url, [embedded_url]),
+                                ("Bearer " + contextual, [contextual]),
+                                ("https://x/" + "b" * 750 + " Bearer " + contextual,
+                                 ["PREFIX_" + contextual + "_SUFFIX"])]:
             with self.subTest(reason=reason[:30]):
                 row = {"result": json.dumps({"review": {"findings": [
                     {"path": "app.py", "reason": reason}]}})}

@@ -18,10 +18,14 @@ def retry_feedback(row, protected=()):
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
-    variants.update(safe_excerpt(value, None) for value in tuple(variants))
     def excerpt(value, limit=700):
-        # Redact shrinking prefixes before bounding the visible sealed-sample scan.
-        text = safe_excerpt(value, None)[:limit + 24]
+        raw = str(value or "")
+        text = safe_excerpt(raw, None)
+        # Contextual redactions lose sample boundaries; hide rather than expose remnants.
+        if variants and text != raw:
+            return "<sealed>"
+        # Bound the matcher by visible output, never by the size of sealed fixtures.
+        text = text[:limit + 24]
         windows = {text[i:i + 24] for i in range(len(text) - 23)}
         pattern = re.compile("|".join(re.escape(part) for part in windows)) if windows else None
         for fragment in sorted(variants, key=len, reverse=True):
