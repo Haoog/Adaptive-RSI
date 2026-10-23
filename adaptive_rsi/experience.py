@@ -63,6 +63,13 @@ def protected_feedback_values(store, task):
                         values.add(str(node.value))
             except (SyntaxError, ValueError):
                 values.update(re.findall(r"[\"']([^\"'\n]+)[\"']", content))
+            # Acceptance may use JavaScript, shell or other languages, not only Python.
+            for number in re.findall(r"(?<![\w.])(?:0[xX][\da-fA-F_]+|[+-]?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)(?!\w)", content):
+                values.add(number)
+                try:
+                    values.add(str(int(number.replace('_', ''), 16)) if number.lower().startswith('0x') else format(float(number.replace('_', '')), '.15g'))
+                except (ValueError, OverflowError):
+                    pass
     return sorted((v for v in values if v), key=len, reverse=True)
 
 

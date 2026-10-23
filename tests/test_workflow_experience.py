@@ -260,6 +260,18 @@ class ExperienceTest(unittest.TestCase):
             feedback = retry_feedback(row, protected=[secret, "私密样本" * 20])
             self.assertEqual("<sealed>", feedback["review_findings"][0]["reason"])
 
+    def test_javascript_acceptance_numeric_samples_are_not_retry_feedback(self):
+        from adaptive_rsi.experience import protected_feedback_values, retry_feedback
+        from adaptive_rsi.recovery import save
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        spec = {"files": [{"path": "check.js", "content": 'const input = 31415926;\nif (add(input,1)!==31415927) throw Error("bad");'}]}
+        save(self.runtime, run, "acceptance", spec, "signature")
+        feedback = retry_feedback({"result": json.dumps({"review": {"findings": [{"path": "app.js", "reason": "For input 31415926 expected 31415927"}]}})}, protected_feedback_values(self.store, task))
+        self.assertNotIn("31415926", json.dumps(feedback))
+        self.assertNotIn("31415927", json.dumps(feedback))
+
     def test_legacy_triage_decision_is_migrated_and_scope_is_not_complete_dependencies(self):
         from adaptive_rsi.gitops import git
         task = self.runtime.goal(self.project, "Wait for backend behavior")
