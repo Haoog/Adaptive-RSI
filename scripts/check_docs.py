@@ -44,7 +44,7 @@ def check():
         text = FENCE.sub("", (ROOT / source).read_text(encoding="utf-8"))
         for target in LINK.findall(text):
             parsed = urlsplit(target)
-            if parsed.scheme or target.startswith(("#", "mailto:")):
+            if parsed.scheme or target.startswith("mailto:"):
                 continue
             relative = unquote(parsed.path)
             destination = (ROOT / source).parent / relative if relative else ROOT / source

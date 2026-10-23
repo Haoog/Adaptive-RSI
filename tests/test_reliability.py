@@ -362,6 +362,9 @@ class ReliabilityTest(unittest.TestCase):
     def test_documentation_commit_does_not_repeat_module_inspection(self):
         self.assertFalse(Runtime._module_changed(None, {"README.md", "docs/diagram.png"}))
         self.assertTrue(Runtime._module_changed(None, {"desktop/icon.svg"}))
+        self.assertTrue(Runtime._module_changed(
+            {"cwd": ".", "language": "Python", "manifest": "pyproject.toml"},
+            {"scripts/install-server.sh"}))
         self.runtime.configure({"sources": {"inspection": True}, "evolution": {"enabled": False}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.request(self.project, "light")

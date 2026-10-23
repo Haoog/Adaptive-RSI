@@ -804,6 +804,7 @@ class Runtime:
             "C / C++": {".c", ".cc", ".cpp", ".h", ".hpp", ".cmake", ".txt", ".ninja"},
             "C# / F# / .NET": {".cs", ".fs", ".fsproj", ".csproj", ".sln", ".props", ".targets"},
         }.get(language, set())
+        suffixes |= {".sh", ".ps1", ".bat", ".cmd"}
         manifests = {Path(selected.get("manifest", "")).name}
         runtime_config = {"Dockerfile", "Makefile", "Procfile", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
         return any(Path(path).suffix in suffixes or Path(path).name in manifests | runtime_config for path in changed_paths)
