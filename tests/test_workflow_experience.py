@@ -336,3 +336,24 @@ class ExperienceTest(unittest.TestCase):
         self.assertIn("connection", evidence.get("failure", {}), evidence)
         self.assertEqual(connection_key(config, "opencode", self.project), evidence["failure"]["connection"])
         self.assertTrue(evidence["failure"]["recoverable"])
+
+    def test_readiness_circuit_failure_resumes_with_connection_without_model_call(self):
+        from adaptive_rsi.provider_health import ProviderHealth, connection_key
+        task = self.runtime.goal(self.project, "Fix addition")
+        config = self.runtime.config(self.project)
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, config)
+        config["models"]["implementation"]["provider"] = "opencode"
+        run["config"] = json.dumps(config)
+        health = ProviderHealth(self.store)
+        for _ in range(3):
+            health.record(config, "opencode", self.project, RuntimeError("HTTP 503"))
+        with patch.object(self.runtime, "invoke", side_effect=AssertionError("Readiness must stop before a model call")):
+            self.runtime.process(run)
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        evidence = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual("blocked", row["state"])
+        self.assertTrue(evidence["failure"]["recoverable"])
+        self.assertEqual(connection_key(config, "opencode", self.project), evidence["failure"]["connection"])
+        self.assertEqual(1, self.runtime.resume_provider_tasks("opencode", self.project))
+        self.assertEqual("queued", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
