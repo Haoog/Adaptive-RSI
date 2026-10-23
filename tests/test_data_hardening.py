@@ -190,17 +190,45 @@ class IssueCommentsTest(unittest.TestCase):
             requests.append(params)
             page = int(params["page"])
             start = (page - 1) * 100
-            return json.dumps(comments[start:start + 100])
+            body = json.dumps(comments[start:start + 100])
+            if page == 1:
+                return ('HTTP/2.0 200 OK\nETag: "window-v1"\n'
+                        'Link: <https://api.github.com/repositories/1/issues/7/comments?per_page=100&page=11>; rel="last"\n\n'
+                        + body)
+            return body
 
         with patch("adaptive_rsi.discovery.time.time", return_value=1790000000):
             result = issue_comment_context(self.runtime, self.project, self.task, self.config, checked=checked)
         self.assertEqual(result["status"], "loaded")
-        self.assertEqual(len(requests), 11)
+        self.assertEqual([request["page"] for request in requests], ["1", "11", "10"])
         self.assertNotIn("sort", requests[0])
         self.assertNotIn("direction", requests[0])
         self.assertEqual([comment["id"] for comment in result["comments"]], list(range(1001, 981, -1)))
         self.assertFalse(result["complete"])
         self.assertEqual(result["omitted_count"], 981)
+
+    def test_comment_etag_304_reuses_the_cached_window(self):
+        initial = [self.comment(1, "2026-10-01T00:00:00Z")]
+        start = 1790000000
+        with patch("adaptive_rsi.discovery.time.time", return_value=start):
+            first = issue_comment_context(
+                self.runtime, self.project, self.task, self.config,
+                checked=lambda args, timeout=60: 'HTTP/2.0 200 OK\nETag: "comment-v1"\n\n' + encode(initial))
+        self.assertEqual([item["id"] for item in first["comments"]], [1])
+        with patch("adaptive_rsi.discovery.time.time", return_value=start + 600):
+            refreshed = issue_comment_context(
+                self.runtime, self.project, self.task, self.config,
+                checked=lambda args, timeout=60: 'HTTP/2.0 200 OK\nETag: "comment-v2"\n\n[]')
+        seen = []
+        def unchanged(args, timeout=60):
+            seen.append(args)
+            return "HTTP/2.0 304 Not Modified\nETag: \"comment-v2\"\n\n"
+        with patch("adaptive_rsi.discovery.time.time", return_value=start + 901):
+            cached = issue_comment_context(self.runtime, self.project, self.task, self.config, checked=unchanged)
+        self.assertEqual(refreshed["status"], "loaded")
+        self.assertEqual(cached["status"], "cached")
+        self.assertEqual([item["id"] for item in cached["comments"]], [1])
+        self.assertIn("If-None-Match: \"comment-v2\"", seen[0])
 
     def test_incremental_scan_finds_edited_old_comment_after_cache_expires(self):
         pages = [[self.comment(1, "2026-10-01T00:00:00Z"), self.comment(2, "2026-10-02T00:00:00Z")]]
@@ -232,6 +260,30 @@ class IssueCommentsTest(unittest.TestCase):
         self.assertEqual({comment["id"] for comment in updated["comments"]}, {1, 2, 3})
         self.assertTrue(updated["complete"])
         self.assertGreater(self.store.setting("issue-comments:p:7")["cursor"], old_cursor)
+
+    def test_incremental_window_reads_every_changed_page(self):
+        start = 1790000000
+        with patch("adaptive_rsi.discovery.time.time", return_value=start):
+            issue_comment_context(
+                self.runtime, self.project, self.task, self.config,
+                checked=lambda args, timeout=60: json.dumps([self.comment(0, "2026-10-01T00:00:00Z")]))
+        changed = [
+            self.comment(1, "2026-10-21T00:01:00Z", "Edited old", "2026-10-01T00:00:00Z")
+        ] + [
+            self.comment(i, "2026-10-21T00:00:%02dZ" % (i % 60), "New " + str(i), "2026-10-21T00:00:%02dZ" % (i % 60))
+            for i in range(2, 102)
+        ]
+        calls = []
+        def incremental(args, timeout=60):
+            params = self.page_args(args)
+            calls.append(int(params["page"]))
+            return json.dumps(changed[:100] if params["page"] == "1" else changed[100:])
+        with patch("adaptive_rsi.discovery.time.time", return_value=start + 600):
+            result = issue_comment_context(
+                self.runtime, self.project, self.task, self.config, checked=incremental)
+        self.assertEqual(calls, [1, 2])
+        self.assertIn(1, {comment["id"] for comment in result["comments"]})
+        self.assertEqual(result["comments"][0]["id"], 1)
 
     def test_issue_revision_refresh_drops_deleted_comment_and_resets_cursor(self):
         start = 1790000000

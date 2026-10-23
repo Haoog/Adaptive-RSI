@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -402,7 +403,7 @@ class Runtime:
     def reassess_deferred(self, project, config, head):
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],))
-            prior = json.loads(run["result"]) if run else {}
+            prior = json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
             signature = fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})
             if head != prior.get("base") or signature != prior.get("triage_input"):
                 self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=? AND state='deferred'", (time.time(), task["id"]))
@@ -540,7 +541,7 @@ class Runtime:
         protected = [p["path"] for p in self.store.query("SELECT path FROM projects")]
         protected += [json.loads(c["spec"])["repository"] for c in self.store.query("SELECT spec FROM cases")]
         config = json.loads(run["config"])
-        if role == "acceptance":
+        if role in ["acceptance", "triage"]:
             config["models"][role] = config["models"]["planning"]
         if role == "review":
             patch_path = Path(workspace).parent / "candidate.patch"
@@ -742,7 +743,9 @@ class Runtime:
                                        "recent_failures": history, "open_prs": self.store.setting("prs:" + project["id"], []),
                                        "ci": ci, "postmerge_outcomes": self.outcomes(project["id"]),
                                        "stable_strategies": strategies}), workspace, run)
-        added = 0
+        candidates = []
+        seen_keys = set()
+        recurrences = 0
         for item in findings["findings"]:
             try:
                 relative_path(item["path"])
@@ -764,19 +767,81 @@ class Runtime:
                                        (encode([{"path": item["path"], "quote": item["quote"], "base": head,
                                                  "source": "reported_recurrence"}]), time.time(), prior["id"]))
                     self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
-                    added += 1
+                    recurrences += 1
                     continue
                 if related_task(backlog, item):
                     continue
+                if finding_key in seen_keys:
+                    continue
+                seen_keys.add(finding_key)
                 evidence = {"path": item["path"], "quote": item["quote"], "base": head, "source": "inspection"}
-                self.store.add_task(project["id"], "inspection", finding_key,
-                                    item["title"], item["body"], [evidence], item["acceptance"], max(1, min(70, item["priority"])))
-                added += 1
+                candidates.append({"index": len(candidates), "item": item, "key": finding_key,
+                                   "evidence": evidence})
             except (ValueError, OSError):
                 continue
+        decisions = {}
+        if len(candidates) > 1:
+            try:
+                triage = self.invoke(
+                    "triage",
+                    "Batch-triage inspection findings before any full planning. This is a low-cost value gate, "
+                    "not a safety review. Default to ready. Use deferred only for weak/duplicate evidence or "
+                    "unclear current value, and rejected only for clear cosmetic churn, speculative rewrites, "
+                    "or disproportionate cost. Never reject concrete correctness, security, data-loss or user-impact "
+                    "work. Return exactly one decision for every input index, with a concrete reason. "
+                    "High-priority or sensitive findings must remain ready for full planning.\n" +
+                    encode({"policy": json.loads(run["config"])["triage"]["policy"],
+                            "findings": [{key: value for key, value in candidate["item"].items()
+                                          if key in ["title", "body", "path", "quote", "acceptance", "priority"]}
+                                         for candidate in candidates]}), workspace, run)
+                rows = triage.get("findings", [])
+                indexes = [row.get("index") for row in rows]
+                if sorted(indexes) != list(range(len(candidates))) or len(set(indexes)) != len(indexes):
+                    raise ValueError("Triage did not classify every finding exactly once")
+                for row in rows:
+                    if row.get("decision") not in ["ready", "deferred", "rejected"] or not row.get("reason", "").strip():
+                        raise ValueError("Triage decision requires a known outcome and reason")
+                    if row["decision"] != "ready" and row.get("confidence") == "low":
+                        row = {**row, "decision": "ready"}
+                    decisions[row["index"]] = row
+            except Cancelled:
+                raise
+            except Exception as exc:
+                self.store.event("triage_unavailable", "Batch triage unavailable; findings retain full planning",
+                                 project["id"], run["id"], {"reason": str(exc)[:300]})
+                decisions = {}
+        added = recurrences
+        queued, deferred, rejected = recurrences, 0, 0
+        for candidate in candidates:
+            item = candidate["item"]
+            decision = decisions.get(candidate["index"], {}).get("decision", "ready")
+            sensitive = re.search(
+                r"auth|permission|credential|secret|security|deploy|release|upgrade|update|delivery|migration|"
+                r"database|dependency|public api|权限|认证|凭据|升级|交付|迁移|依赖|公共 ?API",
+                " ".join([item.get("title", ""), item.get("body", ""), item.get("path", "")]), re.I)
+            if item["priority"] >= 70 or sensitive:
+                decision = "ready"
+            task_id = self.store.add_task(
+                project["id"], "inspection", candidate["key"], item["title"], item["body"],
+                [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])))
+            if decision in ["deferred", "rejected"]:
+                self.store.execute("UPDATE tasks SET state=?,updated=? WHERE id=? AND state='queued'",
+                                   (decision, time.time(), task_id))
+                self.store.put_setting("triage-state:" + task_id, {
+                    "base": head,
+                    "triage_input": fingerprint({"body": item["body"], "evidence": encode([candidate["evidence"]]),
+                                                 "policy": json.loads(run["config"])["triage"]["policy"]}),
+                    "reason": decisions.get(candidate["index"], {}).get("reason", ""),
+                    "decision": decision,
+                })
+            added += 1
+            queued += decision == "ready"
+            deferred += decision == "deferred"
+            rejected += decision == "rejected"
         self.store.put_setting(selected_key, inspection_signature)
         self.store.put_setting(module_head_key, head)
-        self.store.event("inspection", str(added) + " evidenced findings considered", project["id"], run["id"])
+        self.store.event("inspection", str(added) + " evidenced findings considered", project["id"], run["id"],
+                         {"queued": queued, "deferred": deferred, "rejected": rejected})
 
     @staticmethod
     def _module_changed(selected, changed_paths):

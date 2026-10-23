@@ -14,9 +14,11 @@
 
 默认 `GITHUB_TOKEN` 创建的 PR 不会自动触发 `pull_request` 检查。因此准备流程明确触发可信主线的 `release-verify.yml`：独立核对 PR 的仓库、目标分支、精确 SHA，并从基线重新生成六个文件的预期补丁；之后运行完整测试、浏览器检查和 ZIP/wheel 安装升级 smoke。单独的报告作业才有 `checks:write`，在该精确 PR SHA 写入正常 `verify` 检查；执行候选的检查作业只有读取权限，不接收写入 token。合并使用 `--match-head-commit`，没有管理员绕过；必需人工批准、检查失败或冲突会阻断。
 
-机器人合并后再次明确触发正式发布流程，避免 `GITHUB_TOKEN` 合并不触发 push 的限制。最终合并提交会重新构建、验证插件 ZIP 和 wheel，并在隔离状态目录实际启动 ZIP 服务、检查版本与状态保留；存在旧版正式 wheel 时，还实际安装旧 wheel 再升级新 wheel。首次发布没有旧 wheel 时明确记录只执行安装及重复安装检查，不将其称为跨版本升级。正式发布作业只使用同一次检查上传的资产，先创建固定标签和草稿、完整上传后转为正式 Release。已有标签指向其他提交或已有正式资产不一致时停止，绝不移动标签或替换正式资产。ZIP 时间与权限固定，wheel 设置 `SOURCE_DATE_EPOCH`，支持同提交重试对账。
+机器人合并后再次明确触发正式发布流程，避免 `GITHUB_TOKEN` 合并不触发 push 的限制。版本 PR 的验证作业记录精确源树、每个资产的 SHA-256，并使用 GitHub 原生 artifact attestation 签发构建来源；正式发布先查找同一源树的未过期证明，核对可信签名工作流、源 ref、源 digest、proof、校验和、DMG 内应用签名及 bundled engine，再在隔离状态目录实际启动 ZIP 服务、检查版本与状态保留。squash 合并后的提交 SHA 与 PR SHA 不同，因此复用条件是文件树完全一致；没有证明、证明无效、源树变化或任一步复验失败时自动回退到完整重建。正式发布无论复用还是重建都执行最终 smoke，不因复用跳过安装验证。存在旧版正式 wheel 时，还实际安装旧 wheel 再升级新 wheel；首次发布没有旧 wheel 时明确记录只执行安装及重复安装检查，不将其称为跨版本升级。正式发布作业只使用同一次验证上传的资产，先创建固定标签和草稿、完整上传后转为正式 Release。已有标签指向其他提交或已有正式资产不一致时停止，绝不移动标签或替换正式资产。ZIP 时间与权限固定，wheel 设置 `SOURCE_DATE_EPOCH`，支持同提交重试对账。
 
 smoke 可使用可选的 `GH_TOKEN` 读取本仓库固定的官方 latest Release API；工作流为这一步提供仅读权限的 token。该请求拒绝所有重定向，资产下载不携带 token；只有 API 的 404 表示暂无正式版本，403 限流及其他错误仍阻断验证。
+
+普通 PR 的 Desktop 工作流按路径选择验证深度：仅 `adaptive_rsi/**` 变化时构建并实际启动 bundled engine；`desktop/**`、打包脚本、`pyproject.toml` 或发版工作流变化时执行 Rust 测试、Tauri 构建、应用签名、DMG 及包内 engine 验证。手动触发和正式发版始终执行完整构建。npm、Playwright、uv、pip、Docker BuildKit 和 Cargo 缓存只保存公开构建输入，键或作用域包含对应 lockfile、`pyproject.toml` 或 Dockerfile，不缓存凭据、运行状态或用户数据。
 
 GitHub 必须允许 Actions 创建 PR，并允许既定工作流申请对应仓库权限；禁用这些能力时流程会明确失败，不假设已配置额外 PAT。仓库管理员仍应维护必需检查与评审规则。标签和工作流文件应纳入规则保护。
 

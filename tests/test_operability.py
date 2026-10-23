@@ -7,13 +7,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi.agent import CodexAgent
+from adaptive_rsi.cli import doctor
 from adaptive_rsi.model_center import CenterError
 from adaptive_rsi.native import ProviderUnavailable
+from adaptive_rsi.opencode import OpenCodeCapabilities, OpenCodeCompatibilityError
 from adaptive_rsi.provider_health import ProviderHealth, ProviderPaused
+from adaptive_rsi.readiness import inspect
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 from adaptive_rsi.telemetry import quality_summary
 from tests.test_model_center import DirectoryServer
+from tests.test_runtime import fixture
 
 
 class OperabilityTest(unittest.TestCase):
@@ -167,3 +171,61 @@ class OperabilityTest(unittest.TestCase):
         quality = quality_summary(self.store)[0]
         self.assertEqual((quality["runs"], quality["evaluated"], quality["passed"]), (3, 3, 1))
         self.assertEqual((quality["reviewed"], quality["review_blocked"], quality["repeat_failures"]), (3, 2, 1))
+
+    def test_doctor_reports_opencode_version_and_compatibility_without_raw_output(self):
+        capabilities = OpenCodeCapabilities(version="2.1.3", release=(2, 1, 3))
+        with patch("adaptive_rsi.cli.shutil.which",
+                   side_effect=lambda name: "/fake/opencode" if name == "opencode" else None), patch(
+                "adaptive_rsi.opencode.detect_opencode", return_value=capabilities):
+            result = doctor()
+        self.assertEqual(result["opencode_version"], "2.1.3")
+        self.assertEqual(result["opencode_compatibility"], "supported")
+        self.assertEqual(result["opencode_commands"]["run"], "model#variant")
+
+        failure = OpenCodeCompatibilityError("opencode_incompatible_3.0.0", "3.0.0")
+        with patch("adaptive_rsi.cli.shutil.which",
+                   side_effect=lambda name: "/fake/opencode" if name == "opencode" else None), patch(
+                "adaptive_rsi.opencode.detect_opencode", side_effect=failure):
+            result = doctor()
+        self.assertEqual(result["opencode_version"], "3.0.0")
+        self.assertEqual(result["opencode_compatibility"], "unsupported")
+        self.assertIn("OpenCode 1.19.3", result["opencode_diagnostic"])
+        self.assertIn("does not upgrade or downgrade", result["opencode_diagnostic"])
+
+    def test_doctor_uses_docker_worker_when_host_opencode_is_absent(self):
+        capabilities = OpenCodeCapabilities(version="2.1.3", release=(2, 1, 3))
+
+        def run(argv, *args, **kwargs):
+            if argv[:2] == ["docker", "info"] or argv[:3] == ["docker", "image", "inspect"]:
+                return {"exit_code": 0, "error": None}
+            raise AssertionError(argv)
+
+        with patch("adaptive_rsi.cli.shutil.which",
+                   side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None), patch(
+                "adaptive_rsi.cli.run_process", side_effect=run), patch(
+                "adaptive_rsi.opencode.detect_opencode", return_value=capabilities) as detect:
+            result = doctor()
+        self.assertEqual(result["opencode_transport"], "docker")
+        self.assertTrue(result["opencode_worker_available"])
+        self.assertEqual(result["opencode_version"], "2.1.3")
+        self.assertEqual(result["opencode_compatibility"], "supported")
+        self.assertEqual(detect.call_args.kwargs["argv"], [
+            "/usr/bin/docker", "run", "--rm", "adaptive-rsi-worker:local", "opencode", "--version"])
+
+    def test_readiness_reports_specific_opencode_compatibility_diagnostic(self):
+        project = self.runtime.add_project(fixture(Path(self.temp.name) / "project"))
+        self.runtime.configure({"models": {"planning": {
+            "provider": "opencode", "model": "opencode-go/coder", "effort": "high"}}}, project)
+        original_which = __import__("shutil").which
+        failure = OpenCodeCompatibilityError("opencode_incompatible_3.0.0", "3.0.0")
+        with patch("adaptive_rsi.readiness.shutil.which",
+                   side_effect=lambda name: "/fake/opencode" if name == "opencode" else original_which(name)), patch(
+                "adaptive_rsi.opencode.detect_opencode", side_effect=failure), patch(
+                "adaptive_rsi.cli_worker.worker_available", return_value=True), patch.object(
+                self.center, "directory", return_value={"models": [], "fetched": False, "truncated": False}):
+            result = inspect(self.runtime, self.runtime.project(project))
+        planning = next(item for item in result["items"] if item.get("role") == "planning")
+        self.assertFalse(planning["ready"])
+        self.assertEqual(planning["reason"], "opencode_incompatible_3.0.0")
+        self.assertEqual(planning["opencode_version"], "3.0.0")
+        self.assertIn("OpenCode 1.19.3", planning["detail"])

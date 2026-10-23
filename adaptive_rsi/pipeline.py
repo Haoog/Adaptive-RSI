@@ -1,5 +1,7 @@
 """Shared, isolated candidate pipeline used by tasks and strategy experiments."""
+import concurrent.futures
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -8,7 +10,7 @@ from .agent import SCHEMAS, validate_output
 from .config import compatibility, fingerprint, relative_path
 from .gitops import changes, git, snapshot
 from .process import Cancelled, scrub_tree
-from .review import REVIEW_PROMPT, enforce_review
+from .review import REVIEW_PROMPT, enforce_review, risk_review_required
 from .store import encode
 
 
@@ -205,40 +207,64 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                  "related_work": overlaps, "issue_comments": comment_evidence,
                                  "plan": plan, "acceptance_hash": acceptance["hash"], "checks": checks})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
-    transition("executing")
-    if saved_candidate:
-        result = {"summary": saved_candidate["summary"]}
-        patch = saved_candidate["patch"]
-        if fingerprint(patch) != saved_candidate["patch_hash"]:
-            raise RuntimeError("Saved candidate evidence changed; retry refused")
-        (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
-        git(workspace, "apply", "--index", str(directory / "resume.patch"))
-    elif task["source"] == "rollback":
-        git(workspace, "apply", "--reverse", str(patch_path))
-        result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
-    else:
-        result = runtime.invoke("implementation", "Implement this verified plan. Add appropriate regression coverage. "
-                             "Do not modify files outside scope. No publishing.\n" + encode({"plan": plan, **context}), workspace, run)
-    scrub_tree(workspace)
-    files, patch = changes(workspace)
-    if not files and not experiment:
-        transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
-        return None
-    for path in files:
-        relative_path(path)
-        if not any(path == s.rstrip("/") or path.startswith(s.rstrip("/") + "/") for s in plan["scope"]):
-            raise RuntimeError("Change escaped planned scope: " + path)
-    (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
-    # Seal the exact patch outside the executor's writable subtree before evaluation.
-    workspace = snapshot(source, directory / "candidate", base)
-    if patch:
-        git(workspace, "apply", "--index", str(directory / "candidate.patch"))
-    if not experiment:
-        save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
-    transition("evaluating")
     baseline = snapshot(source, directory / "baseline", base)
-    evaluation = runtime.evaluator.evaluate(baseline, workspace, checks, directory / "evaluation", config,
-                                         lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance)
+    acceptance_executor = None
+    acceptance_future = None
+    acceptance_cancel = threading.Event()
+    if saved_candidate is None and task["source"] != "rollback":
+        acceptance_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
+        acceptance_future = acceptance_executor.submit(
+            runtime.evaluator.evaluate_acceptance_baseline, baseline, acceptance,
+            directory / "evaluation", config,
+            lambda: runtime.is_cancelled(run) or acceptance_cancel.is_set(),
+            seeds, project["id"], base, environment["sha256"])
+    transition("executing")
+    acceptance_baseline = None
+    try:
+        if saved_candidate:
+            result = {"summary": saved_candidate["summary"]}
+            patch = saved_candidate["patch"]
+            if fingerprint(patch) != saved_candidate["patch_hash"]:
+                raise RuntimeError("Saved candidate evidence changed; retry refused")
+            (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
+            git(workspace, "apply", "--index", str(directory / "resume.patch"))
+        elif task["source"] == "rollback":
+            git(workspace, "apply", "--reverse", str(patch_path))
+            result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
+        else:
+            result = runtime.invoke("implementation", "Implement this verified plan. Add appropriate regression coverage. "
+                                 "Do not modify files outside scope. No publishing.\n" + encode({"plan": plan, **context}), workspace, run)
+        scrub_tree(workspace)
+        files, patch = changes(workspace)
+        if not files and not experiment:
+            transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
+            return None
+        for path in files:
+            relative_path(path)
+            if not any(path == s.rstrip("/") or path.startswith(s.rstrip("/") + "/") for s in plan["scope"]):
+                raise RuntimeError("Change escaped planned scope: " + path)
+        (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
+        # Seal the exact patch outside the executor's writable subtree before evaluation.
+        workspace = snapshot(source, directory / "candidate", base)
+        if patch:
+            git(workspace, "apply", "--index", str(directory / "candidate.patch"))
+        if not experiment:
+            save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
+        transition("evaluating")
+        if acceptance_future is not None:
+            acceptance_baseline = acceptance_future.result()
+            acceptance_executor.shutdown(wait=True)
+            acceptance_executor = None
+        evaluation = runtime.evaluator.evaluate(
+            baseline, workspace, checks, directory / "evaluation", config,
+            lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,
+            acceptance_baseline=acceptance_baseline, cache_scope=project["id"], cache_base=base,
+            environment_digest=environment["sha256"])
+    finally:
+        if acceptance_executor is not None:
+            acceptance_cancel.set()
+            acceptance_executor.shutdown(wait=True, cancel_futures=True)
     if not experiment:
         save(runtime, run, "evaluation", evaluation, candidate_key)
     if evaluation["decision"] != "pass" and not experiment:
@@ -267,7 +293,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                      "summary": result["summary"]}), workspace, run)
     review = enforce_review(review, config)
     risk_review = None
-    if plan["risk"] == "high" and review["decision"] == "pass":
+    if risk_review_required(plan, review, files, patch):
         risk_review = None if experiment else cached(runtime, run, "risk_review", review_key)
         if risk_review and risk_review.get("decision") != "pass":
             risk_review = None
@@ -275,6 +301,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             risk_review = enforce_review(runtime.invoke("review", REVIEW_PROMPT +
                 "This is an additional high-risk review in a fresh session. Focus on permission boundaries, "
                 "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
+                "Review the concrete sensitive paths and patch lines supplied; do not broaden the review merely "
+                "because the planner marked the task high risk. "
                 "Missing negative-path verification must be reported as insufficient evidence. "
                 "Do not rely on another reviewer's assessment.\n" +
                 encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),

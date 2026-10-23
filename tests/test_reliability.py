@@ -1,6 +1,7 @@
 import json
 import platform
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -8,10 +9,11 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge
 from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.context import code_map, related, terms
+from adaptive_rsi.context import _code_index, _code_map_cached, code_map, related, terms
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.discovery import related_task, value_priority
 from adaptive_rsi.evolution import Evolution
+from adaptive_rsi.evaluator import CACHE_STDERR_LIMIT, Evaluator
 from adaptive_rsi.gitops import git, snapshot
 from adaptive_rsi.readiness import budget, inspect as readiness
 from adaptive_rsi.recovery import failure
@@ -257,6 +259,9 @@ class ReliabilityTest(unittest.TestCase):
                 result = super().invoke(role, *args, **kwargs)
                 if role == "planning":
                     result["risk"] = "high"
+                    result["scope"] = ["calculator.py", "auth.py", "tests"]
+                if role == "implementation":
+                    (args[1] / "auth.py").write_text("PERMISSION_BOUNDARY = 'owner'\n")
                 if role == "review":
                     self.reviews += 1
                     if self.reviews == 2:
@@ -270,6 +275,278 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(result["risk_review"]["decision"], "insufficient_evidence")
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
         self.assertFalse(self.store.query("SELECT * FROM stages WHERE run=? AND stage='validated_candidate'", (run["id"],)))
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_ordinary_high_risk_does_not_force_a_second_review(self):
+        class HighRisk(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+        self.runtime.agent = HighRisk()
+        task, run = self.claim()
+        self.runtime.process(run)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("review"), 1)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+
+    def test_code_map_reuses_content_index_and_invalidates_dirty_changes(self):
+        before = _code_index.cache_info()
+        mapping_before = _code_map_cached.cache_info()
+        self.assertEqual(code_map(self.repo, "calculator", limit=1)["files"][0]["path"], "calculator.py")
+        self.assertEqual(code_map(self.repo, "calculator", limit=1)["files"][0]["path"], "calculator.py")
+        cached = _code_index.cache_info()
+        mapping_cached = _code_map_cached.cache_info()
+        self.assertEqual(cached.misses, before.misses + 1)
+        self.assertEqual(mapping_cached.misses, mapping_before.misses + 1)
+        self.assertGreater(mapping_cached.hits, mapping_before.hits)
+        (self.repo / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+        self.assertEqual(code_map(self.repo, "calculator", limit=1)["files"][0]["path"], "calculator.py")
+        self.assertEqual(_code_index.cache_info().misses, cached.misses + 1)
+        self.assertEqual(_code_map_cached.cache_info().misses, mapping_cached.misses + 1)
+
+    def test_evaluation_baseline_cache_is_project_and_config_scoped(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        (candidate / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+        image_id = "sha256:" + "a" * 64
+        calls = []
+        lock = threading.Lock()
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            with lock:
+                calls.append((Path(workspace).name, check["name"], _sandbox.config["sandbox"]["image"]))
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.0, "error": None}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="docker"), \
+                patch("adaptive_rsi.evaluator.run_process", return_value={
+                    "exit_code": 0, "error": None, "stdout": image_id, "stderr": ""}), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            for directory in ["one", "two"]:
+                evaluator.evaluate(self.repo, candidate, CHECKS, self.root / directory, config,
+                                   cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+            self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 1)
+            changed_checks = [{"name": "different", "argv": ["python3", "-c", "print('ok')"]}]
+            evaluator.evaluate(self.repo, candidate, changed_checks, self.root / "three", config,
+                               cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+            self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 2)
+            evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "four", config,
+                               cache_scope="project-b", cache_base=base, environment_digest="deps-v1")
+            self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 3)
+            evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "five", config,
+                               cache_scope="project-a", cache_base=base, environment_digest="deps-v2")
+            self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 4)
+            self.assertEqual(sum(label == "candidate" for label, _, _ in calls), 5)
+            self.assertGreaterEqual(sum(label == "candidate_full" for label, _, _ in calls), 5)
+            self.assertTrue(all(image == image_id for _, _, image in calls))
+
+    def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        first = "sha256:" + "a" * 64
+        second = "sha256:" + "b" * 64
+        calls = []
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            calls.append((Path(workspace).name, _sandbox.config["sandbox"]["image"]))
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.0, "error": None}
+        images = iter([first, first, second])
+        def inspect(*args, **kwargs):
+            return {"exit_code": 0, "error": None, "stdout": next(images), "stderr": ""}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="docker"), \
+                patch("adaptive_rsi.evaluator.run_process", side_effect=inspect), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            for directory in ["one", "two", "three"]:
+                evaluator.evaluate(self.repo, candidate, CHECKS, self.root / directory, config,
+                                   cache_scope="project", cache_base=base, environment_digest="deps")
+        baselines = [image for label, image in calls if label == "baseline"]
+        self.assertEqual(baselines, [first, second])
+
+    def test_baseline_cache_is_disabled_for_unidentified_native_toolchains(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        calls = []
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            calls.append(Path(workspace).name)
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.0, "error": None}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="seatbelt"), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            for directory in ["one", "two"]:
+                result = evaluator.evaluate(self.repo, candidate, CHECKS, self.root / directory, config,
+                                            cache_scope="project", cache_base=base, environment_digest="deps")
+        self.assertEqual(calls.count("baseline"), 2)
+        self.assertIsNone(result["execution_environment"])
+
+    def test_baseline_cache_invalidates_when_evaluator_build_changes(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        image_id = "sha256:" + "a" * 64
+        calls = []
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            calls.append(Path(workspace).name)
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.0, "error": None}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="docker"), \
+                patch("adaptive_rsi.evaluator.run_process", return_value={
+                    "exit_code": 0, "error": None, "stdout": image_id, "stderr": ""}), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "one", config,
+                               cache_scope="project", cache_base=base, environment_digest="deps")
+            with patch("adaptive_rsi.evaluator.BUILD_ID", "different-build"):
+                evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "two", config,
+                                   cache_scope="project", cache_base=base, environment_digest="deps")
+        self.assertEqual(calls.count("baseline"), 2)
+
+    def test_early_acceptance_baseline_reruns_when_docker_image_id_changes(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        first = "sha256:" + "a" * 64
+        second = "sha256:" + "b" * 64
+        acceptance = {
+            "spec": {"files": []},
+            "checks": [{"name": "acceptance", "cwd": ".", "argv": ["true"]}],
+            "criteria": [],
+            "hash": "acceptance-hash",
+        }
+        calls = []
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            label = Path(workspace).name
+            calls.append((label, _sandbox.config["sandbox"]["image"]))
+            failed = label.startswith("acceptance_baseline")
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 1 if failed else 0,
+                    "stdout": "Ran 1 test\n", "stderr": "AssertionError" if failed else "",
+                    "seconds": 0.0, "error": None}
+        images = iter([first, second])
+        def inspect(*args, **kwargs):
+            return {"exit_code": 0, "error": None, "stdout": next(images), "stderr": ""}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        directory = self.root / "evaluation"
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="docker"), \
+                patch("adaptive_rsi.evaluator.run_process", side_effect=inspect), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            early = evaluator.evaluate_acceptance_baseline(
+                self.repo, acceptance, directory, config,
+                cache_scope="project", cache_base=base, environment_digest="deps")
+            result = evaluator.evaluate(
+                self.repo, candidate, CHECKS, directory, config, acceptance=acceptance,
+                acceptance_baseline=early, cache_scope="project", cache_base=base,
+                environment_digest="deps")
+        baseline_runs = [(label, image) for label, image in calls if label.startswith("acceptance_baseline")]
+        self.assertEqual([image for _, image in baseline_runs], [first, second])
+        self.assertTrue(baseline_runs[1][0].startswith("acceptance_baseline_"))
+        self.assertEqual(result["decision"], "pass")
+
+    def test_evaluation_runs_independent_stages_concurrently(self):
+        candidate = snapshot(self.repo, self.root / "candidate")
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.05, "error": None}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            result = Evaluator(self.store).evaluate(
+                self.repo, candidate, CHECKS, self.root / "parallel",
+                merge(self.runtime.config(self.project), {"limits": {"concurrency": 2}}))
+        self.assertEqual(result["decision"], "pass")
+        self.assertGreaterEqual(maximum, 2)
+
+    def test_evaluation_obeys_concurrency_one(self):
+        candidate = snapshot(self.repo, self.root / "candidate")
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "seconds": 0.03, "error": None}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            result = Evaluator(self.store).evaluate(
+                self.repo, candidate, CHECKS, self.root / "serial",
+                merge(self.runtime.config(self.project), {"limits": {"concurrency": 1}}))
+        self.assertEqual(result["decision"], "pass")
+        self.assertEqual(maximum, 1)
+
+    def test_compact_baseline_cache_retains_failure_evidence_fields(self):
+        evaluator = Evaluator(self.store)
+        evaluator._cache_put("project", "key", [{
+            "name": "acceptance", "argv": ["python3", "check.py"], "cwd": ".",
+            "passed": False, "exit_code": 1, "error": None,
+            "stdout": "x" * 100000, "stderr": "ModuleNotFoundError: missing dependency",
+            "empty_tests": False, "seconds": 1.0}])
+        cached = evaluator._cache_get("project", "key")
+        self.assertNotIn("stdout", cached[0])
+        self.assertEqual(cached[0]["exit_code"], 1)
+        self.assertIn("ModuleNotFoundError", cached[0]["stderr"])
+        self.assertEqual(improvement(
+            {"acceptance_baseline": cached, "acceptance_candidate": [{"passed": True}]},
+            {"change_kind": "behavior"})["decision"], "insufficient_evidence")
+        evaluator._cache_put("project", "long-environment-error", [{
+            "name": "acceptance", "argv": ["python3", "check.py"], "cwd": ".",
+            "passed": False, "exit_code": 1, "error": None,
+            "stdout": "ImportError: private module\n" + ("x" * (CACHE_STDERR_LIMIT + 1024)),
+            "stderr": "", "empty_tests": False, "seconds": 1.0}])
+        long_cached = evaluator._cache_get("project", "long-environment-error")
+        self.assertTrue(long_cached[0]["environment_error"])
+        self.assertEqual(improvement(
+            {"acceptance_baseline": long_cached, "acceptance_candidate": [{"passed": True}]},
+            {"change_kind": "behavior"})["decision"], "insufficient_evidence")
+        evaluator._cache_put("project", "timed-out", [{
+            "name": "slow", "argv": ["sleep"], "passed": False, "exit_code": 0,
+            "error": "Command timed out", "stderr": "", "stdout": ""}])
+        self.assertIsNone(evaluator._cache_get("project", "timed-out"))
+
+    def test_cached_baseline_keeps_unavailable_candidate_detection_intact(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        candidate = snapshot(self.repo, self.root / "candidate")
+        image_id = "sha256:" + "a" * 64
+        unavailable = [False]
+        calls = []
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            label = Path(workspace).name
+            calls.append(label)
+            missing = unavailable[0] and label in ["candidate", "candidate_full"]
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 127 if missing else 0,
+                    "stdout": "" if missing else "Ran 1 test\n",
+                    "stderr": "execvp(): No such file or directory" if missing else "",
+                    "seconds": 0.0, "error": None}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="docker"), \
+                patch("adaptive_rsi.evaluator.run_process", return_value={
+                    "exit_code": 0, "error": None, "stdout": image_id, "stderr": ""}), \
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            first = evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "available", config,
+                                       cache_scope="project", cache_base=base, environment_digest="deps")
+            self.assertEqual(first["decision"], "pass")
+            unavailable[0] = True
+            second = evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "unavailable", config,
+                                        cache_scope="project", cache_base=base, environment_digest="deps")
+        self.assertEqual(second["decision"], "insufficient_evidence")
+        self.assertIn("unavailable", second["reason"])
+        self.assertEqual(calls.count("baseline"), 1)
 
     def import_cases(self):
         for split in ["validation", "holdout"]:
@@ -440,6 +717,7 @@ class EvidenceContractTest(unittest.TestCase):
     def test_failure_codes_and_value_ordering_are_explicit(self):
         self.assertEqual(failure(RuntimeError("Model call budget exhausted"))["code"], "budget")
         self.assertEqual(failure(RuntimeError("Provider HTTP 503"))["action"], "retry_later")
+        self.assertEqual(failure(RuntimeError("opencode_incompatible_2.1.3"))["code"], "environment")
         high = {"impact": "high", "effort": "low", "confidence": "high"}
         low = {"impact": "low", "effort": "high", "confidence": "low"}
         self.assertGreater(value_priority(high, "low"), value_priority(low, "high"))

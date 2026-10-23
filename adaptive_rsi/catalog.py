@@ -247,40 +247,132 @@ def list_models(provider, key=None):
 
 
 def opencode_models():
-    from pathlib import Path
     from .cli_worker import cli_home, clean_environment, run_cli
     from .config import DEFAULTS
-    from .opencode import prepare_home
+    from .opencode import (OpenCodeCompatibilityError, detect_opencode, prepare_home)
     from .process import run_process
     with tempfile.TemporaryDirectory(prefix="rsi-opencode-models-") as directory:
         with cli_home(directory) as home:
-            environment, _ = prepare_home(home)
             binary = shutil.which("opencode")
-            argv = [binary or "opencode", "--pure", "models", "--verbose"]
             if binary:
+                try:
+                    capabilities = detect_opencode(binary)
+                except OpenCodeCompatibilityError as exc:
+                    raise CatalogError(exc.code) from None
+                environment, _ = prepare_home(home, capabilities=capabilities, binary=binary)
                 environment.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
                                     "XDG_DATA_HOME": str(home / ".local/share"), "XDG_CACHE_HOME": str(home / ".cache"),
                                     "XDG_STATE_HOME": str(home / ".local/state")})
-                result = run_process(argv, directory, timeout=TIMEOUT, env={**clean_environment(), **environment})
             elif shutil.which("docker"):
-                result = run_cli(argv, directory, home, DEFAULTS, environment=environment, read_only=True, timeout=TIMEOUT)
+                image = DEFAULTS["sandbox"]["worker_image"]
+                try:
+                    capabilities = detect_opencode(
+                        "opencode", argv=["docker", "run", "--rm", image, "opencode", "--version"],
+                        env=clean_environment())
+                except OpenCodeCompatibilityError as exc:
+                    raise CatalogError(exc.code) from None
+                environment, _ = prepare_home(home, capabilities=capabilities)
             else:
                 raise CatalogError("opencode_missing")
+            def execute(argv):
+                if binary:
+                    return run_process([binary, *argv[1:]], directory, timeout=TIMEOUT,
+                                       env={**clean_environment(), **environment})
+                return run_cli(argv, directory, home, DEFAULTS, environment=environment,
+                               read_only=True, timeout=TIMEOUT)
+            if capabilities.modern:
+                result = execute(["opencode", "api", "GET", "/api/model", "--standalone"])
+                if not result["exit_code"] and not result["error"]:
+                    try:
+                        models = parse_opencode_v2_models(result["stdout"])
+                    except (ValueError, TypeError):
+                        models = None
+                    if models is not None:
+                        return {"models": models[:MAX_MODELS], "truncated": len(models) > MAX_MODELS}
+                if _incompatible_output(result):
+                    raise CatalogError(capabilities.incompatible_code)
+                # v2 的纯 ID 列表是 API 不可用时的保守兜底，不包含 variants。
+                result = execute(capabilities.models_argv("opencode"))
+            else:
+                result = execute(capabilities.models_argv("opencode"))
             if result["exit_code"] or result["error"]:
+                if _incompatible_output(result):
+                    raise CatalogError(capabilities.incompatible_code)
                 raise CatalogError("opencode_error")
-            text, models = result["stdout"], []
-            decoder = json.JSONDecoder()
-            while text.strip():
-                line, separator, text = text.lstrip().partition("\n")
-                if not re.fullmatch(r"[a-zA-Z0-9._/:-]+/[a-zA-Z0-9._/:-]+", line):
-                    continue
+            if capabilities.modern:
+                models = parse_opencode_v2_ids(result["stdout"])
+            else:
                 try:
-                    metadata, end = decoder.raw_decode(text.lstrip())
-                    text = text.lstrip()[end:]
+                    models = parse_opencode_v1_models(result["stdout"])
                 except ValueError:
                     raise CatalogError("invalid_response") from None
-                if metadata.get("capabilities", {}).get("toolcall") is False:
-                    continue
-                variants = metadata.get("variants", {})
-                models.append({"id": line, "name": metadata.get("providerID", line.split("/")[0]) + " / " + metadata.get("name", line), "efforts": sorted(variants)})
-            return {"models": models, "truncated": False}
+            return {"models": models[:MAX_MODELS], "truncated": len(models) > MAX_MODELS}
+
+
+def _incompatible_output(result):
+    text = (result.get("stderr", "") + "\n" + result.get("stdout", "")).lower()
+    return any(marker in text for marker in [
+        "unknown option", "unknown flag", "unexpected argument", "invalid option",
+        "invalid value for flag", "unrecognized option"])
+
+
+def parse_opencode_v2_models(text):
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("invalid OpenCode model response")
+    models = {}
+    for row in data["data"]:
+        if not isinstance(row, dict):
+            continue
+        provider = row.get("providerID")
+        model_id = row.get("modelID")
+        if not isinstance(provider, str) or not isinstance(model_id, str):
+            continue
+        full_id = provider + "/" + model_id
+        if not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", full_id):
+            continue
+        capabilities = row.get("capabilities", {})
+        if isinstance(capabilities, dict) and capabilities.get("tools") is False:
+            continue
+        variants = row.get("variants", [])
+        efforts = sorted({item.get("id") for item in variants
+                          if isinstance(item, dict) and isinstance(item.get("id"), str)
+                          and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", item["id"])})
+        name = row.get("name") if isinstance(row.get("name"), str) else model_id
+        models[full_id] = {"id": full_id, "name": provider + " / " + name[:160], "efforts": efforts}
+    return sorted(models.values(), key=lambda model: model["id"].casefold())
+
+
+def parse_opencode_v2_ids(text):
+    models = {}
+    for line in text.splitlines():
+        model = line.strip()
+        if re.fullmatch(r"[a-zA-Z0-9._/:-]+/[a-zA-Z0-9._/:-]+", model):
+            models[model] = {"id": model, "name": model, "efforts": []}
+    return sorted(models.values(), key=lambda model: model["id"].casefold())
+
+
+def parse_opencode_v1_models(text):
+    models = []
+    decoder = json.JSONDecoder()
+    while text.strip():
+        line, _, text = text.lstrip().partition("\n")
+        if not re.fullmatch(r"[a-zA-Z0-9._/:-]+/[a-zA-Z0-9._/:-]+", line):
+            continue
+        try:
+            metadata, end = decoder.raw_decode(text.lstrip())
+            text = text.lstrip()[end:]
+        except ValueError:
+            raise ValueError("invalid OpenCode metadata") from None
+        if not isinstance(metadata, dict) or metadata.get("capabilities", {}).get("toolcall") is False:
+            continue
+        variants = metadata.get("variants", {})
+        efforts = sorted(variants) if isinstance(variants, dict) else []
+        provider = metadata.get("providerID", line.split("/")[0])
+        name = metadata.get("name", line)
+        if not isinstance(provider, str):
+            provider = line.split("/")[0]
+        if not isinstance(name, str):
+            name = line
+        models.append({"id": line, "name": provider + " / " + name, "efforts": efforts})
+    return models

@@ -1,3 +1,5 @@
+import re
+
 from .agent import REVIEW_AREAS, SCHEMAS, validate_output
 from .config import relative_path
 
@@ -19,6 +21,39 @@ Critical/high findings must block. Medium means a material defect or maintainabi
 low means a nonblocking improvement. Use insufficient_evidence when an area cannot be assessed.
 Return all six assessments and findings, including an empty findings array if appropriate.
 """
+
+
+SENSITIVE_PATH = re.compile(
+    r"(?:^|/)(?:(?:auth(?:entication|orization)?|credentials?|secrets?|permissions?|security|"
+    r"sandbox|process|cli_worker|server|runtime|pipeline|opencode|"
+    r"deploy(?:ment)?|release|upgrade|updates?|delivery|migrations?|database|db|schema|"
+    r"dependenc(?:y|ies))(?:[_-][a-z0-9_-]+)?|"
+    r"package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|pyproject\.toml|requirements[^/]*\.txt|"
+    r"setup\.(?:py|cfg)|poetry\.lock|uv\.lock|go\.(?:mod|sum)|Cargo\.(?:toml|lock)|"
+    r"composer\.(?:json|lock)|Gemfile(?:\.lock)?)"
+    r"(?:$|/|\.)", re.I)
+SENSITIVE_PATCH = re.compile(
+    r"\b(?:auth(?:entication|orization)?|permissions?|credentials?|secrets?|tokens?|oauth|sessions?|"
+    r"roles?|admin|deploy(?:ment)?|release|upgrade|migrations?|schema|database|public\s+api|"
+    r"export(?:ed)?|__all__|dependencies|package-lock|pnpm-lock|yarn\.lock)\b", re.I)
+
+
+def risk_review_required(plan, review, files=(), patch=""):
+    """Request a fresh review only for concrete sensitive changes or weak first evidence."""
+    if plan.get("risk") != "high":
+        return False
+    if review.get("decision") == "insufficient_evidence":
+        return True
+    if any(assessment.get("decision") == "insufficient_evidence"
+           for assessment in review.get("assessments", [])):
+        return True
+    if review.get("decision") != "pass":
+        return False
+    if any(SENSITIVE_PATH.search(str(path)) for path in files):
+        return True
+    changed = [line[1:] for line in str(patch).splitlines()
+               if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    return any(SENSITIVE_PATCH.search(line) for line in changed)
 
 
 def enforce_review(review, config):

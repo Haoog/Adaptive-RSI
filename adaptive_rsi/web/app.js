@@ -426,6 +426,8 @@ const failureNext={checks:'先查看失败的检查项，修正代码或补充�
 function failureCopy(problem){return t(failureMessages[problem.code]||failureMessages.execution);}
 function readinessDetail(item){
  const missing=Array.isArray(item.missing)?item.missing:[],model=item.provider&&item.model?item.provider+' / '+item.model+' · '+(item.effort||'default')+'：':'';
+ const compatibility=String(item.reason||'').match(/^opencode_incompatible_(\d+\.\d+\.\d+)$/);
+ if(compatibility)return t('已检测到 OpenCode ')+compatibility[1]+t('，当前命令参数不兼容。请升级 Adaptive RSI，或临时使用 OpenCode 1.19.3。');
  const reasons={
   checks_missing:'尚未配置项目检查命令，请先在设置中添加。',
   sandbox_unavailable:'没有可用的独立运行环境，请检查运行环境设置。',

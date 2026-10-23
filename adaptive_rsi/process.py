@@ -6,8 +6,30 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+
+PROBE_TTL_SECONDS = 30
+_PROBE_LOCK = threading.Lock()
+_PROBE_CACHE = {}
+
+
+def _cached_probe(key, probe):
+    """Cache process-local sandbox probe results for a short interval."""
+    now = time.monotonic()
+    with _PROBE_LOCK:
+        cached = _PROBE_CACHE.get(key)
+        if cached and now - cached[0] < PROBE_TTL_SECONDS:
+            return cached[1]
+        # Keep concurrent checks from duplicating the same docker probe.
+        value = probe()
+        _PROBE_CACHE[key] = (time.monotonic(), value)
+        if len(_PROBE_CACHE) > 32:
+            oldest = min(_PROBE_CACHE, key=lambda item: _PROBE_CACHE[item][0])
+            _PROBE_CACHE.pop(oldest, None)
+        return value
 
 
 class Cancelled(RuntimeError):
@@ -85,8 +107,11 @@ class Sandbox:
         requested = self.config["sandbox"]["backend"]
         if requested in ["auto", "seatbelt"] and platform.system() == "Darwin" and shutil.which("sandbox-exec"):
             return "seatbelt"
-        if requested in ["auto", "docker"] and shutil.which("docker"):
-            info = run_process(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=8)
+        docker = shutil.which("docker")
+        if requested in ["auto", "docker"] and docker:
+            key = ("backend", requested, platform.system(), docker)
+            info = _cached_probe(key, lambda: run_process(
+                ["docker", "info", "--format", "{{.ServerVersion}}"], timeout=8))
             if info["exit_code"] == 0:
                 return "docker"
         raise RuntimeError("No working sandbox. Enable Docker or use macOS sandbox-exec.")
@@ -154,7 +179,9 @@ class Sandbox:
         if backend == "docker":
             limits = self.config["sandbox"]
             image = limits["image"]
-            found = run_process(["docker", "image", "inspect", image], timeout=10)
+            docker = shutil.which("docker")
+            found = _cached_probe(("image", docker, image), lambda: run_process(
+                ["docker", "image", "inspect", image], timeout=10))
             if found["exit_code"]:
                 raise RuntimeError("Sandbox image is not cached. Pull it explicitly: " + image)
             command = ["docker", "run", "--rm", "--network=none", "--read-only", "--cap-drop=ALL",

@@ -1,7 +1,7 @@
 'use strict';
 window.RSIUsage=(()=>{
  let offset=0,sequence=0,detailSequence=0,report=null,timer=null;
- const usageRoleNames={acceptance:'验收设计'};
+ const usageRoleNames={triage:'价值初筛',acceptance:'验收设计'};
  const number=value=>Number(value||0).toLocaleString(language);
  const token=value=>number(value.tokens)+(value.unknown_calls?' + '+t('部分未知'):'');
  const seconds=value=>Math.round(value||0)+' '+t('秒');

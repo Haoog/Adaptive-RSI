@@ -25,11 +25,57 @@ def doctor():
     result = {"python": sys.version.split()[0], "platform": platform.system(), "version": __version__}
     for tool in ["git", "codex", "opencode", "gh", "docker", "sandbox-exec"]:
         result[tool] = shutil.which(tool)
+    def opencode_compatibility(capabilities=None, error=None, transport="host"):
+        from .opencode import OpenCodeCompatibilityError
+        result["opencode_transport"] = transport
+        if capabilities:
+            result["opencode_version"] = capabilities.version
+            result["opencode_compatibility"] = "supported"
+            result["opencode_commands"] = {
+                "models": "api:/api/model" if capabilities.modern else "legacy:metadata",
+                "run": "model#variant" if capabilities.modern else "variant-flag",
+                "serve": "v2" if capabilities.modern else "v1",
+            }
+            return
+        result["opencode_version"] = ((error.version or None)
+                                      if isinstance(error, OpenCodeCompatibilityError) else None)
+        result["opencode_compatibility"] = "unsupported"
+        version = result["opencode_version"] or "version unknown"
+        result["opencode_diagnostic"] = (
+            "Detected OpenCode " + version +
+            "; its command parameters are incompatible. Upgrade Adaptive RSI or temporarily use OpenCode 1.19.3. "
+            "Adaptive RSI does not upgrade or downgrade OpenCode automatically.")
+    if result["opencode"]:
+        from .opencode import OpenCodeCompatibilityError, detect_opencode
+        try:
+            opencode_compatibility(detect_opencode(result["opencode"]))
+        except OpenCodeCompatibilityError as exc:
+            opencode_compatibility(error=exc)
     if result["codex"]:
         result["codex_authenticated"] = run_process(["codex", "login", "status"], timeout=10)["exit_code"] == 0
     if result["docker"]:
         info = run_process(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=8)
         result["docker_running"] = info["exit_code"] == 0
+    if not result["opencode"] and result.get("docker_running"):
+        from .config import DEFAULTS
+        from .opencode import OpenCodeCompatibilityError, detect_opencode
+        image = DEFAULTS["sandbox"]["worker_image"]
+        result["opencode_worker"] = image
+        inspected = run_process(["docker", "image", "inspect", image], timeout=10)
+        result["opencode_worker_available"] = inspected["exit_code"] == 0 and not inspected["error"]
+        if result["opencode_worker_available"]:
+            try:
+                capabilities = detect_opencode(
+                    "opencode", argv=[result["docker"], "run", "--rm", image, "opencode", "--version"])
+                opencode_compatibility(capabilities, transport="docker")
+            except OpenCodeCompatibilityError as exc:
+                opencode_compatibility(error=exc, transport="docker")
+        else:
+            result["opencode_transport"] = "docker"
+            result["opencode_compatibility"] = "worker_missing"
+            result["opencode_diagnostic"] = (
+                "OpenCode CLI is not installed on the host and the configured Docker worker image is unavailable. "
+                "Install OpenCode 1.19.3/2.x on the host or build the worker image; Adaptive RSI does not change versions automatically.")
     if result["sandbox-exec"]:
         probe = run_process(["sandbox-exec", "-p", "(version 1)(allow default)(deny network*)", "/usr/bin/true"], timeout=5)
         result["seatbelt_working"] = probe["exit_code"] == 0

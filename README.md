@@ -80,7 +80,7 @@ python3 scripts/rsi doctor
 | 使用方式 | 适用场景 |
 | --- | --- |
 | Codex CLI | OpenAI/Codex 账号及兼容 Responses 的网关 |
-| OpenCode CLI | OpenCode 已配置的供应商及 API/OAuth 登录 |
+| OpenCode CLI | OpenCode 1.19.3 / 2.1.3 已配置的供应商及 API/OAuth 登录 |
 | Responses / Chat Completions | OpenAI 官方 API、DeepSeek、兼容 Qwen、中转站和 LM Studio |
 | Anthropic / Gemini | 官方 API 及兼容网关 |
 | Ollama | 本机支持工具调用的模型 |

@@ -1,4 +1,19 @@
 """Task evidence contracts shared by production and experiment runs."""
+import re
+
+
+ENVIRONMENT_FAILURE = re.compile(
+    r"ModuleNotFoundError|ImportError|command not found|No such file or directory",
+    re.I,
+)
+
+
+def environment_failure(row):
+    """Keep environment/setup failures distinguishable after cache compaction."""
+    if row.get("environment_error"):
+        return True
+    return bool(ENVIRONMENT_FAILURE.search(
+        (row.get("stdout") or "") + "\n" + (row.get("stderr") or "")))
 
 
 def change_kind(task):
@@ -29,7 +44,6 @@ def improvement(results, acceptance):
     import re
     changed = [i for i, (old, new) in enumerate(zip(before, after)) if not old["passed"] and new["passed"]
                and not old.get("error") and old.get("exit_code", 0) != 0
-               and not re.search(r"ModuleNotFoundError|ImportError|command not found|No such file or directory",
-                                 old.get("stderr", ""))]
+               and not environment_failure(old)]
     return {"decision": "pass" if changed else "insufficient_evidence", "kind": kind,
             "improved_checks": changed, "basis": "independent_behavior_before_after"}

@@ -81,6 +81,51 @@ class ServerExecutionTest(unittest.TestCase):
         self.assertEqual(len(self.store.query("SELECT * FROM tasks WHERE source='inspection'")), 8)
         validate_output({"findings": findings * 20}, SCHEMAS["analysis"])
 
+    def test_inspection_batch_triage_keeps_evidence_and_only_queues_valuable_findings(self):
+        findings = [
+            {"title": "Cosmetic naming " + str(i), "body": "A low-value naming preference",
+             "path": "calculator.py", "quote": "return a - b", "acceptance": ["Names are clearer"],
+             "priority": priority}
+            for i, priority in enumerate([20, 30, 40, 80])
+        ]
+        findings.append({**findings[0], "body": "Duplicate report at the same anchor"})
+        calls = []
+        def invoke(role, prompt, workspace, run):
+            calls.append(role)
+            if role == "analysis":
+                return {"findings": findings}
+            if role == "triage":
+                return {"findings": [
+                    {"index": 0, "decision": "rejected", "confidence": "high", "reason": "Cosmetic churn"},
+                    {"index": 1, "decision": "deferred", "confidence": "medium", "reason": "Weak current value"},
+                    {"index": 2, "decision": "ready", "confidence": "high", "reason": "Concrete maintenance benefit"},
+                    {"index": 3, "decision": "rejected", "confidence": "high", "reason": "Should be protected by priority"},
+                ]}
+            raise AssertionError(role)
+        with patch.object(self.runtime, "invoke", side_effect=invoke):
+            self.runtime.inspect(
+                self.runtime.project(self.project), self.repo, "light",
+                {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        rows = self.store.query("SELECT id,title,state,evidence FROM tasks WHERE source='inspection' ORDER BY title")
+        self.assertEqual(calls.count("analysis"), 1)
+        self.assertEqual(calls.count("triage"), 1)
+        states = {row["title"].split()[-1]: row["state"] for row in rows}
+        self.assertEqual(states, {"0": "rejected", "1": "deferred", "2": "queued", "3": "queued"})
+        self.assertTrue(all(json.loads(row["evidence"])[0]["quote"] == "return a - b" for row in rows))
+        deferred = next(row for row in rows if row["title"].endswith("1"))
+        config = self.runtime.config(self.project)
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.runtime.reassess_deferred(self.project, config, head)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (deferred["id"],))["state"], "deferred")
+        (self.repo / "calculator.py").write_text((self.repo / "calculator.py").read_text() + "\n# new baseline\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m", "new baseline")
+        self.runtime.reassess_deferred(self.project, config, git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (deferred["id"],))["state"], "queued")
+        validate_output({"findings": [
+            {"index": 0, "decision": "ready", "confidence": "high", "reason": "Concrete defect"}]},
+            SCHEMAS["triage"])
+
     def test_issues_paginate_past_old_total_limit(self):
         config = merge(DEFAULTS, {"github": {"repository": "owner/project", "max_issues": 1}})
         pages = []

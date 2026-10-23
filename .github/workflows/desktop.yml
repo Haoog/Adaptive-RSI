@@ -4,6 +4,8 @@ on:
     paths:
       - 'desktop/**'
       - 'adaptive_rsi/**'
+      - 'pyproject.toml'
+      - 'scripts/package.py'
       - 'scripts/package_desktop.py'
       - '.github/workflows/release.yml'
       - '.github/workflows/release-verify.yml'
@@ -12,34 +14,88 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: desktop-${{ github.event.pull_request.number || github.ref }}
+  group: desktop-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.classify.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+              base="$BASE_SHA"
+            else
+              git fetch --no-tags origin "$BASE_REF" --depth=1
+              base="$(git rev-parse FETCH_HEAD)"
+            fi
+            git diff --name-only "$base" HEAD > /tmp/rsi-desktop-paths
+          else
+            : > /tmp/rsi-desktop-paths
+          fi
+          mode="$(python3 scripts/package_desktop.py classify --event "$EVENT_NAME" < /tmp/rsi-desktop-paths)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Desktop build mode: $mode"
+          cat /tmp/rsi-desktop-paths
   desktop-macos:
+    needs: changes
+    if: needs.changes.outputs.mode != 'skip'
     runs-on: macos-14
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
+        if: needs.changes.outputs.mode == 'full'
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
       - uses: astral-sh/setup-uv@v6
-      - name: 安装桌面构建工具
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.mode == 'full'
+        with:
+          workspaces: desktop/src-tauri -> target
+          key: ${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+      - name: 安装构建工具
+        env:
+          MODE: ${{ needs.changes.outputs.mode }}
         run: |
           rustup default stable
-          npm ci --prefix desktop
-      - name: 构建应用和安装包
-        run: npm run --prefix desktop build
-      - name: 验证桥接边界与独立引擎
+          if [ "$MODE" = full ]; then
+            npm ci --prefix desktop
+          fi
+      - name: 构建并启动 bundled engine
+        if: needs.changes.outputs.mode == 'smoke'
         run: |
+          python3 desktop/scripts/engine.py
+          python3 scripts/package_desktop.py smoke-engine desktop/src-tauri/binaries/adaptive-rsi-engine-*
+      - name: 构建应用和完整安装包
+        if: needs.changes.outputs.mode == 'full'
+        run: |
+          npm run --prefix desktop build
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
           python3 scripts/package_desktop.py
           VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
-          hdiutil verify "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+          DMG="dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
           (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
+          python3 scripts/package_desktop.py verify-dmg --image "$DMG"
       - uses: actions/upload-artifact@v4
+        if: needs.changes.outputs.mode == 'full'
         with:
           name: adaptive-rsi-macos-${{ runner.arch }}-adhoc
           path: dist/adaptive-rsi-*-macos-arm64-adhoc.dmg*

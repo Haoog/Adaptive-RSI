@@ -17,6 +17,8 @@ def failure(exc):
         code, action = "budget", "wait_or_adjust_budget"
     elif any(s in lower for s in ["credential", "api key", "environment variable", "unauthorized", "401"]):
         code, action = "credentials", "check_model_settings"
+    elif "opencode_incompatible" in lower or "opencode command compatibility" in lower:
+        code, action = "environment", "check_environment"
     elif any(s in lower for s in ["rate limit", "429", "503", "timeout", "timed out", "provider", "connection"]):
         code, action = "provider", "retry_later"
     elif any(s in lower for s in ["dependency", "seed", "sandbox", "executable", "not installed"]):
