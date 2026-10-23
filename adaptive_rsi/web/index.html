@@ -1,12 +1,12 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Adaptive RSI · 控制台</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/model-center.css"><script src="/i18n.js" defer></script><script src="/desktop.js" defer></script><script src="/app.js" defer></script><script src="/auth.js" defer></script><script src="/model-center.js" defer></script><script src="/usage.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#225d46"><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon-192.png"><title>Adaptive RSI · 控制台</title><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/model-center.css"><script src="/i18n.js" defer></script><script src="/desktop.js" defer></script><script src="/app.js" defer></script><script src="/auth.js" defer></script><script src="/model-center.js" defer></script><script src="/usage.js" defer></script><script src="/experience.js" defer></script></head>
 <body>
 <aside class="sidebar">
  <a class="brand" href="/" aria-label="Adaptive RSI 首页"><span class="brand-mark">a<span>↗</span></span><span>adaptive<small>RSI</small></span></a>
  <div class="sidebar-projects"><label for="project-select">当前项目</label><select id="project-select" aria-label="当前项目"><option value="">选择项目</option></select><button class="text-button" id="add-project">＋ 添加项目</button></div>
  <nav aria-label="主导航"><button class="nav active" data-view="overview">工作台<span class="nav-count" id="queue-count">0</span></button><button class="nav" data-view="models">模型服务</button><button class="nav" data-view="usage">记录与用量</button></nav>
- <div class="sidebar-bottom"><button class="nav" data-view="evolution">自我改进记录</button><button class="nav" id="global-settings">通用设置</button><small><span class="live-dot"></span>服务运行中</small><small id="version">Adaptive RSI</small></div>
+ <div class="sidebar-bottom"><button class="nav" id="attention-inbox">所有项目待办</button><button class="nav" id="mobile-install">手机安装</button><button class="nav" id="storage-tools">数据与诊断</button><button class="nav" data-view="evolution">自我改进记录</button><button class="nav" id="global-settings">通用设置</button><small><span class="live-dot"></span>服务运行中</small><small id="version">Adaptive RSI</small></div>
 </aside>
 <main>
  <header class="topbar"><span id="page-name">工作台</span><div class="project-tools"><button class="text-button" id="project-settings">项目设置</button><button class="text-button" data-view="overview" id="back-workspace" hidden>返回工作台</button><select id="language-select" aria-label="Language / 语言"><option value="zh-CN">中文</option><option value="en">English</option></select></div></header>

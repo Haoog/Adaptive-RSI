@@ -40,7 +40,9 @@ class ProviderHealth:
 
     def require(self, config, provider, project):
         if self.status(config, provider, project)["paused"]:
-            raise ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
+            error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
+            error.provider_id = provider
+            raise error
 
     def record(self, config, provider, project, error=None):
         code = error_code(error) if error else None

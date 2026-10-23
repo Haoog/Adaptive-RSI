@@ -45,7 +45,7 @@ jobs:
           docs_only=true
           while IFS= read -r path; do
             case "$path" in
-              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
+              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|EXPERIENCE.md|EXPERIENCE.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
               *) docs_only=false; break ;;
             esac
           done < /tmp/rsi-changed-paths
@@ -83,7 +83,7 @@ jobs:
             modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
           - name: 隔离、调度与体验
             os: ubuntu-latest
-            modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience
+            modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience tests.test_workflow_experience
           - name: 交付循环
             os: ubuntu-latest
             modules: tests.test_delivery_loop
@@ -96,6 +96,7 @@ jobs:
           - name: 运营、发现与文档
             os: ubuntu-latest
             modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report
+
           - name: 服务器、协议与集成
             os: ubuntu-latest
             modules: tests.test_auth_sessions tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker
@@ -158,7 +159,8 @@ jobs:
             tests.test_reliability.ReliabilityTest.test_changed_baseline_invalidates_recovery_cache \
             tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry \
             tests.test_reliability.ReliabilityTest.test_high_risk_requires_additional_review_and_preserves_blocking_result \
-            tests.test_reliability.ReliabilityTest.test_ordinary_high_risk_does_not_force_a_second_review
+            tests.test_reliability.ReliabilityTest.test_ordinary_high_risk_does_not_force_a_second_review \
+            tests.test_workflow_experience.ExperienceTest.test_review_rejection_reaches_next_implementation_without_sealed_source
 
   javascript:
     needs: changes
@@ -174,6 +176,9 @@ jobs:
       - run: node --check adaptive_rsi/web/i18n.js
       - run: node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
+      - run: node --check adaptive_rsi/web/experience.js
+      - run: node --check adaptive_rsi/web/install.js
+      - run: node --check adaptive_rsi/web/sw.js
       - run: node --test tests/web_requests.cjs
 
   browser:

@@ -255,6 +255,8 @@ class Evaluator:
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
         key = self._cache_key(cache_scope, cache_base, acceptance["checks"], execution_config,
                               environment_digest, execution_identity, acceptance.get("hash"))
+        if acceptance.get("change_kind") == "performance":
+            key = None
         cached = self._cache_get(cache_scope, key)
         if cached is not None:
             return {"rows": cached, "execution_environment": execution_identity}
@@ -286,6 +288,8 @@ class Evaluator:
         acceptance_key = self._cache_key(cache_scope, cache_base, acceptance["checks"], execution_config,
                                          environment_digest, execution_identity,
                                          acceptance.get("hash")) if acceptance else None
+        if acceptance and acceptance.get("change_kind") == "performance":
+            acceptance_key = None
         cached_acceptance = None
         acceptance_identity_matches = (
             acceptance_baseline is not None and
@@ -364,6 +368,8 @@ class Evaluator:
                 data.update(decision="insufficient_evidence", reason="Checks passed but task-specific improvement is unproven")
             data["acceptance_hash"] = acceptance["hash"]
             data["criteria"] = acceptance["criteria"]
+            data["coverage"] = [{"name": check["name"], "criteria": check["criteria"]} for check in acceptance["spec"]["checks"]]
+            data["contract"] = acceptance.get("contract")
         if unavailable:
             data["reason"] = "Required check executable is unavailable; candidate remains unverified"
         Path(directory).mkdir(parents=True, exist_ok=True)

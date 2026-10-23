@@ -212,7 +212,7 @@ class ModelCenter:
         self.provider(provider_id, project)
         ProviderHealth(self.store).reset(self.runtime.config(project), provider_id, project or "model-center")
         self.store.event("provider_resumed", "Provider resumed by user", project, data={"provider": provider_id})
-        return {"saved": True}
+        return {"saved": True, "resumed_tasks": self.runtime.resume_provider_tasks(provider_id, project)}
 
     def save_routes(self, routes, project=None):
         if not isinstance(routes, dict) or set(routes) != set(self.runtime.config()["models"]):

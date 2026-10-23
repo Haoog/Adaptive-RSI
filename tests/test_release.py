@@ -640,7 +640,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         jobs = workflow["jobs"]
         self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
         self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
-        self.assertEqual(jobs["browser"]["runs-on"], "ubuntu-latest")
+        self.assertEqual(jobs["browser"]["runs-on"], "macos-14")
         self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-14")
         self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-14")
         required = set(jobs["verify"]["needs"])
@@ -671,7 +671,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
                         continue
                     decorators = class_decorators + "\n" + "\n".join(
                         ast.unparse(item) for item in method.decorator_list)
-                    if "Darwin" in decorators or "Seatbelt" in decorators:
+                    if ("skipUnless" in decorators or "skipIf" in decorators) and ("Darwin" in decorators or "Seatbelt" in decorators):
                         continue
                     test_id = module + "." + cls.name + "." + method.name
                     with self.subTest(test=test_id):
@@ -690,7 +690,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
                     if not isinstance(method, ast.FunctionDef) or not method.name.startswith("test"):
                         continue
                     decorators = "\n".join(ast.unparse(item) for item in method.decorator_list)
-                    if "Darwin" in decorators or "Seatbelt" in decorators:
+                    if ("skipUnless" in decorators or "skipIf" in decorators) and ("Darwin" in decorators or "Seatbelt" in decorators):
                         expected.add("tests." + path.stem + "." + cls.name + "." + method.name)
         self.assertTrue(expected)
         for test_id in sorted(expected):

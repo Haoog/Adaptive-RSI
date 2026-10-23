@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Add actionable retry feedback, independent connection backoff, deferral wake conditions, dependency/urgency queues and task-level workflow timing and quality metrics.
+- Restore mobile navigation and provide a PWA installation page with the actual installation URL; add live details, lazy history, acceptance comparisons, attention notifications and idempotent submission.
+- Add same-task requirement revisions, typed evidence contracts, backup/restore and redacted diagnostics while retaining independent acceptance and delivery authorization gates.
 - Distinguish documentation from code checks; run grouped Python tests, browser, JavaScript, packaging and Linux checks in parallel, and cancel unfinished checks for an older commit when a newer push arrives.
 - Reuse planning, acceptance, implementation and review caches by the settings each stage actually uses; skip model inspection for documentation-only changes and prioritize existing repair work over more findings.
 - Use code content to locate files for Chinese goals, compare similar findings by evidence to avoid duplicates while preserving distinct defects.

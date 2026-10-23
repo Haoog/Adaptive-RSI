@@ -109,7 +109,8 @@ class RelatedWorkTest(unittest.TestCase):
                 task = runtime.goal(project, "Fix addition")
                 runtime.process(store.claim(project, runtime.config(project)))
                 self.assertEqual([role for role, _ in runtime.agent.roles].count("planning"), 1)
-                self.assertEqual(store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+                self.assertEqual(store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+                self.assertGreater(store.one("SELECT available FROM tasks WHERE id=?", (task,))["available"], time.time())
                 store.execute("UPDATE runs SET result=? WHERE id='related-run'",
                               (encode({"summary": "New related evidence", "pr": "https://github.com/example/project/pull/7"}),))
                 runtime.retry(task)

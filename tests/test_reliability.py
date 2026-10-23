@@ -81,7 +81,7 @@ class ReliabilityTest(unittest.TestCase):
         task, run = self.claim()
         with patch.object(self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate) as evaluate:
             self.runtime.process(run)
-            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
             self.runtime.retry(task)
             second = self.store.claim(self.project, self.runtime.config(self.project))
             self.runtime.process(second)
@@ -341,6 +341,35 @@ class ReliabilityTest(unittest.TestCase):
             self.assertGreaterEqual(sum(label == "candidate_full" for label, _, _ in calls), 5)
             self.assertTrue(all(image == image_id for _, _, image in calls))
 
+    def test_performance_acceptance_remeasures_baseline_on_repeated_runs(self):
+        acceptance = {"spec": {"files": [], "checks": []}, "checks": CHECKS, "criteria": [], "hash": "benchmark",
+                      "change_kind": "performance", "contract": {"threshold": {
+                          "metric": "latency", "unit": "ms", "target": 5, "tolerance": 1,
+                          "direction": "lower"}}}
+        evaluator = Evaluator(self.store)
+        config = self.runtime.config(self.project)
+        identity = {"backend": "docker", "image_id": "sha256:" + "a" * 64}
+        labels = []
+        def stage(label, *args):
+            labels.append(label)
+            value = 10 if label == "acceptance_baseline" else 4
+            return {"rows": [{"passed": True, "exit_code": 0, "error": None, "stderr": "",
+                              "stdout": json.dumps({"metric": "latency", "unit": "ms", "value": value})}]}
+        with patch.object(evaluator, "_execution_environment", return_value=(config, identity)), \
+                patch.object(evaluator, "_acceptance_stage", side_effect=stage), \
+                patch.object(evaluator, "_standard_stage", side_effect=stage):
+            for name in ["first", "second"]:
+                directory = self.root / name
+                early = evaluator.evaluate_acceptance_baseline(
+                    self.repo, acceptance, directory, config, cache_scope=self.project, cache_base="base")
+                result = evaluator.evaluate(self.repo, self.repo, CHECKS, directory, config,
+                    acceptance=acceptance, acceptance_baseline=early,
+                    cache_scope=self.project, cache_base="base")
+                self.assertEqual(result["decision"], "pass")
+                self.assertEqual(result["improvement"]["before"], 10)
+                self.assertEqual(result["improvement"]["after"], 4)
+        self.assertEqual(labels.count("acceptance_baseline"), 2)
+
     def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
         base = git(self.repo, "rev-parse", "HEAD")
         candidate = snapshot(self.repo, self.root / "candidate")
@@ -411,7 +440,7 @@ class ReliabilityTest(unittest.TestCase):
         first = "sha256:" + "a" * 64
         second = "sha256:" + "b" * 64
         acceptance = {
-            "spec": {"files": []},
+            "spec": {"files": [], "checks": []},
             "checks": [{"name": "acceptance", "cwd": ".", "argv": ["true"]}],
             "criteria": [],
             "hash": "acceptance-hash",

@@ -367,11 +367,27 @@ fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
         .map_err(|_| "Cannot open link".into())
 }
 #[tauri::command]
-fn notify(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
+fn notify(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+    task: Option<String>,
+    project: Option<String>,
+) -> Result<(), String> {
+    let origin = app
+        .state::<RuntimeState>()
+        .target
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.origin.clone());
     app.notification()
         .builder()
         .title(title.chars().take(100).collect::<String>())
         .body(body.chars().take(500).collect::<String>())
+        .extra("task", task)
+        .extra("project", project)
+        .extra("origin", origin)
         .show()
         .map_err(|_| "Cannot show notification".into())
 }
@@ -404,6 +420,23 @@ fn main() {
             }
         })
         .setup(|app| {
+            let handle = app.handle().clone();
+            app.notification().on_action(move |action| {
+                if action.action_id() != "tap" { return; }
+                if let Some(notification) = action.notification() {
+                    let extra = notification.extra();
+                    let origin = handle.state::<RuntimeState>().target.lock().unwrap().as_ref().map(|c| c.origin.clone());
+                    if extra.get("origin").and_then(Value::as_str) != origin.as_deref() || origin.is_none() { return; }
+                    if let (Some(task), Some(project)) = (extra.get("task").and_then(Value::as_str), extra.get("project").and_then(Value::as_str)) {
+                        if let Some(window) = handle.get_webview_window("main") {
+                            let payload = json!({"task": task, "project": project});
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                            let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('rsi-notification-open',{{detail:{payload}}}))"));
+                        }
+                    }
+                }
+            })?;
             let open = MenuItem::with_id(app, "open", "打开 Adaptive RSI", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出 Adaptive RSI", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
