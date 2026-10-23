@@ -27,6 +27,8 @@ Keep temporary UI-check projects paused to avoid unintended model calls. Store r
 
 GitHub main-branch protection requires a PR, successful `verify` checks against the latest main, and resolved conversations, including administrators. With only one maintainer, a second human approval is not required; this does not establish independent human review.
 
+CI first distinguishes documentation changes from code changes. Documentation-only changes check local links, heading anchors and bilingual pairs. Code changes run grouped Python tests, browser checks, JavaScript checks, packaging and Linux checks in parallel; `verify` only aggregates the required results. A newer push cancels unfinished checks for an older commit. Formal releases still run complete installation and desktop-build verification.
+
 ## Commits and documentation
 
 - Start every change on a new working branch. Do not commit or push directly to `main`. Automated improvements to this repository must also pass checks, code review, and a PR before merging.
@@ -39,6 +41,7 @@ GitHub main-branch protection requires a PR, successful `verify` checks against 
 - Update both READMEs, relevant documentation, and UI translations when changing user-facing features. Chinese is the default UI language; English translations live in `adaptive_rsi/web/i18n.js`.
 - Do not translate user goals, Issue bodies, model output, configuration keys, or raw evidence when switching UI language. Check both static and dynamically rendered text.
 - Verify meaningful behavior and risks. Model-substitute tests do not establish improvements in real model capability.
+- Run model review after the change has been organized. Review the complete diff and affected behavior first; after a narrow fix, focus on the original finding and adjacent code, and repeat a complete review for scheduling, authentication, upgrade, permission or data-boundary changes. Review and tests are both retained; model judgment does not replace fixed checks.
 
 ## Recovering local branches after a merge
 

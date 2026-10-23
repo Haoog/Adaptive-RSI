@@ -104,6 +104,8 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
                 "models" if probe.get("state") != "pass" or catalog_warning else None, reason,
                 {**route_fields, "probe": probe})
 
+    task_proofs = runtime.store.setting("task-proof-current:" + project["id"], {})
+    model_evidence = []
     for role in ["planning", "implementation", "review"]:
         route = config["models"][role]
         primary = route_diagnostic(route)
@@ -113,13 +115,22 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         detail = selected[1]
         if not primary[0] and fallback and fallback[0]:
             detail = "Primary route unavailable (" + primary[1] + "); fallback is ready. " + fallback[1]
+        proof = task_proofs.get(role) if isinstance(task_proofs, dict) else None
+        task_verified = bool(proof and proof.get("provider") == selected[4]["provider"] and
+                             proof.get("model") == selected[4]["model"] and
+                             proof.get("effort") == selected[4]["effort"])
         items.append(item("model", ready, detail, selected[2],
                           reason=selected[3], role=role, provider=selected[4]["provider"], model=selected[4]["model"],
                           effort=selected[4]["effort"], probe=selected[4]["probe"], fallback=route.get("fallback")))
+        model_evidence.append({"role": role, "provider": selected[4]["provider"], "model": selected[4]["model"],
+                               "effort": selected[4]["effort"], "configured": ready,
+                               "tool_tested": selected[4]["probe"].get("state") == "pass",
+                               "task_verified": task_verified})
     usage = budget(runtime.store, project["id"], config, required, run)
     proof = runtime.store.setting("verified-checks:" + project["id"])
     from .gitops import git
     verified = bool(proof and proof["base"] == git(root, "rev-parse", "HEAD") and
                     proof["compatibility"] == compatibility(config))
     return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks,
-            "execution_verified": verified, "checked_at": time.time(), "budget": usage}
+            "execution_verified": verified, "model_evidence": model_evidence,
+            "checked_at": time.time(), "budget": usage}

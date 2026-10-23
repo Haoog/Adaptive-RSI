@@ -1,6 +1,8 @@
 """按真实调用记录归集任务用量，失败重试和未知用量均保留。"""
+import datetime
 import math
 import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 TOTALS = """count(*) AS calls,coalesce(sum(c.tokens),0) AS tokens,
@@ -24,6 +26,11 @@ def report(store, params):
     start, end = float(value("start", now - 7 * 86400)), float(value("end", now))
     if not all(math.isfinite(x) for x in [start, end]) or start < 0 or end <= start:
         raise ValueError("Invalid usage time range")
+    timezone = value("timezone", "UTC")
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError("Invalid usage timezone") from None
     limit, offset = int(value("limit", 25)), int(value("offset", 0))
     if not 1 <= limit <= 100 or not 0 <= offset <= 2**63 - 1:
         raise ValueError("Invalid usage pagination")
@@ -44,8 +51,31 @@ def report(store, params):
     scope = " WHERE " + " AND ".join(where)
     background = "(t.id IS NULL OR substr(t.source,1,7)='system_')"
     summary = store.one("SELECT " + TOTALS + ",count(DISTINCT t.id) AS tasks" + JOIN + scope, args)
-    daily = store.query("SELECT cast(c.created/86400 AS INTEGER)*86400 AS day," + TOTALS + JOIN + scope +
-                        " GROUP BY day ORDER BY day", args)
+    raw_daily = store.query("SELECT c.created,c.tokens,c.input_tokens,c.output_tokens,"
+                            "c.cache_read_tokens,c.cache_write_tokens,c.usage_known,c.state,"
+                            "c.seconds,c.unit_price" + JOIN + scope, args)
+    buckets = {}
+    for row in raw_daily:
+        local = datetime.datetime.fromtimestamp(row["created"], zone).date()
+        bucket = buckets.setdefault(local, {
+            "calls": 0, "tokens": 0, "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0, "model_seconds": 0,
+            "unknown_calls": 0, "failed_calls": 0, "estimated_usd": None})
+        bucket["calls"] += 1
+        bucket["tokens"] += row["tokens"] or 0
+        bucket["input_tokens"] += row["input_tokens"] or 0
+        bucket["output_tokens"] += row["output_tokens"] or 0
+        bucket["cache_read_tokens"] += row["cache_read_tokens"] or 0
+        bucket["cache_write_tokens"] += row["cache_write_tokens"] or 0
+        bucket["model_seconds"] += row["seconds"] or 0
+        bucket["unknown_calls"] += int(not row["usage_known"])
+        bucket["failed_calls"] += int(row["state"] == "failed")
+        if row["usage_known"] and row["unit_price"] is not None:
+            bucket["estimated_usd"] = (bucket["estimated_usd"] or 0) + (row["tokens"] or 0) * row["unit_price"] / 1000000
+    daily = []
+    for day, bucket in sorted(buckets.items()):
+        midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=zone)
+        daily.append({"day": midnight.timestamp(), "date": day.isoformat(), **bucket})
     roles = store.query("SELECT c.role,c.provider,c.model,c.effort," + TOTALS + JOIN + scope +
                         " GROUP BY c.role,c.provider,c.model,c.effort ORDER BY tokens DESC", args)
     group = "coalesce(t.id,'background:' || coalesce(c.project,'global'))"
@@ -59,7 +89,7 @@ def report(store, params):
                         "group_concat(DISTINCT c.provider || '/' || c.model) AS models," + TOTALS + JOIN + scope +
                         " GROUP BY 1 ORDER BY " + sort + ",id LIMIT ? OFFSET ?", [*args, limit, offset])
     result = {"start": start, "end": end, "summary": summary, "daily": daily, "roles": roles,
-              "tasks": tasks, "total": count, "offset": offset, "limit": limit, "timezone": "UTC"}
+              "tasks": tasks, "total": count, "offset": offset, "limit": limit, "timezone": timezone}
     if task:
         result["calls"] = store.query("SELECT c.id,c.run,c.role,c.provider,c.model,c.effort,c.state,c.created,c.unit,"
                                      "c.tokens,c.input_tokens,c.output_tokens,c.cache_read_tokens,c.cache_write_tokens,"

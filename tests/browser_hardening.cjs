@@ -203,6 +203,27 @@ async function checkReadinessInstallAction(browser,url,errors) {
   }finally{await page.close();}
 }
 
+async function checkRunProgress(browser,url,errors) {
+  const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+  await page.route('**/api/state*',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    const project=data.projects.find(row=>row.id===data.selected_project)||data.projects[0];
+    if(project){
+      project.paused=false;
+      const task=data.tasks[0]||{id:'fixture-live-task',title:'验证运行阶段'};
+      data.runs=[{id:'fixture-live-run',project:project.id,task:task.id,state:'evaluating',
+        started:Date.now()/1000-125,ended:null,last_stage:'review',last_stage_at:Date.now()/1000-5}];
+    }
+    await route.fulfill({response,body:JSON.stringify(data)});
+  });
+  try{
+    await page.goto(url);
+    await page.locator('#current-work-detail').filter({hasText:'正在评审改动'}).waitFor();
+    const text=await page.locator('#current-work-detail').textContent();
+    assert.match(text,/已运行/);assert.match(text,/最近进展/);
+  }finally{await page.close();}
+}
+
 async function main() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
@@ -220,6 +241,7 @@ async function main() {
     await checkReadiness(browser, url, false, errors);
     await checkReadiness(browser, url, true, errors);
     await checkReadinessInstallAction(browser,url,errors);
+    await checkRunProgress(browser,url,errors);
     await checkModelForms(browser, url, errors);
     await checkDraftRecovery(browser,url,errors);
     await checkInvalidConfigRepair(browser,url,errors);

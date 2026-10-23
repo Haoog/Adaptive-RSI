@@ -17,6 +17,36 @@ def _issue_comment_cache_evidence(issue_comments):
             if key not in {"status", "fetched_at", "checked_at", "cached_at", "updated_at"}}
 
 
+def _stage_config(config, stage):
+    """Keep unrelated settings out of a cached stage's invalidation key."""
+    role = "planning" if stage == "acceptance" else stage
+    value = {"providers": config["providers"], "models": {role: config["models"][role]},
+             "sandbox": config["sandbox"], "limits": config["limits"]}
+    if stage in ["planning", "acceptance"]:
+        value["triage"] = config["triage"]
+    if stage in ["planning", "acceptance", "implementation"]:
+        value["checks"] = config["checks"]
+        value["environment"] = config["environment"]
+    if stage == "review":
+        value["review"] = config["review"]
+    return value, role
+
+
+def _review_evidence(evaluation):
+    """Review needs outcomes and commands, not large passing check transcripts."""
+    checks = {}
+    for label, rows in (evaluation.get("checks") or {}).items():
+        if not isinstance(rows, list):
+            continue
+        checks[label] = [{key: row.get(key) for key in
+                          ["name", "argv", "cwd", "passed", "exit_code", "error", "empty_tests"] if key in row}
+                         for row in rows]
+    return {"decision": evaluation.get("decision"), "reason": evaluation.get("reason"),
+            "harness_hash": evaluation.get("harness_hash"), "acceptance_hash": evaluation.get("acceptance_hash"),
+            "criteria": evaluation.get("criteria"), "improvement": evaluation.get("improvement"),
+            "checks": checks}
+
+
 def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False):
     """One production path for real tasks and paired experiments; experiments never deliver."""
     config = json.loads(run["config"])
@@ -58,17 +88,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             issue_comments = {"status": "unavailable", "comments": [],
                               "warning": "Issue comments could not be loaded", "updated_at": None}
     comment_evidence = _issue_comment_cache_evidence(issue_comments)
-    stage_key = fingerprint({"inputs": signature(run, task, base, strategies), "dependencies": environment["sha256"],
-                             "outcomes": runtime.outcomes(project["id"]), "prs": runtime.store.setting("prs:" + project["id"], []),
-                             "related_work": overlaps,
-                             "issue_comments": comment_evidence})
-    saved_plan = None if experiment else cached(runtime, run, "planning", stage_key)
-    saved_acceptance = None if experiment else cached(runtime, run, "acceptance", stage_key)
-    saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", stage_key)
+    outcomes = runtime.outcomes(project["id"])
+    open_prs = runtime.store.setting("prs:" + project["id"], [])
+    planning_config, _ = _stage_config(config, "planning")
+    plan_key = fingerprint({"inputs": signature(run, task, base, strategies, planning_config),
+                            "dependencies": environment["sha256"], "outcomes": outcomes, "prs": open_prs,
+                            "related_work": overlaps, "issue_comments": comment_evidence})
+    saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
+    saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
                "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
-               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": runtime.outcomes(project["id"]),
-               "open_prs": runtime.store.setting("prs:" + project["id"], []),
+               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": outcomes,
+               "open_prs": open_prs,
                "related_work": overlaps,
                "untrusted_issue_comment_context": issue_comments,
                "known_tasks": runtime.store.query("SELECT id,title,state FROM tasks WHERE project=? AND id<>? "
@@ -133,7 +164,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             raise RuntimeError("Plan must name narrower scope than the entire repository")
     (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     if not experiment:
-        save(runtime, run, "planning", plan, stage_key)
+        save(runtime, run, "planning", plan, plan_key)
         if saved_plan is None and plan.get("value"):
             higher = runtime.store.one("SELECT id FROM tasks WHERE project=? AND id<>? AND state='queued' "
                                        "AND source NOT LIKE 'system_%' AND available<=? AND priority>? LIMIT 1",
@@ -165,9 +196,15 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         encode({"task": context["task"], "plan": plan}), acceptance_workspace, run)
     acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
     if not experiment:
-        save(runtime, run, "acceptance", spec, stage_key)
+        save(runtime, run, "acceptance", spec, plan_key)
     acceptance["change_kind"] = "refactor" if task["source"] == "rollback" else change_kind(task)
     (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
+    implementation_config, _ = _stage_config(config, "implementation")
+    candidate_key = fingerprint({"inputs": signature(run, task, base, strategies, implementation_config),
+                                 "dependencies": environment["sha256"], "outcomes": outcomes, "prs": open_prs,
+                                 "related_work": overlaps, "issue_comments": comment_evidence,
+                                 "plan": plan, "acceptance_hash": acceptance["hash"], "checks": checks})
+    saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
     transition("executing")
     if saved_candidate:
         result = {"summary": saved_candidate["summary"]}
@@ -197,26 +234,30 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if patch:
         git(workspace, "apply", "--index", str(directory / "candidate.patch"))
     if not experiment:
-        save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, stage_key)
+        save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
     transition("evaluating")
     baseline = snapshot(source, directory / "baseline", base)
     evaluation = runtime.evaluator.evaluate(baseline, workspace, checks, directory / "evaluation", config,
                                          lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance)
     if not experiment:
-        save(runtime, run, "evaluation", evaluation, stage_key)
+        save(runtime, run, "evaluation", evaluation, candidate_key)
     if evaluation["decision"] != "pass" and not experiment:
-        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (stage_key, task["id"]))
+        runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
         return {**evaluation, "evaluation": evaluation}
     if not experiment and evaluation["decision"] == "pass":
         runtime.store.put_setting("verified-checks:" + project["id"], {"base": base, "checks": checks,
                                "compatibility": compatibility(config), "at": time.time()})
     if not experiment:
-        save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, stage_key)
+        save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
+    review_config, _ = _stage_config(config, "review")
+    review_key = fingerprint({"inputs": signature(run, task, base, strategies, review_config),
+                              "plan": plan, "evaluation": _review_evidence(evaluation),
+                              "summary": result["summary"], "patch_hash": fingerprint(patch)})
     review = runtime.invoke("review", REVIEW_PROMPT +
                          "Also review the independent acceptance specification for meaningful behavioral coverage. "
                          "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
-                         encode({"task": context["task"], "plan": plan, "evaluation": evaluation,
+                         encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
                                  "independent_acceptance": acceptance["spec"],
                                  "summary": result["summary"]}), workspace, run)
     review = enforce_review(review, config)
@@ -227,19 +268,19 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
             "Missing negative-path verification must be reported as insufficient evidence. "
             "Do not rely on another reviewer's assessment.\n" +
-            encode({"task": context["task"], "plan": plan, "evaluation": evaluation,
+            encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
                     "independent_acceptance": acceptance["spec"]}), workspace, run), config)
         (directory / "risk-review.json").write_text(encode(risk_review), encoding="utf-8")
         if not experiment:
-            save(runtime, run, "risk_review", risk_review, stage_key)
+            save(runtime, run, "risk_review", risk_review, review_key)
         if risk_review["decision"] != "pass":
             review = risk_review
     (directory / "review.json").write_text(encode(review), encoding="utf-8")
     if not experiment:
-        save(runtime, run, "review", review, stage_key)
+        save(runtime, run, "review", review, review_key)
         if review["decision"] != "pass":
             # A rejected patch must be implemented again, not replayed unchanged.
-            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (stage_key, task["id"]))
+            runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
     outcome = {"decision": review["decision"] if evaluation["decision"] == "pass" else evaluation["decision"], "reason": review["reason"], "summary": result["summary"], "files": files,
                "evaluation": evaluation, "review": review, "risk": plan["risk"], "base": base,
                "risk_review": risk_review,

@@ -99,7 +99,9 @@ Tool-test outcomes are retained per effort with timestamps. Failure invalidates 
 
 Optional blended USD prices (under each model’s **More → Estimated pricing**) per million total tokens are frozen on each call. Blank means unknown; later price edits do not alter history. Estimates do not separate input/output/cache rates, establish a hard monetary limit, or represent invoices; missing provider usage can understate costs. Expand **Usage and quality** on the workspace for 24-hour calls, tokens, duration, failures and estimates, including unpriced calls. Global model-test usage is available here when records exist without a project.
 
-Task lists show titles, status and a short reason. Details retain planned benefit, cost, evidence and scope. Thirty-day quality indicators use runs with acceptance evidence, reviewed runs and repeatedly failing tasks; system inspections are excluded from code-task successes. These statistics do not establish improved capabilities. See [LIVE_VALIDATION.en.md](../LIVE_VALIDATION.en.md) for live validation.
+The standalone usage page groups daily bars and custom date ranges in the current browser timezone, and summarizes tokens by analysis, planning, implementation and review roles. Background checks and retries remain visible in task totals. Timezone affects presentation only; it does not rewrite call timestamps or billing data.
+
+Task lists show titles, status and a short reason. Details retain planned benefit, cost, evidence and scope. Thirty-day quality indicators use runs with acceptance evidence, reviewed runs and repeatedly failing tasks; system inspections are excluded from code-task successes. These statistics do not establish improved capabilities. Model status distinguishes a configured connection, a passing basic tool test, and verification by a real task; the first two do not establish full task capability. See [LIVE_VALIDATION.en.md](../LIVE_VALIDATION.en.md) for live validation.
 
 ```json
 {

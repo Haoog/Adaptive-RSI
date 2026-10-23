@@ -228,14 +228,44 @@ def finding_identity(finding):
                         "title": problem_title(finding["title"])})
 
 
+def _problem_tokens(title):
+    from .context import terms
+    ignored = {"the", "and", "for", "with", "from", "into", "when", "this", "that", "修复", "改进", "问题"}
+    return terms(problem_title(title)) - ignored
+
+
+def _number_tokens(title):
+    import re
+    return set(re.findall(r"\d+", title))
+
+
 def related_task(backlog, finding):
-    """Only collapse the same problem with matching source anchors."""
+    """Collapse exact or near-identical findings without merging variants.
+
+    Different error numbers or distinct behavioral anchors can share nearly all
+    title words, so a token-overlap threshold is never sufficient by itself.
+    """
     title = problem_title(finding["title"])
+    tokens = _problem_tokens(finding["title"])
+    numbers = _number_tokens(finding["title"])
     for row in backlog:
-        if not title or title != problem_title(row["title"]):
+        if not title:
             continue
         evidence = json.loads(row["evidence"])
-        if any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence):
+        same_anchor = any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence)
+        same_path = any(e.get("path") == finding["path"] for e in evidence)
+        if title == problem_title(row["title"]) and same_anchor:
+            return row["id"]
+        # A title repeated at a different source anchor can still describe a
+        # separate defect; leave that decision to the planner.
+        if title == problem_title(row["title"]):
+            continue
+        if not same_path or numbers != _number_tokens(row["title"]):
+            continue
+        other_tokens = _problem_tokens(row["title"])
+        union = tokens | other_tokens
+        overlap = len(tokens & other_tokens) / len(union) if union else 0
+        if overlap >= 0.8:
             return row["id"]
     return None
 

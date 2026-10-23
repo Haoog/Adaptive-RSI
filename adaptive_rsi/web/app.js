@@ -100,6 +100,8 @@ function stamp(seconds){return new Date(seconds*1000).toLocaleString(language,{m
 function scheduleStamp(seconds,timezone){try{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:timezone});}catch{return stamp(seconds);}}
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
+function elapsedCopy(seconds){const value=Math.max(0,Math.round(seconds||0));return value<60?value+' '+t('秒'):value<3600?Math.floor(value/60)+' '+t('分钟'):Math.floor(value/3600)+' '+t('小时')+' '+Math.floor(value%3600/60)+' '+t('分钟');}
+function runningStage(run){if(run.last_stage==='review')return t('正在评审改动');return t({planning:'正在判断是否值得做',executing:'正在修改代码',evaluating:'正在运行检查'}[run.state]||'正在处理任务');}
 async function safe(fn,form){
  if(form&&pendingForms.has(form))return;
  if(form)pendingForms.add(form);
@@ -117,7 +119,8 @@ async function safe(fn,form){
   toast(message,true);
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submit.textContent=label;}}
 }
-function scheduleRefreshPoll(delay=5000){clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{$('connection').textContent=t(error.code==='session_required'?'需要重新登录':'连接中断');});},delay);}
+function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
+function scheduleRefreshPoll(delay=refreshDelay()){clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{$('connection').textContent=t(error.code==='session_required'?'需要重新登录':'连接中断');});},delay);}
 function requestedStateSections(){
  const sections=['core'],project=projectId||null,stale=Date.now()-30000;
  if(view==='evolution'&&(loadedStateSections.candidatesProject!==project||loadedStateSections.candidatesAt<stale))sections.push('candidates');
@@ -194,6 +197,7 @@ function render(){
  const running=runs.find(run=>!run.ended),queue=counts?.find(r=>r.state==='queued')?.count??tasks.filter(task=>task.state==='queued').length;
  $('queue-count').textContent=queue;$('queue-count').hidden=!queue;
  $('current-work').textContent=running?(tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
+ $('current-work-detail').textContent=running?runningStage(running)+' · '+t('已运行')+' '+elapsedCopy(Date.now()/1000-running.started)+(running.last_stage_at?' · '+t('最近进展')+' '+stamp(running.last_stage_at):''):project?.paused?t('启动后会按计划检查项目，也可以随时添加目标。'):queue?t('已有')+' '+queue+' '+t('个任务等待，当前任务结束后按价值顺序开始。'):t('已到下一次检查时间时会自动开始，无需保持页面前台运行。');
  const usage=(state.usage||[]).find(u=>u.project===(projectId||'model-center'));$('usage-brief').textContent=loadedStateSections.analyticsProject===(projectId||null)?(usage?.tokens||0)+' tokens':t('统计加载中');$('runtime-evidence').hidden=!project&&!usage;
  const scheduleTime=row=>row.next_effective??row.due;
  const next=state.schedules.filter(row=>row.project===projectId&&((row.kind==='issues'&&config.sources.issues&&config.github.repository)||(row.kind==='light'&&config.sources.inspection))).sort((a,b)=>scheduleTime(a)-scheduleTime(b))[0];
@@ -279,7 +283,7 @@ function taskOutcome(data){
  outcome.append(el('p',t('交付状态')+' · '+next));
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
- if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
+ if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
  outcome.append(stageProgress(data));return outcome;
 }
 async function showTask(task){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
@@ -418,6 +422,7 @@ async function renderCapabilities(){
 
 const readinessNames={checks:'项目检查命令',worker:'模型执行环境',sandbox:'独立运行环境',dependencies:'项目依赖',tools:'执行工具',model:'模型连接配置',budget:'模型服务用量'};
 const failureMessages={checks:'代码检查没有通过，请查看运行与效果检查。',review:'代码评审发现了需要修改的问题，请查看评审建议。',improvement:'修改后的检查通过了，但还缺少解决问题的前后对照证据。',budget:'模型服务暂未提供本次运行所需的用量，请检查连接后重试。',credentials:'模型认证失效，请检查模型连接设置。',provider:'模型服务暂不可用，请稍后重试。',environment:'运行条件不完整，请查看运行准备检查。',baseline:'项目内容已更新，请基于最新版本重新执行。',execution:'这次执行没有完成，请展开运行详情查看原因。'};
+const failureNext={checks:'先查看失败的检查项，修正代码或补充验收条件后重试。',review:'先处理评审指出的问题，再让系统重新检查和评审。',improvement:'补充能实际运行、能证明问题已解决的验收检查。',budget:'检查模型连接和用量设置，恢复后再重试。',credentials:'检查模型连接或刷新登录凭据。',provider:'稍后重试；如果是持续故障，请切换备用模型。',environment:'检查项目依赖、执行工具和独立运行环境。',baseline:'基于最新主线重新执行，不要继续使用旧候选。',execution:'展开原始运行记录，按失败步骤修正后重试。'};
 function failureCopy(problem){return t(failureMessages[problem.code]||failureMessages.execution);}
 function readinessDetail(item){
  const missing=Array.isArray(item.missing)?item.missing:[],model=item.provider&&item.model?item.provider+' / '+item.model+' · '+(item.effort||'default')+'：':'';
@@ -458,6 +463,7 @@ function renderReadiness(){
   const detail=readinessDetail(item);if(detail)row.append(el('small',detail,'muted'));if(item.detail){const raw=el('details',undefined,'readiness-detail-raw');raw.append(el('summary',t('查看原始诊断')),el('p',item.detail,'muted'));row.append(raw);}
   const kind=item.action||({model:'models',checks:'settings',dependencies:'settings',tools:'install',sandbox:'install',budget:'models'}[item.code]||'settings'),actions={models:['检查模型连接','models'],login:['连接账号','models'],settings:['检查项目设置','settings'],install:['检查运行环境','install'],budget:['查看模型用量','overview']},[label,target]=actions[kind]||actions.settings;
   row.append(action(t(label),()=>{if(['install','settings','models'].includes(target))changeSettingsScope('project');showView(target==='install'?'settings':target);if(target==='install'){$('advanced-settings').open=true;$('capabilities').closest('details').open=true;$('capabilities').scrollIntoView({block:'nearest'});}},'text-button'));list.append(row);}
+ if(result.model_evidence?.length){const evidence=el('div',undefined,'readiness-evidence');evidence.append(el('span',t('模型验证状态'),'readiness-evidence-label'));for(const item of result.model_evidence){const state=item.task_verified?'真实任务已验证':item.tool_tested?'基础工具测试通过':item.configured?'连接已配置':'需要检查连接';evidence.append(el('span',t(roleNames[item.role]||item.role)+' · '+t(state),'readiness-evidence-item '+(item.task_verified?'good':item.tool_tested?'tested':item.configured?'configured':'bad')));}list.append(evidence);}
  if(result.ready)list.append(el('small',t(result.execution_verified?'当前版本已有任务运行验证。':'尚未进行真实任务验证；模型连接检查不产生推理费用。'),'muted'));
 }
 function stageProgress(data){
@@ -577,7 +583,7 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
  if(event.target.checked&&!document.querySelector('[data-path="delivery.'+kind+'.sha"]').value){event.target.checked=false;$('release-authorization-feedback').textContent=t('请先选择工作流并点击授权。');$('release-workflow-list').focus();}syncDelivery();
 });
 
-function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'');$('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);if(update.desktop_managed)$('update-status').textContent=t('桌面版请安装新版软件，项目和记录会保留。');$('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);}
+function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};$('update-status').textContent=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'');$('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);if(update.desktop_managed)$('update-status').textContent=t('桌面版请安装新版软件，项目和记录会保留。');else $('update-status').textContent=t('后台服务')+' · '+$('update-status').textContent;$('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);}
 $('check-update').addEventListener('click',()=>safe(async()=>{await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!confirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？')))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
@@ -595,3 +601,8 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  window.RSIDesktop?.translate?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));
+typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{
+ if(document.visibilityState==='visible'&&state)safe(refresh);
+ else scheduleRefreshPoll();
+});
+typeof window.addEventListener==='function'&&window.addEventListener('focus',()=>{if(state)safe(refresh);});

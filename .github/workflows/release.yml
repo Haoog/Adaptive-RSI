@@ -9,10 +9,14 @@ on:
         type: boolean
         default: false
       release_level:
-        description: '本批次的版本升级级别'
+        description: '版本级别：普通稳定批次保持 patch；新阶段才选择 minor/major'
         type: choice
         options: [patch, minor, major]
         default: patch
+      new_product_stage:
+        description: '确认这是一个新产品阶段（仅 minor/major 时勾选）'
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -40,6 +44,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PREPARE_RELEASE: ${{ inputs.prepare_release }}
           RELEASE_LEVEL: ${{ inputs.release_level }}
+          NEW_PRODUCT_STAGE: ${{ inputs.new_product_stage }}
         run: python3 scripts/release.py prepare
       - name: 显式触发版本 PR 的精确 SHA 检查
         if: steps.prepare.outputs.mode == 'verify'

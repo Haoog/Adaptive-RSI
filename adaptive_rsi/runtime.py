@@ -362,8 +362,14 @@ class Runtime:
             row = self.store.one("SELECT * FROM schedules WHERE project=? AND kind=?", (project, kind))
             interval = config["schedule"][kind + "_minutes"] * 60
             if not row or row["due"] <= now:
-                # 到期检查先于普通待办，避免无限量 Issues 让小时同步长期饥饿。
-                self.request(project, kind, priority=90)
+                # Scans remain periodic, but an existing repair backlog is more
+                # useful than producing another batch of findings.
+                queued = self.store.one(
+                    "SELECT count(*) AS n FROM tasks WHERE project=? AND state='queued' "
+                    "AND source NOT LIKE 'system_%'", (project,))["n"]
+                priority = 55 if queued else 90
+                scan = self.request(project, kind, priority=priority)
+                self.store.execute("UPDATE tasks SET priority=? WHERE id=? AND state='queued'", (priority, scan))
                 self.store.execute("INSERT INTO schedules(project,kind,due) VALUES (?,?,?) "
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
         key = "deferred-check:" + project
@@ -640,6 +646,9 @@ class Runtime:
                 raise Cancelled("Cancelled before delivery")
             self.store.transition(run["id"], "awaiting_approval", outcome, True)
             if isinstance(self.agent, CodexAgent):
+                task_proofs = self.store.setting("task-proof-current:" + project["id"], {})
+                if not isinstance(task_proofs, dict):
+                    task_proofs = {}
                 for call in self.store.query("SELECT role,provider,model,effort FROM calls WHERE run=? "
                                              "GROUP BY role,provider,model,effort HAVING sum(state<>'completed')=0", (run["id"],)):
                     provider = next((p for p in BUILTIN_PROVIDERS + config["providers"] if p["id"] == call["provider"]), None)
@@ -647,6 +656,9 @@ class Runtime:
                         continue
                     proof_key = "task-proof:" + project["id"] + ":" + fingerprint({"call": call, "provider": self.model_center.signature(provider)})
                     self.store.put_setting(proof_key, {"run": run["id"], "base": base, "at": time.time(), "role": call["role"]})
+                    task_proofs[call["role"]] = {"provider": call["provider"], "model": call["model"],
+                                                 "effort": call["effort"], "at": time.time(), "base": base}
+                self.store.put_setting("task-proof-current:" + project["id"], task_proofs)
             if config["delivery"]["mode"] == "pr" and self.config(project["id"])["delivery"]["mode"] == "pr":
                 self.deliver(run["id"], automatic=True)
             self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
@@ -691,10 +703,6 @@ class Runtime:
         key = "inspection-head:" + project["id"] + ":" + kind
         ci = self.store.setting("ci:" + project["id"], [])
         recent_failed_ids = self.store.query("SELECT id FROM runs WHERE project=? AND state='failed' ORDER BY started DESC LIMIT 5", (project["id"],))
-        inspection_signature = fingerprint({"head": head, "ci": ci, "failures": recent_failed_ids,
-                                             "postmerge_outcomes": self.outcomes(project["id"]),
-                                             "strategy": [s["id"] for s in strategies],
-                                             "model": json.loads(run["config"])["models"]["analysis"]})
         backlog = self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
                                    "ORDER BY created DESC LIMIT 100", (project["id"],))
         history = self.store.query("SELECT state,result FROM runs WHERE project=? AND state IN ('failed','blocked') "
@@ -703,9 +711,26 @@ class Runtime:
         rotation = int(self.store.setting("rotation:" + project["id"], 0))
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
         selected_key = key + ":" + fingerprint(selected)
+        module_head_key = selected_key + ":head"
+        previous_head = self.store.setting(module_head_key)
+        changed_paths = set() if previous_head == head else None
+        if previous_head and previous_head != head:
+            try:
+                # The execution workspace is a shallow snapshot at the current
+                # base and may not contain the previous commit object.
+                changed_paths = set(git(Path(project["path"]), "diff", "--name-only", previous_head, head).splitlines())
+            except RuntimeError:
+                changed_paths = None
+        relevant_change = previous_head is None or changed_paths is None or self._module_changed(selected, changed_paths)
+        effective_head = head if relevant_change else previous_head
         self.store.put_setting("rotation:" + project["id"], rotation + 1)
+        inspection_signature = fingerprint({"head": effective_head, "ci": ci, "failures": recent_failed_ids,
+                                             "postmerge_outcomes": self.outcomes(project["id"]),
+                                             "strategy": [s["id"] for s in strategies],
+                                             "model": json.loads(run["config"])["models"]["analysis"]})
         if self.store.setting(selected_key) == inspection_signature:
             self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
+            self.store.put_setting(module_head_key, head)
             return
         findings = self.invoke("analysis", "Autonomously inspect this project for concrete, useful improvements. "
                                "No user goal is required. Find reproducible defects, failing CI, missing essential regression coverage, "
@@ -749,7 +774,35 @@ class Runtime:
             except (ValueError, OSError):
                 continue
         self.store.put_setting(selected_key, inspection_signature)
+        self.store.put_setting(module_head_key, head)
         self.store.event("inspection", str(added) + " evidenced findings considered", project["id"], run["id"])
+
+    @staticmethod
+    def _module_changed(selected, changed_paths):
+        """Ignore documentation-only commits when deciding whether to rescan code."""
+        if not changed_paths:
+            return False
+        if all(Path(path).suffix.lower() in {".md", ".png", ".jpg", ".jpeg", ".svg"} for path in changed_paths):
+            return False
+        if not selected:
+            return True
+        cwd = str(selected.get("cwd", ".")).rstrip("/") or "."
+        if cwd != ".":
+            return any(path == cwd or path.startswith(cwd + "/") for path in changed_paths)
+        language = selected.get("language", "")
+        suffixes = {
+            "Python": {".py", ".pyi", ".toml", ".cfg", ".ini", ".txt", ".sql", ".json", ".yaml", ".yml"},
+            "JavaScript / TypeScript": {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json", ".html", ".css", ".vue"},
+            "Java / Kotlin": {".java", ".kt", ".kts", ".xml", ".gradle", ".properties"},
+            "Rust": {".rs", ".toml", ".lock", ".json", ".yaml", ".yml"},
+            "Go": {".go", ".mod", ".sum", ".yaml", ".yml"},
+            "Swift / Objective-C": {".swift", ".m", ".mm", ".plist", ".xcodeproj"},
+            "C / C++": {".c", ".cc", ".cpp", ".h", ".hpp", ".cmake", ".txt", ".ninja"},
+            "C# / F# / .NET": {".cs", ".fs", ".fsproj", ".csproj", ".sln", ".props", ".targets"},
+        }.get(language, set())
+        manifests = {Path(selected.get("manifest", "")).name}
+        runtime_config = {"Dockerfile", "Makefile", "Procfile", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
+        return any(Path(path).suffix in suffixes or Path(path).name in manifests | runtime_config for path in changed_paths)
 
     def sync_issues(self, project, config, run=None):
         repo = config["github"]["repository"]

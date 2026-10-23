@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge
 from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.context import code_map, related
+from adaptive_rsi.context import code_map, related, terms
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.discovery import related_task, value_priority
 from adaptive_rsi.evolution import Evolution
@@ -16,6 +16,7 @@ from adaptive_rsi.gitops import git, snapshot
 from adaptive_rsi.readiness import budget, inspect as readiness
 from adaptive_rsi.recovery import failure
 from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.pipeline import _review_evidence, _stage_config
 from adaptive_rsi.store import Store, encode
 from adaptive_rsi.workflow import improvement
 from tests.test_runtime import CHECKS, FakeAgent, fixture
@@ -90,6 +91,27 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(roles.count("implementation"), 1)
         stages = {r["stage"] for r in self.store.query("SELECT stage FROM stages WHERE run=?", (second["id"],))}
         self.assertTrue({"planning", "acceptance", "implementation", "evaluation", "review"} <= stages)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_implementation_route_change_reuses_plan_and_acceptance(self):
+        class Outage(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                if role == "implementation":
+                    route = kwargs.get("config", args[4] if len(args) > 4 else {})["models"][role]
+                    self.roles.append((role, route))
+                    raise RuntimeError("Provider connection timeout")
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Outage()
+        task, run = self.claim()
+        self.runtime.process(run)
+        self.runtime.configure({"models": {"implementation": {"effort": "high"}}}, self.project)
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.process(second)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("planning"), 1)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("acceptance"), 1)
+        implementations = [route for role, route in self.runtime.agent.roles if role == "implementation"]
+        self.assertEqual([route["effort"] for route in implementations], ["max", "high"])
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_changed_baseline_invalidates_recovery_cache(self):
@@ -289,6 +311,71 @@ class ReliabilityTest(unittest.TestCase):
         self.assertIsNone(related_task(backlog, finding))
         backlog[0]["evidence"] = encode([finding])
         self.assertEqual(related_task(backlog, finding), "a")
+
+    def test_chinese_goals_find_relevant_code_by_content(self):
+        (self.repo / "login.py").write_text("def login(user):\n    # 登录失败时清理旧会话\n    return user is not None\n")
+        git(self.repo, "add", "login.py")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "login")
+        self.assertIn("登录", terms("修复登录失败"))
+        mapping = code_map(self.repo, "修复登录失败", limit=3)
+        self.assertEqual(mapping["files"][0]["path"], "login.py")
+        self.assertTrue(any(anchor["line"] == 2 for anchor in mapping["files"][0]["anchors"]))
+
+    def test_stage_cache_keys_only_change_for_relevant_settings(self):
+        config = self.runtime.config(self.project)
+        before, _ = _stage_config(config, "planning")
+        changed = json.loads(json.dumps(config))
+        changed["models"]["implementation"]["effort"] = "high"
+        after, _ = _stage_config(changed, "planning")
+        self.assertEqual(fingerprint(before), fingerprint(after))
+        implementation_before, _ = _stage_config(config, "implementation")
+        implementation_after, _ = _stage_config(changed, "implementation")
+        self.assertNotEqual(fingerprint(implementation_before), fingerprint(implementation_after))
+
+    def test_review_evidence_keeps_results_without_full_check_transcripts(self):
+        evaluation = {"decision": "pass", "checks": {"candidate": [{
+            "name": "tests", "argv": ["python3", "-m", "unittest"], "passed": True,
+            "stdout": "x" * 100000, "stderr": "noise"}]}}
+        evidence = _review_evidence(evaluation)
+        self.assertTrue(evidence["checks"]["candidate"][0]["passed"])
+        self.assertNotIn("stdout", evidence["checks"]["candidate"][0])
+        self.assertNotIn("stderr", evidence["checks"]["candidate"][0])
+
+    def test_documentation_commit_does_not_repeat_module_inspection(self):
+        self.assertFalse(Runtime._module_changed(None, {"README.md", "docs/diagram.png"}))
+        self.runtime.configure({"sources": {"inspection": True}, "evolution": {"enabled": False}}, self.project)
+        self.runtime.pause(self.project, False)
+        self.runtime.request(self.project, "light")
+        self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
+        (self.repo / "README.md").write_text("documentation only\n")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "docs")
+        self.runtime.request(self.project, "light")
+        self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("analysis"), 1)
+
+    def test_due_scan_yields_to_an_existing_repair_backlog(self):
+        self.runtime.configure({"sources": {"inspection": True, "issues": False}}, self.project)
+        self.store.add_task(self.project, "goal", "repair", "Repair existing defect")
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100)
+        task = self.store.one("SELECT * FROM tasks WHERE source='system_light'")
+        self.assertEqual(task["priority"], 55)
+        self.store.execute("UPDATE tasks SET state='completed' WHERE fingerprint='repair'")
+        self.store.execute("UPDATE tasks SET state='completed' WHERE source='system_light'")
+        self.store.execute("DELETE FROM schedules")
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=200)
+        self.assertEqual(self.store.query("SELECT * FROM tasks WHERE source='system_light' ORDER BY created")[-1]["priority"], 90)
+
+    def test_readiness_separates_configuration_tool_tests_and_real_tasks(self):
+        config = self.runtime.config(self.project)
+        proof = config["models"]["planning"]
+        self.store.put_setting("task-proof-current:" + self.project, {"planning": {
+            **proof, "at": time.time(), "base": git(self.repo, "rev-parse", "HEAD")}})
+        result = readiness(self.runtime, self.runtime.project(self.project), config)
+        evidence = {row["role"]: row for row in result["model_evidence"]}
+        self.assertTrue(evidence["planning"]["configured"])
+        self.assertTrue(evidence["planning"]["task_verified"])
+        self.assertFalse(evidence["implementation"]["task_verified"])
 
 
 class EvidenceContractTest(unittest.TestCase):
