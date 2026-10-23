@@ -2,6 +2,7 @@
 import json
 import re
 import time
+from pathlib import PurePosixPath
 
 
 def safe_excerpt(value, limit=1200):
@@ -12,25 +13,51 @@ def safe_excerpt(value, limit=1200):
     return text[:limit]
 
 
-def retry_feedback(row):
+def retry_feedback(row, protected=()):
     result = json.loads(row["result"])
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
-    for key in ["reason", "summary", "patch_hash"]:
+    def excerpt(value, limit=700):
+        text = safe_excerpt(value, limit)
+        for fragment in protected:
+            if fragment:
+                text = re.sub(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", "<sealed>", text)
+        return text
+    for key in ["summary", "patch_hash"]:
         if key in result:
-            feedback[key] = safe_excerpt(result[key])
+            feedback[key] = excerpt(result[key])
     if result.get("failure"):
-        feedback["failure"] = {k: safe_excerpt(result["failure"].get(k)) for k in ["code", "action", "detail"]}
-    feedback["review_findings"] = [{k: safe_excerpt(finding.get(k), 700) for k in
+        feedback["failure"] = {k: excerpt(result["failure"].get(k)) for k in ["code", "action"]}
+    feedback["review_findings"] = [{k: excerpt(finding.get(k)) for k in
                                   ["severity", "path", "line", "title", "reason", "suggestion"]}
                                  for finding in result.get("review", {}).get("findings", [])[:8]
-                                 if not str(finding.get("path", "")).startswith(".rsi-acceptance")]
+                                 if ".rsi-acceptance" not in PurePosixPath(str(finding.get("path", ""))).parts
+                                 and not any(".rsi-acceptance" in str(v) for v in finding.values())]
     # Sealed acceptance files, commands, logs and protected samples never enter retry prompts.
     checks = result.get("evaluation", {}).get("checks", {})
-    feedback["failed_regression_checks"] = [{"name": safe_excerpt(c.get("name"), 200),
+    feedback["failed_regression_checks"] = [{"stage": stage, "name": excerpt(c.get("name"), 200),
                                              "exit_code": c.get("exit_code"),
-                                             "stderr": safe_excerpt(c.get("stderr"), 1000)}
-                                            for c in checks.get("candidate", []) if not c.get("passed")][:5]
+                                             "stderr": excerpt(c.get("stderr"), 1000)}
+                                            for stage in ["candidate", "candidate_full"]
+                                            for c in checks.get(stage, []) if not c.get("passed")][:5]
     return feedback
+
+
+def protected_feedback_values(store, task):
+    """Remove literal sealed samples even when quoted in application-file findings."""
+    import ast
+    values = set()
+    rows = store.query("SELECT s.data FROM stages s JOIN runs r ON r.id=s.run WHERE r.task=? AND s.stage='acceptance' ORDER BY s.created DESC LIMIT 2", (task,))
+    for row in rows:
+        for item in json.loads(row["data"]).get("files", []):
+            content = item.get("content", "")
+            values.update(line.strip() for line in content.splitlines() if len(line.strip()) >= 10)
+            try:
+                for node in ast.walk(ast.parse(content)):
+                    if isinstance(node, ast.Constant) and type(node.value) in [str, int, float]:
+                        values.add(str(node.value))
+            except (SyntaxError, ValueError):
+                values.update(re.findall(r"[\"']([^\"'\n]+)[\"']", content))
+    return sorted((v for v in values if v), key=len, reverse=True)
 
 
 def queue_status(store, project):

@@ -24,6 +24,8 @@ Timeouts, rate limits and transient network failures schedule up to three retrie
 
 Retry feedback retains specific review locations, consequences and suggestions, plus bounded failed regression summaries. Protected independent acceptance sources remain excluded. Rejected candidates still require implementation, checks and review again. Plans can declare behavior, performance, refactor, documentation, configuration or UI changes. Defect fixes still need behavioral evidence and cannot evade gates through reclassification.
 
+Performance tasks freeze a metric, unit, target, tolerance and direction before implementation. Independent checks report measurements for each version. The host verifies the target and an improvement exceeding tolerance; missing thresholds or matching measurements yield insufficient evidence. Preservation contracts require an explicitly behavior-preserving request. Other types demonstrate the requested before/after change and still require fixed regressions and independent review.
+
 ## Results and attention
 
 Task details load the latest run first and fetch historical runs on expansion. Current state updates periodically; task URLs support direct navigation. Saved checkpoints are distinguished from actual execution. No fabricated percentages or completion estimates are shown. Results include independent before/after acceptance, review findings and readable diffs; original evidence is preserved.
@@ -31,6 +33,8 @@ Task details load the latest run first and fetch historical runs on expansion. C
 The **Attention inbox** covers every project. System notifications require opt-in and fire on new states or reasons. Unchanged polling stays quiet. Denied notification permission does not remove inbox items, and viewing a notification does not resolve work. Browser notifications navigate to tasks; desktop notifications provide alerts, with details in the inbox. Web Push while the page or desktop client is closed is not provided.
 
 **Records and usage → Workflow quality and timing** reports logical tasks created in the last 30 days: first pass, acceptance, merges, infrastructure failures, repeated failures, revisions and reused stages. Accumulated phase durations include parallel runs and are not total elapsed time. Unknown usage remains explicit rather than becoming zero. These metrics do not establish model capability improvements.
+
+Metrics also report average time to PR and merge with sample counts, repeated failure signatures, user interventions, tokens per accepted/delivered task, invalidation reasons and recorded CI/review waits. Missing historical wait durations are not fabricated. Preparation, model calls, checks and review are recorded separately.
 
 ## Backups and retention
 

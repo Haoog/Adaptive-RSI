@@ -212,8 +212,20 @@ class Store:
                 db.execute("INSERT INTO remote_waits(run,reason,started) VALUES (?,?,?)", (run, reason, now))
 
     @staticmethod
-    def queue_order():
-        return "urgency DESC,(priority + min(20, (? - created)/86400.0)) DESC,created,id"
+    def queue_order(display=False):
+        rank = "(priority + min(20, (? - created)/86400.0))"
+        if display:
+            return ("CASE WHEN " + Store.ready_clause() + " THEN 0 WHEN state='queued' THEN 1 ELSE 2 END,"
+                    "CASE WHEN state='queued' THEN urgency ELSE 0 END DESC,"
+                    "CASE WHEN state='queued' THEN " + rank + " ELSE NULL END DESC,"
+                    "CASE WHEN state='queued' THEN created ELSE -updated END,id")
+        return "urgency DESC," + rank + " DESC,created,id"
+
+    @staticmethod
+    def ready_clause():
+        return ("state='queued' AND available<=? AND NOT EXISTS "
+                "(SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.dependency "
+                "WHERE d.task=tasks.id AND p.state<>'merged')")
 
     def claim(self, project, config):
         now = time.time()
@@ -227,9 +239,7 @@ class Store:
             task = None
             effective = None
             while True:
-                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND state='queued' AND available<=? "
-                                       "AND NOT EXISTS (SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.dependency "
-                                       "WHERE d.task=tasks.id AND p.state<>'merged') "
+                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() + " "
                                        "ORDER BY " + self.queue_order() + " LIMIT 1",
                                        (project, now, now)).fetchone()
                 if not candidate:

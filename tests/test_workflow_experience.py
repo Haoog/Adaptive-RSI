@@ -8,7 +8,7 @@ from pathlib import Path
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from tests.test_runtime import FakeAgent, fixture
+from tests.test_runtime import CHECKS, FakeAgent, fixture
 
 
 class ExperienceTest(unittest.TestCase):
@@ -105,3 +105,149 @@ class ExperienceTest(unittest.TestCase):
             restore(self.store.path, destination)
         self.assertNotIn("DO_NOT_EXPORT", json.dumps(diagnostics(self.store)))
         self.assertNotIn(str(self.root), json.dumps(diagnostics(self.store)))
+
+    def test_review_rejection_reaches_next_implementation_without_sealed_source(self):
+        class Reviewer(FakeAgent):
+            rejected = False
+            prompts = []
+
+            def invoke(self, role, prompt, *args, **kwargs):
+                if role == "implementation":
+                    self.prompts.append(prompt)
+                result = super().invoke(role, prompt, *args, **kwargs)
+                if role == "review" and not self.rejected:
+                    self.rejected = True
+                    result.update(decision="fail", reason="Boundary issue", findings=[{
+                        "severity": "high", "area": "correctness", "path": "calculator.py", "line": 2,
+                        "title": "Handle boundary", "reason": "Boundary input is wrong", "suggestion": "RETRY_REVIEW_MARKER"}])
+                return result
+
+        agent = Reviewer()
+        self.runtime.agent = agent
+        self.runtime.configure({"checks": CHECKS, "limits": {"retries": 0}, "evolution": {"enabled": False}}, self.project)
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.pause(self.project, False)
+        self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.assertEqual("failed", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+        self.runtime.retry(task)
+        self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.assertEqual(2, len(agent.prompts))
+        self.assertIn("RETRY_REVIEW_MARKER", agent.prompts[1])
+        self.assertNotIn("assert add(2, 3) == 5", agent.prompts[1])
+        self.assertEqual("awaiting_approval", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+
+    def test_provider_resume_is_scoped_to_revision_and_failure(self):
+        from adaptive_rsi.provider_health import connection_key
+        from adaptive_rsi.store import encode
+        task = self.runtime.goal(self.project, "Connection failure")
+        cancelled = self.runtime.goal(self.project, "Cancelled task")
+        self.runtime.pause(self.project, False)
+        connection = connection_key(self.runtime.config(self.project), "openai", self.project)
+        for index, identifier in enumerate([task, cancelled]):
+            self.store.execute("UPDATE tasks SET state=? WHERE id=?", ("blocked" if identifier == task else "cancelled", identifier))
+            self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,'blocked',?,1,2)",
+                               ("resume-" + str(index), identifier, self.project, encode({"failure": {"code": "provider", "action": "retry_later", "connection": connection, "recoverable": True}})))
+        self.assertEqual(0, self.runtime.resume_provider_tasks("opencode", self.project))
+        self.assertEqual(1, self.runtime.resume_provider_tasks("openai", self.project))
+        self.assertEqual("cancelled", self.store.one("SELECT state FROM tasks WHERE id=?", (cancelled,))["state"])
+        self.assertEqual("queued", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+
+    def test_auth_failure_does_not_auto_retry(self):
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        with patch.object(self.runtime, "execute_candidate", side_effect=RuntimeError("HTTP 401 unauthorized")):
+            self.runtime.process(run)
+        current = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        self.assertEqual("blocked", current["state"])
+        self.assertEqual(0, current["infra_retries"])
+
+    def test_visible_queue_matches_claim_urgency_value_and_dependency(self):
+        from adaptive_rsi.dashboard import records
+        low = self.runtime.goal(self.project, "Low value")
+        high = self.runtime.goal(self.project, "High value")
+        urgent = self.runtime.goal(self.project, "Urgent")
+        self.store.execute("UPDATE tasks SET priority=1 WHERE id=?", (low,))
+        self.runtime.set_dependency(urgent, urgency=1)
+        displayed = records(self.store, self.project, group="active")["tasks"]
+        self.assertEqual([urgent, high, low], [task["id"] for task in displayed])
+        self.runtime.pause(self.project, False)
+        self.assertEqual(urgent, self.store.claim(self.project, self.runtime.config(self.project))["task"])
+
+    def test_model_cannot_grant_behavior_preservation_exception(self):
+        from adaptive_rsi.workflow import change_kind
+        self.assertEqual("behavior", change_kind({"title": "整理接口", "body": "Handle the reported defect"}, {"change_kind": "refactor"}))
+        self.assertEqual("behavior", change_kind({"title": "Refactor module", "body": "Also fix incorrect output"}, {"change_kind": "refactor"}))
+        self.assertEqual("refactor", change_kind({"title": "整理模块并保持行为不变", "body": ""}, {"change_kind": "refactor"}))
+
+    def test_dependency_only_project_does_not_starve_another_project(self):
+        from concurrent.futures import Future
+        parent = self.runtime.goal(self.project, "Parent")
+        dependent = self.runtime.goal(self.project, "Dependent")
+        self.runtime.set_dependency(dependent, parent)
+        self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (parent,))
+        other = self.runtime.add_project(fixture(self.root / "other"))
+        independent = self.runtime.goal(other, "Independent work")
+        self.runtime.pause(self.project, False)
+        self.runtime.pause(other, False)
+        with patch.object(self.runtime.pool, "submit", return_value=Future()) as submit:
+            self.runtime.dispatch([(self.runtime.project(p), self.runtime.config(p)) for p in [self.project, other]])
+        self.assertEqual(independent, submit.call_args[0][1]["task"])
+
+    def test_feedback_excludes_normalized_sealed_paths_and_keeps_new_test_failure(self):
+        from adaptive_rsi.experience import retry_feedback
+        result = {"reason": "SEALED_SAMPLE", "failure": {"code": "review", "detail": "SEALED_SAMPLE"},
+                  "review": {"findings": [{"path": "./.rsi-acceptance/check.py", "suggestion": "SEALED_SAMPLE"},
+                                           {"path": "calculator.py", "reason": "Handle sample 12345"}]},
+                  "evaluation": {"checks": {"candidate_full": [{"name": "new boundary", "passed": False, "exit_code": 1, "stderr": "AssertionError"}]}}}
+        feedback = retry_feedback({"result": json.dumps(result)}, protected=["12345"])
+        self.assertNotIn("SEALED_SAMPLE", json.dumps(feedback))
+        self.assertNotIn("12345", json.dumps(feedback))
+        self.assertEqual("candidate_full", feedback["failed_regression_checks"][0]["stage"])
+
+    def test_global_resume_resets_only_matching_project_circuit(self):
+        from adaptive_rsi.provider_health import ProviderHealth, connection_key
+        from adaptive_rsi.store import encode
+        task = self.runtime.goal(self.project, "Temporary connection failure")
+        self.runtime.pause(self.project, False)
+        config = self.runtime.config(self.project)
+        health = ProviderHealth(self.store)
+        for _ in range(3):
+            health.record(config, "openai", self.project, RuntimeError("HTTP 503 connection failed"))
+        self.assertTrue(health.status(config, "openai", self.project)["paused"])
+        self.store.execute("UPDATE tasks SET state='blocked' WHERE id=?", (task,))
+        self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES ('global-resume',?,?,'blocked',?,1,2)",
+                           (task, self.project, encode({"failure": {"code": "provider", "action": "retry_later", "connection": connection_key(config, "openai", self.project), "recoverable": True}})))
+        self.assertEqual(1, self.runtime.model_center.resume_provider("openai")["resumed_tasks"])
+        self.assertFalse(health.status(config, "openai", self.project)["paused"])
+
+    def test_performance_contract_uses_real_measurements_and_tolerance(self):
+        from adaptive_rsi.workflow import evidence_contract, improvement
+        task = {"source": "goal", "title": "降低接口延迟"}
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {"change_kind": "performance"})
+        plan = {"change_kind": "performance", "performance_threshold": {"metric": "latency", "unit": "ms", "target": 80, "tolerance": 2, "direction": "lower"}}
+        contract = evidence_contract(task, plan)
+        def sample(value):
+            return {"passed": True, "stdout": json.dumps({"metric": "latency", "unit": "ms", "value": value})}
+        acceptance = {"change_kind": "performance", "contract": contract}
+        checks = {"acceptance_baseline": [sample(100)], "acceptance_candidate": [sample(79)]}
+        self.assertEqual("pass", improvement(checks, acceptance)["decision"])
+        checks["acceptance_candidate"] = [sample(99)]
+        self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
+
+    def test_metrics_count_logical_interventions_and_same_failure_only(self):
+        from adaptive_rsi.telemetry import workflow_metrics
+        from adaptive_rsi.store import encode
+        task = self.runtime.goal(self.project, "Fix addition")
+        for index, name in enumerate(["a", "b"]):
+            evidence = {"failure": {"code": "checks"}, "evaluation": {"checks": {"candidate": [{"name": name, "passed": False, "exit_code": 1}]}}}
+            self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,'failed',?,?,?)",
+                               ("metric-" + name, task, self.project, encode(evidence), time.time() + index, time.time() + index + 1))
+        self.assertEqual(0, workflow_metrics(self.store, self.project)["repeated_failures"])
+        self.store.execute("UPDATE runs SET result=(SELECT result FROM runs WHERE id='metric-a') WHERE id='metric-b'")
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.runtime.retry(task)
+        report = workflow_metrics(self.store, self.project)
+        self.assertEqual(1, report["repeated_failures"])
+        self.assertEqual(1, report["interventions"])

@@ -285,6 +285,7 @@ class Runtime:
         if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired"]:
             raise ValueError("This task cannot be retried")
         self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (time.time(), task))
+        self.store.event("manual_retry", "User requested fresh verification", row["project"], data={"task": task})
         self.wake.set()
 
     def revise_task(self, task, supplement):
@@ -300,7 +301,7 @@ class Runtime:
                 raise ValueError("Combined requirements exceed 30000 characters")
             db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
                        (task, row["body"], supplement.strip(), time.time()))
-            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (body, time.time(), task))
+            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,updated=? WHERE id=?", (body, time.time(), task))
         self.store.event("requirements_revised", "Requirements supplemented; fresh verification required", row["project"], data={"task": task})
         self.wake.set()
 
@@ -328,21 +329,24 @@ class Runtime:
             else:
                 db.execute("DELETE FROM task_dependencies WHERE task=?", (task,))
             db.execute("UPDATE tasks SET urgency=?,updated=? WHERE id=?", (urgency, time.time(), task))
+        self.store.event("queue_settings", "Queue dependency or urgency changed", row["project"], data={"task": task})
         self.wake.set()
 
     def resume_provider_tasks(self, provider, project=None):
-        from .provider_health import connection_key
+        from .provider_health import ProviderHealth, connection_key
+        resumed_config = self.config(project)
         count = 0
         for task in self.store.query("SELECT * FROM tasks WHERE state='blocked'" + (" AND project=?" if project else ""), (project,) if project else ()):
             if self.project(task["project"])["paused"]:
                 continue
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 1", (task["id"],))
             problem = json.loads(run["result"]).get("failure", {}) if run else {}
-            if problem.get("code") != "provider" or problem.get("action") != "retry_later":
+            if problem.get("code") != "provider" or problem.get("action") != "retry_later" or problem.get("recoverable") is not True:
                 continue
             current = connection_key(self.config(task["project"]), provider, task["project"])
-            if problem.get("connection") != current:
+            if problem.get("connection") != current or current != connection_key(resumed_config, provider, task["project"]):
                 continue
+            ProviderHealth(self.store).reset(self.config(task["project"]), provider, task["project"])
             self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=? AND state='blocked'", (time.time(), task["id"]))
             count += 1
         self.wake.set()
@@ -353,7 +357,7 @@ class Runtime:
         if not row:
             raise ValueError("Task not found")
         self.store.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (time.time(), task))
-        self.store.event("cancelled", "Cancellation requested", row["project"])
+        self.store.event("cancelled", "Cancellation requested", row["project"], data={"task": task})
 
     def deliver(self, run_id, automatic=False):
         with self.dispatch_lock:
@@ -366,6 +370,8 @@ class Runtime:
         result = json.loads(original["result"])
         if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
             raise ValueError("Independent gates have not passed")
+        if not automatic:
+            self.store.event("delivery_approved", "Candidate approved by user", original["project"], run_id, {"task": original["task"]})
         evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
         prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (original["project"], "publish:" + run_id))
         if prior:
@@ -468,7 +474,10 @@ class Runtime:
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],)) if not decision else None
-            prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else {}
+            prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
+            if prior and not decision:
+                prior = {"decision_source": "legacy_triage", "wake_condition": "inputs_policy_or_relevant_baseline_change", **prior}
+                self.store.defer(task["id"], prior)
             signature = fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})
             if not prior:
                 self.store.defer(task["id"], {"base": head, "triage_input": signature, "reason": "Legacy deferral retained until inputs change"})
@@ -549,7 +558,7 @@ class Runtime:
             for project, config in eligible:
                 if self.store.one("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project["id"],)):
                     continue
-                task = self.store.one("SELECT min(created) AS oldest FROM tasks WHERE project=? AND state='queued' AND available<=?", (project["id"], now))
+                task = self.store.one("SELECT min(created) AS oldest FROM tasks WHERE project=? AND " + self.store.ready_clause(), (project["id"], now))
                 if task and task["oldest"] is not None:
                     ready.append((project, config))
             if not ready:
@@ -727,7 +736,8 @@ class Runtime:
             workspace = directory / "candidate"
             result = {"summary": outcome["summary"]}
             if remote_baseline(self, project, config)[1] != base:
-                self.store.transition(run["id"], "blocked", {**outcome, "reason": "Project HEAD changed; retry against the new baseline."}, True)
+                self.store.transition(run["id"], "blocked", {**outcome, "reason": "Project HEAD changed; retry against the new baseline.",
+                    "failure": {"code": "baseline", "action": "retry_new_baseline"}}, True)
                 return
             if self.is_cancelled(run):
                 raise Cancelled("Cancelled before delivery")
@@ -762,12 +772,14 @@ class Runtime:
             state = "waiting_budget" if problem["code"] == "budget" else "blocked"
             task = self.store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
             if problem["code"] == "provider" and task and not task["source"].startswith("system_"):
-                from .provider_health import connection_key, error_code
+                from .provider_health import ProviderHealth, connection_key, error_code
                 config = json.loads(run["config"])
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
                 provider = call["provider"] if call else config["models"]["planning"]["provider"]
                 problem["connection"] = connection_key(config, provider, run["project"])
                 transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
+                circuit = ProviderHealth(self.store).status(config, provider, run["project"])
+                problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
                 self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?", (task["id"],))
                 if transient and task["infra_retries"] < 3 and not self.is_cancelled(run):
                     import random

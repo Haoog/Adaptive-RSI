@@ -287,7 +287,7 @@ function taskOutcome(data){
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
  outcome.append(stageProgress(data));return outcome;
 }
-async function showTask(task){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
+async function showTask(task,restoreView){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task);
  const evidence=el('details',undefined,'detail-section');evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
@@ -314,11 +314,13 @@ async function showTask(task){const ticket=++detailSequence,project=projectId;de
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
+  restoreView?.(body);
   }
  for(const [index,run] of history.entries()){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));body.append(section);let loaded=false;section.addEventListener('toggle',()=>{if(section.open&&!loaded){loaded=true;safe(()=>loadRun(run,index,section));}});if(index===0){loaded=true;await loadRun(run,index,section);}}
 
  if(ticket!==detailSequence||projectId!==project)return;
  if(['queued','planning','executing','evaluating'].includes(task.state))body.append(action(t('取消任务'),async()=>{if(ticket!==detailSequence||projectId!==project)return;await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
+ restoreView?.(body);
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null))for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=(state.cases||[]).filter(c=>c.project===projectId).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}else summary.append(el('p',t('验证统计加载中。'),'muted'));
  $('experiment-readiness').textContent=t('改进方案需通过独立样本的前后对照验证；调用与 tokens 只记录用量。');

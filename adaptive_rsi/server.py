@@ -139,7 +139,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/attention":
                 data = records(store, group="attention", include_system=False, limit=200)
                 data["projects"] = store.query("SELECT id,name FROM projects ORDER BY created")
-                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.updated,r.id AS run,r.result FROM tasks t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
+                from .store import encode, uid
+                store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
+                data["instance"] = store.setting("instance-id")
+                from .dashboard import TASKS
+                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
                 self.respond(data)
             elif parsed.path == "/api/storage":
                 from .storage_tools import overview
@@ -208,7 +212,10 @@ class Handler(BaseHTTPRequestHandler):
                     selected = projects[0]["id"] if projects else None
                 rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
                                params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
+                capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
                 for task in rows["tasks"]:
+                    if task.get("wait_reason") == "ready" and capacity:
+                        task["wait_reason"] = "capacity"
                     if task.get("wait_reason") in ["ready", "running"] and selected:
                         try:
                             opening = runtime.next_effective_schedule(selected, time.time())

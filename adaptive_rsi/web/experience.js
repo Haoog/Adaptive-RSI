@@ -7,6 +7,7 @@ window.RSIExperience = (() => {
     running: "等待当前任务结束",
     ready: "可开始",
     working_hours: "等待工作时段",
+    capacity: "等待运行资源",
   };
   let liveTimer,
     liveBusy = false,
@@ -22,6 +23,8 @@ window.RSIExperience = (() => {
     }
   }
   let seen = readSaved(notificationKey + ":seen", {});
+  let seenInstance = '';
+  const phaseNames = {preparation:'准备运行环境', implementation:'正在修改代码', review:'正在评审改动', acceptance:'验收设计'};
   function queueCopy(task) {
     return [
       t(waiting[task.wait_reason] || task.wait_reason),
@@ -57,7 +60,7 @@ window.RSIExperience = (() => {
     taskOffset = 0;
     showView("overview");
     await refresh();
-    await showTask(task);
+    await showTask(await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(task.project)));
   }
   async function inbox() {
     const box = dialog("所有项目待办"),
@@ -124,6 +127,10 @@ window.RSIExperience = (() => {
     inboxBusy = true;
     try {
       const data = await api("attention");
+      if (seenInstance !== data.instance) {
+        seenInstance = data.instance;
+        seen = readSaved(notificationKey + ':seen:' + seenInstance, {});
+      }
       inboxAt = Date.now();
       $("attention-inbox").textContent =
         t("所有项目待办") + " · " + data.pagination.total;
@@ -136,6 +143,10 @@ window.RSIExperience = (() => {
         "expired",
         "merged",
         "completed",
+        "regressed",
+        "unverified_merge",
+        "release_failed",
+        "deploy_failed",
       ]);
       const next = {};
       for (const task of data.notifications || []) {
@@ -143,14 +154,17 @@ window.RSIExperience = (() => {
         try {
           result = JSON.parse(task.result || "{}");
         } catch {}
-        const status =
-            result.delivery_status === "ci_failed" ? "ci_failed" : task.state,
+        const status = task.display_state || task.state,
           signature = JSON.stringify([
             task.run,
             status,
             result.failure?.code,
             result.failure?.detail,
             result.reason,
+            result.feedback?.state,
+            result.feedback?.head,
+            result.automation?.release?.state,
+            result.automation?.deploy?.state,
           ]);
         next[task.id] = signature;
         if (
@@ -181,7 +195,7 @@ window.RSIExperience = (() => {
         }
       }
       seen = Object.fromEntries(Object.entries({ ...seen, ...next }).slice(-5000));
-      localStorage.setItem(notificationKey + ":seen", JSON.stringify(seen));
+      localStorage.setItem(notificationKey + ":seen:" + seenInstance, JSON.stringify(seen));
     } catch {
     } finally {
       inboxBusy = false;
@@ -189,6 +203,30 @@ window.RSIExperience = (() => {
   }
   function enhanceOutcome(outcome, data) {
     const result = data.result;
+    for (const stage of ["candidate", "candidate_full"]) {
+      for (const check of result.evaluation?.checks?.[stage] || []) {
+        if (check.passed) continue;
+        const card = el("section", undefined, "blocking-finding");
+        card.append(el("h4", t("未通过的固定检查") + " · " + check.name),
+          el("p", t(evaluationNames[stage] || stage) + " · " + t("退出码") + " " + check.exit_code));
+        const excerpt = String(check.stderr || check.stdout || check.error || "").slice(-1800);
+        if (excerpt) card.append(el("pre", excerpt));
+        outcome.append(card);
+      }
+    }
+    if (result.evaluation?.criteria?.length) {
+      const criteria = el("details");
+      criteria.append(el("summary", t("验收标准与覆盖")));
+      for (const [index, criterion] of result.evaluation.criteria.entries()) {
+        const checks = (result.evaluation.coverage || []).filter(c => c.criteria.includes(index)).map(c => c.name);
+        criteria.append(el("p", (index + 1) + ". " + criterion + " · " + (checks.join(", ") || t("覆盖记录未知"))));
+      }
+      outcome.append(criteria);
+    }
+    if (data.state === "awaiting_approval" && data.ended) {
+      const days = currentProject()?.config?.limits?.retention_days;
+      if (days) outcome.append(el("p", t("候选清理时间") + " · " + stamp(data.ended + days * 86400), "muted"));
+    }
     const checks = result.evaluation?.checks || {},
       before = checks.acceptance_baseline || [],
       after = checks.acceptance_candidate || [];
@@ -242,7 +280,7 @@ window.RSIExperience = (() => {
         timeline.append(
           el(
             "p",
-            t(statusNames[phase.phase] || phase.phase) +
+              t(phaseNames[phase.phase] || statusNames[phase.phase] || phase.phase) +
               " · " +
               Math.round(seconds) +
               " " +
@@ -339,6 +377,8 @@ window.RSIExperience = (() => {
       input.rows = 3;
       input.maxLength = 10000;
       input.required = true;
+        input.value = draftStore.get('task-supplement', task.id) || '';
+        input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
@@ -348,10 +388,12 @@ window.RSIExperience = (() => {
         safe(async () => {
           submit.disabled = true;
           try {
+            const value = input.value;
             await api("task/revise", {
               task: task.id,
-              supplement: input.value,
+              supplement: value,
             });
+            if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
             await refresh();
             await showTask(
               await api("task?id=" + task.id + "&project=" + task.project),
@@ -443,6 +485,22 @@ window.RSIExperience = (() => {
     safe(() => taskControls(task, $("detail-body"), ticket));
     liveTimer = setTimeout(liveDetail, 5000);
   }
+  function detailsSnapshot(root) {
+    const key = node => {
+      const labels = [];
+      for (let item=node; item && item!==root; item=item.parentElement) {
+        if (item.tagName==='DETAILS') labels.unshift(item.querySelector(':scope > summary')?.textContent || '');
+      }
+      return labels.join('\n');
+    };
+    const values = new Map([...root.querySelectorAll('details')].map(node => [key(node), node.open]));
+    return target => {
+      for (const detail of target.querySelectorAll('details')) {
+        const saved = values.get(key(detail));
+        if (saved !== undefined) detail.open = saved;
+      }
+    };
+  }
   async function liveDetail() {
     if (liveBusy || !detailTask || !$("detail-dialog").open) return;
     liveBusy = true;
@@ -468,22 +526,21 @@ window.RSIExperience = (() => {
         ]);
         const previous = $("live-task-outcome");
         if (signature !== lastDetail && previous) {
+          const scroll = $("detail-dialog").scrollTop;
+          const restore = detailsSnapshot(previous);
           const outcome = taskOutcome(data);
           outcome.id = "live-task-outcome";
           enhanceOutcome(outcome, data);
           previous.replaceWith(outcome);
+          restore(outcome);
+          $("detail-dialog").scrollTop = scroll;
           lastDetail = signature;
         }
         if (metadata.state !== task.state) {
           detailTask = metadata;
-          const scroll = $("detail-dialog").scrollTop,
-            opened = [
-              ...$("detail-body").querySelectorAll("details[open]"),
-            ].map((d) => d.querySelector("summary")?.textContent);
-          await showTask(metadata);
-          for (const detail of $("detail-body").querySelectorAll("details"))
-            if (opened.includes(detail.querySelector("summary")?.textContent))
-              detail.open = true;
+          const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
+          await showTask(metadata, restore);
+          restore($("detail-body"));
           $("detail-dialog").scrollTop = scroll;
         }
       }
@@ -546,7 +603,7 @@ window.RSIExperience = (() => {
           Object.entries(data.bytes)
             .map(
               ([key, value]) =>
-                key + ": " + (value / 1048576).toFixed(1) + " MB",
+                t(({database:'数据库',runs:'运行文件',backups:'备份'})[key] || key) + ": " + (value / 1048576).toFixed(1) + " MB",
             )
             .join(" / "),
       ),
@@ -659,6 +716,8 @@ window.RSIExperience = (() => {
       ["repeated_failures", "反复失败任务"],
       ["requirements_revised", "补充需求任务"],
       ["stage_reused", "阶段复用"],
+      ["interventions", "用户介入次数"],
+      ["stale_rework", "旧基线返工次数"],
     ])
       box.append(el("p", t(label) + " · " + data[key]));
     box.append(
@@ -691,13 +750,21 @@ window.RSIExperience = (() => {
       box.append(
         el(
           "p",
-          t(statusNames[phase] || phase) +
+          t(phaseNames[phase] || statusNames[phase] || phase) +
             " · " +
             Math.round(seconds) +
             " " +
             t("秒"),
         ),
       );
+    for (const [key, label] of [["to_pr", "到 PR 的平均耗时"], ["to_merge", "到合并的平均耗时"]]) {
+      box.append(el("p", t(label) + " · " + (data[key + "_samples"] ? Math.round(data[key + "_seconds"] / data[key + "_samples"]) + " " + t("秒") : t("未知")) + " · n=" + data[key + "_samples"]));
+    }
+    box.append(el("p", t("每个已合并任务的已记录 tokens") + " · " + (data.delivered ? Math.round(data.delivered_tokens / data.delivered) : t("未知")) + " · " + data.delivered_unknown_calls + " " + t("次调用用量未知")));
+    for (const [reason, seconds] of Object.entries(data.remote_wait_seconds)) {
+      box.append(el("p", t(deliveryNames[reason] || reason) + " · " + Math.round(seconds) + " " + t("秒")));
+    }
+    box.append(el("p", t("缓存与重评失效记录") + " · " + Object.entries(data.invalidations).map(([key, value]) => t(({stage_invalidated: "阶段输入变化", requirements_revised: "需求修订", triage_recheck: "暂缓唤醒", issue_revision: "Issue 更新"})[key]) + ": " + value).join(" / ")));
     box.append(
       el(
         "p",

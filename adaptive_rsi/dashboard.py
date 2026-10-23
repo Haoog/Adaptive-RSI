@@ -32,9 +32,9 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     total = store.one("SELECT count(*) AS n FROM " + TASKS + " WHERE " + task_clause, args)["n"]
     import time
     from .experience import queue_status
-    tasks = store.query("SELECT * FROM " + TASKS + " WHERE " + task_clause +
-                        " ORDER BY CASE WHEN state='queued' THEN 0 ELSE 1 END, " + store.queue_order() +
-                        " LIMIT ? OFFSET ?", (*args, time.time(), limit, offset))
+    tasks = store.query("SELECT * FROM " + TASKS + " tasks WHERE " + task_clause +
+                        " ORDER BY " + store.queue_order(display=True) +
+                        " LIMIT ? OFFSET ?", (*args, time.time(), time.time(), limit, offset))
     queue = {row["id"]: row for row in queue_status(store, project)} if project else {}
     for task in tasks:
         if task["id"] in queue:

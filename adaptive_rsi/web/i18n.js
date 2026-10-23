@@ -1,6 +1,28 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+  "Android：浏览器菜单安装应用。iPhone：Safari 分享，再添加到主屏幕。": "Android: install from the browser menu. iPhone: Safari, Share, Add to Home Screen.",
+  "数据库": "Database",
+  "运行文件": "Run artifacts",
+  "备份": "Backups",
+
+  "等待运行资源": "Waiting for worker capacity",
+  "未通过的固定检查": "Failed fixed check",
+  "退出码": "Exit code",
+  "验收标准与覆盖": "Acceptance criteria and coverage",
+  "覆盖记录未知": "Coverage record unknown",
+  "候选清理时间": "Candidate cleanup time",
+  "用户介入次数": "User interventions",
+  "旧基线返工次数": "Stale baseline rework",
+  "到 PR 的平均耗时": "Average time to PR",
+  "到合并的平均耗时": "Average time to merge",
+  "每个已合并任务的已记录 tokens": "Recorded tokens per merged task",
+  "缓存与重评失效记录": "Cache invalidations and reassessment",
+  "阶段输入变化": "Stage inputs changed",
+  "需求修订": "Requirements revised",
+  "暂缓唤醒": "Deferred work reawakened",
+  "Issue 更新": "Issue updated",
+
   "备份读取未完成": "Backup download is incomplete",
   "preparation": "Preparation",
   "implementation": "Implementation",

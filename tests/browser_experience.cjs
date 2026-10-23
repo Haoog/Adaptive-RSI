@@ -126,7 +126,7 @@ const { chromium } = require("playwright");
       .locator("[data-run]")
       .first()
       .getAttribute("data-run");
-    let runRequests = 0;
+    let runRequests = 0, liveSummary = "";
     await page.route("**/api/task-runs?*", async (route) => {
       const response = await route.fetch(),
         rows = await response.json();
@@ -142,8 +142,9 @@ const { chromium } = require("playwright");
       runRequests++;
       const parsed = new URL(route.request().url());
       parsed.searchParams.set("id", run);
-      const response = await route.fetch({ url: parsed.href });
-      await route.fulfill({ response });
+      const response = await route.fetch({ url: parsed.href }), data = await response.json();
+      if (liveSummary) data.result.summary = liveSummary;
+      await route.fulfill({ json: data });
     });
     await page.locator("#detail-dialog .close-dialog").click();
     runRequests = 0;
@@ -157,6 +158,17 @@ const { chromium } = require("playwright");
       document.querySelector('[data-run="old-run-1"] pre'),
     );
     assert.equal(runRequests, 2);
+    const coverage = page.locator('#live-task-outcome details').filter({has: page.getByText('验收标准与覆盖', {exact: true})});
+    await coverage.locator('summary').click();
+    liveSummary = 'Live checkpoint received';
+    await page.locator('#live-task-outcome').filter({hasText: liveSummary}).waitFor();
+    assert.equal(await coverage.getAttribute('open'), '', 'same-state updates preserve expanded evidence');
+    assert.equal(await page.locator('[data-run="old-run-1"]').getAttribute('open'), '');
+    const deepUrl = page.url();
+    const deep = await context.newPage();
+    await deep.goto(deepUrl);
+    await deep.locator('#detail-dialog[open] #detail-title').filter({hasText:'Fix addition'}).waitFor();
+    await deep.close();
     await page.locator("#detail-dialog .close-dialog").click();
     await page.locator("#storage-tools").click();
     await page
@@ -173,6 +185,33 @@ const { chromium } = require("playwright");
       .locator(".experience-dialog")
       .getByRole("button", { name: "关闭", exact: true })
       .click();
+    let notificationState = 'merged', feedbackHead = 'head-1';
+    await page.route('**/api/attention', async route => {
+      const response = await route.fetch(), data = await response.json();
+      data.notifications = [{id:'notification-test',project:ids[2],title:'Notification fixture',state:'merged',display_state:notificationState,run:'notification-run',result:JSON.stringify({feedback:{state:notificationState==='regressed'?'regressed':'verified',head:feedbackHead}})}];
+      await route.fulfill({json:data});
+    });
+    await page.evaluate(() => {
+      window.__notifications = [];
+      window.Notification = class { static permission = 'granted'; constructor(title, options) { window.__notifications.push({title,...options}); } close() {} };
+      localStorage.setItem('rsi-notifications:'+location.origin,'true');
+      const now = Date.now.bind(Date); window.__timeOffset = 0; Date.now = () => now() + window.__timeOffset;
+    });
+    async function pollNotifications(expected) {
+      const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/attention');
+      await page.evaluate(() => {window.__timeOffset += 20000; RSIExperience.refreshed();});
+      await response;
+      await page.waitForFunction(n => window.__notifications.length === n, expected);
+    }
+    await pollNotifications(1);
+    await pollNotifications(1);
+    notificationState = 'regressed';
+    await pollNotifications(2);
+    await pollNotifications(2);
+    notificationState = 'merged';feedbackHead = 'head-2';
+    await pollNotifications(3);
+    notificationState = 'regressed';
+    await pollNotifications(4);
     await page.locator("#language-select").selectOption("en");
     assert.equal(
       await page.locator("#mobile-install").innerText(),

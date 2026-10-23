@@ -44,12 +44,15 @@ SCHEMAS = {
 
 # Optional for older adapters; production planners are instructed to return it explicitly.
 SCHEMAS["planning"]["properties"]["change_kind"] = {"type": "string", "enum": ["behavior", "performance", "refactor", "documentation", "configuration", "ui"]}
+SCHEMAS["planning"]["properties"]["performance_threshold"] = object_schema({
+    "metric": TEXT, "unit": TEXT, "target": {"type": "number"}, "tolerance": {"type": "number"},
+    "direction": {"type": "string", "enum": ["lower", "higher"]}})
 
 
 def validate_output(value, schema):
     kind = schema["type"]
-    types = {"object": dict, "array": list, "string": str, "integer": int}
-    if type(value) is not types[kind]:
+    types = {"object": (dict,), "array": (list,), "string": (str,), "integer": (int,), "number": (int, float)}
+    if type(value) not in types[kind]:
         raise RuntimeError("Agent returned invalid structured output")
     if "enum" in schema and value not in schema["enum"]:
         raise RuntimeError("Agent returned an unknown decision")
