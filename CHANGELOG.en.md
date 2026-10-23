@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.101
+
+<!-- adaptive-rsi-release:0.5.101;base:8bec79619d0167e22b6c26daeaa501bd1b16d189 -->
+
 - Support OpenCode 1.19.3 and 2.1.3 with version-aware model/authentication adapters, guided connection steps and actionable compatibility diagnostics.
 - Batch-triage inspection findings and run independent acceptance and evaluation in parallel; reuse baselines across tasks only with the same immutable Docker image and dependencies, never across host toolchain runs.
 - Optimize Issue comment window retrieval, Issue sync time slicing, code context indexing and Docker probe caching.
