@@ -19,8 +19,8 @@ def retry_feedback(row, protected=()):
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
     def excerpt(value, limit=700):
-        # Bound the matcher by the output size, never by the size of sealed fixtures.
-        text = str(value or "")[:limit + 24]
+        # Redact shrinking prefixes before bounding the visible sealed-sample scan.
+        text = safe_excerpt(value, None)[:limit + 24]
         windows = {text[i:i + 24] for i in range(len(text) - 23)}
         pattern = re.compile("|".join(re.escape(part) for part in windows)) if windows else None
         for fragment in sorted(variants, key=len, reverse=True):
@@ -29,7 +29,7 @@ def retry_feedback(row, protected=()):
                     return "<sealed>"
             elif fragment:
                 text = re.sub(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", "<sealed>", text)
-        return safe_excerpt(text, limit)
+        return text[:limit]
     for key in ["summary", "patch_hash"]:
         if key in result:
             feedback[key] = excerpt(result[key])

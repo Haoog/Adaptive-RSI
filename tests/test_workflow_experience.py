@@ -272,6 +272,18 @@ class ExperienceTest(unittest.TestCase):
         self.assertNotIn("31415926", json.dumps(feedback))
         self.assertNotIn("31415927", json.dumps(feedback))
 
+    def test_shrinking_redactions_cannot_expose_truncated_sealed_samples(self):
+        from adaptive_rsi.experience import retry_feedback
+        secret = "TOPSECRETVALUE1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        prefixes = ["https://x/" + "a" * 700, "token=" + "a" * 700,
+                    "Bearer " + "a" * 700, "sk-" + "a" * 700]
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix[:12]):
+                row = {"result": json.dumps({"review": {"findings": [
+                    {"path": "app.py", "reason": prefix + " " + secret}]}})}
+                feedback = retry_feedback(row, protected=[secret])
+                self.assertEqual("<sealed>", feedback["review_findings"][0]["reason"])
+
     def test_large_sealed_fixtures_do_not_build_an_unbounded_fragment_index(self):
         import hashlib
         import tracemalloc
