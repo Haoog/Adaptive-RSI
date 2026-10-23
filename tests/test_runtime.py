@@ -19,8 +19,8 @@ from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge, val
 from adaptive_rsi.evaluator import Evaluator, empty_test_run
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import git, snapshot
-from adaptive_rsi.process import Sandbox, checked, run_process
-from adaptive_rsi.review import enforce_review
+from adaptive_rsi.process import _PROBE_CACHE, Sandbox, checked, run_process
+from adaptive_rsi.review import enforce_review, risk_review_required
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Handler, Server
 from adaptive_rsi.store import Store, encode, uid
@@ -261,6 +261,49 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual((self.repo / "vendor/value.txt").read_text(), "sealed dependency")
         self.assertEqual((Path(row["path"]) / "evaluation/candidate/vendor/value.txt").read_text(), "sealed dependency")
 
+    def test_acceptance_baseline_runs_in_parallel_with_implementation(self):
+        class ParallelImplementation(FakeAgent):
+            acceptance_started = threading.Event()
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == "implementation":
+                    self_test.assertTrue(self.acceptance_started.wait(3),
+                                        "acceptance baseline should start before implementation finishes")
+                return super().invoke(role, prompt, workspace, *args, **kwargs)
+        self_test = self
+        agent = ParallelImplementation()
+        self.runtime.agent = agent
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            label = Path(workspace).name
+            if label == "acceptance_baseline":
+                agent.acceptance_started.set()
+            fail = (label == "baseline" and check["name"] == "real unittest regression") or \
+                   (label == "acceptance_baseline" and check["name"] == "independent addition")
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 1 if fail else 0,
+                    "stdout": "Ran 1 test\n", "stderr": "AssertionError" if fail else "",
+                    "seconds": 0.01, "error": None}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            task, run = self.claim()
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+
+    def test_acceptance_baseline_failure_aggregates_without_running_candidate_checks(self):
+        self.runtime.configure({"environment": {"setup": [
+            {"name": "prepare acceptance", "cwd": ".", "argv": ["true"]}]}}, self.project)
+        def check(_sandbox, check, workspace, *args, **kwargs):
+            label = Path(workspace).name
+            failed = label == "acceptance_baseline" and check["name"] == "prepare acceptance"
+            return {"argv": check["argv"], "name": check["name"], "exit_code": 1 if failed else 0,
+                    "stdout": "", "stderr": "acceptance setup failed" if failed else "",
+                    "seconds": 0.01, "error": None}
+        with patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
+            task, run = self.claim()
+            self.runtime.process(run)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        self.assertEqual(result["reason"], "Independent acceptance environment preparation failed")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_sandbox_hides_controller_prevents_network_and_harness_writes(self):
         workspace = self.store.root / "runs" / "probe"
@@ -473,6 +516,52 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "every review area"):
             enforce_review(review, DEFAULTS)
 
+    def test_risk_review_is_limited_to_sensitive_changes_or_missing_evidence(self):
+        review = FakeAgent().invoke("review", "", None, None, None, DEFAULTS)
+        plan = {"risk": "high"}
+        self.assertFalse(risk_review_required(plan, review, ["calculator.py"], "+def add(a, b):"))
+        self.assertTrue(risk_review_required(plan, review, ["auth/session.py"], ""))
+        self.assertTrue(risk_review_required(plan, review, ["adaptive_rsi/auth_sessions.py"], ""))
+        self.assertTrue(risk_review_required(plan, review, ["adaptive_rsi/updates.py"], ""))
+        self.assertTrue(risk_review_required(plan, review, ["adaptive_rsi/delivery.py"], ""))
+        self.assertTrue(risk_review_required(plan, review, ["adaptive_rsi/process.py"], "- --network=none"))
+        self.assertTrue(risk_review_required(plan, review, ["adaptive_rsi/server.py"], "- origin check"))
+        self.assertFalse(risk_review_required(plan, review, ["docs/authors.py"], ""))
+        self.assertTrue(risk_review_required(plan, review, ["calculator.py"], "+permissions = ['admin']"))
+        review["assessments"][0]["decision"] = "insufficient_evidence"
+        self.assertTrue(risk_review_required(plan, review, ["calculator.py"], ""))
+        review["assessments"][0]["decision"] = "pass"
+        review["decision"] = "insufficient_evidence"
+        self.assertTrue(risk_review_required(plan, review, ["calculator.py"], ""))
+        self.assertFalse(risk_review_required({"risk": "low"}, review, ["auth/session.py"], ""))
+
+    def test_docker_backend_and_image_probes_use_a_short_lived_cache(self):
+        calls = []
+        def probe(argv, **kwargs):
+            calls.append(argv)
+            return {"exit_code": 0, "error": None, "stdout": "ok", "stderr": ""}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            state = root / "state"
+            config = validate({"sandbox": {"backend": "docker", "image": "worker:one"}})
+            _PROBE_CACHE.clear()
+            try:
+                with patch("adaptive_rsi.process.platform.system", return_value="Linux"), \
+                        patch("adaptive_rsi.process.shutil.which", return_value="/usr/bin/docker"), \
+                        patch("adaptive_rsi.process.run_process", side_effect=probe):
+                    sandbox = Sandbox(state, config)
+                    self.assertEqual([sandbox.backend(), sandbox.backend()], ["docker", "docker"])
+                    sandbox.command(["true"], workspace)
+                    sandbox.command(["true"], workspace)
+                    changed = validate({"sandbox": {"backend": "docker", "image": "worker:two"}})
+                    Sandbox(state, changed).command(["true"], workspace)
+            finally:
+                _PROBE_CACHE.clear()
+        self.assertEqual(sum(call[:2] == ["docker", "info"] for call in calls), 1)
+        self.assertEqual(sum(call[:3] == ["docker", "image", "inspect"] for call in calls), 2)
+
     def test_provider_validation_and_strategy_compatibility(self):
         provider = {"id": "gateway", "name": "Gateway", "base_url": "https://models.example/v1", "env_key": "RSI_MODEL_KEY"}
         config = validate({"providers": [provider], "models": {"implementation": {
@@ -534,6 +623,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
         result = run_process(["python3", "-c", "import time; time.sleep(5)"], timeout=0.1)
         self.assertEqual(result["error"], "Command timed out")
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_custom_and_local_models_route_without_forced_reasoning_or_secret_arguments(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")
@@ -563,6 +653,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             self.assertEqual(len(commands), 1)
             self.assertEqual([c["provider"] for c in store.query("SELECT provider FROM calls ORDER BY rowid")], ["gateway", "ollama"])
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_provider_fallback_and_failed_setup_are_accounted_for(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")
@@ -598,6 +689,7 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                     CodexAgent(store).invoke("implementation", "task", workspace, "project", "run", DEFAULTS)
             self.assertEqual(store.query("SELECT state FROM calls ORDER BY rowid")[-1]["state"], "failed")
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_codex_command_really_routes_model_and_effort_and_records_usage(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "controller")

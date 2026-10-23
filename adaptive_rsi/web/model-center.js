@@ -20,7 +20,7 @@ window.RSIModelCenter = (() => {
     invalid_key:'密钥格式不正确，请重新填写。',provider_in_use:'此连接仍被角色或备用模型使用，请先更换相关配置。',
     builtin_provider:'内置连接不能移除。',unknown_provider:'此连接已不存在，请刷新列表。',
     connection_changed:'连接配置已经改变，请重新获取或测试。',update_in_progress:'服务正在更新，请稍后重试。',
-    codex_missing:'未找到 Codex CLI，请安装并登录。',opencode_missing:'未找到 OpenCode，请安装后重新获取模型。',opencode_error:'无法读取 OpenCode 模型，请检查连接配置和 CLI 版本。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。',
+    codex_missing:'未找到 Codex CLI，请安装并登录。',opencode_missing:'未找到 OpenCode，请安装后重新获取模型。',opencode_error:'无法读取 OpenCode 模型，请检查连接配置和 CLI 版本。',opencode_version_unknown:'无法确认 OpenCode 版本，请升级 Adaptive RSI，或临时使用 OpenCode 1.19.3。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。',
     provider_paused:'模型服务连续失败已暂停，请检查配置后恢复请求。',model_missing:'模型不存在或当前账号不可用，请重新获取目录。',tool_format:'模型未返回符合要求的工具结果，请检查协议与模型能力。',probe_failed:'基础能力测试未通过，请检查账号权限、推理参数和模型工具能力。',
     budget_exhausted:'模型服务暂未提供调用，请检查服务账号用量或稍后重试。',default_effort_required:'此接口要求使用服务默认思考深度。',
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_routes:'角色配置不完整，请重新选择。'
@@ -42,7 +42,12 @@ window.RSIModelCenter = (() => {
   const routes = () => drafts.get(scopeKey());
   const modified = () => data?.project===scope && routes() && JSON.stringify(routes())!==JSON.stringify(data.models);
   const jobKey = (provider,project=scope) => (project||'global')+':'+provider;
-  const message = error => t(errors[error.code] || error.message);
+  function errorCopy(code,fallback='模型服务暂时不可用，请稍后重试。'){
+    const match=String(code||'').match(/^opencode_incompatible_(\d+\.\d+\.\d+)$/);
+    if(match)return t('已检测到 OpenCode ')+match[1]+t('，当前命令参数不兼容。请升级 Adaptive RSI，或临时使用 OpenCode 1.19.3。');
+    return t(errors[code]||fallback);
+  }
+  const message = error => errorCopy(error.code,error.message);
   const setStatus = (text,error=false) => { feedbackKey=Object.hasOwn(english,text)?text:Object.entries(english).find(([,value])=>value===text)?.[0]||text;feedbackError=error;$('mc-feedback').textContent=t(feedbackKey);$('mc-feedback').classList.toggle('mc-error',error); };
   function info(text,cls='mc-secondary'){return el('span',text,cls);}
   function findModel(route){return data?.providers.find(p=>p.id===route.provider)?.catalog.models.find(m=>m.id===route.model);}
@@ -117,7 +122,11 @@ window.RSIModelCenter = (() => {
     $('mc-edit-provider').hidden=provider.builtin;$('mc-remove-provider').hidden=provider.builtin;
     $('mc-fetch').disabled=jobs.has(jobKey(provider.id));$('mc-fetch').textContent=t(jobs.has(jobKey(provider.id))?'获取中…':'获取模型');
     $('mc-directory-error').hidden=!catalog.error;
-    $('mc-directory-error').textContent=catalog.error?t(errors[catalog.error]||'模型服务暂时不可用，请稍后重试。'):'';
+    $('mc-directory-error').textContent=catalog.error?errorCopy(catalog.error):'';
+    const connected=!!window.RSIAuth?.isConnected?.(provider.id);
+    $('mc-step-provider').dataset.state='done';
+    $('mc-step-account').dataset.state=connected?'done':'current';
+    $('mc-step-models').dataset.state=catalog.fetched?'done':connected?'current':'pending';
     $('mc-truncated').hidden=!catalog.truncated;
     $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
     $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';

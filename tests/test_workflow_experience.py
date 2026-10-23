@@ -1,4 +1,5 @@
 import json
+import platform
 import tempfile
 import time
 import unittest
@@ -106,6 +107,7 @@ class ExperienceTest(unittest.TestCase):
         self.assertNotIn("DO_NOT_EXPORT", json.dumps(diagnostics(self.store)))
         self.assertNotIn(str(self.root), json.dumps(diagnostics(self.store)))
 
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_review_rejection_reaches_next_implementation_without_sealed_source(self):
         class Reviewer(FakeAgent):
             rejected = False
@@ -355,7 +357,9 @@ class ExperienceTest(unittest.TestCase):
             if state == "blocked":
                 self.runtime.cancel_task(task)
             return transition(run_id, state, result, terminal)
-        with patch.object(self.store, "transition", side_effect=concurrent_cancel), patch.object(self.runtime, "invoke", side_effect=RuntimeError("HTTP 503 connection failed")):
+        with patch.object(self.store, "transition", side_effect=concurrent_cancel), \
+                patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                patch.object(self.runtime, "invoke", side_effect=RuntimeError("HTTP 503 connection failed")):
             self.runtime.process(run)
         self.assertEqual("cancelled", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
 

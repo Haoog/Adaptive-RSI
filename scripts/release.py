@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,10 @@ def gh(endpoint, method="GET", **fields):
 
 def read_at(sha, name):
     return subprocess.check_output(["git", "show", sha + ":" + name], cwd=ROOT, text=True)
+
+
+def tree_at(sha):
+    return run("git", "rev-parse", sha + "^{tree}")
 
 
 def get_version(text):
@@ -100,6 +106,76 @@ def release_assets(directory, target):
     return sorted([files[name] for name in expected] + wheels)
 
 
+def workflow_path(reference):
+    source = reference.split("@", 1)[0]
+    parts = source.split("/", 2)
+    return parts[2] if len(parts) == 3 else source
+
+
+def read_proof(directory):
+    path = Path(directory) / "release-proof.json"
+    try:
+        proof = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ValueError("Release proof is missing or invalid") from exc
+    if (proof.get("format") != 1 or not re.fullmatch(r"[a-f0-9]{40}", proof.get("source_sha", "")) or
+            not re.fullmatch(r"[a-f0-9]{40}", proof.get("source_tree", "")) or
+            not isinstance(proof.get("artifacts"), dict)):
+        raise ValueError("Release proof has an unsupported format")
+    workflow_source_sha = proof.get("workflow_source_sha")
+    if workflow_source_sha is not None and not re.fullmatch(r"[a-f0-9]{40}", workflow_source_sha):
+        raise ValueError("Release proof has an invalid workflow source SHA")
+    return proof
+
+
+def validate_proof(directory, sha, allowed_workflows):
+    proof = read_proof(directory)
+    target = get_version(read_at(sha, "adaptive_rsi/__init__.py"))
+    if proof.get("version") != target or proof["source_tree"] != tree_at(sha):
+        raise ValueError("Release proof does not describe the exact source tree")
+    producer = workflow_path(proof.get("workflow_ref", ""))
+    if producer not in allowed_workflows:
+        raise ValueError("Release proof was not produced by a trusted release workflow")
+    if producer == ".github/workflows/release.yml" and proof["source_sha"] != sha:
+        raise ValueError("Direct release build proof does not match the release commit")
+    if not re.fullmatch(r"[a-f0-9]{40}", proof.get("workflow_source_sha", "")):
+        raise ValueError("Release proof is missing the signing workflow source SHA")
+    assets = release_assets(directory, target)
+    expected = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in assets}
+    if proof["artifacts"] != expected:
+        raise ValueError("Release proof does not match the built asset bytes")
+    for asset in assets:
+        if not asset.name.endswith(".sha256"):
+            continue
+        subject = asset.with_name(asset.name[:-7])
+        fields = asset.read_text().split()
+        digest = hashlib.sha256(subject.read_bytes()).hexdigest()
+        if fields != [digest, subject.name]:
+            raise ValueError("Release checksum does not match its asset")
+    return proof
+
+
+def find_verified_artifact(tree, branch):
+    """Find an unexpired artifact from a successful trusted verification run."""
+    if not re.fullmatch(r"[a-f0-9]{40}", tree or ""):
+        raise ValueError("An exact source tree is required")
+    name = "release-verified-" + tree
+    listing = gh("actions/artifacts?name=" + quote(name, safe="") + "&per_page=100")
+    artifacts = sorted(listing.get("artifacts", []), key=lambda item: item.get("id", 0), reverse=True)
+    for artifact in artifacts:
+        run_id = (artifact.get("workflow_run") or {}).get("id")
+        if artifact.get("name") != name or artifact.get("expired") or not run_id:
+            continue
+        run_info = gh("actions/runs/" + str(run_id))
+        if (run_info.get("path") != ".github/workflows/release-verify.yml" or
+                run_info.get("event") != "workflow_dispatch" or
+                run_info.get("status") != "completed" or run_info.get("conclusion") != "success" or
+                run_info.get("head_branch") != branch):
+            continue
+        return {"run_id": run_id, "name": name}
+    return None
+
+
 def output(**fields):
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
@@ -122,7 +198,17 @@ def prepare():
         except ValueError:
             pass
         else:
-            output(mode="publish", sha=head, version=current)
+            tree = tree_at(head)
+            try:
+                artifact = find_verified_artifact(tree, branch)
+            except (subprocess.CalledProcessError, ValueError) as exc:
+                print("Verified artifact lookup failed; formal release will rebuild: " + str(exc), file=sys.stderr)
+                artifact = None
+            if not artifact:
+                print("No reusable attested artifact found for this source tree; formal release will rebuild", file=sys.stderr)
+            output(mode="publish", sha=head, version=current, tree=tree,
+                   artifact_run_id=(artifact or {}).get("run_id", ""),
+                   artifact_name=(artifact or {}).get("name", ""))
             return
     # 合并不等于发版；只有明确启动稳定批次，才创建新的版本 PR。
     if os.environ.get("PREPARE_RELEASE") != "true":
@@ -165,7 +251,7 @@ def prepare():
     run("git", "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost", "commit", "-m", "准备正式版本 " + target)
     run("git", "push", "origin", "HEAD:refs/heads/" + release_branch)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as body:
-        body.write("同步四处版本及中英文版本记录。\n\n价值：将已合入主线并通过检查的改进交付给用户。发布前独立重建版本补丁、完整检查、ZIP/wheel/macOS ARM64 桌面 DMG 构建及安装/升级 smoke。DMG 使用临时 ad-hoc 签名，尚未 Apple 公证。\n\n基线：`" + head + "`。必须遵守所有必需检查与评审规则；不得绕过审批。")
+        body.write("同步四处版本及中英文版本记录。\n\n价值：将已合入主线并通过检查的改进交付给用户。发布前独立重建版本补丁、完整检查、ZIP/wheel/macOS ARM64 桌面 DMG 构建及安装/升级 smoke；正式发布优先复用同一源树且 provenance 有效的产物并再次 smoke，任何不一致都会回退完整重建。DMG 使用临时 ad-hoc 签名，尚未 Apple 公证。\n\n基线：`" + head + "`。必须遵守所有必需检查与评审规则；不得绕过审批。")
         body.flush()
         url = run("gh", "pr", "create", "--repo", os.environ["GITHUB_REPOSITORY"], "--base", branch, "--head", release_branch,
                   "--title", "准备正式版本 " + target, "--body-file", body.name)
@@ -193,6 +279,10 @@ def publish():
     if not marker:
         raise ValueError("Formal releases require the generated and reviewed version PR")
     verify_generated(marker[1], head)
+    validate_proof(ROOT / "dist", head, {
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/release.yml",
+    })
     tag = "v" + target
     refs = gh("git/matching-refs/tags/" + tag)
     existing = [item for item in refs if item["ref"] == "refs/tags/" + tag]
@@ -225,12 +315,19 @@ def publish():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["prepare", "gate", "publish"])
+    parser.add_argument("action", choices=["prepare", "gate", "publish", "validate-verified"])
     parser.add_argument("--pr")
     parser.add_argument("--sha")
+    parser.add_argument("--directory", default=str(ROOT / "dist"))
     args = parser.parse_args()
     if args.action == "gate":
         gate(args.pr, args.sha)
+    elif args.action == "validate-verified":
+        if not args.sha:
+            parser.error("validate-verified requires --sha")
+        proof = validate_proof(Path(args.directory), args.sha, {".github/workflows/release-verify.yml"})
+        output(source_sha=proof["source_sha"], source_tree=proof["source_tree"],
+               workflow_source_sha=proof["workflow_source_sha"])
     else:
         globals()[args.action]()
 

@@ -1,5 +1,6 @@
 """Read-only preflight. Detection is deliberately separate from execution proof."""
 import os
+import platform
 import shutil
 import time
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 from .adapters import detect
 from .config import BUILTIN_PROVIDERS, compatibility
 from .agent import CodexAgent
-from .process import Sandbox
+from .process import Sandbox, run_process
 
 
 def budget(store, project, config, required=1, run=None):
@@ -51,6 +52,34 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
                       "Configured dependency paths are available.", "settings" if missing_seeds else None,
                       reason="dependencies_missing" if missing_seeds else None, missing=missing_seeds))
     providers = {p["id"]: p for p in BUILTIN_PROVIDERS + config["providers"]}
+    opencode_checks = {}
+
+    def opencode_status():
+        container = platform.system() != "Darwin" or config["sandbox"]["backend"] == "docker"
+        binary = shutil.which("opencode")
+        image = config["sandbox"]["worker_image"]
+        key = ("docker:" + image) if container else binary
+        if not key:
+            return None
+        if key not in opencode_checks:
+            from .opencode import OpenCodeCompatibilityError, detect_opencode
+            try:
+                if not container and binary:
+                    opencode_checks[key] = ("ready", detect_opencode(binary))
+                elif shutil.which("docker"):
+                    from .cli_worker import clean_environment
+                    inspected = run_process(["docker", "image", "inspect", image], timeout=10)
+                    if inspected["exit_code"] or inspected["error"]:
+                        return None
+                    opencode_checks[key] = ("ready", detect_opencode(
+                        "opencode", argv=["docker", "run", "--rm", image, "opencode", "--version"],
+                        env=clean_environment()))
+                else:
+                    return None
+            except OpenCodeCompatibilityError as exc:
+                opencode_checks[key] = ("failed", exc)
+        return opencode_checks[key]
+
     def route_diagnostic(route):
         provider_id = route.get("provider", "openai")
         provider = providers.get(provider_id)
@@ -75,6 +104,19 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         from .provider_health import ProviderHealth
         if ProviderHealth(runtime.store).status(config, provider_id, project["id"])["paused"]:
             return False, detail + " is paused after repeated provider failures.", "models", "provider_paused", {**route_fields, "probe": {"state": "unavailable"}}
+        opencode = opencode_status() if provider.get("protocol") == "opencode" else None
+        if opencode and opencode[0] == "failed":
+            exc = opencode[1]
+            version = exc.version or "unknown"
+            route_fields.update({"opencode_version": version, "compatibility": "unsupported"})
+            return (False, detail + " detected OpenCode " + version +
+                    "; the command parameters are incompatible. Upgrade Adaptive RSI or temporarily use OpenCode 1.19.3. "
+                    "Adaptive RSI does not upgrade or downgrade OpenCode automatically.",
+                    "install", exc.code, {**route_fields, "probe": {"state": "unavailable"}})
+        if opencode and opencode[0] == "ready":
+            capabilities = opencode[1]
+            route_fields.update({"opencode_version": capabilities.version, "compatibility": "supported"})
+            detail += " Detected OpenCode " + capabilities.version + " with compatible command parameters."
         if provider.get("protocol", "codex") in ["codex", "codex_login", "opencode"] and isinstance(runtime.agent, CodexAgent):
             from .cli_worker import worker_available
             binary = "opencode" if provider.get("protocol") == "opencode" else "codex"
@@ -122,9 +164,13 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
                              proof.get("signature") == selected[4].get("signature"))
         items.append(item("model", ready, detail, selected[2],
                           reason=selected[3], role=role, provider=selected[4]["provider"], model=selected[4]["model"],
-                          effort=selected[4]["effort"], probe=selected[4]["probe"], fallback=route.get("fallback")))
+                          effort=selected[4]["effort"], probe=selected[4]["probe"], fallback=route.get("fallback"),
+                          **{key: selected[4][key] for key in ("opencode_version", "compatibility")
+                             if key in selected[4]}))
         model_evidence.append({"role": role, "provider": selected[4]["provider"], "model": selected[4]["model"],
                                "effort": selected[4]["effort"], "configured": ready,
+                               **{key: selected[4][key] for key in ("opencode_version", "compatibility")
+                                  if key in selected[4]},
                                "tool_tested": selected[4]["probe"].get("state") == "pass",
                                "task_verified": task_verified})
     usage = budget(runtime.store, project["id"], config, required, run)

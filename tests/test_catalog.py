@@ -18,6 +18,52 @@ from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store
 
 
+def opencode_fixture(directory, version="2.1.3", fail=False):
+    script = Path(directory) / "opencode"
+    trace = Path(directory) / "opencode-trace.jsonl"
+    script.write_text("#!" + sys.executable + "\n" + '''import json, sys
+from pathlib import Path
+version = %r
+fail = %r
+args = sys.argv[1:]
+with Path(__file__).with_name("opencode-trace.jsonl").open("a") as stream:
+    stream.write(json.dumps(args) + "\\n")
+if args == ["--version"]:
+    print("opencode v" + version)
+    raise SystemExit(0)
+if args[:2] == ["auth", "export"]:
+    print("[]")
+    raise SystemExit(0)
+if fail:
+    print("private-output-secret")
+    print("private-stderr-secret", file=sys.stderr)
+    raise SystemExit(2)
+if version.startswith("2."):
+    if args == ["api", "GET", "/api/model", "--standalone"]:
+        print(json.dumps({"location": {}, "data": [
+            {"id": "coder", "modelID": "coder", "providerID": "opencode-go", "name": "Coder",
+             "capabilities": {"tools": True}, "variants": [{"id": "high"}, {"id": "low"}]},
+            {"id": "embed", "modelID": "embed", "providerID": "opencode-go", "name": "Embed",
+             "capabilities": {"tools": False}, "variants": []},
+            {"id": "other", "modelID": "other", "providerID": "fixture", "name": "Other",
+             "capabilities": {"tools": True}, "variants": []}]}))
+        raise SystemExit(0)
+    if args == ["models", "--standalone"]:
+        print("opencode-go/coder\\nfixture/other")
+        raise SystemExit(0)
+else:
+    if args == ["--pure", "models", "--verbose"]:
+        print("provider/legacy")
+        print(json.dumps({"providerID": "provider", "name": "Legacy",
+                          "capabilities": {"toolcall": True},
+                          "variants": {"low": {}, "high": {}}}))
+        raise SystemExit(0)
+raise SystemExit(3)
+''' % (version, fail))
+    script.chmod(0o700)
+    return script, trace
+
+
 class CatalogFixture:
     def __init__(self, protocol="responses", behavior="normal"):
         self.requests, self.protocol, self.behavior = [], protocol, behavior
@@ -188,6 +234,48 @@ for line in sys.stdin:
             self.assertEqual(error.exception.code, "timeout")
             self.assertNotIn("secret", str(error.exception))
             self.assertEqual(processes[0].returncode, -9)
+
+    def test_opencode_v1_and_v2_commands_and_parsers_do_not_cross_flags(self):
+        cases = {
+            "1.19.3": (["provider/legacy"], ["--pure", "models", "--verbose"]),
+            "2.1.3": (["fixture/other", "opencode-go/coder"], ["api", "GET", "/api/model", "--standalone"]),
+        }
+        for version, (expected, required) in cases.items():
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                script, trace = opencode_fixture(directory, version)
+                env = {"XDG_CONFIG_HOME": str(Path(directory) / "config"),
+                       "XDG_DATA_HOME": str(Path(directory) / "data"),
+                       "XDG_CACHE_HOME": str(Path(directory) / "cache")}
+                with patch.dict(os.environ, env), patch(
+                        "adaptive_rsi.catalog.shutil.which",
+                        side_effect=lambda name: str(script) if name == "opencode" else None):
+                    data = list_models("opencode")
+                self.assertEqual([model["id"] for model in data["models"]], expected)
+                calls = [json.loads(line) for line in trace.read_text().splitlines()]
+                self.assertIn(required, calls)
+                model_calls = [call for call in calls if call[:1] not in (["--version"], ["auth"])]
+                if version.startswith("1."):
+                    self.assertFalse(any("--standalone" in call for call in model_calls))
+                    self.assertEqual(data["models"][0]["efforts"], ["high", "low"])
+                else:
+                    self.assertFalse(any("--pure" in call or "--verbose" in call for call in model_calls))
+                    coder = next(model for model in data["models"] if model["id"] == "opencode-go/coder")
+                    self.assertEqual(coder["efforts"], ["high", "low"])
+                    self.assertFalse(any(model["id"].endswith("/embed") for model in data["models"]))
+
+    def test_opencode_command_errors_are_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script, _ = opencode_fixture(directory, "2.1.3", fail=True)
+            env = {"XDG_CONFIG_HOME": str(Path(directory) / "config"),
+                   "XDG_DATA_HOME": str(Path(directory) / "data"),
+                   "XDG_CACHE_HOME": str(Path(directory) / "cache")}
+            with patch.dict(os.environ, env), patch(
+                    "adaptive_rsi.catalog.shutil.which",
+                    side_effect=lambda name: str(script) if name == "opencode" else None):
+                with self.assertRaises(CatalogError) as error:
+                    list_models("opencode")
+            self.assertEqual(error.exception.code, "opencode_error")
+            self.assertNotIn("private", str(error.exception))
 
     def test_api_fetches_unsaved_provider_without_mutation_or_dispatch_lock(self):
         with tempfile.TemporaryDirectory() as directory, CatalogFixture() as fixture:

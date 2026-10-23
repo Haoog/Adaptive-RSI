@@ -36,18 +36,43 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: 记录精确源树
+        id: source
+        run: echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+          key: ${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-build-${{ runner.os }}-
       - run: python3 -m unittest discover -v
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
@@ -56,14 +81,10 @@ jobs:
       - run: npx playwright install chromium
       - run: npm run test:browser
       - run: python3 scripts/package.py
-      - run: python3 -m pip install build
+      - run: python3 -m pip install --disable-pip-version-check build
       - run: python3 -m build --wheel
         env:
           SOURCE_DATE_EPOCH: '1577836800'
-      - run: python3 scripts/release_smoke.py
-        env:
-          GH_TOKEN: ${{ github.token }}
-      - uses: astral-sh/setup-uv@v6
       - name: 安装 macOS ARM64 桌面构建工具
         run: |
           rustup default stable
@@ -76,8 +97,32 @@ jobs:
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
           python3 scripts/package_desktop.py
           VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
-          hdiutil verify "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+          DMG="dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
           (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
+          python3 scripts/package_desktop.py verify-dmg --image "$DMG"
+      - name: 最终安装与升级 smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RSI_SOURCE_SHA: ${{ needs.gate.outputs.sha }}
+          RSI_SOURCE_TREE: ${{ steps.source.outputs.tree }}
+          RSI_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RSI_WORKFLOW_SOURCE_SHA: ${{ github.sha }}
+        run: python3 scripts/release_smoke.py
+      - name: 为精确构建产物签发 GitHub provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+      - uses: actions/upload-artifact@v4
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        with:
+          name: release-verified-${{ steps.source.outputs.tree }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
   report:
     if: always() && needs.gate.result == 'success'
     needs: [gate, verify]
@@ -97,7 +142,7 @@ jobs:
             -f name=verify -f head_sha="$PR_SHA" -f status=completed -f conclusion="$conclusion" \
             -f details_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             -f 'output[title]=版本 PR 独立检查' \
-            -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel/桌面安装包。'
+            -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel/桌面安装包；provenance 可用时传递精确源树产物供正式发布复验复用。'
   merge:
     needs: [gate, verify, report]
     runs-on: ubuntu-latest

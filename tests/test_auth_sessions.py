@@ -14,7 +14,7 @@ import urllib.request
 
 from adaptive_rsi.auth_sessions import AuthError, AuthSessions, CodexAuth, OpenCodeAuth
 from adaptive_rsi.cli_worker import CODEX_AUTH_LOCK
-from adaptive_rsi.opencode import AUTH_LOCK
+from adaptive_rsi.opencode import AUTH_LOCK, OpenCodeCapabilities, load_auth_export, merge_auth_export
 
 
 @contextlib.contextmanager
@@ -119,6 +119,37 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
         self.assertEqual(self.manager.snapshot()["codex"]["state"], "signed_out")
+
+    def test_container_snapshot_reads_v1_auth_without_host_opencode_binary(self):
+        path = self.root / "data/opencode/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"openai": {"type": "oauth", "refresh": "PRIVATE-REFRESH"}}))
+        manager = AuthSessions(self.root / "container-state", config={"sandbox": {"backend": "docker"}})
+        try:
+            with patch("adaptive_rsi.auth_sessions.shutil.which",
+                       side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None), patch(
+                    "adaptive_rsi.auth_sessions.run_process", return_value={"exit_code": 0, "error": None}), patch(
+                    "adaptive_rsi.auth_sessions.detect_opencode",
+                    return_value=OpenCodeCapabilities("1.19.3", (1, 19, 3))):
+                snapshot = manager.snapshot()
+        finally:
+            manager.close()
+        self.assertEqual(snapshot["opencode"]["state"], "authenticated")
+        self.assertEqual(snapshot["opencode"]["transport"], "docker")
+        self.assertEqual(snapshot["opencode"]["authenticated_providers"], ["openai"])
+        self.assertNotIn("PRIVATE-REFRESH", json.dumps(snapshot))
+
+    def test_container_logout_removes_persisted_v2_export_without_host_cli(self):
+        merge_auth_export([{"integrationID": "opencode-go", "id": "credential",
+                            "value": {"type": "key", "key": "PRIVATE-KEY"}}])
+        manager = AuthSessions(self.root / "container-logout", config={"sandbox": {"backend": "docker"}})
+        try:
+            with patch("adaptive_rsi.auth_sessions.shutil.which",
+                       side_effect=lambda name: "/usr/bin/docker" if name == "docker" else None):
+                manager.logout("opencode", "opencode-go")
+        finally:
+            manager.close()
+        self.assertEqual(load_auth_export(), [])
 
     def test_codex_device_completion_persists_compatible_private_credentials(self):
         session = self.manager.start("codex")
@@ -407,6 +438,9 @@ _PROTOCOL_FIXTURE = r'''#!/usr/bin/env python3
 import base64,json,os,pathlib,sys
 from http.server import BaseHTTPRequestHandler,HTTPServer
 from socketserver import TCPServer
+if sys.argv[1:]==['--version']:
+ print('opencode v1.19.3')
+ raise SystemExit(0)
 home=pathlib.Path(os.environ['HOME'])
 assert os.environ['CODEX_HOME']==str(home/'.codex')
 assert 'OPENAI_API_KEY' not in os.environ
@@ -430,6 +464,8 @@ else:
  assert os.environ['OPENCODE_PURE']=='true'
  assert os.environ['OPENCODE_DISABLE_PROJECT_CONFIG']=='true'
  assert 'OPENCODE_CONFIG' not in os.environ
+ assert '--pure' in sys.argv
+ assert sys.argv[1]=='serve'
  class Handler(BaseHTTPRequestHandler):
   def log_message(self,*args): pass
   def request(self):
@@ -456,6 +492,91 @@ else:
    self.server_port=self.server_address[1]
  port=int(sys.argv[sys.argv.index('--port')+1])
  LoopbackServer(('127.0.0.1',port),Handler).serve_forever()
+'''
+
+
+_PROTOCOL_V2_FIXTURE = r'''#!/usr/bin/env python3
+import base64,json,os,pathlib,sys
+from http.server import BaseHTTPRequestHandler,HTTPServer
+from socketserver import TCPServer
+args=sys.argv[1:]
+if args==['--version']:
+ print('opencode v2.1.3')
+ raise SystemExit(0)
+home=pathlib.Path(os.environ['HOME'])
+data_home=pathlib.Path(os.environ['XDG_DATA_HOME'])
+auth_file=data_home/'opencode/fake-auth.json'
+if args[:1]==['api']:
+ assert args==['api','GET','/api/model','--standalone']
+ print(json.dumps({'location':{},'data':[{'id':'fixture','modelID':'fixture','providerID':'opencode-go','name':'Fixture','capabilities':{'tools':True},'variants':[{'id':'low'}]}]}))
+ raise SystemExit(0)
+def credentials():
+ if not auth_file.is_file(): return []
+ value=json.loads(auth_file.read_text())
+ return value if isinstance(value,list) else []
+def save(rows):
+ auth_file.parent.mkdir(parents=True,exist_ok=True)
+ auth_file.write_text(json.dumps(rows));auth_file.chmod(0o600)
+if args[:2]==['auth','list']:
+ rows=[]
+ for item in credentials():
+  rows.append({'id':item['integrationID'],'name':item['integrationID'],'connections':[{'type':'credential','id':item['id'],'label':item.get('label',''), 'method':item.get('value',{}).get('type','key')}]})
+ print(json.dumps(rows));raise SystemExit(0)
+if args[:2]==['auth','export']:
+ target=args[3] if len(args)>3 else None
+ rows=[item for item in credentials() if not target or item['integrationID']==target]
+ print(json.dumps(rows));raise SystemExit(0)
+if args[:2]==['auth','import']:
+ source=pathlib.Path(args[3])
+ incoming=json.loads(source.read_text())
+ current={item['integrationID']:item for item in credentials()}
+ for item in incoming: current[item['integrationID']]=item
+ save(list(current.values()));raise SystemExit(0)
+if args[:2]==['auth','logout']:
+ target=args[3]
+ save([item for item in credentials() if item['integrationID']!=target]);raise SystemExit(0)
+assert args[0]=='serve' and '--pure' not in args and '--log-level' not in args
+assert os.environ['OPENCODE_PURE']=='true'
+assert os.environ['OPENCODE_SERVER_USERNAME']=='opencode'
+class Handler(BaseHTTPRequestHandler):
+ def log_message(self,*args): pass
+ def request(self):
+  expected='Basic '+base64.b64encode((os.environ['OPENCODE_SERVER_USERNAME']+':'+os.environ['OPENCODE_SERVER_PASSWORD']).encode()).decode()
+  if self.headers.get('Authorization')!=expected:
+   self.send_response(401);self.end_headers();return
+  value={}
+  if self.path=='/api/info': value={'status':'ok'}
+  if self.path=='/api/integration':
+   status=[]
+   for item in credentials():
+    status.append({'type':'credential','id':item['id'],'label':item.get('label',''), 'method':item.get('value',{}).get('type','key')})
+   value={'location':{},'data':[
+    {'id':'openai','name':'OpenAI','methods':[{'type':'key'},{'id':'chatgpt-browser','type':'oauth','label':'Codex browser (legacy)'},{'id':'chatgpt-headless','type':'oauth','label':'Codex device code'}],'connections':[]},
+    {'id':'opencode-go','name':'OpenCode Go','methods':[{'type':'key'}],'connections':[item for item in status if item['id']=='v2-key']}]}
+  if self.path=='/api/integration/openai/connect/oauth' and self.command=='POST':
+   body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))))
+   assert body['methodID']=='chatgpt-headless'
+   value={'location':{},'data':{'attemptID':'attempt-1','url':'https://example.test/device','instructions':'Complete in browser','mode':'auto','time':{'created':1,'expires':9999999999}}}
+  if self.path=='/api/integration/openai/connect/oauth/attempt-1' and self.command=='GET':
+   rows=credentials()
+   if not any(item['integrationID']=='openai' for item in rows):
+    rows.append({'id':'credential-oauth','integrationID':'openai','label':'OAuth','active':True,'value':{'type':'oauth','refresh':'V2-REFRESH','access':'V2-ACCESS'}})
+    save(rows)
+   value={'location':{},'data':{'status':'complete','time':{'created':1,'expires':9999999999}}}
+  if self.path=='/api/integration/opencode-go/connect/key' and self.command=='POST':
+   body=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))))
+   rows=credentials()
+   rows.append({'id':'v2-key','integrationID':'opencode-go','label':'API key','active':True,'value':{'type':'key','key':body['key']}})
+   save(rows)
+   self.send_response(204);self.end_headers();return
+  self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(json.dumps(value).encode())
+ do_GET=request
+ do_POST=request
+class LoopbackServer(HTTPServer):
+ def server_bind(self):
+  TCPServer.server_bind(self);self.server_name='localhost';self.server_port=self.server_address[1]
+port=int(args[args.index('--port')+1])
+LoopbackServer(('127.0.0.1',port),Handler).serve_forever()
 '''
 
 
@@ -515,6 +636,27 @@ class AuthProtocolTests(unittest.TestCase):
             worker.close()
         self.assertFalse(home.exists())
 
+    def test_opencode_v1_session_save_and_api_key_use_auth_json_not_v2_integration_api(self):
+        manager = AuthSessions(self.root / "v1-state")
+        try:
+            session = manager.start("opencode", "openai", 0)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                result = manager.status(session["id"])
+                if result["state"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(result["state"], "completed", result)
+            path = self.root / "saved-data/opencode/auth.json"
+            self.assertEqual(json.loads(path.read_text())["openai"]["refresh"], "FIXTURE-REFRESH")
+            self.assertFalse((self.root / "saved-data/opencode/fake-auth.json").exists())
+
+            manager.set_api_key("opencode", "openai", "V1-PRIVATE-KEY")
+            self.assertEqual(json.loads(path.read_text())["openai"], {"type": "api", "key": "V1-PRIVATE-KEY"})
+            self.assertFalse((self.root / "saved-data/opencode/fake-auth.json").exists())
+        finally:
+            manager.close()
+
     def test_loopback_fixture_skips_reverse_dns_and_uses_current_python(self):
         script = self.root / "opencode"
         fixture = script.read_text().replace(
@@ -565,3 +707,84 @@ os._exit(0)
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+class OpenCodeV2AuthProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        script = self.root / "opencode"
+        script.write_text(_PROTOCOL_V2_FIXTURE.replace('#!/usr/bin/env python3', '#!' + sys.executable, 1))
+        script.chmod(0o700)
+        self.original_which = __import__("shutil").which
+        self.which = patch("adaptive_rsi.auth_sessions.shutil.which", side_effect=lambda name:
+                           str(script) if name == "opencode" else self.original_which(name))
+        self.which.start()
+        self.env = patch.dict(os.environ, {"CODEX_HOME": str(self.root / "saved-codex"),
+            "XDG_DATA_HOME": str(self.root / "saved-data"),
+            "XDG_CONFIG_HOME": str(self.root / "saved-config"),
+            "XDG_CACHE_HOME": str(self.root / "saved-cache")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.which.stop()
+        self.temp.cleanup()
+
+    def wait_state(self, manager, session, state):
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            result = manager.status(session["id"])
+            if result["state"] in {"completed", "failed", "expired"}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(result["state"], state, result)
+        return result
+
+    def test_v2_oauth_key_snapshot_and_logout_use_integration_api_and_import(self):
+        manager = AuthSessions(self.root / "state")
+        try:
+            initial = manager.snapshot()["opencode"]
+            self.assertEqual(initial["version"], "2.1.3")
+            self.assertEqual(initial["state"], "signed_out")
+            providers = manager.providers("opencode")
+            openai = next(row for row in providers if row["id"] == "openai")
+            self.assertFalse(next(method for method in openai["methods"] if "browser" in method["label"])["supported"])
+            oauth = next(method for method in openai["methods"] if method["type"] == "oauth" and method["supported"])
+            session = manager.start("opencode", "openai", oauth["index"])
+            result = self.wait_state(manager, session, "completed")
+            self.assertNotIn("verification_url", result)
+            stored = json.loads((self.root / "saved-data/opencode/fake-auth.json").read_text())
+            self.assertEqual(stored[0]["integrationID"], "openai")
+            self.assertEqual(manager.snapshot()["opencode"]["authenticated_providers"], ["openai"])
+
+            manager.set_api_key("opencode", "opencode-go", "V2-PRIVATE-KEY")
+            stored = json.loads((self.root / "saved-data/opencode/fake-auth.json").read_text())
+            key = next(item for item in stored if item["integrationID"] == "opencode-go")
+            self.assertEqual(key["value"], {"type": "key", "key": "V2-PRIVATE-KEY"})
+            self.assertEqual(manager.snapshot()["opencode"]["authenticated_providers"], ["openai", "opencode-go"])
+            connected = next(row for row in manager.providers("opencode") if row["id"] == "opencode-go")
+            self.assertTrue(connected["connected"])
+
+            manager.logout("opencode", "openai")
+            remaining = json.loads((self.root / "saved-data/opencode/fake-auth.json").read_text())
+            self.assertEqual([item["integrationID"] for item in remaining], ["opencode-go"])
+        finally:
+            manager.close()
+
+    def test_v2_worker_install_writes_legacy_auth_when_host_cli_is_v1(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.home = self.root / "worker-home"
+        credentials = [{"id": "credential", "integrationID": "provider", "label": "Provider",
+                        "active": True, "value": {"type": "oauth", "refresh": "private-refresh"}}]
+        with patch.dict(os.environ, {"XDG_DATA_HOME": str(self.root / "fallback-data")}), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value="/fake/opencode"), patch(
+                "adaptive_rsi.auth_sessions.detect_opencode",
+                return_value=OpenCodeCapabilities("1.19.3", (1, 19, 3))), patch(
+                "adaptive_rsi.auth_sessions.import_auth") as imported:
+            worker.install_credential("provider", credentials)
+            stored = json.loads((self.root / "fallback-data/opencode/auth.json").read_text())
+            exported = load_auth_export()
+        imported.assert_not_called()
+        self.assertEqual(stored["provider"]["refresh"], "private-refresh")
+        self.assertEqual(exported, [])

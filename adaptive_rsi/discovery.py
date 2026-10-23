@@ -12,6 +12,33 @@ ISSUE_COMMENT_TTL = 300
 ISSUE_COMMENT_LIMIT = 20
 ISSUE_COMMENT_PAGE_SIZE = 100
 ISSUE_COMMENT_BODY_LIMIT = 4000
+ISSUE_COMMENT_FALLBACK_PAGES = 25
+ISSUE_SYNC_MAX_PAGES = 10
+ISSUE_SYNC_SECONDS = 20
+
+
+def _github_response(text):
+    """Split ``gh api --include`` headers from its JSON body."""
+    value = text or ""
+    headers = {}
+    status = None
+    if value.lstrip().startswith("HTTP/"):
+        head, separator, body = value.partition("\n\n")
+        if not separator:
+            head, separator, body = value.partition("\r\n\r\n")
+        match = re.match(r"HTTP/\S+\s+(\d+)", head)
+        status = int(match.group(1)) if match else None
+        for line in head.replace("\r\n", "\n").splitlines()[1:]:
+            if ":" in line:
+                key, item = line.split(":", 1)
+                headers[key.strip().lower()] = item.strip()
+        value = body
+    return value, headers, status
+
+
+def _link_page(headers):
+    match = re.search(r"[?&]page=(\d+)[^>]*>;\s*rel=\"last\"", headers.get("link", ""), re.I)
+    return int(match.group(1)) if match else None
 
 
 def issue_comment_context(runtime, project, task, config, checked=None, cancel=None):
@@ -49,68 +76,159 @@ def issue_comment_context(runtime, project, task, config, checked=None, cancel=N
     comments = {str(item["id"]): item for item in cached.get("comments", []) if item.get("id") is not None}
     total_seen = cached.get("total_seen", 0 if cursor is None else None)
     max_comment_id = cached.get("max_comment_id", 0)
-    next_cursor = cursor
-    pages_complete = False
+    cached_ids = set(comments)
     scan_started = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
     watermark = (scan_started - datetime.timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
     any_truncated = False
-    try:
-        page = 1
-        while True:
-            if cancel and cancel():
-                from .process import Cancelled
-                raise Cancelled("Issue comment retrieval cancelled")
-            args = ["gh", "api", "--method", "GET", "repos/" + repo + "/issues/" + str(number) + "/comments",
-                    "-f", "per_page=" + str(ISSUE_COMMENT_PAGE_SIZE), "-f", "page=" + str(page)]
-            if cursor:
-                args += ["-f", "since=" + cursor]
-            rows = json.loads(checked(args, timeout=60))
-            if not isinstance(rows, list):
+    fetched_comments = {}
+
+    def fetch(page, etag=None):
+        args = ["gh", "api", "--include", "--method", "GET",
+                "repos/" + repo + "/issues/" + str(number) + "/comments",
+                "-f", "per_page=" + str(ISSUE_COMMENT_PAGE_SIZE), "-f", "page=" + str(page)]
+        if cursor:
+            args += ["-f", "since=" + cursor]
+        if etag:
+            args += ["-H", "If-None-Match: " + etag]
+        body, headers, status = _github_response(checked(args, timeout=60))
+        if status == 304:
+            return None, headers, status
+        rows = json.loads(body)
+        if not isinstance(rows, list):
+            raise ValueError("Unexpected GitHub Issue comment response")
+        return rows, headers, status
+
+    def consume(rows):
+        nonlocal any_truncated, max_comment_id
+        for row in rows:
+            if not isinstance(row, dict) or row.get("id") is None or not isinstance(row.get("body"), str):
                 raise ValueError("Unexpected GitHub Issue comment response")
-            for row in rows:
-                if not isinstance(row, dict) or row.get("id") is None or not isinstance(row.get("body"), str):
-                    raise ValueError("Unexpected GitHub Issue comment response")
-                truncated = len(row["body"]) > ISSUE_COMMENT_BODY_LIMIT
-                any_truncated = any_truncated or truncated
-                comment = {"id": row["id"], "author": str((row.get("user") or {}).get("login", ""))[:100],
-                           "body": row["body"][:ISSUE_COMMENT_BODY_LIMIT], "truncated": truncated,
-                           "created_at": row.get("created_at", ""), "updated_at": row.get("updated_at", ""),
-                           "url": row.get("html_url", "")}
-                comment_id = int(comment["id"])
-                if cursor is None:
-                    total_seen = (total_seen or 0) + 1
-                elif (comment_id > max_comment_id and comment["created_at"] and
-                      comment["created_at"] >= cursor):
-                    total_seen = None if total_seen is None else total_seen + 1
-                max_comment_id = max(max_comment_id, comment_id)
-                comments[str(comment["id"])] = comment
-                comments = dict(sorted(comments.items(), key=lambda pair: (pair[1].get("updated_at", ""), int(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
-            if len(rows) < ISSUE_COMMENT_PAGE_SIZE:
-                pages_complete = True
-                break
-            page += 1
+            truncated = len(row["body"]) > ISSUE_COMMENT_BODY_LIMIT
+            any_truncated = any_truncated or truncated
+            comment = {"id": row["id"], "author": str((row.get("user") or {}).get("login", ""))[:100],
+                       "body": row["body"][:ISSUE_COMMENT_BODY_LIMIT], "truncated": truncated,
+                       "created_at": row.get("created_at", ""), "updated_at": row.get("updated_at", ""),
+                       "url": row.get("html_url", "")}
+            max_comment_id = max(max_comment_id, int(comment["id"]))
+            fetched_comments[str(comment["id"])] = comment
+
+    try:
+        if cancel and cancel():
+            from .process import Cancelled
+            raise Cancelled("Issue comment retrieval cancelled")
+        etag = cached.get("etag") if cached.get("etag_cursor") == cursor else None
+        first_rows, first_headers, status = fetch(1, etag)
+        if status == 304 and cached:
+            refreshed = {**cached, "checked_at": now, "status": "loaded"}
+            store.put_setting(key, refreshed)
+            return _issue_comment_response(refreshed, "cached")
+        if first_rows is None:
+            raise ValueError("Unexpected GitHub Issue comment response")
+        last_page = _link_page(first_headers)
+        observed_total = None
+        pages_complete = False
+        if cursor:
+            # Incremental responses contain only changed comments and remain
+            # ordered by creation. Read every changed page so an old comment
+            # edited during this interval cannot be skipped.
+            rows = first_rows
+            page = 1
+            consume(rows)
+            while len(rows) >= ISSUE_COMMENT_PAGE_SIZE and page < ISSUE_COMMENT_FALLBACK_PAGES:
+                page += 1
+                if cancel and cancel():
+                    from .process import Cancelled
+                    raise Cancelled("Issue comment retrieval cancelled")
+                rows, _, _ = fetch(page)
+                if rows is None:
+                    break
+                consume(rows)
+            pages_complete = len(rows) < ISSUE_COMMENT_PAGE_SIZE
+        elif last_page and last_page > 1:
+            # REST comments are oldest-first. The Link header gives the newest
+            # page directly, so only the final one or two pages are needed.
+            newest, _, _ = fetch(last_page)
+            if newest is None:
+                raise ValueError("Unexpected GitHub Issue comment response")
+            consume(newest)
+            observed_total = (last_page - 1) * ISSUE_COMMENT_PAGE_SIZE + len(newest)
+            page = last_page - 1
+            while len(fetched_comments) < ISSUE_COMMENT_LIMIT and page >= 1:
+                if cancel and cancel():
+                    from .process import Cancelled
+                    raise Cancelled("Issue comment retrieval cancelled")
+                rows, _, _ = fetch(page)
+                if rows is None:
+                    break
+                consume(rows)
+                if not rows:
+                    break
+                page -= 1
+            pages_complete = True
+        elif last_page == 1 or len(first_rows) < ISSUE_COMMENT_PAGE_SIZE:
+            consume(first_rows)
+            observed_total = len(first_rows)
+            pages_complete = True
+        else:
+            # Servers or test doubles may omit Link. Preserve correctness with a
+            # bounded fallback rather than an unbounded historical scan.
+            page = 1
+            rows = first_rows
+            while True:
+                consume(rows)
+                if len(rows) < ISSUE_COMMENT_PAGE_SIZE or page >= ISSUE_COMMENT_FALLBACK_PAGES:
+                    pages_complete = len(rows) < ISSUE_COMMENT_PAGE_SIZE
+                    break
+                page += 1
+                if cancel and cancel():
+                    from .process import Cancelled
+                    raise Cancelled("Issue comment retrieval cancelled")
+                rows, _, _ = fetch(page)
+                if rows is None:
+                    break
+            if pages_complete:
+                observed_total = len(fetched_comments)
+
+        comments.update(fetched_comments)
+        sort_field = "updated_at" if cursor else "created_at"
+        comments = dict(sorted(comments.items(), key=lambda pair: (
+            pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
         retained = list(comments.values())
+        if cursor is None or not isinstance(total_seen, int):
+            total_seen = observed_total
+        else:
+            new_ids = set(fetched_comments) - cached_ids
+            total_seen = max(total_seen + len(new_ids), len(retained))
         total_seen = max(total_seen, len(retained)) if total_seen is not None else None
-        next_cursor = max(cursor or "", watermark)
+        # Keep the request watermark stable across empty incremental scans so a
+        # conditional ETag can turn the next TTL refresh into a 304.
+        next_cursor = cursor or watermark
+        if fetched_comments:
+            next_cursor = max(cursor or "", watermark)
         complete = pages_complete and total_seen is not None and total_seen <= ISSUE_COMMENT_LIMIT and not any_truncated
         warnings = []
         if not pages_complete:
             warnings.append("Comment retrieval did not finish; the latest comments may be incomplete.")
         if total_seen is None or total_seen > ISSUE_COMMENT_LIMIT:
-            warnings.append("Only the 20 most recently updated comments are included; older Issue comments are omitted.")
+            warnings.append("Only the 20 most recent comments are included; older Issue comments are omitted.")
         if any_truncated or any(item.get("truncated") for item in retained):
             warnings.append("One or more comments were truncated at 4,000 characters.")
             complete = False
         warning = " ".join(warnings) or None
         entry = {"repository": repo, "cursor": next_cursor, "comments": retained, "total_seen": total_seen,
                  "max_comment_id": max_comment_id, "complete": complete, "pages_complete": pages_complete, "warning": warning,
-                 "issue_updated_at": issue_evidence.get("updated"), "status": "loaded", "checked_at": now, "last_success_at": now}
+                 "issue_updated_at": issue_evidence.get("updated"), "status": "loaded", "checked_at": now,
+                 "last_success_at": now, "etag": first_headers.get("etag"), "etag_cursor": cursor}
         store.put_setting(key, entry)
         return _issue_comment_response(entry, "loaded")
     except Exception as exc:
         from .process import Cancelled
         if isinstance(exc, Cancelled):
             raise
+        if cached and ("HTTP 304" in str(exc) or "Not Modified" in str(exc)):
+            refreshed = {**cached, "checked_at": now, "status": "loaded"}
+            store.put_setting(key, refreshed)
+            return _issue_comment_response(refreshed, "cached")
         status = "permission_denied" if "HTTP 403" in str(exc) else "authentication_required" if "HTTP 401" in str(exc) else "unavailable"
         warning = {"permission_denied": "GitHub denied access to Issue comments; comment context is missing.",
                    "authentication_required": "GitHub authentication is required to read Issue comments; comment context is missing.",
@@ -188,10 +306,14 @@ def sync(runtime, project, config, checked, cancel=None):
         apply(issue)
     # API 按页读取并持久化游标，不限制可同步的 Issue 总数。
     size = 100
+    started = time.monotonic()
+    pages_read = 0
     while True:
         if cancel and cancel():
             from .process import Cancelled
             raise Cancelled("Issue sync cancelled; continuation retained")
+        if pages_read >= ISSUE_SYNC_MAX_PAGES or time.monotonic() - started >= ISSUE_SYNC_SECONDS:
+            break
         args = ["gh", "api", "--method", "GET", "repos/" + repo + "/issues", "-f", "state=all",
                 "-f", "sort=created", "-f", "direction=asc", "-f", "per_page=" + str(size),
                 "-f", "page=" + str(progress["page"])]
@@ -199,12 +321,14 @@ def sync(runtime, project, config, checked, cancel=None):
             args += ["-f", "since=" + progress["since"]]
         # A fixed since filter and creation order keep edits from moving existing rows.
         # The next cycle overlaps this cycle start to catch newly matching older Issues.
-        rows = json.loads(checked(args, timeout=60))
+        remaining = max(1, min(60, ISSUE_SYNC_SECONDS - (time.monotonic() - started)))
+        rows = json.loads(checked(args, timeout=remaining))
         if not isinstance(rows, list):
             raise RuntimeError("Unexpected GitHub Issue response")
         for issue in rows:
             apply(issue)
         progress["page"] += 1
+        pages_read += 1
         if len(rows) < size:
             complete = True
             # Overlap catches updates made while this cycle was draining.
@@ -214,7 +338,7 @@ def sync(runtime, project, config, checked, cancel=None):
         if complete:
             break
     store.event("issues", str(consumed) + " Issue updates synchronized", project["id"],
-                data={"complete": complete, "next_page": progress["page"]})
+                data={"complete": complete, "next_page": progress["page"], "pages_read": pages_read})
 
 
 def problem_title(title):

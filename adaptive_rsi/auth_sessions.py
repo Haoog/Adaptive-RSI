@@ -20,7 +20,11 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from .cli_worker import CODEX_AUTH_LOCK, clean_environment
-from .opencode import AUTH_LOCK, auth_path
+from .opencode import (AUTH_LOCK, OpenCodeCompatibilityError, auth_path, auth_providers,
+                       detect_opencode, export_auth, import_auth, install_legacy_credential,
+                       load_auth_export, logout_provider, merge_auth_export, remove_auth_export,
+                       _parse_auth_export)
+from .process import run_process
 
 
 ACTIVE = {"starting", "awaiting_authorization", "completing"}
@@ -326,12 +330,26 @@ class OpenCodeAuth(_Process):
         super().__init__("opencode", config, cancel)
         try:
             binary = self.binary()
+            if self.container:
+                image = self.config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
+                self.capabilities = detect_opencode(
+                    "opencode", argv=[shutil.which("docker"), "run", "--rm", image, "opencode", "--version"],
+                    env=clean_environment())
+            else:
+                self.capabilities = detect_opencode(binary)
         except AuthError:
             self.close()
             raise
+        except OpenCodeCompatibilityError as exc:
+            self.close()
+            raise AuthError(exc.code) from None
+        except Exception:
+            self.close()
+            raise AuthError("opencode_version_unknown") from None
         password = secrets.token_urlsafe(32)
-        self.header = "Basic " + base64.b64encode(("adaptive-rsi:" + password).encode()).decode()
-        self.environment.update(OPENCODE_SERVER_USERNAME="adaptive-rsi", OPENCODE_SERVER_PASSWORD=password,
+        self.header = "Basic " + base64.b64encode((self.capabilities.http_username + ":" + password).encode()).decode()
+        self.environment.update(OPENCODE_SERVER_USERNAME=self.capabilities.http_username,
+                                OPENCODE_SERVER_PASSWORD=password,
                                 OPENCODE_DISABLE_PROJECT_CONFIG="true", OPENCODE_DISABLE_AUTOUPDATE="true",
                                 OPENCODE_DISABLE_MODELS_FETCH="true", OPENCODE_PURE="true")
         _write_json(self.home / ".config/opencode/opencode.json", {
@@ -349,8 +367,8 @@ class OpenCodeAuth(_Process):
         self.base = "http://127.0.0.1:" + str(port)
         try:
             self.publish = self.container
-            self.launch([binary, "serve", "--pure", "--log-level", "ERROR", "--hostname", "0.0.0.0" if self.container else "127.0.0.1",
-                         "--port", "4096" if self.container else str(port)])
+            self.launch(self.capabilities.serve_argv(
+                binary, "0.0.0.0" if self.container else "127.0.0.1", 4096 if self.container else port))
             deadline = time.monotonic() + 25
             while True:
                 if self.cancel.is_set():
@@ -364,7 +382,7 @@ class OpenCodeAuth(_Process):
                         if not match:
                             raise AuthError("auth_container_unavailable")
                         self.base = "http://127.0.0.1:" + match[1].decode()
-                    self.http("GET", "/global/health", timeout=1)
+                    self.http("GET", "/api/info" if self.capabilities.modern else "/global/health", timeout=1)
                     break
                 except AuthError:
                     if not self.alive() or time.monotonic() >= deadline:
@@ -389,11 +407,15 @@ class OpenCodeAuth(_Process):
                 raw = response.read(MAX_BYTES + 1)
             if len(raw) > MAX_BYTES:
                 raise AuthError("invalid_response")
+            if not raw:
+                return None
             return json.loads(raw)
         except (OSError, ValueError, urllib.error.URLError):
             raise AuthError("auth_protocol_error") from None
 
     def providers(self):
+        if self.capabilities.modern:
+            return self._v2_providers()
         value = self.http("GET", "/provider/auth")
         if not isinstance(value, dict):
             raise AuthError("invalid_response")
@@ -426,6 +448,8 @@ class OpenCodeAuth(_Process):
         return result
 
     def start(self, provider, method, inputs=None):
+        if self.capabilities.modern:
+            return self._v2_start(provider, method, inputs)
         self.provider, self.method = provider, method
         rows = next((row["methods"] for row in self.providers() if row["id"] == provider), [])
         selected = next((item for item in rows if item["index"] == method), None)
@@ -453,11 +477,230 @@ class OpenCodeAuth(_Process):
                 "instructions": str(result.get("instructions", ""))[:2048], "user_code": ""}
 
     def complete(self, code="", timeout=600):
+        if self.capabilities.modern:
+            return self._v2_complete(code, timeout)
         result = self.http("POST", "/provider/" + quote(self.provider, safe="") + "/oauth/callback",
                            {"method": self.method, **({"code": code} if code else {})}, timeout=timeout)
         if result is not True:
             raise AuthError("authorization_failed")
         return True
+
+    def _v2_integrations(self):
+        value = self.http("GET", "/api/integration")
+        if not isinstance(value, dict) or not isinstance(value.get("data"), list):
+            raise AuthError("invalid_response")
+        return value["data"]
+
+    @staticmethod
+    def _v2_prompt(field):
+        if not isinstance(field, dict) or not isinstance(field.get("key"), str) or field.get("hidden"):
+            return None
+        options = []
+        for option in field.get("options", []):
+            if isinstance(option, dict) and isinstance(option.get("value"), str):
+                options.append({"value": option["value"],
+                                "label": str(option.get("label", option["value"]))[:160]})
+        when = field.get("when")
+        if isinstance(when, list):
+            when = when[0] if when and isinstance(when[0], dict) else None
+        prompt = {"type": "select" if options else "text", "key": field["key"],
+                  "message": str(field.get("title", field["key"]))[:160]}
+        if isinstance(field.get("placeholder"), str):
+            prompt["placeholder"] = field["placeholder"][:160]
+        if options:
+            prompt["options"] = options
+        if isinstance(when, dict) and isinstance(when.get("key"), str) and when.get("op") in {"eq", "neq"}:
+            prompt["when"] = {key: when.get(key) for key in ("key", "op", "value")}
+        return prompt
+
+    def _v2_providers(self):
+        result, methods_by_index = [], {}
+        host_connected = set()
+        if self.container:
+            host_connected = {item["integrationID"] for item in load_auth_export()}
+        binary = shutil.which("opencode")
+        if binary and not self.container:
+            try:
+                host_connected = set(auth_providers(binary, self.capabilities))
+            except (RuntimeError, OSError):
+                host_connected = set()
+        for integration in self._v2_integrations():
+            if not isinstance(integration, dict):
+                continue
+            provider = integration.get("id")
+            if not isinstance(provider, str):
+                continue
+            try:
+                _identifier(provider)
+            except AuthError:
+                continue
+            connections = integration.get("connections", [])
+            connected = provider in host_connected or (
+                isinstance(connections, list) and any(
+                    isinstance(connection, dict) and connection.get("type") == "credential" for connection in connections))
+            items = []
+            for index, method in enumerate(integration.get("methods", [])):
+                if not isinstance(method, dict) or method.get("type") not in {"key", "oauth"}:
+                    continue
+                form = method.get("form") if isinstance(method.get("form"), list) else []
+                prompts = [prompt for prompt in (self._v2_prompt(field) for field in form) if prompt]
+                defaults = {field["key"]: field["default"] for field in form
+                            if isinstance(field, dict) and field.get("hidden") and
+                            isinstance(field.get("key"), str) and isinstance(field.get("default"), str)}
+                label = str(method.get("label") or ("API key" if method["type"] == "key" else "OAuth"))[:160]
+                method_id = str(method.get("id", "")).lower()
+                device_oauth = method["type"] == "oauth" and (
+                    "device" in method_id or "headless" in method_id or
+                    "device" in label.lower() or "headless" in label.lower())
+                supported = (method["type"] == "oauth" and device_oauth) or (method["type"] == "key" and not prompts)
+                item = {"index": index, "label": label,
+                        "type": "api" if method["type"] == "key" else "oauth", "supported": supported,
+                        "prompts": prompts, "defaults": defaults,
+                        "unsupported_reason": "" if supported else "unsupported_auth_method"}
+                if method["type"] == "oauth" and isinstance(method.get("id"), str):
+                    item["method_id"] = method["id"]
+                items.append(item)
+                methods_by_index[(provider, index)] = method
+            if items:
+                result.append({"id": provider, "name": str(integration.get("name", provider))[:160],
+                               "methods": items, "connected": connected})
+        self._v2_methods = methods_by_index
+        result.sort(key=lambda row: (not row["connected"], row["name"].casefold()))
+        return result
+
+    def _v2_start(self, provider, method, inputs):
+        rows = next((row["methods"] for row in self.providers() if row["id"] == provider), [])
+        selected = next((item for item in rows if item["index"] == method), None)
+        if not selected or not selected["supported"] or selected["type"] != "oauth":
+            raise AuthError("unsupported_auth_method")
+        method_data = self._v2_methods.get((provider, method), {})
+        method_id = method_data.get("id")
+        if not isinstance(method_id, str):
+            raise AuthError("invalid_response")
+        inputs = {**selected.get("defaults", {}), **(inputs or {})}
+        prompts = selected.get("prompts", [])
+        allowed = {prompt.get("key") for prompt in prompts} | set(selected.get("defaults", {}))
+        if set(inputs) - allowed:
+            raise AuthError("invalid_auth_inputs")
+        for prompt in prompts:
+            condition = prompt.get("when")
+            if condition:
+                matched = inputs.get(condition.get("key")) == condition.get("value")
+                if matched != (condition.get("op") == "eq"):
+                    continue
+            value = inputs.get(prompt.get("key"), "")
+            if not value or (prompt["type"] == "select" and value not in {
+                    option.get("value") for option in prompt.get("options", [])}):
+                raise AuthError("invalid_auth_inputs")
+        result = self.http("POST", "/api/integration/" + quote(provider, safe="") + "/connect/oauth",
+                           {"methodID": method_id, "answer": inputs or None, "label": None})
+        if not isinstance(result, dict) or not isinstance(result.get("data"), dict):
+            raise AuthError("invalid_response")
+        data = result["data"]
+        if not isinstance(data.get("attemptID"), str) or data.get("mode") not in {"auto", "code"}:
+            raise AuthError("invalid_response")
+        self.provider, self.method, self.method_id = provider, method, method_id
+        self.attempt_id = data["attemptID"]
+        return {"verification_url": _url(data.get("url")), "method": data["mode"],
+                "instructions": str(data.get("instructions", ""))[:2048], "user_code": ""}
+
+    def _v2_complete(self, code="", timeout=600):
+        base = "/api/integration/" + quote(self.provider, safe="") + "/connect/oauth/" + quote(self.attempt_id, safe="")
+        if code:
+            result = self.http("POST", base + "/complete", {"code": code}, timeout=timeout)
+            if result is not None:
+                raise AuthError("authorization_failed")
+            return True
+        deadline = time.monotonic() + max(1, timeout)
+        while time.monotonic() < deadline:
+            value = self.http("GET", base, timeout=min(25, max(1, deadline - time.monotonic())))
+            data = value.get("data") if isinstance(value, dict) else None
+            status = data.get("status") if isinstance(data, dict) else None
+            if status == "complete":
+                return True
+            if status in {"failed", "expired"}:
+                raise AuthError("authorization_failed" if status == "failed" else "auth_expired")
+            if status != "pending":
+                raise AuthError("invalid_response")
+            time.sleep(0.2)
+        raise AuthError("auth_timeout")
+
+    def set_api_key(self, provider, key):
+        result = self.http("POST", "/api/integration/" + quote(provider, safe="") + "/connect/key",
+                           {"key": key, "answer": None, "label": None})
+        if result is not None:
+            raise AuthError("authorization_failed")
+        return True
+
+    def _worker_auth(self, argv, timeout=20):
+        if not self.container:
+            return None
+        docker = shutil.which("docker")
+        if not docker:
+            raise AuthError("auth_container_unavailable")
+        result = run_process([docker, "exec", self.container_name, "opencode"] + list(argv),
+                             timeout=timeout, output_mb=self.config.get("limits", {}).get("max_output_mb", 12))
+        if result.get("exit_code") or result.get("error"):
+            raise AuthError("auth_protocol_error")
+        return result.get("stdout", "")
+
+    def export_credential(self, provider):
+        try:
+            if self.container:
+                text = self._worker_auth(["auth", "export", "--standalone", provider])
+                credentials = _parse_auth_export(text)
+            else:
+                binary = shutil.which("opencode")
+                if not binary:
+                    raise AuthError("auth_protocol_error")
+                credentials = export_auth(binary, self.capabilities, {
+                    **clean_environment(),
+                    "HOME": str(self.home),
+                    "NO_COLOR": "1",
+                    "XDG_CONFIG_HOME": str(self.home / ".config"),
+                    "XDG_DATA_HOME": str(self.home / ".local/share"),
+                    "XDG_CACHE_HOME": str(self.home / ".cache"),
+                    "XDG_STATE_HOME": str(self.home / ".local/state"),
+                    "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+                    "OPENCODE_DISABLE_AUTOUPDATE": "true",
+                    "OPENCODE_DISABLE_MODELS_FETCH": "true",
+                    "OPENCODE_PURE": "true",
+                }, provider)
+        except RuntimeError:
+            raise AuthError("auth_protocol_error") from None
+        return [item for item in credentials if item.get("integrationID") == provider]
+
+    def install_credential(self, provider, credentials):
+        if not credentials:
+            raise AuthError("invalid_credentials")
+        binary = shutil.which("opencode")
+        host_capabilities = None
+        if binary:
+            try:
+                host_capabilities = detect_opencode(binary)
+            except OpenCodeCompatibilityError as exc:
+                raise AuthError(exc.code) from None
+        if not host_capabilities or not host_capabilities.modern:
+            if host_capabilities:
+                if not install_legacy_credential(provider, credentials):
+                    raise AuthError("invalid_credentials")
+            else:
+                merge_auth_export(credentials)
+            return
+        try:
+            import_auth(binary, {
+                **clean_environment(),
+                "HOME": os.environ.get("HOME", str(Path.home())),
+                "NO_COLOR": "1",
+                **{key: os.environ[key] for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]
+                   if os.environ.get(key)},
+                "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+                "OPENCODE_DISABLE_AUTOUPDATE": "true",
+                "OPENCODE_DISABLE_MODELS_FETCH": "true",
+                "OPENCODE_PURE": "true",
+            }, credentials, self.home)
+        except RuntimeError:
+            raise AuthError("auth_protocol_error") from None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -524,15 +767,63 @@ class AuthSessions:
             available = bool(shutil.which("docker") if container or not shutil.which(backend) else shutil.which(backend))
             try:
                 # 凭据写入采用原子替换；状态读取不等待可能持续整个模型调用的 CLI 锁。
-                data = _read_json(_codex_path() if backend == "codex" else auth_path())
-                authenticated = bool(data.get("tokens") or data.get("OPENAI_API_KEY")) if backend == "codex" else any(
-                    isinstance(value, dict) and value.get("type") in {"oauth", "api"} for value in data.values())
-                result[backend] = {"state": "authenticated" if authenticated else "signed_out",
-                                   "available": available, "transport": "docker" if container or not shutil.which(backend) else "host"}
-                if backend == "opencode":
-                    result[backend]["authenticated_providers"] = sorted(key for key, value in data.items()
-                        if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
+                if backend == "codex":
+                    data = _read_json(_codex_path())
+                    authenticated = bool(data.get("tokens") or data.get("OPENAI_API_KEY"))
+                    result[backend] = {"state": "authenticated" if authenticated else "signed_out",
+                                       "available": available, "transport": "docker" if container or not shutil.which(backend) else "host"}
+                else:
+                    if self.custom_factory:
+                        data = _read_json(auth_path())
+                        providers = sorted(key for key, value in data.items()
+                                           if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
+                        capabilities = None
+                    else:
+                        binary = shutil.which("opencode")
+                        if binary:
+                            capabilities = detect_opencode(binary)
+                            providers = auth_providers(binary, capabilities)
+                        else:
+                            # Linux/Docker deployments can keep v1 credentials on the host
+                            # even when only the worker image contains the CLI.
+                            capabilities = None
+                            docker = shutil.which("docker")
+                            if docker:
+                                try:
+                                    image = config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
+                                    inspected = run_process([docker, "image", "inspect", image], timeout=10)
+                                    if inspected["exit_code"] or inspected["error"]:
+                                        capabilities = None
+                                    else:
+                                        capabilities = detect_opencode(
+                                            "opencode", argv=[docker, "run", "--rm", image, "opencode", "--version"],
+                                            env=clean_environment())
+                                except (OpenCodeCompatibilityError, OSError):
+                                    capabilities = None
+                            providers = auth_providers(None, capabilities)
+                    result[backend] = {"state": "authenticated" if providers else "signed_out",
+                                       "available": available,
+                                       "transport": "docker" if container or not shutil.which(backend) else "host",
+                                       "authenticated_providers": providers}
+                    if capabilities:
+                        result[backend]["version"] = capabilities.version
+                        result[backend]["compatibility"] = "supported"
+            except OpenCodeCompatibilityError as exc:
+                result[backend] = {"state": "signed_out", "available": available,
+                                   "transport": "docker" if container or not shutil.which(backend) else "host",
+                                   "error": exc.code, "authenticated_providers": []}
+                if exc.version:
+                    result[backend]["version"] = exc.version
+            except RuntimeError as exc:
+                if backend == "opencode" and str(exc).startswith("OpenCode credential listing"):
+                    result[backend] = {"state": "signed_out", "available": available,
+                                       "transport": "docker" if container or not shutil.which(backend) else "host",
+                                       "error": "opencode_error", "authenticated_providers": []}
+                else:
+                    raise
             except AuthError:
+                result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
+            except (OSError, ValueError):
                 result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
         with self.lock:
             result["sessions"] = [{key: item.get(key) for key in ("id", "backend", "provider", "state", "expires_at", "error")}
@@ -657,14 +948,21 @@ class AuthSessions:
                 worker.close()
 
     def _save(self, worker, backend, provider, session_id, stop):
-        data = _read_json(worker.credentials)
         if backend == "codex":
+            data = _read_json(worker.credentials)
             if not isinstance(data.get("tokens"), dict) or not data["tokens"].get("refresh_token"):
                 raise AuthError("invalid_credentials")
         else:
-            value = data.get(provider)
-            if not isinstance(value, dict) or value.get("type") not in {"oauth", "api"}:
-                raise AuthError("invalid_credentials")
+            modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
+            if modern:
+                value = worker.export_credential(provider)
+                if not isinstance(value, list) or not value:
+                    raise AuthError("invalid_credentials")
+            else:
+                data = _read_json(worker.credentials)
+                value = data.get(provider)
+                if not isinstance(value, dict) or value.get("type") not in {"oauth", "api"}:
+                    raise AuthError("invalid_credentials")
         credential_lock = CODEX_AUTH_LOCK if backend == "codex" else AUTH_LOCK
         # 执行器可能长时间持锁；等待期间仍允许取消、过期和关闭服务。
         while not credential_lock.acquire(timeout=0.05):
@@ -680,6 +978,8 @@ class AuthSessions:
                     return
                 if backend == "codex":
                     _write_json(_codex_path(), data)
+                elif modern:
+                    worker.install_credential(provider, value)
                 else:
                     current = _read_json(auth_path())
                     current[provider] = value
@@ -742,16 +1042,25 @@ class AuthSessions:
                         self._update(session_id, state="cancelled")
                         if session_id in self.workers:
                             workers.append(self.workers[session_id])
-                path = _codex_path() if backend == "codex" else auth_path()
                 if backend == "codex":
+                    path = _codex_path()
                     try:
                         path.unlink()
                     except FileNotFoundError:
                         pass
                 else:
-                    data = _read_json(path)
-                    data.pop(provider, None)
-                    _write_json(path, data)
+                    binary = shutil.which("opencode")
+                    removed_export = remove_auth_export(provider)
+                    try:
+                        modern = bool(not self.custom_factory and binary and logout_provider(provider, binary))
+                    except (OpenCodeCompatibilityError, RuntimeError):
+                        raise AuthError("auth_protocol_error") from None
+                    if not modern or removed_export:
+                        path = auth_path()
+                        data = _read_json(path)
+                        if provider in data:
+                            data.pop(provider, None)
+                            _write_json(path, data)
         finally:
             credential_lock.release()
             for worker, stop in workers:
@@ -766,21 +1075,34 @@ class AuthSessions:
         _identifier(provider)
         if not isinstance(key, str) or not key.strip() or len(key) > 8192:
             raise AuthError("invalid_api_key")
-        if not any(row["id"] == provider and any(item["type"] == "api" for item in row["methods"])
+        if not any(row["id"] == provider and any(item["type"] == "api" and item.get("supported", True)
+                                                 for item in row["methods"])
                    for row in self.providers(backend)):
             raise AuthError("unsupported_auth_method")
         if not AUTH_LOCK.acquire(blocking=False):
             raise AuthError("auth_credentials_busy")
+        worker = None
         try:
             with self.lock:
                 if self.closed:
                     raise AuthError("service_closed")
                 if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                     raise AuthError("auth_busy")
+            worker = self.factory(backend)
+            modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
+            if modern and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"):
+                worker.set_api_key(provider, key.strip())
+                credentials = worker.export_credential(provider)
+                if not credentials:
+                    raise AuthError("invalid_credentials")
+                worker.install_credential(provider, credentials)
+            else:
                 data = _read_json(auth_path())
                 data[provider] = {"type": "api", "key": key.strip()}
                 _write_json(auth_path(), data)
         finally:
+            if worker:
+                worker.close()
             AUTH_LOCK.release()
         return self.snapshot()
 

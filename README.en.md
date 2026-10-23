@@ -82,7 +82,7 @@ The launcher reuses an existing service. Add projects and configure models, scan
 | Route | Use cases |
 | --- | --- |
 | Codex CLI | OpenAI/Codex accounts and Responses-compatible gateways |
-| OpenCode CLI | Providers configured in OpenCode with API/OAuth login |
+| OpenCode CLI | Providers configured in OpenCode 1.19.3 / 2.1.3 with API/OAuth login |
 | Responses / Chat Completions | OpenAI API, DeepSeek, compatible Qwen, gateways, and LM Studio |
 | Anthropic / Gemini | Official APIs and compatible gateways |
 | Ollama | Local models with tool-calling support |

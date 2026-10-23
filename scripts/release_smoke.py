@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -23,6 +24,36 @@ from adaptive_rsi.updates import RELEASE_API, REPOSITORY, download, extract_bund
 
 def command(*argv, cwd):
     subprocess.run(list(map(str, argv)), cwd=cwd, check=True, timeout=90)
+
+
+def write_proof(directory, package_version, source_sha, source_tree, workflow_ref, workflow_source_sha=None):
+    """Record the exact source tree and bytes exercised by release smoke."""
+    if not re.fullmatch(r"[a-f0-9]{40}", source_sha or ""):
+        raise ValueError("Release proof requires an exact source SHA")
+    if not re.fullmatch(r"[a-f0-9]{40}", source_tree or ""):
+        raise ValueError("Release proof requires an exact source tree")
+    if not workflow_ref or "@refs/" not in workflow_ref:
+        raise ValueError("Release proof requires a trusted workflow reference")
+    if workflow_source_sha is not None and not re.fullmatch(r"[a-f0-9]{40}", workflow_source_sha):
+        raise ValueError("Release proof requires an exact workflow source SHA")
+    directory = Path(directory)
+    files = {path.name: path for path in directory.iterdir()
+             if path.is_file() and not path.is_symlink() and path.name != "release-proof.json"}
+    if not files:
+        raise ValueError("Release proof requires built assets")
+    proof = {
+        "format": 1,
+        "version": package_version,
+        "source_sha": source_sha,
+        "source_tree": source_tree,
+        "workflow_ref": workflow_ref,
+        "artifacts": {name: hashlib.sha256(files[name].read_bytes()).hexdigest() for name in sorted(files)},
+    }
+    if workflow_source_sha is not None:
+        proof["workflow_source_sha"] = workflow_source_sha
+    destination = directory / "release-proof.json"
+    destination.write_text(json.dumps(proof, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return destination
 
 
 class NoMetadataRedirect(urllib.request.HTTPRedirectHandler):
@@ -121,9 +152,15 @@ def main():
                 except subprocess.TimeoutExpired:
                     child.kill()
                     child.wait()
+        proof_values = [os.environ.get("RSI_SOURCE_SHA"), os.environ.get("RSI_SOURCE_TREE"),
+                        os.environ.get("RSI_WORKFLOW_REF"), os.environ.get("RSI_WORKFLOW_SOURCE_SHA")]
+        if any(proof_values) and not all(proof_values):
+            raise ValueError("Release proof metadata must be provided together")
+        proof = write_proof(ROOT / "dist", __version__, *proof_values) if all(proof_values) else None
         print(json.dumps({"version": __version__, "zip_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
                           "wheel_install": True, "wheel_upgrade_from_official_release": bool(previous),
-                          "zip_supervised_startup": True, "state_preserved": True}))
+                          "zip_supervised_startup": True, "state_preserved": True,
+                          "release_proof": proof.name if proof else None}))
 
 
 if __name__ == "__main__":

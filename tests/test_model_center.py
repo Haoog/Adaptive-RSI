@@ -257,6 +257,7 @@ class ModelCenterTest(unittest.TestCase):
         with self.assertRaises(CredentialError):
             self.center.credentials.get(provider)
 
+    @patch("adaptive_rsi.cli_worker.platform.system", new=lambda: "Darwin")
     def test_codex_route_receives_key_only_in_environment_and_probe_reads_nonce(self):
         with DirectoryServer() as fixture:
             provider = {**fixture.provider, "protocol": "codex"}

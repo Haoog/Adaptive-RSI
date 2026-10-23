@@ -1,10 +1,16 @@
 """Bounded, project-local context selected from tracked paths and evidence."""
+import copy
+import hashlib
+import os
 import re
+import time
+from functools import lru_cache
 from pathlib import Path
 
 from .gitops import git
 
 
+@lru_cache(maxsize=512)
 def terms(text):
     """Return searchable ASCII words and overlapping CJK fragments.
 
@@ -29,10 +35,52 @@ def terms(text):
     return {term for term in sorted(result)[:512] if len(term) >= 2}
 
 
-def code_map(workspace, text, limit=24):
-    words = terms(text)
+def _workspace_fingerprint(workspace):
+    """Hash the checked-out base plus any local content that can affect retrieval."""
+    root = Path(workspace).resolve()
+    try:
+        head = git(root, "rev-parse", "HEAD")
+        changed = [name for name in git(
+            root, "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", "HEAD", "--").split("\0") if name]
+        untracked = [name for name in git(
+            root, "ls-files", "--others", "--exclude-standard", "-z").split("\0") if name]
+        names = sorted(set(changed) | set(untracked))
+    except RuntimeError:
+        head = ""
+        names = []
+        for parent, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [name for name in dirs if name != ".git" and not name.startswith(".rsi-")]
+            names.extend((Path(parent) / name).relative_to(root).as_posix() for name in files
+                         if not name.startswith(".rsi-"))
+
+    digest = hashlib.sha256(head.encode("utf-8"))
+    remaining = 12 * 1024 * 1024
+    for name in names:
+        path = root / name
+        digest.update(name.encode("utf-8", "surrogateescape"))
+        if path.is_symlink():
+            digest.update(b"symlink\0" + os.readlink(path).encode("utf-8", "surrogateescape"))
+            continue
+        if not path.is_file():
+            digest.update(b"missing\0")
+            continue
+        size = path.stat().st_size
+        if size > remaining:
+            # Never let an unusually large dirty tree make an unsafe cache hit.
+            return head + ":" + str(time.time_ns())
+        remaining -= size
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=3)
+def _code_index(root, fingerprint):
+    """Cache the bounded text index for one exact workspace content state."""
+    workspace = Path(root)
     paths = git(workspace, "ls-files").splitlines()
-    ranked = []
+    rows = []
     content_budget = 12 * 1024 * 1024
     text_suffixes = {
         ".c", ".cc", ".cpp", ".cs", ".css", ".dart", ".ex", ".exs", ".fs", ".go",
@@ -40,15 +88,9 @@ def code_map(workspace, text, limit=24):
         ".lua", ".m", ".md", ".php", ".pl", ".py", ".rb", ".rs", ".scss", ".sh",
         ".sql", ".swift", ".toml", ".ts", ".tsx", ".vue", ".xml", ".yaml", ".yml",
     }
-    path_words = sorted(words, key=lambda word: (-len(word), word))[:256]
-    content_words = path_words[:128]
     for path in paths:
         if path.startswith((".git/", ".rsi-")):
             continue
-        lower_path = path.lower()
-        score = sum(6 for word in path_words if word in lower_path)
-        if any(word == Path(path).stem.lower() for word in path_words):
-            score += 12
         content = ""
         file = Path(workspace) / path
         if file.suffix.lower() in text_suffixes and not file.is_symlink() and file.is_file():
@@ -57,9 +99,27 @@ def code_map(workspace, text, limit=24):
                 if size <= 160000 and size <= content_budget:
                     content = file.read_text(errors="replace").lower()
                     content_budget -= size
-                    score += sum(1 for word in content_words if word in content)
             except OSError:
                 content = ""
+        rows.append((path, content))
+    return tuple(rows), len(paths)
+
+
+@lru_cache(maxsize=64)
+def _code_map_cached(root, fingerprint, text, limit):
+    workspace = Path(root)
+    words = terms(text)
+    indexed, total_files = _code_index(root, fingerprint)
+    path_words = sorted(words, key=lambda word: (-len(word), word))[:256]
+    content_words = path_words[:128]
+    ranked = []
+    for path, content in indexed:
+        lower_path = path.lower()
+        score = sum(6 for word in path_words if word in lower_path)
+        if any(word == Path(path).stem.lower() for word in path_words):
+            score += 12
+        if content:
+            score += sum(1 for word in content_words if word in content)
         ranked.append((-score, path))
     rows = []
     for negative_score, path in sorted(ranked)[:limit]:
@@ -80,7 +140,13 @@ def code_map(workspace, text, limit=24):
                         if len(anchors) >= 12:
                             break
         rows.append({"path": path, "anchors": anchors})
-    return {"files": rows, "total_files": len(paths), "truncated": len(paths) > len(rows)}
+    return {"files": rows, "total_files": total_files, "truncated": total_files > len(rows)}
+
+
+def code_map(workspace, text, limit=24):
+    root = str(Path(workspace).resolve())
+    fingerprint = _workspace_fingerprint(root)
+    return copy.deepcopy(_code_map_cached(root, fingerprint, text, limit))
 
 
 def related(rows, text, limit=3, characters=5000):

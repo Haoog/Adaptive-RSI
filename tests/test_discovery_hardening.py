@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, merge
+from adaptive_rsi.context import terms
 from adaptive_rsi.discovery import related_work, sync
 from adaptive_rsi.store import Store, encode
 
@@ -73,6 +74,28 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.synchronize([{**issue, "updated_at": "2026-10-21T00:00:00Z"}])
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE fingerprint='issue:1'")["state"], "cancelled")
 
+    def test_issue_sync_page_budget_persists_and_resumes_without_losing_issues(self):
+        pages = []
+        def checked(args, **kwargs):
+            page = int(next(value.split("=", 1)[1] for value in args if value.startswith("page=")))
+            pages.append(page)
+            start = (page - 1) * 100 + 1
+            if start > 205:
+                return "[]"
+            return encode([{"number": number, "title": "Issue " + str(number), "body": "body",
+                            "labels": [], "state": "open", "updated_at": "2026-10-20T00:00:00Z",
+                            "html_url": "https://github.com/owner/project/issues/" + str(number)}
+                           for number in range(start, min(start + 100, 206))])
+        with patch("adaptive_rsi.discovery.ISSUE_SYNC_MAX_PAGES", 2):
+            sync(self.runtime, self.project, self.config, checked)
+            progress = self.store.setting("issue-sync:p")
+            self.assertEqual(progress["page"], 3)
+            self.assertEqual(len(self.store.query("SELECT * FROM tasks")), 200)
+            sync(self.runtime, self.project, self.config, checked)
+        self.assertEqual(pages, [1, 2, 3])
+        self.assertEqual(len(self.store.query("SELECT * FROM tasks")), 205)
+        self.assertEqual(self.store.setting("issue-sync:p")["page"], 1)
+
     def add_related(self, task_id, title, paths, result=None, updated=1, state="merged"):
         self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,updated) "
                            "VALUES (?,'p','inspection',?,?,'',?,?,?)",
@@ -121,6 +144,19 @@ class DiscoveryHardeningTest(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual([row["id"] for row in rows], ["task-" + str(i) for i in range(count - 1, count - 13, -1)])
         self.assertLess(peak, 1024 * 1024, "Related-work selection retained the whole run history")
+
+    def test_related_work_reuses_bounded_title_tokenization(self):
+        evidence = [{"path": "client.py"}]
+        for index in range(40):
+            self.store.add_task("p", "inspection", "related-" + str(index),
+                                "Handle client response " + str(index), evidence=evidence)
+        task = {"id": "subject", "title": "Handle client response", "body": "", "evidence": encode(evidence)}
+        before = terms.cache_info()
+        first = related_work(self.store, "p", task)
+        second = related_work(self.store, "p", task)
+        after = terms.cache_info()
+        self.assertEqual(first, second)
+        self.assertGreater(after.hits, before.hits)
 
     def test_related_work_closes_history_connection_after_invalid_evidence(self):
         self.add_related("broken", "Handle client response", ["client.py"])

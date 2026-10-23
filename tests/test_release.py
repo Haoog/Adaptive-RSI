@@ -1,9 +1,13 @@
+import ast
 import base64
 import copy
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -478,11 +482,6 @@ class ReleaseVersionPatchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "independently reconstructed"):
                 module.verify_generated(base, git(root, "rev-parse", "HEAD"))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ReleaseBatchCadenceTest(unittest.TestCase):
     def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False, new_stage='false'):
         from scripts import release as module
@@ -498,7 +497,7 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         def read(sha,name):
             return '__version__ = "1.2.3"\n' if name.endswith('__init__.py') else notes
         with patch.dict(os.environ,{'PREPARE_RELEASE':requested,'RELEASE_LEVEL':level,
-                                    'NEW_PRODUCT_STAGE':new_stage,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'output') as output:
+                                    'NEW_PRODUCT_STAGE':new_stage,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'tree_at',return_value='d'*40),patch.object(module,'find_verified_artifact',return_value={'run_id':17,'name':'release-verified-'+('d'*40)}),patch.object(module,'output') as output:
             module.prepare()
             return output.call_args.kwargs,calls.call_args_list
 
@@ -524,7 +523,244 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         result,_=self.prepare(notes='<!-- adaptive-rsi-release:1.2.3;base:'+('a'*40)+' -->',generated=True)
         self.assertEqual(result['mode'],'publish')
         self.assertEqual(result['version'],'1.2.3')
+        self.assertEqual(result['artifact_run_id'],17)
+        self.assertEqual(result['artifact_name'],'release-verified-'+('d'*40))
 
     def test_invalid_explicit_increment_is_rejected(self):
         with self.assertRaisesRegex(ValueError,'Release level'):
             self.prepare(requested='true',level='surprise')
+
+
+class VerifiedArtifactReuseTest(unittest.TestCase):
+    def test_only_successful_release_verify_artifacts_from_main_are_reused(self):
+        from scripts import release as module
+        tree = "a" * 40
+        name = "release-verified-" + tree
+        artifacts = [
+            {"id": 1, "name": name, "expired": True, "workflow_run": {"id": 10}},
+            {"id": 2, "name": name, "expired": False, "workflow_run": {"id": 20}},
+            {"id": 3, "name": name, "expired": False, "workflow_run": {"id": 30}},
+        ]
+        runs = {
+            "20": {"path": ".github/workflows/checks.yml", "event": "workflow_dispatch",
+                   "status": "completed", "conclusion": "success", "head_branch": "main"},
+            "30": {"path": ".github/workflows/release-verify.yml", "event": "workflow_dispatch",
+                   "status": "completed", "conclusion": "success", "head_branch": "main"},
+        }
+        def api(endpoint):
+            if endpoint.startswith("actions/artifacts?"):
+                return {"artifacts": artifacts}
+            return runs[endpoint.rsplit("/", 1)[-1]]
+        with patch.object(module, "gh", side_effect=api):
+            self.assertEqual(module.find_verified_artifact(tree, "main"), {"run_id": 30, "name": name})
+
+    def test_failed_or_untrusted_artifact_lookup_returns_no_reuse(self):
+        from scripts import release as module
+        tree = "b" * 40
+        name = "release-verified-" + tree
+        with patch.object(module, "gh", side_effect=[
+                    {"artifacts": [{"id": 1, "name": name, "expired": False, "workflow_run": {"id": 10}}]},
+                    {"path": ".github/workflows/release-verify.yml", "event": "workflow_dispatch",
+                     "status": "completed", "conclusion": "failure", "head_branch": "main"},
+                ]):
+            self.assertIsNone(module.find_verified_artifact(tree, "main"))
+
+
+class ReleaseProofTest(unittest.TestCase):
+    def test_proof_binds_exact_tree_workflow_and_asset_bytes(self):
+        from scripts import release as module
+        from scripts.release_smoke import write_proof
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "adaptive_rsi").mkdir()
+            (root / "adaptive_rsi/__init__.py").write_text('__version__ = "0.5.0"\n')
+            git(root, "init", "-q")
+            git(root, "add", ".")
+            git(root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "base")
+            sha = git(root, "rev-parse", "HEAD")
+            tree = git(root, "rev-parse", "HEAD^{tree}")
+            dist = root / "dist"
+            dist.mkdir()
+            for name in ["adaptive-rsi-0.5.0-plugin.zip", "adaptive_rsi-0.5.0-py3-none-any.whl",
+                         "adaptive-rsi-0.5.0-macos-arm64-adhoc.dmg"]:
+                (dist / name).write_bytes(("fixture:" + name).encode())
+            for name in ["adaptive-rsi-0.5.0-plugin.zip", "adaptive-rsi-0.5.0-macos-arm64-adhoc.dmg"]:
+                digest = hashlib.sha256((dist / name).read_bytes()).hexdigest()
+                (dist / (name + ".sha256")).write_text(digest + "  " + name + "\n")
+            write_proof(dist, "0.5.0", sha, tree,
+                        "Haoog/Adaptive-RSI/.github/workflows/release-verify.yml@refs/heads/main",
+                        "c" * 40)
+            with patch.object(module, "ROOT", root):
+                proof = module.validate_proof(
+                    dist, sha, {".github/workflows/release-verify.yml"})
+                self.assertEqual(proof["source_tree"], tree)
+                self.assertEqual(proof["workflow_source_sha"], "c" * 40)
+                self.assertEqual(set(proof["artifacts"]), {path.name for path in dist.iterdir()
+                                                           if path.name != "release-proof.json"})
+                (dist / "adaptive-rsi-0.5.0-plugin.zip").write_bytes(b"tampered")
+                with self.assertRaisesRegex(ValueError, "asset bytes"):
+                    module.validate_proof(dist, sha, {".github/workflows/release-verify.yml"})
+                with self.assertRaisesRegex(ValueError, "trusted release workflow"):
+                    module.validate_proof(dist, sha, {".github/workflows/release.yml"})
+
+    def test_proof_rejects_incomplete_identity_metadata(self):
+        from scripts.release_smoke import write_proof
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "asset.whl").write_bytes(b"asset")
+            for sha, tree, workflow in [
+                ("not-a-sha", "a" * 40, "example/repo/.github/workflows/release.yml@refs/heads/main"),
+                ("a" * 40, "not-a-tree", "example/repo/.github/workflows/release.yml@refs/heads/main"),
+                ("a" * 40, "a" * 40, "release.yml"),
+            ]:
+                with self.subTest(sha=sha, tree=tree, workflow=workflow), self.assertRaises(ValueError):
+                    write_proof(root, "0.5.0", sha, tree, workflow)
+
+
+class WorkflowConfigurationTest(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def workflow(self, name):
+        path = self.ROOT / ".github/workflows" / name
+        try:
+            import yaml
+            return yaml.safe_load(path.read_text())
+        except ImportError:
+            if not shutil.which("ruby"):
+                self.skipTest("A local YAML parser is unavailable")
+            output = subprocess.check_output(
+                ["ruby", "-ryaml", "-rjson", "-e",
+                 "puts JSON.generate(YAML.load_file(ARGV[0]))", str(path)],
+                text=True,
+            )
+            return json.loads(output)
+
+    def test_python_matrix_uses_ubuntu_and_runs_macos_only_cases_separately(self):
+        workflow = self.workflow("checks.yml")
+        jobs = workflow["jobs"]
+        self.assertEqual(jobs["python"]["runs-on"], "${{ matrix.os }}")
+        self.assertTrue(all(item["os"] == "ubuntu-latest" for item in jobs["python"]["strategy"]["matrix"]["include"]))
+        self.assertEqual(jobs["browser"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["macos_sandbox_core"]["runs-on"], "macos-14")
+        self.assertEqual(jobs["macos_sandbox_flows"]["runs-on"], "macos-14")
+        required = set(jobs["verify"]["needs"])
+        self.assertTrue({"python", "macos_sandbox_core", "macos_sandbox_flows", "browser", "linux"} <= required)
+        text = (self.ROOT / ".github/workflows/checks.yml").read_text()
+        self.assertIn("hashFiles('package-lock.json')", text)
+        self.assertIn("hashFiles('deploy/Dockerfile.worker')", text)
+        self.assertIn("hashFiles('pyproject.toml')", text)
+        for path in sorted((self.ROOT / "tests").glob("test_*.py")):
+            self.assertIn("tests." + path.stem, text)
+
+    def test_python_matrix_covers_every_non_darwin_test_method(self):
+        workflow = self.workflow("checks.yml")
+        modules = {
+            module
+            for item in workflow["jobs"]["python"]["strategy"]["matrix"]["include"]
+            for module in item["modules"].split()
+        }
+        for path in sorted((self.ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text())
+            module = "tests." + path.stem
+            for cls in tree.body:
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                class_decorators = "\n".join(ast.unparse(item) for item in cls.decorator_list)
+                for method in cls.body:
+                    if not isinstance(method, ast.FunctionDef) or not method.name.startswith("test"):
+                        continue
+                    decorators = class_decorators + "\n" + "\n".join(
+                        ast.unparse(item) for item in method.decorator_list)
+                    if ("skipUnless" in decorators or "skipIf" in decorators) and ("Darwin" in decorators or "Seatbelt" in decorators):
+                        continue
+                    test_id = module + "." + cls.name + "." + method.name
+                    with self.subTest(test=test_id):
+                        self.assertTrue(module in modules or module + "." + cls.name in modules,
+                                        test_id + " is not covered by the Ubuntu Python matrix")
+
+    def test_every_darwin_decorated_test_is_kept_in_a_macos_job(self):
+        text = (self.ROOT / ".github/workflows/checks.yml").read_text()
+        expected = set()
+        for path in sorted((self.ROOT / "tests").glob("test_*.py")):
+            tree = ast.parse(path.read_text())
+            for cls in tree.body:
+                if not isinstance(cls, ast.ClassDef):
+                    continue
+                for method in cls.body:
+                    if not isinstance(method, ast.FunctionDef) or not method.name.startswith("test"):
+                        continue
+                    decorators = "\n".join(ast.unparse(item) for item in method.decorator_list)
+                    if ("skipUnless" in decorators or "skipIf" in decorators) and ("Darwin" in decorators or "Seatbelt" in decorators):
+                        expected.add("tests." + path.stem + "." + cls.name + "." + method.name)
+        self.assertTrue(expected)
+        for test_id in sorted(expected):
+            self.assertIn(test_id, text)
+
+    def test_desktop_paths_select_smoke_or_full_and_cache_lockfiles(self):
+        workflow = self.workflow("desktop.yml")
+        self.assertEqual(set(workflow["jobs"]), {"changes", "desktop-macos"})
+        paths = workflow["jobs"]["changes"]["steps"][1]["env"]
+        self.assertIn("BASE_SHA", paths)
+        text = (self.ROOT / ".github/workflows/desktop.yml").read_text()
+        for command in ["scripts/package_desktop.py classify", "scripts/package_desktop.py smoke-engine",
+                        "scripts/package_desktop.py verify-dmg", "npm run --prefix desktop build"]:
+            self.assertIn(command, text)
+        self.assertIn("desktop/package-lock.json", text)
+        self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
+        self.assertIn("cache-dependency-glob: pyproject.toml", text)
+
+    def test_release_verification_attests_and_uploads_exact_tree_artifacts(self):
+        workflow = self.workflow("release-verify.yml")
+        permissions = workflow["jobs"]["verify"]["permissions"]
+        self.assertEqual(permissions["id-token"], "write")
+        self.assertEqual(permissions["attestations"], "write")
+        steps = workflow["jobs"]["verify"]["steps"]
+        attest = next(step for step in steps if step.get("id") == "attest")
+        self.assertTrue(attest["continue-on-error"])
+        upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact"))
+        self.assertIn("steps.attest.outcome", upload["if"])
+        text = (self.ROOT / ".github/workflows/release-verify.yml").read_text()
+        self.assertIn("actions/attest-build-provenance@v4", text)
+        self.assertIn("release-verified-${{ steps.source.outputs.tree }}", text)
+        self.assertIn("RSI_SOURCE_TREE", text)
+        self.assertIn("RSI_WORKFLOW_SOURCE_SHA", text)
+        self.assertIn("hashFiles('package-lock.json')", text)
+        self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
+
+    def test_formal_release_prefers_attested_reuse_and_falls_back_to_rebuild(self):
+        workflow = self.workflow("release.yml")
+        jobs = workflow["jobs"]
+        self.assertTrue({"reuse", "build", "publish"} <= set(jobs))
+        self.assertEqual(jobs["build"]["needs"], ["prepare", "reuse"])
+        self.assertIn("needs.reuse.result != 'success'", jobs["build"]["if"])
+        text = (self.ROOT / ".github/workflows/release.yml").read_text()
+        for command in ["actions/download-artifact@v4", "scripts/release.py validate-verified",
+                        "gh attestation verify", "--signer-workflow", "--source-ref refs/heads/main", "--source-digest",
+                        "scripts/release_smoke.py", "scripts/package_desktop.py verify-dmg"]:
+            self.assertIn(command, text)
+        self.assertIn("hashFiles('package-lock.json')", text)
+        self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
+        self.assertIn("hashFiles('pyproject.toml')", text)
+        if shutil.which("actionlint"):
+            subprocess.run(["actionlint", *map(str, (self.ROOT / ".github/workflows").glob("*.yml"))], check=True)
+
+    def test_manual_caches_only_store_public_build_inputs(self):
+        allowed_paths = {
+            "~/.cache/ms-playwright",
+            "~/.cache/pip",
+            "~/Library/Caches/ms-playwright",
+            "~/Library/Caches/pip",
+        }
+        for name in ["checks.yml", "release-verify.yml", "release.yml"]:
+            workflow = self.workflow(name)
+            for job in workflow["jobs"].values():
+                for step in job.get("steps", []):
+                    if not str(step.get("uses", "")).startswith("actions/cache@"):
+                        continue
+                    with self.subTest(workflow=name, path=step["with"]["path"]):
+                        self.assertIn(step["with"]["path"], allowed_paths)
+                        self.assertIn("hashFiles(", step["with"]["key"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -21,6 +21,11 @@ SCHEMAS = {
     "analysis": object_schema({"findings": {"type": "array", "items": object_schema({
         "title": TEXT, "body": TEXT, "path": TEXT, "quote": TEXT,
         "acceptance": STRINGS, "priority": {"type": "integer"}})}}),
+    "triage": object_schema({"findings": {"type": "array", "items": object_schema({
+        "index": {"type": "integer"},
+        "decision": {"type": "string", "enum": ["ready", "deferred", "rejected"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "reason": TEXT})}}),
     "planning": object_schema({"decision": {"type": "string", "enum": ["ready", "obsolete", "blocked", "deferred", "rejected"]},
                                "reason": TEXT, "scope": {"type": "array", "items": {"type": "string", "description": "A literal repository-relative file or directory path only. No descriptions, colons, globs, or annotations."}}, "acceptance": STRINGS,
                                "value": object_schema({"impact": {"type": "string", "enum": ["low", "medium", "high"]},

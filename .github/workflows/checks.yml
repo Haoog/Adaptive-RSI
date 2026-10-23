@@ -66,20 +66,40 @@ jobs:
   python:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: macos-latest
-    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: 控制、恢复与桌面
+            os: ubuntu-latest
             modules: tests.test_controls tests.test_updates_recovery tests.test_desktop_runtime tests.test_desktop_release
-          - name: 运行时、隔离与调度
-            modules: tests.test_runtime tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience tests.test_workflow_experience
-          - name: 交付、发布与数据
-            modules: tests.test_delivery_loop tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening
+          - name: 运行时核心
+            os: ubuntu-latest
+            modules: tests.test_runtime.RuntimeTest
+          - name: 运行时适配与服务
+            os: ubuntu-latest
+            modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
+          - name: 隔离、调度与体验
+            os: ubuntu-latest
+            modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience tests.test_workflow_experience
+          - name: 交付循环
+            os: ubuntu-latest
+            modules: tests.test_delivery_loop
+          - name: 发布与数据
+            os: ubuntu-latest
+            modules: tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening
+          - name: 模型与可靠性
+            os: ubuntu-latest
+            modules: tests.test_model_center tests.test_reliability
+          - name: 运营、发现与文档
+            os: ubuntu-latest
+            modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report
+
           - name: 服务器、协议与集成
-            modules: tests.test_auth_sessions tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_model_center tests.test_operability tests.test_reliability tests.test_usage_report tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker tests.test_discovery_hardening
+            os: ubuntu-latest
+            modules: tests.test_auth_sessions tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker
     name: Python · ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
@@ -87,6 +107,60 @@ jobs:
         with:
           python-version: '3.12'
       - run: python3 -m unittest -v ${{ matrix.modules }}
+
+  macos_sandbox_core:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: macOS Seatbelt 与 Keychain
+        run: |
+          python3 -m unittest -v \
+            tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project \
+            tests.test_model_center.ModelCenterTest.test_real_keychain_round_trip_and_no_plaintext_database_key \
+            tests.test_runtime.RuntimeTest.test_green_tests_cannot_bypass_blocking_maintainability_review \
+            tests.test_runtime.RuntimeTest.test_real_git_and_sandbox_end_to_end_without_user_tree_changes \
+            tests.test_runtime.RuntimeTest.test_fake_agent_success_cannot_replace_original_tests \
+            tests.test_runtime.RuntimeTest.test_dependency_seed_is_frozen_for_both_checks_and_preserves_original \
+            tests.test_runtime.RuntimeTest.test_sandbox_hides_controller_prevents_network_and_harness_writes \
+            tests.test_runtime.RuntimeTest.test_read_only_model_cannot_mutate_sealed_candidate \
+            tests.test_runtime.RuntimeTest.test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance
+
+  macos_sandbox_flows:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: macOS 隔离交付与可靠性
+        run: |
+          python3 -m unittest -v \
+            tests.test_delivery_loop.DeliveryLoopTest.test_candidate_cannot_weaken_a_modern_test_file_to_hide_a_regression \
+            tests.test_delivery_loop.DeliveryLoopTest.test_acceptance_generation_artifacts_never_enter_implementer_workspace \
+            tests.test_delivery_loop.DeliveryLoopTest.test_candidate_new_failing_test_is_not_erased_by_frozen_regression \
+            tests.test_delivery_loop.DeliveryLoopTest.test_independent_acceptance_blocks_weak_original_and_candidate_tests \
+            tests.test_delivery_loop.DeliveryLoopTest.test_auto_pr_is_queued_only_after_all_local_gates \
+            tests.test_delivery_loop.DeliveryLoopTest.test_actual_codex_single_layer_permissions_hide_secrets_and_disable_network \
+            tests.test_delivery_loop.DeliveryLoopTest.test_native_command_cannot_install_host_git_execution_hooks \
+            tests.test_delivery_loop.DeliveryLoopTest.test_stale_candidate_before_pr_is_invalidated_and_can_be_replanned \
+            tests.test_delivery_loop.DeliveryLoopTest.test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression \
+            tests.test_reliability.ReliabilityTest.test_review_outage_reuses_plan_acceptance_and_patch_but_reruns_checks \
+            tests.test_reliability.ReliabilityTest.test_implementation_route_change_reuses_plan_and_acceptance \
+            tests.test_reliability.ReliabilityTest.test_completed_review_is_reused_after_a_post_review_failure \
+            tests.test_reliability.ReliabilityTest.test_changed_baseline_invalidates_recovery_cache \
+            tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry \
+            tests.test_reliability.ReliabilityTest.test_high_risk_requires_additional_review_and_preserves_blocking_result \
+            tests.test_reliability.ReliabilityTest.test_ordinary_high_risk_does_not_force_a_second_review \
+            tests.test_workflow_experience.ExperienceTest.test_review_rejection_reaches_next_implementation_without_sealed_source
 
   javascript:
     needs: changes
@@ -110,7 +184,7 @@ jobs:
   browser:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: macos-latest
+    runs-on: macos-14
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -120,8 +194,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
-      - run: npx playwright install chromium
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - run: npx playwright install --with-deps chromium
       - name: 浏览器真实表单与多项目检查
         run: npm run test:browser
 
@@ -135,8 +216,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-build-${{ runner.os }}-
       - run: python3 scripts/package.py
-      - run: python3 -m pip install build
+      - run: python3 -m pip install --disable-pip-version-check build
       - run: python3 -m build --wheel
 
   linux:
@@ -149,8 +235,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: docker/setup-buildx-action@v3
       - name: 构建 Linux 执行镜像
-        run: docker build -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile.worker
+          tags: adaptive-rsi-worker:local
+          load: true
+          cache-from: type=gha,scope=worker-${{ hashFiles('deploy/Dockerfile.worker') }}
+          cache-to: type=gha,mode=max,scope=worker-${{ hashFiles('deploy/Dockerfile.worker') }}
       - name: 验证 Linux 隔离、完整候选检查和真实 CLI 协议
         env:
           RSI_DOCKER_TESTS: '1'
@@ -162,7 +256,7 @@ jobs:
 
   verify:
     if: always()
-    needs: [changes, docs, python, javascript, browser, package, linux]
+    needs: [changes, docs, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -172,6 +266,8 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           PYTHON_RESULT: ${{ needs.python.result }}
+          MACOS_SANDBOX_CORE_RESULT: ${{ needs.macos_sandbox_core.result }}
+          MACOS_SANDBOX_FLOWS_RESULT: ${{ needs.macos_sandbox_flows.result }}
           JAVASCRIPT_RESULT: ${{ needs.javascript.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
@@ -189,7 +285,7 @@ jobs:
             echo "Documentation checks passed"
             exit 0
           fi
-          for result in "$PYTHON_RESULT" "$JAVASCRIPT_RESULT" "$BROWSER_RESULT" "$PACKAGE_RESULT" "$LINUX_RESULT"; do
+          for result in "$PYTHON_RESULT" "$MACOS_SANDBOX_CORE_RESULT" "$MACOS_SANDBOX_FLOWS_RESULT" "$JAVASCRIPT_RESULT" "$BROWSER_RESULT" "$PACKAGE_RESULT" "$LINUX_RESULT"; do
             if [ "$result" != success ]; then
               echo "One or more required jobs failed: $result"
               exit 1

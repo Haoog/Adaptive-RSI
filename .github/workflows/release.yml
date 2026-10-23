@@ -32,6 +32,8 @@ jobs:
     outputs:
       mode: ${{ steps.prepare.outputs.mode }}
       sha: ${{ steps.prepare.outputs.sha }}
+      artifact_run_id: ${{ steps.prepare.outputs.artifact_run_id }}
+      artifact_name: ${{ steps.prepare.outputs.artifact_name }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,13 +58,14 @@ jobs:
       - name: 阻断需要人工处理的版本 PR
         if: steps.prepare.outputs.mode == 'blocked'
         run: exit 1
-  verify:
-    if: needs.prepare.outputs.mode == 'publish'
+  reuse:
+    if: needs.prepare.outputs.mode == 'publish' && needs.prepare.outputs.artifact_run_id != ''
     needs: prepare
-    runs-on: macos-latest
-    timeout-minutes: 25
+    runs-on: macos-14
+    timeout-minutes: 20
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,9 +75,87 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.artifact_name }}
+          run-id: ${{ needs.prepare.outputs.artifact_run_id }}
+          github-token: ${{ github.token }}
+          path: dist
+      - name: 核对源树、版本与全部资产字节
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py validate-verified --sha "${{ needs.prepare.outputs.sha }}" --directory dist
+      - name: 验证 GitHub provenance 与可信签名工作流
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for asset in dist/*; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-verify.yml" \
+              --source-ref refs/heads/main --source-digest "${{ steps.proof.outputs.workflow_source_sha }}" \
+              --deny-self-hosted-runners
+          done
+      - name: 独立复验安装包与校验和
+        run: |
+          (cd dist && shasum -a 256 -c *.sha256)
+          VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
+          python3 scripts/package_desktop.py verify-dmg --image "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+      - name: 正式发布前独立 ZIP 与 wheel smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.prepare.outputs.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+  build:
+    needs: [prepare, reuse]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')
+    runs-on: macos-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 记录精确源树
+        id: source
+        run: echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+          key: ${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: pip-build-${{ runner.os }}-
       - run: python3 -m unittest discover -v
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
@@ -83,15 +164,10 @@ jobs:
       - run: npx playwright install chromium
       - run: npm run test:browser
       - run: python3 scripts/package.py
-      - run: python3 -m pip install build
+      - run: python3 -m pip install --disable-pip-version-check build
       - run: python3 -m build --wheel
         env:
           SOURCE_DATE_EPOCH: '1577836800'
-      - name: 真实 ZIP 与 wheel 安装升级检查
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release_smoke.py
-      - uses: astral-sh/setup-uv@v6
       - name: 安装 macOS ARM64 桌面构建工具
         run: |
           rustup default stable
@@ -104,14 +180,32 @@ jobs:
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
           python3 scripts/package_desktop.py
           VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
-          hdiutil verify "dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
+          DMG="dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
           (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
+          python3 scripts/package_desktop.py verify-dmg --image "$DMG"
+      - name: 完整安装与升级 smoke
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RSI_SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          RSI_SOURCE_TREE: ${{ steps.source.outputs.tree }}
+          RSI_WORKFLOW_REF: ${{ github.workflow_ref }}
+          RSI_WORKFLOW_SOURCE_SHA: ${{ github.sha }}
+        run: python3 scripts/release_smoke.py
+      - name: 为回退重建的精确产物签发 provenance
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ needs.prepare.outputs.sha }}
           path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
   publish:
-    needs: [prepare, verify]
+    needs: [prepare, reuse, build]
+    if: always() && needs.prepare.result == 'success' && (needs.reuse.result == 'success' || needs.build.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
