@@ -284,6 +284,19 @@ class ExperienceTest(unittest.TestCase):
                 feedback = retry_feedback(row, protected=[secret])
                 self.assertEqual("<sealed>", feedback["review_findings"][0]["reason"])
 
+    def test_sealed_literals_and_embedded_urls_cannot_shrink_past_the_scan(self):
+        from adaptive_rsi.experience import retry_feedback
+        short = "0123456789ABCDEFGH"
+        secret = "UNIQUE_SEALED_PRIVATE_SAMPLE_0123456789ABCDEFGHIJ"
+        embedded_url = "INPUT https://example.com/long/private/path END_SECRET_79"
+        for reason, samples in [((short + " ") * 37 + secret, [short, secret]),
+                                (embedded_url, [embedded_url])]:
+            with self.subTest(reason=reason[:30]):
+                row = {"result": json.dumps({"review": {"findings": [
+                    {"path": "app.py", "reason": reason}]}})}
+                feedback = retry_feedback(row, protected=samples)
+                self.assertEqual("<sealed>", feedback["review_findings"][0]["reason"])
+
     def test_large_sealed_fixtures_do_not_build_an_unbounded_fragment_index(self):
         import hashlib
         import tracemalloc

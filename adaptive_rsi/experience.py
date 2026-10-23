@@ -18,6 +18,7 @@ def retry_feedback(row, protected=()):
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
+    variants.update(safe_excerpt(value, None) for value in tuple(variants))
     def excerpt(value, limit=700):
         # Redact shrinking prefixes before bounding the visible sealed-sample scan.
         text = safe_excerpt(value, None)[:limit + 24]
@@ -27,8 +28,8 @@ def retry_feedback(row, protected=()):
             if len(fragment) >= 24:
                 if pattern and pattern.search(fragment):
                     return "<sealed>"
-            elif fragment:
-                text = re.sub(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", "<sealed>", text)
+            elif fragment and re.search(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", text):
+                return "<sealed>"
         return text[:limit]
     for key in ["summary", "patch_hash"]:
         if key in result:
