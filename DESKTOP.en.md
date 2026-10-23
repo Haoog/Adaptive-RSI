@@ -20,7 +20,7 @@ Real call records are grouped by task, including failures and retries. Filter by
 
 ## Build
 
-Future formal releases will include a macOS ARM64 installer named `adaptive-rsi-version-macos-arm64-adhoc.dmg` and its `.dmg.sha256` checksum on GitHub Releases. Installation on other platforms has not been verified; the local runtime is not supported on Windows yet.
+Official releases include a macOS ARM64 installer named `adaptive-rsi-version-macos-arm64-adhoc.dmg` and its `.dmg.sha256` checksum on GitHub Releases. Installation on other platforms has not been verified; the local runtime is not supported on Windows yet.
 
 ```sh
 # Requires Node.js, Rust, uv and platform-specific Tauri build dependencies

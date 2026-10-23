@@ -29,7 +29,10 @@ Project inspection and Issue sync default to hourly. Both can be customized, pau
 flowchart LR
     A[Inspection / user goals / GitHub Issues] --> B[Task queue]
     B --> C{Worth doing?}
-    C -->|Defer or reject| B
+    C -->|Defer| Z[Save deferred decision]
+    C -->|Reject| Y[Save rejection reason]
+    Z -->|Baseline, evidence, or policy changes| B
+    Y -->|User explicitly reconsiders| B
     C -->|Execute| D[Plan and acceptance design]
     D --> E[Isolated implementation from a fixed snapshot]
     E --> F[Regression / independent acceptance / code review]
