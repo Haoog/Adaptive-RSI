@@ -251,3 +251,76 @@ class ExperienceTest(unittest.TestCase):
         report = workflow_metrics(self.store, self.project)
         self.assertEqual(1, report["repeated_failures"])
         self.assertEqual(1, report["interventions"])
+
+    def test_long_partial_and_escaped_sealed_samples_are_removed_before_truncation(self):
+        from adaptive_rsi.experience import retry_feedback
+        secret = "PRIVATE_SEALED_" + "ABC0123456789" * 70
+        for quoted in [secret, secret[15:200], json.dumps("私密样本" * 20)[1:-1]]:
+            row = {"result": json.dumps({"review": {"findings": [{"path": "app.py", "reason": "Boundary fails on " + quoted}]}})}
+            feedback = retry_feedback(row, protected=[secret, "私密样本" * 20])
+            self.assertEqual("<sealed>", feedback["review_findings"][0]["reason"])
+
+    def test_legacy_triage_decision_is_migrated_and_scope_is_not_complete_dependencies(self):
+        from adaptive_rsi.gitops import git
+        task = self.runtime.goal(self.project, "Wait for backend behavior")
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        config = self.runtime.config(self.project)
+        repo = Path(self.runtime.project(self.project)["path"])
+        base = git(repo, "rev-parse", "HEAD")
+        self.store.put_setting("triage-state:" + task, {"base": base, "scope": ["calc.py"],
+            "triage_input": fingerprint({"body": row["body"], "evidence": row["evidence"], "policy": config["triage"]["policy"]})})
+        self.store.execute("UPDATE tasks SET state='deferred' WHERE id=?", (task,))
+        self.runtime.reassess_deferred(self.project, config, base)
+        self.assertEqual("deferred", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+        self.assertIsNotNone(self.store.one("SELECT * FROM task_decisions WHERE task=?", (task,)))
+        (repo / "backend.py").write_text("API_VERSION = 2\n")
+        git(repo, "add", "backend.py")
+        git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-m", "Change backend dependency")
+        self.runtime.reassess_deferred(self.project, config, git(repo, "rev-parse", "HEAD"))
+        self.assertEqual("queued", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+
+    def test_planning_yield_is_not_a_code_attempt(self):
+        from adaptive_rsi.telemetry import workflow_metrics
+        from adaptive_rsi.store import encode
+        task = self.runtime.goal(self.project, "Fix addition")
+        passed = {"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}
+        for index, (state, evidence) in enumerate([("assessed", {}), ("awaiting_approval", passed)]):
+            self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,?,?,?,?,?)",
+                ("first-pass-" + str(index), task, self.project, state, encode(evidence), time.time() + index, time.time() + index + 1))
+        self.assertEqual(1, workflow_metrics(self.store, self.project)["first_pass"])
+
+    def test_cancel_during_infrastructure_failure_cannot_be_requeued(self):
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        transition = self.store.transition
+        def concurrent_cancel(run_id, state, result=None, terminal=False):
+            if state == "blocked":
+                self.runtime.cancel_task(task)
+            return transition(run_id, state, result, terminal)
+        with patch.object(self.store, "transition", side_effect=concurrent_cancel), patch.object(self.runtime, "invoke", side_effect=RuntimeError("HTTP 503 connection failed")):
+            self.runtime.process(run)
+        self.assertEqual("cancelled", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+
+    def test_paused_implementation_provider_is_not_attributed_to_planner(self):
+        from adaptive_rsi.agent import CodexAgent
+        from adaptive_rsi.provider_health import ProviderHealth, connection_key
+        task = self.runtime.goal(self.project, "Fix addition")
+        config = self.runtime.config(self.project)
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, config)
+        config["models"]["implementation"]["provider"] = "opencode"
+        run["config"] = json.dumps(config)
+        health = ProviderHealth(self.store)
+        for _ in range(3):
+            health.record(config, "opencode", self.project, RuntimeError("HTTP 503"))
+        self.store.reserve_call(self.project, run["id"], "planning", config["models"]["planning"], config)
+        agent = CodexAgent(self.store)
+        def invoke(*args, **kwargs):
+            return agent.invoke("implementation", "Implement", self.root, self.project, run["id"], config)
+        with patch.object(self.runtime, "invoke", side_effect=invoke), patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}):
+            self.runtime.process(run)
+        evidence = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertIn("connection", evidence.get("failure", {}), evidence)
+        self.assertEqual(connection_key(config, "opencode", self.project), evidence["failure"]["connection"])
+        self.assertTrue(evidence["failure"]["recoverable"])

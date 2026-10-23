@@ -127,6 +127,7 @@ const { chromium } = require("playwright");
       .first()
       .getAttribute("data-run");
     let runRequests = 0, liveSummary = "";
+    const phaseStart = Date.now()/1000-20;
     await page.route("**/api/task-runs?*", async (route) => {
       const response = await route.fetch(),
         rows = await response.json();
@@ -144,8 +145,11 @@ const { chromium } = require("playwright");
       parsed.searchParams.set("id", run);
       const response = await route.fetch({ url: parsed.href }), data = await response.json();
       if (liveSummary) data.result.summary = liveSummary;
+      data.state = 'merged';
+      data.phases = [{phase:'implementation',started:phaseStart,ended:null}];
       await route.fulfill({ json: data });
     });
+    await page.route('**/api/release-status?*', route => route.fulfill({json:{deploy:{state:'failed',workflow_run_id:42,error:'connection'}}}));
     await page.locator("#detail-dialog .close-dialog").click();
     runRequests = 0;
     await page
@@ -164,6 +168,10 @@ const { chromium } = require("playwright");
     await page.locator('#live-task-outcome').filter({hasText: liveSummary}).waitFor();
     assert.equal(await coverage.getAttribute('open'), '', 'same-state updates preserve expanded evidence');
     assert.equal(await page.locator('[data-run="old-run-1"]').getAttribute('open'), '');
+    await page.locator('#live-task-outcome .release-outcome').filter({hasText:'部署'}).waitFor();
+    const phaseText = await page.locator('#live-task-outcome details').filter({has:page.getByText('阶段耗时',{exact:true})}).textContent();
+    await page.waitForFunction(previous => [...document.querySelectorAll('#live-task-outcome details')].find(n=>n.querySelector('summary')?.textContent==='阶段耗时')?.textContent !== previous, phaseText);
+    await page.locator('#live-task-outcome .release-outcome').filter({hasText:'部署'}).waitFor();
     const deepUrl = page.url();
     const deep = await context.newPage();
     await deep.goto(deepUrl);
@@ -223,6 +231,11 @@ const { chromium } = require("playwright");
       ),
       true,
     );
+    await page.evaluate(([task, project]) => {
+      window.RSIDesktop = {};
+      window.dispatchEvent(new CustomEvent('rsi-notification-open',{detail:{task,project}}));
+    }, [ids[0],ids[2]]);
+    await page.locator('#detail-dialog[open] #detail-title').filter({hasText:'手机测试目标'}).waitFor();
     assert.deepEqual(errors, []);
     console.log(
       "Mobile fresh navigation, install assets, idempotency, revisions, lazy history, evidence, diff and backup passed.",

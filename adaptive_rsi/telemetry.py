@@ -59,7 +59,10 @@ def workflow_metrics(store, project=None):
             evidence = json.loads(run["result"])
             infrastructure = evidence.get("failure", {}).get("code") in ["provider", "credentials", "environment"]
             result["infrastructure_failures"] += infrastructure
-            if not infrastructure:
+            implemented = bool(evidence.get("evaluation") or store.one(
+                "SELECT 1 FROM phase_times WHERE run=? AND phase='implementation' LIMIT 1", (run["id"],)) or store.one(
+                "SELECT 1 FROM calls WHERE run=? AND role='implementation' LIMIT 1", (run["id"],)))
+            if not infrastructure and implemented:
                 code_attempts.append(run)
             if evidence.get("evaluation", {}).get("decision") == "pass" and evidence.get("review", {}).get("decision") == "pass":
                 accepted = accepted or run

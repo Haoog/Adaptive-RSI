@@ -273,9 +273,13 @@ class Store:
     def transition(self, run, state, result=None, terminal=False):
         now = time.time()
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM runs WHERE id=?", (run,)).fetchone()
             if not row or row["ended"] is not None:
                 return False
+            task = db.execute("SELECT state FROM tasks WHERE id=?", (row["task"],)).fetchone()
+            if task and task["state"] == "cancelled" and state not in ["merged", "pr_open"]:
+                state, terminal = "cancelled", True
             previous = json.loads(row["result"])
             phase = (result or {}).get("stage", state)
             active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()

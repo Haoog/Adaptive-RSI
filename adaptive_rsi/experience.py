@@ -16,12 +16,18 @@ def safe_excerpt(value, limit=1200):
 def retry_feedback(row, protected=()):
     result = json.loads(row["result"])
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
+    variants = {variant for value in protected for variant in
+                (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
+    sample_fragments = {value[i:i + 24] for value in variants for i in range(len(value) - 23)}
     def excerpt(value, limit=700):
-        text = safe_excerpt(value, limit)
-        for fragment in protected:
+        text = str(value or "")
+        # A partial or escaped sample quote is unsafe even if it omits the full literal.
+        if any(text[i:i + 24] in sample_fragments for i in range(len(text) - 23)):
+            return "<sealed>"
+        for fragment in sorted(variants, key=len, reverse=True):
             if fragment:
                 text = re.sub(r"(?<!\w)" + re.escape(fragment) + r"(?!\w)", "<sealed>", text)
-        return text
+        return safe_excerpt(text, limit)
     for key in ["summary", "patch_hash"]:
         if key in result:
             feedback[key] = excerpt(result[key])

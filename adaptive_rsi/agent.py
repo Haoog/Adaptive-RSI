@@ -160,6 +160,8 @@ class CodexAgent:
                 effective = {**config, "models": {**config["models"], role: {**route, "fallback": None}}}
                 result = self._invoke(role, prompt, workspace, project, run, effective, cancel, protected)
             except Exception as exc:
+                exc.provider_id = provider_id
+                exc.role = role
                 health.record(config, provider_id, project, exc)
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
                 codex_unavailable = str(exc).startswith("Codex call failed:") and any(

@@ -177,7 +177,7 @@ window.RSIExperience = (() => {
               "Adaptive RSI · " +
               (data.projects.find((p) => p.id === task.project)?.name || "");
           if (window.RSIDesktop)
-            window.RSIDesktop.invoke("notify", { title, body }).catch(() => {});
+            window.RSIDesktop.invoke("notify", { title, body, task: task.id, project: task.project }).catch(() => {});
           else if (
             "Notification" in window &&
             Notification.permission === "granted"
@@ -523,6 +523,8 @@ window.RSIExperience = (() => {
           data.state,
           data.result,
           data.stages,
+          data.phases,
+          data.phases?.some(phase => !phase.ended) ? Math.floor(Date.now() / 5000) : null,
         ]);
         const previous = $("live-task-outcome");
         if (signature !== lastDetail && previous) {
@@ -532,6 +534,8 @@ window.RSIExperience = (() => {
           outcome.id = "live-task-outcome";
           enhanceOutcome(outcome, data);
           previous.replaceWith(outcome);
+          await renderReleaseOutcome(outcome, data, task.project);
+          if (ticket !== detailSequence) return;
           restore(outcome);
           $("detail-dialog").scrollTop = scroll;
           lastDetail = signature;
@@ -797,6 +801,10 @@ window.RSIExperience = (() => {
     }
   }
   document.addEventListener("DOMContentLoaded", () => {
+    window.addEventListener('rsi-notification-open', event => {
+      if (window.RSIDesktop && event.detail?.task && event.detail?.project)
+        safe(() => openTask({id:event.detail.task,project:event.detail.project}));
+    });
     $("attention-inbox").onclick = () => safe(inbox);
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);

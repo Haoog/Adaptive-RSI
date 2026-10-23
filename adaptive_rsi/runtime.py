@@ -483,7 +483,8 @@ class Runtime:
                 self.store.defer(task["id"], {"base": head, "triage_input": signature, "reason": "Legacy deferral retained until inputs change"})
                 continue
             baseline_changed = head != prior.get("base")
-            paths = prior.get("scope") or [e["path"] for e in json.loads(task["evidence"]) if isinstance(e, dict) and e.get("path")]
+            # Implementation scope and issue locations do not prove a complete dependency set.
+            paths = prior.get("related_paths", []) if prior.get("dependency_scope_complete") is True else []
             if baseline_changed and paths and prior.get("base"):
                 try:
                     for path in paths:
@@ -775,7 +776,7 @@ class Runtime:
                 from .provider_health import ProviderHealth, connection_key, error_code
                 config = json.loads(run["config"])
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
-                provider = call["provider"] if call else config["models"]["planning"]["provider"]
+                provider = getattr(exc, "provider_id", None) or (call["provider"] if call else config["models"]["planning"]["provider"])
                 problem["connection"] = connection_key(config, provider, run["project"])
                 transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
                 circuit = ProviderHealth(self.store).status(config, provider, run["project"])
@@ -813,7 +814,7 @@ class Runtime:
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if state == "failed" and task["attempts"] <= config["limits"]["retries"]:
             delay = 60 * 2 ** task["attempts"]
-            self.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=?", (time.time() + delay, task["id"]))
+            self.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=? AND state='failed'", (time.time() + delay, task["id"]))
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
