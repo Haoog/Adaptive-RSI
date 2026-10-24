@@ -397,7 +397,7 @@ function changeSettingsScope(scope){
  if(!state)return;
  scopeChosen=true;
  stashSettings();$('config-scope').value=scope;settingsBaseline=null;
- if(view==='models')window.RSIModelCenter?.show(scope==='project'?projectId:null);
+ if(view==='models')renderNavigation();
  else renderSettings();renderNavigation();window.RSIModelCenter?.show(scope==='project'?projectId:null);
 }
 const schedulePaths=['schedule.light_minutes','schedule.issues_minutes','sources.inspection','sources.issues'];

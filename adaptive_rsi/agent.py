@@ -266,7 +266,7 @@ class CodexAgent:
                         forwarded["RSI_PROVIDER_API_KEY"] = secret
                     try:
                         result = run_cli(argv, workspace, home, config, cancel, protected,
-                                         role != "implementation", forwarded, self.store.root)
+                                         role != "implementation", forwarded, self.store.root, timeout=3600)
                     finally:
                         if login:
                             auth_file = home / ".codex/auth.json"
