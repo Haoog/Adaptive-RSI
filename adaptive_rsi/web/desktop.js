@@ -2,7 +2,7 @@
 if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
- const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.kind==='local'?'local':info.scope;return info;});
+ const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.kind==='local'?'local':info.scope;return info;}).catch(error=>{console.warn(error);return null;});
  window.RSIDesktop={invoke,ready};
  window.fetch=async(input,options={})=>{
   if(typeof input!=='string'||!input.startsWith('/api/'))return originalFetch(input,options);
@@ -13,6 +13,7 @@ if(window.__TAURI_INTERNALS__){
  };
  document.addEventListener('DOMContentLoaded',async()=>{
   const info=await ready,tools=document.querySelector('.project-tools');
+  if(!info)return;
   const machine=document.createElement('button');machine.className='text-button';machine.textContent=info.name||'连接运行机器';tools.prepend(machine);
   const dialog=document.createElement('dialog'),form=document.createElement('form');
   const title=document.createElement('h2');title.textContent=t('运行机器');

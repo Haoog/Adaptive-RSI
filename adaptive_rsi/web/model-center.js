@@ -94,7 +94,7 @@ window.RSIModelCenter = (() => {
     $('mc-scope').querySelector('[value="project"]').disabled=!projectId;
     $('mc-scope-note').textContent=scope?t('当前项目的模型服务与角色覆盖独立保存。'):t('模型服务与角色默认供各项目继承使用。');
     $('mc-scope-note').hidden=tab!=='providers';
-    document.querySelectorAll('[data-mc-tab]').forEach(button=>{const on=button.dataset.mcTab===tab;button.setAttribute('aria-selected',String(on));});
+    document.querySelectorAll('[data-mc-tab]').forEach(button=>{const on=button.dataset.mcTab===tab;button.setAttribute('aria-selected',String(on));button.tabIndex=on?0:-1;});
     $('mc-providers-panel').hidden=tab!=='providers';$('mc-roles-panel').hidden=tab!=='roles';
     renderProviders();renderProvider();renderRoles();
   }
@@ -293,7 +293,16 @@ window.RSIModelCenter = (() => {
     $('mc-probe-effort').replaceChildren(effortControl({...route},t('测试模型'),()=>{},true));$('mc-probe-result').textContent='';$('mc-probe-start').disabled=false;$('mc-probe-dialog').showModal();
   }
   function init(){
-    document.querySelectorAll('[data-mc-tab]').forEach(button=>button.addEventListener('click',()=>{tab=button.dataset.mcTab;render();}));
+    const tabs=[...document.querySelectorAll('[data-mc-tab]')];
+    tabs.forEach(button=>{button.tabIndex=button.dataset.mcTab===tab?0:-1;button.addEventListener('click',()=>{tab=button.dataset.mcTab;render();});});
+    tabs[0].parentElement.addEventListener('keydown',event=>{
+      if(event.key!=='ArrowLeft'&&event.key!=='ArrowRight')return;
+      const current=tabs.indexOf(document.activeElement);
+      if(current<0)return;
+      event.preventDefault();
+      const next=tabs[(current+(event.key==='ArrowRight'?1:tabs.length-1))%tabs.length];
+      next.focus();next.click();
+    });
     $('mc-scope').addEventListener('change',()=>safe(async()=>{scope=$('mc-scope').value==='project'?projectId:null;setStatus('');await load();}));
     $('mc-add-provider').addEventListener('click',()=>{if(data)openEditor();});$('mc-edit-provider').addEventListener('click',()=>openEditor(selected()));
     $('mc-provider-preset').addEventListener('change',applyPreset);$('mc-input-auth').addEventListener('change',syncAuth);

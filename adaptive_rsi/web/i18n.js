@@ -396,7 +396,7 @@ const english = {
   "正在保存模型分工…": "Saving model assignments…",
   "模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。": "Model IDs may contain letters, digits, dots, underscores, slashes, colons and hyphens only.",
   "只能让项目扫描设置跟随通用设置。": "Only project scan settings can inherit global defaults.",
-  "跟随通用的扫描项不能同时设置单独值，请先选择项目单独设置。": "Inherited scan settings cannot also have project-specific values. Select project settings first.",
+  "跟随通用的扫描项不能同时填写 JSON 覆盖，请先选择单独设置。": "Inherited scan settings cannot also carry a JSON override; select project-specific settings first.",
   "通用设置": "General settings",
   "返回工作台": "Back to workbench",
   "模型服务与分工": "Model connections and roles",
@@ -472,7 +472,7 @@ const english = {
   "模型服务暂不可用，请稍后重试。": "The model service is temporarily unavailable. Try again later.",
   "运行条件不完整，请查看运行准备检查。": "Run requirements are incomplete. See the readiness checks.",
   "项目内容已更新，请基于最新版本重新执行。": "The project has changed. Retry against its latest version.",
-  "这次执行没有完成，请展开原始记录查看原因。": "This run did not complete. Expand the original record for details.",
+  "这次执行没有完成，请展开运行详情查看原因。": "This run did not complete. Expand the run details for the cause.",
   "判断价值": "Assess value",
   "确定完成标准": "Define completion criteria",
   "修改代码": "Change code",
@@ -614,7 +614,6 @@ const english = {
   "运行记录将在这里出现。": "Activity will appear here.",
   "原文": "Original",
   "当前交付：保存在本地，确认后创建 PR。": "Delivery: keep locally, then create a PR after approval.",
-  "当前交付：检查通过后自动提交修改，等待合并 并合并。": "Delivery: create PRs and merge automatically after checks pass.",
   "当前交付：检查通过后自动提交修改，等待合并。": "Delivery: create PRs automatically after checks pass.",
   "这里暂无任务。其他分组中可能有历史记录。": "No tasks in this group. Check the other groups for history.",
   "查看详情": "Details",
@@ -935,6 +934,8 @@ const english = {
   "low": "Low",
 
   "。": ".",
+  "：": ": ",
+  "、": ", ",
   "Adaptive RSI · 本地控制台": "Adaptive RSI · Local console",
   "Adaptive RSI 首页": "Adaptive RSI home",
   "WORKSPACE / 工作空间": "WORKSPACE",
@@ -1246,7 +1247,21 @@ const english = {
   "控制台登录已失效，请重新打开控制台后继续授权。": "The console session expired. Reopen the console to continue authorization.",
   "暂时无法连接，授权状态已保留，正在重试。": "Connection is unavailable. Authorization status is retained; retrying.",
   "项目时区": "Project timezone",
-  "等待模型服务恢复用量": "Waiting for provider usage to recover"
+  "等待模型服务恢复用量": "Waiting for provider usage to recover",
+  "这个版本更新了什么": "What is new in this version",
+  "安装方式": "Installed via",
+  "桌面应用": "the desktop app",
+  "Python 包（建议用 pip 升级）": "a Python package (prefer pip upgrades)",
+  "内置自更新": "built-in self-update",
+  "有新版本可用": "A new version is available",
+  "下载并安装新版本": "Download and install the new version",
+  "正在下载新版本…": "Downloading the new version…",
+  "下载已完成，安装镜像已打开；请拖拽安装后重启应用。": "Download complete and the installer image is open. Drag to install, then restart the app.",
+  "新版本下载失败：": "Update download failed: ",
+  "校验未通过，已删除下载文件。": "Checksum verification failed; the download was removed.",
+  "差异超过 2000 行，已折叠为纯文本。": "The diff exceeds 2000 lines and is shown as plain text.",
+  "安装地址不可用": "The install address is unavailable",
+  "将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？": "This downloads the new desktop installer image and opens it automatically. Drag to install after the download. Continue?"
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }
@@ -1265,7 +1280,7 @@ for(const node of document.querySelectorAll('[aria-label], [placeholder]')){
 function translateStatic(){
  document.documentElement.lang=language;
  for(const [node,original,key] of staticText){
-  if(node.isConnected)node.textContent=language==='en'?original.replace(key,t(key)):original;
+  if(node.isConnected)node.textContent=language==='en'?original.replace(key,()=>t(key)):original;
  }
  for(const [node,attr,key] of staticAttributes)if(node.isConnected)node.setAttribute(attr,t(key));
  document.querySelector('#language-select').value=language;

@@ -63,9 +63,8 @@ window.RSIExperience = (() => {
     await showTask(await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(task.project)));
   }
   async function inbox() {
-    const box = dialog("所有项目待办"),
-      data = await api("attention");
-    if (!box.isConnected) return;
+    const data = await api("attention"),
+      box = dialog("所有项目待办");
     box.append(el("p", t("查看通知不会替你处理任务。"), "muted"));
     const notify = action(t("启用系统通知"), async () => {
       if (window.RSIDesktop) {
@@ -128,8 +127,11 @@ window.RSIExperience = (() => {
     try {
       const data = await api("attention");
       if (seenInstance !== data.instance) {
+        const next = readSaved(notificationKey + ':seen:' + data.instance, {});
+        if (seenInstance) localStorage.removeItem(notificationKey + ':seen:' + seenInstance);
+        localStorage.removeItem(notificationKey + ':seen');
+        seen = next;
         seenInstance = data.instance;
-        seen = readSaved(notificationKey + ':seen:' + seenInstance, {});
       }
       inboxAt = Date.now();
       $("attention-inbox").textContent =
@@ -556,11 +558,17 @@ window.RSIExperience = (() => {
     }
   }
   async function showDiff(run) {
-    const box = dialog("阅读代码差异"),
-      response = await fetch("/api/patch?id=" + encodeURIComponent(run));
+    const response = await fetch("/api/patch?id=" + encodeURIComponent(run));
     if (!response.ok) throw Error(t("代码差异不可用"));
-    const patch = await response.text();
-    if (!box.isConnected) return;
+    const patch = await response.text(),
+      box = dialog("阅读代码差异");
+    if (patch.split("\n").length > 2000) {
+      box.append(
+        el("p", t("差异超过 2000 行，已折叠为纯文本。"), "muted"),
+        el("pre", patch, "readable-diff"),
+      );
+      return;
+    }
     const pre = el("pre", undefined, "readable-diff");
     for (const line of patch.split("\n")) {
       const row = el("div", line);
@@ -575,6 +583,7 @@ window.RSIExperience = (() => {
     const data = await api("mobile"),
       box = dialog("手机安装");
     box.append(el("p", t("手机需要能访问运行机器的 HTTPS 地址。"), "muted"));
+    if (!/^https?:\/\//.test(data.install_url)) throw Error(t("安装地址不可用"));
     const link = el("a", data.install_url, "button");
     link.href = data.install_url;
     link.target = "_blank";
@@ -597,8 +606,8 @@ window.RSIExperience = (() => {
     );
   }
   async function storage() {
-    const box = dialog("数据与诊断"),
-      data = await api("storage");
+    const data = await api("storage"),
+      box = dialog("数据与诊断");
     box.append(
       el(
         "p",
@@ -619,16 +628,20 @@ window.RSIExperience = (() => {
         "muted",
       ),
     );
-    box.append(
-      action(t("创建一致性备份"), async () => {
+    const backupButton = action(t("创建一致性备份"), async () => {
+      backupButton.disabled = true;
+      try {
         const saved = await api("backup", {}),
           link = el("a", t("下载备份") + " · " + saved.id, "button");
         link.href = "/api/backup?id=" + saved.id;
         link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
         desktopDownload(link, saved.id);
         box.append(link);
-      }),
-    );
+      } finally {
+        backupButton.disabled = false;
+      }
+    });
+    box.append(backupButton);
     for (const saved of data.backups) {
       const link = el(
         "a",
@@ -709,8 +722,8 @@ window.RSIExperience = (() => {
     };
   }
   async function metrics() {
-    const box = dialog("流程质量与耗时"),
-      data = await api("workflow-metrics?project=" + projectId);
+    const data = await api("workflow-metrics?project=" + projectId),
+      box = dialog("流程质量与耗时");
     for (const [key, label] of [
       ["tasks", "任务数"],
       ["accepted", "验收与评审通过"],
