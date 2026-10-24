@@ -57,6 +57,7 @@ class ReliabilityTest(unittest.TestCase):
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertFalse(next(i for i in result["readiness"]["items"] if i["code"] == "dependencies")["ready"])
 
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_configuration_change_uses_test_first_without_independent_acceptance(self):
         class ConfigurationPlan(FakeAgent):
             def invoke(self, role, *args, **kwargs):

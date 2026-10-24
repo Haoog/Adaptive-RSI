@@ -155,6 +155,7 @@ jobs:
             tests.test_delivery_loop.DeliveryLoopTest.test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression \
             tests.test_reliability.ReliabilityTest.test_review_outage_reuses_plan_and_patch_but_reruns_checks \
             tests.test_reliability.ReliabilityTest.test_implementation_route_change_reuses_plan_without_acceptance \
+            tests.test_reliability.ReliabilityTest.test_configuration_change_uses_test_first_without_independent_acceptance \
             tests.test_reliability.ReliabilityTest.test_completed_review_is_reused_after_a_post_review_failure \
             tests.test_reliability.ReliabilityTest.test_changed_baseline_invalidates_recovery_cache \
             tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry \
