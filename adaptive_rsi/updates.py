@@ -41,19 +41,32 @@ def automatic_allowed(status, policy="patch"):
                                  policy == "patch" and target[:2] == current[:2])
 
 
-def download(url, limit):
+def download(url, limit, progress=None):
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname not in ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"] or parsed.username or parsed.query:
         raise ValueError("Updates must come from official GitHub release URLs")
     request = urllib.request.Request(url, headers={"User-Agent": "Adaptive-RSI-updater", "Accept": "application/vnd.github+json" if parsed.hostname == "api.github.com" else "application/octet-stream"})
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=30) as response:
         final = urllib.parse.urlsplit(response.url)
         if final.scheme != "https" or final.hostname not in ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]:
             raise ValueError("Untrusted update redirect")
-        data = response.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError("Release asset exceeds size limit")
-    return data
+        # 分块读取并提供进度；校验仍在完整读取后进行。
+        headers = getattr(response, "headers", None)
+        length = headers.get("Content-Length") if headers else None
+        total = int(length) if length and length.isdigit() and int(length) <= limit else None
+        data = bytearray()
+        while True:
+            chunk = response.read(65536)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > limit:
+                raise ValueError("Release asset exceeds size limit")
+            if progress and total:
+                progress(len(data), total)
+    if progress and total:
+        progress(len(data), total)
+    return bytes(data)
 
 
 def release_info(data, current=__version__):
@@ -69,7 +82,9 @@ def release_info(data, current=__version__):
     if not all(assets[k].startswith(prefix) for k in [name, name + ".sha256"]):
         raise ValueError("Release assets belong to another repository")
     return {"state": "available", "current": current, "version": target, "asset": assets[name],
-            "checksum": assets[name + ".sha256"], "patch": version(target)[:2] == version(current)[:2]}
+            "checksum": assets[name + ".sha256"],
+            "notes": str(data.get("body") or "")[:16000],
+            "patch": version(target)[:2] == version(current)[:2]}
 
 
 def extract_bundle(data, expected_hash, destination, target):
@@ -239,9 +254,24 @@ class UpdateManager:
                 (self.store.root / "update-ready").unlink(missing_ok=True)
             return self.installing
 
+    def channel(self):
+        """一次性判定安装渠道：桌面应用、内置自更新布局或直接 pip 安装。"""
+        cached = getattr(self, "_channel", None)
+        if cached:
+            return cached
+        if getattr(self, "desktop_managed", False):
+            self._channel = "desktop"
+        elif (self.store.root / "installations" / "active.json").exists():
+            self._channel = "managed"
+        else:
+            parts = Path(__file__).resolve().parts
+            self._channel = "pip" if "site-packages" in parts or "dist-packages" in parts else "managed"
+        return self._channel
+
     def snapshot(self):
         busy = self.is_busy()
-        return {**self.status(), "busy": busy, "desktop_managed": getattr(self, "desktop_managed", False)}
+        return {**self.status(), "busy": busy, "channel": self.channel(),
+                "desktop_managed": getattr(self, "desktop_managed", False)}
 
     def require_ready(self):
         if self.is_busy():
@@ -323,7 +353,20 @@ class UpdateManager:
                 self.store.put_setting("update-status", {**fresh, "state": "available", "checked": time.time(), "reason": "Automatic update authorization changed"})
                 return
             checksum = download(fresh["checksum"], 4096).decode("ascii").split()[0]
-            data = download(fresh["asset"], 64 * 1024 * 1024)
+            last_report = [0.0]
+
+            def report(done, total):
+                # 进度写入限频；失败不阻断下载本身。
+                moment = time.monotonic()
+                if moment - last_report[0] < 1.0 and done < total:
+                    return
+                last_report[0] = moment
+                try:
+                    self.store.put_setting("update-status",
+                                           {**status, "state": "downloading", "progress": done * 100.0 / total})
+                except Exception:
+                    pass
+            data = download(fresh["asset"], 64 * 1024 * 1024, report)
             installs = self.store.root / "installations"
             installs.mkdir(exist_ok=True)
             import tempfile
@@ -359,12 +402,14 @@ class UpdateManager:
             failures = status.get("failures", 0) + 1
             self.store.put_setting("update-status", {**status, "state": "error", "reason": str(exc)[:500],
                                                     "failures": failures, "retry_after": time.time() + min(3600, 60 * 2 ** failures)})
-            self.installing = False
+            with self.runtime.dispatch_lock:
+                self.installing = False
         finally:
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
             if self.status().get("state") != "restarting":
-                self.installing = False
+                with self.runtime.dispatch_lock:
+                    self.installing = False
             self.lock.release()
 
 

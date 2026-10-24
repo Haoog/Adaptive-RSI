@@ -84,14 +84,18 @@ def workflow_choices(runtime, project_id):
     branch = info["default_branch"]
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
     workflows = api(repo, "actions/workflows?per_page=100").get("workflows", [])
-    choices = []
-    for item in workflows:
+    import concurrent.futures
+
+    def inspect(item):
         path = item.get("path", "")
         if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path):
-            continue
+            return None
         compatible = item.get("state") == "active" and compatible_workflow(workflow_content(repo, path, sha))
-        choices.append({"workflow": path, "name": item.get("name", path), "compatible": compatible,
-                        "reason": "" if compatible else "Requires workflow_dispatch inputs rsi_operation_id/rsi_sha and run-name: ${{ inputs.rsi_operation_id }}"})
+        return {"workflow": path, "name": item.get("name", path), "compatible": compatible,
+                "reason": "" if compatible else "Requires workflow_dispatch inputs rsi_operation_id/rsi_sha and run-name: ${{ inputs.rsi_operation_id }}"}
+    # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        choices = [row for row in pool.map(inspect, workflows) if row]
     return {"repository": repo, "sha": sha, "workflows": choices}
 
 

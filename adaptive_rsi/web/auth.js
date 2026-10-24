@@ -34,7 +34,7 @@ window.RSIAuth = (() => {
   async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
     selectPreferredProvider();render();}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;render();}}
-  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)))timer=setTimeout(()=>safe(poll),1500);}
+  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state))){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
   async function poll(){
     if(polling||pollingStopped)return;polling=true;
     try{for(const [id,session] of sessions){if(terminal.has(session.state))continue;

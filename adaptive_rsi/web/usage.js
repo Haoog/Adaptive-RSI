@@ -19,7 +19,7 @@ window.RSIUsage=(()=>{
    for(const id of ['usage-totals','usage-role-summary','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
    $('usage-tasks').replaceChildren(el('p',t('当前服务版本尚不支持用量页面，请先升级服务后再刷新。'),'muted'));
    $('usage-prev').disabled=$('usage-next').disabled=true;
-  }finally{if(ticket===sequence)$('usage-refresh').disabled=false;clearTimeout(timer);if(view==='usage'&&!unsupported)timer=setTimeout(()=>safe(load),document.visibilityState==='hidden'?60000:30000);}
+  }finally{if(ticket===sequence)$('usage-refresh').disabled=false;if(ticket===sequence){clearTimeout(timer);if(view==='usage'&&!unsupported)timer=setTimeout(()=>safe(load),document.visibilityState==='hidden'?60000:30000);}}
  }
  function metric(label,value,note){const node=el('div',undefined,'usage-metric');node.append(el('span',t(label)),el('strong',value));if(note)node.append(el('small',t(note)));return node;}
  function render(){if(!report)return;const totals=report.summary,summary=$('usage-totals');summary.replaceChildren(metric('已记录 tokens',token(totals)),metric('任务数',number(totals.tasks)),metric('模型运行耗时',seconds(totals.model_seconds)),metric('缓存读取 tokens',number(totals.cache_read_tokens)));

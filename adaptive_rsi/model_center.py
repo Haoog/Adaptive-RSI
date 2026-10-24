@@ -85,6 +85,17 @@ class ModelCenter:
                 "keychain": platform.system() == "Darwin", "project": project,
                 "global_models": self.runtime.config()["models"]}
 
+    def _credential_in_use(self, reference):
+        """共享的 secret_ref 可能仍被通用或其他项目配置引用；被引用时不删除。"""
+        configs = [self.runtime.config()]
+        for row in self.store.query("SELECT id FROM projects"):
+            configs.append(self.runtime.config(row["id"]))
+        for config in configs:
+            for provider in [*BUILTINS, *config["providers"]]:
+                if provider.get("secret_ref") == reference:
+                    return True
+        return False
+
     def save_provider(self, data, authentication, project=None):
         if not isinstance(data, dict) or not isinstance(authentication, dict):
             raise CenterError("invalid_provider")
@@ -134,11 +145,20 @@ class ModelCenter:
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
             self.store.put_setting(self.key(provider, project), {"models": preferences, "fetched": None, "truncated": False})
+        if (fresh and old and old.get("credential") == mode and old.get("secret_ref")
+                and old["secret_ref"] != provider["secret_ref"]
+                and not self._credential_in_use(old["secret_ref"])):
+            # 密钥轮换成功后删除旧凭据，避免钥匙串/凭据文件累积孤儿条目。
+            try:
+                self.credentials.delete(old["secret_ref"], mode)
+            except CredentialError:
+                self.store.event("credential_cleanup_failed",
+                                 "Previous provider credential could not be removed; delete it manually", project)
         return {"id": provider["id"], "saved": True}
 
     def remove_provider(self, provider_id, project=None):
         config = self.runtime.config(project)
-        self.provider(provider_id, project)
+        removed = self.provider(provider_id, project)
         if provider_id in {p["id"] for p in BUILTINS}:
             raise CenterError("builtin_provider")
         providers = [p for p in config["providers"] if p["id"] != provider_id]
@@ -146,6 +166,14 @@ class ModelCenter:
             self.runtime.configure({"providers": providers}, project)
         except ValueError:
             raise CenterError("provider_in_use") from None
+        if (removed.get("credential") in ["keychain", "session", "file"] and removed.get("secret_ref")
+                and not self._credential_in_use(removed["secret_ref"])):
+            # 移除连接时同步删除已存密钥，不把密钥材料留在钥匙串或凭据目录。
+            try:
+                self.credentials.delete(removed["secret_ref"], removed["credential"])
+            except CredentialError:
+                self.store.event("credential_cleanup_failed",
+                                 "Removed provider credential could not be deleted; delete it manually", project)
         return {"removed": True}
 
     def fetch(self, provider_id, project=None):

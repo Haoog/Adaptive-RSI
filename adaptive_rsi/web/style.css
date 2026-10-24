@@ -627,7 +627,7 @@ input:disabled,select:disabled {
     width:auto;
     padding:4px 0;
   }
-  .sidebar-bottom .nav[data-view=evolution],.sidebar-bottom small {
+  .sidebar-bottom small {
     display:none;
   }
   .brand {

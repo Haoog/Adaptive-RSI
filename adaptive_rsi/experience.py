@@ -85,9 +85,15 @@ def queue_status(store, project):
     paused = store.one("SELECT paused FROM projects WHERE id=?", (project,))
     busy = store.one("SELECT id FROM runs WHERE project=? AND ended IS NULL", (project,))
     rows = store.query("SELECT * FROM tasks WHERE project=? AND state='queued' ORDER BY " + store.queue_order(), (project, now))
+    # 一次 JOIN 取回全部排队任务的依赖，避免逐条查询。
+    dependencies = {}
+    for row in store.query("SELECT d.task AS task,p.id AS id,p.state AS state,p.title AS title FROM task_dependencies d "
+                           "JOIN tasks p ON p.id=d.dependency WHERE d.task IN "
+                           "(SELECT id FROM tasks WHERE project=? AND state='queued')", (project,)):
+        dependencies[row["task"]] = {"id": row["id"], "state": row["state"], "title": row["title"]}
     ready = 0
     for row in rows:
-        dependency = store.one("SELECT p.id,p.state,p.title FROM task_dependencies d JOIN tasks p ON p.id=d.dependency WHERE d.task=?", (row["id"],))
+        dependency = dependencies.get(row["id"])
         reason = "dependency" if dependency and dependency["state"] != "merged" else "backoff" if row["available"] > now else "paused" if paused and paused["paused"] else "running" if busy else "ready"
         if reason in ["running", "ready"]:
             ready += 1

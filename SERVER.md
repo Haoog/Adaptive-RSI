@@ -20,13 +20,19 @@ sudo loginctl enable-linger "$(id -un)"
 
 安装器构建 `adaptive-rsi-worker:local`，建立独立 Python 环境，启动用户服务；已有配置不覆盖。`enable-linger` 使用户服务在退出 SSH 和服务器重启后继续运行。
 
+也可以免 clone 直接从官方发布包安装（自动校验 SHA-256，布局与内置自更新兼容）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Haoog/Adaptive-RSI/main/scripts/remote-install.sh | bash
+```
+
 默认仅监听服务器的 `127.0.0.1:6090`。在个人电脑执行：
 
 ```sh
 ssh -N -L 6090:127.0.0.1:6090 用户@服务器
 ```
 
-在服务器执行 `journalctl --user -u adaptive-rsi` 查看启动认证地址，再在个人电脑浏览器打开该地址。认证地址包含会话凭据，不要公开；普通不带凭据的地址会显示登录说明。
+在服务器执行 `journalctl --user -u adaptive-rsi` 查看启动认证地址，再在个人电脑浏览器打开该地址。认证地址包含会话凭据，不要公开；它会留在浏览器历史记录中，共用设备时请在登录后清除该记录。普通不带凭据的地址会显示登录说明。
 
 接入项目时填**服务器上的路径**，或使用 GitHub 链接。模型服务配置同样使用服务器的网络和认证环境；个人电脑上的登录不会自动上传。新项目保持暂停，选择模型、确认检查可执行和交付设置后启动。
 

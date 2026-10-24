@@ -406,7 +406,10 @@ class OpenCodeAuth(_Process):
                 if not self.alive() and time.monotonic() < deadline and not retried:
                     retried = True
                     if self.control is not None:
-                        os.close(self.control)
+                        try:
+                            os.close(self.control)
+                        except OSError:
+                            pass
                         self.control = None
                     port = self._port()
                     self.base = "http://127.0.0.1:" + str(port)
@@ -748,6 +751,8 @@ class AuthSessions:
         self.custom_factory = factory is not None
         # backend -> (expires_at, rows)；测试注入 factory 时不缓存，便于断言每次真实发现。
         self.providers_cache = {}
+        # 状态快照的子进程发现结果同样短 TTL 缓存，登录/登出/密钥变更时失效。
+        self.status_cache = {}
         self.factory = factory or (lambda backend, cancel=None: (CodexAuth if backend == "codex" else OpenCodeAuth)(
             self.config() if callable(self.config) else self.config, cancel=cancel or self.shutdown))
         try:
@@ -805,28 +810,33 @@ class AuthSessions:
                                            if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
                         capabilities = None
                     else:
-                        binary = shutil.which("opencode")
-                        if binary:
-                            capabilities = detect_opencode(binary)
-                            providers = auth_providers(binary, capabilities)
+                        cached = self.status_cache.get("opencode")
+                        if cached and cached[0] > time.monotonic():
+                            capabilities, providers = cached[1]
                         else:
-                            # Linux/Docker deployments can keep v1 credentials on the host
-                            # even when only the worker image contains the CLI.
-                            capabilities = None
-                            docker = shutil.which("docker")
-                            if docker:
-                                try:
-                                    image = config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
-                                    inspected = run_process([docker, "image", "inspect", image], timeout=10)
-                                    if inspected["exit_code"] or inspected["error"]:
+                            binary = shutil.which("opencode")
+                            if binary:
+                                capabilities = detect_opencode(binary)
+                                providers = auth_providers(binary, capabilities)
+                            else:
+                                # Linux/Docker deployments can keep v1 credentials on the host
+                                # even when only the worker image contains the CLI.
+                                capabilities = None
+                                docker = shutil.which("docker")
+                                if docker:
+                                    try:
+                                        image = config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
+                                        inspected = run_process([docker, "image", "inspect", image], timeout=10)
+                                        if inspected["exit_code"] or inspected["error"]:
+                                            capabilities = None
+                                        else:
+                                            capabilities = detect_opencode(
+                                                "opencode", argv=[docker, "run", "--rm", image, "opencode", "--version"],
+                                                env=clean_environment())
+                                    except (OpenCodeCompatibilityError, OSError):
                                         capabilities = None
-                                    else:
-                                        capabilities = detect_opencode(
-                                            "opencode", argv=[docker, "run", "--rm", image, "opencode", "--version"],
-                                            env=clean_environment())
-                                except (OpenCodeCompatibilityError, OSError):
-                                    capabilities = None
                             providers = auth_providers(None, capabilities)
+                            self.status_cache["opencode"] = (time.monotonic() + 25, (capabilities, providers))
                     result[backend] = {"state": "authenticated" if providers else "signed_out",
                                        "available": available,
                                        "transport": "docker" if container or not shutil.which(backend) else "host",
@@ -920,6 +930,7 @@ class AuthSessions:
             self._thread(lambda: self._run(session_id, method, inputs))
             # 认证状态即将变化，缓存的供应商发现结果不再可靠。
             self.providers_cache.pop(backend, None)
+            self.status_cache.clear()
             return copy.deepcopy(self.sessions[session_id])
 
     def _update(self, session_id, **values):
@@ -1112,6 +1123,7 @@ class AuthSessions:
                     worker.close()
         with self.lock:
             self.providers_cache.pop(backend, None)
+            self.status_cache.clear()
         return self.snapshot()
 
     def set_api_key(self, backend, provider, key):
@@ -1151,6 +1163,7 @@ class AuthSessions:
             AUTH_LOCK.release()
         with self.lock:
             self.providers_cache.pop(backend, None)
+            self.status_cache.clear()
         return self.snapshot()
 
     def close(self):
@@ -1158,6 +1171,7 @@ class AuthSessions:
             self.closed = True
             self.shutdown.set()
             self.providers_cache.clear()
+            self.status_cache.clear()
             workers = list(self.workers.values())
             discoveries = list(self.discoveries)
             for key, item in self.sessions.items():

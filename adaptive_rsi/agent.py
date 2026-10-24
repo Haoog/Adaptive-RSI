@@ -275,7 +275,8 @@ class CodexAgent:
                             with CODEX_AUTH_LOCK:
                                 sync_codex_oauth(home, original_auth)
             else:
-                result = run_process(argv, workspace, 0, cancel,
+                # 模型挂起不能永久占用并发槽位；上限 1 小时，仅靠取消无法覆盖所有情况。
+                result = run_process(argv, workspace, 3600, cancel,
                                      config["limits"]["max_output_mb"], environment)
             for secret_value in [secret, *auth_secrets]:
                 if not isinstance(secret_value, str) or not secret_value:
