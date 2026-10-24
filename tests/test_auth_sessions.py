@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -363,6 +364,208 @@ class AuthSessionTests(unittest.TestCase):
             self.assertTrue(finished.wait(0.5))
             thread.join(1)
         self.assertTrue(worker.closed)
+
+    def test_status_expiry_closes_worker_outside_lock(self):
+        entered, release = threading.Event(), threading.Event()
+
+        class BlockingClose(FakeAuth):
+            def close(worker_self):
+                entered.set()
+                release.wait(2)
+                super().close()
+        created = []
+
+        def factory(backend):
+            worker = BlockingClose(backend)
+            created.append(worker)
+            return worker
+        manager = AuthSessions(self.root / "expiry-lock", factory=factory, ttl=0.5)
+        try:
+            session = manager.start("opencode", "openai")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and manager.status(session["id"])["state"] == "starting":
+                time.sleep(0.005)
+            self.assertEqual(manager.status(session["id"])["state"], "awaiting_authorization")
+            time.sleep(0.6)
+            thread = threading.Thread(target=manager.status, args=(session["id"],))
+            thread.start()
+            self.assertTrue(entered.wait(1), "Expired worker was not closed")
+            # 引用已在锁内摘除，慢的 close() 不再持有会话锁。
+            self.assertNotIn(session["id"], manager.workers)
+            self.assertTrue(manager.lock.acquire(timeout=0.5), "Expiry close blocked the session lock")
+            manager.lock.release()
+            release.set()
+            thread.join(2)
+            self.assertTrue(created[0].closed)
+            self.assertEqual(manager.status(session["id"])["state"], "expired")
+        finally:
+            manager.close()
+            for worker in created:
+                worker.temp.cleanup()
+
+    def test_providers_cache_hit_and_invalidation(self):
+        manager = AuthSessions(self.root / "providers-cache", ttl=5)
+        made = []
+
+        def factory(backend, cancel=None):
+            worker = FakeAuth(backend, self.gate)
+            made.append(worker)
+            return worker
+        try:
+            with patch.object(manager, "factory", side_effect=factory):
+                first = manager.providers("opencode")
+                second = manager.providers("opencode")
+                self.assertEqual(first, second)
+                self.assertEqual(len(made), 1, "Repeated discovery within TTL should hit the cache")
+                session = manager.start("opencode", "openai")
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and manager.status(session["id"])["state"] == "starting":
+                    time.sleep(0.005)
+                self.assertEqual(manager.status(session["id"])["state"], "awaiting_authorization")
+                manager.providers("opencode")
+                # 会话 worker 之外，start 失效后重新发现了一次。
+                self.assertEqual(len(made), 3, "Cache should be invalidated after start")
+                manager.cancel(session["id"])
+                # 避免本机真实 opencode CLI 影响快照断言。
+                with patch("adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+                    manager.set_api_key("opencode", "openai", "PRIVATE-KEY")
+                    self.assertNotIn("opencode", manager.providers_cache)
+                    manager.providers("opencode")
+                    self.assertIn("opencode", manager.providers_cache)
+                    manager.logout("opencode", "openai")
+                    self.assertNotIn("opencode", manager.providers_cache)
+        finally:
+            manager.close()
+            for worker in made:
+                worker.temp.cleanup()
+        self.assertEqual(manager.providers_cache, {}, "close should clear the providers cache")
+
+    def test_custom_factory_providers_skip_cache(self):
+        first = self.manager.providers("opencode")
+        second = self.manager.providers("opencode")
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.created), 2, "Custom factory should never use the providers cache")
+        self.assertEqual(self.manager.providers_cache, {})
+
+
+class OpenCodeServeTests(unittest.TestCase):
+    def make_worker(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = False
+        worker.cancel = threading.Event()
+        worker.control = None
+        worker.capabilities = OpenCodeCapabilities("1.19.3", (1, 19, 3))
+        worker.base = "http://127.0.0.1:41001"
+        return worker
+
+    def test_dead_process_gets_one_new_port_retry(self):
+        worker = self.make_worker()
+        launches, checks, alive = [], [], {"value": False}
+
+        def launch(argv):
+            launches.append(list(argv))
+            # 第一次启动的进程立即死亡（如端口被抢占），重试后存活。
+            alive["value"] = len(launches) > 1
+        worker.launch = launch
+        worker.alive = lambda: alive["value"]
+
+        def http(method, path, body=None, timeout=25):
+            checks.append(path)
+            if len(checks) == 1:
+                raise AuthError("auth_protocol_error")
+            return {}
+        worker.http = http
+
+        worker._serve("fake-opencode", 41001)
+        self.assertEqual(len(launches), 2, "Dead process should get exactly one retry on a new port")
+        self.assertEqual(launches[0], ["fake-opencode", "serve", "--pure", "--log-level", "ERROR",
+                                       "--hostname", "127.0.0.1", "--port", "41001"])
+        self.assertNotEqual(launches[1][-1], "41001")
+        self.assertTrue(worker.base.endswith(":" + launches[1][-1]))
+        self.assertEqual(checks, ["/global/health", "/global/health"])
+
+    def test_retry_happens_only_once(self):
+        worker = self.make_worker()
+        launches = []
+        worker.launch = lambda argv: launches.append(list(argv))
+        worker.alive = lambda: False
+
+        def http(method, path, body=None, timeout=25):
+            raise AuthError("auth_protocol_error")
+        worker.http = http
+        with self.assertRaisesRegex(AuthError, "auth_protocol_error"):
+            worker._serve("fake-opencode", 41002)
+        self.assertEqual(len(launches), 2, "Retry must not loop")
+
+    def test_alive_process_polls_until_deadline_without_retry(self):
+        worker = self.make_worker()
+        launches, sleeps = [], []
+        worker.launch = lambda argv: launches.append(list(argv))
+        worker.alive = lambda: True
+
+        def http(method, path, body=None, timeout=25):
+            raise AuthError("auth_protocol_error")
+        worker.http = http
+        clock = {"now": 0.0}
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=fake_sleep)
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            with self.assertRaisesRegex(AuthError, "auth_protocol_error"):
+                worker._serve("fake-opencode", 41003)
+        self.assertEqual(len(launches), 1, "Alive process must never be relaunched")
+        self.assertAlmostEqual(clock["now"], 25.0, delta=0.1)
+
+    def test_v2_complete_polls_with_backoff_intervals(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        clock = {"now": 0.0}
+        calls, sleeps = [], []
+
+        def fake_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], path))
+            if len(calls) >= 6:
+                return {"data": {"status": "complete"}}
+            return {"data": {"status": "pending"}}
+        worker.http = fake_http
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=fake_sleep)
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            self.assertTrue(worker._v2_complete(timeout=600))
+        intervals = [round(calls[index + 1][0] - calls[index][0], 6) for index in range(len(calls) - 1)]
+        # 阶梯退避 0.5/1/2/3 封顶；同样 9.5 秒内线性 0.2s 轮询约需 48 次请求。
+        self.assertEqual(intervals, [0.5, 1.0, 2.0, 3.0, 3.0])
+        self.assertEqual(len(calls), 6)
+
+    def test_v2_complete_times_out_at_deadline_with_backoff(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        clock = {"now": 0.0}
+        calls, sleeps = [], []
+
+        def fake_http(method, path, body=None, timeout=25):
+            calls.append(clock["now"])
+            return {"data": {"status": "pending"}}
+        worker.http = fake_http
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            clock["now"] += seconds
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=fake_sleep)
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            with self.assertRaisesRegex(AuthError, "auth_timeout"):
+                worker._v2_complete(timeout=10)
+        # 10 秒窗口内 6 次请求（线性 0.2s 方案约 50 次），最后一次 sleep 不越过截止时间。
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(sleeps[-1], 0.5)
+        self.assertAlmostEqual(clock["now"], 10.0, places=6)
 
 
 class RealAuthChecks:

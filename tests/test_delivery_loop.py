@@ -4,6 +4,7 @@ import json
 import platform
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -215,6 +216,51 @@ class DeliveryLoopTest(unittest.TestCase):
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), original)
         self.assertEqual((self.repo / "notes.txt").read_text(), "user draft")
 
+    def overlapping_baseline_fetches(self, names):
+        """对给定项目并发调用 baseline，返回同时处于 fetch 内的最大并发数。"""
+        repos = {}
+        for name in names:
+            repo = fixture(self.root / ("baseline-" + name + "-" + str(time.time_ns())))
+            git(repo, "remote", "add", "origin", "https://github.com/example/" + name + ".git")
+            repos[name] = repo
+        projects = {}
+        for name, repo in repos.items():
+            project = self.runtime.add_project(repo)
+            self.runtime.configure({"github": {"repository": "example/" + name},
+                                    "delivery": {"base_branch": "main"}}, project)
+            projects[name] = project
+        active, peak, guard = [], 0, threading.Lock()
+
+        def fetch(root, *args):
+            nonlocal peak
+            with guard:
+                active.append(root)
+                peak = max(peak, len(active))
+            time.sleep(0.3)
+            with guard:
+                active.pop()
+            return ""
+
+        def run(name):
+            baseline(self.runtime, self.runtime.project(projects[name]),
+                     self.runtime.config(projects[name]))
+
+        with patch("adaptive_rsi.delivery.github_git", side_effect=fetch), \
+                patch("adaptive_rsi.delivery.git", return_value="f" * 40):
+            threads = [threading.Thread(target=run, args=(name,)) for name in names]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+        return peak
+
+    def test_baseline_locks_are_per_project_and_do_not_serialize_projects(self):
+        # 不同项目的基线 fetch 并发进行，不再被全局锁串行阻塞。
+        self.assertGreaterEqual(self.overlapping_baseline_fetches(["one", "two"]), 2)
+        # 同一项目的并发基线刷新仍然互斥。
+        self.assertLessEqual(self.overlapping_baseline_fetches(["solo", "solo"]), 1)
+
     def test_exact_head_ci_conflict_review_and_empty_check_gates(self):
         good = {"headRefOid": "head", "baseRefOid": "base", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                 "reviewDecision": "", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
@@ -348,6 +394,49 @@ print('BOUNDARIES_OK')
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], expected)
         self.assertEqual(self.runtime.agent.roles, [])
 
+    def test_legacy_deferred_without_triage_input_is_retained_until_inputs_change(self):
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Deferred legacy work")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "deferred", {"base": "old-sha", "reason": "Waiting for dependency"}, True)
+        # 模拟升级前数据：没有迁移 decision，只有缺少 triage_input 的历史 run 结果。
+        self.store.execute("DELETE FROM task_decisions")
+        from adaptive_rsi.config import fingerprint
+
+        def reassess(head):
+            self.runtime.request(self.project, "reassess")
+            check = self.store.claim(self.project, self.runtime.config(self.project))
+            with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")):
+                self.runtime.process(check)
+
+        reassess("new-sha")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "deferred")
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        decision = json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?", (task,))["data"])
+        self.assertEqual(decision["decision_source"], "legacy_triage")
+        self.assertEqual(decision["base"], "new-sha")
+        self.assertEqual(decision["triage_input"],
+                         fingerprint({"body": row["body"], "evidence": row["evidence"],
+                                      "policy": self.runtime.config(self.project)["triage"]["policy"]}))
+        # 输入与基线均未变化：保持暂缓，不重新入队。
+        reassess("new-sha")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "deferred")
+        # 输入真正变化后才唤醒。
+        self.store.execute("UPDATE tasks SET body=? WHERE id=?", (row["body"] + " with updated dependency", task))
+        reassess("new-sha")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+
+    def test_tick_accepts_run_mapping_as_active_run(self):
+        run = self.tracked_pr()
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "mergeable": "MERGEABLE",
+              "mergeStateStatus": "CLEAN", "reviewDecision": "REVIEW_REQUIRED",
+              "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr):
+            tick(self.runtime, active_run={"id": run["id"]})
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertEqual(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["delivery_status"],
+                         "waiting_review")
+
     def test_merged_tasks_still_trigger_strategy_evolution_and_reverts_reach_planning(self):
         self.runtime.pause(self.project, False)
         self.runtime.configure({"evolution": {"enabled": True, "every_completed": 2}}, self.project)
@@ -472,6 +561,32 @@ print('BOUNDARIES_OK')
                 self.runtime.futures.clear()
                 self.runtime.dispatch([(self.runtime.project(p), self.runtime.config(p)) for p in counts])
         self.assertGreaterEqual(min(counts.values()), 9)
+
+    def test_dispatch_reads_concurrency_limit_once_per_pass(self):
+        self.runtime.pause(self.project, False)
+        for index in range(6):
+            self.runtime.goal(self.project, "task " + str(index))
+
+        class Pool:
+            def submit(_, fn, run):
+                self.store.transition(run["id"], "completed", {}, True)
+                future = concurrent.futures.Future()
+                future.set_result(None)
+                return future
+
+        eligible = [(self.runtime.project(self.project), self.runtime.config(self.project))]
+        original = self.runtime.config
+        calls = []
+
+        def counting(project=None):
+            calls.append(project)
+            return original(project)
+
+        with patch.object(self.runtime, "pool", Pool()), patch.object(self.runtime, "config", side_effect=counting):
+            self.runtime.futures.clear()
+            self.runtime.dispatch(eligible)
+        # 并发上限只在本次 dispatch 读取一次；此前每轮 while 迭代都会重读配置。
+        self.assertEqual(calls, [None])
 
     def test_long_regression_output_survives_investigation_failure_and_retries_once(self):
         from adaptive_rsi.delivery import feedback

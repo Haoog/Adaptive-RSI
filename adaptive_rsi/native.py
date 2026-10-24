@@ -24,6 +24,21 @@ class ProviderInterrupted(RuntimeError):
         super().__init__("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations")
 
 
+class ArgumentsError(ValueError):
+    """Arguments of one tool call could not be parsed; reported back to the model instead of failing the run."""
+
+
+def parse_arguments(name, raw):
+    # One malformed tool call must not end the run; the model receives the reason and can correct itself.
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError) as exc:
+        return ArgumentsError("Arguments for tool '" + name + "' are not valid JSON: " + str(exc))
+    if not isinstance(value, dict):
+        return ArgumentsError("Arguments for tool '" + name + "' are not a JSON object")
+    return value
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -209,14 +224,14 @@ class Conversation:
             output = response.get("output", [])
             self.history.extend(output)
             usage = response.get("usage", {})
-            calls = [(x["call_id"], x["name"], json.loads(x["arguments"])) for x in output if x.get("type") == "function_call"]
+            calls = [(x["call_id"], x["name"], parse_arguments(x["name"], x.get("arguments"))) for x in output if x.get("type") == "function_call"]
             return calls, int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
         if p in ["chat_completions", "ollama"]:
             message = response["message"] if p == "ollama" else response["choices"][0]["message"]
             # Keep reasoning_content returned by gateways that require it on subsequent turns.
             self.history.append(message)
             usage = response.get("usage", {})
-            calls = [(x.get("id", str(i)), x["function"]["name"], x["function"]["arguments"] if isinstance(x["function"]["arguments"], dict) else json.loads(x["function"]["arguments"]))
+            calls = [(x.get("id", str(i)), x["function"]["name"], parse_arguments(x["function"]["name"], x["function"].get("arguments")))
                      for i, x in enumerate(message.get("tool_calls", []))]
             tokens = int(response.get("prompt_eval_count", 0)) + int(response.get("eval_count", 0)) if p == "ollama" else int(usage.get("total_tokens", 0))
             return calls, tokens
@@ -224,11 +239,12 @@ class Conversation:
             content = response.get("content", [])
             self.history.append({"role": "assistant", "content": content})
             usage = response.get("usage", {})
-            calls = [(x["id"], x["name"], x["input"]) for x in content if x.get("type") == "tool_use"]
+            calls = [(x["id"], x["name"], parse_arguments(x["name"], x.get("input"))) for x in content if x.get("type") == "tool_use"]
             return calls, sum(int(usage.get(k, 0)) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
         content = response["candidates"][0]["content"]
         self.history.append(content)  # Preserve opaque thoughtSignature fields verbatim.
-        calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"], x["functionCall"].get("args", {}))
+        calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"],
+                  parse_arguments(x["functionCall"]["name"], x["functionCall"].get("args", {})))
                  for i, x in enumerate(content["parts"]) if "functionCall" in x]
         return calls, int(response.get("usageMetadata", {}).get("totalTokenCount", 0))
 
@@ -261,17 +277,19 @@ class NativeAgent:
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
         began = time.monotonic()
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
+        # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
+        timeout = 30 if role == "probe" else 300
         while True:
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
             suffix, payload = conversation.request()
             if len(json.dumps(payload).encode()) > max_bytes:
-                raise RuntimeError("Native model context exceeds output budget")
+                raise RuntimeError("Native model context exceeds output limit")
             call = self.store.reserve_call(project, run, role, route, config)
             started = time.monotonic()
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
             try:
-                response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, 30, max_bytes)
+                response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, timeout, max_bytes)
                 calls, tokens = conversation.receive(response)
                 if tokens < 0:
                     raise ValueError("Invalid token usage")
@@ -281,15 +299,28 @@ class NativeAgent:
                     raise Cancelled("Cancelled after model response")
                 if not calls:
                     raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
-                final = [args for _, name, args in calls if name == "finish"]
+                final = [x for x in calls if x[1] == "finish"]
                 if final:
                     if len(calls) != 1:
                         raise RuntimeError("finish must be the only tool call")
-                    validate_output(final[0], SCHEMAS[role])
+                    call_id, name, args = final[0]
+                    error = str(args) if isinstance(args, ArgumentsError) else None
+                    if error is None:
+                        try:
+                            validate_output(args, SCHEMAS[role])
+                        except RuntimeError as exc:
+                            error = "finish arguments failed schema validation: " + str(exc)
+                    if error is None:
+                        self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
+                        return args
+                    conversation.results([(call_id, name, {"error": error})])
                     self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
-                    return final[0]
+                    continue
                 results = []
                 for call_id, name, args in calls:
+                    if isinstance(args, ArgumentsError):
+                        results.append((call_id, name, {"error": str(args)}))
+                        continue
                     try:
                         value = tools.execute(name, args)
                         if len(json.dumps(value).encode()) > 128000:

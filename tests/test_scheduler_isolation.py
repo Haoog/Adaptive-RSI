@@ -1,6 +1,7 @@
 import concurrent.futures
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -41,7 +42,7 @@ class SchedulerIsolationTest(unittest.TestCase):
                            (str(directory), old, old, run["id"]))
         return self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
 
-    def iteration(self):
+    def iteration(self, join_maintenance=True):
         test = self
 
         class Pool:
@@ -58,6 +59,9 @@ class SchedulerIsolationTest(unittest.TestCase):
                 patch.object(self.runtime.wake, "wait", side_effect=lambda timeout: self.runtime.stop.set()), \
                 patch.object(self.runtime, "pool", Pool()):
             self.runtime.loop()
+        if join_maintenance and self.runtime.maintenance_thread:
+            # 清理已移入后台线程；默认等待其收尾，让后续断言保持确定性。
+            self.runtime.maintenance_thread.join(5)
 
     def errors(self, phase):
         return [row for row in self.store.query("SELECT * FROM events WHERE kind='scheduler_error'")
@@ -136,6 +140,55 @@ class SchedulerIsolationTest(unittest.TestCase):
 
         self.assertFalse((Path(run["path"]) / "candidate").exists())
         self.assertEqual(self.errors("maintenance_project")[0]["project"], "broken")
+
+    def test_maintenance_cleanup_runs_in_background_without_blocking_dispatch(self):
+        run = self.historical_run("healthy", "awaiting_approval")
+        (Path(run["path"]) / "candidate").mkdir(parents=True)
+        healthy_task = self.task("healthy")
+        release = threading.Event()
+        started = threading.Event()
+        real = Runtime.maintenance
+
+        def slow_maintenance(rt):
+            started.set()
+            if not release.wait(5):
+                raise AssertionError("maintenance worker was not released in time")
+            real(rt)
+
+        with patch.object(Runtime, "maintenance", slow_maintenance):
+            self.iteration(join_maintenance=False)
+            # 维护线程被阻塞在慢清理里时，调度循环已完成本轮派发，未被 rmtree 拖住。
+            self.assertIn(healthy_task, [item["task"] for item in self.dispatched])
+            self.assertTrue(started.wait(5))
+            release.set()
+        self.runtime.maintenance_thread.join(5)
+        self.assertFalse(self.runtime.maintenance_thread.is_alive())
+        # 后台清理仍然真实发生。
+        self.assertFalse((Path(run["path"]) / "candidate").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "expired")
+
+    def test_maintenance_worker_does_not_reenter_while_previous_cleanup_runs(self):
+        entered = []
+        release = threading.Event()
+
+        def slow_maintenance(rt):
+            entered.append(threading.current_thread())
+            self.assertTrue(release.wait(5))
+
+        with patch.object(Runtime, "maintenance", slow_maintenance):
+            self.runtime.maintenance_async()
+            first = self.runtime.maintenance_thread
+            self.runtime.maintenance_async()
+            # 上一轮清理未结束时，重入请求被直接跳过。
+            self.assertIs(self.runtime.maintenance_thread, first)
+            release.set()
+            first.join(5)
+            # 上一轮结束后，下一轮调度仍能再次启动清理。
+            self.runtime.maintenance_async()
+            self.assertIsNot(self.runtime.maintenance_thread, first)
+            release.set()
+            self.runtime.maintenance_thread.join(5)
+        self.assertEqual(len(entered), 2)
 
     def test_invalid_delivery_run_does_not_block_other_tracking_jobs(self):
         bad = self.historical_run("broken", "merged")

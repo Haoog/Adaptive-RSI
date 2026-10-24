@@ -327,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authenticated():
             return
-        if self.headers.get("Origin") != self.server.origin or not hmac.compare_digest(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
+        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not hmac.compare_digest(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
             self.respond({"error": "Invalid origin or CSRF token"}, 403)
             return
         try:

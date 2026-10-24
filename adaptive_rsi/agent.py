@@ -247,11 +247,15 @@ class CodexAgent:
             self.store.event("model", role + ": " + route.get("provider", "openai") + " / " + route["model"] + " / " + route["effort"], project, run)
             auth_secrets = []
             if container:
-                import contextlib
                 from .cli_worker import cli_home, codex_home, run_cli, sync_codex_oauth, CODEX_AUTH_LOCK
                 login = provider and provider.get("protocol") == "codex_login"
-                with (CODEX_AUTH_LOCK if login else contextlib.nullcontext()), cli_home(workspace) as home:
-                    original_auth = codex_home(home) if login else {}
+                with cli_home(workspace) as home:
+                    # 仅在拷贝与回写宿主凭据时持锁；隔离 home 内的模型调用不串行。
+                    if login:
+                        with CODEX_AUTH_LOCK:
+                            original_auth = codex_home(home)
+                    else:
+                        original_auth = {}
                     (home / ".codex").mkdir(exist_ok=True)
                     auth_secrets += list((original_auth.get("tokens") or {}).values())
                     forwarded = {}
@@ -268,7 +272,8 @@ class CodexAgent:
                             auth_file = home / ".codex/auth.json"
                             if auth_file.is_file():
                                 auth_secrets += list((json.loads(auth_file.read_text()).get("tokens") or {}).values())
-                            sync_codex_oauth(home, original_auth)
+                            with CODEX_AUTH_LOCK:
+                                sync_codex_oauth(home, original_auth)
             else:
                 result = run_process(argv, workspace, 0, cancel,
                                      config["limits"]["max_output_mb"], environment)

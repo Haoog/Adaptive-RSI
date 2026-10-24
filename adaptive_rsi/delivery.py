@@ -54,7 +54,8 @@ def baseline(runtime, project, config):
         raise RuntimeError("Baseline repository must match project origin")
     branch = config["delivery"]["base_branch"] or checked(
         ["gh", "repo", "view", repo, "--json", "defaultBranchRef", "--jq", ".defaultBranchRef.name"])
-    with runtime.baseline_lock:
+    # 基线锁按项目隔离：锁内的网络 fetch 不再让其他项目的基线刷新全局串行等待。
+    with runtime.baseline_lock_for(project["id"]):
         cache = runtime.store.root / "remotes" / project["id"]
         if not cache.exists():
             checked(["git", "init", "--bare", "--quiet", str(cache)])
@@ -197,6 +198,12 @@ def schedule(runtime, now=None):
 def tick(runtime, now=None, project_id=None, active_run=None):
     now = now or time.time()
     store = runtime.store
+    # 入口处归一化：调用方约定传运行 id 字符串；若误传 run 字典则取其 id，
+    # 其余真值非字符串转为字符串，空值保持 falsy，后续一律使用归一后的值参与查询。
+    if isinstance(active_run, dict):
+        active_run = active_run.get("id")
+    if active_run and not isinstance(active_run, str):
+        active_run = str(active_run)
     tick_key = "delivery-tick" + (":" + project_id if project_id else "")
     if now - store.setting(tick_key, 0) < 60:
         return
@@ -207,8 +214,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             return True
         if not active_run:
             return False
-        active_id = active_run["id"] if isinstance(active_run, dict) else active_run
-        current = store.one("SELECT * FROM runs WHERE id=?", (active_id,))
+        current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
     for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') ORDER BY started"):

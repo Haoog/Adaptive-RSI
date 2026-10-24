@@ -1,10 +1,16 @@
 import contextlib
 import json
+import queue
 import sqlite3
 import time
 import uuid
 from pathlib import Path
 from zoneinfo import ZoneInfoNotFoundError
+
+
+# /api/state 单次请求会执行十几条查询；8 个复用连接足以覆盖线程池的并发峰值，
+# 池满时新借出的连接用完直接关闭，不阻塞调用方。
+POOL_SIZE = 8
 
 
 def uid():
@@ -15,12 +21,20 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+class PooledConnection(sqlite3.Connection):
+    """携带创建时数据库文件标识的连接，用于识别被整体替换的数据库。"""
+
+    identity = None
+
+
 class Store:
     def __init__(self, root):
         self.root = Path(root).expanduser().resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.chmod(0o700)
         self.path = self.root / "state.sqlite3"
+        # 有界连接池；__init__ 的 DDL 迁移同样经由 connect() 走借出-归还路径。
+        self._pool = queue.LifoQueue(maxsize=POOL_SIZE)
         with self.connect() as db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
@@ -87,7 +101,8 @@ class Store:
                     started REAL, ended REAL);
             """)
             db.execute("BEGIN IMMEDIATE")
-            for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0")]:
+            for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
+                                      ("budget_waits", "INTEGER DEFAULT 0")]:
                 if field not in {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}:
                     db.execute("ALTER TABLE tasks ADD COLUMN " + field + " " + definition)
             if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
@@ -119,19 +134,73 @@ class Store:
             db.execute("DELETE FROM schedules WHERE kind='deep'")
             db.execute("UPDATE tasks SET state='obsolete' WHERE source='system_deep' AND state IN ('queued','waiting_budget')")
 
-    @contextlib.contextmanager
-    def connect(self):
-        db = sqlite3.connect(str(self.path), timeout=15)
+    def _file_identity(self):
+        try:
+            info = self.path.stat()
+        except OSError:
+            return None
+        return (info.st_dev, info.st_ino)
+
+    def _new_connection(self):
+        # WAL 持久保存在数据库文件中，busy timeout 由 connect(timeout=15) 设置；
+        # 借出期间连接由单线程独占，check_same_thread=False 因此是安全的。
+        db = sqlite3.connect(str(self.path), timeout=15, check_same_thread=False, factory=PooledConnection)
+        db.identity = self._file_identity()
+        db.execute("PRAGMA journal_mode=WAL")
+        return db
+
+    @staticmethod
+    def _prepare(db):
+        # 调用方可能在持有期间改过连接级设置，每次借出重新确保生效（PRAGMA 幂等）。
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        return db
+
+    @contextlib.contextmanager
+    def connect(self):
+        try:
+            db = self._pool.get_nowait()
+        except queue.Empty:
+            db = None
+        if db is not None and db.identity != self._file_identity():
+            # 升级回滚会整体替换 state.sqlite3（连同 -wal/-shm）；指向旧文件的
+            # 池连接必须弃用，否则轻则 I/O 错误，重则读到替换前的数据。
+            db.close()
+            db = None
+        if db is None:
+            db = self._new_connection()
+        try:
+            self._prepare(db)
+        except sqlite3.Error:
+            # 借出瞬间文件仍可能被替换；首条语句失败的连接直接重建一次。
+            db.close()
+            db = self._new_connection()
+            self._prepare(db)
         try:
             yield db
             db.commit()
-        except Exception:
-            db.rollback()
-            raise
-        finally:
+        except BaseException:
+            # 异常退出（包括 stream 被中途放弃）的连接可能持有坏状态：
+            # 回滚后直接关闭，绝不归还回池。
+            try:
+                db.rollback()
+            except sqlite3.Error:
+                pass
             db.close()
+            raise
+        else:
+            try:
+                self._pool.put_nowait(db)
+            except queue.Full:
+                db.close()
+
+    def close(self):
+        """关闭池中空闲连接；已借出的连接由各自的 with 块负责关闭。"""
+        while True:
+            try:
+                self._pool.get_nowait().close()
+            except queue.Empty:
+                return
 
     def query(self, sql, args=()):
         with self.connect() as db:
@@ -270,7 +339,7 @@ class Store:
             db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
-    def transition(self, run, state, result=None, terminal=False):
+    def transition(self, run, state, result=None, terminal=False, task_fields=None):
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -290,7 +359,15 @@ class Store:
             result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
-            db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
+            # task_fields 必须与状态变更同事务写入（如 waiting_budget 的退避时间），
+            # 否则调度器可能在两条语句之间按旧值把任务立即重排。
+            extra = ""
+            values = []
+            if task_fields and task and task["state"] != "cancelled":
+                extra = "," + ",".join(field + "=?" for field in task_fields)
+                values = [task_fields[field] for field in task_fields]
+            db.execute("UPDATE tasks SET state=?,updated=?" + extra + " WHERE id=?",
+                       (state, now, *values, row["task"]))
             if state == "deferred":
                 db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (row["task"], encode(result), now))
         self.event(state, (result or {}).get("reason", state), row["project"], run, result)
@@ -334,4 +411,6 @@ class Store:
             previous = db.execute("SELECT tokens FROM calls WHERE id=?", (call,)).fetchone()
             db.execute("UPDATE calls SET " + ",".join(field + "=?" for field in fields) + ",seconds=? WHERE id=?",
                        (*[values[field] for field in fields], seconds, call))
-            db.execute("UPDATE runs SET tokens=tokens+? WHERE id=?", (values["tokens"] - previous["tokens"], run))
+            # 重试或重复记录时新值可能小于旧值；runs 只增不减，重复记录保持幂等。
+            db.execute("UPDATE runs SET tokens=tokens+? WHERE id=?",
+                       (max(0, values["tokens"] - previous["tokens"]), run))
