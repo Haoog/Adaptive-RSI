@@ -12,7 +12,8 @@ from .build import BUILD_ID
 from .config import fingerprint
 from .gitops import copy_source, git
 from .process import Sandbox, run_process
-from .workflow import _go_test_options, environment_failure, npm_test_runner
+from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
+                       unittest_discovery_options)
 
 MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py",
              "pom.xml", "build.gradle", "build.gradle.kts", "Makefile", "CMakeLists.txt", "Cargo.toml",
@@ -155,21 +156,41 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
         lower = [arg.lower() for arg in argv]
         command = None
         command_cwd = check.get("cwd", ".")
+        suffix = Path(filename).suffix.lower()
+        python_test = suffix == ".py"
+        javascript_test = suffix in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+        node_test = suffix in {".js", ".mjs", ".cjs"}
 
-        if filename.endswith(".py") and "-m" in lower:
+        if python_test and "-m" in lower:
             module_index = lower.index("-m")
             if module_index + 1 < len(lower) and lower[module_index + 1] == "unittest":
-                module_path = Path(relative)
-                if ".." not in module_path.parts:
-                    command = argv[:module_index + 2] + [".".join(module_path.with_suffix("").parts)]
-        if command is None and "-m" in lower:
+                options = unittest_discovery_options(argv)
+                if options is not None:
+                    original_start = options["start"] or "."
+                    original_top = options["top"] or original_start
+                    start_dir = (cwd / original_start).resolve()
+                    top_dir = (cwd / original_top).resolve()
+                    try:
+                        start_dir.relative_to(root)
+                        top_dir.relative_to(root)
+                        target.parent.relative_to(start_dir)
+                        start_dir.relative_to(top_dir)
+                    except ValueError:
+                        continue
+                    # unittest discovery patterns match basenames, so refuse ambiguity.
+                    if any(path != target for path in target.parent.rglob(target.name) if path.is_file()):
+                        continue
+                    start_arg = Path(os.path.relpath(target.parent, cwd)).as_posix()
+                    command = (argv[:module_index + 2] + ["discover"] + options["flags"] +
+                               ["-s", start_arg, "-t", original_top, "-p", target.name])
+        if command is None and python_test and "-m" in lower:
             module_index = lower.index("-m")
             if module_index + 1 < len(lower) and lower[module_index + 1] == "pytest":
                 command = argv[:module_index + 2] + [relative]
-        if command is None and any(Path(item).name == "pytest" for item in lower):
+        if command is None and python_test and any(Path(item).name == "pytest" for item in lower):
             runner = next(index for index, item in enumerate(lower) if Path(item).name == "pytest")
             command = argv[:runner + 1] + [relative]
-        if command is None and filename.endswith(".go") and any(Path(item).name == "go" for item in lower):
+        if command is None and suffix == ".go" and any(Path(item).name == "go" for item in lower):
             flags = _go_test_options(argv)
             if names and flags is not None:
                 go_index = next(index for index, item in enumerate(lower) if Path(item).name == "go")
@@ -178,9 +199,10 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
                 package = "." if parent == "." else "./" + parent
                 pattern = "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
                 command = argv[:runner + 1] + flags + ["-run", pattern, package]
-        if command is None and Path(lower[0]).name == "node" and "--test" in lower:
-            runner = lower.index("--test")
-            command = argv[:runner + 1] + [relative]
+        if command is None and node_test and Path(lower[0]).name == "node":
+            options = node_test_options(argv)
+            if options is not None:
+                command = [argv[0]] + options + [relative]
         if command is None and Path(lower[0]).name == "npm" and lower[1:] in (["test"], ["run", "test"]):
             package = root / check.get("cwd", ".") / "package.json"
             try:
@@ -188,18 +210,21 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
                 runner = npm_test_runner(script)
             except (OSError, ValueError, TypeError):
                 runner = None
-            if runner:
+            if runner and ((runner[0] == "node" and node_test) or
+                           (runner[0] != "node" and javascript_test)):
                 command = (runner + [relative] if runner[0] == "node" else
                            [argv[0], "exec", "--"] + runner + [relative])
         if command is None:
             for runner_name in ["jest", "vitest"]:
-                if any(Path(item).name == runner_name for item in lower):
+                if javascript_test and any(Path(item).name == runner_name for item in lower):
                     runner = next(index for index, item in enumerate(lower) if Path(item).name == runner_name)
                     command = argv[:runner + 1] + (["run"] if runner_name == "vitest" else []) + [relative]
                     break
         if command is None:
             for runner_name in ["phpunit", "rspec"]:
-                if any(Path(item).name == runner_name for item in lower):
+                if ((runner_name == "phpunit" and suffix == ".php") or
+                        (runner_name == "rspec" and suffix == ".rb")) and \
+                        any(Path(item).name == runner_name for item in lower):
                     runner = next(index for index, item in enumerate(lower) if Path(item).name == runner_name)
                     command = argv[:runner + 1] + [relative]
                     break

@@ -800,10 +800,26 @@ class EvidenceContractTest(unittest.TestCase):
         root = Path("/project")
         self.assertEqual(_isolated_test_check(
             [{"name": "unit", "cwd": ".", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"]}],
-            root, "tests/test_new.py" )["argv"], ["python3", "-m", "unittest", "tests.test_new"])
+            root, "tests/test_new.py")["argv"],
+            ["python3", "-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-p", "test_new.py"])
         self.assertEqual(_isolated_test_check(
             [{"name": "node", "cwd": ".", "argv": ["node", "--test"]}],
             root, "tests/new.test.js")["argv"], ["node", "--test", "tests/new.test.js"])
+        self.assertEqual(_isolated_test_check(
+            [{"name": "node", "cwd": ".", "argv": ["node", "--test", "--require", "./preload.cjs", "tests"]}],
+            root, "tests/new.test.js")["argv"],
+            ["node", "--test", "--require", "./preload.cjs", "tests/new.test.js"])
+        self.assertTrue(supports_test_first([{"name": "node", "argv": ["node", "--test", "--require", "./preload.cjs"]}]))
+        self.assertFalse(supports_test_first([{"name": "node", "argv": ["node", "--test", "--test-name-pattern", "legacy"]}]))
+        self.assertTrue(supports_test_first([{"name": "unit", "argv": ["python3", "-m", "unittest",
+                                                                            "discover", "-s", "tests"]}]))
+        self.assertFalse(supports_test_first([{"name": "unit", "argv": ["python3", "-m", "unittest",
+                                                                             "discover", "--unknown"]}]))
+        self.assertEqual(_isolated_test_check(
+            [{"name": "python", "cwd": "backend", "argv": ["python3", "-m", "pytest", "tests"]},
+             {"name": "frontend", "cwd": ".", "argv": ["node", "--test"]}],
+            root, "frontend/tests/new.test.js")["argv"],
+            ["node", "--test", "frontend/tests/new.test.js"])
         self.assertEqual(_isolated_test_check(
             [{"name": "go", "cwd": ".", "argv": ["go", "test", "./..."]}],
             root, "pkg/new_test.go", ["TestNew"])["argv"],
@@ -874,6 +890,26 @@ class EvidenceContractTest(unittest.TestCase):
             self.assertTrue(supports_test_first([{"cwd": ".", "argv": ["npm", "test"]}], root))
             self.assertEqual(_isolated_test_check([check], root, "tests/new.test.ts")["argv"],
                              ["npm", "exec", "--", "vitest", "run", "tests/new.test.ts"])
+
+    def test_unittest_discovery_isolates_one_file_without_losing_helper_imports(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "helpers.py").write_text("VALUE = 42\n")
+            (tests / "test_new.py").write_text(
+                "import unittest\nimport helpers\n"
+                "class RegressionTest(unittest.TestCase):\n"
+                "    def test_import_context(self):\n"
+                "        self.assertEqual(helpers.VALUE, 42)\n")
+            checks = [{"name": "unit", "cwd": ".", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"]}]
+            isolated = _isolated_test_check(checks, root, "tests/test_new.py")
+            self.assertEqual(isolated["argv"], ["python3", "-m", "unittest", "discover", "-s", "tests",
+                                                "-t", "tests", "-p", "test_new.py"])
+            result = subprocess.run(isolated["argv"], cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_change_kind_keeps_docs_and_performance_contracts_distinct(self):
         self.assertEqual(change_kind({"title": "Fix slow query", "body": "Optimize latency"}), "performance")

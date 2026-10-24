@@ -13,6 +13,78 @@ ENVIRONMENT_FAILURE = re.compile(
     re.I,
 )
 
+UNITTEST_DISCOVERY_VALUE_FLAGS = {"-s", "--start-directory", "-t", "--top-level-directory", "-p", "--pattern"}
+UNITTEST_DISCOVERY_BOOL_FLAGS = {"-v", "--verbose", "-q", "--quiet", "-f", "--failfast", "--locals",
+                                 "--buffer", "--catch"}
+NODE_TEST_VALUE_FLAGS = {"-r", "--require", "--import", "--loader", "--experimental-loader", "-C",
+                         "--conditions", "--test-reporter", "--test-reporter-destination",
+                         "--test-concurrency", "--test-timeout"}
+NODE_TEST_BOOL_FLAGS = {"--test", "--experimental-strip-types"}
+
+
+def unittest_discovery_options(argv):
+    """Parse the unittest options we can safely retain while targeting one file."""
+    module_index = next((index for index, item in enumerate(argv[:-1])
+                         if item == "-m" and argv[index + 1] == "unittest"), None)
+    if module_index is None:
+        return None
+    args = list(argv[module_index + 2:])
+    if args[:1] == ["discover"]:
+        args = args[1:]
+    elif any(not item.startswith("-") for item in args):
+        return None
+    options = {"start": None, "top": None, "pattern": None, "flags": []}
+    names = {"-s": "start", "--start-directory": "start", "-t": "top", "--top-level-directory": "top",
+             "-p": "pattern", "--pattern": "pattern"}
+    index = 0
+    while index < len(args):
+        item = args[index]
+        key, separator, value = item.partition("=")
+        if key in names:
+            if not separator:
+                index += 1
+                if index >= len(args):
+                    return None
+                value = args[index]
+            if not value:
+                return None
+            options[names[key]] = value
+        elif item in UNITTEST_DISCOVERY_BOOL_FLAGS:
+            options["flags"].append(item)
+        else:
+            return None
+        index += 1
+    return options
+
+
+def node_test_options(argv):
+    """Retain supported Node setup flags and reject options we cannot rewrite safely."""
+    if not argv or Path(str(argv[0])).name.lower() != "node":
+        return None
+    options = []
+    has_test = False
+    index = 1
+    while index < len(argv):
+        item = str(argv[index])
+        key, separator, value = item.partition("=")
+        if key in NODE_TEST_VALUE_FLAGS:
+            if separator:
+                if not value:
+                    return None
+                options.append(item)
+            else:
+                index += 1
+                if index >= len(argv) or not str(argv[index]):
+                    return None
+                options.extend([item, str(argv[index])])
+        elif item in NODE_TEST_BOOL_FLAGS:
+            options.append(item)
+            has_test = has_test or item == "--test"
+        elif item == "--" or item.startswith("-"):
+            return None
+        index += 1
+    return options if has_test else None
+
 
 def npm_test_runner(script):
     """Recognize only npm scripts whose test target can be replaced with one file."""
@@ -93,7 +165,10 @@ def supports_test_first(checks, root=None):
             continue
         if "-m" in argv:
             module_index = argv.index("-m")
-            if module_index + 1 < len(argv) and argv[module_index + 1] in {"pytest", "unittest"}:
+            if module_index + 1 < len(argv) and argv[module_index + 1] == "pytest":
+                return True
+            if module_index + 1 < len(argv) and argv[module_index + 1] == "unittest" and \
+                    unittest_discovery_options(check.get("argv", [])) is not None:
                 return True
         names = [Path(item).name for item in argv]
         if any(item in {"pytest", "phpunit", "rspec", "jest", "vitest"} for item in names):
@@ -101,7 +176,7 @@ def supports_test_first(checks, root=None):
         if any(names[index] == "go" and names[index + 1] == "test" and _go_test_options(argv) is not None
                for index in range(len(names) - 1)):
             return True
-        if names[0] == "node" and "--test" in argv:
+        if names[0] == "node" and node_test_options(check.get("argv", [])) is not None:
             return True
         if names[0] == "npm" and root is not None and argv[1:] in (["test"], ["run", "test"]):
             package = Path(root) / check.get("cwd", ".") / "package.json"
