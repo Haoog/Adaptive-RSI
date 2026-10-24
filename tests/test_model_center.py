@@ -4,6 +4,7 @@ import os
 import platform
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -333,3 +334,28 @@ class ModelCenterTest(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join()
+
+    def test_credential_rotation_never_deletes_a_reference_still_in_use(self):
+        # 评审实测回归：项目覆盖继承连接的密钥时，不能删除全局仍在引用的凭据。
+        from adaptive_rsi.credentials import Credentials
+        with DirectoryServer() as fixture:
+            self.save(fixture, "file", value="global-key")
+            provider = self.center.provider("gateway")
+            shared = provider["secret_ref"]
+            credentials = Credentials(self.runtime.store.root)
+            self.assertEqual(credentials.get(provider), "global-key")
+            self.runtime.store.execute(
+                "INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                ("proj01", "fixture", str(self.root / "unused"), "{}", 1, time.time()))
+            project = "proj01"
+            self.center.save_provider(fixture.provider, {"mode": "file", "value": "project-key"}, project)
+            replaced = self.center.provider("gateway", project)
+            self.assertNotEqual(replaced["secret_ref"], shared)
+            # 全局配置仍引用共享凭据，文件必须保留且可读取。
+            self.assertEqual(credentials.get(self.center.provider("gateway")), "global-key")
+            self.assertTrue((self.runtime.store.root / "credentials" / shared).is_file())
+            self.assertEqual(credentials.get(replaced), "project-key")
+            # 全局重新保存且无其他引用时，旧凭据才被删除。
+            self.center.save_provider(fixture.provider, {"mode": "file", "value": "rotated-key"})
+            self.assertFalse((self.runtime.store.root / "credentials" / shared).exists())
+            self.assertEqual(credentials.get(self.center.provider("gateway")), "rotated-key")

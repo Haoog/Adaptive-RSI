@@ -259,6 +259,14 @@ class UsageAndOpenCodeTest(unittest.TestCase):
         self.assertEqual((details["tokens"], details["input_tokens"], details["cache_read_tokens"]), (120, 30, 70))
         self.assertIsNone(native_usage("responses", {}))
         self.assertEqual(opencode_usage([{"input": 10, "output": 5, "cache": {"read": 20, "write": 2}}])["tokens"], 37)
+        # 网关可能返回 null 或字符串计数；无法确认时按未知处理，不否决成功调用。
+        self.assertIsNone(native_usage("chat_completions", {"usage": {"prompt_tokens": None, "completion_tokens": 3, "total_tokens": None}}))
+        self.assertIsNone(native_usage("anthropic", {"usage": {"input_tokens": None, "output_tokens": 1}}))
+        self.assertIsNone(opencode_usage([{"input": None, "output": 3}]))
+        tolerated = native_usage("chat_completions", {"usage": {"prompt_tokens": "12", "completion_tokens": "5", "total_tokens": "17"}})
+        self.assertEqual(tolerated["tokens"], 17)
+        self.assertEqual(tolerated["input_tokens"], 12)
+        self.assertEqual(tolerated["output_tokens"], 5)
 
     def test_opencode_jsonl_variants_and_jsonc_urls(self):
         data, steps = parse_events('\n'.join([encode({"type": "step_finish", "part": {"id": "step", "tokens": {"input": 5}}}),
