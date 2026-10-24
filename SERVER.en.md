@@ -20,13 +20,19 @@ sudo loginctl enable-linger "$(id -un)"
 
 The installer builds `adaptive-rsi-worker:local`, creates an isolated Python environment and starts a user service without overwriting existing settings. Lingering keeps it running after SSH logout and across reboots.
 
+Alternatively, install directly from the verified release bundle without cloning (SHA-256 checked; the layout stays compatible with built-in self-updates):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Haoog/Adaptive-RSI/main/scripts/remote-install.sh | bash
+```
+
 By default the app listens only on the server's `127.0.0.1:6090`. On your personal computer:
 
 ```sh
 ssh -N -L 6090:127.0.0.1:6090 user@server
 ```
 
-Run `journalctl --user -u adaptive-rsi` on the server for the authenticated startup URL, then open it in your local browser. The URL contains session credentials; keep it private. A plain URL displays recovery instructions.
+Run `journalctl --user -u adaptive-rsi` on the server for the authenticated startup URL, then open it in your local browser. The URL contains session credentials; keep it private and note that it stays in the browser history—clear that entry on shared devices. A plain URL displays recovery instructions.
 
 Register a path **on the server**, or import a GitHub URL. Model connections also use the server's network and authentication; logins from your personal computer are not uploaded. New projects remain paused until models, executable checks and delivery settings are ready.
 

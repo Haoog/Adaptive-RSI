@@ -10,6 +10,7 @@
 
 ```sh
 python3 -m unittest discover -v
+日常开发不必每次跑全量测试（约 8 分钟）。按 CI 的分组只跑受影响的模块，例如 `python3 -m unittest tests.test_runtime.RuntimeTest` 或 `python3 -m unittest tests.test_store`；推送后由 CI 并行执行全量检查。
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js

@@ -10,6 +10,7 @@ Requires Python 3.9+. Execution uses macOS Seatbelt or Linux Docker. Models can 
 
 ```sh
 python3 -m unittest discover -v
+You do not need the full suite (~8 minutes) for every local change. Run only the affected group the same way CI splits them, for example `python3 -m unittest tests.test_runtime.RuntimeTest` or `python3 -m unittest tests.test_store`; CI runs the full set in parallel after you push.
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
