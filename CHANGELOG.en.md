@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.103
+
+<!-- adaptive-rsi-release:0.5.103;base:0ec3e61d6e0d1603c73fbaacc379c851a6ec14ac -->
+
 - Stop the scheduler from hot-retrying quota-waiting tasks while no quota exists: quota failures now wait with increasing backoff before resuming, and after the automatic retry cap the task becomes blocked until manually retried; context or output overflow is no longer misclassified as a quota failure.
 - OpenCode and Codex model calls no longer serialize end to end; execution outside credential reads and writes can run concurrently, and remote baseline refreshes now run per project in parallel.
 - Native API response timeouts are relaxed by role to support slower reasoning models; unparseable tool arguments or schema-invalid finish results are reported back to the model to self-correct instead of failing the run.
