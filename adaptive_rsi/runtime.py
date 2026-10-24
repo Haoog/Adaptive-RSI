@@ -1248,5 +1248,14 @@ class Runtime:
                 paused, created = False, 0
             if not paused and created < stale:
                 self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        # Issue 评论缓存按 issue 数量累积（每个键含最多 20 条评论正文）；
+        # 超过保留期未刷新的键不会再被命中（处理时总会刷新），直接删除。
+        for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'issue-comments:%' LIMIT 400"):
+            try:
+                checked = json.loads(row["value"]).get("checked_at", 0)
+            except (ValueError, TypeError):
+                checked = 0
+            if checked < stale:
+                self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         self.store.execute("DELETE FROM events WHERE created<? AND seq NOT IN (SELECT seq FROM events ORDER BY seq DESC LIMIT 1000)", (now - 90 * 86400,))
         self.store.put_setting("maintenance-last", now)
