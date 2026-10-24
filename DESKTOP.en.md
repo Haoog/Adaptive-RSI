@@ -33,3 +33,7 @@ npm run --prefix desktop dev
 The build downloads Python 3.12, installs PyInstaller and packages a standalone engine. The app version comes from the Python package rather than a second release-version source. Bundles are under `desktop/src-tauri/target/release/bundle/`.
 
 Builds use local ad-hoc signatures only. Apple Developer ID signing and notarization are not configured; macOS may show a security warning, and the package is not notarized. To update, download the new asset from GitHub Releases, quit, then replace the app manually. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
+
+## Software updates
+
+Opening "General settings → Software updates" makes the desktop app check GitHub for the latest official release. When a new version is available it can be downloaded in place: progress is shown as a percentage, the download is verified against its SHA-256 checksum, and the installer image opens automatically—drag to replace the app. Projects and records live in the data directory and survive the replacement. You can also download and replace manually from GitHub Releases. The bundled server runtime updates together with the desktop app; no separate step is needed.
