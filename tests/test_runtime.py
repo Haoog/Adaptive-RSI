@@ -928,6 +928,15 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(denied.exception.code, 401)
             self.assertEqual(json.load(denied.exception)["error_code"], "session_required")
 
+    def test_stale_token_link_falls_back_to_a_valid_session(self):
+        # 收藏的旧启动地址携带已轮换 token；已登录的浏览器应直接回到控制台而不是 403。
+        request = urllib.request.Request(self.server.origin + "/?token=stale-token", headers=self.headers())
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(response.status, 200)
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            urllib.request.urlopen(self.server.origin + "/?token=stale-token")
+        self.assertEqual(denied.exception.code, 401)
+
     def test_update_gate_rejects_before_mutation_with_a_retryable_code(self):
         self.runtime.updates.installing = True
         headers = {**self.headers(), "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,

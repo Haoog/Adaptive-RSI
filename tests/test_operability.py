@@ -230,3 +230,42 @@ class OperabilityTest(unittest.TestCase):
         self.assertEqual(planning["reason"], "opencode_incompatible_3.0.0")
         self.assertEqual(planning["opencode_version"], "3.0.0")
         self.assertIn("OpenCode 1.19.3", planning["detail"])
+
+    def test_retention_cleanup_removes_stale_derived_data_but_keeps_active_delivery(self):
+        store = self.store
+        stale = time.time() - 120 * 86400
+        store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                      ("proj01", "fixture", str(Path(self.temp.name) / "project"), "{}", 1, stale))
+        for run, state in [("runold01", "completed"), ("runlive1", "merged"), ("runnew01", "completed")]:
+            store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,attempts,overrides,available,created,updated) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                          ("task" + run, "proj01", "goal", "fp" + run, "title", "body", "[]", "[]", state, 50, 0, "{}", stale, stale))
+            ended = stale if run != "runnew01" else time.time()
+            store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) VALUES (?,?,?,?,?,?,?,?)",
+                          (run, "task" + run, "proj01", state, "{}", stale, ended, "{}"))
+        store.put_setting("run-baseline:runold01", {"sha": "old"})
+        store.put_setting("delivery:runold01", {"head": "old"})
+        store.put_setting("run-baseline:runlive1", {"sha": "merged"})
+        store.put_setting("delivery:runlive1", {"head": "merged"})
+        store.put_setting("run-baseline:runnew01", {"sha": "fresh"})
+        store.put_setting("triage-state:taskrunold01", {"decision": "deferred"})
+        store.put_setting("task-proof:proj01:abc", {"at": stale})
+        store.put_setting("task-proof:proj01:def", {"at": time.time()})
+        store.put_setting("provider-health:proj01:p1:sig", {"paused": False, "at": stale})
+        store.put_setting("provider-health:proj01:p2:sig", {"paused": True, "at": stale})
+        store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                      ("skillold", "proj01", None, "verified", "[]", "content", "{}", stale, stale))
+        self.runtime.maintenance()
+        keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+        self.assertNotIn("run-baseline:runold01", keys)
+        self.assertNotIn("delivery:runold01", keys)
+        self.assertNotIn("triage-state:taskrunold01", keys)
+        self.assertNotIn("task-proof:proj01:abc", keys)
+        self.assertNotIn("provider-health:proj01:p1:sig", keys)
+        # 交付与合并后监控仍在生命周期的运行保留全部键。
+        self.assertIn("run-baseline:runlive1", keys)
+        self.assertIn("delivery:runlive1", keys)
+        self.assertIn("run-baseline:runnew01", keys)
+        self.assertIn("task-proof:proj01:def", keys)
+        self.assertIn("provider-health:proj01:p2:sig", keys)
+        self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
