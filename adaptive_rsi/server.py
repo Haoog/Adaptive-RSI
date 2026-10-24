@@ -221,9 +221,13 @@ class Handler(BaseHTTPRequestHandler):
                     if task.get("wait_reason") == "ready" and capacity:
                         task["wait_reason"] = "capacity"
                     if task.get("wait_reason") in ["ready", "running"] and selected:
-                        # 同一请求内项目相同，工作时段开头只需计算一次。
-                        if opening is None:
-                            opening = runtime.next_effective_schedule(selected, time.time())
+                        # 同一请求内项目相同，工作时段开头只需计算一次；
+                        # 配置异常时跳过标注，控制台仍需返回以展示修复入口。
+                        try:
+                            if opening is None:
+                                opening = runtime.next_effective_schedule(selected, time.time())
+                        except (AttributeError, ValueError, TypeError, KeyError):
+                            break
                         if opening > time.time() + 1:
                             task.update(wait_reason="working_hours", available=opening)
                 schedules = store.query("SELECT * FROM schedules")
