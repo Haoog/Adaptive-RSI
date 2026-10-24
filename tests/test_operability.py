@@ -15,7 +15,7 @@ from adaptive_rsi.provider_health import ProviderHealth, ProviderPaused
 from adaptive_rsi.readiness import inspect
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from adaptive_rsi.telemetry import quality_summary
+from adaptive_rsi.telemetry import quality_summary, workflow_metrics
 from tests.test_model_center import DirectoryServer
 from tests.test_runtime import fixture
 
@@ -269,3 +269,24 @@ class OperabilityTest(unittest.TestCase):
         self.assertIn("task-proof:proj01:def", keys)
         self.assertIn("provider-health:proj01:p2:sig", keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
+
+    def test_workflow_metrics_scales_past_sql_variable_limit(self):
+        # 运行数超过连接变量上限时聚合查询不能失败（评审实测回归）。
+        store = self.store
+        now = time.time()
+        store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)", ("proj01", "fixture", str(Path(self.temp.name) / "project"), "{}", 1, now))
+        for index in range(1100):
+            task = "t%05d" % index
+            run = "r%05d" % index
+            store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,attempts,overrides,available,created,updated) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                          (task, "proj01", "goal", "fp" + task, "t", "b", "[]", "[]", "merged", 50, 0, "{}", now, now))
+            store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) VALUES (?,?,?,?,?,?,?,?)",
+                          (run, task, "proj01", "completed", "{}", now, now,
+                           json.dumps({"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}, "merged_at": now})))
+            store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,seconds,created,provider,unit) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                          ("c" + run, "proj01", run, "implementation", "m", "high", "completed", 10, 1.0, now, "openai", "http_request"))
+        result = workflow_metrics(store)
+        self.assertEqual(result["tasks"], 1100)
+        self.assertEqual(result["accepted"], 1100)
+        self.assertEqual(result["accepted_tokens"], 11000)

@@ -216,16 +216,16 @@ class Handler(BaseHTTPRequestHandler):
                 rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
                                params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
                 capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
+                opening = None
                 for task in rows["tasks"]:
                     if task.get("wait_reason") == "ready" and capacity:
                         task["wait_reason"] = "capacity"
                     if task.get("wait_reason") in ["ready", "running"] and selected:
-                        try:
+                        # 同一请求内项目相同，工作时段开头只需计算一次。
+                        if opening is None:
                             opening = runtime.next_effective_schedule(selected, time.time())
-                            if opening > time.time() + 1:
-                                task.update(wait_reason="working_hours", available=opening)
-                        except AttributeError:
-                            pass
+                        if opening > time.time() + 1:
+                            task.update(wait_reason="working_hours", available=opening)
                 schedules = store.query("SELECT * FROM schedules")
                 project_by_id = {project["id"]: project for project in projects}
                 for schedule in schedules:
