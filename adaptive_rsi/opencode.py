@@ -686,7 +686,7 @@ class OpenCodeAgent:
                     _private_json(import_path, original_auth)
                     imported = run_cli(["opencode", "auth", "import", "--standalone", str(import_path)],
                                        workspace, home, config, cancel, protected, True,
-                                       environment, self.store.root)
+                                       environment, self.store.root, timeout=120)
                     if imported["exit_code"] or imported["error"]:
                         raise RuntimeError("OpenCode credential import failed; see the redacted execution record")
                     for item in original_auth:
@@ -717,7 +717,7 @@ class OpenCodeAgent:
                             exported = run_cli(
                                 ["opencode", "auth", "export", "--standalone", provider_prefix],
                                 workspace, home, config, cancel, protected, True,
-                                environment, self.store.root)
+                                environment, self.store.root, timeout=120)
                             rows = _parse_auth_export(exported.get("stdout", "")) if not (
                                 exported["exit_code"] or exported["error"]) else []
                             if rows:
