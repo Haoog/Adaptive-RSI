@@ -4,8 +4,9 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::Mutex,
     time::Duration,
 };
@@ -34,6 +35,257 @@ struct RuntimeState {
     local: Mutex<Option<Connection>>,
     child: Mutex<Option<Child>>,
     error: Mutex<String>,
+    update: Mutex<Option<DesktopUpdate>>,
+}
+
+///桌面应用自身的更新状态；percent 存百分比×100，避免浮点原子。
+struct DesktopUpdate {
+    version: String,
+    notes: String,
+    url: String,
+    sha_url: String,
+    error: String,
+    percent: AtomicU64,
+    downloading: AtomicBool,
+    opened: AtomicBool,
+}
+
+impl DesktopUpdate {
+    fn json(&self) -> Value {
+        json!({
+            "version": self.version,
+            "notes": self.notes,
+            "downloading": self.downloading.load(Ordering::Relaxed),
+            "percent": self.percent.load(Ordering::Relaxed) as f64 / 100.0,
+            "opened": self.opened.load(Ordering::Relaxed),
+            "error": self.error,
+        })
+    }
+}
+
+const UPDATE_REPO: &str = "Haoog/Adaptive-RSI";
+
+fn update_client() -> Result<Client, String> {
+    // 资产下载会经过 GitHub 的 https 重定向；只跟随 https，且限制跳数。
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 5 {
+                attempt.error("too many redirects")
+            } else if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|_| "Cannot create updater connection".into())
+}
+
+fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+    let mut numbers = value.trim().split('.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?.parse().ok()?;
+    let patch = numbers.next()?.parse().ok()?;
+    if numbers.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn check_desktop_update_blocking(app: &tauri::AppHandle) -> Option<Value> {
+    {
+        let state = app.state::<RuntimeState>();
+        let guard = state.update.lock().unwrap();
+        if let Some(current) = guard.as_ref() {
+            if current.downloading.load(Ordering::Relaxed) {
+                return Some(current.json());
+            }
+        }
+    }
+    let client = update_client().ok()?;
+    let response = client
+        .get(format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO))
+        .header("User-Agent", "Adaptive-RSI-updater")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let release: Value = response.json().ok()?;
+    let tag = release.get("tag_name")?.as_str()?.trim_start_matches('v');
+    let current = app.package_info().version.to_string();
+    if parse_version(tag)? <= parse_version(&current)? {
+        return None;
+    }
+    let dmg_name = format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", tag);
+    let mut url = None;
+    let mut sha_url = None;
+    if let Some(assets) = release.get("assets").and_then(Value::as_array) {
+        for asset in assets {
+            let name = asset.get("name").and_then(Value::as_str).unwrap_or("");
+            let link = asset.get("browser_download_url").and_then(Value::as_str);
+            if name == dmg_name {
+                url = link.map(str::to_string);
+            } else if name == format!("{}.sha256", dmg_name) {
+                sha_url = link.map(str::to_string);
+            }
+        }
+    }
+    let (url, sha_url) = (url?, sha_url?);
+    let notes = release
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .chars()
+        .take(16000)
+        .collect::<String>();
+    let state = app.state::<RuntimeState>();
+    let mut guard = state.update.lock().unwrap();
+    *guard = Some(DesktopUpdate {
+        version: tag.to_string(),
+        notes,
+        url,
+        sha_url,
+        error: String::new(),
+        percent: AtomicU64::new(0),
+        downloading: AtomicBool::new(false),
+        opened: AtomicBool::new(false),
+    });
+    guard.as_ref().map(DesktopUpdate::json)
+}
+
+fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
+    let (url, sha_url, version) = {
+        let state = app.state::<RuntimeState>();
+        let guard = state.update.lock().unwrap();
+        match guard.as_ref() {
+            Some(update) if !update.downloading.load(Ordering::Relaxed) => {
+                (update.url.clone(), update.sha_url.clone(), update.version.clone())
+            }
+            _ => return Err("No desktop update available".into()),
+        }
+    };
+    {
+        let state = app.state::<RuntimeState>();
+        let mut guard = state.update.lock().unwrap();
+        if let Some(update) = guard.as_mut() {
+            update.downloading.store(true, Ordering::Relaxed);
+            update.percent.store(0, Ordering::Relaxed);
+            update.error.clear();
+        }
+    }
+    std::thread::spawn(move || {
+        let fail = |message: String| {
+            let state = app.state::<RuntimeState>();
+            let mut guard = state.update.lock().unwrap();
+            if let Some(update) = guard.as_mut() {
+                update.downloading.store(false, Ordering::Relaxed);
+                update.error = message;
+            }
+        };
+        let client = match update_client() {
+            Ok(client) => client,
+            Err(error) => {
+                fail(error);
+                return;
+            }
+        };
+        let expected = match client
+            .get(&sha_url)
+            .header("User-Agent", "Adaptive-RSI-updater")
+            .send()
+        {
+            Ok(mut response) if response.status().is_success() => {
+                let mut text = String::new();
+                let _ = response.read_to_string(&mut text);
+                text.split_whitespace().next().unwrap_or("").to_lowercase()
+            }
+            _ => {
+                fail("Checksum download failed".into());
+                return;
+            }
+        };
+        if expected.len() != 64 {
+            fail("Checksum unavailable".into());
+            return;
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let path = std::path::PathBuf::from(&home)
+            .join("Downloads")
+            .join(format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", version));
+        let outcome = (|| -> Result<(), String> {
+            let mut response = client
+                .get(&url)
+                .header("User-Agent", "Adaptive-RSI-updater")
+                .send()
+                .map_err(|_| "Download failed".to_string())?;
+            if !response.status().is_success() {
+                return Err("Download failed".into());
+            }
+            let total = response.content_length().unwrap_or(0);
+            let mut file = std::fs::File::create(&path).map_err(|_| "Cannot write download".to_string())?;
+            let mut downloaded: u64 = 0;
+            let mut buffer = [0u8; 65536];
+            loop {
+                let read = response
+                    .read(&mut buffer)
+                    .map_err(|_| "Download interrupted".to_string())?;
+                if read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..read])
+                    .map_err(|_| "Cannot write download".to_string())?;
+                downloaded += read as u64;
+                if total > 0 {
+                    let state = app.state::<RuntimeState>();
+                    let guard = state.update.lock().unwrap();
+                    if let Some(update) = guard.as_ref() {
+                        update.percent.store(downloaded * 10000 / total, Ordering::Relaxed);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(message) = outcome {
+            let _ = std::fs::remove_file(&path);
+            fail(message);
+            return;
+        }
+        let digest = Command::new("/usr/bin/shasum")
+            .arg("-a")
+            .arg("256")
+            .arg(&path)
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|text| text.split_whitespace().next().map(str::to_lowercase))
+            .unwrap_or_default();
+        {
+            let state = app.state::<RuntimeState>();
+            let mut guard = state.update.lock().unwrap();
+            if let Some(update) = guard.as_mut() {
+                update.downloading.store(false, Ordering::Relaxed);
+            }
+        }
+        if digest.is_empty() || digest != expected {
+            let _ = std::fs::remove_file(&path);
+            fail("Checksum verification failed".into());
+            return;
+        }
+        {
+            let state = app.state::<RuntimeState>();
+            let mut guard = state.update.lock().unwrap();
+            if let Some(update) = guard.as_mut() {
+                update.percent.store(10000, Ordering::Relaxed);
+                update.opened.store(true, Ordering::Relaxed);
+            }
+        }
+        let _ = Command::new("hdiutil").arg("attach").arg(&path).spawn();
+    });
+    Ok(())
 }
 
 struct PendingChild(Option<Child>);
@@ -343,6 +595,20 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
     Ok(runtime_info(state))
 }
 #[tauri::command]
+async fn check_desktop_update(app: tauri::AppHandle) -> Option<Value> {
+    tauri::async_runtime::spawn_blocking(move || check_desktop_update_blocking(&app))
+        .await
+        .ok()
+        .flatten()
+}
+#[tauri::command]
+async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || start_desktop_download(handle))
+        .await
+        .map_err(|_| "Request interrupted".to_string())?
+}
+#[tauri::command]
 fn choose_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     app.dialog()
         .file()
@@ -411,7 +677,9 @@ fn main() {
             connect,
             choose_folder,
             open_url,
-            notify
+            notify,
+            check_desktop_update,
+            download_desktop_update
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

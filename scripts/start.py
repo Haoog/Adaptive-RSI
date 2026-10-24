@@ -39,7 +39,8 @@ if not session:
         log_path.chmod(0o600)
         subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve"],
                          cwd=root, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-    for attempt in range(40):
+    # 大状态目录的首次启动可能超过 10 秒；等待上限 30 秒。
+    for attempt in range(150):
         time.sleep(0.2)
         session = live_session()
         if session:
