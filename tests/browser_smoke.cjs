@@ -268,7 +268,7 @@ async function main() {
     await page.locator('#language-select').selectOption('zh-CN');
     await page.locator('#tasks-list .task-title').filter({hasText: 'Fix addition'}).click();
     await page.locator('#detail-dialog[open] .stage-progress .done').first().waitFor();
-    assert.equal(await page.locator('#detail-dialog .stage-progress .done').count(), 5);
+    assert.equal(await page.locator('#detail-dialog .stage-progress .done').count(), 4);
     await page.locator('#detail-dialog summary').filter({hasText: '检查过程与运行记录'}).click();
     await page.locator('#detail-dialog summary').filter({hasText: '运行与效果检查'}).click();
     await page.locator('#detail-dialog .close-dialog').click();

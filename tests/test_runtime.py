@@ -65,6 +65,10 @@ class FakeAgent:
             return {"files": [{"path": ".rsi-acceptance/check.py", "content": "from calculator import add\nassert add(2, 3) == 5\n"}],
                     "checks": [{"name": "independent addition", "argv": ["python3", "-c", "exec(open('.rsi-acceptance/check.py').read())"], "criteria": [0]}]}
         if role == "implementation":
+            (workspace / "tests/test_addition_regression.py").write_text(
+                "import unittest\nfrom calculator import add\n\n"
+                "class AddedRegression(unittest.TestCase):\n"
+                "    def test_addition(self):\n        self.assertEqual(add(2, 3), 5)\n")
             if self.malicious:
                 (workspace / "tests/test_calculator.py").write_text("import unittest\nclass Fake(unittest.TestCase):\n    def test_fake(self): pass\n")
             else:
@@ -225,9 +229,11 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(evaluation["checks"]["candidate"][0]["passed"])
         self.assertEqual((self.repo / "notes.txt").read_text(), "uncommitted user work")
         self.assertIn("a - b", (self.repo / "calculator.py").read_text())
-        self.assertEqual([r[0] for r in self.agent.roles], ["planning", "acceptance", "implementation", "review"])
-        self.assertEqual(self.agent.roles[2][1]["model"], "gpt-6-luna")
-        self.assertEqual(self.agent.roles[2][1]["effort"], "max")
+        self.assertEqual([r[0] for r in self.agent.roles], ["planning", "implementation", "review"])
+        self.assertEqual(self.agent.roles[1][1]["model"], "gpt-6-luna")
+        self.assertEqual(self.agent.roles[1][1]["effort"], "max")
+        evaluation = json.loads(result["result"])["evaluation"]
+        self.assertEqual(evaluation["improvement"]["decision"], "pass")
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_fake_agent_success_cannot_replace_original_tests(self):
@@ -235,8 +241,8 @@ class RuntimeTest(unittest.TestCase):
         task, run = self.claim()
         self.runtime.process(run)
         row = self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
-        self.assertEqual(row["state"], "failed", row["result"])
-        self.assertFalse(json.loads(row["result"])["checks"]["candidate"][0]["passed"])
+        self.assertEqual(row["state"], "blocked", row["result"])
+        self.assertIn("Test-first behavior changes may only add a regression test", json.loads(row["result"])["reason"])
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_dependency_seed_is_frozen_for_both_checks_and_preserves_original(self):
@@ -249,6 +255,8 @@ class RuntimeTest(unittest.TestCase):
         class SeedEditingAgent(FakeAgent):
             def invoke(self, role, *args, **kwargs):
                 result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["scope"].append("vendor")
                 if role == "implementation":
                     (Path(args[1]) / "vendor/value.txt").write_text("candidate attempted dependency change")
                 return result
@@ -268,7 +276,10 @@ class RuntimeTest(unittest.TestCase):
                 if role == "implementation":
                     self_test.assertTrue(self.acceptance_started.wait(3),
                                         "acceptance baseline should start before implementation finishes")
-                return super().invoke(role, prompt, workspace, *args, **kwargs)
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
         self_test = self
         agent = ParallelImplementation()
         self.runtime.agent = agent
@@ -287,6 +298,13 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
 
     def test_acceptance_baseline_failure_aggregates_without_running_candidate_checks(self):
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                return result
+        self.runtime.agent = HighRisk()
         self.runtime.configure({"environment": {"setup": [
             {"name": "prepare acceptance", "cwd": ".", "argv": ["true"]}]}}, self.project)
         def check(_sandbox, check, workspace, *args, **kwargs):
@@ -448,6 +466,8 @@ Path(%r).write_text('allowed output')
                         expression = {"add": "a + b", "multiply": "a * b", "subtract": "a - b", "divide": "a / b",
                                       "maximum": "max(a, b)", "minimum": "min(a, b)"}[function]
                         path.write_text("def " + function + "(a, b):\n    return " + expression + "\n")
+                    (workspace / "tests/test_strategy_regression.py").write_text(
+                        (workspace / "tests/test_calculator.py").read_text())
                     return {"summary": "Applied supplied strategy"}
                 result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
                 if role == "acceptance":
@@ -585,6 +605,9 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
         self.assertTrue(empty_test_run("running 0 tests\n0 passed; 0 failed"))
         self.assertTrue(empty_test_run("No examples found.\n0 examples, 0 failures"))
         self.assertTrue(empty_test_run("# tests 0\n# pass 0"))
+        self.assertTrue(empty_test_run("\u2139 tests 0\n\u2139 pass 0"))
+        self.assertTrue(empty_test_run("0 passing (5ms)"))
+        self.assertFalse(empty_test_run("\u2139 tests 2\n\u2139 pass 2"))
     def test_configuration_rejects_typos_escapes_and_invalid_model_effort(self):
         for override in [{"scheduel": {}}, {"models": {"implementation": {"effort": "ultra"}}},
                          {"checks": [{"name": "escape", "cwd": "../", "argv": ["true"]}]},

@@ -5,13 +5,50 @@ import threading
 import time
 from pathlib import Path
 
-from .adapters import detect
+from .adapters import detect, test_path
 from .agent import SCHEMAS, validate_output
 from .config import compatibility, fingerprint, relative_path
 from .gitops import changes, git, snapshot
 from .process import Cancelled, scrub_tree
 from .review import REVIEW_PROMPT, enforce_review, risk_review_required
 from .store import encode
+
+
+def _regression_test_scope(workspace, scope, allow_colocated=False):
+    test_dirs = {"test", "tests", "spec", "specs", "__tests__"}
+    candidates = set()
+    root_tests = False
+    for path in git(workspace, "ls-files").splitlines():
+        parts = Path(path).parts
+        in_test_directory = False
+        for index, part in enumerate(parts[:-1]):
+            if part.lower() in test_dirs:
+                candidates.add(Path(*parts[:index + 1]).as_posix())
+                in_test_directory = True
+                break
+        if test_path(path):
+            parent = Path(path).parent
+            if parent.parts and allow_colocated and not in_test_directory:
+                candidates.add(parent.as_posix())
+            elif not parent.parts:
+                root_tests = True
+    if not candidates:
+        return "." if root_tests and allow_colocated else "tests"
+    scope_parts = [Path(path).parts for path in scope]
+    def rank(candidate):
+        parts = Path(candidate).parts
+        common = max((sum(1 for left, right in zip(parts, item) if left == right)
+                      for item in scope_parts), default=0)
+        return (-common, len(parts), candidate)
+    return min(candidates, key=rank)
+
+
+def _within_scope(path, scope):
+    return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
+
+
+def _uses_test_first(change_type, risk):
+    return change_type in {"behavior", "configuration", "ui"} and risk != "high"
 
 
 def _issue_comment_cache_evidence(issue_comments):
@@ -34,7 +71,7 @@ def _stage_config(config, stage):
     return value, role
 
 
-def _review_evidence(evaluation):
+def _review_evidence(evaluation, include_test_output=True):
     """Review needs outcomes and commands, not large passing check transcripts."""
     checks = {}
     for label, rows in (evaluation.get("checks") or {}).items():
@@ -43,17 +80,31 @@ def _review_evidence(evaluation):
         checks[label] = [{key: row.get(key) for key in
                           ["name", "argv", "cwd", "passed", "exit_code", "error", "empty_tests"] if key in row}
                          for row in rows]
-    return {"decision": evaluation.get("decision"), "reason": evaluation.get("reason"),
+    evidence = {"decision": evaluation.get("decision"), "reason": evaluation.get("reason"),
             "harness_hash": evaluation.get("harness_hash"), "acceptance_hash": evaluation.get("acceptance_hash"),
             "criteria": evaluation.get("criteria"), "improvement": evaluation.get("improvement"),
             "contract": evaluation.get("contract"), "coverage": evaluation.get("coverage"),
             "checks": checks}
+    improvement = evaluation.get("improvement") or {}
+    if include_test_output and improvement.get("basis") == "isolated_new_test_fails_baseline_and_passes_candidate":
+        excerpts = {}
+        indexes = improvement.get("improved_checks", [])
+        for label in ["test_first_baseline", "test_first_candidate"]:
+            rows = (evaluation.get("checks") or {}).get(label, [])
+            excerpts[label] = []
+            for index in indexes:
+                if index < len(rows):
+                    row = rows[index]
+                    output = ((row.get("stdout") or "") + "\n" + (row.get("stderr") or "")).strip()
+                    excerpts[label].append({"index": index, "output_excerpt": output[-1600:]})
+        evidence["test_first_output_excerpts"] = excerpts
+    return evidence
 
 
 def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False):
     """One production path for real tasks and paired experiments; experiments never deliver."""
     config = json.loads(run["config"])
-    from .workflow import evidence_contract
+    from .workflow import change_kind, evidence_contract, supports_test_first
     def transition(state, result=None, terminal=False):
         if not experiment:
             runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal)
@@ -96,21 +147,31 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                               "warning": "Issue comments could not be loaded", "updated_at": None}
     comment_evidence = _issue_comment_cache_evidence(issue_comments)
     outcomes = runtime.outcomes(project["id"])
-    open_prs = runtime.store.setting("prs:" + project["id"], [])
+    planning_outcomes = []
+    for item in outcomes[:5]:
+        row = {key: item[key] for key in ["run", "value", "delivery_status", "merged_sha"] if key in item}
+        if item.get("summary"):
+            row["summary"] = str(item["summary"])[:500]
+        if item.get("feedback"):
+            row["feedback"] = {key: item["feedback"][key] for key in ["state", "head"]
+                                if key in item["feedback"]}
+        planning_outcomes.append(row)
+    open_prs = [{key: item[key] for key in ["number", "title", "headRefName"] if key in item}
+                for item in runtime.store.setting("prs:" + project["id"], [])[:20]
+                if isinstance(item, dict)]
     planning_config, _ = _stage_config(config, "planning")
     plan_key = fingerprint({"inputs": signature(run, task, base, strategies, planning_config),
-                            "dependencies": environment["sha256"], "outcomes": outcomes, "prs": open_prs,
+                            "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
                             "related_work": overlaps, "issue_comments": comment_evidence})
     saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
                "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
-               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"]), "baseline": base, "postmerge_outcomes": outcomes,
+               "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"], limit=12), "baseline": base,
+               "postmerge_outcomes": planning_outcomes,
                "open_prs": open_prs,
                "related_work": overlaps,
                "untrusted_issue_comment_context": issue_comments,
-               "known_tasks": runtime.store.query("SELECT id,title,state FROM tasks WHERE project=? AND id<>? "
-                                               "AND source NOT LIKE 'system_%' LIMIT 100", (project["id"], task["id"])),
                "previous_attempts": runtime.store.query("SELECT id,base,state,result FROM runs WHERE task=? AND ended IS NOT NULL "
                                                       "ORDER BY started DESC LIMIT 2", (task["id"],))}
     if experiment:
@@ -176,6 +237,21 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         relative_path(path)
         if path == "." or any(char in path for char in [":", "：", "\n", "*", "?", "["]):
             raise RuntimeError("Plan must name narrower scope than the entire repository")
+    original_scope = list(plan["scope"])
+    change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
+    checks = config["checks"] or detect(workspace)["checks"]
+    test_first_requested = _uses_test_first(change_type, plan["risk"])
+    test_first = test_first_requested and supports_test_first(checks, workspace)
+    regression_test_scope = None
+    if test_first or change_type == "performance" or (plan["risk"] == "high" and change_type != "documentation"):
+        test_scope = _regression_test_scope(workspace, plan["scope"], allow_colocated=test_first)
+        covered = any(Path(workspace, path).is_dir() and
+                      (test_scope == path or test_scope.startswith(path.rstrip("/") + "/"))
+                      for path in plan["scope"])
+        if test_first:
+            regression_test_scope = test_scope
+        elif not covered:
+            plan["scope"].append(test_scope)
     (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     if not experiment:
         save(runtime, run, "planning", plan, plan_key)
@@ -189,7 +265,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 runtime.store.execute("UPDATE tasks SET state='queued',attempts=max(0,attempts-1),available=0,updated=? WHERE id=?",
                                       (time.time(), task["id"]))
                 return None
-    checks = config["checks"] or detect(workspace)["checks"]
     if not checks:
         transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
         return None
@@ -198,40 +273,45 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     except ValueError as exc:
         transition("insufficient_evidence", {"reason": str(exc), "failure": {"code": "improvement", "action": "inspect_evidence"}}, True)
         return {"decision": "insufficient_evidence", "reason": str(exc)} if experiment else None
-    from .acceptance import seal
-    acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
-    restore(seeds, acceptance_workspace, config)
-    spec = saved_acceptance
-    if spec is None:
-        spec = runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
-        "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
-        "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
-        "Use python3 for Python checks; do not assume a python executable alias exists. "
-        "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
-        "For new APIs or modules, handle absence and assert the missing public behavior explicitly; import/setup errors alone are not improvement evidence. "
-        "For performance tasks use reproducible benchmark assertions with explicit tolerances. "
-        "For a performance contract, each version must emit exactly one stdout JSON line with metric, unit and numeric value matching the frozen threshold. "
-        "For refactors cover preserved behavior and observable maintainability criteria. "
-        "High-risk changes require negative, permission-boundary and failure-path checks. "
-        "No network, credentials, dependency installs or changes to application files. The host seals these files away from the implementer.\n" +
-        encode({"task": context["task"], "plan": plan, "evidence_contract": contract}), acceptance_workspace, run)
-    acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
-    if not experiment:
-        save(runtime, run, "acceptance", spec, plan_key)
-    acceptance["change_kind"] = contract["kind"]
-    acceptance["contract"] = contract
-    (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
+    acceptance = None
+    independent_acceptance = (plan["risk"] == "high" and change_type != "documentation" or
+                              change_type == "performance" or test_first_requested and not test_first)
+    if independent_acceptance:
+        from .acceptance import seal
+        acceptance_workspace = snapshot(source, directory / "acceptance-design", base)
+        restore(seeds, acceptance_workspace, config)
+        spec = saved_acceptance
+        if spec is None:
+            spec = runtime.invoke("acceptance", "Independently design executable acceptance BEFORE implementation. Inspect baseline code. "
+                "Return files only beneath .rsi-acceptance/ and checks that exercise real public behavior. "
+                "Map each check to zero-based acceptance criterion indexes; cover every criterion. "
+                "Use python3 for Python checks; do not assume a python executable alias exists. "
+                "Checks must fail on incorrect behavior, avoid source-string assertions and test-count-only assertions. "
+                "For new APIs or modules, handle absence and assert the missing public behavior explicitly; import/setup errors alone are not improvement evidence. "
+                "For performance tasks use reproducible benchmark assertions with explicit tolerances. "
+                "For a performance contract, each version must emit exactly one stdout JSON line with metric, unit and numeric value matching the frozen threshold. "
+                "For refactors cover preserved behavior and observable maintainability criteria. "
+                "High-risk changes require negative, permission-boundary and failure-path checks. "
+                "No network, credentials, dependency installs or changes to application files. The host seals these files away from the implementer.\n" +
+            encode({"task": context["task"], "plan": plan, "evidence_contract": contract}), acceptance_workspace, run)
+        acceptance = seal(spec, plan["acceptance"], directory / "acceptance")
+        if not experiment:
+            save(runtime, run, "acceptance", spec, plan_key)
+        acceptance["change_kind"] = contract["kind"]
+        acceptance["contract"] = contract
+        (directory / "acceptance.json").write_text(encode(acceptance), encoding="utf-8")
     implementation_config, _ = _stage_config(config, "implementation")
     candidate_key = fingerprint({"inputs": signature(run, task, base, strategies, implementation_config),
-                                 "dependencies": environment["sha256"], "outcomes": outcomes, "prs": open_prs,
+                                 "dependencies": environment["sha256"], "outcomes": planning_outcomes, "prs": open_prs,
                                  "related_work": overlaps, "issue_comments": comment_evidence,
-                                 "plan": plan, "acceptance_hash": acceptance["hash"], "checks": checks})
+                                 "plan": plan, "acceptance_hash": acceptance["hash"] if acceptance else None,
+                                 "test_first": test_first, "checks": checks})
     saved_candidate = None if experiment else cached(runtime, run, "validated_candidate", candidate_key)
     baseline = snapshot(source, directory / "baseline", base)
     acceptance_executor = None
     acceptance_future = None
     acceptance_cancel = threading.Event()
-    if saved_candidate is None and task["source"] != "rollback":
+    if saved_candidate is None and task["source"] != "rollback" and acceptance:
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         acceptance_future = acceptance_executor.submit(
@@ -253,16 +333,37 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             git(workspace, "apply", "--reverse", str(patch_path))
             result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
         else:
-            result = runtime.invoke("implementation", "Implement this verified plan. Add appropriate regression coverage. "
-                                 "Do not modify files outside scope. No publishing.\n" + encode({"plan": plan, **context}), workspace, run)
+            if test_first:
+                test_instruction = ("Add exactly one new regression test file within the provided regression_test_scope. "
+                                    "It must fail on the unchanged baseline and pass with the fix. Do not edit existing tests, "
+                                    "test configuration, manifests, or check entrypoints. No other files are allowed in that test scope. ")
+                implementation_context = {**context, "regression_test_scope": regression_test_scope}
+            elif change_type == "documentation":
+                test_instruction = "Keep this as a documentation-only change. "
+                implementation_context = context
+            else:
+                test_instruction = "Add appropriate regression coverage within the declared scope without weakening existing checks. "
+                implementation_context = context
+            result = runtime.invoke("implementation", "Implement this verified plan. " + test_instruction +
+                                 "Do not modify files outside scope. No publishing.\n" +
+                                 encode({"plan": plan, **implementation_context}), workspace, run)
         scrub_tree(workspace)
         files, patch = changes(workspace)
         if not files and not experiment:
             transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
             return None
+        added_test_files = {path for path in git(workspace, "diff", "--cached", "--diff-filter=A", "--name-only", "-z").split("\0")
+                            if path and test_path(path)}
+        if test_first and len(added_test_files) != 1:
+            raise RuntimeError("Test-first changes require exactly one new regression test file")
         for path in files:
             relative_path(path)
-            if not any(path == s.rstrip("/") or path.startswith(s.rstrip("/") + "/") for s in plan["scope"]):
+            if test_first and test_path(path):
+                if path not in added_test_files or not _within_scope(path, regression_test_scope or ""):
+                    raise RuntimeError("Test-first behavior changes may only add a regression test within its declared test scope")
+                continue
+            allowed_scope = original_scope if test_first else plan["scope"]
+            if not any(_within_scope(path, scope) for scope in allowed_scope):
                 raise RuntimeError("Change escaped planned scope: " + path)
         (directory / "candidate.patch").write_text(patch + "\n", encoding="utf-8")
         # Seal the exact patch outside the executor's writable subtree before evaluation.
@@ -280,7 +381,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             baseline, workspace, checks, directory / "evaluation", config,
             lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,
             acceptance_baseline=acceptance_baseline, cache_scope=project["id"], cache_base=base,
-            environment_digest=environment["sha256"])
+            environment_digest=environment["sha256"], test_first=test_first,
+            test_first_kind=change_type, changed_files=files)
     finally:
         if acceptance_executor is not None:
             acceptance_cancel.set()
@@ -298,19 +400,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     transition("evaluating", {"stage": "review"})
     review_config, _ = _stage_config(config, "review")
     review_key = fingerprint({"inputs": signature(run, task, base, strategies, review_config),
-                              "plan": plan, "evaluation": _review_evidence(evaluation),
+                              "plan": plan, "evaluation": _review_evidence(evaluation, include_test_output=False),
                               "summary": result["summary"], "patch_hash": fingerprint(patch)})
     saved_review = None if experiment else cached(runtime, run, "review", review_key)
     if saved_review and saved_review.get("decision") != "pass":
         saved_review = None
     review = saved_review
     if review is None:
-        review = runtime.invoke("review", REVIEW_PROMPT +
-                             "Also review the independent acceptance specification for meaningful behavioral coverage. "
-                             "Always-passing checks or criteria covered only by source-string/count assertions must fail the tests assessment.\n" +
-                             encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
-                                     "independent_acceptance": acceptance["spec"],
-                                     "summary": result["summary"]}), workspace, run)
+        review_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
+                          "summary": result["summary"]}
+        if acceptance:
+            review_context["independent_acceptance"] = acceptance["spec"]
+        review = runtime.invoke("review", REVIEW_PROMPT + encode(review_context), workspace, run)
     review = enforce_review(review, config)
     risk_review = None
     if risk_review_required(plan, review, files, patch):
@@ -318,15 +419,16 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if risk_review and risk_review.get("decision") != "pass":
             risk_review = None
         if risk_review is None:
+            risk_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation)}
+            if acceptance:
+                risk_context["independent_acceptance"] = acceptance["spec"]
             risk_review = enforce_review(runtime.invoke("review", REVIEW_PROMPT +
                 "This is an additional high-risk review in a fresh session. Focus on permission boundaries, "
                 "credential exposure, failure paths, dependency or schema changes, and backward compatibility. "
                 "Review the concrete sensitive paths and patch lines supplied; do not broaden the review merely "
                 "because the planner marked the task high risk. "
                 "Missing negative-path verification must be reported as insufficient evidence. "
-                "Do not rely on another reviewer's assessment.\n" +
-                encode({"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
-                        "independent_acceptance": acceptance["spec"]}), workspace, run), config)
+                "Do not rely on another reviewer's assessment.\n" + encode(risk_context), workspace, run), config)
         (directory / "risk-review.json").write_text(encode(risk_review), encoding="utf-8")
         if not experiment:
             save(runtime, run, "risk_review", risk_review, review_key)

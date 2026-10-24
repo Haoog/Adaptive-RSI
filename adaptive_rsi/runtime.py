@@ -597,9 +597,10 @@ class Runtime:
         result = []
         for row in rows:
             data = json.loads(row["result"])
-            item = {"run": row["id"], **{key: data[key] for key in ["value", "summary", "delivery_status", "merged_sha"] if key in data}}
+            item = {"run": row["id"], **{key: data[key] for key in
+                    ["value", "summary", "files", "delivery_status", "merged_sha"] if key in data}}
             if data.get("feedback"):
-                item["feedback"] = {key: data["feedback"][key] for key in ["state", "head", "checked_at"] if key in data["feedback"]}
+                item["feedback"] = {key: data["feedback"][key] for key in ["state", "head"] if key in data["feedback"]}
             result.append(item)
         return result
 
@@ -823,11 +824,6 @@ class Runtime:
         head = git(workspace, "rev-parse", "HEAD")
         key = "inspection-head:" + project["id"] + ":" + kind
         ci = self.store.setting("ci:" + project["id"], [])
-        recent_failed_ids = self.store.query("SELECT id FROM runs WHERE project=? AND state='failed' ORDER BY started DESC LIMIT 5", (project["id"],))
-        backlog = self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
-                                   "ORDER BY created DESC LIMIT 100", (project["id"],))
-        history = self.store.query("SELECT state,result FROM runs WHERE project=? AND state IN ('failed','blocked') "
-                                   "ORDER BY started DESC LIMIT 8", (project["id"],))
         modules = detect(workspace)
         rotation = int(self.store.setting("rotation:" + project["id"], 0))
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
@@ -842,25 +838,74 @@ class Runtime:
                 changed_paths = set(git(Path(project["path"]), "diff", "--name-only", previous_head, head).splitlines())
             except RuntimeError:
                 changed_paths = None
-        relevant_change = previous_head is None or changed_paths is None or self._module_changed(selected, changed_paths)
+        module_changes = (sorted(self._relevant_module_paths(selected, changed_paths))
+                          if changed_paths is not None else None)
+        relevant_change = previous_head is None or changed_paths is None or bool(module_changes)
         effective_head = head if relevant_change else previous_head
+        module_scope = str((selected or {}).get("cwd", "."))
+        context_paths = module_changes if module_changes else ([module_scope] if module_scope != "." else None)
+        def relevant_path(path):
+            if not path:
+                return False
+            if context_paths is None:
+                return True
+            return any(path == target or path.startswith(target.rstrip("/") + "/") or
+                       target.startswith(path.rstrip("/") + "/") for target in context_paths)
+
+        backlog = []
+        for item in self.store.query("SELECT id,title,state,evidence FROM tasks WHERE project=? AND source NOT LIKE 'system_%' "
+                                     "ORDER BY created DESC LIMIT 100", (project["id"],)):
+            try:
+                evidence = json.loads(item["evidence"])
+            except (TypeError, ValueError):
+                evidence = []
+            paths = [entry.get("path", "") for entry in evidence if isinstance(entry, dict)]
+            if any(relevant_path(path) for path in paths):
+                backlog.append({"id": item["id"], "title": item["title"], "state": item["state"],
+                                "paths": paths, "evidence": item["evidence"]})
+        history = []
+        for item in self.store.query("SELECT r.id,r.state,r.result,t.evidence FROM runs r JOIN tasks t ON t.id=r.task "
+                                     "WHERE r.project=? AND r.state IN ('failed','blocked') ORDER BY r.started DESC LIMIT 100",
+                                     (project["id"],)):
+            try:
+                result = json.loads(item["result"])
+                evidence = json.loads(item["evidence"])
+            except (TypeError, ValueError):
+                continue
+            paths = result.get("files", []) + [entry.get("path", "") for entry in evidence if isinstance(entry, dict)]
+            if any(relevant_path(path) for path in paths):
+                history.append({"id": item["id"], "state": item["state"],
+                                "reason": str(result.get("reason", ""))[:500], "files": result.get("files", [])})
+                if len(history) == 8:
+                    break
+        recent_failed_ids = [{"id": item["id"], "state": item["state"]} for item in history]
+        module_outcomes = [item for item in self.outcomes(project["id"])
+                           if any(relevant_path(path) for path in item.get("files", []))]
         self.store.put_setting("rotation:" + project["id"], rotation + 1)
+        prs_context = [{key: item[key] for key in ["number", "title", "headRefName"] if key in item}
+                       for item in self.store.setting("prs:" + project["id"], [])[:20]]
         inspection_signature = fingerprint({"head": effective_head, "ci": ci, "failures": recent_failed_ids,
-                                             "postmerge_outcomes": self.outcomes(project["id"]),
+                                             "postmerge_outcomes": module_outcomes,
+                                             "open_prs": prs_context,
                                              "strategy": [s["id"] for s in strategies],
                                              "model": json.loads(run["config"])["models"]["analysis"]})
         if self.store.setting(selected_key) == inspection_signature:
             self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
             self.store.put_setting(module_head_key, head)
             return
-        findings = self.invoke("analysis", "Autonomously inspect this project for concrete, useful improvements. "
+        selected_context = ({key: selected[key] for key in ["language", "manifest", "cwd", "tool", "checks"]
+                             if key in selected} if selected else None)
+        findings = self.invoke("analysis", "Inspect only the selected module for concrete, useful improvements. "
                                "No user goal is required. Find reproducible defects, failing CI, missing essential regression coverage, "
                                "or evidenced performance/maintenance problems. Do not turn every TODO/style preference into a task. "
-                               "Return all evidenced findings you discover; there is no finding-count quota. Each needs a literal existing-code quote and path, meaningful acceptance, "
-                               "priority 1..100. Find bugs, useful improvements, usability, performance and maintenance issues. Avoid existing tasks and PRs. Focus this round on the selected module while considering project-wide failures.\n" +
-                               encode({"kind": kind, "modules": modules, "selected_module": selected, "tasks": backlog,
-                                       "recent_failures": history, "open_prs": self.store.setting("prs:" + project["id"], []),
-                                       "ci": ci, "postmerge_outcomes": self.outcomes(project["id"]),
+                               "Use changed_paths as the entry points and inspect their immediate callers. On the initial scan, inspect only the selected module. "
+                               "Do not enumerate unrelated modules or repeat findings already represented by tasks or open PRs. "
+                               "Return every evidenced finding in scope. Each needs a literal existing-code quote and path, meaningful acceptance, priority 1..100.\n" +
+                               encode({"kind": kind, "selected_module": selected_context, "changed_paths": module_changes,
+                                       "tasks": [{key: item[key] for key in ["id", "title", "state", "paths"]}
+                                                 for item in backlog[:20]],
+                                       "recent_failures": history, "open_prs": prs_context,
+                                       "ci": ci, "postmerge_outcomes": module_outcomes,
                                        "stable_strategies": strategies}), workspace, run)
         candidates = []
         seen_keys = set()
@@ -963,20 +1008,19 @@ class Runtime:
                          {"queued": queued, "deferred": deferred, "rejected": rejected})
 
     @staticmethod
-    def _module_changed(selected, changed_paths):
-        """Ignore documentation-only commits when deciding whether to rescan code."""
+    def _relevant_module_paths(selected, changed_paths):
         if not changed_paths:
-            return False
+            return set()
         documentation_images = {".png", ".jpg", ".jpeg", ".svg"}
         if all(path.lower().endswith(".md") or
                (path.startswith("docs/") and Path(path).suffix.lower() in documentation_images)
                for path in changed_paths):
-            return False
+            return set()
         if not selected:
-            return True
+            return set(changed_paths)
         cwd = str(selected.get("cwd", ".")).rstrip("/") or "."
         if cwd != ".":
-            return any(path == cwd or path.startswith(cwd + "/") for path in changed_paths)
+            return {path for path in changed_paths if path == cwd or path.startswith(cwd + "/")}
         language = selected.get("language", "")
         suffixes = {
             "Python": {".py", ".pyi", ".toml", ".cfg", ".ini", ".txt", ".sql", ".json", ".yaml", ".yml"},
@@ -991,7 +1035,12 @@ class Runtime:
         suffixes |= {".sh", ".ps1", ".bat", ".cmd"}
         manifests = {Path(selected.get("manifest", "")).name}
         runtime_config = {"Dockerfile", "Makefile", "Procfile", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"}
-        return any(Path(path).suffix in suffixes or Path(path).name in manifests | runtime_config for path in changed_paths)
+        return {path for path in changed_paths if Path(path).suffix in suffixes or
+                Path(path).name in manifests | runtime_config}
+
+    @staticmethod
+    def _module_changed(selected, changed_paths):
+        return bool(Runtime._relevant_module_paths(selected, changed_paths))
 
     def sync_issues(self, project, config, run=None):
         repo = config["github"]["repository"]

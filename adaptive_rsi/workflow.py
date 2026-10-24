@@ -2,12 +2,116 @@
 import json
 import math
 import re
+import shlex
+from pathlib import Path
 
 
 ENVIRONMENT_FAILURE = re.compile(
-    r"ModuleNotFoundError|ImportError|command not found|No such file or directory",
+    r"ModuleNotFoundError|ImportError|LoadError|GemNotFound|ERR_MODULE_NOT_FOUND|Cannot find module|"
+    r"No module named|SyntaxError|command not found|No such file or directory|compilation failed|"
+    r"failed to compile|cannot find symbol|unresolved import|linker command failed|failed to resolve package",
     re.I,
 )
+
+
+def npm_test_runner(script):
+    """Recognize only npm scripts whose test target can be replaced with one file."""
+    try:
+        tokens = shlex.split(str(script))
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    runner = Path(tokens[0]).name.lower()
+    if runner == "node":
+        return ["node", "--test"] if tokens[1:] == ["--test"] else None
+    if runner not in {"jest", "vitest", "mocha"}:
+        return None
+    args = tokens[1:]
+    command = [runner]
+    if runner == "vitest" and args[:1] == ["run"]:
+        command.append("run")
+        args = args[1:]
+    if any(not arg.startswith("-") or arg == "--" for arg in args):
+        return None
+    return command + args
+
+
+GO_TEST_VALUE_FLAGS = {"-benchtime", "-blockprofile", "-blockprofilerate", "-covermode",
+                       "-coverpkg", "-coverprofile", "-cpu", "-cpuprofile", "-gcflags", "-ldflags",
+                       "-memprofile", "-memprofilerate", "-mod", "-modfile", "-mutexprofile",
+                       "-mutexprofilefraction", "-outputdir",
+                       "-p", "-parallel", "-run", "-tags", "-timeout", "-trace", "-vet",
+                       "-shuffle"}
+GO_TEST_BOOL_FLAGS = {"-json", "-race", "-v", "-cover", "-failfast",
+                      "-benchmem", "-msan", "-asan"}
+GO_TEST_REJECT_FLAGS = {"-exec", "-bench", "-fuzz", "-list", "-c", "-i", "-n", "-overlay"}
+def _go_test_options(argv):
+    lower = [str(item).lower() for item in argv]
+    go_index = next((index for index, item in enumerate(lower) if Path(item).name == "go"), None)
+    if go_index is None or "test" not in lower[go_index + 1:]:
+        return None
+    test_index = lower.index("test", go_index + 1)
+    flags = []
+    args = argv[test_index + 1:]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in GO_TEST_REJECT_FLAGS or any(arg.startswith(flag + "=") for flag in GO_TEST_REJECT_FLAGS):
+            return None
+        if arg == "--":
+            return None
+        if arg in GO_TEST_VALUE_FLAGS:
+            if index + 1 == len(args):
+                return None
+            if arg != "-run":
+                flags.extend([arg, args[index + 1]])
+            index += 2
+        elif arg.startswith("-run="):
+            index += 1
+        elif arg.startswith("-") and "=" in arg:
+            flag = arg.split("=", 1)[0]
+            if flag not in GO_TEST_VALUE_FLAGS | GO_TEST_BOOL_FLAGS:
+                return None
+            if flag not in {"-run", "-skip"}:
+                flags.append(arg)
+            index += 1
+        elif arg in GO_TEST_BOOL_FLAGS:
+            flags.append(arg)
+            index += 1
+        elif arg.startswith("-"):
+            return None
+        else:
+            index += 1
+    return flags
+
+
+def supports_test_first(checks, root=None):
+    for check in checks:
+        argv = [str(item).lower() for item in check.get("argv", [])]
+        if not argv:
+            continue
+        if "-m" in argv:
+            module_index = argv.index("-m")
+            if module_index + 1 < len(argv) and argv[module_index + 1] in {"pytest", "unittest"}:
+                return True
+        names = [Path(item).name for item in argv]
+        if any(item in {"pytest", "phpunit", "rspec", "jest", "vitest"} for item in names):
+            return True
+        if any(names[index] == "go" and names[index + 1] == "test" and _go_test_options(argv) is not None
+               for index in range(len(names) - 1)):
+            return True
+        if names[0] == "node" and "--test" in argv:
+            return True
+        if names[0] == "npm" and root is not None and argv[1:] in (["test"], ["run", "test"]):
+            package = Path(root) / check.get("cwd", ".") / "package.json"
+            try:
+                script = str(json.loads(package.read_text(encoding="utf-8")).get("scripts", {}).get("test", "")).lower()
+            except (OSError, ValueError, TypeError):
+                script = ""
+            if npm_test_runner(script):
+                return True
+    return False
 
 
 def environment_failure(row):
@@ -22,9 +126,15 @@ def environment_failure(row):
 def change_kind(task, plan=None):
     # Only explicit behavior-preserving requests can use the preservation contract.
     title = (task["title"] + "\n" + task.get("body", "")).lower()
+    declared = (plan or {}).get("change_kind")
+    if declared == "performance":
+        return "performance"
+    if any(word in title for word in ["performance", "benchmark", "optimize", "optimized", "optimization",
+                                      "optimise", "optimised", "latency", "throughput", "speedup", "faster",
+                                      "性能", "优化", "提速", "耗时", "吞吐"]):
+        return "performance"
     if any(word in title for word in ["fix", "bug", "broken", "incorrect", "修复", "错误", "缺陷", "失效", "异常"]):
         return "behavior"
-    declared = (plan or {}).get("change_kind")
     if declared == "refactor" and not any(word in title for word in ["refactor", "重构", "保持行为不变", "preserve behavior"]):
         return "behavior"
     if declared in ["behavior", "performance", "refactor", "documentation", "configuration", "ui"]:
@@ -39,6 +149,25 @@ def change_kind(task, plan=None):
 def improvement(results, acceptance):
     if not acceptance:
         return {"decision": "not_requested", "kind": "regression_only"}
+    if acceptance.get("mode") == "test_first":
+        before = results.get("test_first_baseline", [])
+        after = results.get("test_first_candidate", [])
+        test_files = acceptance.get("regression_test_files", [])
+        if len(test_files) != 1 or not before or len(before) != len(after):
+            return {"decision": "insufficient_evidence", "kind": acceptance["change_kind"]}
+        old, new = before[0], after[0]
+        same_isolated_check = (str(old.get("name", "")).startswith("isolated regression:") and
+                               old.get("name") == new.get("name") and old.get("argv") == new.get("argv") and
+                               old.get("cwd", ".") == new.get("cwd", "."))
+        failed_on_baseline = (old.get("exit_code") not in (None, 0) and not old.get("error") and
+                              not old.get("empty_tests") and not environment_failure(old))
+        passed_on_candidate = (new.get("passed") is True and new.get("exit_code") == 0 and
+                               not new.get("error") and not new.get("empty_tests"))
+        proven = same_isolated_check and failed_on_baseline and passed_on_candidate
+        return {"decision": "pass" if proven else "insufficient_evidence",
+                "kind": acceptance["change_kind"], "improved_checks": [0] if proven else [],
+                "regression_test_files": test_files,
+                "basis": "isolated_new_test_fails_baseline_and_passes_candidate"}
     before = results.get("acceptance_baseline", [])
     after = results.get("acceptance_candidate", [])
     kind = acceptance.get("change_kind", "behavior")

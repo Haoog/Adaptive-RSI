@@ -126,17 +126,20 @@ class DeliveryLoopTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "blocked")
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
-    def test_acceptance_generation_artifacts_never_enter_implementer_workspace(self):
+    def test_high_risk_acceptance_artifacts_never_enter_implementer_workspace(self):
         workspaces = {}
         class ObservingAgent(FakeAgent):
             def invoke(self, role, prompt, workspace, *args, **kwargs):
                 workspaces[role] = workspace
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
                 if role == "acceptance":
                     (workspace / "sealed-result.json").write_text("hidden acceptance result")
                 if role == "implementation":
                     self_test.assertFalse((workspace / "sealed-result.json").exists())
                     self_test.assertNotEqual(workspace, workspaces["acceptance"])
-                return super().invoke(role, prompt, workspace, *args, **kwargs)
+                return result
         self_test = self
         self.runtime.agent = ObservingAgent()
         self.runtime.pause(self.project, False)

@@ -113,7 +113,7 @@ const { chromium } = require("playwright");
       .getByRole("button", { name: "Fix addition", exact: true })
       .click();
     await page.locator("#live-task-outcome").waitFor();
-    assert.equal(await page.locator(".evidence-table").count(), 1);
+    assert.equal(await page.locator(".evidence-table").count(), 0);
     await page
       .getByRole("button", { name: "阅读代码差异", exact: true })
       .click();
@@ -162,11 +162,11 @@ const { chromium } = require("playwright");
       document.querySelector('[data-run="old-run-1"] pre'),
     );
     assert.equal(runRequests, 2);
-    const coverage = page.locator('#live-task-outcome details').filter({has: page.getByText('验收标准与覆盖', {exact: true})});
-    await coverage.locator('summary').click();
+    const timeline = page.locator('#live-task-outcome details').filter({has: page.getByText('阶段耗时', {exact: true})});
+    await timeline.locator('summary').click();
     liveSummary = 'Live checkpoint received';
     await page.locator('#live-task-outcome').filter({hasText: liveSummary}).waitFor();
-    assert.equal(await coverage.getAttribute('open'), '', 'same-state updates preserve expanded evidence');
+    assert.equal(await timeline.getAttribute('open'), '', 'same-state updates preserve expanded run details');
     assert.equal(await page.locator('[data-run="old-run-1"]').getAttribute('open'), '');
     await page.locator('#live-task-outcome .release-outcome').filter({hasText:'部署'}).waitFor();
     const phaseText = await page.locator('#live-task-outcome details').filter({has:page.getByText('阶段耗时',{exact:true})}).textContent();

@@ -7,16 +7,25 @@ import shutil
 import time
 from pathlib import Path
 
-from .adapters import test_path
+from .adapters import detect, test_path
 from .build import BUILD_ID
 from .config import fingerprint
-from .gitops import copy_source
+from .gitops import copy_source, git
 from .process import Sandbox, run_process
-from .workflow import environment_failure
+from .workflow import _go_test_options, environment_failure, npm_test_runner
 
 MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py",
              "pom.xml", "build.gradle", "build.gradle.kts", "Makefile", "CMakeLists.txt", "Cargo.toml",
-             "composer.json", "phpunit.xml", "Gemfile", "Rakefile", "Package.swift", "pubspec.yaml"}
+             "composer.json", "composer.lock", "phpunit.xml", "Gemfile", "Gemfile.lock", "Rakefile",
+             "Package.swift", "pubspec.yaml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "uv.lock",
+             "poetry.lock", "Pipfile", "Pipfile.lock", "requirements.txt", "requirements-dev.txt", "go.mod",
+             "go.sum", "Cargo.lock", ".npmrc", ".yarnrc", ".yarnrc.yml", "rust-toolchain",
+             "rust-toolchain.toml"}
+MANIFESTS_LOWER = {name.lower() for name in MANIFESTS}
+HARNESS_CONFIG_PREFIXES = ("jest.config.", "vitest.config.", "playwright.config.", "cypress.config.",
+                           "test.config.", "karma.conf.", "wdio.conf.", "ava.config.")
+HARNESS_CONFIGS = {".mocharc.js", ".mocharc.cjs", ".mocharc.mjs", ".mocharc.json", ".mocharc.yaml",
+                   ".mocharc.yml", ".mocharc.toml"}
 BASELINE_CACHE_LIMIT = 4
 CACHE_STDERR_LIMIT = 16 * 1024
 UNAVAILABLE_OUTPUT = re.compile(
@@ -26,9 +35,12 @@ DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 def empty_test_run(text):
     empty = re.search(r"Ran 0 tests|no tests ran|No tests found|No tests were found|no test files|running 0 tests|"
-                      r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|0 runs, 0 assertions", text, re.I)
+                      r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|"
+                      r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|"
+                      r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
-                         r"Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*", text, re.I)
+                         r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
+                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b", text, re.I)
     return bool(empty and not positive)
 
 
@@ -58,13 +70,14 @@ def configured_check_files(baseline, checks):
 def freeze_harness(baseline, target, checks=()):
     """Host-owned baseline tests/build entrypoints overwrite candidate-authored gate changes."""
     protected = set()
+    baseline_harness = set()
     explicit_checks = configured_check_files(baseline, checks)
     for parent, dirs, files in os.walk(baseline, followlinks=False):
         dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
         for name in files:
             src = Path(parent) / name
             relative = src.relative_to(baseline)
-            if not (test_path(relative) or relative in explicit_checks or name in MANIFESTS or
+            if not (test_path(relative) or relative in explicit_checks or _harness_path(relative) or
                     name.endswith((".csproj", ".fsproj", ".sln"))):
                 continue
             dst = target / relative
@@ -78,10 +91,166 @@ def freeze_harness(baseline, target, checks=()):
             if dst.is_dir():
                 shutil.rmtree(dst)
             shutil.copy2(src, dst)
+            baseline_harness.add(relative)
             parts = relative.parts
             test_dir = next((i for i, part in enumerate(parts[:-1]) if part.lower() in {"test", "tests", "spec", "specs", "__tests__"}), None)
             protected.add(target.joinpath(*parts[:test_dir + 1]) if test_dir is not None else dst)
+    for parent, dirs, files in os.walk(target, followlinks=False):
+        for name in list(dirs):
+            cargo_dir = Path(parent) / name
+            if name == ".cargo" and cargo_dir.is_symlink():
+                cargo_dir.unlink()
+                dirs.remove(name)
+        dirs[:] = [name for name in dirs if name not in {".git", ".rsi-agent", ".rsi-home"}]
+        for name in files:
+            path = Path(parent) / name
+            relative = path.relative_to(target)
+            if _harness_path(relative) and relative not in baseline_harness:
+                path.unlink()
     return sorted(protected, key=str)
+
+
+def _added_test_files(candidate):
+    try:
+        raw = git(candidate, "diff", "HEAD", "--diff-filter=A", "--name-only", "-z")
+        untracked = git(candidate, "ls-files", "--others", "--exclude-standard", "-z")
+    except RuntimeError:
+        return []
+    return sorted({path for path in (raw + "\0" + untracked).split("\0") if path and test_path(path)})
+
+
+def _test_symbols(root, filename):
+    path = Path(root) / filename
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return []
+    if path.suffix == ".go":
+        return re.findall(r"(?m)^\s*func\s+(Test[A-Z]\w*)\s*\(", source)
+    if path.suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}:
+        return [match[1] for match in re.findall(r"\b(?:test|it)\s*\(\s*(['\"])([^'\"]+)\1", source)]
+    if path.suffix == ".rs":
+        return re.findall(r"(?m)#\[test\]\s*(?:#\[[^\]]+\]\s*)*fn\s+([A-Za-z_]\w*)", source)
+    return []
+
+
+def _isolated_test_check(checks, root, filename, regression_symbols=()):
+    root = Path(root).resolve()
+    target = (root / filename).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    names = {str(name) for name in regression_symbols}
+    for check in checks:
+        argv = list(check.get("argv", []))
+        if not argv or not all(isinstance(arg, str) for arg in argv):
+            continue
+        cwd = (root / check.get("cwd", ".")).resolve()
+        try:
+            cwd.relative_to(root)
+        except ValueError:
+            continue
+        relative = Path(os.path.relpath(target, cwd)).as_posix()
+        lower = [arg.lower() for arg in argv]
+        command = None
+        command_cwd = check.get("cwd", ".")
+
+        if filename.endswith(".py") and "-m" in lower:
+            module_index = lower.index("-m")
+            if module_index + 1 < len(lower) and lower[module_index + 1] == "unittest":
+                module_path = Path(relative)
+                if ".." not in module_path.parts:
+                    command = argv[:module_index + 2] + [".".join(module_path.with_suffix("").parts)]
+        if command is None and "-m" in lower:
+            module_index = lower.index("-m")
+            if module_index + 1 < len(lower) and lower[module_index + 1] == "pytest":
+                command = argv[:module_index + 2] + [relative]
+        if command is None and any(Path(item).name == "pytest" for item in lower):
+            runner = next(index for index, item in enumerate(lower) if Path(item).name == "pytest")
+            command = argv[:runner + 1] + [relative]
+        if command is None and filename.endswith(".go") and any(Path(item).name == "go" for item in lower):
+            flags = _go_test_options(argv)
+            if names and flags is not None:
+                go_index = next(index for index, item in enumerate(lower) if Path(item).name == "go")
+                runner = lower.index("test", go_index)
+                parent = Path(relative).parent.as_posix()
+                package = "." if parent == "." else "./" + parent
+                pattern = "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
+                command = argv[:runner + 1] + flags + ["-run", pattern, package]
+        if command is None and Path(lower[0]).name == "node" and "--test" in lower:
+            runner = lower.index("--test")
+            command = argv[:runner + 1] + [relative]
+        if command is None and Path(lower[0]).name == "npm" and lower[1:] in (["test"], ["run", "test"]):
+            package = root / check.get("cwd", ".") / "package.json"
+            try:
+                script = json.loads(package.read_text(encoding="utf-8")).get("scripts", {}).get("test", "")
+                runner = npm_test_runner(script)
+            except (OSError, ValueError, TypeError):
+                runner = None
+            if runner:
+                command = (runner + [relative] if runner[0] == "node" else
+                           [argv[0], "exec", "--"] + runner + [relative])
+        if command is None:
+            for runner_name in ["jest", "vitest"]:
+                if any(Path(item).name == runner_name for item in lower):
+                    runner = next(index for index, item in enumerate(lower) if Path(item).name == runner_name)
+                    command = argv[:runner + 1] + (["run"] if runner_name == "vitest" else []) + [relative]
+                    break
+        if command is None:
+            for runner_name in ["phpunit", "rspec"]:
+                if any(Path(item).name == runner_name for item in lower):
+                    runner = next(index for index, item in enumerate(lower) if Path(item).name == runner_name)
+                    command = argv[:runner + 1] + [relative]
+                    break
+        if command:
+            return {"name": "isolated regression: " + check.get("name", "test check"),
+                    "argv": command, "cwd": command_cwd}
+    return None
+
+
+def _changed_files(candidate):
+    try:
+        tracked = git(candidate, "diff", "HEAD", "--name-only", "-z")
+        untracked = git(candidate, "ls-files", "--others", "--exclude-standard", "-z")
+    except RuntimeError:
+        return None
+    return sorted({path for path in (tracked + "\0" + untracked).split("\0") if path})
+
+
+def _harness_path(path):
+    name = Path(path).name.lower()
+    parts = Path(path).parts
+    cargo_config = name in {"config", "config.toml"} and ".cargo" in parts[:-1]
+    return (cargo_config or name in MANIFESTS_LOWER or name in HARNESS_CONFIGS or name.startswith(HARNESS_CONFIG_PREFIXES) or
+            name.startswith("requirements") and name.endswith((".txt", ".in")) or
+            name.endswith((".csproj", ".fsproj", ".sln", ".props", ".targets")))
+
+
+def _changed_harness(files, checks, baseline, added_tests=()):
+    explicit_checks = configured_check_files(baseline, checks)
+    additions = set(added_tests)
+    return any(path not in additions and
+               (test_path(path) or _harness_path(path) or Path(path) in explicit_checks)
+               for path in files)
+
+
+def _overlay_added_tests(candidate, target, paths):
+    protected = []
+    for relative in paths:
+        source = Path(candidate) / relative
+        destination = Path(target) / relative
+        if source.is_symlink() or not source.is_file() or destination.exists():
+            raise RuntimeError("Added regression test is not a new regular file")
+        for parent in [destination.parent, *destination.parents]:
+            if parent == Path(target).parent:
+                break
+            if parent.is_symlink():
+                raise RuntimeError("Added regression test overlaps a symlink")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        protected.append(destination)
+    return protected
 
 
 class Evaluator:
@@ -164,11 +333,19 @@ class Evaluator:
         restore(seeds, target, config)
 
     def _standard_stage(self, label, source, baseline, candidate, checks, directory, config, cancel,
-                        overlay, seeds, hidden):
+                        overlay, seeds, hidden, test_first_files=(), test_first_check=None):
         target = copy_source(source, Path(directory) / label)
         self._seed_target(target, seeds, config, clear=True)
         harness = candidate if label == "candidate_full" else baseline
         protected = freeze_harness(harness, target, checks)
+        if label == "baseline" and test_first_files:
+            protected.extend(_overlay_added_tests(candidate, target, test_first_files))
+        elif label in {"candidate", "candidate_full"} and test_first_files:
+            for relative in test_first_files:
+                path = target / relative
+                if path.is_symlink() or not path.is_file():
+                    raise RuntimeError("Added regression test is not a new regular file")
+                protected.append(path)
         if overlay:
             from .process import scrub_tree
             scrub_tree(overlay)
@@ -201,14 +378,21 @@ class Evaluator:
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty
             result["empty_tests"] = empty
             rows.append(result)
-        return {"rows": rows}
+        outcome = {"rows": rows}
+        if test_first_check is not None and label in {"baseline", "candidate"}:
+            focused = sandbox.check(test_first_check, target, cancel, protected, hidden)
+            focused_text = focused["stdout"] + focused["stderr"]
+            focused["empty_tests"] = empty_test_run(focused_text)
+            focused["passed"] = focused["exit_code"] == 0 and not focused["error"] and not focused["empty_tests"]
+            outcome["test_first_row"] = focused
+        return outcome
 
-    def _acceptance_stage(self, label, source, acceptance, directory, config, cancel, seeds, hidden):
+    def _acceptance_stage(self, label, source, baseline, acceptance, directory, config, cancel, seeds, hidden):
         from .config import relative_path
         target = copy_source(source, Path(directory) / label)
         if (target / ".rsi-acceptance").exists():
             raise RuntimeError("Candidate overlaps independent acceptance namespace")
-        protected = []
+        protected = freeze_harness(baseline, target, acceptance["checks"])
         for item in acceptance["spec"]["files"]:
             dst = target / relative_path(item["path"])
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -261,8 +445,8 @@ class Evaluator:
         if cached is not None:
             return {"rows": cached, "execution_environment": execution_identity}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
-        outcome = self._acceptance_stage("acceptance_baseline", baseline, acceptance, directory, execution_config,
-                                         cancel, seeds, hidden)
+        outcome = self._acceptance_stage("acceptance_baseline", baseline, baseline, acceptance, directory,
+                                         execution_config, cancel, seeds, hidden)
         if "setup" in outcome:
             return {"decision": "insufficient_evidence",
                     "reason": "Independent acceptance environment preparation failed",
@@ -273,15 +457,45 @@ class Evaluator:
 
     def evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                  acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
-                 environment_digest=None):
+                 environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
         if not checks:
             return {"decision": "insufficient_evidence", "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": []}
         results = {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
-        baseline_key = self._cache_key(cache_scope, cache_base, checks, execution_config,
-                                       environment_digest, execution_identity)
+        if changed_files is None:
+            changed_files = _changed_files(candidate)
+        added_tests = _added_test_files(candidate) if test_first else []
+        existing_test_files = ([path for path in git(baseline, "ls-files").splitlines() if test_path(path)]
+                               if test_first else [])
+        existing_test_symbols = ({symbol for path in existing_test_files
+                                  for symbol in _test_symbols(baseline, path)} if test_first else set())
+        regression_test_symbols = ([symbol for path in added_tests for symbol in _test_symbols(candidate, path)
+                                   if symbol not in existing_test_symbols] if test_first else [])
+        full_checks = list(checks)
+        for check in detect(candidate)["checks"]:
+            if not any(row["argv"] == check["argv"] and row.get("cwd", ".") == check.get("cwd", ".")
+                       for row in full_checks):
+                full_checks.append(check)
+        changed_harness = _changed_harness(changed_files or [], full_checks, baseline, added_tests)
+        if test_first and changed_harness:
+            return {"decision": "insufficient_evidence",
+                    "reason": "Test-first proof cannot modify the existing test harness", "checks": []}
+        test_first_check = None
+        if test_first:
+            if len(added_tests) != 1:
+                return {"decision": "insufficient_evidence",
+                        "reason": "Test-first proof requires exactly one new regression test file", "checks": []}
+            test_first_check = _isolated_test_check(checks, baseline, added_tests[0], regression_test_symbols)
+            if test_first_check is None:
+                return {"decision": "insufficient_evidence",
+                        "reason": "Configured test runner cannot execute the new regression test in isolation",
+                        "checks": []}
+        reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
+                      not changed_harness)
+        baseline_key = None if test_first else self._cache_key(
+            cache_scope, cache_base, checks, execution_config, environment_digest, execution_identity)
         cached_baseline = self._cache_get(cache_scope, baseline_key)
         if cached_baseline is not None:
             results["baseline"] = cached_baseline
@@ -315,7 +529,7 @@ class Evaluator:
         if "baseline" not in results:
             stages["baseline"] = lambda: self._standard_stage(
                 "baseline", baseline, baseline, candidate, checks, directory, execution_config, cancel, overlay,
-                seeds, hidden)
+                seeds, hidden, added_tests if test_first else (), test_first_check)
         if acceptance and "acceptance_baseline" not in results:
             physical = "acceptance_baseline"
             if acceptance_baseline is not None:
@@ -324,16 +538,18 @@ class Evaluator:
                     "early": acceptance_baseline.get("execution_environment"),
                     "nonce": time.time_ns()})[:12]
             stages["acceptance_baseline"] = lambda: self._acceptance_stage(
-                physical, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
+                physical, baseline, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
         stages["candidate"] = lambda: self._standard_stage(
             "candidate", candidate, baseline, candidate, checks, directory, execution_config, cancel, overlay,
-            seeds, hidden)
-        stages["candidate_full"] = lambda: self._standard_stage(
-            "candidate_full", candidate, baseline, candidate, checks, directory, execution_config, cancel, overlay,
-            seeds, hidden)
+            seeds, hidden, added_tests if test_first else (), test_first_check)
+        if not reuse_full:
+            stages["candidate_full"] = lambda: self._standard_stage(
+                "candidate_full", candidate, baseline, candidate, checks, directory, execution_config, cancel,
+                overlay, seeds, hidden, added_tests if test_first else ())
         if acceptance:
             stages["acceptance_candidate"] = lambda: self._acceptance_stage(
-                "acceptance_candidate", candidate, acceptance, directory, execution_config, cancel, seeds, hidden)
+                "acceptance_candidate", candidate, baseline, acceptance, directory, execution_config, cancel,
+                seeds, hidden)
         outcomes = self._run_stages(stages, int(config.get("limits", {}).get("concurrency", 1)))
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
@@ -349,6 +565,10 @@ class Evaluator:
                 (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 return data
             results[label] = outcome["rows"]
+            if "test_first_row" in outcome:
+                results["test_first_" + label] = [outcome["test_first_row"]]
+        if reuse_full:
+            results["candidate_full"] = list(results.get("candidate", []))
         if cached_baseline is None and "baseline" in results:
             self._cache_put(cache_scope, baseline_key, results["baseline"])
         if acceptance and "acceptance_baseline" in outcomes:
@@ -358,8 +578,8 @@ class Evaluator:
         unavailable = any(not row["passed"] and UNAVAILABLE_OUTPUT.search(row["stderr"])
             for label in ["candidate", "candidate_full", "acceptance_candidate"] for row in results.get(label, []))
         data = {"decision": "insufficient_evidence" if unavailable else "pass" if passing else "fail",
-                "reason": "Regression, full candidate and independent acceptance passed" if passing else "Candidate failed independent checks",
-                "harness_hash": fingerprint(checks), "checks": results,
+                "reason": "Regression and full candidate checks passed" if passing else "Candidate failed independent checks",
+                "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
                 "execution_environment": execution_identity}
         if acceptance:
             from .workflow import improvement
@@ -370,6 +590,14 @@ class Evaluator:
             data["criteria"] = acceptance["criteria"]
             data["coverage"] = [{"name": check["name"], "criteria": check["criteria"]} for check in acceptance["spec"]["checks"]]
             data["contract"] = acceptance.get("contract")
+        elif test_first:
+            from .workflow import improvement
+            data["improvement"] = improvement(results, {
+                "mode": "test_first", "change_kind": test_first_kind, "regression_test_files": added_tests,
+                "existing_test_files": existing_test_files, "regression_test_symbols": regression_test_symbols})
+            if passing and data["improvement"]["decision"] != "pass":
+                data.update(decision="insufficient_evidence",
+                            reason="Checks passed but the new regression test did not prove the planned change")
         if unavailable:
             data["reason"] = "Required check executable is unavailable; candidate remains unverified"
         Path(directory).mkdir(parents=True, exist_ok=True)

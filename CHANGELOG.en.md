@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- Reduce module-inspection context and duplicate candidate checks; directly run new regression tests in isolation on the baseline and candidate for behavior, configuration and UI changes, falling back to independent acceptance for unsupported runners; retain high-risk and performance acceptance.
+
 ## 0.5.101
 
 <!-- adaptive-rsi-release:0.5.101;base:8bec79619d0167e22b6c26daeaa501bd1b16d189 -->

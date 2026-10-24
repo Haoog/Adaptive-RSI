@@ -4,7 +4,7 @@
 
 Let AI inspect, fix, and improve your software projects continuously inside isolated workspaces.
 
-Adaptive RSI turns project inspections, user goals, and GitHub Issues into maintenance tasks that must pass value assessment. Changes go through planning, isolated implementation, independent acceptance, and code review before a project's own authorization allows a PR, merge, or delivery.
+Adaptive RSI turns project inspections, user goals, and GitHub Issues into maintenance tasks that must pass value assessment. Changes go through planning, isolated implementation, host checks, and code review before a project's own authorization allows a PR, merge, or delivery. Independent acceptance is reserved for high-risk and performance work.
 
 [![Latest release](https://img.shields.io/github/v/release/Haoog/Adaptive-RSI?display_name=tag&label=release)](https://github.com/Haoog/Adaptive-RSI/releases/latest)
 [![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue)](pyproject.toml)
@@ -20,7 +20,7 @@ Autonomous coding tools can treat every suggestion as work and deliver changes w
 
 - Decide whether a problem is real, duplicated, and worth solving.
 - Modify a fixed Git snapshot instead of the user's worktree.
-- Evaluate results with frozen regression checks, independent acceptance, and code review.
+- Evaluate behavior, configuration, and UI changes with isolated new regression tests that fail on the baseline and pass on the candidate, frozen regression checks, and code review; unsupported runners, high-risk, and performance tasks use independent acceptance.
 - Create PRs, merge, release, or deploy only after project-level authorization.
 
 Project inspection and Issue sync default to hourly. Both can be customized, paused, or inherited from shared settings. There are no call-count, run-duration, or finding quotas; tokens and available cost estimates are recorded for usage reporting.
@@ -35,11 +35,15 @@ flowchart LR
     C -->|Reject| Y[Save rejection reason]
     Z -->|Baseline, evidence, or policy changes| B
     Y -->|User explicitly reconsiders| B
-    C -->|Execute| D[Plan and acceptance design]
-    D --> E[Isolated implementation from a fixed snapshot]
-    E --> F[Regression / independent acceptance / code review]
-    F -->|Failure| G[Keep evidence and resolve]
-    F -->|Pass| H[Project-authorized PR, merge, or delivery]
+    C -->|Execute| D[Plan and assess value]
+    D --> E[Isolated implementation]
+    E --> F[Host frozen regression and full candidate checks]
+    F --> G{High-risk or performance task?}
+    G -->|Yes| V[Independent before/after acceptance]
+    G -->|No| R[One independent code review]
+    V --> R
+    R -->|Failure or insufficient evidence| X[Keep evidence and resolve]
+    R -->|Pass| H[Project-authorized PR, merge, or delivery]
     H --> I[Post-merge verification / release / deployment]
     I --> B
 ```
@@ -72,7 +76,7 @@ The launcher reuses an existing service. Add projects and configure models, scan
 
 - **Continuous discovery:** hourly checks for bugs, feature gaps, performance, usability, and maintenance work, with rotating code modules. Sync GitHub Issues incrementally or add a goal at any time.
 - **Value gate:** assess current evidence, duplicates, expected benefit, cost, and the impact of doing nothing before implementation.
-- **Isolation and verification:** implementation, acceptance, and review use separate contexts. The host reruns frozen regression, the full candidate suite, and planned acceptance checks; model claims do not establish success.
+- **Isolation and verification:** implementation and review use separate contexts. The host runs new behavior tests in isolation on the baseline and candidate, then runs frozen regression and full-candidate checks. Unsupported runners, high-risk, and performance tasks use independent acceptance; model claims do not establish success.
 - **Code review:** check correctness, security, maintainability, architecture, tests, and scope. Blocking findings or insufficient evidence stop delivery.
 - **Controlled delivery:** keep candidates local by default. Each project can opt into automatic PRs, merging after checks, and release or deployment through pinned workflows.
 - **Multiple projects and providers:** clone and manage repositories separately with support for official providers, gateways, local models, Codex, and OpenCode.
