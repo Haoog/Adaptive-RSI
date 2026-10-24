@@ -1,5 +1,7 @@
 FROM node:22-bookworm
 ARG CODEX_VERSION=0.163.0
+# 固定为已验证的最低支持版本以保证可复现构建；代码同时兼容 OpenCode 2.x，
+# 升级本镜像前需在 Linux CI 完整通过 tests.test_opencode_integration。
 ARG OPENCODE_VERSION=1.19.3
 RUN python3 --version && git --version \
     && npm install -g @openai/codex@${CODEX_VERSION} opencode-ai@${OPENCODE_VERSION} \

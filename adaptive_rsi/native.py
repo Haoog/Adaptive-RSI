@@ -279,7 +279,7 @@ class NativeAgent:
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
         # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
         timeout = 30 if role == "probe" else 300
-        while True:
+        for turn in range(200):
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
             suffix, payload = conversation.request()
@@ -338,3 +338,4 @@ class NativeAgent:
             except Exception:
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
                 raise
+        raise RuntimeError("Native model exceeded the maximum tool-call turns")

@@ -314,12 +314,21 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if saved_candidate is None and task["source"] != "rollback" and acceptance:
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
-        acceptance_future = acceptance_executor.submit(
-            runtime.evaluator.evaluate_acceptance_baseline, baseline, acceptance,
-            directory / "evaluation", config,
-            lambda: runtime.is_cancelled(run) or acceptance_cancel.is_set(),
-            seeds, project["id"], base, environment["sha256"])
-    transition("executing")
+        try:
+            acceptance_future = acceptance_executor.submit(
+                runtime.evaluator.evaluate_acceptance_baseline, baseline, acceptance,
+                directory / "evaluation", config,
+                lambda: runtime.is_cancelled(run) or acceptance_cancel.is_set(),
+                seeds, project["id"], base, environment["sha256"])
+            transition("executing")
+        except BaseException:
+            # 提交或状态落库失败时立即回收线程池，避免悬挂的非守护工作线程。
+            acceptance_cancel.set()
+            acceptance_executor.shutdown(wait=True, cancel_futures=True)
+            acceptance_executor = None
+            raise
+    else:
+        transition("executing")
     acceptance_baseline = None
     try:
         if saved_candidate:

@@ -93,7 +93,7 @@ class Handler(BaseHTTPRequestHandler):
             token = ""
         if not hmac.compare_digest(token, self.server.token):
             if self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
-                self.respond((Path(__file__).parent / "web" / "login.html").read_bytes(), 401, "text/html; charset=utf-8")
+                self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
             else:
                 self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
             return False
@@ -103,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         if parsed.path == "/login.css" and self.headers.get("Host") in self.server.allowed_hosts:
-            self.respond((Path(__file__).parent / "web" / "login.css").read_bytes(), content_type="text/css; charset=utf-8")
+            self.respond(self.server.assets["login.css"], content_type="text/css; charset=utf-8")
             return
         if parsed.path in ["/install", "/install.js", "/install.css", "/i18n.js", "/manifest.webmanifest", "/sw.js", "/icon-192.png", "/icon-512.png", "/favicon.svg"]:
             if self.headers.get("Host") not in self.server.allowed_hosts:
@@ -113,13 +113,16 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(self.server.assets[name], content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
             return
         if parsed.path == "/" and "token" in params:
-            if self.headers.get("Host") not in self.server.allowed_hosts or not hmac.compare_digest(params["token"][0], self.server.token):
-                self.respond({"error": "Invalid login"}, 403)
-                return
+            valid = self.headers.get("Host") in self.server.allowed_hosts and hmac.compare_digest(params["token"][0], self.server.token)
+            if not valid:
+                # 旧启动地址携带的 token 可能已轮换；已持有有效会话时仍直接回到控制台。
+                if not self.authenticated():
+                    return
             self.send_response(303)
             self.headers_common()
-            self.send_header("Set-Cookie", self.server.cookie + "=" + self.server.token + "; Path=/; HttpOnly; SameSite=Strict" +
-                             ("; Secure" if self.server.origin.startswith("https://") and self.headers.get("Host") == urlparse(self.server.origin).netloc else ""))
+            if valid:
+                self.send_header("Set-Cookie", self.server.cookie + "=" + self.server.token + "; Path=/; HttpOnly; SameSite=Strict" +
+                                 ("; Secure" if self.server.origin.startswith("https://") and self.headers.get("Host") == urlparse(self.server.origin).netloc else ""))
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -321,7 +324,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(payload, content_type=(mimetypes.guess_type(str(path))[0] or "application/octet-stream") + "; charset=utf-8")
             else:
                 self.respond({"error": "Not found"}, 404)
-        except (ValueError, OSError, RuntimeError) as exc:
+        except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
             self.respond({"error": str(exc), **({"error_code": exc.code} if hasattr(exc, "code") else {})}, 400)
 
     def do_POST(self):

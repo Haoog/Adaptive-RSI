@@ -447,6 +447,16 @@ def sync_modern_worker_to_legacy_host(rows, model, original_legacy):
     return [value for value in merged.values() if isinstance(value, str) and len(value) > 8]
 
 
+def _load_auth():
+    """容忍损坏的 auth.json；读取失败按无凭据处理而不是让整次运行失败。"""
+    path = auth_path()
+    try:
+        data = json.loads(path.read_text()) if path.is_file() else {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def jsonc(text):
     # 保留字符串中的 URL、转义和注释符号。
     pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*[\s\S]*?\*/'
@@ -539,10 +549,8 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
         if auth:
             for value in auth.values():
                 secrets += [item for item in value.values() if isinstance(item, str) and len(item) > 8]
-            target = home / ".local/share/opencode/auth.json"
-            target.parent.mkdir(parents=True)
-            target.write_text(json.dumps(auth))
-            target.chmod(0o600)
+            # 先以 0600 创建再原子替换，避免短暂的全局可读窗口。
+            _private_json(home / ".local/share/opencode/auth.json", auth)
     for provider in providers.values():
         options = provider.get("options", {})
         key = options.get("apiKey")
@@ -650,7 +658,7 @@ class OpenCodeAgent:
                         host_export = export_auth(host_binary, host_capabilities, _host_auth_environment(),
                                                   provider_prefix)
                     elif host_capabilities:
-                        host_legacy = json.loads(auth_path().read_text()) if auth_path().is_file() else {}
+                        host_legacy = _load_auth()
                     if capabilities.modern:
                         if host_capabilities and host_capabilities.modern:
                             original_auth = host_export
@@ -665,8 +673,7 @@ class OpenCodeAgent:
                             legacy = _legacy_auth(host_export, provider_prefix)
                             original_auth = {provider_prefix: legacy} if legacy else {}
                         else:
-                            original_auth = host_legacy if host_capabilities else (
-                                json.loads(auth_path().read_text()) if auth_path().is_file() else {})
+                            original_auth = host_legacy if host_capabilities else _load_auth()
                             original_auth = {key: value for key, value in original_auth.items()
                                              if key == provider_prefix and isinstance(value, dict)}
                 environment, secrets = prepare_home(
@@ -676,8 +683,7 @@ class OpenCodeAgent:
                     exported_auth=original_auth)
                 if capabilities.modern and not (host_capabilities and host_capabilities.modern) and original_auth:
                     import_path = home / ".rsi-auth-export.json"
-                    import_path.write_text(json.dumps(original_auth))
-                    import_path.chmod(0o600)
+                    _private_json(import_path, original_auth)
                     imported = run_cli(["opencode", "auth", "import", "--standalone", str(import_path)],
                                        workspace, home, config, cancel, protected, True,
                                        environment, self.store.root)
@@ -692,7 +698,7 @@ class OpenCodeAgent:
                 argv += ["Read the task in " + str(task) + ". Follow its instructions. Return the requested JSON."]
                 self.store.event("model", role + ": OpenCode / " + route["model"] + " / " + route["effort"], project, run)
                 try:
-                    result = run_cli(argv, workspace, home, config, cancel, protected, role != "implementation", environment, self.store.root)
+                    result = run_cli(argv, workspace, home, config, cancel, protected, role != "implementation", environment, self.store.root, timeout=3600)
                 finally:
                     if capabilities.modern and host_capabilities and host_capabilities.modern:
                         with AUTH_LOCK:
@@ -748,5 +754,5 @@ class OpenCodeAgent:
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                 return data
         except Exception:
-            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
+            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=? AND state='reserved'", (time.monotonic() - started, call))
             raise

@@ -1211,5 +1211,38 @@ class Runtime:
                 for candidate in archive[config["evolution"]["archive_limit"]:]:
                     if candidate["id"] not in referenced:
                         self.store.execute("DELETE FROM candidates WHERE id=?", (candidate["id"],))
+        # 数据保留：清理过期技能、已结束运行的派生数据及其 settings 键；
+        # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
+        stale = now - 90 * 86400
+        self.store.execute("DELETE FROM skills WHERE expires<?", (now - 30 * 86400,))
+        self.store.execute("DELETE FROM phase_times WHERE ended IS NOT NULL AND ended<? AND run IN "
+                           "(SELECT id FROM runs WHERE ended IS NOT NULL AND ended<?)", (stale, stale))
+        self.store.execute("DELETE FROM remote_waits WHERE ended IS NOT NULL AND ended<? AND run IN "
+                           "(SELECT id FROM runs WHERE ended IS NOT NULL AND ended<?)", (stale, stale))
+        self.store.execute("DELETE FROM task_revisions WHERE created<? AND task IN "
+                           "(SELECT id FROM tasks WHERE updated<? AND state NOT IN ('queued','planning','executing','evaluating'))", (stale, stale))
+        self.store.execute("DELETE FROM submissions WHERE task IN "
+                           "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed'))", (stale,))
+        for run in self.store.query("SELECT id FROM runs WHERE ended IS NOT NULL AND ended<? LIMIT 200", (stale,)):
+            for prefix in ("run-baseline:", "automation:", "delivery:"):
+                self.store.execute("DELETE FROM settings WHERE key=? OR key LIKE ?",
+                                   (prefix + run["id"], prefix + run["id"] + ":%"))
+        for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? LIMIT 200", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=?", ("triage-state:" + task["id"],))
+        for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'task-proof:%' LIMIT 400"):
+            try:
+                created = json.loads(row["value"]).get("at", 0)
+            except (ValueError, TypeError):
+                created = 0
+            if created < stale:
+                self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'provider-health:%' LIMIT 400"):
+            try:
+                data = json.loads(row["value"])
+                paused, created = data.get("paused"), data.get("at", 0)
+            except (ValueError, TypeError):
+                paused, created = False, 0
+            if not paused and created < stale:
+                self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         self.store.execute("DELETE FROM events WHERE created<? AND seq NOT IN (SELECT seq FROM events ORDER BY seq DESC LIMIT 1000)", (now - 90 * 86400,))
         self.store.put_setting("maintenance-last", now)

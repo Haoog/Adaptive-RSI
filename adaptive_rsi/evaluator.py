@@ -37,7 +37,7 @@ DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 def empty_test_run(text):
     empty = re.search(r"Ran 0 tests|no tests ran|No tests found|No tests were found|no test files|running 0 tests|"
                       r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|"
-                      r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|"
+                      r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|no tests to run|"
                       r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"

@@ -52,25 +52,30 @@ def report(store, params):
     background = "(t.id IS NULL OR substr(t.source,1,7)='system_')"
     summary = store.one("SELECT " + TOTALS + ",count(DISTINCT t.id) AS tasks" + JOIN + scope, args)
     buckets = {}
-    for row in store.stream("SELECT c.created,c.tokens,c.input_tokens,c.output_tokens,"
-                            "c.cache_read_tokens,c.cache_write_tokens,c.usage_known,c.state,"
-                            "c.seconds,c.unit_price" + JOIN + scope, args):
-        local = datetime.datetime.fromtimestamp(row["created"], zone).date()
-        bucket = buckets.setdefault(local, {
-            "calls": 0, "tokens": 0, "input_tokens": 0, "output_tokens": 0,
-            "cache_read_tokens": 0, "cache_write_tokens": 0, "model_seconds": 0,
-            "unknown_calls": 0, "failed_calls": 0, "estimated_usd": None})
-        bucket["calls"] += 1
-        bucket["tokens"] += row["tokens"] or 0
-        bucket["input_tokens"] += row["input_tokens"] or 0
-        bucket["output_tokens"] += row["output_tokens"] or 0
-        bucket["cache_read_tokens"] += row["cache_read_tokens"] or 0
-        bucket["cache_write_tokens"] += row["cache_write_tokens"] or 0
-        bucket["model_seconds"] += row["seconds"] or 0
-        bucket["unknown_calls"] += int(not row["usage_known"])
-        bucket["failed_calls"] += int(row["state"] == "failed")
-        if row["usage_known"] and row["unit_price"] is not None:
-            bucket["estimated_usd"] = (bucket["estimated_usd"] or 0) + (row["tokens"] or 0) * row["unit_price"] / 1000000
+    rows = store.stream("SELECT c.created,c.tokens,c.input_tokens,c.output_tokens,"
+                        "c.cache_read_tokens,c.cache_write_tokens,c.usage_known,c.state,"
+                        "c.seconds,c.unit_price" + JOIN + scope, args)
+    try:
+        for row in rows:
+            local = datetime.datetime.fromtimestamp(row["created"], zone).date()
+            bucket = buckets.setdefault(local, {
+                "calls": 0, "tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "model_seconds": 0,
+                "unknown_calls": 0, "failed_calls": 0, "estimated_usd": None})
+            bucket["calls"] += 1
+            bucket["tokens"] += row["tokens"] or 0
+            bucket["input_tokens"] += row["input_tokens"] or 0
+            bucket["output_tokens"] += row["output_tokens"] or 0
+            bucket["cache_read_tokens"] += row["cache_read_tokens"] or 0
+            bucket["cache_write_tokens"] += row["cache_write_tokens"] or 0
+            bucket["model_seconds"] += row["seconds"] or 0
+            bucket["unknown_calls"] += int(not row["usage_known"])
+            bucket["failed_calls"] += int(row["state"] == "failed")
+            if row["usage_known"] and row["unit_price"] is not None:
+                bucket["estimated_usd"] = (bucket["estimated_usd"] or 0) + (row["tokens"] or 0) * row["unit_price"] / 1000000
+    finally:
+        # 显式关闭生成器，连接立即归还连接池而不是等 GC。
+        rows.close()
     daily = []
     for day, bucket in sorted(buckets.items()):
         midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=zone)
