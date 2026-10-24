@@ -145,7 +145,7 @@ jobs:
         run: |
           python3 -m unittest -v \
             tests.test_delivery_loop.DeliveryLoopTest.test_candidate_cannot_weaken_a_modern_test_file_to_hide_a_regression \
-            tests.test_delivery_loop.DeliveryLoopTest.test_acceptance_generation_artifacts_never_enter_implementer_workspace \
+            tests.test_delivery_loop.DeliveryLoopTest.test_high_risk_acceptance_artifacts_never_enter_implementer_workspace \
             tests.test_delivery_loop.DeliveryLoopTest.test_candidate_new_failing_test_is_not_erased_by_frozen_regression \
             tests.test_delivery_loop.DeliveryLoopTest.test_independent_acceptance_blocks_weak_original_and_candidate_tests \
             tests.test_delivery_loop.DeliveryLoopTest.test_auto_pr_is_queued_only_after_all_local_gates \
@@ -153,8 +153,9 @@ jobs:
             tests.test_delivery_loop.DeliveryLoopTest.test_native_command_cannot_install_host_git_execution_hooks \
             tests.test_delivery_loop.DeliveryLoopTest.test_stale_candidate_before_pr_is_invalidated_and_can_be_replanned \
             tests.test_delivery_loop.DeliveryLoopTest.test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression \
-            tests.test_reliability.ReliabilityTest.test_review_outage_reuses_plan_acceptance_and_patch_but_reruns_checks \
-            tests.test_reliability.ReliabilityTest.test_implementation_route_change_reuses_plan_and_acceptance \
+            tests.test_reliability.ReliabilityTest.test_review_outage_reuses_plan_and_patch_but_reruns_checks \
+            tests.test_reliability.ReliabilityTest.test_implementation_route_change_reuses_plan_without_acceptance \
+            tests.test_reliability.ReliabilityTest.test_configuration_change_uses_test_first_without_independent_acceptance \
             tests.test_reliability.ReliabilityTest.test_completed_review_is_reused_after_a_post_review_failure \
             tests.test_reliability.ReliabilityTest.test_changed_baseline_invalidates_recovery_cache \
             tests.test_reliability.ReliabilityTest.test_value_assessment_yields_and_reuses_plan_without_spending_retry \

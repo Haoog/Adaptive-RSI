@@ -15,11 +15,14 @@ flowchart TD
     Q --> O[Readiness: environment, dependencies, model settings]
     O --> P
     P --> B{Worth doing with sufficient evidence?}
-    B -->|Execute| W[Independent acceptance design → executor at latest base commit]
+    B -->|Execute| W[Executor at latest base commit]
     B -->|Defer or reject| Z[Save decision and evidence]
     Z --> M
-    W --> T[Host checks: frozen regression, full candidate suite, independent acceptance]
-    T --> R[Independent review: correctness, security, maintainability, architecture, tests, scope]
+    W --> T[Host checks: baseline and candidate tests, frozen regression, full candidate suite]
+    T --> X{High-risk or performance task?}
+    X -->|Yes| V[Independent before/after acceptance]
+    X -->|No| R[One independent code review]
+    V --> R
     R --> D{Both checks and review pass?}
     D -->|Yes| C[Local patch and verification evidence]
     C --> A[Project-authorized PR or per-candidate confirmation]
@@ -287,7 +290,9 @@ See [the validation report](../VALIDATION.en.md) and [contribution guide](../CON
 
 ## Autonomous delivery loop
 
-Before implementation, a separate call using the planning model generates executable acceptance criteria. The host seals them outside implementer access. Frozen original regression, full candidate tests (including changed/new tests), and independent acceptance all must pass. Every planned criterion needs coverage. Model-generated acceptance can still be incomplete; review and real-task validation remain necessary.
+For behavior, configuration, and UI changes, the implementation adds one separate regression-test file. The host constructs a command that runs this file in isolation on the original baseline and candidate, requiring a nonzero baseline exit and a passing candidate exit; it does not infer ownership from full-suite log text. Existing tests, test configuration, manifests, and check entrypoints cannot be changed; an undiscovered test, unsupported isolated command, or environment failure blocks delivery as insufficient evidence. Configured runners without isolated-file support fall back to independent acceptance sealed before implementation. Original tests remain protected by the frozen baseline copy, and full-candidate checks run the added test. When frozen-regression and full-candidate checks use the same test tree and commands, one candidate execution supplies both results; test-harness changes or an external acceptance overlay keep the runs separate.
+
+High-risk and performance tasks always get independent acceptance designed and sealed before implementation, with every planned criterion covered. The same acceptance path is the fallback when a runner for an ordinary behavior, configuration, or UI task cannot isolate the new test. Documentation changes and refactors use applicable fixed regression checks, while review checks scope and maintainability. One independent review covers six areas; a second focused review runs only when evidence is insufficient or the patch actually touches authentication/credentials, security boundaries, sandboxing, migrations/databases, dependency manifests, release/deployment workflows, or core runtime paths. Fixed checks and real-task evidence remain necessary because model judgments can be incomplete.
 
 The repository, resolved target branch and SHA are sealed when a run starts. Changing targets cannot reuse old authorization; stale candidates replan within retry limits. Branches use `feat/rsi-*` or `fix/rsi-*`; commits and PR descriptions are Chinese. Squash merging requires the exact evaluated head, a current base, successful CI, GitHub mergeability and required reviews. GitHub rules remain the final gate. Enable strict required checks or a merge queue to close the race between checking the base and requesting merge. Failed CI retains the PR; stale PRs close and replan within retry limits. Restart recovery tracks existing PRs and resumes idempotent publishing without reusing interrupted, unverified implementation.
 

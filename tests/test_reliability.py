@@ -13,14 +13,15 @@ from adaptive_rsi.context import _code_index, _code_map_cached, code_map, relate
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.discovery import related_task, value_priority
 from adaptive_rsi.evolution import Evolution
-from adaptive_rsi.evaluator import CACHE_STDERR_LIMIT, Evaluator
+from adaptive_rsi.evaluator import CACHE_STDERR_LIMIT, Evaluator, _isolated_test_check, freeze_harness
 from adaptive_rsi.gitops import git, snapshot
 from adaptive_rsi.readiness import budget, inspect as readiness
 from adaptive_rsi.recovery import failure
+from adaptive_rsi.review import risk_review_required
 from adaptive_rsi.runtime import Runtime
-from adaptive_rsi.pipeline import _review_evidence, _stage_config
+from adaptive_rsi.pipeline import _review_evidence, _stage_config, _uses_test_first
 from adaptive_rsi.store import Store, encode
-from adaptive_rsi.workflow import improvement
+from adaptive_rsi.workflow import change_kind, improvement, supports_test_first
 from tests.test_runtime import CHECKS, FakeAgent, fixture
 
 
@@ -56,6 +57,24 @@ class ReliabilityTest(unittest.TestCase):
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertFalse(next(i for i in result["readiness"]["items"] if i["code"] == "dependencies")["ready"])
 
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    def test_configuration_change_uses_test_first_without_independent_acceptance(self):
+        class ConfigurationPlan(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "planning":
+                    result["change_kind"] = "configuration"
+                return result
+        self.runtime.agent = ConfigurationPlan()
+        task, run = self.claim("Configure the addition behavior")
+        self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "awaiting_approval", result)
+        self.assertEqual(result["evaluation"]["improvement"]["kind"], "configuration")
+        self.assertEqual(result["evaluation"]["improvement"]["decision"], "pass")
+        self.assertNotIn("acceptance", [role for role, _ in self.runtime.agent.roles])
+
     def test_injected_transport_is_available_without_bypassing_real_codex_requirement(self):
         import shutil
         system_which = shutil.which
@@ -69,7 +88,7 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.query("SELECT * FROM calls"), [])
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
-    def test_review_outage_reuses_plan_acceptance_and_patch_but_reruns_checks(self):
+    def test_review_outage_reuses_plan_and_patch_but_reruns_checks(self):
         class Outage(FakeAgent):
             unavailable = True
             def invoke(self, role, *args, **kwargs):
@@ -89,13 +108,13 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
         roles = [r[0] for r in self.runtime.agent.roles]
         self.assertEqual(roles.count("planning"), 1)
-        self.assertEqual(roles.count("acceptance"), 1)
+        self.assertEqual(roles.count("acceptance"), 0)
         self.assertEqual(roles.count("implementation"), 1)
         stages = {r["stage"] for r in self.store.query("SELECT stage FROM stages WHERE run=?", (second["id"],))}
-        self.assertTrue({"planning", "acceptance", "implementation", "evaluation", "review"} <= stages)
+        self.assertTrue({"planning", "implementation", "evaluation", "review"} <= stages)
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
-    def test_implementation_route_change_reuses_plan_and_acceptance(self):
+    def test_implementation_route_change_reuses_plan_without_acceptance(self):
         class Outage(FakeAgent):
             def invoke(self, role, *args, **kwargs):
                 if role == "implementation":
@@ -111,7 +130,7 @@ class ReliabilityTest(unittest.TestCase):
         second = self.store.claim(self.project, self.runtime.config(self.project))
         self.runtime.process(second)
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("planning"), 1)
-        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("acceptance"), 1)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("acceptance"), 0)
         implementations = [route for role, route in self.runtime.agent.roles if role == "implementation"]
         self.assertEqual([route["effort"] for route in implementations], ["max", "high"])
 
@@ -324,12 +343,14 @@ class ReliabilityTest(unittest.TestCase):
                     "exit_code": 0, "error": None, "stdout": image_id, "stderr": ""}), \
                 patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
             for directory in ["one", "two"]:
-                evaluator.evaluate(self.repo, candidate, CHECKS, self.root / directory, config,
-                                   cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+                result = evaluator.evaluate(self.repo, candidate, CHECKS, self.root / directory, config,
+                                            cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+            self.assertTrue(result["candidate_full_reused"])
             self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 1)
             changed_checks = [{"name": "different", "argv": ["python3", "-c", "print('ok')"]}]
-            evaluator.evaluate(self.repo, candidate, changed_checks, self.root / "three", config,
-                               cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+            result = evaluator.evaluate(self.repo, candidate, changed_checks, self.root / "three", config,
+                                        cache_scope="project-a", cache_base=base, environment_digest="deps-v1")
+            self.assertFalse(result["candidate_full_reused"])
             self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 2)
             evaluator.evaluate(self.repo, candidate, CHECKS, self.root / "four", config,
                                cache_scope="project-b", cache_base=base, environment_digest="deps-v1")
@@ -338,8 +359,21 @@ class ReliabilityTest(unittest.TestCase):
                                cache_scope="project-a", cache_base=base, environment_digest="deps-v2")
             self.assertEqual(sum(label == "baseline" for label, _, _ in calls), 4)
             self.assertEqual(sum(label == "candidate" for label, _, _ in calls), 5)
-            self.assertGreaterEqual(sum(label == "candidate_full" for label, _, _ in calls), 5)
+            full_runs = sum(label == "candidate_full" for label, _, _ in calls)
+            self.assertGreater(full_runs, 0)
+            self.assertLess(full_runs, sum(label == "candidate" for label, _, _ in calls))
             self.assertTrue(all(image == image_id for _, _, image in calls))
+
+    def test_test_first_evaluation_blocks_changed_harness_before_running_checks(self):
+        evaluator = Evaluator(self.store)
+        with patch.object(evaluator, "_execution_environment", return_value=(self.runtime.config(self.project), None)), \
+                patch("adaptive_rsi.evaluator.Sandbox.check") as check:
+            result = evaluator.evaluate(
+                self.repo, self.repo, CHECKS, self.root / "test-first", self.runtime.config(self.project),
+                test_first=True, changed_files=["calculator.py", "pyproject.toml", "tests/test_behavior.py"])
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        self.assertIn("test harness", result["reason"])
+        check.assert_not_called()
 
     def test_performance_acceptance_remeasures_baseline_on_repeated_runs(self):
         acceptance = {"spec": {"files": [], "checks": []}, "checks": CHECKS, "criteria": [], "hash": "benchmark",
@@ -717,6 +751,15 @@ class ReliabilityTest(unittest.TestCase):
 
 
 class EvidenceContractTest(unittest.TestCase):
+    def test_behavior_configuration_and_ui_changes_use_test_first_unless_high_risk(self):
+        for kind in ["behavior", "configuration", "ui"]:
+            with self.subTest(kind=kind):
+                self.assertTrue(_uses_test_first(kind, "low"))
+                self.assertFalse(_uses_test_first(kind, "high"))
+        for kind in ["performance", "documentation", "refactor"]:
+            with self.subTest(kind=kind):
+                self.assertFalse(_uses_test_first(kind, "low"))
+
     def results(self, before, after, **extras):
         return {"acceptance_baseline": [{"passed": before, "error": "", "exit_code": 0 if before else 1, "stderr": "AssertionError", **extras}],
                 "acceptance_candidate": [{"passed": after}]}
@@ -728,6 +771,156 @@ class EvidenceContractTest(unittest.TestCase):
         self.assertEqual(improvement(self.results(False, True), acceptance)["decision"], "pass")
         self.assertEqual(improvement(self.results(False, True, stderr="ModuleNotFoundError"), acceptance)["decision"], "insufficient_evidence")
         self.assertEqual(improvement(self.results(True, True), {"change_kind": "refactor"})["decision"], "pass")
+
+    def test_test_first_requires_a_real_isolated_test_exit_status_pair(self):
+        before = {"passed": False, "empty_tests": False, "error": None, "exit_code": 1,
+                  "stderr": "AssertionError", "name": "isolated regression: project tests",
+                  "argv": ["python3", "-m", "unittest", "tests.test_behavior"], "cwd": "."}
+        after = {**before, "passed": True, "exit_code": 0, "stderr": ""}
+        contract = {"mode": "test_first", "change_kind": "behavior",
+                    "regression_test_files": ["tests/test_behavior.py"]}
+        focused = {"test_first_baseline": [before], "test_first_candidate": [after]}
+        self.assertEqual(improvement(focused, contract)["decision"], "pass")
+        self.assertEqual(improvement(focused, {**contract, "regression_test_files": []})["decision"],
+                         "insufficient_evidence")
+        unisolated = {"baseline": [{**before, "name": "project tests", "stderr":
+                                    "FAIL: test_behavior (tests.test_behavior.BehaviorTests.test_behavior)"}],
+                      "candidate": [{**after, "name": "project tests"}]}
+        self.assertEqual(improvement(unisolated, contract)["decision"], "insufficient_evidence")
+        mismatched = {"test_first_baseline": [before], "test_first_candidate": [{**after, "argv": ["pytest", "-q"]}]}
+        self.assertEqual(improvement(mismatched, contract)["decision"], "insufficient_evidence")
+        spoofed_success = {"test_first_baseline": [{**before, "exit_code": 0, "stderr": "FAIL: fake"}],
+                           "test_first_candidate": [after]}
+        self.assertEqual(improvement(spoofed_success, contract)["decision"], "insufficient_evidence")
+        environment_error = {"test_first_baseline": [{**before, "stderr": "ModuleNotFoundError: pytest"}],
+                             "test_first_candidate": [after]}
+        self.assertEqual(improvement(environment_error, contract)["decision"], "insufficient_evidence")
+
+    def test_isolated_test_check_builds_targeted_commands_only_for_supported_runners(self):
+        root = Path("/project")
+        self.assertEqual(_isolated_test_check(
+            [{"name": "unit", "cwd": ".", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"]}],
+            root, "tests/test_new.py")["argv"],
+            ["python3", "-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-p", "test_new.py"])
+        self.assertEqual(_isolated_test_check(
+            [{"name": "node", "cwd": ".", "argv": ["node", "--test"]}],
+            root, "tests/new.test.js")["argv"], ["node", "--test", "tests/new.test.js"])
+        self.assertEqual(_isolated_test_check(
+            [{"name": "node", "cwd": ".", "argv": ["node", "--test", "--require", "./preload.cjs", "tests"]}],
+            root, "tests/new.test.js")["argv"],
+            ["node", "--test", "--require", "./preload.cjs", "tests/new.test.js"])
+        self.assertTrue(supports_test_first([{"name": "node", "argv": ["node", "--test", "--require", "./preload.cjs"]}]))
+        self.assertFalse(supports_test_first([{"name": "node", "argv": ["node", "--test", "--test-name-pattern", "legacy"]}]))
+        self.assertTrue(supports_test_first([{"name": "unit", "argv": ["python3", "-m", "unittest",
+                                                                            "discover", "-s", "tests"]}]))
+        self.assertFalse(supports_test_first([{"name": "unit", "argv": ["python3", "-m", "unittest",
+                                                                             "discover", "--unknown"]}]))
+        module_check = _isolated_test_check(
+            [{"name": "backend", "cwd": "backend", "argv": ["python3", "-m", "pytest", "tests"]},
+             {"name": "frontend", "cwd": "frontend", "argv": ["python3", "-m", "pytest", "tests"]}],
+            root, "frontend/tests/test_new.py")
+        self.assertEqual((module_check["cwd"], module_check["argv"]),
+                         ("frontend", ["python3", "-m", "pytest", "tests/test_new.py"]))
+        self.assertEqual(_isolated_test_check(
+            [{"name": "python", "cwd": "backend", "argv": ["python3", "-m", "pytest", "tests"]},
+             {"name": "frontend", "cwd": ".", "argv": ["node", "--test"]}],
+            root, "frontend/tests/new.test.js")["argv"],
+            ["node", "--test", "frontend/tests/new.test.js"])
+        self.assertEqual(_isolated_test_check(
+            [{"name": "go", "cwd": ".", "argv": ["go", "test", "./..."]}],
+            root, "pkg/new_test.go", ["TestNew"])["argv"],
+            ["go", "test", "-run", "^(TestNew)$", "./pkg"])
+        self.assertEqual(_isolated_test_check(
+            [{"name": "go", "cwd": ".", "argv": ["go", "test", "-tags", "integration", "./..."]}],
+            root, "pkg/new_test.go", ["TestNew"])["argv"],
+            ["go", "test", "-tags", "integration", "-run", "^(TestNew)$", "./pkg"])
+        self.assertIsNone(_isolated_test_check(
+            [{"name": "go", "cwd": ".", "argv": ["go", "test", "-unknown", "value", "./..."]}],
+            root, "pkg/new_test.go", ["TestNew"]))
+        for argv in [["go", "test", "-exec", "true"], ["go", "test", "-test.run=^Legacy$"],
+                     ["go", "test", "-c"], ["go", "test", "-list", "."],
+                     ["go", "test", "-unknown=value"], ["go", "test", "-skip", "^TestNew$"],
+                     ["go", "test", "-skip=^TestNew$"], ["go", "test", "-count", "0"],
+                     ["go", "test", "-count=0"], ["go", "test", "-short"]]:
+            with self.subTest(argv=argv):
+                self.assertFalse(supports_test_first([{"name": "go", "argv": argv}]))
+        self.assertEqual(_isolated_test_check(
+            [{"name": "phpunit", "cwd": ".", "argv": ["vendor/bin/phpunit", "tests"]}],
+            root, "tests/NewTest.php")["argv"], ["vendor/bin/phpunit", "tests/NewTest.php"])
+
+    def test_cargo_workspace_checks_fall_back_to_sealed_acceptance(self):
+        for argv in [["cargo", "test", "--workspace"], ["cargo", "test", "--package", "calc"]]:
+            with self.subTest(argv=argv):
+                self.assertFalse(supports_test_first([{"name": "cargo", "argv": argv}]))
+
+    def test_freeze_harness_restores_or_removes_cargo_runner_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline"
+            target = root / "target"
+            (baseline / ".cargo").mkdir(parents=True)
+            (target / ".cargo").mkdir(parents=True)
+            (baseline / ".cargo/config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrunner = "real"\n')
+            (target / ".cargo/config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrunner = "true"\n')
+            freeze_harness(baseline, target)
+            self.assertEqual((target / ".cargo/config.toml").read_text(),
+                             (baseline / ".cargo/config.toml").read_text())
+            nested_config = Path("crates/calc/.cargo/config.toml")
+            (baseline / nested_config).parent.mkdir(parents=True)
+            (target / nested_config).parent.mkdir(parents=True)
+            (baseline / nested_config).write_text('[target.x86_64-unknown-linux-gnu]\nrunner = "real"\n')
+            (target / nested_config).write_text('[target.x86_64-unknown-linux-gnu]\nrunner = "true"\n')
+            freeze_harness(baseline, target)
+            self.assertEqual((target / nested_config).read_text(), (baseline / nested_config).read_text())
+            baseline_without_config = root / "baseline-without-config"
+            target_with_added_config = root / "target-with-added-config"
+            baseline_without_config.mkdir()
+            nested_added_config = target_with_added_config / nested_config
+            nested_added_config.parent.mkdir(parents=True)
+            nested_added_config.write_text('runner = "true"\n')
+            freeze_harness(baseline_without_config, target_with_added_config)
+            self.assertFalse(nested_added_config.exists())
+
+    def test_test_first_runner_support_is_fail_closed_for_unrecognised_npm_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            check = {"cwd": ".", "argv": ["npm", "test"]}
+            package = root / "package.json"
+            package.write_text('{"scripts":{"test":"custom-runner"}}')
+            self.assertFalse(supports_test_first([check], root))
+            self.assertIsNone(_isolated_test_check([check], root, "tests/new.test.ts"))
+            package.write_text('{"scripts":{"test":"vitest run tests"}}')
+            self.assertFalse(supports_test_first([check], root))
+            self.assertIsNone(_isolated_test_check([check], root, "tests/new.test.ts"))
+            package.write_text('{"scripts":{"test":"vitest run"}}')
+            self.assertTrue(supports_test_first([{"cwd": ".", "argv": ["npm", "test"]}], root))
+            self.assertEqual(_isolated_test_check([check], root, "tests/new.test.ts")["argv"],
+                             ["npm", "exec", "--", "vitest", "run", "tests/new.test.ts"])
+
+    def test_unittest_discovery_isolates_one_file_without_losing_helper_imports(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "helpers.py").write_text("VALUE = 42\n")
+            (tests / "test_new.py").write_text(
+                "import unittest\nimport helpers\n"
+                "class RegressionTest(unittest.TestCase):\n"
+                "    def test_import_context(self):\n"
+                "        self.assertEqual(helpers.VALUE, 42)\n")
+            checks = [{"name": "unit", "cwd": ".", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"]}]
+            isolated = _isolated_test_check(checks, root, "tests/test_new.py")
+            self.assertEqual(isolated["argv"], ["python3", "-m", "unittest", "discover", "-s", "tests",
+                                                "-t", "tests", "-p", "test_new.py"])
+            result = subprocess.run(isolated["argv"], cwd=root, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_change_kind_keeps_docs_and_performance_contracts_distinct(self):
+        self.assertEqual(change_kind({"title": "Fix slow query", "body": "Optimize latency"}), "performance")
+        self.assertEqual(change_kind({"title": "Update guide"}, {"change_kind": "documentation"}),
+                         "documentation")
 
     def test_tiny_or_unrepeated_experiments_cannot_promote(self):
         def trials(count, repetitions):
@@ -750,3 +943,16 @@ class EvidenceContractTest(unittest.TestCase):
         high = {"impact": "high", "effort": "low", "confidence": "high"}
         low = {"impact": "low", "effort": "high", "confidence": "low"}
         self.assertGreater(value_priority(high, "low"), value_priority(low, "high"))
+
+    def test_high_risk_second_review_covers_manifests_and_core_paths(self):
+        high_risk = {"risk": "high"}
+        passing_review = {"decision": "pass", "assessments": [{"decision": "pass"}]}
+        insufficient_review = {"decision": "insufficient_evidence", "assessments": []}
+        self.assertFalse(risk_review_required(high_risk, passing_review, ["calculator.py"], "return a + b"))
+        for path in ["adaptive_rsi/auth.py", "pyproject.toml", "setup.py", "setup.cfg", "requirements.in",
+                     "adaptive_rsi/pipeline.py", "adaptive_rsi/evaluator.py", ".cargo/config.toml",
+                     ".github/workflows/release.yml"]:
+            with self.subTest(path=path):
+                self.assertTrue(risk_review_required(high_risk, passing_review, [path], ""))
+        self.assertTrue(risk_review_required(high_risk, insufficient_review))
+        self.assertFalse(risk_review_required({"risk": "low"}, insufficient_review))
