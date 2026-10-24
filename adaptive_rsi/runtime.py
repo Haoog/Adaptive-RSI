@@ -848,15 +848,17 @@ class Runtime:
                 else:
                     delay = min(BUDGET_WAIT_MAX_SECONDS, BUDGET_WAIT_SECONDS * 2 ** waits)
                     problem = {**problem, "budget_waits": waits + 1, "retry_at": time.time() + delay}
-            self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True)
-            if state == "waiting_budget" and task:
-                # tasks.available 记录「最早可领取时间」；resume_budget 只重排退避期满的任务。
-                self.store.execute("UPDATE tasks SET available=?,budget_waits=?,updated=? WHERE id=? AND state='waiting_budget'",
-                                   (problem["retry_at"], problem["budget_waits"], time.time(), task["id"]))
-            elif problem["code"] == "budget" and task:
-                # 退避重试额度用尽转 blocked 时清零计数，手动重试后闸门重新生效。
-                self.store.execute("UPDATE tasks SET budget_waits=0,updated=? WHERE id=? AND state='blocked'",
-                                   (time.time(), task["id"]))
+            task_fields = {}
+            if problem["code"] == "budget" and task:
+                if state == "waiting_budget":
+                    # tasks.available 记录「最早可领取时间」，与状态变更同事务写入，
+                    # 避免调度器在置态与写入之间按旧值立即重排（绕过退避）。
+                    task_fields = {"available": problem["retry_at"], "budget_waits": problem["budget_waits"]}
+                else:
+                    # 退避重试额度用尽转 blocked 时清零计数，手动重试后闸门重新生效。
+                    task_fields = {"budget_waits": 0}
+            self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
+                                  task_fields=task_fields or None)
         finally:
             self.wake.set()
 

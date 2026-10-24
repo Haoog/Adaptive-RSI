@@ -339,7 +339,7 @@ class Store:
             db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
-    def transition(self, run, state, result=None, terminal=False):
+    def transition(self, run, state, result=None, terminal=False, task_fields=None):
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -359,7 +359,15 @@ class Store:
             result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
-            db.execute("UPDATE tasks SET state=?,updated=? WHERE id=?", (state, now, row["task"]))
+            # task_fields 必须与状态变更同事务写入（如 waiting_budget 的退避时间），
+            # 否则调度器可能在两条语句之间按旧值把任务立即重排。
+            extra = ""
+            values = []
+            if task_fields and task and task["state"] != "cancelled":
+                extra = "," + ",".join(field + "=?" for field in task_fields)
+                values = [task_fields[field] for field in task_fields]
+            db.execute("UPDATE tasks SET state=?,updated=?" + extra + " WHERE id=?",
+                       (state, now, *values, row["task"]))
             if state == "deferred":
                 db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (row["task"], encode(result), now))
         self.event(state, (result or {}).get("reason", state), row["project"], run, result)

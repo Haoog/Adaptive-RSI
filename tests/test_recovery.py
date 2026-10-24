@@ -81,6 +81,26 @@ class BudgetWaitGateTest(unittest.TestCase):
         self.runtime.resume_budget(self.project, self.runtime.config(self.project))
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
 
+    def test_backoff_is_persisted_atomically_with_the_waiting_state(self):
+        # 回归：置态与退避写入必须是同一事务。若分成两条语句，调度器可在两者之间
+        # 按旧的 available 立即重排，随后按 state='waiting_budget' 过滤的写入落空，
+        # 闸门被绕过。这里在 transition 落库瞬间注入 resume_budget 复现该交错。
+        task, run = self.claim()
+        original = Store.transition
+
+        def interleave(store, run_id, *args, **kwargs):
+            result = original(store, run_id, *args, **kwargs)
+            self.runtime.resume_budget(self.project, self.runtime.config(self.project))
+            return result
+
+        with patch.object(Store, "transition", interleave), patch.object(
+                self.runtime, "execute_candidate", side_effect=BudgetExhausted("quota exceeded for current requests")):
+            self.runtime.process(run)
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        self.assertEqual(row["state"], "waiting_budget")
+        self.assertEqual(row["budget_waits"], 1)
+        self.assertGreater(row["available"], time.time())
+
     def test_budget_wait_cap_turns_task_blocked_and_manual_retry_rearms(self):
         task, run = self.claim()
         for _ in range(BUDGET_WAIT_RETRIES):
