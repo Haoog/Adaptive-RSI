@@ -268,6 +268,22 @@ class OperabilityTest(unittest.TestCase):
         self.assertIn("run-baseline:runnew01", keys)
         self.assertIn("task-proof:proj01:def", keys)
         self.assertIn("provider-health:proj01:p2:sig", keys)
+        store.put_setting("issue-comments:proj01:7", {"checked_at": stale, "comments": []})
+        store.put_setting("issue-comments:proj01:8", {"checked_at": time.time(), "comments": []})
+        # maintenance 每小时节流一次；清理新插入的键需要重置门控再跑一轮。
+        store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+        self.runtime.maintenance()
+        keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+        self.assertNotIn("issue-comments:proj01:7", keys)
+        self.assertIn("issue-comments:proj01:8", keys)
+        # 新鲜条目占满一批时，过期条目仍在本轮被删除（过滤先于 LIMIT）。
+        for index in range(450):
+            store.put_setting("task-proof:proj01:fresh%03d" % index, {"at": time.time()})
+        store.put_setting("task-proof:proj01:stale-old", {"at": stale})
+        store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+        self.runtime.maintenance()
+        keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+        self.assertNotIn("task-proof:proj01:stale-old", keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
 
     def test_workflow_metrics_scales_past_sql_variable_limit(self):

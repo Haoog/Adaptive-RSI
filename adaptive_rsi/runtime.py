@@ -1233,20 +1233,20 @@ class Runtime:
                                    (prefix + run["id"], prefix + run["id"] + ":%"))
         for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? LIMIT 200", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", ("triage-state:" + task["id"],))
-        for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'task-proof:%' LIMIT 400"):
-            try:
-                created = json.loads(row["value"]).get("at", 0)
-            except (ValueError, TypeError):
-                created = 0
-            if created < stale:
-                self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
-        for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'provider-health:%' LIMIT 400"):
-            try:
-                data = json.loads(row["value"])
-                paused, created = data.get("paused"), data.get("at", 0)
-            except (ValueError, TypeError):
-                paused, created = False, 0
-            if not paused and created < stale:
-                self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        # 过滤在 LIMIT 之前完成：新鲜条目占满一批时，过期条目仍能在本轮被删除。
+        for row in self.store.query(
+                "SELECT key FROM settings WHERE key LIKE 'task-proof:%' AND "
+                "(json_extract(value,'$.at') IS NULL OR json_extract(value,'$.at')<?) LIMIT 400", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        for row in self.store.query(
+                "SELECT key FROM settings WHERE key LIKE 'provider-health:%' AND "
+                "(json_extract(value,'$.at') IS NULL OR (json_extract(value,'$.paused')=0 AND json_extract(value,'$.at')<?)) LIMIT 400", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        # Issue 评论缓存按 issue 数量累积（每个键含最多 20 条评论正文）；
+        # 超过保留期未刷新的键不会再被命中（处理时总会刷新），直接删除。
+        for row in self.store.query(
+                "SELECT key FROM settings WHERE key LIKE 'issue-comments:%' AND "
+                "(json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) LIMIT 400", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         self.store.execute("DELETE FROM events WHERE created<? AND seq NOT IN (SELECT seq FROM events ORDER BY seq DESC LIMIT 1000)", (now - 90 * 86400,))
         self.store.put_setting("maintenance-last", now)
