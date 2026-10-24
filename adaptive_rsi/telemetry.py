@@ -55,15 +55,13 @@ def workflow_metrics(store, project=None):
     runs_by_task = {}
     for run in store.query("SELECT * FROM runs WHERE task IN (" + scope + ") ORDER BY task,started,id", scope_args):
         runs_by_task.setdefault(run["task"], []).append(run)
-    run_ids = [run["id"] for rows in runs_by_task.values() for run in rows]
-    run_scope = "(" + ",".join("?" for _ in run_ids) + ")"
+    run_scope = "SELECT id FROM runs WHERE task IN (" + scope + ")"
     implemented = {row["run"] for row in store.query(
-        "SELECT DISTINCT run FROM phase_times WHERE phase='implementation' AND run IN " + run_scope, run_ids)} if run_ids else set()
-    if run_ids:
-        implemented |= {row["run"] for row in store.query(
-            "SELECT DISTINCT run FROM calls WHERE role='implementation' AND run IN " + run_scope, run_ids)}
+        "SELECT DISTINCT run FROM phase_times WHERE phase='implementation' AND run IN (" + run_scope + ")", scope_args)}
+    implemented |= {row["run"] for row in store.query(
+        "SELECT DISTINCT run FROM calls WHERE role='implementation' AND run IN (" + run_scope + ")", scope_args)}
     pr_created_at = {row["run"]: row["at"] for row in store.query(
-        "SELECT run,min(created) AS at FROM events WHERE kind='pr' AND run IN " + run_scope + " GROUP BY run", run_ids)} if run_ids else {}
+        "SELECT run,min(created) AS at FROM events WHERE kind='pr' AND run IN (" + run_scope + ") GROUP BY run", scope_args)}
     usage_by_task = {row["task"]: row for row in store.query(
         "SELECT r.task AS task,sum(c.tokens) AS tokens,sum(c.usage_known=0) AS unknown,sum(c.seconds) AS seconds "
         "FROM calls c JOIN runs r ON r.id=c.run WHERE r.task IN (" + scope + ") GROUP BY r.task", scope_args)}
@@ -73,9 +71,9 @@ def workflow_metrics(store, project=None):
         "SELECT json_extract(data,'$.task') AS task,count(*) AS n FROM events WHERE "
         "kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') GROUP BY 1")}
     phase_rows = store.query(
-        "SELECT run,phase,ended-started AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN " + run_scope, run_ids) if run_ids else []
+        "SELECT run,phase,ended-started AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
     wait_rows = store.query(
-        "SELECT run,reason,ended-started AS seconds FROM remote_waits WHERE ended IS NOT NULL AND run IN " + run_scope, run_ids) if run_ids else []
+        "SELECT run,reason,ended-started AS seconds FROM remote_waits WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
     for task in tasks:
         runs = runs_by_task.get(task["id"], [])
         code_attempts = []
