@@ -10,10 +10,18 @@ class BudgetExhausted(RuntimeError):
     pass
 
 
+# 额度类故障只匹配异常类型或明确的配额/额度耗尽措辞；"上下文/输出超限"
+# （无论旧消息里的 "output budget" 还是新消息里的 "output limit"）属于确定性
+# 执行错误，不得归入 budget，否则会在无额度的 waiting_budget 状态下无限重试。
+QUOTA_EXHAUSTED = ("budget exhausted", "budget insufficient", "insufficient budget",
+                   "insufficient quota", "quota exceeded", "exceeded your current quota",
+                   "credit balance", "resource_exhausted")
+
+
 def failure(exc):
     text = str(exc)
     lower = text.lower()
-    if isinstance(exc, BudgetExhausted) or "budget" in lower:
+    if isinstance(exc, BudgetExhausted) or any(s in lower for s in QUOTA_EXHAUSTED):
         code, action = "budget", "wait_or_adjust_budget"
     elif any(s in lower for s in ["credential", "api key", "environment variable", "unauthorized", "401"]):
         code, action = "credentials", "check_model_settings"

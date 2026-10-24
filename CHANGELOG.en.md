@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Stop the scheduler from hot-retrying quota-waiting tasks while no quota exists: quota failures now wait with increasing backoff before resuming, and after the automatic retry cap the task becomes blocked until manually retried; context or output overflow is no longer misclassified as a quota failure.
+- OpenCode and Codex model calls no longer serialize end to end; execution outside credential reads and writes can run concurrently, and remote baseline refreshes now run per project in parallel.
+- Native API response timeouts are relaxed by role to support slower reasoning models; unparseable tool arguments or schema-invalid finish results are reported back to the model to self-correct instead of failing the run.
+- Legacy deferred tasks stay deferred on their first reassessment after an upgrade and only re-enter the queue when the baseline or inputs change.
+- Write requests from the loopback origin are no longer rejected when a public URL is configured; login-session polling backs off, the provider list is cached briefly, and the auth service retries on a fresh port if its port is stolen.
+- Database connections are reused through a bounded pool and rebuilt after file replacement; maintenance cleanup moved off the scheduler thread; several queries and file reads were deduplicated.
+- Added missing English UI translations and removed duplicate entries.
+
 ## 0.5.102
 
 <!-- adaptive-rsi-release:0.5.102;base:d27e35c636459847c86df3a67b9e8221f671773e -->

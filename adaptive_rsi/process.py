@@ -14,21 +14,51 @@ from pathlib import Path
 PROBE_TTL_SECONDS = 30
 _PROBE_LOCK = threading.Lock()
 _PROBE_CACHE = {}
+# 每个探测键保留一个进行中标记：并发线程等待首个结果，而不是各自排队重复探测。
+_PROBE_INFLIGHT = {}
+
+
+class _ProbeFlight:
+    def __init__(self):
+        self.done = threading.Event()
+        self.error = None
 
 
 def _cached_probe(key, probe):
     """Cache process-local sandbox probe results for a short interval."""
-    now = time.monotonic()
-    with _PROBE_LOCK:
-        cached = _PROBE_CACHE.get(key)
-        if cached and now - cached[0] < PROBE_TTL_SECONDS:
-            return cached[1]
-        # Keep concurrent checks from duplicating the same docker probe.
-        value = probe()
-        _PROBE_CACHE[key] = (time.monotonic(), value)
-        if len(_PROBE_CACHE) > 32:
-            oldest = min(_PROBE_CACHE, key=lambda item: _PROBE_CACHE[item][0])
-            _PROBE_CACHE.pop(oldest, None)
+    while True:
+        with _PROBE_LOCK:
+            cached = _PROBE_CACHE.get(key)
+            if cached and time.monotonic() - cached[0] < PROBE_TTL_SECONDS:
+                return cached[1]
+            flight = _PROBE_INFLIGHT.get(key)
+            if flight is None:
+                flight = _PROBE_INFLIGHT[key] = _ProbeFlight()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # 首个线程正在锁外探测（docker info 等可能耗时 8-10 秒），
+            # 等待它的结果而不是重复同样的探测；失败时共享同一异常。
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            continue
+        try:
+            value = probe()
+        except BaseException as exc:
+            with _PROBE_LOCK:
+                flight.error = exc
+                _PROBE_INFLIGHT.pop(key, None)
+                flight.done.set()
+            raise
+        with _PROBE_LOCK:
+            _PROBE_CACHE[key] = (time.monotonic(), value)
+            if len(_PROBE_CACHE) > 32:
+                oldest = min(_PROBE_CACHE, key=lambda item: _PROBE_CACHE[item][0])
+                _PROBE_CACHE.pop(oldest, None)
+            _PROBE_INFLIGHT.pop(key, None)
+            flight.done.set()
         return value
 
 

@@ -89,17 +89,17 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening
+            modules: tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store
           - name: 模型与可靠性
             os: ubuntu-latest
-            modules: tests.test_model_center tests.test_reliability
+            modules: tests.test_model_center tests.test_reliability tests.test_recovery
           - name: 运营、发现与文档
             os: ubuntu-latest
             modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report
 
           - name: 服务器、协议与集成
             os: ubuntu-latest
-            modules: tests.test_auth_sessions tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker
+            modules: tests.test_auth_sessions tests.test_protocols tests.test_server_execution tests.test_opencode_integration tests.test_codex_docker tests.test_credential_lock_scope
     name: Python · ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4

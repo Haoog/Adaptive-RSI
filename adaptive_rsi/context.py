@@ -126,17 +126,21 @@ def _code_map_cached(root, fingerprint, text, limit):
         file = Path(workspace) / path
         anchors = []
         if not file.is_symlink() and file.is_file() and file.stat().st_size <= 200000:
-            for n, line in enumerate(file.read_text(errors="replace").splitlines(), 1):
+            # 同一文件只读一次：声明锚点与内容词匹配共用同一份行列表。
+            lines = file.read_text(errors="replace").splitlines()
+            for n, line in enumerate(lines, 1):
                 if re.match(r"\s*(?:async\s+)?(?:def |class |function |export |interface |type )", line):
                     anchors.append({"line": n, "declaration": line[:160]})
                 if len(anchors) >= 8:
                     break
             if -negative_score:
-                lowered = file.read_text(errors="replace").lower().splitlines()
                 present = {item["line"] for item in anchors}
-                for n, line in enumerate(lowered, 1):
-                    if n not in present and any(word in line for word in content_words):
-                        anchors.append({"line": n, "declaration": line[:160]})
+                for n, line in enumerate(lines, 1):
+                    if n in present:
+                        continue
+                    lowered = line.lower()
+                    if any(word in lowered for word in content_words):
+                        anchors.append({"line": n, "declaration": lowered[:160]})
                         if len(anchors) >= 12:
                             break
         rows.append({"path": path, "anchors": anchors})

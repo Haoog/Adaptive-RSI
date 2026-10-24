@@ -1,4 +1,5 @@
 import concurrent.futures
+import fcntl
 import json
 import os
 import platform
@@ -19,7 +20,7 @@ from adaptive_rsi.config import DEFAULTS, compatibility, fingerprint, merge, val
 from adaptive_rsi.evaluator import Evaluator, empty_test_run
 from adaptive_rsi.evolution import Evolution
 from adaptive_rsi.gitops import git, snapshot
-from adaptive_rsi.process import _PROBE_CACHE, Sandbox, checked, run_process
+from adaptive_rsi.process import _PROBE_CACHE, _PROBE_INFLIGHT, Sandbox, _cached_probe, checked, run_process
 from adaptive_rsi.review import enforce_review, risk_review_required
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Handler, Server
@@ -193,6 +194,78 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.retry(task)
         new = self.store.claim(self.project, self.runtime.config(self.project))
         self.assertNotEqual(new["id"], run["id"])
+
+    def test_start_failure_releases_the_state_directory_lock(self):
+        with patch.object(self.runtime.updates, "restore_startup", side_effect=RuntimeError("startup failed")):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                self.runtime.start()
+        self.assertIsNone(self.runtime.lockfile)
+        # 锁已随异常路径关闭释放：新的文件描述符可以立即取得排它锁。
+        probe = (self.store.root / "runtime.lock").open("a+")
+        try:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            probe.close()
+
+    def test_active_strategies_fetches_evidence_without_extra_candidate_queries(self):
+        key = compatibility(self.runtime.config(self.project))
+        for candidate, evidence in [("a", {"compatibility": key}), ("b", {"compatibility": "other"}),
+                                    ("c", {"compatibility": None})]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", None, "stable",
+                                encode({"guidance": "Reproduce arithmetic boundary cases"}), encode(evidence), time.time()))
+        original_query, original_one = self.store.query, self.store.one
+        statements = []
+
+        def record_query(sql, *args, **kwargs):
+            statements.append(sql)
+            return original_query(sql, *args, **kwargs)
+
+        def record_one(sql, *args, **kwargs):
+            statements.append(sql)
+            return original_one(sql, *args, **kwargs)
+
+        with patch.object(self.store, "query", side_effect=record_query), \
+                patch.object(self.store, "one", side_effect=record_one):
+            strategies = self.runtime.active_strategies(self.project)
+        # evidence 随首查取出，不再对每个 candidate 追加查询；兼容性过滤行为不变。
+        self.assertEqual([s["id"] for s in strategies], ["a", "c"])
+        self.assertEqual(strategies[0]["content"]["guidance"], "Reproduce arithmetic boundary cases")
+        self.assertEqual([sql for sql in statements if "FROM candidates" in sql],
+                         ["SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'"])
+
+    def test_inspection_reads_each_finding_path_only_once(self):
+        findings = {"findings": [
+            {"title": "Subtraction defect", "body": "add(2, 3) returns -1", "path": "calculator.py",
+             "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60},
+            {"title": "Signature drift", "body": "Function signature lacks type hints", "path": "calculator.py",
+             "quote": "def add(a, b):", "acceptance": ["typing preserved"], "priority": 60}]}
+
+        def invoke(role, *args, **kwargs):
+            if role == "analysis":
+                return findings
+            if role == "triage":
+                return {"findings": [{"index": 0, "decision": "ready", "confidence": "high", "reason": "Concrete defect"},
+                                     {"index": 1, "decision": "ready", "confidence": "high", "reason": "Concrete defect"}]}
+            raise AssertionError(role)
+
+        reads = []
+        original_read = Path.read_text
+        target = str(self.repo / "calculator.py")
+
+        def counting_read(path_self, *args, **kwargs):
+            if str(path_self) == target:
+                reads.append(str(path_self))
+            return original_read(path_self, *args, **kwargs)
+
+        with patch.object(self.runtime, "invoke", side_effect=invoke), \
+                patch.object(Path, "read_text", counting_read):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        # 两条 finding 指向同一文件：全文只读取一次，引文包含检查复用缓存。
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='inspection'")), 2)
 
     def test_calls_are_recorded_without_daily_quotas(self):
         config = merge(self.runtime.config(self.project), {"limits": {"daily_calls": 1}})
@@ -581,6 +654,67 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
                 _PROBE_CACHE.clear()
         self.assertEqual(sum(call[:2] == ["docker", "info"] for call in calls), 1)
         self.assertEqual(sum(call[:3] == ["docker", "image", "inspect"] for call in calls), 2)
+
+    def test_concurrent_probes_wait_for_the_first_result_instead_of_duplicating_it(self):
+        calls = []
+        def probe():
+            calls.append("probe")
+            time.sleep(0.2)
+            return {"exit_code": 0, "error": None, "stdout": "ok", "stderr": ""}
+        key = ("backend", "auto", "Linux", "/usr/bin/docker")
+        _PROBE_CACHE.clear()
+        try:
+            barrier = threading.Barrier(4)
+            results, errors = [], []
+            def call():
+                try:
+                    barrier.wait(5)
+                    results.append(_cached_probe(key, probe))
+                except Exception as exc:  # 收集任意线程失败后在主线程统一断言
+                    errors.append(exc)
+            threads = [threading.Thread(target=call) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+        finally:
+            _PROBE_CACHE.clear()
+            _PROBE_INFLIGHT.clear()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([result["exit_code"] for result in results], [0, 0, 0, 0])
+
+    def test_concurrent_probe_failures_share_the_first_error_without_recaching_it(self):
+        calls = []
+        def probe():
+            calls.append("probe")
+            time.sleep(0.1)
+            raise RuntimeError("docker daemon unreachable")
+        key = ("backend", "auto", "Linux", "/usr/bin/docker")
+        _PROBE_CACHE.clear()
+        try:
+            barrier = threading.Barrier(4)
+            errors = []
+            def call():
+                barrier.wait(5)
+                try:
+                    _cached_probe(key, probe)
+                except RuntimeError as exc:
+                    errors.append(exc)
+            threads = [threading.Thread(target=call) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+        finally:
+            _PROBE_CACHE.clear()
+            _PROBE_INFLIGHT.clear()
+        # 失败结果传播给等待者且不写缓存：之后的调用方仍会重新探测。
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(errors), 4)
+        self.assertEqual(_PROBE_CACHE.get(key), None)
 
     def test_provider_validation_and_strategy_compatibility(self):
         provider = {"id": "gateway", "name": "Gateway", "base_url": "https://models.example/v1", "env_key": "RSI_MODEL_KEY"}

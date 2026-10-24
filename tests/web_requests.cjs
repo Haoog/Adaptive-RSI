@@ -611,6 +611,10 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   for(const [key,value] of Object.entries(english))assert.doesNotMatch(value,/[\u4e00-\u9fff]/,key);
   assert.equal(english['安排检查'],'Schedule check');
   assert.equal(english['Issue 已变化，等待同步后重评'],'Issue changed; waiting for sync and reassessment');
+  assert.equal(english['连接超时'],'Connection timed out');
+  assert.equal(english['通用'],'General');
+  const definitions=[...i18n.matchAll(/^  "((?:[^"\\]|\\.)*)":/gm)].map(match=>match[1]);
+  assert.equal(definitions.length,new Set(definitions).size,'english 对象存在重复定义的 key');
 });
 
 test('the live run stage marks an in-progress review before its stage row exists', () => {

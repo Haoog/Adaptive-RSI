@@ -10,7 +10,7 @@ from unittest.mock import patch
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.config import validate
 from adaptive_rsi.gitops import git
-from adaptive_rsi.native import Conversation, WorkspaceTools, tools_for
+from adaptive_rsi.native import Conversation, NativeAgent, WorkspaceTools, tools_for
 from adaptive_rsi.store import Store
 
 
@@ -37,14 +37,18 @@ class ProtocolFixture:
                               ("finish", {"summary": "Fixed addition"})][min(step - 1, 2)]
                 if fixture.behavior == "long_loop" and step <= 35:
                     name, args = "read_file", {"path": "source.py", "start_line": 1, "end_line": 10}
+                if fixture.behavior == "bad_finish":
+                    # One invalid finish, then the model corrects itself on the next turn.
+                    name, args = ("finish", {}) if step == 1 else ("finish", {"summary": "Fixed addition"})
+                if fixture.behavior == "bad_arguments":
+                    # Arguments that are not valid JSON; the agent must report them back instead of failing the run.
+                    name, args = ("read_file", "{\"path") if step == 1 else ("finish", {"summary": "Fixed addition"})
                 if fixture.behavior == "text_only":
                     data = {"choices": [{"message": {"role": "assistant", "content": "I am done"}}]}
-                elif fixture.behavior == "bad_finish":
-                    data = {"choices": [{"message": {"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "finish", "arguments": "{}"}}]}}]}
                 elif protocol == "responses":
-                    data = {"output": [{"type": "function_call", "id": "fc" + str(step), "call_id": "call" + str(step), "name": name, "arguments": json.dumps(args)}], "usage": {"input_tokens": 10, "output_tokens": 5}}
+                    data = {"output": [{"type": "function_call", "id": "fc" + str(step), "call_id": "call" + str(step), "name": name, "arguments": args if isinstance(args, str) else json.dumps(args)}], "usage": {"input_tokens": 10, "output_tokens": 5}}
                 elif protocol in ["chat_completions", "ollama"]:
-                    message = {"role": "assistant", "content": "", "tool_calls": [{"id": "call" + str(step), "type": "function", "function": {"name": name, "arguments": args if protocol == "ollama" else json.dumps(args)}}]}
+                    message = {"role": "assistant", "content": "", "tool_calls": [{"id": "call" + str(step), "type": "function", "function": {"name": name, "arguments": args if (protocol == "ollama" or isinstance(args, str)) else json.dumps(args)}}]}
                     data = {"message": message, "prompt_eval_count": 10, "eval_count": 5} if protocol == "ollama" else {"choices": [{"message": message}], "usage": {"total_tokens": 15}}
                 elif protocol == "anthropic":
                     data = {"role": "assistant", "content": [{"type": "tool_use", "id": "call" + str(step), "name": name, "input": args}], "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2}}
@@ -123,14 +127,74 @@ class NativeProtocolsTest(unittest.TestCase):
                     self.assertEqual(second["messages"][2]["role"], "tool")
 
     def test_unsupported_results_fail_closed(self):
-        for behavior in ["text_only", "bad_finish"]:
-            with self.subTest(behavior=behavior), ProtocolFixture("chat_completions", behavior) as fixture:
-                config = self.config(fixture, "chat_completions", run_calls=1)
-                with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}), self.assertRaises(RuntimeError):
-                    CodexAgent(self.store).invoke("implementation", "task", self.workspace, behavior, behavior, config)
-                self.assertEqual(len(fixture.requests), 1)
-                state = self.store.one("SELECT state FROM calls WHERE project=?", (behavior,))["state"]
-                self.assertEqual(state, "failed")
+        with ProtocolFixture("chat_completions", "text_only") as fixture:
+            config = self.config(fixture, "chat_completions", run_calls=1)
+            with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}), self.assertRaises(RuntimeError):
+                CodexAgent(self.store).invoke("implementation", "task", self.workspace, "text_only", "text_only", config)
+            self.assertEqual(len(fixture.requests), 1)
+            state = self.store.one("SELECT state FROM calls WHERE project=?", ("text_only",))["state"]
+            self.assertEqual(state, "failed")
+
+    def test_invalid_finish_arguments_are_reported_back_and_retried(self):
+        for protocol in ["responses", "chat_completions"]:
+            project = "bad-finish-" + protocol
+            with self.subTest(protocol=protocol), ProtocolFixture(protocol, "bad_finish") as fixture:
+                config = self.config(fixture, protocol)
+                with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}):
+                    result = CodexAgent(self.store).invoke("implementation", "task", self.workspace, project, project, config)
+                self.assertEqual(result, {"summary": "Fixed addition"})
+                self.assertEqual(len(fixture.requests), 2)
+                retry = fixture.requests[1][2]
+                if protocol == "responses":
+                    self.assertEqual(retry["input"][2]["type"], "function_call_output")
+                    self.assertEqual(retry["input"][2]["call_id"], "call1")
+                    error = retry["input"][2]["output"]
+                else:
+                    self.assertEqual(retry["messages"][2]["role"], "tool")
+                    error = retry["messages"][2]["content"]
+                self.assertIn("finish arguments failed schema validation", error)
+                states = [c["state"] for c in self.store.query("SELECT state FROM calls WHERE project=? ORDER BY created", (project,))]
+                self.assertEqual(states, ["completed", "completed"])
+
+    def test_unparseable_tool_arguments_are_reported_back_and_retried(self):
+        for protocol in ["responses", "chat_completions", "anthropic", "gemini", "ollama"]:
+            with self.subTest(protocol=protocol), ProtocolFixture(protocol, "bad_arguments") as fixture:
+                config = self.config(fixture, protocol)
+                with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}):
+                    result = CodexAgent(self.store).invoke("implementation", "task", self.workspace, "bad-args-" + protocol, "bad-args", config)
+                self.assertEqual(result, {"summary": "Fixed addition"})
+                self.assertEqual(len(fixture.requests), 2)
+                retry = fixture.requests[1][2]
+                if protocol == "responses":
+                    self.assertEqual(retry["input"][2]["type"], "function_call_output")
+                    self.assertEqual(retry["input"][2]["call_id"], "call1")
+                elif protocol in ["chat_completions", "ollama"]:
+                    self.assertEqual(retry["messages"][2]["role"], "tool")
+                elif protocol == "anthropic":
+                    self.assertEqual(retry["messages"][2]["content"][0]["tool_use_id"], "call1")
+                else:
+                    self.assertEqual(retry["contents"][2]["parts"][0]["functionResponse"]["name"], "read_file")
+                self.assertIn("not valid JSON", json.dumps(retry))
+                states = [c["state"] for c in self.store.query("SELECT state FROM calls WHERE project=? ORDER BY created", ("bad-args-" + protocol,))]
+                self.assertEqual(states, ["completed", "completed"])
+
+    def test_probe_uses_short_timeout_while_other_roles_allow_long_generation(self):
+        captured = []
+
+        def fake_post_json(url, payload, headers, timeout, max_bytes):
+            captured.append(timeout)
+            return {"output": [{"type": "function_call", "call_id": "call1", "name": "finish", "arguments": json.dumps({"summary": "RSI_OK"})}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+        provider = {"id": "native", "name": "Fixture", "protocol": "responses", "base_url": "http://127.0.0.1:9", "env_key": ""}
+        route = {"model": "test-model", "effort": "default"}
+        config = validate({})
+        with patch("adaptive_rsi.native.post_json", side_effect=fake_post_json):
+            probe = NativeAgent(self.store).invoke("probe", "Probe the loop", self.workspace, "timeout-probe", "timeout", config, route, provider)
+            implementation = NativeAgent(self.store).invoke("implementation", "Implement it", self.workspace, "timeout-implementation", "timeout", config, route, provider)
+        self.assertEqual(probe, {"summary": "RSI_OK"})
+        self.assertEqual(implementation, {"summary": "RSI_OK"})
+        self.assertEqual(captured, [30, 300])
 
     def test_tool_loop_continues_past_old_call_and_turn_limits(self):
         with ProtocolFixture("chat_completions", "long_loop") as fixture:

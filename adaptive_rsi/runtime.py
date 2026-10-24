@@ -26,6 +26,13 @@ Do not push, merge, publish, run git hooks, or modify user configuration. Work o
 The host runs acceptance checks independently. Missing evidence must be reported honestly.
 """
 
+# 额度类等待（waiting_budget）的自动恢复闸门：初始退避 15 分钟并按等待次数翻倍
+# （上限 1 小时），tasks.available 复用为「最早可领取时间」；自动退避重试达到
+# BUDGET_WAIT_RETRIES 次后不再重排，转 blocked 由用户手动重试。
+BUDGET_WAIT_SECONDS = 900
+BUDGET_WAIT_MAX_SECONDS = 3600
+BUDGET_WAIT_RETRIES = 3
+
 
 class Runtime:
     def __init__(self, store, agent=None):
@@ -41,8 +48,12 @@ class Runtime:
         self._scheduler_failures = {}
         self.import_lock = threading.Lock()
         self.import_in_progress = False
-        self.baseline_lock = threading.RLock()
+        # 按项目粒度的基线锁：锁内包含网络 fetch，全局锁会让多项目基线刷新互相阻塞。
+        self._baseline_locks = {}
+        self._baseline_locks_guard = threading.Lock()
         self.dispatch_lock = threading.RLock()
+        self.maintenance_lock = threading.Lock()
+        self.maintenance_thread = None
         from .updates import UpdateManager
         self.updates = UpdateManager(self)
         from .model_center import ModelCenter
@@ -62,6 +73,15 @@ class Runtime:
         if not row:
             raise ValueError("Project not found")
         return row
+
+    def baseline_lock_for(self, project):
+        # 用一把短锁保护 dict 创建，避免并发首次获取时的竞态；锁本身按项目隔离。
+        with self._baseline_locks_guard:
+            lock = self._baseline_locks.get(project)
+            if lock is None:
+                lock = threading.RLock()
+                self._baseline_locks[project] = lock
+            return lock
 
     def add_project(self, path, name=None, enabled=False):
         with self.dispatch_lock:
@@ -302,7 +322,7 @@ class Runtime:
                 raise ValueError("Combined requirements exceed 30000 characters")
             db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
                        (task, row["body"], supplement.strip(), time.time()))
-            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,updated=? WHERE id=?", (body, time.time(), task))
+            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, time.time(), task))
         self.store.event("requirements_revised", "Requirements supplemented; fresh verification required", row["project"], data={"task": task})
         self.wake.set()
 
@@ -407,13 +427,19 @@ class Runtime:
         except BlockingIOError:
             self.lockfile.close()
             raise RuntimeError("Another runtime already owns this state directory")
-        if paused:
-            self.store.execute("UPDATE projects SET paused=1")
-        self.updates.restore_startup()
-        self.store.recover()
-        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
-        self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
-        self.thread.start()
+        try:
+            if paused:
+                self.store.execute("UPDATE projects SET paused=1")
+            self.updates.restore_startup()
+            self.store.recover()
+            self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
+            self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
+            self.thread.start()
+        except BaseException:
+            # 启动失败时释放状态目录锁并关闭文件，成功路径保持原有行为（锁持有到 stop/进程结束）。
+            self.lockfile.close()
+            self.lockfile = None
+            raise
 
     def close(self):
         self.stop.set()
@@ -422,6 +448,8 @@ class Runtime:
         if self.thread:
             self.thread.join(timeout=10)
         self.pool.shutdown(wait=True)
+        if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
+            self.maintenance_thread.join(timeout=10)
         if self.lockfile:
             self.lockfile.close()
 
@@ -484,6 +512,13 @@ class Runtime:
             if not prior:
                 self.store.defer(task["id"], {"base": head, "triage_input": signature, "reason": "Legacy deferral retained until inputs change"})
                 continue
+            if "triage_input" not in prior:
+                # 历史 run 结果或迁移 decision 缺少 triage_input，无法判断输入是否变化；
+                # 与全新暂缓一致：记录当前基线与输入并保持暂缓，只有后续基线或输入真正变化才唤醒，
+                # 避免升级后首次 reassess 把全部历史暂缓任务一次性重新入队。
+                self.store.defer(task["id"], {**prior, "base": head, "triage_input": signature,
+                                              "reason": prior.get("reason") or "Legacy deferral retained until inputs change"})
+                continue
             baseline_changed = head != prior.get("base")
             # Implementation scope and issue locations do not prove a complete dependency set.
             paths = prior.get("related_paths", []) if prior.get("dependency_scope_complete") is True else []
@@ -503,9 +538,12 @@ class Runtime:
                 self.store.event("triage_recheck", "New evidence or execution baseline; deferred task queued for reassessment", project)
 
     def resume_budget(self, project, config):
-        # 兼容升级前等待额度的任务，下一次调度即可恢复。
-        self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE project=? AND state='waiting_budget'",
-                           (time.time(), project))
+        # 只重排退避期满的额度等待，避免调度循环对无额度项目形成热循环；
+        # 升级前遗留的 waiting_budget 任务 available 已过期，下一次调度照常恢复。
+        now = time.time()
+        self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
+                           "WHERE project=? AND state='waiting_budget' AND available<=?",
+                           (now, project, now))
 
     @contextlib.contextmanager
     def scheduler_scope(self, phase, project=None, run=None):
@@ -533,8 +571,7 @@ class Runtime:
                 self.updates.tick()
                 if self.updates.is_busy():
                     continue
-                with self.scheduler_scope("maintenance"):
-                    self.maintenance()
+                self.maintenance_async()
                 self.futures = {f for f in self.futures if not f.done()}
                 from .delivery import schedule as schedule_delivery
                 with self.scheduler_scope("delivery"):
@@ -555,7 +592,9 @@ class Runtime:
 
     def dispatch(self, eligible):
         # 持久化虚拟服务量：权重越高增长越慢，等待项目可持续获得执行机会。
-        while len(self.futures) < self.config()["limits"]["concurrency"]:
+        # 并发上限在本次 dispatch 内固定读取一次，避免每轮循环都重读配置（数据库查询+全量校验）。
+        concurrency = self.config()["limits"]["concurrency"]
+        while len(self.futures) < concurrency:
             ready = []
             now = time.time()
             for project, config in eligible:
@@ -610,15 +649,15 @@ class Runtime:
         return self.stop.is_set() or not row or row["paused"] or row["state"] == "cancelled"
 
     def active_strategies(self, project, config=None):
-        rows = self.store.query("SELECT id,kind,content FROM candidates WHERE project=? AND status='stable'", (project,))
+        # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
+        rows = self.store.query("SELECT id,kind,content,evidence FROM candidates WHERE project=? AND status='stable'", (project,))
         key = compatibility(config or self.config(project))
         result = []
         for row in rows:
-            evidence = self.store.one("SELECT evidence FROM candidates WHERE id=?", (row["id"],))
-            expected = json.loads(evidence["evidence"]).get("compatibility")
+            expected = json.loads(row["evidence"]).get("compatibility")
             if expected and expected != key:
                 continue
-            result.append({**row, "content": json.loads(row["content"])})
+            result.append({"id": row["id"], "kind": row["kind"], "content": json.loads(row["content"])})
         return result
 
     def memories(self, project, text):
@@ -626,9 +665,15 @@ class Runtime:
                                 "ORDER BY created DESC LIMIT 50", (project, time.time()))
         active = {c["id"] for c in self.active_strategies(project)}
         from .context import related
-        eligible = [{"content": r["content"][:2000], "evidence": json.loads(r["evidence"]), "created": r["created"], "triggers": json.loads(r["triggers"])}
-                    for r in rows if json.loads(r["evidence"]).get("candidate") in active and
-                    any(t.lower() in text.lower() for t in json.loads(r["triggers"]) if t.strip())]
+        lower = text.lower()
+        eligible = []
+        for r in rows:
+            # evidence/triggers 各只解析一次，供过滤与输出复用。
+            evidence = json.loads(r["evidence"])
+            triggers = json.loads(r["triggers"])
+            if evidence.get("candidate") in active and any(t.lower() in lower for t in triggers if t.strip()):
+                eligible.append({"content": r["content"][:2000], "evidence": evidence,
+                                 "created": r["created"], "triggers": triggers})
         return related(eligible, text)
 
     def invoke(self, role, text, workspace, run):
@@ -794,7 +839,24 @@ class Runtime:
                                        (problem["retry_at"], time.time(), task["id"]))
                     self.store.event("infrastructure_retry", "Temporary connection failure; fresh run scheduled", run["project"], run["id"], {"retry_at": problem["retry_at"]})
                     return
+            elif problem["code"] == "budget" and task:
+                # 额度类故障按等待次数退避重排；达到上限后转 blocked，等待用户手动重试。
+                waits = max(0, task["budget_waits"] or 0)
+                if waits >= BUDGET_WAIT_RETRIES:
+                    state = "blocked"
+                    problem = {**problem, "budget_waits": waits, "auto_retry_exhausted": True}
+                else:
+                    delay = min(BUDGET_WAIT_MAX_SECONDS, BUDGET_WAIT_SECONDS * 2 ** waits)
+                    problem = {**problem, "budget_waits": waits + 1, "retry_at": time.time() + delay}
             self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True)
+            if state == "waiting_budget" and task:
+                # tasks.available 记录「最早可领取时间」；resume_budget 只重排退避期满的任务。
+                self.store.execute("UPDATE tasks SET available=?,budget_waits=?,updated=? WHERE id=? AND state='waiting_budget'",
+                                   (problem["retry_at"], problem["budget_waits"], time.time(), task["id"]))
+            elif problem["code"] == "budget" and task:
+                # 退避重试额度用尽转 blocked 时清零计数，手动重试后闸门重新生效。
+                self.store.execute("UPDATE tasks SET budget_waits=0,updated=? WHERE id=? AND state='blocked'",
+                                   (time.time(), task["id"]))
         finally:
             self.wake.set()
 
@@ -910,12 +972,18 @@ class Runtime:
         candidates = []
         seen_keys = set()
         recurrences = 0
+        contents = {}
         for item in findings["findings"]:
             try:
                 relative_path(item["path"])
                 path = (workspace / item["path"]).resolve()
                 path.relative_to(workspace)
-                if not item["quote"].strip() or item["quote"] not in path.read_text(errors="replace") or not item["acceptance"]:
+                if not item["quote"].strip():
+                    continue
+                # 同一路径只读一次全文，多条 finding 复用缓存做引文包含检查。
+                if item["path"] not in contents:
+                    contents[item["path"]] = path.read_text(errors="replace")
+                if item["quote"] not in contents[item["path"]] or not item["acceptance"]:
                     continue
                 from .discovery import finding_identity, related_task
                 finding_key = finding_identity(item)
@@ -1094,6 +1162,25 @@ class Runtime:
     def rollback_strategy(self, candidate):
         from .evolution import Evolution
         return Evolution(self).rollback(candidate)
+
+    def maintenance_async(self):
+        # maintenance 里的批量删除可能耗时数秒，放到后台线程执行，避免阻塞调度循环；
+        # 同一时刻只允许一个清理线程，重入直接跳过，未完成的清理由下一轮调度继续。
+        # 线程为 daemon，退出时不残留非守护线程；close() 会等待其收尾。
+        if time.time() - self.store.setting("maintenance-last", 0) < 3600:
+            return
+        if not self.maintenance_lock.acquire(blocking=False):
+            return
+        self.maintenance_thread = threading.Thread(target=self._maintenance_worker,
+                                                   name="rsi-maintenance", daemon=True)
+        self.maintenance_thread.start()
+
+    def _maintenance_worker(self):
+        try:
+            with self.scheduler_scope("maintenance"):
+                self.maintenance()
+        finally:
+            self.maintenance_lock.release()
 
     def maintenance(self):
         import shutil

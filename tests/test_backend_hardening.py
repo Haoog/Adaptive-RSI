@@ -174,14 +174,14 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.runtime.close()
         self.temp.cleanup()
 
-    def post(self, path, payload):
+    def post(self, path, payload, origin=None):
         import http.client
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
         try:
             body = json.dumps(payload).encode()
             connection.request("POST", path, body=body, headers={
                 "Content-Type": "application/json", "Content-Length": str(len(body)),
-                "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+                "Origin": origin or self.server.origin, "X-RSI-CSRF": self.server.csrf,
                 "Cookie": self.server.cookie + "=" + self.server.token})
             response = connection.getresponse()
             return response.status, json.loads(response.read())
@@ -279,6 +279,22 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.assertEqual(self.runtime.project(self.project)["paused"], 0)
         self.assertEqual(self.runtime.store.query(
             "SELECT key FROM settings WHERE key LIKE ?", ("project-config-repair-backup:" + self.project + ":%",)), [])
+
+    def test_post_accepts_local_origin_besides_configured_public_origin(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(3)
+        self.server = Server(self.runtime, public_url="https://rsi.example.com")
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.assertNotEqual(self.server.origin, self.server.local_origin)
+        status, _ = self.post("/api/pause", {"project": self.project, "paused": True})
+        self.assertEqual(status, 200)
+        status, _ = self.post("/api/pause", {"project": self.project, "paused": False}, origin=self.server.local_origin)
+        self.assertEqual(status, 200)
+        status, body = self.post("/api/pause", {"project": self.project, "paused": True}, origin="https://evil.example")
+        self.assertEqual(status, 403)
+        self.assertEqual(body, {"error": "Invalid origin or CSRF token"})
 
 
 class ImportAdmissionTest(unittest.TestCase):

@@ -30,6 +30,8 @@ from .process import run_process
 ACTIVE = {"starting", "awaiting_authorization", "completing"}
 TERMINAL = {"completed", "cancelled", "expired", "failed", "interrupted"}
 MAX_BYTES = 1024 * 1024
+# providers 发现结果要完整启动一个 worker（Docker 模式下是一个容器），缓存短 TTL 内的重复查询。
+PROVIDERS_CACHE_TTL = 25
 # 父服务退出或崩溃时控制管道关闭；整个认证进程组随即停止。
 _SUPERVISOR = """import os,subprocess,sys,threading
 fd=int(sys.argv[1])
@@ -224,10 +226,10 @@ class CodexAuth(_Process):
         except AuthError:
             self.close()
             raise
-        config = self.home / ".codex"
-        config.mkdir(mode=0o700)
+        codex_home = self.home / ".codex"
+        codex_home.mkdir(mode=0o700)
         # 文件存储与执行器读取 auth.json 的约定一致，禁止加载用户配置。
-        (config / "config.toml").write_text('cli_auth_credentials_store = "file"\nmodel_provider = "openai"\n[analytics]\nenabled = false\n')
+        (codex_home / "config.toml").write_text('cli_auth_credentials_store = "file"\nmodel_provider = "openai"\n[analytics]\nenabled = false\n')
         self.environment["RUST_LOG"] = "off"
         try:
             self.launch([binary, "app-server", "--listen", "stdio://"], subprocess.PIPE, subprocess.PIPE)
@@ -361,33 +363,11 @@ class OpenCodeAuth(_Process):
             target = self.home / ".cache/opencode/models.json"
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(cache, target)
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            port = listener.getsockname()[1]
+        port = self._port()
         self.base = "http://127.0.0.1:" + str(port)
         try:
             self.publish = self.container
-            self.launch(self.capabilities.serve_argv(
-                binary, "0.0.0.0" if self.container else "127.0.0.1", 4096 if self.container else port))
-            deadline = time.monotonic() + 25
-            while True:
-                if self.cancel.is_set():
-                    raise AuthError("service_closed")
-                try:
-                    if self.container and self.base.endswith(":" + str(port)):
-                        mapping = subprocess.run([shutil.which("docker"), "port", self.container_name, "4096/tcp"],
-                                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                                 stderr=subprocess.DEVNULL, timeout=3)
-                        match = re.fullmatch(rb"127\.0\.0\.1:(\d+)\s*", mapping.stdout)
-                        if not match:
-                            raise AuthError("auth_container_unavailable")
-                        self.base = "http://127.0.0.1:" + match[1].decode()
-                    self.http("GET", "/api/info" if self.capabilities.modern else "/global/health", timeout=1)
-                    break
-                except AuthError:
-                    if not self.alive() or time.monotonic() >= deadline:
-                        raise AuthError("auth_protocol_error") from None
-                    time.sleep(0.05)
+            self._serve(binary, port)
         except Exception:
             self.close()
             raise
@@ -395,6 +375,47 @@ class OpenCodeAuth(_Process):
     @property
     def credentials(self):
         return self.home / ".local/share/opencode/auth.json"
+
+    def _port(self):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            return listener.getsockname()[1]
+
+    def _serve(self, binary, port):
+        # 启动回环服务并等待就绪。端口可能在探测与实际绑定之间被其他进程抢占，
+        # 此时服务进程会立即退出：未超时且进程已死时换一个新端口重新 launch 一次。
+        deadline = time.monotonic() + 25
+        self.launch(self.capabilities.serve_argv(
+            binary, "0.0.0.0" if self.container else "127.0.0.1", 4096 if self.container else port))
+        retried = False
+        while True:
+            if self.cancel.is_set():
+                raise AuthError("service_closed")
+            try:
+                if self.container and self.base.endswith(":" + str(port)):
+                    mapping = subprocess.run([shutil.which("docker"), "port", self.container_name, "4096/tcp"],
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                             stderr=subprocess.DEVNULL, timeout=3)
+                    match = re.fullmatch(rb"127\.0\.0\.1:(\d+)\s*", mapping.stdout)
+                    if not match:
+                        raise AuthError("auth_container_unavailable")
+                    self.base = "http://127.0.0.1:" + match[1].decode()
+                self.http("GET", "/api/info" if self.capabilities.modern else "/global/health", timeout=1)
+                return
+            except AuthError:
+                if not self.alive() and time.monotonic() < deadline and not retried:
+                    retried = True
+                    if self.control is not None:
+                        os.close(self.control)
+                        self.control = None
+                    port = self._port()
+                    self.base = "http://127.0.0.1:" + str(port)
+                    self.launch(self.capabilities.serve_argv(
+                        binary, "0.0.0.0" if self.container else "127.0.0.1", 4096 if self.container else port))
+                    continue
+                if not self.alive() or time.monotonic() >= deadline:
+                    raise AuthError("auth_protocol_error") from None
+                time.sleep(0.05)
 
     def http(self, method, path, body=None, timeout=25):
         request = urllib.request.Request(self.base + path,
@@ -612,6 +633,7 @@ class OpenCodeAuth(_Process):
                 raise AuthError("authorization_failed")
             return True
         deadline = time.monotonic() + max(1, timeout)
+        interval = 0.5
         while time.monotonic() < deadline:
             value = self.http("GET", base, timeout=min(25, max(1, deadline - time.monotonic())))
             data = value.get("data") if isinstance(value, dict) else None
@@ -622,7 +644,9 @@ class OpenCodeAuth(_Process):
                 raise AuthError("authorization_failed" if status == "failed" else "auth_expired")
             if status != "pending":
                 raise AuthError("invalid_response")
-            time.sleep(0.2)
+            # 阶梯退避轮询：0.5s 起步逐步加倍、3s 封顶，截止时间与状态处理不变。
+            time.sleep(min(interval, max(0, deadline - time.monotonic())))
+            interval = min(3.0, interval * 2)
         raise AuthError("auth_timeout")
 
     def set_api_key(self, provider, key):
@@ -722,6 +746,8 @@ class AuthSessions:
         self.ttl = ttl
         self.config = config
         self.custom_factory = factory is not None
+        # backend -> (expires_at, rows)；测试注入 factory 时不缓存，便于断言每次真实发现。
+        self.providers_cache = {}
         self.factory = factory or (lambda backend, cancel=None: (CodexAuth if backend == "codex" else OpenCodeAuth)(
             self.config() if callable(self.config) else self.config, cancel=cancel or self.shutdown))
         try:
@@ -835,6 +861,10 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            if not self.custom_factory:
+                cached = self.providers_cache.get(backend)
+                if cached and cached[0] > time.monotonic():
+                    return copy.deepcopy(cached[1])
         if backend != "opencode":
             return []
         worker = self.factory(backend)
@@ -843,11 +873,16 @@ class AuthSessions:
                 if self.closed:
                     raise AuthError("service_closed")
                 self.discoveries.add(worker)
-            return worker.providers()
+            rows = worker.providers()
         finally:
             with self.lock:
                 self.discoveries.discard(worker)
             worker.close()
+        # worker 已关闭，rows 只是纯数据，可安全缓存供短 TTL 内复用。
+        with self.lock:
+            if not self.closed and not self.custom_factory:
+                self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
+        return rows
 
     def _thread(self, target):
         def run():
@@ -883,6 +918,8 @@ class AuthSessions:
                                          "state": "starting", "expires_at": time.time() + self.ttl, "error": ""}
             self._persist()
             self._thread(lambda: self._run(session_id, method, inputs))
+            # 认证状态即将变化，缓存的供应商发现结果不再可靠。
+            self.providers_cache.pop(backend, None)
             return copy.deepcopy(self.sessions[session_id])
 
     def _update(self, session_id, **values):
@@ -989,17 +1026,23 @@ class AuthSessions:
             credential_lock.release()
 
     def status(self, session_id):
+        expired_worker = None
         with self.lock:
             if not isinstance(session_id, str) or session_id not in self.sessions:
                 raise AuthError("unknown_session")
             item = self.sessions[session_id]
             if item["state"] in ACTIVE and time.time() >= item["expires_at"]:
                 self._update(session_id, state="expired", error="auth_expired")
-                if session_id in self.workers:
-                    self.workers[session_id][1].set()
-                    if self.workers[session_id][0]:
-                        self.workers[session_id][0].close()
-            return copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
+                # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
+                # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
+                # 与 cancel()/_run()/close() 的并发路径一致，不会双重关闭。
+                expired_worker = self.workers.pop(session_id, None)
+                if expired_worker:
+                    expired_worker[1].set()
+            result = copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
+        if expired_worker and expired_worker[0]:
+            expired_worker[0].close()
+        return result
 
     def complete(self, session_id, code=""):
         if not isinstance(code, str) or len(code) > 8192:
@@ -1067,6 +1110,8 @@ class AuthSessions:
                 stop.set()
                 if worker:
                     worker.close()
+        with self.lock:
+            self.providers_cache.pop(backend, None)
         return self.snapshot()
 
     def set_api_key(self, backend, provider, key):
@@ -1104,12 +1149,15 @@ class AuthSessions:
             if worker:
                 worker.close()
             AUTH_LOCK.release()
+        with self.lock:
+            self.providers_cache.pop(backend, None)
         return self.snapshot()
 
     def close(self):
         with self.lock:
             self.closed = True
             self.shutdown.set()
+            self.providers_cache.clear()
             workers = list(self.workers.values())
             discoveries = list(self.discoveries)
             for key, item in self.sessions.items():

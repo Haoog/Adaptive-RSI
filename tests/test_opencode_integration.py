@@ -13,7 +13,7 @@ from unittest.mock import patch
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.auth_sessions import OpenCodeAuth
 from adaptive_rsi.config import validate
-from adaptive_rsi.opencode import OpenCodeAgent, OpenCodeCapabilities, auth_providers, merge_auth_export, remove_auth_export
+from adaptive_rsi.opencode import OpenCodeAgent, OpenCodeCapabilities, auth_providers, merge_auth_export, parse_events, remove_auth_export
 from adaptive_rsi.store import Store
 
 
@@ -96,6 +96,15 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
                     "probe", "Return a valid result", workspace, "p", "run", config,
                     config["models"]["implementation"])
             return value, captured[0]
+
+    def test_parse_events_accepts_uppercase_json_fence(self):
+        events = "\n".join([
+            json.dumps({"type": "step_finish", "part": {"id": "step", "tokens": {"input": 5, "output": 2}}}),
+            json.dumps({"type": "text", "part": {"text": "```JSON\n{\"summary\":\"fence\"}\n```"}}),
+        ])
+        data, steps = parse_events(events, strict=False)
+        self.assertEqual(data, {"summary": "fence"})
+        self.assertEqual(len(steps), 1)
 
     def test_v1_and_v2_run_commands_use_version_specific_variant_syntax(self):
         value, legacy = self.invoke("1.19.3")

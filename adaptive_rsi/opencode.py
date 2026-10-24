@@ -518,7 +518,8 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
         if binary:
             credentials = exported_auth
             if credentials is None:
-                credentials = export_auth(binary, capabilities, _host_auth_environment(), prefix)
+                with AUTH_LOCK:
+                    credentials = export_auth(binary, capabilities, _host_auth_environment(), prefix)
             if prefix:
                 credentials = [item for item in credentials if item.get("integrationID") == prefix]
             import_auth(binary, {**_isolated_environment(home), **environment}, credentials, home)
@@ -529,8 +530,9 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
         if isinstance(exported_auth, dict):
             auth = exported_auth
         else:
-            source = auth_path()
-            auth = json.loads(source.read_text()) if source.is_file() else {}
+            with AUTH_LOCK:
+                source = auth_path()
+                auth = json.loads(source.read_text()) if source.is_file() else {}
         auth = {key: value for key, value in auth.items()
                 if (prefix is None or key == prefix) and isinstance(value, dict)
                 and value.get("type") in ["api", "oauth"]}
@@ -578,7 +580,8 @@ def parse_events(text, strict=True):
     for text in reversed(final):
         text = text.strip()
         if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+            # 语言标签大小写不敏感，避免 ```JSON 围栏导致解析失败。
+            text = re.sub(r"^```(?i:json)?\s*|\s*```$", "", text)
         try:
             return json.loads(text), usage
         except ValueError:
@@ -618,7 +621,7 @@ class OpenCodeAgent:
         call = self.store.reserve_call(project, run, role, route, config)
         started = time.monotonic()
         try:
-            with AUTH_LOCK, cli_home(workspace) as home:
+            with cli_home(workspace) as home:
                 try:
                     host_capabilities = detect_opencode(host_binary) if host_binary else None
                     if container:
@@ -641,29 +644,31 @@ class OpenCodeAgent:
                     raise RuntimeError("OpenCode command compatibility check failed: " + exc.code) from None
                 provider_prefix = route["model"].split("/", 1)[0]
                 host_export, host_legacy, host_original_export = [], {}, []
-                if host_capabilities and host_capabilities.modern:
-                    host_export = export_auth(host_binary, host_capabilities, _host_auth_environment(),
-                                              provider_prefix)
-                elif host_capabilities:
-                    host_legacy = json.loads(auth_path().read_text()) if auth_path().is_file() else {}
-                if capabilities.modern:
+                # 仅在读取宿主凭据存储时持锁；隔离 home 与模型调用不串行。
+                with AUTH_LOCK:
                     if host_capabilities and host_capabilities.modern:
-                        original_auth = host_export
+                        host_export = export_auth(host_binary, host_capabilities, _host_auth_environment(),
+                                                  provider_prefix)
                     elif host_capabilities:
-                        original_auth = _modern_rows(provider_prefix, host_legacy.get(provider_prefix))
+                        host_legacy = json.loads(auth_path().read_text()) if auth_path().is_file() else {}
+                    if capabilities.modern:
+                        if host_capabilities and host_capabilities.modern:
+                            original_auth = host_export
+                        elif host_capabilities:
+                            original_auth = _modern_rows(provider_prefix, host_legacy.get(provider_prefix))
+                        else:
+                            original_auth = [item for item in load_auth_export()
+                                             if item.get("integrationID") == provider_prefix]
                     else:
-                        original_auth = [item for item in load_auth_export()
-                                         if item.get("integrationID") == provider_prefix]
-                else:
-                    if host_capabilities and host_capabilities.modern:
-                        host_original_export = host_export
-                        legacy = _legacy_auth(host_export, provider_prefix)
-                        original_auth = {provider_prefix: legacy} if legacy else {}
-                    else:
-                        original_auth = host_legacy if host_capabilities else (
-                            json.loads(auth_path().read_text()) if auth_path().is_file() else {})
-                        original_auth = {key: value for key, value in original_auth.items()
-                                         if key == provider_prefix and isinstance(value, dict)}
+                        if host_capabilities and host_capabilities.modern:
+                            host_original_export = host_export
+                            legacy = _legacy_auth(host_export, provider_prefix)
+                            original_auth = {provider_prefix: legacy} if legacy else {}
+                        else:
+                            original_auth = host_legacy if host_capabilities else (
+                                json.loads(auth_path().read_text()) if auth_path().is_file() else {})
+                            original_auth = {key: value for key, value in original_auth.items()
+                                             if key == provider_prefix and isinstance(value, dict)}
                 environment, secrets = prepare_home(
                     home, route["model"], read_only=role != "implementation",
                     container=container, capabilities=capabilities,
@@ -690,14 +695,17 @@ class OpenCodeAgent:
                     result = run_cli(argv, workspace, home, config, cancel, protected, role != "implementation", environment, self.store.root)
                 finally:
                     if capabilities.modern and host_capabilities and host_capabilities.modern:
-                        secrets += sync_oauth(home, route["model"], original_auth, capabilities,
-                                              host_binary)
+                        with AUTH_LOCK:
+                            secrets += sync_oauth(home, route["model"], original_auth, capabilities,
+                                                  host_binary)
                     elif not capabilities.modern and host_capabilities and host_capabilities.modern:
-                        secrets += sync_legacy_worker_to_modern_host(
-                            home, route["model"], host_original_export,
-                            original_auth.get(provider_prefix), host_binary, host_capabilities)
+                        with AUTH_LOCK:
+                            secrets += sync_legacy_worker_to_modern_host(
+                                home, route["model"], host_original_export,
+                                original_auth.get(provider_prefix), host_binary, host_capabilities)
                     elif not capabilities.modern:
-                        secrets += sync_oauth(home, route["model"], original_auth, capabilities)
+                        with AUTH_LOCK:
+                            secrets += sync_oauth(home, route["model"], original_auth, capabilities)
                     elif capabilities.modern:
                         try:
                             exported = run_cli(
@@ -707,13 +715,14 @@ class OpenCodeAgent:
                             rows = _parse_auth_export(exported.get("stdout", "")) if not (
                                 exported["exit_code"] or exported["error"]) else []
                             if rows:
-                                if host_capabilities:
-                                    secrets += sync_modern_worker_to_legacy_host(
-                                        rows, route["model"], original_auth.get(provider_prefix)
-                                        if isinstance(original_auth, dict) else
-                                        host_legacy.get(provider_prefix))
-                                else:
-                                    merge_auth_export(rows)
+                                with AUTH_LOCK:
+                                    if host_capabilities:
+                                        secrets += sync_modern_worker_to_legacy_host(
+                                            rows, route["model"], original_auth.get(provider_prefix)
+                                            if isinstance(original_auth, dict) else
+                                            host_legacy.get(provider_prefix))
+                                    else:
+                                        merge_auth_export(rows)
                                 for item in rows:
                                     secrets += [value for value in item.get("value", {}).values()
                                                 if isinstance(value, str) and len(value) > 8]
