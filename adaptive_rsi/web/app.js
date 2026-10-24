@@ -624,7 +624,7 @@ function renderUpdateExtras(update){
 }
 function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};
  const progress=update.state==='downloading'&&Number.isFinite(update.progress)?' · '+Math.max(0,Math.min(100,Math.round(update.progress)))+'%':'';
- const channel=updateChannels[update.channel]?' · '+t('安装方式')+t('：')+t(updateChannels[update.channel]):'';
+ const channel=updateChannels[update.channel]?' · '+t('安装渠道')+t('：')+t(updateChannels[update.channel]):'';
  let status=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'')+progress;
  if(update.desktop_managed)status=t('桌面版请安装新版软件，项目和记录会保留。')+channel;
  else status=t('后台服务')+' · '+status+channel;

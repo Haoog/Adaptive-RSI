@@ -1249,7 +1249,7 @@ const english = {
   "项目时区": "Project timezone",
   "等待模型服务恢复用量": "Waiting for provider usage to recover",
   "这个版本更新了什么": "What is new in this version",
-  "安装方式": "Installed via",
+  "安装渠道": "Installed via",
   "桌面应用": "the desktop app",
   "Python 包（建议用 pip 升级）": "a Python package (prefer pip upgrades)",
   "内置自更新": "built-in self-update",
