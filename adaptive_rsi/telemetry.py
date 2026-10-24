@@ -36,10 +36,14 @@ def quality_summary(store, project=None):
 
 
 def workflow_metrics(store, project=None):
-    """Logical task outcomes; elapsed spans and model call durations remain separate."""
+    """Logical task outcomes; elapsed spans and model call durations remain separate.
+
+    派生数据各用一条聚合查询取回，避免逐任务 N+1 查询；输出结构与逐任务版本一致。
+    """
     cutoff = time.time() - 30 * 86400
-    tasks = store.query("SELECT * FROM tasks WHERE source NOT LIKE 'system_%' AND created>?" +
-                        (" AND project=?" if project else ""), (cutoff, project) if project else (cutoff,))
+    scope = "SELECT id FROM tasks WHERE source NOT LIKE 'system_%' AND created>?" + (" AND project=?" if project else "")
+    scope_args = (cutoff, project) if project else (cutoff,)
+    tasks = store.query("SELECT * FROM tasks WHERE id IN (" + scope + ")", scope_args)
     result = {"window_days": 30, "tasks": len(tasks), "accepted": 0, "delivered": 0,
               "first_pass": 0, "infrastructure_failures": 0, "repeated_failures": 0,
               "requirements_revised": 0, "elapsed_samples": 0, "elapsed_seconds": 0,
@@ -48,8 +52,32 @@ def workflow_metrics(store, project=None):
               "delivered_tokens": 0, "delivered_unknown_calls": 0, "remote_wait_seconds": {}, "remote_wait_samples": 0,
               "to_pr_seconds": 0, "to_pr_samples": 0, "to_merge_seconds": 0, "to_merge_samples": 0,
               "interventions": 0, "stale_rework": 0, "invalidations": {}}
+    runs_by_task = {}
+    for run in store.query("SELECT * FROM runs WHERE task IN (" + scope + ") ORDER BY task,started,id", scope_args):
+        runs_by_task.setdefault(run["task"], []).append(run)
+    run_ids = [run["id"] for rows in runs_by_task.values() for run in rows]
+    run_scope = "(" + ",".join("?" for _ in run_ids) + ")"
+    implemented = {row["run"] for row in store.query(
+        "SELECT DISTINCT run FROM phase_times WHERE phase='implementation' AND run IN " + run_scope, run_ids)} if run_ids else set()
+    if run_ids:
+        implemented |= {row["run"] for row in store.query(
+            "SELECT DISTINCT run FROM calls WHERE role='implementation' AND run IN " + run_scope, run_ids)}
+    pr_created_at = {row["run"]: row["at"] for row in store.query(
+        "SELECT run,min(created) AS at FROM events WHERE kind='pr' AND run IN " + run_scope + " GROUP BY run", run_ids)} if run_ids else {}
+    usage_by_task = {row["task"]: row for row in store.query(
+        "SELECT r.task AS task,sum(c.tokens) AS tokens,sum(c.usage_known=0) AS unknown,sum(c.seconds) AS seconds "
+        "FROM calls c JOIN runs r ON r.id=c.run WHERE r.task IN (" + scope + ") GROUP BY r.task", scope_args)}
+    revised = {row["task"] for row in store.query(
+        "SELECT DISTINCT task FROM task_revisions WHERE task IN (" + scope + ")", scope_args)}
+    interventions = {row["task"]: row["n"] for row in store.query(
+        "SELECT json_extract(data,'$.task') AS task,count(*) AS n FROM events WHERE "
+        "kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') GROUP BY 1")}
+    phase_rows = store.query(
+        "SELECT run,phase,ended-started AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN " + run_scope, run_ids) if run_ids else []
+    wait_rows = store.query(
+        "SELECT run,reason,ended-started AS seconds FROM remote_waits WHERE ended IS NOT NULL AND run IN " + run_scope, run_ids) if run_ids else []
     for task in tasks:
-        runs = store.query("SELECT * FROM runs WHERE task=? ORDER BY started,id", (task["id"],))
+        runs = runs_by_task.get(task["id"], [])
         code_attempts = []
         accepted = None
         failure_signatures = []
@@ -59,10 +87,7 @@ def workflow_metrics(store, project=None):
             evidence = json.loads(run["result"])
             infrastructure = evidence.get("failure", {}).get("code") in ["provider", "credentials", "environment"]
             result["infrastructure_failures"] += infrastructure
-            implemented = bool(evidence.get("evaluation") or store.one(
-                "SELECT 1 FROM phase_times WHERE run=? AND phase='implementation' LIMIT 1", (run["id"],)) or store.one(
-                "SELECT 1 FROM calls WHERE run=? AND role='implementation' LIMIT 1", (run["id"],)))
-            if not infrastructure and implemented:
+            if not infrastructure and (run["id"] in implemented or evidence.get("evaluation")):
                 code_attempts.append(run)
             if evidence.get("evaluation", {}).get("decision") == "pass" and evidence.get("review", {}).get("decision") == "pass":
                 accepted = accepted or run
@@ -73,18 +98,10 @@ def workflow_metrics(store, project=None):
                     "findings": [(f.get("path"), f.get("title")) for f in evidence.get("review", {}).get("findings", [])]}))
             if evidence.get("merged_at"):
                 merged_at.append(evidence["merged_at"])
-            pr = store.one("SELECT min(created) AS at FROM events WHERE run=? AND kind='pr'", (run["id"],))
-            if pr and pr["at"]:
-                pr_created.append(pr["at"])
+            if pr_created_at.get(run["id"]):
+                pr_created.append(pr_created_at[run["id"]])
             if run["state"] == "superseded" or evidence.get("failure", {}).get("code") == "baseline":
                 result["stale_rework"] += 1
-            for phase in store.query("SELECT phase,started,ended FROM phase_times WHERE run=? AND ended IS NOT NULL", (run["id"],)):
-                name = phase["phase"]
-                result["phase_seconds"][name] = result["phase_seconds"].get(name, 0) + max(0, phase["ended"] - phase["started"])
-            for wait in store.query("SELECT * FROM remote_waits WHERE run=? AND ended IS NOT NULL", (run["id"],)):
-                name = wait["reason"]
-                result["remote_wait_samples"] += 1
-                result["remote_wait_seconds"][name] = result["remote_wait_seconds"].get(name, 0) + max(0, wait["ended"] - wait["started"])
         result["repeated_failures"] += len(failure_signatures) > len(set(failure_signatures))
         if pr_created:
             result["to_pr_samples"] += 1
@@ -92,8 +109,8 @@ def workflow_metrics(store, project=None):
         if merged_at:
             result["to_merge_samples"] += 1
             result["to_merge_seconds"] += max(0, min(merged_at) - task["created"])
-        result["interventions"] += store.one("SELECT count(*) AS n FROM events WHERE json_extract(data,'$.task')=? AND kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved')", (task["id"],))["n"]
-        result["requirements_revised"] += bool(store.one("SELECT 1 FROM task_revisions WHERE task=? LIMIT 1", (task["id"],)))
+        result["interventions"] += interventions.get(task["id"], 0)
+        result["requirements_revised"] += task["id"] in revised
         if runs:
             result["queue_seconds"] += max(0, runs[0]["started"] - task["created"])
         result["delivered"] += task["state"] == "merged"
@@ -103,13 +120,20 @@ def workflow_metrics(store, project=None):
             if accepted["ended"]:
                 result["elapsed_samples"] += 1
                 result["elapsed_seconds"] += max(0, accepted["ended"] - task["created"])
-            usage = store.one("SELECT sum(c.tokens) AS tokens,sum(c.usage_known=0) AS unknown,sum(c.seconds) AS seconds FROM calls c JOIN runs r ON r.id=c.run WHERE r.task=?", (task["id"],))
-            result["accepted_tokens"] += usage["tokens"] or 0
-            result["accepted_unknown_calls"] += usage["unknown"] or 0
-            result["model_seconds"] += usage["seconds"] or 0
+            usage = usage_by_task.get(task["id"], {})
+            result["accepted_tokens"] += usage.get("tokens") or 0
+            result["accepted_unknown_calls"] += usage.get("unknown") or 0
+            result["model_seconds"] += usage.get("seconds") or 0
             if task["state"] == "merged":
-                result["delivered_tokens"] += usage["tokens"] or 0
-                result["delivered_unknown_calls"] += usage["unknown"] or 0
+                result["delivered_tokens"] += usage.get("tokens") or 0
+                result["delivered_unknown_calls"] += usage.get("unknown") or 0
+    for phase in phase_rows:
+        name = phase["phase"]
+        result["phase_seconds"][name] = result["phase_seconds"].get(name, 0) + max(0, phase["seconds"])
+    for wait in wait_rows:
+        name = wait["reason"]
+        result["remote_wait_samples"] += 1
+        result["remote_wait_seconds"][name] = result["remote_wait_seconds"].get(name, 0) + max(0, wait["seconds"])
     events = store.query("SELECT kind,count(*) AS n FROM events WHERE created>?" + (" AND project=?" if project else "") + " GROUP BY kind",
                          (cutoff, project) if project else (cutoff,))
     result["events"] = {row["kind"]: row["n"] for row in events}
