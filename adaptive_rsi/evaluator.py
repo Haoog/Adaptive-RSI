@@ -153,6 +153,8 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
         except ValueError:
             continue
         relative = Path(os.path.relpath(target, cwd)).as_posix()
+        if ".." in Path(relative).parts:
+            continue
         lower = [arg.lower() for arg in argv]
         command = None
         command_cwd = check.get("cwd", ".")

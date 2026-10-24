@@ -815,6 +815,12 @@ class EvidenceContractTest(unittest.TestCase):
                                                                             "discover", "-s", "tests"]}]))
         self.assertFalse(supports_test_first([{"name": "unit", "argv": ["python3", "-m", "unittest",
                                                                              "discover", "--unknown"]}]))
+        module_check = _isolated_test_check(
+            [{"name": "backend", "cwd": "backend", "argv": ["python3", "-m", "pytest", "tests"]},
+             {"name": "frontend", "cwd": "frontend", "argv": ["python3", "-m", "pytest", "tests"]}],
+            root, "frontend/tests/test_new.py")
+        self.assertEqual((module_check["cwd"], module_check["argv"]),
+                         ("frontend", ["python3", "-m", "pytest", "tests/test_new.py"]))
         self.assertEqual(_isolated_test_check(
             [{"name": "python", "cwd": "backend", "argv": ["python3", "-m", "pytest", "tests"]},
              {"name": "frontend", "cwd": ".", "argv": ["node", "--test"]}],
