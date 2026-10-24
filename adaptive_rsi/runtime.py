@@ -1223,7 +1223,11 @@ class Runtime:
                            "(SELECT id FROM tasks WHERE updated<? AND state NOT IN ('queued','planning','executing','evaluating'))", (stale, stale))
         self.store.execute("DELETE FROM submissions WHERE task IN "
                            "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed'))", (stale,))
-        for run in self.store.query("SELECT id FROM runs WHERE ended IS NOT NULL AND ended<? LIMIT 200", (stale,)):
+        # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
+        # 与上方目录清理的保护范围保持一致，不做无条件删除。
+        for run in self.store.query(
+                "SELECT id FROM runs WHERE ended IS NOT NULL AND ended<? AND state NOT IN "
+                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') LIMIT 200", (stale,)):
             for prefix in ("run-baseline:", "automation:", "delivery:"):
                 self.store.execute("DELETE FROM settings WHERE key=? OR key LIKE ?",
                                    (prefix + run["id"], prefix + run["id"] + ":%"))

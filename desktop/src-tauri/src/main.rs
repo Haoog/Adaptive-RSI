@@ -94,12 +94,17 @@ fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn check_desktop_update_blocking(app: &tauri::AppHandle) -> Option<Value> {
+fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<Value> {
     {
         let state = app.state::<RuntimeState>();
         let guard = state.update.lock().unwrap();
         if let Some(current) = guard.as_ref() {
-            if current.downloading.load(Ordering::Relaxed) {
+            // 下载中与已结束（成功打开/失败）的状态保留给轮询，直到显式强制刷新。
+            if !force
+                && (current.downloading.load(Ordering::Relaxed)
+                    || current.opened.load(Ordering::Relaxed)
+                    || !current.error.is_empty())
+            {
                 return Some(current.json());
             }
         }
@@ -595,8 +600,9 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
     Ok(runtime_info(state))
 }
 #[tauri::command]
-async fn check_desktop_update(app: tauri::AppHandle) -> Option<Value> {
-    tauri::async_runtime::spawn_blocking(move || check_desktop_update_blocking(&app))
+async fn check_desktop_update(app: tauri::AppHandle, force: Option<bool>) -> Option<Value> {
+    let force = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || check_desktop_update_blocking(&app, force))
         .await
         .ok()
         .flatten()

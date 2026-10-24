@@ -1261,7 +1261,8 @@ const english = {
   "校验未通过，已删除下载文件。": "Checksum verification failed; the download was removed.",
   "差异超过 2000 行，已折叠为纯文本。": "The diff exceeds 2000 lines and is shown as plain text.",
   "安装地址不可用": "The install address is unavailable",
-  "将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？": "This downloads the new desktop installer image and opens it automatically. Drag to install after the download. Continue?"
+  "将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？": "This downloads the new desktop installer image and opens it automatically. Drag to install after the download. Continue?",
+  "安装后应用会保留中文名称；界面语言仍跟随此处的选择。": "After installation the app keeps its Chinese name; the interface language still follows your choice here."
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }

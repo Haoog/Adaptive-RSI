@@ -34,13 +34,15 @@ if [[ -e "$target" ]]; then
 else
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
-  echo "下载 adaptive-rsi-$version-plugin.zip …"
-  curl -fsSL --retry 3 -o "$work/plugin.zip" \
-    "https://github.com/${repo}/releases/download/v${version}/adaptive-rsi-${version}-plugin.zip"
-  curl -fsSL --retry 3 -o "$work/plugin.zip.sha256" \
-    "https://github.com/${repo}/releases/download/v${version}/adaptive-rsi-${version}-plugin.zip.sha256"
-  (cd "$work" && shasum -a 256 -c plugin.zip.sha256)
-  unzip -q "$work/plugin.zip" -d "$work/unpacked"
+  asset="adaptive-rsi-${version}-plugin.zip"
+  echo "下载 $asset …"
+  # 与校验文件中记录的文件名保持一致，shasum -c 才能找到归档。
+  curl -fsSL --retry 3 -o "$work/$asset" \
+    "https://github.com/${repo}/releases/download/v${version}/${asset}"
+  curl -fsSL --retry 3 -o "$work/${asset}.sha256" \
+    "https://github.com/${repo}/releases/download/v${version}/${asset}.sha256"
+  (cd "$work" && shasum -a 256 -c "${asset}.sha256")
+  unzip -q "$work/$asset" -d "$work/unpacked"
   mkdir -p "$base"
   mv "$work/unpacked/adaptive-rsi" "$target"
 fi

@@ -594,9 +594,9 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
 
 const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升级）',managed:'内置自更新'};
 let desktopUpdate=null,desktopUpdateTimer=null;
-async function checkDesktopUpdate(){
+async function checkDesktopUpdate(force=false){
  if(!window.RSIDesktop?.invoke)return;
- try{const info=await window.RSIDesktop.invoke('check_desktop_update');desktopUpdate=info&&info.version?info:null;}catch{desktopUpdate=null;}
+ try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;}catch{desktopUpdate=null;}
  renderUpdate();
 }
 async function startDesktopUpdate(){
@@ -632,7 +632,7 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  $('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);
  $('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);
  renderUpdateExtras(update);}
-$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate();if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
+$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!confirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？')))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
 if(window.RSIDesktop)safe(checkDesktopUpdate);
