@@ -140,10 +140,11 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
                     "adaptive_rsi.opencode.run_cli", return_value={
                         "exit_code": 1, "error": None, "stderr": "private-key-value",
                         "stdout": '{"type":"text","part":{"text":"private-key-value"}}\n'}):
-                with self.assertRaisesRegex(RuntimeError, "redacted execution record"):
+                with self.assertRaisesRegex(RuntimeError, "OpenCode call failed") as raised:
                     OpenCodeAgent(store).invoke(
                         "probe", "Return a valid result", workspace, "p", "run", config,
                         config["models"]["implementation"])
+                self.assertNotIn("private-key-value", str(raised.exception))
             events = list(workspace.glob(".rsi-agent/*/events.jsonl"))
             self.assertEqual(len(events), 1)
             self.assertNotIn("private-key-value", events[0].read_text())

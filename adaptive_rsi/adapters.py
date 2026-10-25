@@ -51,7 +51,10 @@ def detect(root):
                 tests = folder / "tests"
                 text = "\n".join((folder / f).read_text(errors="replace")[:30000] for f in matched if (folder / f).is_file())
                 if tests.is_dir() or any(f.startswith("test_") for f in files):
-                    checks = [["python3", "-m", "pytest", "-q"]] if "pytest" in text else [["python3", "-m", "unittest", "discover", "-s", "tests" if tests.is_dir() else ".", "-v"]]
+                    # pytest 的存在不只写在 manifest 文本里：专有配置文件与 conftest.py 同样可靠。
+                    uses_pytest = ("pytest" in text or "pytest.ini" in names or "conftest.py" in names
+                                   or (tests / "conftest.py").is_file())
+                    checks = [["python3", "-m", "pytest", "-q"]] if uses_pytest else [["python3", "-m", "unittest", "discover", "-s", "tests" if tests.is_dir() else ".", "-v"]]
                 if "uv.lock" in names:
                     tool = "uv"
                     checks = [["uv", "run", "--offline", "--no-sync"] + c for c in checks]

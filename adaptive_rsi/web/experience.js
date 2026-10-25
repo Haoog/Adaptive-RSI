@@ -642,6 +642,42 @@ window.RSIExperience = (() => {
       }
     });
     box.append(backupButton);
+    // 会话轮换：怀疑链接泄漏时立即作废旧链接，server.json 同步更新，重启后仍有效。
+    const rotateButton = action(t("轮换访问链接"), async () => {
+      if (
+        !(await uiConfirm(
+          t("轮换后旧的登录链接立即失效，所有已打开的会话需要用新链接重新登录。继续？"),
+        ))
+      )
+        return;
+      rotateButton.disabled = true;
+      try {
+        const saved = await api("session/rotate", { confirm: true });
+        if (state) state.csrf = saved.csrf;
+        const field = el("input");
+        field.readOnly = true;
+        field.value = saved.url;
+        field.className = "rotate-url";
+        field.setAttribute("aria-label", t("新的认证链接"));
+        const copy = action(t("复制链接"), async () => {
+          try {
+            await navigator.clipboard.writeText(saved.url);
+            copy.textContent = t("已复制");
+          } catch {
+            field.select();
+            document.execCommand("copy");
+            copy.textContent = t("已复制");
+          }
+        }, "text-button");
+        const note = el("p", t("已轮换。请立即保存新的认证链接，旧链接已失效："));
+        box.append(note, field, copy);
+        field.focus();
+        field.select();
+      } finally {
+        rotateButton.disabled = false;
+      }
+    });
+    box.append(rotateButton);
     for (const saved of data.backups) {
       const link = el(
         "a",

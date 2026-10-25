@@ -193,13 +193,20 @@ def issue_comment_context(runtime, project, task, config, checked=None, cancel=N
         sort_field = "updated_at" if cursor else "created_at"
         comments = dict(sorted(comments.items(), key=lambda pair: (
             pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
+        authoritative = issue_evidence.get("comments")
+        if isinstance(authoritative, int) and 0 <= authoritative < len(comments):
+            # Issue 快照携带的评论总数会随删除扣减；多出的缓存条目按排序丢弃，避免已删除评论长期滞留。
+            comments = dict(sorted(comments.items(), key=lambda pair: (
+                pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:authoritative])
         retained = list(comments.values())
-        if cursor is None or not isinstance(total_seen, int):
+        if isinstance(authoritative, int) and authoritative >= 0:
+            # 权威计数比增量累计可靠：增量扫描看不到被删除的评论。
+            total_seen = max(authoritative, len(retained))
+        elif cursor is None or not isinstance(total_seen, int):
             total_seen = observed_total
         else:
             new_ids = set(fetched_comments) - cached_ids
             total_seen = max(total_seen + len(new_ids), len(retained))
-        total_seen = max(total_seen, len(retained)) if total_seen is not None else None
         # Keep the request watermark stable across empty incremental scans so a
         # conditional ETag can turn the next TTL refresh into a 304.
         next_cursor = cursor or watermark
@@ -271,7 +278,10 @@ def sync(runtime, project, config, checked, cancel=None):
         number = int(issue["number"])
         held = pending.pop(str(number), None)
         existing = store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], "issue:" + str(number)))
-        previous = json.loads(existing["evidence"]) if existing else []
+        try:
+            previous = json.loads(existing["evidence"]) if existing else []
+        except (TypeError, ValueError):
+            previous = []
         revised = not previous or previous[0].get("updated") != issue["updated_at"]
         labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
@@ -279,6 +289,12 @@ def sync(runtime, project, config, checked, cancel=None):
         if issue["state"].lower() != "open" or not allowed:
             if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]:
                 store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
+            elif existing and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
+                # 记录关闭快照，让下一次重新打开可以被识别为「重开」。
+                closed_evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
+                                    "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
+                store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
+                              (encode(closed_evidence), time.time(), existing["id"]))
             elif existing and existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
                 pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
@@ -286,9 +302,22 @@ def sync(runtime, project, config, checked, cancel=None):
                     store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project["id"],
                                 data={"task": existing["id"], "updated": issue["updated_at"]})
             return
-        evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"]}]
+        evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
+                     "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
+        if existing and existing["state"] in ["completed", "merged", "pr_closed"]:
+            # 已交付的任务不因 Issue 的普通编辑重新入队；只有 Issue 从关闭重新打开才值得重跑。
+            reopened = bool(previous and isinstance(previous[0], dict) and
+                            previous[0].get("state") and str(previous[0]["state"]).lower() != "open")
+            if revised and reopened:
+                store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
+                    (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
+                consumed += 1
+            elif revised:
+                store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
+                              (encode(evidence), time.time(), existing["id"]))
+            return
         if existing:
-            if existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted", "completed", "merged", "pr_closed"] and revised:
+            if existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
                 store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
             elif revised:

@@ -176,10 +176,13 @@ async function checkInvalidConfigRepair(browser,url,errors) {
     await page.locator('#project-config-error').getByRole('button',{name:'Reset damaged settings'}).waitFor();
     assert.match(await page.locator('#project-config-error').textContent(),/local audit backup/);
     await page.locator('#language-select').selectOption('zh-CN');
-    let confirmation='';page.once('dialog',async dialog=>{confirmation=dialog.message();await dialog.accept();});
     await button.click();
-    await page.locator('#project-config-error').waitFor({state:'hidden'});
+    const confirmBox=page.locator('.confirm-dialog');
+    await confirmBox.waitFor();
+    const confirmation=await confirmBox.locator('p').textContent();
     assert.match(confirmation,/原始配置仅保存在本地审计备份/);assert.match(confirmation,/需要你手动启动/);
+    await confirmBox.getByRole('button',{name:'确认'}).click();
+    await page.locator('#project-config-error').waitFor({state:'hidden'});
     assert.equal(repairs.length,1);
     assert.equal(repairs[0].project,await page.locator('#project-select').inputValue());
     assert.equal(repairs[0].confirmation,'reset-invalid-overrides-to-global-defaults');

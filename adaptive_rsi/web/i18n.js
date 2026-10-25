@@ -1262,7 +1262,17 @@ const english = {
   "差异超过 2000 行，已折叠为纯文本。": "The diff exceeds 2000 lines and is shown as plain text.",
   "安装地址不可用": "The install address is unavailable",
   "将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？": "This downloads the new desktop installer image and opens it automatically. Drag to install after the download. Continue?",
-  "安装后应用会保留中文名称；界面语言仍跟随此处的选择。": "After installation the app keeps its Chinese name; the interface language still follows your choice here."
+  "安装后应用会保留中文名称；界面语言仍跟随此处的选择。": "After installation the app keeps its Chinese name; the interface language still follows your choice here.",
+  "确认": "Confirm",
+  "轮换访问链接": "Rotate access link",
+  "轮换后旧的登录链接立即失效，所有已打开的会话需要用新链接重新登录。继续？": "Rotating makes the old login link invalid immediately; every open session must sign in again with the new link. Continue?",
+  "新的认证链接": "New authenticated link",
+  "复制链接": "Copy link",
+  "已复制": "Copied",
+  "已轮换。请立即保存新的认证链接，旧链接已失效：": "Rotated. Save the new authenticated link now; the old one no longer works:",
+  "此前尝试未产出修复；重新发现的问题已入队等待全新验证": "An earlier attempt ended without a fix; the rediscovered finding was queued for fresh verification",
+  "前置任务无法合并；等待已解除，任务需要人工复核后重试": "The dependency will not merge; the wait was released and the task needs manual review before retrying",
+  "候选已超过保留期被清理，请重新生成后再发布。": "The candidate was cleaned up after the retention window; regenerate it before publishing."
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }
@@ -1280,6 +1290,7 @@ for(const node of document.querySelectorAll('[aria-label], [placeholder]')){
 }
 function translateStatic(){
  document.documentElement.lang=language;
+ document.documentElement.style.visibility='';
  for(const [node,original,key] of staticText){
   if(node.isConnected)node.textContent=language==='en'?original.replace(key,()=>t(key)):original;
  }

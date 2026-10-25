@@ -279,7 +279,8 @@ class CodexAgent:
                 result = run_process(argv, workspace, 3600, cancel,
                                      config["limits"]["max_output_mb"], environment)
             for secret_value in [secret, *auth_secrets]:
-                if not isinstance(secret_value, str) or not secret_value:
+                if not isinstance(secret_value, str) or len(secret_value) <= 8:
+                    # 过短的值会在脱敏替换时破坏 JSON 与统计记录，不进入脱敏列表。
                     continue
                 for field in ["stdout", "stderr"]:
                     result[field] = result[field].replace(secret_value, "[REDACTED]")

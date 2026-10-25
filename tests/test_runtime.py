@@ -290,6 +290,86 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(sum(r[0] == "analysis" for r in self.agent.roles), 1)
         self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='inspection'")), 1)
 
+    def test_rediscovered_failure_requeues_instead_of_being_suppressed(self):
+        from adaptive_rsi.discovery import finding_identity
+        finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
+                   "path": "calculator.py", "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60}
+        task = self.runtime.goal(self.project, "Addition subtracts")
+        self.store.execute("UPDATE tasks SET fingerprint=?,source='inspection',state='failed',attempts=2 WHERE id=?",
+                           (finding_identity(finding), task))
+        with patch.object(self.runtime, "invoke", return_value={"findings": [finding]}):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["attempts"], 0)
+        self.assertEqual(json.loads(row["evidence"])[0]["source"], "rediscovered")
+
+    def test_rejected_and_cancelled_findings_stay_suppressed(self):
+        from adaptive_rsi.discovery import finding_identity
+        finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
+                   "path": "calculator.py", "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60}
+        for state in ["rejected", "cancelled"]:
+            with self.subTest(state=state):
+                title = finding["title"] + " " + state
+                key = finding_identity({**finding, "title": title})
+                task = self.runtime.goal(self.project, title)
+                self.store.execute("UPDATE tasks SET fingerprint=?,source='inspection',state=?,evidence=? WHERE id=?",
+                                   (key, state, encode([{"path": finding["path"], "quote": finding["quote"]}]), task))
+                before = len(self.store.query("SELECT id FROM tasks WHERE source NOT LIKE 'system_%'"))
+                with patch.object(self.runtime, "invoke", return_value={"findings": [{**finding, "title": title}]}):
+                    self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                         {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], state)
+                # 没有为同一条发现创建新任务。
+                self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source NOT LIKE 'system_%'")), before)
+
+    def test_failing_system_scan_gets_circuit_breaker_backoff(self):
+        self.runtime.pause(self.project, False)
+        self.runtime.request(self.project, "light")
+        task = self.store.one("SELECT id FROM tasks WHERE fingerprint='system:light'")["id"]
+        for round_index in range(3):
+            self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (task,))
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.store.transition(run["id"], "blocked", {"reason": "gh not authenticated"}, True)
+            # 退避期内 request 不会重新入队，避免每周期产生新的失败 run。
+            self.runtime.request(self.project, "light")
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "blocked")
+        self.store.execute("UPDATE runs SET ended=ended-86400 WHERE task=?", (task,))
+        self.runtime.request(self.project, "light")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+
+    def test_manual_retry_can_pull_a_backing_off_task_forward(self):
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.store.execute("UPDATE tasks SET state='queued',available=?,infra_retries=0 WHERE id=?",
+                           (time.time() + 3600, task))
+        self.runtime.retry(task)
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        self.assertEqual((row["state"], row["available"]), ("queued", 0))
+
+    def test_cancel_cannot_rewrite_terminal_states(self):
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.cancel_task(task)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "cancelled")
+        other = self.runtime.goal(self.project, "Second")
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (other,))
+        with self.assertRaises(ValueError):
+            self.runtime.cancel_task(other)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (other,))["state"], "merged")
+
+    def test_dead_dependency_releases_the_waiting_task(self):
+        first = self.runtime.goal(self.project, "First")
+        dependent = self.runtime.goal(self.project, "Dependent")
+        self.runtime.set_dependency(dependent, first)
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (first,))
+        self.runtime.release_dead_dependencies()
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (dependent,))
+        self.assertEqual(row["state"], "blocked")
+        self.assertIsNone(self.store.one("SELECT dependency FROM task_dependencies WHERE task=?", (dependent,)))
+        # 解除等待后手动重试即可独立运行。
+        self.runtime.retry(dependent)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (dependent,))["state"], "queued")
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_real_git_and_sandbox_end_to_end_without_user_tree_changes(self):
         (self.repo / "notes.txt").write_text("uncommitted user work")
@@ -750,6 +830,14 @@ class ConfigurationAndAdapterTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=str(override)):
                 validate(override)
 
+    def test_command_seconds_is_a_safety_timeout_not_a_retired_quota(self):
+        self.assertEqual(validate({})["limits"]["command_seconds"], 3600)
+        # 旧版本把它当作额度字段清零；升级后 0 或缺省必须回到安全超时，避免被测命令永不超时。
+        self.assertEqual(validate({"limits": {"command_seconds": 0}})["limits"]["command_seconds"], 3600)
+        self.assertEqual(validate({"limits": {"command_seconds": 7200}})["limits"]["command_seconds"], 7200)
+        with self.assertRaises(ValueError):
+            validate({"limits": {"command_seconds": -1}})
+
     def test_polyglot_manifest_detection_and_honest_environment_status(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -933,6 +1021,43 @@ class ServerTest(unittest.TestCase):
         request = urllib.request.Request(self.server.origin + "/?token=stale-token", headers=self.headers())
         with urllib.request.urlopen(request) as response:
             self.assertEqual(response.status, 200)
+
+    def test_session_rotation_invalidates_the_old_token_and_returns_the_new_link(self):
+        old_token = self.server.token
+        request = urllib.request.Request(self.server.origin + "/api/session/rotate",
+                                         data=json.dumps({"confirm": True}).encode(),
+                                         headers={"Content-Type": "application/json",
+                                                  "Origin": self.server.local_origin,
+                                                  "Cookie": self.server.cookie + "=" + self.server.token,
+                                                  "X-RSI-CSRF": self.server.csrf})
+        with urllib.request.urlopen(request) as response:
+            result = json.load(response)
+        self.assertNotEqual(self.server.token, old_token)
+        self.assertIn("?token=" + self.server.token, result["url"])
+        self.assertEqual(result["csrf"], self.server.csrf)
+        # 旧 token 的链接和旧会话立即失效。
+        for credentials in ["?token=" + old_token, None]:
+            headers = {} if credentials else {"Cookie": self.server.cookie + "=" + old_token}
+            url = self.server.origin + "/" + (credentials or "")
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(urllib.request.Request(url, headers=headers))
+            self.assertEqual(denied.exception.code, 401)
+        # 新链接可登录（303 并下发新会话 cookie），轮换持久化到 server.json。
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            opener.open(self.server.origin + "/?token=" + self.server.token)
+            self.fail("expected the token link to redirect")
+        except urllib.error.HTTPError as redirect:
+            self.assertEqual(redirect.code, 303)
+            self.assertIn(self.server.cookie + "=" + self.server.token, redirect.headers.get("Set-Cookie", ""))
+        with urllib.request.urlopen(urllib.request.Request(self.server.origin + "/",
+                headers={"Cookie": self.server.cookie + "=" + self.server.token})) as response:
+            self.assertEqual(response.status, 200)
+        session = json.loads((Path(self.tmp.name) / "server.json").read_text())
+        self.assertEqual(session["token"], self.server.token)
         with self.assertRaises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(self.server.origin + "/?token=stale-token")
         self.assertEqual(denied.exception.code, 401)

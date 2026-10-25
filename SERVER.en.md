@@ -32,7 +32,7 @@ By default the app listens only on the server's `127.0.0.1:6090`. On your person
 ssh -N -L 6090:127.0.0.1:6090 user@server
 ```
 
-Run `journalctl --user -u adaptive-rsi` on the server for the authenticated startup URL, then open it in your local browser. The URL contains session credentials; keep it private and note that it stays in the browser history—clear that entry on shared devices. A plain URL displays recovery instructions.
+Run `journalctl --user -u adaptive-rsi` on the server for the authenticated startup URL, then open it in your local browser. The URL contains session credentials; keep it private and note that it stays in the browser history—clear that entry on shared devices. A plain URL displays recovery instructions. If the link may have leaked, choose **Rotate access link** in the console's data and diagnostics dialog: the old link and sessions become invalid immediately, server.json is updated, and the rotation survives restarts.
 
 Register a path **on the server**, or import a GitHub URL. Model connections also use the server's network and authentication; logins from your personal computer are not uploaded. New projects remain paused until models, executable checks and delivery settings are ready.
 

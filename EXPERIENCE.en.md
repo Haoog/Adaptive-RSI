@@ -12,6 +12,8 @@ Choose **Install on phone** in the console sidebar and open the actual installat
 
 Your phone cannot reach your computer's `127.0.0.1`. Configure a reachable HTTPS origin using [Server deployment](SERVER.en.md), sign in on your phone with the runtime-generated login link, then open installation. Neither the manifest nor shortcut stores a token. The service worker does not cache API responses, code or private pages. A network connection is required.
 
+Minimum requirements follow the browser: the console needs a modern browser equivalent to iOS 15.4+ or Android 8+ (requires `structuredClone` and PWA support). Older systems render a blank page; upgrade the system or use the desktop app instead.
+
 ## Tasks and recovery
 
 The submit button retains a request ID for the same unconfirmed submission. Retrying an ambiguous response returns the original task; submitting after success creates a new task. CLI users can specify `goal --request-id`. Reusing an ID with different content is rejected; project submissions remain isolated.

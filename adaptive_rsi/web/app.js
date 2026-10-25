@@ -41,6 +41,7 @@ const apiErrors={
  "Health response must confirm the exact deployment SHA and healthy status": "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。",
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
+ "Candidate was cleaned up after the retention window; regenerate it before publishing": "候选已超过保留期被清理，请重新生成后再发布。",
 
  "Select the root of an existing Git repository": "请选择已有 Git 仓库的根目录。",
  "Expected a GitHub repository URL": "请填写 GitHub 仓库链接，例如 https://github.com/owner/repository。",
@@ -96,10 +97,27 @@ function currentProject(){return state.projects.find(p=>p.id===projectId);}
 function stashGoalDraft(){if(!projectId)return;const value=$('goal-text').value;if(value){goalDrafts.set(projectId,value);draftStore.set('goal',projectId,value);}else{goalDrafts.delete(projectId);draftStore.remove('goal',projectId);}}
 function restoreGoalDraft(){if(!projectId){$('goal-text').value='';return;}const value=goalDrafts.has(projectId)?goalDrafts.get(projectId):draftStore.get('goal',projectId)||'';if(value)goalDrafts.set(projectId,value);$('goal-text').value=value;}
 function scoped(rows){return rows.filter(row=>row.project===projectId);}
-function stamp(seconds){return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}
+let displayTz=null;
+function stamp(seconds){try{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:displayTz||undefined});}catch{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}}
 function scheduleStamp(seconds,timezone){try{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:timezone});}catch{return stamp(seconds);}}
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
+function uiConfirm(message){
+ // 原生 confirm 无法跟随界面语言且风格割裂；用统一的对话框获取确认结果。
+ return new Promise(resolve=>{
+  const box=el('dialog',undefined,'confirm-dialog'),text=el('p',message),row=el('div',undefined,'confirm-actions');
+  const no=el('button',t('取消'),'button');no.type='button';
+  const yes=el('button',t('确认'),'button primary');yes.type='button';
+  row.append(no,yes);box.append(text,row);document.body.append(box);
+  let settled=false;
+  const finish=value=>{if(settled)return;settled=true;resolve(value);box.close();box.remove();};
+  no.addEventListener('click',()=>finish(false));
+  yes.addEventListener('click',()=>finish(true));
+  box.addEventListener('cancel',event=>{event.preventDefault();finish(false);});
+  yes.focus();
+  box.showModal();
+ });
+}
 function elapsedCopy(seconds){const value=Math.max(0,Math.round(seconds||0));return value<60?value+' '+t('秒'):value<3600?Math.floor(value/60)+' '+t('分钟'):Math.floor(value/3600)+' '+t('小时')+' '+Math.floor(value%3600/60)+' '+t('分钟');}
 function runningStage(run){if(run.last_stage==='review'||run.stage==='review')return t('正在评审改动');return t({planning:'正在判断是否值得做',executing:'正在修改代码',evaluating:'正在运行检查'}[run.state]||'正在处理任务');}
 async function safe(fn,form){
@@ -157,7 +175,8 @@ async function refresh(){
 }
 function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
- const parent=parentView(view),configScope=$('config-scope').value;
+ const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
+ document.title=(project?project.name+' · ':'')+t('Adaptive RSI · 控制台');
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
  $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录',usage:'记录与用量'}[parent]);
@@ -171,20 +190,22 @@ const activeStates=['releasing','deploying','queued','planning','executing','eva
 const attentionStates=['release_failed','deploy_failed','waiting_budget','awaiting_approval','blocked','failed','insufficient_evidence','interrupted','regressed','unverified_merge','ci_failed'];
 function visibleTasks(rows,filter,includeSystem=false){return rows.filter(task=>(includeSystem||!task.source.startsWith('system_'))&&(filter==='all'||(filter==='active'?activeStates.includes(task.display_state||task.state):filter==='attention'?attentionStates.includes(task.display_state||task.state):!activeStates.includes(task.display_state||task.state)&&!attentionStates.includes(task.display_state||task.state))));}
 function eventCopy(event){
- const known={'Project registered (paused)':'项目已接入，等待启动','Project registered and enabled':'项目已接入并启动','Settings saved; active runs retain their snapshot':'设置已保存','Model routes updated':'模型分工已保存','Project paused':'项目已暂停','Project enabled':'项目已启动','Cancellation requested':'已申请取消任务','Dependency snapshot frozen':'已准备独立工作环境','Committed snapshot unchanged; no model call':'项目没有新改动，本次检查未调用模型','Fresh run scheduled with bounded backoff':'已安排重试','Provider resumed by user':'模型连接已恢复','Issue closed or excluded during execution; recheck before delivery':'运行期间 Issue 已关闭或被排除，将在交付前复核'};
+const known={'Project registered (paused)':'项目已接入，等待启动','Project registered and enabled':'项目已接入并启动','Settings saved; active runs retain their snapshot':'设置已保存','Model routes updated':'模型分工已保存','Project paused':'项目已暂停','Project enabled':'项目已启动','Cancellation requested':'已申请取消任务','Dependency snapshot frozen':'已准备独立工作环境','Committed snapshot unchanged; no model call':'项目没有新改动，本次检查未调用模型','Fresh run scheduled with bounded backoff':'已安排重试','Provider resumed by user':'模型连接已恢复','Issue closed or excluded during execution; recheck before delivery':'运行期间 Issue 已关闭或被排除，将在交付前复核','Earlier attempt ended without a fix; rediscovered finding queued for fresh verification':'此前尝试未产出修复；重新发现的问题已入队等待全新验证','Dependency will not merge; waiting released and the task needs manual review':'前置任务无法合并；等待已解除，任务需要人工复核后重试'};
  if(known[event.message])return t(known[event.message]);
  const issues=event.message.match(/^(\d+) Issue updates synchronized$/);if(issues)return t('已同步 Issue 更新')+' · '+issues[1];
  return event.message;
 }
 function render(){
  const project=currentProject(),tasks=scoped(state.tasks),runs=scoped(state.runs),config=project?.config||state.config;
+ // 统一时间显示约定：活动与任务时间使用项目时区（与「下次检查」一致），未接入项目时用浏览器时区。
+ displayTz=config?.schedule?.timezone||null;
  if(!project&&$('config-scope').value==='project'){$('config-scope').value='global';settingsBaseline=null;}
  renderNavigation();$('onboarding').hidden=!!project;$('project-workspace').hidden=!project;$('pause-button').hidden=!project;
  const configError=project?.configuration_error,configErrorText=typeof configError==='string'?configError:configError?.message||configError?.error||'';
  $('pause-button').disabled=!project||!!(configError&&project.paused);$('pause-button').textContent=t(!project||project.paused?'开始运行':'暂停运行');
  $('project-config-error').hidden=!configError;$('project-config-error').textContent=configError?t('项目配置异常，已暂停运行。请修复后再启动。')+(configErrorText?' '+configErrorText:'')+' '+t('重置会丢弃项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要手动启动。'):'';
  if(configError){const repair=el('button',t('重置损坏设置'),'text-button');repair.type='button';repair.disabled=configurationRepairBusy;repair.addEventListener('click',()=>safe(async()=>{
-  if(configurationRepairBusy)return;const project=projectId;if(!project||!confirm(t('确认重置损坏设置？这会删除当前项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要你手动启动。')))return;
+  if(configurationRepairBusy)return;const project=projectId;if(!project||!(await uiConfirm(t('确认重置损坏设置？这会删除当前项目单独覆盖并改为跟随通用默认；原始配置仅保存在本地审计备份中。修复后仍保持暂停，需要你手动启动。'))))return;
   configurationRepairBusy=true;repair.disabled=true;let result;try{result=await api('config/repair',{project,confirmation:'reset-invalid-overrides-to-global-defaults'});}finally{configurationRepairBusy=false;repair.disabled=false;}
   if(result.repaired){await refresh();toast(t('项目设置已修复为通用默认，项目仍保持暂停。'));}
  }));$('project-config-error').append(repair);}
@@ -216,7 +237,7 @@ function render(){
  const activity=$('activity'),events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,6);
  if(changedList(activity,events)){activity.replaceChildren();
  if(!events.length)activity.append(el('p',t('运行记录将在这里出现。'),'empty-copy'));
- for(const event of events){const row=el('div',undefined,'activity-row');row.append(el('time',stamp(event.created)),el('span',eventCopy(event)));if(language!=='en'&&eventCopy(event)!==event.message){const raw=el('details');raw.append(el('summary',t('原文')),el('p',event.message));row.append(raw);}activity.append(row);}}
+ for(const event of events){const copy=eventCopy(event),row=el('div',undefined,'activity-row');row.append(el('time',stamp(event.created)),el('span',copy));if(language!=='en'&&copy!==event.message){const raw=el('details');raw.append(el('summary',t('原文')),el('p',event.message));row.append(raw);}activity.append(row);}}
  $('delivery-summary').textContent=t(config.delivery.mode==='local'?'当前交付：保存在本地，确认后创建 PR。':config.delivery.auto_merge?'当前交付：检查和评审通过后自动提交并合并。':'当前交付：检查通过后自动提交修改，等待合并。');
  if(project&&!readinessCache.has(project.id))safe(()=>checkReadiness());else renderReadiness();
  renderTelemetry();renderUpdate();if(['overview','tasks'].includes(view))renderTasks();if(view==='evolution')renderEvolution();if(view==='settings'){if(!settingsBaseline)renderSettings();window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);}
@@ -310,7 +331,7 @@ async function showTask(task,restoreView){const ticket=++detailSequence,project=
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
   if(data.result.files){delivery.append(action(t('阅读代码差异'),()=>window.RSIExperience?.showDiff(run.id),'text-button'));if(!window.RSIDesktop){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
-  if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!window.confirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？')))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
+  if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!(await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'))))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
@@ -482,7 +503,7 @@ function stageProgress(data){
 $('readiness-check').addEventListener('click',()=>safe(()=>checkReadiness(true)));
 $('tasks-prev').addEventListener('click',()=>{taskOffset=Math.max(0,taskOffset-50);safe(refresh);});
 $('tasks-next').addEventListener('click',()=>{taskOffset+=50;safe(refresh);});
-$('reload-ui').addEventListener('click',()=>{if(confirm(t('刷新会清除当前未提交的输入，请确认已经保存。')))location.reload();});
+$('reload-ui').addEventListener('click',()=>safe(async()=>{if(await uiConfirm(t('刷新会清除当前未提交的输入，请确认已经保存。')))location.reload();}));
 
 document.querySelector('.brand')?.addEventListener('click',event=>{event.preventDefault();showView('overview');});
 document.querySelectorAll('[data-view]').forEach(node=>node.addEventListener('click',()=>showView(node.dataset.view)));
@@ -601,13 +622,13 @@ async function checkDesktopUpdate(force=false){
 }
 async function startDesktopUpdate(){
  if(!desktopUpdate||desktopUpdateTimer)return;
- if(!confirm(t('将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？')))return;
+ if(!(await uiConfirm(t('将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？'))))return;
  desktopUpdate.downloading=true;desktopUpdate.percent=0;renderUpdate();
  try{await window.RSIDesktop.invoke('download_desktop_update');}catch(error){desktopUpdate=null;toast(t('新版本下载失败：')+error,true);renderUpdate();return;}
  desktopUpdateTimer=setInterval(async()=>{
    try{const info=await window.RSIDesktop.invoke('check_desktop_update');
      if(!info||!info.version){desktopUpdate=null;clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
-     else if(info.error){desktopUpdate=null;clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;toast(t('新版本下载失败：')+(info.error==='Checksum verification failed'?t('校验未通过，已删除下载文件。'):info.error),true);}
+     else if(info.error){desktopUpdate=null;clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;toast(t('新版本下载失败：')+(info.error_code==='checksum'?t('校验未通过，已删除下载文件。'):info.error),true);}
      else{desktopUpdate=info;if(!info.downloading&&info.percent>=100){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;toast(t('下载已完成，安装镜像已打开；请拖拽安装后重启应用。'));}}
    }catch{clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
    renderUpdate();
@@ -633,7 +654,7 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  $('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);
  renderUpdateExtras(update);}
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
-$('apply-update').addEventListener('click',()=>safe(async()=>{if(!confirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？')))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
+$('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
 if(window.RSIDesktop)safe(checkDesktopUpdate);
 $('language-select').addEventListener('change',()=>safe(async()=>{

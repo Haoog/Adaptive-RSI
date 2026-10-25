@@ -74,6 +74,26 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.synchronize([{**issue, "updated_at": "2026-10-21T00:00:00Z"}])
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE fingerprint='issue:1'")["state"], "cancelled")
 
+    def test_delivered_issue_tasks_ignore_edits_and_return_on_reopen(self):
+        issue = {"number": 1, "title": "Requirements", "body": "body", "labels": [], "state": "open",
+                 "updated_at": "2026-10-20T00:00:00Z", "comments": 2,
+                 "html_url": "https://github.com/owner/project/issues/1"}
+        self.synchronize([issue])
+        self.store.execute("UPDATE tasks SET state='merged' WHERE fingerprint='issue:1'")
+        # 已交付任务的 Issue 普通编辑：只刷新证据，不重排。
+        self.synchronize([{**issue, "body": "edited", "updated_at": "2026-10-21T00:00:00Z"}])
+        row = self.store.one("SELECT * FROM tasks WHERE fingerprint='issue:1'")
+        self.assertEqual(row["state"], "merged")
+        self.assertEqual(row["body"], "body")
+        self.assertEqual(json.loads(row["evidence"])[0]["state"], "open")
+        # 关闭再重新打开：值得重跑，任务带最新正文重新入队。
+        self.synchronize([{**issue, "state": "closed", "updated_at": "2026-10-22T00:00:00Z"}])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE fingerprint='issue:1'")["state"], "merged")
+        self.synchronize([{**issue, "state": "open", "body": "reopened body", "updated_at": "2026-10-23T00:00:00Z"}])
+        row = self.store.one("SELECT * FROM tasks WHERE fingerprint='issue:1'")
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["body"], "reopened body")
+
     def test_issue_sync_page_budget_persists_and_resumes_without_losing_issues(self):
         pages = []
         def checked(args, **kwargs):

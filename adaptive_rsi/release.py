@@ -75,6 +75,10 @@ def compatible_workflow(text):
     return True
 
 
+WORKFLOW_CHOICES_TTL = 300
+_workflow_choices_cache = {}
+
+
 def workflow_choices(runtime, project_id):
     project = runtime.project(project_id)
     repo = runtime.config(project_id)["github"]["repository"]
@@ -83,6 +87,10 @@ def workflow_choices(runtime, project_id):
     info = api(repo, "")
     branch = info["default_branch"]
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
+    cached = _workflow_choices_cache.get((repo, sha))
+    now = time.time()
+    if cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
+        return cached[1]
     workflows = api(repo, "actions/workflows?per_page=100").get("workflows", [])
     import concurrent.futures
 
@@ -96,7 +104,12 @@ def workflow_choices(runtime, project_id):
     # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         choices = [row for row in pool.map(inspect, workflows) if row]
-    return {"repository": repo, "sha": sha, "workflows": choices}
+    result = {"repository": repo, "sha": sha, "workflows": choices}
+    # 缓存绑定精确的默认分支 SHA；分支前进后键自然失效。授权路径始终重新校验，不受缓存影响。
+    if len(_workflow_choices_cache) > 32:
+        _workflow_choices_cache.clear()
+    _workflow_choices_cache[(repo, sha)] = (now, result)
+    return result
 
 
 def authorize_workflow(runtime, project_id, kind, workflow):

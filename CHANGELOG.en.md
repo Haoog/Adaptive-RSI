@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Fixed sandboxed commands running without a timeout: the command timeout is a safety boundary, not a quota. It now defaults to 1 hour (configurable 1–24 hours), so a hung check can no longer hold a run slot forever.
+- OpenCode executor: task and event files are always written as UTF-8, so Chinese tasks no longer fail under non-UTF-8 locales; call failures now surface timeout/rate-limit details (redacted first) so transient connection faults retry automatically and feed the provider circuit breaker; OAuth write-back tolerates a corrupt auth.json and no longer hides an already-completed model call.
+- Fixed findings trapped by the fingerprint dedup: when a previous attempt failed or expired, rediscovering the same issue requeues it with reset counters; explicitly rejected and user-cancelled decisions stay suppressed.
+- Failure backoff is capped at 6 hours and manual retry can pull a backing-off task forward; periodically scheduled system tasks back off by consecutive-failure count instead of producing a new failed run every cycle.
+- When a dependency reaches a terminal state where it will never merge, the wait is released automatically, the task is blocked with a visible reason, and a manual retry runs it independently.
+- Cancelling can no longer rewrite terminal states such as merged or PR-opened; before publishing, an approved candidate re-verifies that its source task was not cancelled or expired.
+- Ordinary Issue edits no longer reset delivered tasks to the queue; only reopening a closed Issue requeues them. Issue comment totals now use the authoritative snapshot count so deleted comments no longer distort notices.
+- New **Rotate access link** action (data and diagnostics): one click invalidates the old token and sessions, updates server.json, and survives restarts.
+- The HTTP service now enforces a socket timeout and a concurrent-connection cap, so slow connections cannot exhaust threads; missing backups return a clear message instead of leaking server paths.
+- Very short secret values are excluded from redaction to keep output parsing and usage accounting intact; rolling back a strategy twice is idempotent; a damaged trailing line in a model catalog is skipped instead of failing the whole list; OpenCode versions accept four segments; pytest detection covers conftest.py and pytest.ini; 0.0.0.0 loopback addresses are rewritten inside Docker workers; empty-run detection covers more framework outputs; scheduler config validation is cached by content; DST-boundary schedule display is more stable.
+- Console: system dark mode; confirmation dialogs follow the interface language instead of native confirm; timestamps consistently use the project timezone; the page title tracks the selected project; the English interface no longer flashes Chinese first; the PWA icon supports maskable; the static shell opens offline (API and private data are still never cached); desktop update failures use structured error codes.
+
 ## 0.5.104
 
 <!-- adaptive-rsi-release:0.5.104;base:4cea07180b463817c84d1322c2f84b098e7c36d8 -->

@@ -39,9 +39,11 @@ def empty_test_run(text):
                       r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|"
                       r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|no tests to run|"
                       r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
+    # positive 表示「确实有测试执行过」；覆盖更多框架的通过/失败行，减少把真实运行误判为空跑。
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
-                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b", text, re.I)
+                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b|"
+                         r"(?m)^(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b", text, re.I)
     return bool(empty and not positive)
 
 

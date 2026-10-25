@@ -102,9 +102,13 @@ def publish(runtime, project, task, run, workspace, config):
         live = runtime.config(project["id"])
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
         pending = store.one("SELECT state FROM tasks WHERE id=?", (approval["id"],))
+        source = store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))
         if (runtime.stop.is_set() or runtime.project(project["id"])["paused"] or
                 not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
             raise Cancelled("Publishing cancelled or project paused")
+        if not source or source["state"] in ["cancelled", "expired", "obsolete"]:
+            # 批准之后、发出外部写操作之前源任务被取消/过期时，授权不再成立。
+            raise Cancelled("Source task is cancelled or expired; publishing stopped")
         if not authorization or authorization[0].get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
         if authorization[0]["authorization"] == "project_policy" and (
@@ -135,7 +139,8 @@ def publish(runtime, project, task, run, workspace, config):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + task["title"])
     sha = git(workspace, "rev-parse", "HEAD")
-    existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch, "--json", "url"]))
+    existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
+                                   "--limit", "1", "--json", "url"]))
     if existing:
         url = existing[0]["url"]
         existing_pr = pr_view(repo, url)
