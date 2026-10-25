@@ -22,7 +22,8 @@ def clean_environment():
 
 def container_endpoint(value):
     parsed = urlsplit(value)
-    if parsed.hostname in ["127.0.0.1", "localhost", "::1"]:
+    # 0.0.0.0 是 Ollama 等本地服务的常见监听地址写法，同样指向宿主回环。
+    if parsed.hostname in ["127.0.0.1", "localhost", "::1", "0.0.0.0"]:
         return urlunsplit(parsed._replace(netloc="host.docker.internal" + (":" + str(parsed.port) if parsed.port else "")))
     return value
 

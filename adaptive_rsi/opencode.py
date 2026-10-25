@@ -78,7 +78,7 @@ class OpenCodeCapabilities:
 def parse_opencode_version(text):
     if not isinstance(text, str):
         return None
-    match = re.search(r"(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)", text[:4096])
+    match = re.search(r"(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)", text[:4096])
     if not match:
         return None
     release = tuple(int(value) for value in match.groups())
@@ -384,14 +384,18 @@ def sync_oauth(home, model, original, capabilities=None, binary=None):
     if not source.is_file() or not updated.is_file():
         return []
     prefix = model.split("/", 1)[0]
-    current = json.loads(source.read_text())
-    refreshed = json.loads(updated.read_text()).get(prefix, {})
+    # 损坏的 auth.json 只影响凭据回写，不能吞掉已经完成的模型调用结果。
+    try:
+        current = json.loads(source.read_text())
+        refreshed = json.loads(updated.read_text()).get(prefix, {})
+    except (OSError, ValueError):
+        return []
     if refreshed.get("type") != "oauth" or original.get(prefix, {}).get("type") != "oauth":
         return []
     if current.get(prefix) == original.get(prefix) and refreshed != original.get(prefix):
         # 仅写回此连接已有的 OAuth 字段，不采纳执行器写入的新服务或配置。
         current[prefix] = {key: refreshed.get(key, value) for key, value in original[prefix].items()}
-        with tempfile.NamedTemporaryFile("w", dir=source.parent, prefix=".auth-rsi-", delete=False) as stream:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=source.parent, prefix=".auth-rsi-", delete=False) as stream:
             temporary = stream.name
             json.dump(current, stream)
         os.replace(temporary, source)
@@ -503,8 +507,7 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
     directory = home / ".config/opencode"
     directory.mkdir(parents=True)
     target = directory / "opencode.json"
-    target.write_text(json.dumps(config))
-    target.chmod(0o600)
+    _private_json(target, config)
     secrets = []
     environment = {"OPENCODE_DISABLE_PROJECT_CONFIG": "true", "OPENCODE_DISABLE_AUTOUPDATE": "true",
                    "OPENCODE_DISABLE_MODELS_FETCH": "true", "OPENCODE_PURE": "true"}
@@ -523,7 +526,9 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
     for name in names:
         if name in os.environ:
             environment[name] = os.environ[name]
-            secrets.append(os.environ[name])
+            # 过短的值会在脱敏替换时破坏 JSON 与统计记录，不进入脱敏列表。
+            if len(os.environ[name]) > 8:
+                secrets.append(os.environ[name])
     if capabilities and capabilities.modern:
         if binary:
             credentials = exported_auth
@@ -554,11 +559,12 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
     for provider in providers.values():
         options = provider.get("options", {})
         key = options.get("apiKey")
-        if isinstance(key, str) and not key.startswith("{env:"):
+        if isinstance(key, str) and not key.startswith("{env:") and len(key) > 8:
             secrets.append(key)
         headers = options.get("headers", {})
         if isinstance(headers, dict):
-            secrets.extend(value for value in headers.values() if isinstance(value, str) and value)
+            secrets.extend(value for value in headers.values()
+                           if isinstance(value, str) and len(value) > 8)
     return environment, secrets
 
 
@@ -693,7 +699,7 @@ class OpenCodeAgent:
                         secrets += [value for value in item.get("value", {}).values()
                                     if isinstance(value, str) and len(value) > 8]
                 task = home / "task.txt"
-                task.write_text(prompt + "\nReturn ONLY a JSON object matching this schema as your final message:\n" + json.dumps(SCHEMAS[role]))
+                task.write_text(prompt + "\nReturn ONLY a JSON object matching this schema as your final message:\n" + json.dumps(SCHEMAS[role]), encoding="utf-8")
                 argv = capabilities.run_argv(binary, route["model"], route["effort"])
                 argv += ["Read the task in " + str(task) + ". Follow its instructions. Return the requested JSON."]
                 self.store.event("model", role + ": OpenCode / " + route["model"] + " / " + route["effort"], project, run)
@@ -741,13 +747,21 @@ class OpenCodeAgent:
                         raw = raw.replace(secret, "[REDACTED]")
                 directory = Path(workspace) / ".rsi-agent" / call
                 directory.mkdir()
-                (directory / "events.jsonl").write_text(raw)
+                (directory / "events.jsonl").write_text(raw, encoding="utf-8")
                 data, steps = parse_events(raw, strict=False)
                 from .usage import opencode_usage
                 self.store.record_usage(call, run, opencode_usage(steps), time.monotonic() - started)
                 check_provider_errors(raw)
                 if result["exit_code"] or result["error"]:
-                    raise RuntimeError("OpenCode call failed; see the redacted execution record")
+                    # 透传超时/输出超限等错误详情，供故障分类、基础设施重试与供应商熔断识别；
+                    # stderr 可能包含模型环境输出，先做与执行记录相同的脱敏。
+                    detail = str(result.get("error") or "").strip()
+                    stderr_tail = (result.get("stderr") or "").strip()[-2000:]
+                    summary = "\n".join(part for part in [detail, stderr_tail] if part)
+                    for secret in secrets:
+                        if secret:
+                            summary = summary.replace(secret, "[REDACTED]")
+                    raise RuntimeError("OpenCode call failed" + (": " + summary if summary else "; see the redacted execution record"))
                 if data is None:
                     raise RuntimeError("OpenCode did not return valid structured output; see the redacted execution record")
                 validate_output(data, SCHEMAS[role])

@@ -176,8 +176,13 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
     usage = budget(runtime.store, project["id"], config, required, run)
     proof = runtime.store.setting("verified-checks:" + project["id"])
     from .gitops import git
-    verified = bool(proof and proof["base"] == git(root, "rev-parse", "HEAD") and
-                    proof["compatibility"] == compatibility(config))
+    try:
+        head = git(root, "rev-parse", "HEAD")
+        verified = bool(proof and proof["base"] == head and
+                        proof["compatibility"] == compatibility(config))
+    except (RuntimeError, OSError, ValueError):
+        # 仓库缺失或损坏时 readiness 仍应给出可操作的结果，而不是整体报错。
+        verified = False
     return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks,
             "execution_verified": verified, "model_evidence": model_evidence,
             "checked_at": time.time(), "budget": usage}

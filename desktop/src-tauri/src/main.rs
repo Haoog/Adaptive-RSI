@@ -45,6 +45,7 @@ struct DesktopUpdate {
     url: String,
     sha_url: String,
     error: String,
+    error_code: String,
     percent: AtomicU64,
     downloading: AtomicBool,
     opened: AtomicBool,
@@ -59,6 +60,7 @@ impl DesktopUpdate {
             "percent": self.percent.load(Ordering::Relaxed) as f64 / 100.0,
             "opened": self.opened.load(Ordering::Relaxed),
             "error": self.error,
+            "error_code": self.error_code,
         })
     }
 }
@@ -155,6 +157,7 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
         url,
         sha_url,
         error: String::new(),
+        error_code: String::new(),
         percent: AtomicU64::new(0),
         downloading: AtomicBool::new(false),
         opened: AtomicBool::new(false),
@@ -180,21 +183,23 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             update.downloading.store(true, Ordering::Relaxed);
             update.percent.store(0, Ordering::Relaxed);
             update.error.clear();
+            update.error_code.clear();
         }
     }
     std::thread::spawn(move || {
-        let fail = |message: String| {
+        let fail = |message: String, code: &str| {
             let state = app.state::<RuntimeState>();
             let mut guard = state.update.lock().unwrap();
             if let Some(update) = guard.as_mut() {
                 update.downloading.store(false, Ordering::Relaxed);
                 update.error = message;
+                update.error_code = code.to_string();
             }
         };
         let client = match update_client() {
             Ok(client) => client,
             Err(error) => {
-                fail(error);
+                fail(error, "");
                 return;
             }
         };
@@ -209,12 +214,12 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 text.split_whitespace().next().unwrap_or("").to_lowercase()
             }
             _ => {
-                fail("Checksum download failed".into());
+                fail("Checksum download failed".into(), "checksum_unavailable");
                 return;
             }
         };
         if expected.len() != 64 {
-            fail("Checksum unavailable".into());
+            fail("Checksum unavailable".into(), "checksum_unavailable");
             return;
         }
         let home = std::env::var("HOME").unwrap_or_default();
@@ -256,7 +261,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
         })();
         if let Err(message) = outcome {
             let _ = std::fs::remove_file(&path);
-            fail(message);
+            fail(message, "");
             return;
         }
         let digest = Command::new("/usr/bin/shasum")
@@ -277,7 +282,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
         }
         if digest.is_empty() || digest != expected {
             let _ = std::fs::remove_file(&path);
-            fail("Checksum verification failed".into());
+            fail("Checksum verification failed".into(), "checksum");
             return;
         }
         {

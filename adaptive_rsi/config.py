@@ -27,7 +27,7 @@ DEFAULTS = {
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
     "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch"},
     "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
-               "command_seconds": 0, "concurrency": 1, "retries": 1,
+               "command_seconds": 3600, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30},
     "sandbox": {"backend": "auto", "image": "python:3.12-slim",
                 "worker_image": "adaptive-rsi-worker:local", "memory_mb": 2048,
@@ -72,10 +72,15 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
-    # 旧额度字段仅用于读取历史配置，不再阻断运行。
-    for key in ["daily_calls", "run_calls", "run_seconds", "command_seconds", "max_changed_files"]:
+    # 旧额度字段仅用于读取历史配置，不再阻断运行；command_seconds 是安全超时而非额度，单独保留。
+    for key in ["daily_calls", "run_calls", "run_seconds", "max_changed_files"]:
         config["limits"][key] = 0
     config["evolution"]["max_calls"] = 0
+    if config["limits"]["command_seconds"] == 0:
+        # 0.5.104 及之前把它当作额度清零；0 视为缺省，恢复安全超时。
+        config["limits"]["command_seconds"] = DEFAULTS["limits"]["command_seconds"]
+    if not 60 <= config["limits"]["command_seconds"] <= 86400:
+        raise ValueError("Invalid command timeout: command_seconds must be 60..86400")
     providers = {"openai", "ollama", "lmstudio", "opencode"}
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
@@ -144,8 +149,7 @@ def validate(config):
     from zoneinfo import ZoneInfo
     ZoneInfo(config["schedule"]["timezone"])
     for key, value in config["limits"].items():
-        if value < (0 if key in ["retries", "daily_calls", "run_calls", "run_seconds", "command_seconds", "max_changed_files"] else 1) or value > 10000000:
-            raise ValueError("Invalid positive limit: " + key)
+        if value < (0 if key in ["retries", "daily_calls", "run_calls", "run_seconds", "max_changed_files"] else 1) or value > 10000000:            raise ValueError("Invalid positive limit: " + key)
     if config["limits"]["concurrency"] > 4:
         raise ValueError("Maximum concurrency is 4")
     if config["sandbox"]["backend"] not in ["auto", "seatbelt", "docker"]:

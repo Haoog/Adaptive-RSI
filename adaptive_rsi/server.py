@@ -29,6 +29,9 @@ from .updates import UpdateInProgress
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 32
+    # 未认证的慢速连接不能无限占用线程；同时打开的连接数超过上限时直接拒绝。
+    max_connections = 64
 
     def server_bind(self):
         # 本地控制台不需要反向 DNS；解析阻塞不能拖住更新后的启动。
@@ -45,6 +48,7 @@ class Server(ThreadingHTTPServer):
         self.assets = {p.name: p.read_bytes() for p in (Path(__file__).parent / "web").iterdir() if p.is_file()}
         self.token = secrets.token_urlsafe(32)
         self.csrf = secrets.token_urlsafe(32)
+        self._connection_gate = threading.BoundedSemaphore(self.max_connections)
         super().__init__(("127.0.0.1", port), Handler)
         self.local_origin = "http://127.0.0.1:" + str(self.server_port)
         self.origin = (public_url or (session or {}).get("public_url") or self.local_origin).rstrip("/")
@@ -56,8 +60,50 @@ class Server(ThreadingHTTPServer):
                 raise RuntimeError("Restart session does not match this listener")
             self.token, self.csrf, self.url = session["token"], session["csrf"], session["url"]
 
+    def process_request(self, request, client_address):
+        if not self._connection_gate.acquire(blocking=False):
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_gate.release()
+
+    def cookie_header(self, host):
+        return (self.cookie + "=" + self.token + "; Path=/; HttpOnly; SameSite=Strict" +
+                ("; Secure" if self.origin.startswith("https://") and host == urlparse(self.origin).netloc else ""))
+
+    def rotate_session(self):
+        """轮换访问令牌：旧链接与旧会话立即失效；server.json 同步更新，重启后仍有效。"""
+        self.token = secrets.token_urlsafe(32)
+        self.csrf = secrets.token_urlsafe(32)
+        self.url = self.origin + "/?token=" + self.token
+        path = self.runtime.store.root / "server.json"
+        try:
+            session = json.loads(path.read_text())
+        except (OSError, ValueError):
+            session = {}
+        session.update({"origin": self.origin, "local_origin": self.local_origin,
+                        "public_url": self.origin if self.origin != self.local_origin else None,
+                        "cookie": self.cookie, "token": self.token, "csrf": self.csrf,
+                        "url": self.url, "pid": os.getpid()})
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(session))
+        tmp.chmod(0o600)
+        os.replace(tmp, path)
+        return {"url": self.url, "csrf": self.csrf}
+
 
 class Handler(BaseHTTPRequestHandler):
+    # 慢速或悬挂的连接最多占用线程 30 秒；超时由 handle_one_request 关闭连接。
+    timeout = 30
+
     def log_message(self, *args):
         pass
 
@@ -67,13 +113,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
 
-    def respond(self, data, code=200, content_type="application/json; charset=utf-8"):
+    def respond(self, data, code=200, content_type="application/json; charset=utf-8", headers=None):
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
         if isinstance(payload, str):
             payload = payload.encode()
         try:
             self.send_response(code)
             self.headers_common()
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -121,8 +169,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.headers_common()
             if valid:
-                self.send_header("Set-Cookie", self.server.cookie + "=" + self.server.token + "; Path=/; HttpOnly; SameSite=Strict" +
-                                 ("; Secure" if self.server.origin.startswith("https://") and self.headers.get("Host") == urlparse(self.server.origin).netloc else ""))
+                self.send_header("Set-Cookie", self.server.cookie_header(self.headers.get("Host")))
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -159,6 +206,9 @@ class Handler(BaseHTTPRequestHandler):
                 if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
                     raise ValueError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
+                if not path.is_file():
+                    # 不回显文件系统路径；只说明备份不存在。
+                    raise ValueError("Backup not found")
                 if params.get("format", [""])[0] == "json":
                     import base64
                     offset = int(params.get("offset", [0])[0])
@@ -319,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]
@@ -455,6 +505,11 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"id": runtime.revert_code(body["run"])}
                 elif path == "/api/cases":
                     result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
+                elif path == "/api/session/rotate":
+                    # 轮换后旧链接立即失效；响应携带新 cookie，当前浏览器保持登录。
+                    result = self.server.rotate_session()
+                    self.respond(result, headers={"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))})
+                    return
                 else:
                     self.respond({"error": "Not found"}, 404)
                     return

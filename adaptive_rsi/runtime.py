@@ -33,6 +33,20 @@ BUDGET_WAIT_SECONDS = 900
 BUDGET_WAIT_MAX_SECONDS = 3600
 BUDGET_WAIT_RETRIES = 3
 
+# 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
+FAILURE_BACKOFF_MAX_SECONDS = 21600
+
+# 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
+LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
+                       "pr_open", "merged", "deferred", "waiting_budget")
+# 用户明确做出的决定（不采纳、取消）同样压制重复发现，只有用户重新考虑才回池。
+SUPPRESSING_STATES = LIVE_FINDING_STATES + ("rejected", "cancelled")
+# 到达这些状态的发现可以被巡检重新入队：此前尝试已结束且没有产出修复。
+REDISCOVERABLE_STATES = ("failed", "blocked", "expired", "obsolete", "insufficient_evidence", "interrupted")
+# 依赖到达这些终态意味着永远不会合并；等待它的任务需要人工复核。
+DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejected",
+                          "pr_closed", "unverified_merge", "reverted", "superseded")
+
 
 class Runtime:
     def __init__(self, store, agent=None):
@@ -46,6 +60,8 @@ class Runtime:
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi")
         self.futures = set()
         self._scheduler_failures = {}
+        self._scheduler_failures_lock = threading.Lock()
+        self._config_cache = {}
         self.import_lock = threading.Lock()
         self.import_in_progress = False
         # 按项目粒度的基线锁：锁内包含网络 fetch，全局锁会让多项目基线刷新互相阻塞。
@@ -66,7 +82,17 @@ class Runtime:
         if project:
             row = self.project(project)
             override = json.loads(row["config"])
-        return validate(merge(DEFAULTS, self.store.setting("config", {}), override))
+        raw = merge(DEFAULTS, self.store.setting("config", {}), override)
+        # 调度循环每 5 秒读取每个项目的配置；validate 是纯函数，按内容指纹缓存校验结果。
+        key = fingerprint(raw)
+        cached = self._config_cache.get(key)
+        if cached is None:
+            cached = validate(raw)
+            if len(self._config_cache) >= 64:
+                self._config_cache.clear()
+            self._config_cache[key] = cached
+        import copy
+        return copy.deepcopy(cached)
 
     def project(self, project):
         row = self.store.one("SELECT * FROM projects WHERE id=?", (project,))
@@ -292,6 +318,18 @@ class Runtime:
             if prior["state"] == "queued":
                 self.store.execute("UPDATE tasks SET priority=max(priority,?) WHERE id=?", (priority, prior["id"]))
             return prior["id"]
+        if prior and prior["state"] in ["failed", "blocked"]:
+            # 周期任务的持续故障（如 gh 未认证）没有供应商熔断；按连败次数退避重排，避免每周期产生新的失败 run。
+            rows = self.store.query("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 4", (prior["id"],))
+            streak, last_failure = 0, 0.0
+            for row in rows:
+                if row["state"] in ["failed", "blocked"]:
+                    streak += 1
+                    last_failure = max(last_failure, row["ended"] or 0)
+                else:
+                    break
+            if streak and time.time() < last_failure + min(FAILURE_BACKOFF_MAX_SECONDS, 600 * 2 ** (streak - 1)):
+                return prior["id"]
         if prior:
             self.store.execute("UPDATE tasks SET state='queued',priority=?,available=0,updated=? WHERE id=?", (priority, time.time(), prior["id"]))
             task = prior["id"]
@@ -302,7 +340,8 @@ class Runtime:
 
     def retry(self, task):
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
-        scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time() and row["infra_retries"] > 0
+        # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
+        scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
         if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired"]:
             raise ValueError("This task cannot be retried")
         self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (time.time(), task))
@@ -377,6 +416,11 @@ class Runtime:
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
         if not row:
             raise ValueError("Task not found")
+        # 终态（已合并、PR 已创建、已发布等）承载历史与复发判定，取消不能改写它们。
+        cancellable = ["queued", "planning", "executing", "evaluating", "blocked", "waiting_budget",
+                       "deferred", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]
+        if row["state"] not in cancellable:
+            raise ValueError("This task has finished and can no longer be cancelled")
         self.store.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (time.time(), task))
         self.store.event("cancelled", "Cancellation requested", row["project"], data={"task": task})
 
@@ -478,6 +522,17 @@ class Runtime:
                 self.request(project, "reassess", priority=40)
             self.store.put_setting(key, now)
 
+    @staticmethod
+    def _zone_timestamp(day, hour, zone):
+        """DST 会让某个本地整点不存在或出现两次；返回该日该时刻的稳定时间戳。"""
+        naive = datetime.datetime.combine(day, datetime.time(hour=hour))
+        aware = naive.replace(tzinfo=zone)
+        shifted = aware.astimezone(datetime.timezone.utc).astimezone(zone).replace(tzinfo=None)
+        if shifted != naive:
+            # 不存在的本地时刻（DST 空洞）：平移到空洞结束后的等价时刻。
+            aware = aware + (shifted - naive)
+        return aware.timestamp()
+
     def next_effective_schedule(self, project, due, now=None):
         """Return the first instant at or after due that falls inside working hours."""
         schedule = self.config(project)["schedule"]
@@ -486,17 +541,16 @@ class Runtime:
         zone = ZoneInfo(schedule["timezone"])
         local = datetime.datetime.fromtimestamp(candidate, zone)
         start, end = schedule["working_hours"]
-        opening = local.replace(hour=start, minute=0, second=0, microsecond=0)
+        opening = datetime.datetime.fromtimestamp(self._zone_timestamp(local.date(), start, zone), zone)
         if local < opening:
             return opening.timestamp()
         if end == 24:
             closing = datetime.datetime.combine(local.date() + datetime.timedelta(days=1),
                                                 datetime.time.min).replace(tzinfo=zone)
         else:
-            closing = local.replace(hour=end, minute=0, second=0, microsecond=0)
+            closing = datetime.datetime.fromtimestamp(self._zone_timestamp(local.date(), end, zone), zone)
         if local >= closing:
-            tomorrow = local.date() + datetime.timedelta(days=1)
-            return datetime.datetime.combine(tomorrow, datetime.time(hour=start)).replace(tzinfo=zone).timestamp()
+            return self._zone_timestamp(local.date() + datetime.timedelta(days=1), start, zone)
         return candidate
 
     def reassess_deferred(self, project, config, head):
@@ -545,6 +599,33 @@ class Runtime:
                            "WHERE project=? AND state='waiting_budget' AND available<=?",
                            (now, project, now))
 
+    def release_dead_dependencies(self):
+        # 依赖到达「永远不会合并」的终态时，等待它的任务会永久卡在
+        # 「等待前置任务合并」；解除等待并转 blocked，由用户复核后手动重试。
+        placeholders = ",".join("?" * len(DEAD_DEPENDENCY_STATES))
+        rows = self.store.query(
+            "SELECT td.task AS task, td.dependency AS dependency, t.project AS project, d.state AS dep_state "
+            "FROM task_dependencies td JOIN tasks t ON t.id=td.task JOIN tasks d ON d.id=td.dependency "
+            "WHERE d.state IN (" + placeholders + ") AND t.state IN ('queued','deferred','blocked')",
+            DEAD_DEPENDENCY_STATES)
+        released = False
+        for row in rows:
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                link = db.execute("SELECT dependency FROM task_dependencies WHERE task=?", (row["task"],)).fetchone()
+                if not link or link["dependency"] != row["dependency"]:
+                    continue
+                db.execute("DELETE FROM task_dependencies WHERE task=?", (row["task"],))
+                db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state IN ('queued','deferred')",
+                           (time.time(), row["task"]))
+            self.store.event("dependency_released",
+                             "Dependency will not merge; waiting released and the task needs manual review",
+                             row["project"], data={"task": row["task"], "dependency": row["dependency"],
+                                                   "dependency_state": row["dep_state"]})
+            released = True
+        if released:
+            self.wake.set()
+
     @contextlib.contextmanager
     def scheduler_scope(self, phase, project=None, run=None):
         key = (phase, project, run)
@@ -553,13 +634,15 @@ class Runtime:
         except Exception as exc:
             message = str(exc)
             # 相同故障只记一次；恢复后再失败仍保留新证据。
-            if self._scheduler_failures.get(key) != message:
-                self.store.event("scheduler_error", message, project, run, {"phase": phase})
-                if key not in self._scheduler_failures and len(self._scheduler_failures) >= 128:
-                    self._scheduler_failures.pop(next(iter(self._scheduler_failures)))
-                self._scheduler_failures[key] = message
+            with self._scheduler_failures_lock:
+                if self._scheduler_failures.get(key) != message:
+                    self.store.event("scheduler_error", message, project, run, {"phase": phase})
+                    if key not in self._scheduler_failures and len(self._scheduler_failures) >= 128:
+                        self._scheduler_failures.pop(next(iter(self._scheduler_failures)))
+                    self._scheduler_failures[key] = message
         else:
-            self._scheduler_failures.pop(key, None)
+            with self._scheduler_failures_lock:
+                self._scheduler_failures.pop(key, None)
 
     def loop(self):
         while not self.stop.is_set():
@@ -576,6 +659,8 @@ class Runtime:
                 from .delivery import schedule as schedule_delivery
                 with self.scheduler_scope("delivery"):
                     schedule_delivery(self)
+                with self.scheduler_scope("dependencies"):
+                    self.release_dead_dependencies()
                 eligible = []
                 for project in self.store.query("SELECT * FROM projects WHERE paused=0 ORDER BY created"):
                     with self.scheduler_scope("project", project["id"]):
@@ -731,11 +816,17 @@ class Runtime:
                     self.store.transition(run["id"], "completed", {"reason": "Existing delivery recovered", "pr": outcome["pr"]}, True)
                     return
                 candidate = Path(original["path"]) / "candidate"
+                if not candidate.is_dir():
+                    # maintenance 会清理超过保留期的候选；给用户可操作的指引而不是裸 git 错误。
+                    raise RuntimeError("Candidate was cleaned up after the retention window; regenerate it before publishing")
                 changes(candidate)
                 patch = git(candidate, "diff", original["base"], "--binary", "--no-ext-diff", "--no-textconv")
                 if fingerprint(patch) != outcome.get("patch_hash"):
                     raise RuntimeError("Candidate changed after evaluation; delivery refused")
                 source_task = self.store.one("SELECT * FROM tasks WHERE id=?", (original["task"],))
+                if source_task and source_task["state"] in ["cancelled", "expired", "obsolete"]:
+                    # 批准之后、发布之前取消源任务时，授权不再成立。
+                    raise Cancelled("Source task is " + source_task["state"] + "; publishing stopped")
                 from .delivery import StaleCandidate
                 try:
                     url = self.publish(project, source_task, original, candidate, config)
@@ -880,7 +971,7 @@ class Runtime:
                              for old, new in zip(checks.get("baseline", []), checks.get("candidate", [])))
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if state == "failed" and task["attempts"] <= config["limits"]["retries"]:
-            delay = 60 * 2 ** task["attempts"]
+            delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** task["attempts"])
             self.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=? AND state='failed'", (time.time() + delay, task["id"]))
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
 
@@ -974,6 +1065,7 @@ class Runtime:
         candidates = []
         seen_keys = set()
         recurrences = 0
+        rediscoveries = 0
         contents = {}
         for item in findings["findings"]:
             try:
@@ -1003,7 +1095,15 @@ class Runtime:
                     self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})
                     recurrences += 1
                     continue
-                if related_task(backlog, item):
+                if prior and prior["state"] in REDISCOVERABLE_STATES:
+                    # 此前的尝试已结束且没有产出修复；同一条发现不应被指纹去重永久压制。
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
+                                       (encode([{"path": item["path"], "quote": item["quote"], "base": head,
+                                                 "source": "rediscovered"}]), time.time(), prior["id"]))
+                    self.store.event("finding_requeued", "Earlier attempt ended without a fix; rediscovered finding queued for fresh verification", project["id"], run["id"], {"task": prior["id"]})
+                    rediscoveries += 1
+                    continue
+                if related_task([entry for entry in backlog if entry["state"] in SUPPRESSING_STATES], item):
                     continue
                 if finding_key in seen_keys:
                     continue
@@ -1044,8 +1144,8 @@ class Runtime:
                 self.store.event("triage_unavailable", "Batch triage unavailable; findings retain full planning",
                                  project["id"], run["id"], {"reason": str(exc)[:300]})
                 decisions = {}
-        added = recurrences
-        queued, deferred, rejected = recurrences, 0, 0
+        added = recurrences + rediscoveries
+        queued, deferred, rejected = recurrences + rediscoveries, 0, 0
         for candidate in candidates:
             item = candidate["item"]
             decision = decisions.get(candidate["index"], {}).get("decision", "ready")
@@ -1130,7 +1230,10 @@ class Runtime:
 
     def issue_still_open(self, project, task, config):
         from .delivery import StaleCandidate
-        evidence = json.loads(task["evidence"])[0]
+        evidence_rows = json.loads(task["evidence"])
+        if not evidence_rows or not isinstance(evidence_rows[0], dict) or "number" not in evidence_rows[0]:
+            raise StaleCandidate("Task evidence no longer references its Issue; synchronize Issues before delivering")
+        evidence = evidence_rows[0]
         row = json.loads(checked(["gh", "issue", "view", str(evidence["number"]), "--repo",
                                   config["github"]["repository"], "--json", "state,updatedAt,labels"]))
         if row.get("state") != "OPEN":

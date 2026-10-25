@@ -73,12 +73,18 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                                    stdout=stdout, stderr=stderr, env=env, start_new_session=True)
         reason = None
         while process.poll() is None:
-            if cancel and cancel():
-                reason = "Cancelled"
-            elif timeout and time.monotonic() - started > timeout:
-                reason = "Command timed out"
-            elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > output_mb * 1024 * 1024:
-                reason = "Command output limit exceeded"
+            if reason is None:
+                try:
+                    requested = bool(cancel and cancel())
+                except Exception:
+                    # 取消检查依赖数据库；查询失败时继续轮询，避免遗留正在运行的子进程。
+                    requested = False
+                if requested:
+                    reason = "Cancelled"
+                elif timeout and time.monotonic() - started > timeout:
+                    reason = "Command timed out"
+                elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > output_mb * 1024 * 1024:
+                    reason = "Command output limit exceeded"
             if reason:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -253,11 +259,14 @@ class Sandbox:
                "GOPROXY": "off", "GOTOOLCHAIN": "local", "NO_COLOR": "1"}
         Path(env["HOME"]).mkdir(exist_ok=True)
         Path(env["TMPDIR"]).mkdir(exist_ok=True)
+        cleanup = argv[0] == "docker"
         try:
             result = run_process(argv, cwd, self.config["limits"]["command_seconds"], cancel,
                                  self.config["limits"]["max_output_mb"], env)
+            # --rm 由 Docker 在容器退出后清理；只有超时、取消或输出超限才需要强制移除。
+            cleanup = cleanup and bool(result["error"])
         finally:
-            if argv[0] == "docker":
+            if cleanup:
                 name = argv[argv.index("--name") + 1]
                 run_process(["docker", "rm", "--force", name], timeout=15)
         result["argv"] = check["argv"]

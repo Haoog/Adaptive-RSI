@@ -243,7 +243,12 @@ class Evolution:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
-            if not row or row["status"] != "stable":
+            if not row:
+                raise ValueError("Candidate not found")
+            if row["status"] == "rolled_back":
+                # 重复回滚是幂等操作；监控线程与用户操作并发时不产生误导性错误事件。
+                return
+            if row["status"] != "stable":
                 raise ValueError("Only an active strategy can be rolled back")
             db.execute("UPDATE candidates SET status='rolled_back' WHERE id=?", (candidate,))
             if row["parent"]:

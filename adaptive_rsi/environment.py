@@ -49,5 +49,8 @@ def restore(source, target, config):
         shutil.copytree(Path(source) / relative, destination, symlinks=True)
         info = Path(target) / ".git/info/exclude"
         if info.exists():
-            with info.open("a") as stream:
-                stream.write("\n/" + relative.rstrip("/") + "/\n")
+            marker = "/" + relative.rstrip("/") + "/"
+            with info.open("r+") as stream:
+                # 重复 restore 不再向 exclude 追加重复条目。
+                if marker not in stream.read():
+                    stream.write("\n" + marker + "\n")

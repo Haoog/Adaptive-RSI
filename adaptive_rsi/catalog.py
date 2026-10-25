@@ -363,6 +363,10 @@ def parse_opencode_v1_models(text):
             metadata, end = decoder.raw_decode(text.lstrip())
             text = text.lstrip()[end:]
         except ValueError:
+            if models:
+                # stdout 截断或版本差异可能让最后一行缺少元数据；跳过坏行而不是丢弃整个目录。
+                text = ""
+                continue
             raise ValueError("invalid OpenCode metadata") from None
         if not isinstance(metadata, dict) or metadata.get("capabilities", {}).get("toolcall") is False:
             continue

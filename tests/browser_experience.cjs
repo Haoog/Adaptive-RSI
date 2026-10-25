@@ -71,7 +71,9 @@ const { chromium } = require("playwright");
       await context.request.get(new URL("/manifest.webmanifest", url).href)
     ).json();
     assert.equal(manifest.start_url, "/");
-    assert.equal(manifest.icons.length, 2);
+    // any 两种尺寸 + 一份 maskable 图标，Android 自适应裁切使用。
+    assert.equal(manifest.icons.length, 3);
+    assert.ok(manifest.icons.some((icon) => icon.purpose === "maskable"));
     for (const icon of manifest.icons)
       assert.equal(
         (await context.request.get(new URL(icon.src, url).href)).status(),
