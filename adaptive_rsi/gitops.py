@@ -31,7 +31,7 @@ def snapshot(source, destination, sha=None):
     git(destination, "checkout", "--quiet", "--detach", "FETCH_HEAD")
     scrub_tree(destination)
     with (destination / ".git" / "info" / "exclude").open("a") as stream:
-        stream.write("\n.rsi-agent/\n.rsi-home/\n.rsi-build/\n")
+        stream.write("\n.rsi-agent/\n.rsi-home/\n.rsi-build/\n.rsi-tmp/\n")
     return destination
 
 

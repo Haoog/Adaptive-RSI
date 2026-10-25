@@ -73,7 +73,12 @@ async function sendApi(path,body,signal){
  if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;throw error;}
  let data;
  try{data=await response.json();}catch(error){const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;throw invalid;}
- if(!response.ok){const error=Error(t(apiErrors[data.error]||data.error||String(response.status)));error.code=data.error_code||data.catalog_error;error.status=response.status;throw error;}
+ if(!response.ok){
+  // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
+  const known=apiErrors[data.error];
+  const message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
+  if(!known&&data.error)console.warn('[adaptive-rsi]',data.error);
+  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;throw error;}
  if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
 }
@@ -614,10 +619,10 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
 });
 
 const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升级）',managed:'内置自更新'};
-let desktopUpdate=null,desktopUpdateTimer=null;
+let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 async function checkDesktopUpdate(force=false){
  if(!window.RSIDesktop?.invoke)return;
- try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;}catch{desktopUpdate=null;}
+ try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  renderUpdate();
 }
 async function startDesktopUpdate(){
@@ -653,7 +658,7 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  $('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);
  $('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);
  renderUpdateExtras(update);}
-$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
+$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
 if(window.RSIDesktop)safe(checkDesktopUpdate);

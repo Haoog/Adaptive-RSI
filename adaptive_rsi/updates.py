@@ -119,6 +119,11 @@ def atomic_json(path, data):
     os.replace(temp, path)
 
 
+# 新候选与回滚旧版本的启动健康检查窗口：大状态目录的首次启动（迁移/WAL 恢复）
+# 可能超过 start.py 的 30 秒等待，这里统一给足预算，避免把慢启动误判为失败。
+RESTART_HEALTH_SECONDS = 60
+
+
 def supervisor_active(state):
     import fcntl
     try:
@@ -511,7 +516,7 @@ def _supervise_restart(state):
             recovery_required(state, "Committed candidate cannot be verified; preserve current database and inspect the retained restart plan")
         return
     if phase == "health_check" and process_present(plan.get("candidate_pid")):
-        deadline = time.monotonic() + 25
+        deadline = time.monotonic() + RESTART_HEALTH_SECONDS
         while time.monotonic() < deadline and process_present(plan.get("candidate_pid")):
             if candidate_health(plan):
                 commit_installation(state, plan)
@@ -562,7 +567,7 @@ def _supervise_restart(state):
                                  cwd=plan["candidate"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
         plan.update(phase="health_check", candidate_pid=child.pid)
         atomic_json(plan_path, plan)
-        deadline = time.monotonic() + 25
+        deadline = time.monotonic() + RESTART_HEALTH_SECONDS
         healthy = False
         while time.monotonic() < deadline and child.poll() is None:
             try:
@@ -612,10 +617,28 @@ def _supervise_restart(state):
             for suffix in ["-wal", "-shm"]:
                 Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
             os.replace(restore, state / "state.sqlite3")
-            Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
         atomic_json(state / "restart-session.json", session)
-        subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
+        previous_child = subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
                          cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        # 回滚重启的旧版本同样要通过启动健康检查；不能无条件宣布就绪后留下没有服务在跑的状态。
+        deadline = time.monotonic() + RESTART_HEALTH_SECONDS
+        previous_healthy = False
+        while time.monotonic() < deadline and previous_child.poll() is None:
+            try:
+                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health",
+                    headers={"Cookie": session["cookie"] + "=" + session["token"]})
+                with urllib.request.urlopen(request, timeout=1) as response:
+                    health = json.load(response)
+                previous_healthy = health.get("version") == __version__ and health.get("pid") == previous_child.pid
+                if previous_healthy:
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        if not previous_healthy:
+            recovery_required(state, "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually")
+            return
+        Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
         (state / "update-ready").write_text("ready")
     finally:
         if Store(state).setting("update-status", {}).get("state") in ["installed", "rolled_back"]:

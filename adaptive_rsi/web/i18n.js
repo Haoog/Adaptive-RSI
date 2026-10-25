@@ -1272,7 +1272,9 @@ const english = {
   "已轮换。请立即保存新的认证链接，旧链接已失效：": "Rotated. Save the new authenticated link now; the old one no longer works:",
   "此前尝试未产出修复；重新发现的问题已入队等待全新验证": "An earlier attempt ended without a fix; the rediscovered finding was queued for fresh verification",
   "前置任务无法合并；等待已解除，任务需要人工复核后重试": "The dependency will not merge; the wait was released and the task needs manual review before retrying",
-  "候选已超过保留期被清理，请重新生成后再发布。": "The candidate was cleaned up after the retention window; regenerate it before publishing."
+  "候选已超过保留期被清理，请重新生成后再发布。": "The candidate was cleaned up after the retention window; regenerate it before publishing.",
+  "检查更新失败，请稍后重试。": "Update check failed; try again later.",
+  "操作未完成，请稍后重试。": "The request did not complete; try again later."
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }

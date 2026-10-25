@@ -309,7 +309,8 @@ class RuntimeTest(unittest.TestCase):
         from adaptive_rsi.discovery import finding_identity
         finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
                    "path": "calculator.py", "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60}
-        for state in ["rejected", "cancelled"]:
+        # obsolete 是规划得出的结论而非失败：同样不被重新发现，但可手动重试或补充需求。
+        for state in ["rejected", "cancelled", "obsolete"]:
             with self.subTest(state=state):
                 title = finding["title"] + " " + state
                 key = finding_identity({**finding, "title": title})
@@ -323,6 +324,14 @@ class RuntimeTest(unittest.TestCase):
                 self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], state)
                 # 没有为同一条发现创建新任务。
                 self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source NOT LIKE 'system_%'")), before)
+        # 被判 obsolete 的目标仍有出路：手动重试与补充需求都可用。
+        obsolete_task = self.runtime.goal(self.project, "Judged obsolete")
+        self.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete_task,))
+        self.runtime.retry(obsolete_task)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (obsolete_task,))["state"], "queued")
+        self.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete_task,))
+        self.runtime.revise_task(obsolete_task, "New evidence arrived")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (obsolete_task,))["state"], "queued")
 
     def test_failing_system_scan_gets_circuit_breaker_backoff(self):
         self.runtime.pause(self.project, False)
@@ -346,6 +355,10 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.retry(task)
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
         self.assertEqual((row["state"], row["available"]), ("queued", 0))
+        # 手动重试清零基础设施退避计数：之后的瞬时故障仍可自动重试。
+        self.store.execute("UPDATE tasks SET state='blocked',infra_retries=3 WHERE id=?", (task,))
+        self.runtime.retry(task)
+        self.assertEqual(self.store.one("SELECT infra_retries FROM tasks WHERE id=?", (task,))["infra_retries"], 0)
 
     def test_cancel_cannot_rewrite_terminal_states(self):
         task = self.runtime.goal(self.project, "Fix addition")
@@ -1061,6 +1074,13 @@ class ServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as denied:
             urllib.request.urlopen(self.server.origin + "/?token=stale-token")
         self.assertEqual(denied.exception.code, 401)
+
+    def test_non_ascii_tokens_are_rejected_without_raising(self):
+        # compare_digest 对非 ASCII str 抛 TypeError；必须按不匹配处理而不是让连接炸成 traceback。
+        # HTTP 头无法直接携带非 ASCII（latin-1 限制），因此直接验证比较辅助方法。
+        self.assertFalse(Handler._token_matches("非ASCII令牌", self.server.token))
+        self.assertFalse(Handler._token_matches(None, self.server.token))
+        self.assertTrue(Handler._token_matches(self.server.token, self.server.token))
 
     def test_update_gate_rejects_before_mutation_with_a_retryable_code(self):
         self.runtime.updates.installing = True

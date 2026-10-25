@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import venv
@@ -66,15 +67,25 @@ def latest_release():
     headers = {"User-Agent": "Adaptive-RSI-release-smoke", "Accept": "application/vnd.github+json"}
     if os.environ.get("GH_TOKEN"):
         headers["Authorization"] = "Bearer " + os.environ["GH_TOKEN"]
-    request = urllib.request.Request(RELEASE_API, headers=headers)
     opener = urllib.request.build_opener(NoMetadataRedirect())
-    try:
-        with opener.open(request, timeout=20) as response:
-            data = response.read(2 * 1024 * 1024 + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code != 404:
-            raise
-        return {}
+    # runner 偶发的 DNS/网络抖动不应当作发版失败；短暂退避后重试。
+    data = None
+    for attempt in range(3):
+        request = urllib.request.Request(RELEASE_API, headers=headers)
+        try:
+            with opener.open(request, timeout=20) as response:
+                data = response.read(2 * 1024 * 1024 + 1)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return {}
+            if exc.code not in (403, 429, 500, 502, 503, 504) or attempt == 2:
+                raise
+            time.sleep(2)
+        except urllib.error.URLError:
+            if attempt == 2:
+                raise
+            time.sleep(2)
     if len(data) > 2 * 1024 * 1024:
         raise ValueError("Release metadata exceeds size limit")
     return json.loads(data)

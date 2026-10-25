@@ -4,5 +4,7 @@
 try {
   if (localStorage.getItem('rsi-language') === 'en') {
     document.documentElement.style.visibility = 'hidden';
+    // 兜底：i18n.js 加载失败时 3 秒后强制恢复显示，页面绝不因翻译脚本报错而永久空白。
+    setTimeout(() => { document.documentElement.style.visibility = ''; }, 3000);
   }
 } catch (error) { /* localStorage 不可用时按默认语言渲染。 */ }

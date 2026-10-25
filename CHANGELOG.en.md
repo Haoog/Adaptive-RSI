@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Tasks judged obsolete by planning are no longer requeued by inspections (avoiding repeated paid planning every scan cycle); manual retry and requirement supplements remain available for obsolete tasks.
+- A failed desktop update check no longer displays "up to date"; check errors are now distinct from "no update".
+- After an automatic-update rollback, the previous version must pass its startup health check before the system reports ready; startup waits for the new candidate and the rollback are unified at 60 seconds so large state directories are no longer misjudged.
+- The English anti-flash bootstrap now has a 3-second safety net, so a broken translation script can no longer leave the page blank forever.
+- Sandbox snapshots exclude `.rsi-tmp`, so setup leftovers no longer pollute candidate patches; publishing retries use `checkout -B` so an existing branch no longer fails.
+- Authentication token comparison treats non-ASCII input as a mismatch instead of raising and resetting the connection; CSP now includes `form-action 'self'`.
+- Manual retry resets the infrastructure backoff counter; recurrence requeue of merged tasks also resets attempt counters.
+- Native APIs tolerate null usage fields, and empty Gemini candidates return a diagnosable error instead of crashing.
+- OpenCode CLI timeouts, rate limits and connection failures can now trigger the configured fallback model.
+- Dark mode covers the model center and dialog accent variables; desktop exit force-kills a stuck engine after 10 seconds; the update download no longer has a double-click race; the unused Tauri global API is disabled.
+- Unknown UI errors now show a generic message (the original text stays in the browser console); the release smoke retries transient GitHub API network errors.
+
 ## 0.5.105
 
 <!-- adaptive-rsi-release:0.5.105;base:9b3de09c0ec50af7a9557b509b14d662c79a60a8 -->

@@ -225,7 +225,7 @@ class Conversation:
             self.history.extend(output)
             usage = response.get("usage", {})
             calls = [(x["call_id"], x["name"], parse_arguments(x["name"], x.get("arguments"))) for x in output if x.get("type") == "function_call"]
-            return calls, int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+            return calls, int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
         if p in ["chat_completions", "ollama"]:
             message = response["message"] if p == "ollama" else response["choices"][0]["message"]
             # Keep reasoning_content returned by gateways that require it on subsequent turns.
@@ -233,20 +233,24 @@ class Conversation:
             usage = response.get("usage", {})
             calls = [(x.get("id", str(i)), x["function"]["name"], parse_arguments(x["function"]["name"], x["function"].get("arguments")))
                      for i, x in enumerate(message.get("tool_calls", []))]
-            tokens = int(response.get("prompt_eval_count", 0)) + int(response.get("eval_count", 0)) if p == "ollama" else int(usage.get("total_tokens", 0))
+            tokens = int(response.get("prompt_eval_count") or 0) + int(response.get("eval_count") or 0) if p == "ollama" else int(usage.get("total_tokens") or 0)
             return calls, tokens
         if p == "anthropic":
             content = response.get("content", [])
             self.history.append({"role": "assistant", "content": content})
             usage = response.get("usage", {})
             calls = [(x["id"], x["name"], parse_arguments(x["name"], x.get("input"))) for x in content if x.get("type") == "tool_use"]
-            return calls, sum(int(usage.get(k, 0)) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
-        content = response["candidates"][0]["content"]
+            return calls, sum(int(usage.get(k) or 0) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_tokens"])
+        candidates = response.get("candidates") or []
+        if not candidates:
+            # prompt 被安全策略拦截时 candidates 为空；按可诊断错误处理而不是裸 IndexError。
+            raise RuntimeError("Gemini returned no candidates; the request may have been blocked by safety settings")
+        content = candidates[0]["content"]
         self.history.append(content)  # Preserve opaque thoughtSignature fields verbatim.
         calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"],
                   parse_arguments(x["functionCall"]["name"], x["functionCall"].get("args", {})))
-                 for i, x in enumerate(content["parts"]) if "functionCall" in x]
-        return calls, int(response.get("usageMetadata", {}).get("totalTokenCount", 0))
+                 for x in content["parts"] if "functionCall" in x]
+        return calls, int(response.get("usageMetadata", {}).get("totalTokenCount") or 0)
 
     def results(self, results):
         if self.protocol == "responses":

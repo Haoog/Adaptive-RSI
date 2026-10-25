@@ -111,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
     def respond(self, data, code=200, content_type="application/json; charset=utf-8", headers=None):
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
@@ -130,6 +130,15 @@ class Handler(BaseHTTPRequestHandler):
             # Aborted browser fetches are normal during navigation; do not retry a response to a closed socket.
             self.close_connection = True
 
+    @staticmethod
+    def _token_matches(received, expected):
+        """常量时间比较；非 ASCII 输入按不匹配处理而不是抛 TypeError 重置连接。"""
+        try:
+            return hmac.compare_digest(received.encode("utf-8", "surrogatepass"),
+                                       expected.encode("utf-8", "surrogatepass"))
+        except (AttributeError, ValueError):
+            return False
+
     def authenticated(self):
         if self.headers.get("Host") not in self.server.allowed_hosts:
             self.respond({"error": "Invalid Host"}, 403)
@@ -139,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
             token = cookie[self.server.cookie].value if self.server.cookie in cookie else ""
         except Exception:
             token = ""
-        if not hmac.compare_digest(token, self.server.token):
+        if not self._token_matches(token, self.server.token):
             if self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
                 self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
             else:
@@ -161,7 +170,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(self.server.assets[name], content_type=mimetypes.guess_type(name)[0] or "application/octet-stream")
             return
         if parsed.path == "/" and "token" in params:
-            valid = self.headers.get("Host") in self.server.allowed_hosts and hmac.compare_digest(params["token"][0], self.server.token)
+            valid = self.headers.get("Host") in self.server.allowed_hosts and self._token_matches(params["token"][0], self.server.token)
             if not valid:
                 # 旧启动地址携带的 token 可能已轮换；已持有有效会话时仍直接回到控制台。
                 if not self.authenticated():
@@ -384,7 +393,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authenticated():
             return
-        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not hmac.compare_digest(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
+        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
             self.respond({"error": "Invalid origin or CSRF token"}, 403)
             return
         try:

@@ -134,7 +134,8 @@ def publish(runtime, project, task, run, workspace, config):
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
     branch = prefix + "/rsi-" + run["id"]
     if git(workspace, "branch", "--show-current") != branch:
-        git(workspace, "checkout", "-b", branch)
+        # -B：push 成功但创建 PR 失败后的重试会再次进入本分支，此时分支已存在。
+        git(workspace, "checkout", "-B", branch)
     if git(workspace, "diff", "--cached", "--name-only"):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + task["title"])

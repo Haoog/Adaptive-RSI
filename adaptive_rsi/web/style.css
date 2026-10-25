@@ -793,8 +793,10 @@ input:disabled,select:disabled {
  :root{
   color-scheme:dark;
   --paper:#161c17; --surface:#1e2620; --ink:#dde6da; --muted:#93a394;
-  --line:#313d33; --green:#7db99a; --wash:#263129; --danger:#d07b68;
+  --line:#313d33; --green:#7db99a; --wash:#263129; --danger:#d07b68; --border:#313d33;
  }
+ /* 模型中心的辅助色定义在 .model-center 自身，须在同选择器下覆盖才会生效。 */
+ .model-center{--mc-muted:#93a394;--mc-soft:#242e25}
  body{background:var(--paper)}
  .sidebar{background:#131a14;border-right-color:var(--line)}
  .nav{color:#a4b3a5}.nav.active{background:#28352b;color:#9ed3b6}.nav:hover{background:#242f25}

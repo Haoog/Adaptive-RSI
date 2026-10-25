@@ -169,10 +169,13 @@ class CodexAgent:
                 exc.role = role
                 health.record(config, provider_id, project, exc)
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
-                codex_unavailable = str(exc).startswith("Codex call failed:") and any(
-                    text in str(exc).lower() for text in ["model not found", "not supported", "does not exist", "rate limit", "usage limit"])
+                # Codex 与 OpenCode 的 CLI 失败都带前缀；瞬时网络类失败也允许切换备用。
+                cli_unavailable = str(exc).startswith(("Codex call failed:", "OpenCode call failed:")) and any(
+                    text in str(exc).lower() for text in ["model not found", "not supported", "does not exist",
+                                                          "rate limit", "usage limit", "timed out", "timeout",
+                                                          "connection", "429", "502", "503"])
                 can_fallback = index + 1 < len(routes) and (
-                    isinstance(exc, (ProviderUnavailable, ProviderPaused)) or codex_unavailable)
+                    isinstance(exc, (ProviderUnavailable, ProviderPaused)) or cli_unavailable)
                 if can_fallback and workspace_before is not None and \
                         workspace_signature(workspace, config["limits"]["max_output_mb"] * 1024 * 1024) != workspace_before:
                     raise RuntimeError("Primary implementation failed after changing the workspace; fallback refused to prevent mixing partial edits") from None

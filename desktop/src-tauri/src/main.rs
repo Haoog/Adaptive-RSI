@@ -111,21 +111,36 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
             }
         }
     }
-    let client = update_client().ok()?;
-    let response = client
+    // 检查失败必须与「没有新版」区分：返回带 check_error 的结构，由前端提示重试。
+    let check_failed = || -> Option<Value> { Some(json!({"check_error": true, "error": "check_failed"})) };
+    let client = match update_client() {
+        Ok(client) => client,
+        Err(_) => return check_failed(),
+    };
+    let response = match client
         .get(format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO))
         .header("User-Agent", "Adaptive-RSI-updater")
         .header("Accept", "application/vnd.github+json")
         .send()
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(_) => return check_failed(),
+    };
     if !response.status().is_success() {
-        return None;
+        return check_failed();
     }
-    let release: Value = response.json().ok()?;
-    let tag = release.get("tag_name")?.as_str()?.trim_start_matches('v');
+    let release: Value = match response.json() {
+        Ok(value) => value,
+        Err(_) => return check_failed(),
+    };
+    let tag = match release.get("tag_name").and_then(Value::as_str) {
+        Some(tag) => tag.trim_start_matches('v').to_string(),
+        None => return check_failed(),
+    };
     let current = app.package_info().version.to_string();
-    if parse_version(tag)? <= parse_version(&current)? {
-        return None;
+    match (parse_version(&tag), parse_version(&current)) {
+        (Some(target), Some(now)) if target > now => {}
+        _ => return None,
     }
     let dmg_name = format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", tag);
     let mut url = None;
@@ -166,26 +181,21 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
 }
 
 fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
+    // 检查与置位放在同一个锁作用域内，双击不会启动两个下载线程写同一个文件。
     let (url, sha_url, version) = {
         let state = app.state::<RuntimeState>();
-        let guard = state.update.lock().unwrap();
-        match guard.as_ref() {
+        let mut guard = state.update.lock().unwrap();
+        match guard.as_mut() {
             Some(update) if !update.downloading.load(Ordering::Relaxed) => {
+                update.downloading.store(true, Ordering::Relaxed);
+                update.percent.store(0, Ordering::Relaxed);
+                update.error.clear();
+                update.error_code.clear();
                 (update.url.clone(), update.sha_url.clone(), update.version.clone())
             }
             _ => return Err("No desktop update available".into()),
         }
     };
-    {
-        let state = app.state::<RuntimeState>();
-        let mut guard = state.update.lock().unwrap();
-        if let Some(update) = guard.as_mut() {
-            update.downloading.store(true, Ordering::Relaxed);
-            update.percent.store(0, Ordering::Relaxed);
-            update.error.clear();
-            update.error_code.clear();
-        }
-    }
     std::thread::spawn(move || {
         let fail = |message: String, code: &str| {
             let state = app.state::<RuntimeState>();
@@ -754,6 +764,15 @@ fn main() {
         if let tauri::RunEvent::ExitRequested { .. } = event {
             if let Some(mut child) = app.state::<RuntimeState>().child.lock().unwrap().take() {
                 drop(child.stdin.take());
+                // 引擎正常会在 stdin 关闭后退出；卡死时限时强杀，避免应用退出被永久挂起。
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while child.try_wait().ok().flatten().is_none() {
+                    if std::time::Instant::now() > deadline {
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 let _ = child.wait();
             }
         }
