@@ -123,8 +123,9 @@ class DeliveryLoopTest(unittest.TestCase):
         self.runtime.goal(self.project, "Fix addition")
         run = self.store.claim(self.project, self.runtime.config(self.project))
         self.runtime.process(run)
-        self.assertEqual([r[0] for r in self.runtime.agent.roles], ["planning"])
-        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "blocked")
+        result = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual([r[0] for r in self.runtime.agent.roles], ["planning"], result["result"])
+        self.assertEqual(result["state"], "blocked")
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_high_risk_acceptance_artifacts_never_enter_implementer_workspace(self):
