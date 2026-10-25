@@ -193,14 +193,10 @@ def issue_comment_context(runtime, project, task, config, checked=None, cancel=N
         sort_field = "updated_at" if cursor else "created_at"
         comments = dict(sorted(comments.items(), key=lambda pair: (
             pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
-        authoritative = issue_evidence.get("comments")
-        if isinstance(authoritative, int) and 0 <= authoritative < len(comments):
-            # Issue 快照携带的评论总数会随删除扣减；多出的缓存条目按排序丢弃，避免已删除评论长期滞留。
-            comments = dict(sorted(comments.items(), key=lambda pair: (
-                pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:authoritative])
         retained = list(comments.values())
+        authoritative = issue_evidence.get("comments")
         if isinstance(authoritative, int) and authoritative >= 0:
-            # 权威计数比增量累计可靠：增量扫描看不到被删除的评论。
+            # 快照计数只用于省略统计；同步之后新增的评论比快照更新，绝不按旧计数裁剪刚取回的内容。
             total_seen = max(authoritative, len(retained))
         elif cursor is None or not isinstance(total_seen, int):
             total_seen = observed_total
