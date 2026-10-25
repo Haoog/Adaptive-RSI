@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.105
+
+<!-- adaptive-rsi-release:0.5.105;base:9b3de09c0ec50af7a9557b509b14d662c79a60a8 -->
+
 - Fixed sandboxed commands running without a timeout: the command timeout is a safety boundary, not a quota. It now defaults to 1 hour (configurable 1–24 hours), so a hung check can no longer hold a run slot forever.
 - OpenCode executor: task and event files are always written as UTF-8, so Chinese tasks no longer fail under non-UTF-8 locales; call failures now surface timeout/rate-limit details (redacted first) so transient connection faults retry automatically and feed the provider circuit breaker; OAuth write-back tolerates a corrupt auth.json and no longer hides an already-completed model call.
 - Fixed findings trapped by the fingerprint dedup: when a previous attempt failed or expired, rediscovering the same issue requeues it with reset counters; explicitly rejected and user-cancelled decisions stay suppressed.
