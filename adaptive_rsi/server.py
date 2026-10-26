@@ -675,8 +675,8 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/api/projects":
                     result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
                 elif path == "/api/updates/check":
-                    runtime.updates.check_async()
-                    result = {"started": True}
+                    started = runtime.updates.check_async()
+                    result = {"started": started, "update": runtime.updates.snapshot()}
                 elif path == "/api/updates/apply":
                     if body.get("confirm") is not True:
                         raise RequestError("Confirm installation and idle restart")

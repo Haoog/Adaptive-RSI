@@ -56,6 +56,20 @@ class ServerHardeningTest(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_update_check_acknowledges_current_pending_state(self):
+        pending = {"state": "checking", "busy": False, "current": "fixture"}
+        starts = []
+        self.runtime.updates.check_async = lambda: starts.append(True) or True
+        self.runtime.updates.snapshot = lambda: pending
+        status, _, payload = self.request("/api/updates/check", "POST")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"started": True, "update": pending})
+        self.assertEqual(starts, [True])
+        self.runtime.updates.check_async = lambda: False
+        status, _, payload = self.request("/api/updates/check", "POST")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"started": False, "update": pending})
+
     def test_rotation_is_private_atomic_and_preserves_cookie_contract(self):
         old_token = self.server.token
         status, headers, payload = self.request("/api/session/rotate", "POST")

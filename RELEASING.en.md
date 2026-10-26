@@ -51,7 +51,7 @@ Durable ownership serializes deployments to the same project's same target. Once
 
 ## Stable user updates
 
-Daily checks and notifications are the default. `updates.mode` accepts `manual`, `notify` or `automatic`; automatic mode also uses `updates.auto_policy`: `patch` (default, same major/minor), `minor` (same major) or `stable` (any newer stable version). Drafts, prereleases, equal versions and downgrades are never installed. Updates wait for project runs, model probes and browser authorization to become idle. Calls and tokens are recorded without quotas.
+While a check is running, the interface shows “Checking for updates” and disables additional checks and installation, without blocking ordinary project work. Transient network failures retain an explicitly confirmed idle-install request bound to its original version; a changed target requires confirmation again. Daily checks and notifications are the default. `updates.mode` accepts `manual`, `notify` or `automatic`; automatic mode also uses `updates.auto_policy`: `patch` (default, same major/minor), `minor` (same major) or `stable` (any newer stable version). Drafts, prereleases, equal versions and downgrades are never installed. Updates wait for project runs, model probes and browser authorization to become idle. Calls and tokens are recorded without quotas.
 
 The source is fixed to `Haoog/Adaptive-RSI`. Formal releases require `adaptive-rsi-X.Y.Z-plugin.zip` and its `.zip.sha256`; ZIP roots are `adaptive-rsi/`. There is currently no independent signature; checksums are provided by the same GitHub Release. `update.json` only accepts `format: 1`, `python_min: [3, 9]` and `state_schema: 1`. Incompatible state migrations are rejected rather than bypassed by a version change.
 

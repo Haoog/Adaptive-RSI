@@ -1,6 +1,7 @@
 import json
 import contextlib
 import hashlib
+import io
 import os
 import shutil
 import signal
@@ -11,6 +12,8 @@ import sys
 from pathlib import Path
 import tempfile
 import time
+import threading
+import urllib.error
 from types import SimpleNamespace
 import unittest
 import urllib.request
@@ -19,7 +22,7 @@ from unittest.mock import Mock, patch
 from adaptive_rsi import __version__
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from adaptive_rsi.updates import supervise_restart, valid_backup
+from adaptive_rsi.updates import atomic_json, commit_installation, installed_root, supervise_restart, valid_backup
 
 
 class UpdateJournalRecoveryTest(unittest.TestCase):
@@ -118,6 +121,209 @@ class UpdateJournalRecoveryTest(unittest.TestCase):
         self.assertTrue(valid_backup(backup))
         self.assertFalse(Path(str(backup) + "-wal").exists())
         self.assertFalse(Path(str(backup) + "-shm").exists())
+
+
+class UpdatePointerCrashRecoveryTest(unittest.TestCase):
+    def test_commit_crash_boundaries_keep_original_rollback_pointers(self):
+        class Crash(BaseException):
+            pass
+
+        # Cover both first managed installation and an upgrade of a managed installation.
+        for managed in [False, True]:
+            for boundary in ["journal", "active", "current", "committed"]:
+                with self.subTest(managed=managed, boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                    store = Store(Path(directory) / "state")
+                    state = store.root
+                    installs = state / "installations"
+                    installs.mkdir()
+                    previous, candidate = installs / "previous", installs / "candidate"
+                    for root in [previous, candidate]:
+                        (root / "adaptive_rsi").mkdir(parents=True)
+                        (root / "adaptive_rsi/cli.py").write_text("")
+                    original_active = {"path": str(previous), "version": __version__, "previous": "older"}
+                    original_link = "previous"  # Preserve relative links exactly, too.
+                    if managed:
+                        atomic_json(installs / "active.json", original_active)
+                        (installs / "current").symlink_to(original_link)
+                    store.put_setting("update-status", {"state": "restarting", "version": "99.0.0"})
+                    store.put_setting("sentinel", "preserve")
+                    with contextlib.closing(sqlite3.connect(store.path)) as source, contextlib.closing(sqlite3.connect(installs / "state-before-update.sqlite3")) as destination:
+                        source.backup(destination)
+                    plan = {"candidate": str(candidate), "previous": str(previous), "target": "99.0.0",
+                            "pid": -1, "candidate_pid": 987654321, "phase": "health_check", "state_schema": 1,
+                            "backup_ready": True, "session": {"origin": "http://127.0.0.1:9999", "cookie": "fixture", "token": "fixture"}}
+                    atomic_json(installs / "restart.json", plan)
+                    real_replace = os.replace
+
+                    def crash_after_replace(source, destination):
+                        real_replace(source, destination)
+                        name = Path(destination).name
+                        if name == "restart.json":
+                            phase = json.loads(Path(destination).read_text())["phase"]
+                            stage = "committed" if phase == "committed" else "journal"
+                        else:
+                            stage = {"active.json": "active", "current": "current"}.get(name)
+                        if stage == boundary:
+                            raise Crash()
+
+                    with patch("adaptive_rsi.updates.os.replace", side_effect=crash_after_replace):
+                        with self.assertRaises(Crash):
+                            commit_installation(state, plan)
+                    saved = json.loads((installs / "restart.json").read_text())
+                    self.assertEqual(saved["previous_pointers"], {"active": original_active if managed else None,
+                                                                "current": original_link if managed else None})
+                    failed_candidate, restored = Mock(pid=101), Mock(pid=102)
+                    failed_candidate.poll.return_value = 1
+                    restored.poll.return_value = None
+                    response = Mock()
+                    response.__enter__ = Mock(return_value=io.StringIO(json.dumps({"version": __version__, "pid": 102})))
+                    response.__exit__ = Mock(return_value=False)
+
+                    def complete(state, plan):
+                        store.put_setting("update-status", {"state": "rolled_back", "current": __version__})
+                        return True
+
+                    with patch("adaptive_rsi.updates.process_present", return_value=False), patch("adaptive_rsi.updates.candidate_health", return_value=False), patch("adaptive_rsi.updates.subprocess.Popen", side_effect=[failed_candidate, restored]) as spawn, patch("adaptive_rsi.updates.urllib.request.urlopen", return_value=response), patch("adaptive_rsi.updates.complete_rollback", side_effect=complete):
+                        supervise_restart(state)
+                    self.assertEqual(store.setting("sentinel"), "preserve")
+                    if boundary == "committed":
+                        # A durable commit never authorizes database rollback after a crash.
+                        spawn.assert_not_called()
+                        self.assertEqual(store.setting("update-status")["state"], "recovery_required")
+                        self.assertTrue((installs / "restart.json").exists())
+                        self.assertEqual(installed_root(state, previous), candidate)
+                    else:
+                        self.assertEqual(store.setting("update-status")["state"], "rolled_back")
+                        self.assertEqual([call.kwargs["cwd"] for call in spawn.call_args_list], [str(candidate), str(previous)])
+                        self.assertEqual(installed_root(state, previous), previous)
+                        self.assertFalse((installs / "restart.json").exists())
+                        if managed:
+                            self.assertEqual(json.loads((installs / "active.json").read_text()), original_active)
+                            self.assertEqual(os.readlink(installs / "current"), original_link)
+                        else:
+                            self.assertFalse((installs / "active.json").exists())
+                            self.assertFalse((installs / "current").is_symlink())
+                    store.close()
+
+
+class UpdateCheckLifecycleTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.runtime = Runtime(Store(self.temp.name), object())
+        self.manager = self.runtime.updates
+        self.target = "99.0.0"
+        self.runtime.configure({"updates": {"mode": "notify"}})
+
+    def tearDown(self):
+        self.runtime.close()
+        self.temp.cleanup()
+
+    def feed(self, target=None):
+        target = target or self.target
+        name = "adaptive-rsi-" + target + "-plugin.zip"
+        prefix = "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + target + "/"
+        return json.dumps({"tag_name": "v" + target, "assets": [
+            {"name": name, "browser_download_url": prefix + name},
+            {"name": name + ".sha256", "browser_download_url": prefix + name + ".sha256"}]}).encode()
+
+    def pending(self):
+        return {"state": "waiting_idle", "requested": True, "current": __version__,
+                "version": self.target, "checked": 1}
+
+    def test_async_check_publishes_before_worker_starts_and_does_not_block_work(self):
+        previous = {"state": "error", "reason": "old error", "checked": 1}
+        self.runtime.store.put_setting("update-status", previous)
+        entered, finish = threading.Event(), threading.Event()
+        workers = []
+
+        def download(*args):
+            workers.append(threading.current_thread())
+            entered.set()
+            if not finish.wait(5):
+                raise RuntimeError("test did not release feed")
+            return self.feed()
+
+        real_thread = threading.Thread
+
+        def make_thread(*args, **kwargs):
+            # This assertion runs before Thread.start(), independently of scheduling.
+            status = self.manager.snapshot()
+            self.assertEqual(status["state"], "checking")
+            self.assertEqual(status["previous_status"], previous)
+            self.assertEqual(status["checked"], 1)
+            self.assertGreater(status["check_started"], 1)
+            self.assertFalse(status["busy"])
+            self.manager.require_ready()
+            return real_thread(*args, **kwargs)
+
+        with patch("adaptive_rsi.updates.download", side_effect=download), patch("adaptive_rsi.updates.threading.Thread", side_effect=make_thread):
+            try:
+                self.assertTrue(self.manager.check_async())
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(self.manager.check_async())
+                self.assertFalse(self.manager.check())
+                self.runtime.configure({"schedule": {"light_minutes": 240}})
+                self.assertEqual(self.runtime.config()["schedule"]["light_minutes"], 240)
+            finally:
+                finish.set()
+                for worker in workers:
+                    worker.join(5)
+        self.assertEqual(self.manager.status()["state"], "available")
+        self.assertNotIn("previous_status", self.manager.status())
+        self.assertFalse(self.manager.lock.locked())
+
+    def test_failed_thread_start_restores_status_and_releases_lock(self):
+        previous = self.pending()
+        self.runtime.store.put_setting("update-status", previous)
+        with patch("adaptive_rsi.updates.threading.Thread") as thread:
+            thread.return_value.start.side_effect = RuntimeError("cannot start")
+            with self.assertRaisesRegex(RuntimeError, "cannot start"):
+                self.manager.check_async()
+        self.assertEqual(self.manager.status(), previous)
+        self.assertFalse(self.manager.lock.locked())
+
+    def test_transient_errors_preserve_confirmed_target_and_same_release_resumes(self):
+        for error in [OSError("offline"), urllib.error.HTTPError("https://example.invalid", 503, "unavailable", {}, None)]:
+            with self.subTest(error=type(error).__name__):
+                self.runtime.store.put_setting("update-status", self.pending())
+                with patch("adaptive_rsi.updates.download", side_effect=error):
+                    self.manager.check()
+                    self.manager.check()  # Repeated failure must retain the original consent.
+                status = self.manager.status()
+                self.assertEqual((status["state"], status["requested"], status["version"]),
+                                 ("error", True, self.target))
+                self.assertNotIn("previous_status", status)
+                with patch("adaptive_rsi.updates.download", return_value=self.feed()):
+                    self.manager.check()
+                self.assertEqual(self.manager.status()["state"], "waiting_idle")
+                with patch.object(self.manager, "apply_async") as apply:
+                    self.manager.tick()
+                apply.assert_called_once_with(requested=True)
+
+    def test_changed_target_or_no_release_clears_old_consent_after_failure(self):
+        for result in [self.feed("99.0.1"), urllib.error.HTTPError("https://example.invalid", 404, "missing", {}, None)]:
+            with self.subTest(result=type(result).__name__):
+                self.runtime.store.put_setting("update-status", self.pending())
+                with patch("adaptive_rsi.updates.download", side_effect=OSError("offline")):
+                    self.manager.check()
+                options = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+                with patch("adaptive_rsi.updates.download", **options):
+                    self.manager.check()
+                self.assertNotIn("requested", self.manager.status())
+                with patch.object(self.manager, "apply_async") as apply:
+                    self.manager.tick()
+                apply.assert_not_called()
+
+    def test_restart_during_check_restores_pending_intent_without_blocking_work(self):
+        previous = self.pending()
+        self.runtime.store.put_setting("update-status", previous)
+        self.assertEqual(self.manager.begin_check(), previous)
+        self.manager.lock.release()  # A crashed process cannot retain its in-memory lock.
+        self.manager.restore_startup()
+        self.assertEqual(self.manager.status()["state"], "error")
+        self.assertTrue(self.manager.status()["requested"])
+        self.assertEqual(self.manager.status()["version"], self.target)
+        self.manager.require_ready()
 
 
 class UpdateIdleAndRetryTest(unittest.TestCase):

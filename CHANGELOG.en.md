@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Inspection requests preserve cancellation until the active run stops. Cancellation no longer overwrites concurrent completion, preventing delivered tasks from being executed again.
+- Preserve prerequisite links during automatic retries and recheck current state when releasing dead dependencies, so temporary failures do not discard execution ordering.
+- Successful cross-project submissions clear their submitted goal draft while retaining later edits. Expired candidates remain visible in attention, and delayed notification navigation cannot replace a newer project or detail selection.
+- Show update checks in progress instead of stale errors, and prevent installation clicks during checks. Transient check failures retain confirmed installation requests bound to their original version.
+- Persist previous installation pointers before committing an update, fixing crash recovery that could report rollback while leaving the failed candidate selected for the next launch.
+
 ## 0.5.108
 
 <!-- adaptive-rsi-release:0.5.108;base:2cc8dcbd17190de8d9b2d55c35deff4d507ec316 -->

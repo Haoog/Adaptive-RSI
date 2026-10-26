@@ -126,6 +126,31 @@ async function checkRouteSaveRace(browser,url,errors) {
   }finally{release();await page.close();}
 }
 
+async function checkUpdatePending(browser,url,errors) {
+  const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+  let checked=false;
+  await page.route('**/api/state*',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    data.update={state:checked?'checking':'error',busy:false,channel:'managed',...(checked?{}:{reason:'previous-check-error'})};
+    await route.fulfill({response,body:JSON.stringify(data)});
+  });
+  await page.route('**/api/updates/check',route=>{checked=true;return reply(route,{started:true,update:{state:'checking',busy:false,channel:'managed'}});});
+  try{
+    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('#project-settings').click();
+    await page.locator('#advanced-settings > summary').click();
+    await page.locator('#update-status').filter({hasText:'previous-check-error'}).waitFor();
+    await page.locator('#check-update').click();
+    await page.locator('#update-status').filter({hasText:'正在检查更新'}).waitFor();
+    assert.doesNotMatch(await page.locator('#update-status').textContent(),/previous-check-error/);
+    assert.equal(await page.locator('#check-update').isDisabled(),true);
+    assert.equal(await page.locator('#apply-update').isDisabled(),true);
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#update-status').filter({hasText:'Checking for updates'}).waitFor();
+    assert.equal(await page.locator('#settings-save').isDisabled(),false);
+  }finally{await page.close();}
+}
+
 async function checkDraftRecovery(browser, url, errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   const secret='BROWSER-SECRET-MUST-NOT-PERSIST';
@@ -305,6 +330,7 @@ async function main() {
     await checkRunProgress(browser,url,errors);
     await checkModelForms(browser, url, errors);
     await checkRouteSaveRace(browser,url,errors);
+    await checkUpdatePending(browser,url,errors);
     await checkDraftRecovery(browser,url,errors);
     await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);

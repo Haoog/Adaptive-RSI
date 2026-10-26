@@ -881,6 +881,7 @@ const english = {
   "一次请输入 1 至 10 个仓库链接": "Enter between 1 and 10 repository URLs",
   "正在导入": "Importing",
   "尚未检查更新": "Updates not checked",
+  "正在检查更新": "Checking for updates",
   "已是最新稳定版": "Latest stable release installed",
   "尚无可用的正式发布包": "No official release package available yet",
   "发现可用更新": "Update available",

@@ -207,6 +207,9 @@ class UpdateManager:
             return
         if status.get("state") == "recovery_required":
             self.installing = True
+        if status.get("state") == "checking":
+            previous = status.get("previous_status", {})
+            self.store.put_setting("update-status", self.check_failure(previous, "Update check interrupted; retry is safe"))
         if status.get("state") == "downloading":
             self.store.put_setting("update-status", {**status, "state": "error", "reason": "Installation interrupted before restart; retry is safe"})
         # 恢复登录会话不代表正在升级；仅新版本等待监督进程确认安装。
@@ -315,27 +318,62 @@ class UpdateManager:
                 getattr(getattr(self.runtime, "model_center", None), "busy", 0) or
                 getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))
 
+    @staticmethod
+    def check_failure(previous, reason):
+        # A failed observation cannot revoke consent for a specific pending target.
+        pending = (previous.get("state") in ["waiting_idle", "error"] and
+                   previous.get("requested") is True and previous.get("version"))
+        return {**(previous if pending else {}), "state": "error", "current": __version__,
+                "checked": time.time(), "reason": reason}
+
+    def begin_check(self):
+        if not self.lock.acquire(False):
+            return None
+        try:
+            previous = self.status()
+            self.store.put_setting("update-status", {"state": "checking", "current": __version__,
+                                                    "check_started": time.time(), "checked": previous.get("checked", 0),
+                                                    "previous_status": previous})
+            return previous
+        except BaseException:
+            self.lock.release()
+            raise
+
     def check_async(self):
-        if self.lock.locked():
-            return
-        threading.Thread(target=self.check, daemon=True, name="rsi-update-check").start()
+        previous = self.begin_check()
+        if previous is None:
+            return False
+        try:
+            threading.Thread(target=self.finish_check, args=(previous,), daemon=True, name="rsi-update-check").start()
+        except BaseException:
+            try:
+                self.store.put_setting("update-status", previous)
+            finally:
+                self.lock.release()
+            raise
+        return True
 
     def check(self):
-        if not self.lock.acquire(False):
-            return
+        previous = self.begin_check()
+        if previous is None:
+            return False
+        self.finish_check(previous)
+        return True
+
+    def finish_check(self, previous):
         try:
-            checked = time.time()
-            previous = self.status()
             try:
                 result = release_info(json.loads(download(RELEASE_API, 2 * 1024 * 1024)))
             except urllib.error.HTTPError as exc:
-                result = {"state": "no_release" if exc.code == 404 else "error", "reason": "GitHub HTTP " + str(exc.code)}
+                reason = "GitHub HTTP " + str(exc.code)
+                result = ({"state": "no_release", "reason": reason} if exc.code == 404 else
+                          self.check_failure(previous, reason))
             except Exception:
-                result = {"state": "error", "reason": "Unable to verify the official release feed"}
-            if (previous.get("state") == "waiting_idle" and previous.get("requested") is True and
-                    previous.get("version") == result.get("version")):
+                result = self.check_failure(previous, "Unable to verify the official release feed")
+            if (previous.get("state") in ["waiting_idle", "error"] and previous.get("requested") is True and
+                    previous.get("version") == result.get("version") and result.get("state") == "available"):
                 result.update(state="waiting_idle", requested=True)
-            self.store.put_setting("update-status", {**result, "current": __version__, "checked": checked})
+            self.store.put_setting("update-status", {**result, "current": __version__, "checked": time.time()})
         finally:
             self.lock.release()
             self.runtime.wake.set()
@@ -514,9 +552,21 @@ def valid_backup(path):
         return False
 
 
+def preserve_previous_pointers(state, plan):
+    """Journal rollback pointers before any installation pointer can change."""
+    if "previous_pointers" not in plan:
+        installs = state / "installations"
+        active, link = installs / "active.json", installs / "current"
+        plan["previous_pointers"] = {"active": json.loads(active.read_text()) if active.exists() else None,
+                                     "current": os.readlink(link) if link.is_symlink() else None}
+        atomic_json(installs / "restart.json", plan)
+    return plan["previous_pointers"]
+
+
 def commit_installation(state, plan):
     from .store import Store
     installs = state / "installations"
+    preserve_previous_pointers(state, plan)
     atomic_json(installs / "active.json", {"path": plan["candidate"], "version": plan["target"], "previous": plan["previous"]})
     link = installs / "current.next"
     link.unlink(missing_ok=True)
@@ -614,9 +664,10 @@ def _supervise_restart(state):
     log = (state / "server.log").open("ab")
     (state / "server.log").chmod(0o600)
     active = installs / "active.json"
-    previous_active = json.loads(active.read_text()) if active.exists() else None
+    pointers = preserve_previous_pointers(state, plan)
+    previous_active = pointers["active"]
     current_link = installs / "current"
-    previous_link = os.readlink(current_link) if current_link.is_symlink() else None
+    previous_link = pointers["current"]
     child = None
     try:
         atomic_json(state / "restart-session.json", session)

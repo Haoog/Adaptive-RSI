@@ -315,27 +315,32 @@ class Runtime:
         self.project(project)
         # Coalesce manual and timer triggers for the same system job.
         key = "system:" + kind
-        prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project, key))
-        if prior and prior["state"] in ["queued", "planning", "executing", "evaluating", "waiting_budget"]:
-            if prior["state"] == "queued":
-                self.store.execute("UPDATE tasks SET priority=max(priority,?) WHERE id=?", (priority, prior["id"]))
-            return prior["id"]
-        if prior and prior["state"] in ["failed", "blocked"]:
-            # 周期任务的持续故障（如 gh 未认证）没有供应商熔断；按连败次数退避重排，避免每周期产生新的失败 run。
-            rows = self.store.query("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 4", (prior["id"],))
-            streak, last_failure = 0, 0.0
-            for row in rows:
-                if row["state"] in ["failed", "blocked"]:
-                    streak += 1
-                    last_failure = max(last_failure, row["ended"] or 0)
-                else:
-                    break
-            if streak and time.time() < last_failure + min(FAILURE_BACKOFF_MAX_SECONDS, 600 * 2 ** (streak - 1)):
-                return prior["id"]
-        if prior:
-            self.store.execute("UPDATE tasks SET state='queued',priority=?,available=0,updated=? WHERE id=?", (priority, time.time(), prior["id"]))
-            task = prior["id"]
-        else:
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project, key)).fetchone()
+            if prior:
+                # 检查与重排同事务：取消中的 worker 仍靠任务状态接收停止信号。
+                if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (prior["id"],)).fetchone():
+                    return prior["id"]
+                if prior["state"] in ["queued", "planning", "executing", "evaluating", "waiting_budget"]:
+                    if prior["state"] == "queued":
+                        db.execute("UPDATE tasks SET priority=max(priority,?) WHERE id=?", (priority, prior["id"]))
+                    return prior["id"]
+                if prior["state"] in ["failed", "blocked"]:
+                    # 周期任务持续故障时按连败次数退避，避免每周期产生新的失败 run。
+                    rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 4", (prior["id"],)).fetchall()
+                    streak, last_failure = 0, 0.0
+                    for row in rows:
+                        if row["state"] in ["failed", "blocked"]:
+                            streak += 1
+                            last_failure = max(last_failure, row["ended"] or 0)
+                        else:
+                            break
+                    if streak and time.time() < last_failure + min(FAILURE_BACKOFF_MAX_SECONDS, 600 * 2 ** (streak - 1)):
+                        return prior["id"]
+                db.execute("UPDATE tasks SET state='queued',priority=?,available=0,updated=? WHERE id=?", (priority, time.time(), prior["id"]))
+                task = prior["id"]
+        if not prior:
             task = self.store.add_task(project, "system_" + kind, key, "System: " + kind, priority=priority)
         self.wake.set()
         return task
@@ -437,7 +442,13 @@ class Runtime:
                        "deferred", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]
         if row["state"] not in cancellable:
             raise ValueError("This task has finished and can no longer be cancelled")
-        self.store.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (time.time(), task))
+        # worker 可在上面的读取后完成；写入时再次检查，不能覆盖新提交的终态。
+        placeholders = ",".join("?" * len(cancellable))
+        with self.store.connect() as db:
+            changed = db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=? AND state IN (" + placeholders + ")",
+                                 (time.time(), task, *cancellable)).rowcount
+            if not changed:
+                raise ValueError("This task has finished and can no longer be cancelled")
         self.store.event("cancelled", "Cancellation requested", row["project"], data={"task": task})
 
     def deliver(self, run_id, automatic=False):
@@ -632,8 +643,15 @@ class Runtime:
         for row in rows:
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                link = db.execute("SELECT dependency FROM task_dependencies WHERE task=?", (row["task"],)).fetchone()
-                if not link or link["dependency"] != row["dependency"]:
+                # 外层查询只是候选集；重试、领取或修改依赖可能已改变两端状态。
+                link = db.execute(
+                    "SELECT d.state AS dep_state FROM task_dependencies td "
+                    "JOIN tasks t ON t.id=td.task JOIN tasks d ON d.id=td.dependency "
+                    "WHERE td.task=? AND td.dependency=? AND d.state IN (" + placeholders + ") "
+                    "AND t.state IN ('queued','deferred','blocked') "
+                    "AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.ended IS NULL AND r.task IN (t.id,d.id))",
+                    (row["task"], row["dependency"], *DEAD_DEPENDENCY_STATES)).fetchone()
+                if not link:
                     continue
                 db.execute("DELETE FROM task_dependencies WHERE task=?", (row["task"],))
                 db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state IN ('queued','deferred')",
@@ -641,7 +659,7 @@ class Runtime:
             self.store.event("dependency_released",
                              "Dependency will not merge; waiting released and the task needs manual review",
                              row["project"], data={"task": row["task"], "dependency": row["dependency"],
-                                                   "dependency_state": row["dep_state"]})
+                                                   "dependency_state": link["dep_state"]})
             released = True
         if released:
             self.wake.set()
@@ -988,15 +1006,19 @@ class Runtime:
             if result.get("evaluation", {}).get("improvement", {}).get("decision") == "insufficient_evidence":
                 code = "improvement"
             result = {**result, "failure": {"code": code, "action": "inspect_evidence", "detail": result.get("reason", "")}}
-        self.store.transition(run["id"], state, result, True)
+        retry = state == "failed" and task["attempts"] <= config["limits"]["retries"]
+        task_fields = None
+        if retry:
+            delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** task["attempts"])
+            # run 保留失败证据，任务与退避同事务回队，依赖清理看不到临时 failed。
+            task_fields = {"state": "queued", "available": time.time() + delay}
+        transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)
         if state == "failed":
             checks = result.get("evaluation", {}).get("checks", {})
             regression = any(old.get("passed") and not new.get("passed")
                              for old, new in zip(checks.get("baseline", []), checks.get("candidate", [])))
             self.monitor_strategy(run["project"], False, run, attributable=regression)
-        if state == "failed" and task["attempts"] <= config["limits"]["retries"]:
-            delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** task["attempts"])
-            self.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=? AND state='failed'", (time.time() + delay, task["id"]))
+        if retry and transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])
 
     def inspect(self, project, workspace, kind, run, strategies):
