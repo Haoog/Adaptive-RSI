@@ -44,6 +44,15 @@ const apiErrors={
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
  "Candidate was cleaned up after the retention window; regenerate it before publishing": "候选已超过保留期被清理，请重新生成后再发布。",
+ "Automatic merge requires PR delivery": "自动合并只在交付方式为 PR 时可用：请把「完成后如何交付」改为「自动提交修改，等待合并」或「检查通过后自动合并」，或关闭自动合并。",
+ "Automation workflow must be a fixed .github/workflows YAML file": "工作流必须是 .github/workflows/ 目录下的固定 .yml 或 .yaml 文件（例如 .github/workflows/deploy.yml），请修正工作流路径后重新保存。",
+ "Automation requires a fixed trusted tag": "工作流标签必须是固定名称：只能包含字母、数字、点、下划线和斜杠，不能包含 .. 或 //，也不能以 / 结尾。请填写仓库中真实存在的标签或分支。",
+ "Automation requires the trusted workflow tag's full commit SHA": "工作流 SHA 必须是该标签指向的完整 40 位提交号，且只能使用小写字母 a-f 和数字：请在 GitHub 打开对应提交，复制完整 SHA 后重新粘贴。",
+ "Release/deploy requires an explicit project and a pinned workflow tag": "启用发布或部署需要同时具备：GitHub 仓库、工作流文件、固定标签和完整提交 SHA。请在项目设置中补全这些字段后重新保存。",
+ "Deployment health URL requires HTTPS without credentials, query or fragment": "健康检查地址必须以 https:// 开头，且不能包含账号密码、? 查询参数、# 片段或空格：请改用形如 https://example.com/health 的地址。",
+ "Automatic deployment rollback requires an explicit health URL": "自动回滚需要先填写 HTTPS 健康检查地址：请补全「上线后检查地址」，或关闭「检查失败时恢复上一正常版本」。",
+ "Workflow repository must match the selected project's origin": "无法读取工作流：项目设置中的 GitHub 仓库与项目本地 origin 不一致。请把 GitHub 仓库改成与 origin 相同的 owner/name（或更新项目 origin）后点击「刷新工作流」。",
+ "Workflow must be an existing repository file": "无法读取工作流：仓库中不存在该工作流文件。请确认 .github/workflows 下的工作流路径后点击「刷新工作流」。",
 
  "Select the root of an existing Git repository": "请选择已有 Git 仓库的根目录。",
  "Expected a GitHub repository URL": "请填写 GitHub 仓库链接，例如 https://github.com/owner/repository。",
@@ -697,8 +706,8 @@ async function loadReleaseWorkflows(){
  try{const result=await api('release-workflows?project='+encodeURIComponent(project));if(ticket!==releaseWorkflowSequence||project!==projectId||$('config-scope').value!=='project')return;
   list.replaceChildren();const first=el('option',t('选择发布或部署工作流'));first.value='';list.append(first);
   for(const workflow of result.workflows||[]){const option=el('option',workflow.name+' · '+workflow.workflow+(workflow.compatible?'':' · '+t('需要补充自动交付输入')));option.value=workflow.workflow;option.disabled=!workflow.compatible;list.append(option);}
-  if(!result.workflows?.length)$('release-authorization-feedback').textContent=t('此仓库还没有可用工作流。可在高级设置手动指定，或先为项目添加工作流。');
- }catch(error){if(ticket===releaseWorkflowSequence)$('release-authorization-feedback').textContent=error.message;}
+  if(!result.workflows?.length)$('release-authorization-feedback').textContent=t('此仓库还没有可用工作流。可在高级设置手动指定，或先为项目添加工作流。');else $('release-authorization-feedback').textContent='';
+ }catch(error){if(ticket!==releaseWorkflowSequence)return;list.replaceChildren();const failed=el('option',t('读取失败：')+error.message);failed.value='';list.append(failed);$('release-authorization-feedback').textContent=error.message;}
 }
 async function authorizeRelease(kind){
  const project=projectId,scope=$('config-scope').value,workflow=$('release-workflow-list').value;if(!project||scope!=='project')return;

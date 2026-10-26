@@ -232,7 +232,7 @@ const english = {
   "授权所选工作流用于发布": "Authorize selected workflow for release",
   "授权所选工作流用于部署": "Authorize selected workflow for deployment",
   "手动指定工作流与授权证据": "Manual workflows and authorization evidence",
-  "填写仓库维护者确认的固定工作流、标签和该标签的完整提交 SHA。工作流须支持安全的自动交付输入。": "Use a workflow, fixed tag and full commit SHA confirmed by the repository maintainer. The workflow must support secure automatic delivery inputs.",
+  "填写仓库维护者确认的固定工作流、标签和该标签的完整提交 SHA（40 位，仅小写字母 a-f 和数字）。工作流须支持安全的自动交付输入。": "Use a workflow, fixed tag and full commit SHA (40 characters, lowercase a-f and digits only) confirmed by the repository maintainer. The workflow must support secure automatic delivery inputs.",
   "发布工作流": "Release workflow",
   "部署工作流": "Deployment workflow",
   "发布工作流标签": "Release workflow tag",
@@ -290,10 +290,22 @@ const english = {
   "工作流已取消": "Workflow cancelled",
   "已关闭": "Closed",
   "正在读取工作流…": "Loading workflows…",
+  "读取失败：": "Loading failed: ",
+  "完整 40 位提交 SHA，仅小写字母 a-f 和数字": "Full 40-character commit SHA, lowercase a-f and digits only",
+  "必须以 https:// 开头，不能包含账号、? 查询参数或 # 片段": "Must start with https:// and contain no credentials, ? query or # fragment",
   "选择发布或部署工作流": "Choose a release or deployment workflow",
   "需要补充自动交付输入": "Automatic delivery inputs required",
   "此仓库还没有可用工作流。可在高级设置手动指定，或先为项目添加工作流。": "This repository has no available workflows. Enter one in advanced settings or add a workflow to the project first.",
   "请先选择可用工作流。": "Choose an available workflow first.",
+  "自动合并只在交付方式为 PR 时可用：请把「完成后如何交付」改为「自动提交修改，等待合并」或「检查通过后自动合并」，或关闭自动合并。": "Automatic merge is only available with PR delivery: set \"Delivery after verification\" to \"Create PRs automatically\" or \"Merge automatically after checks pass\", or turn automatic merge off.",
+  "工作流必须是 .github/workflows/ 目录下的固定 .yml 或 .yaml 文件（例如 .github/workflows/deploy.yml），请修正工作流路径后重新保存。": "The workflow must be a fixed .yml or .yaml file under .github/workflows/ (for example .github/workflows/deploy.yml). Correct the workflow path and save again.",
+  "工作流标签必须是固定名称：只能包含字母、数字、点、下划线和斜杠，不能包含 .. 或 //，也不能以 / 结尾。请填写仓库中真实存在的标签或分支。": "The workflow tag must be a fixed name: only letters, digits, dots, underscores and slashes are allowed; \"..\", \"//\" and a trailing \"/\" are not. Use a tag or branch that exists in the repository.",
+  "工作流 SHA 必须是该标签指向的完整 40 位提交号，且只能使用小写字母 a-f 和数字：请在 GitHub 打开对应提交，复制完整 SHA 后重新粘贴。": "The workflow SHA must be the full 40-character commit ID the tag points to, using lowercase a-f and digits only. Open the commit on GitHub, copy the full SHA and paste it again.",
+  "启用发布或部署需要同时具备：GitHub 仓库、工作流文件、固定标签和完整提交 SHA。请在项目设置中补全这些字段后重新保存。": "Enabling release or deploy requires a GitHub repository, a workflow file, a fixed tag and the full commit SHA. Fill in these fields in the project settings and save again.",
+  "健康检查地址必须以 https:// 开头，且不能包含账号密码、? 查询参数、# 片段或空格：请改用形如 https://example.com/health 的地址。": "The health URL must start with https:// and must not contain credentials, a ? query, a # fragment or spaces. Use an address like https://example.com/health.",
+  "自动回滚需要先填写 HTTPS 健康检查地址：请补全「上线后检查地址」，或关闭「检查失败时恢复上一正常版本」。": "Automatic rollback needs a health URL first: fill in the \"Health check URL after deployment\", or turn off \"Restore the last healthy version if the check fails\".",
+  "无法读取工作流：项目设置中的 GitHub 仓库与项目本地 origin 不一致。请把 GitHub 仓库改成与 origin 相同的 owner/name（或更新项目 origin）后点击「刷新工作流」。": "Cannot load workflows: the GitHub repository in the project settings does not match the project's origin. Set the repository to the same owner/name as the origin (or update the project origin), then click \"Refresh workflows\".",
+  "无法读取工作流：仓库中不存在该工作流文件。请确认 .github/workflows 下的工作流路径后点击「刷新工作流」。": "Cannot load workflows: that workflow file does not exist in the repository. Check the workflow path under .github/workflows, then click \"Refresh workflows\".",
   "工作流已授权。只影响当前项目，其他尚未保存的设置仍可继续修改。": "Workflow authorized for this project. You can continue editing other unsaved settings.",
   "发布与上线": "Release and deployment",
   "发布": "Release",
@@ -1375,8 +1387,8 @@ while(walker.nextNode()){
  const node=walker.currentNode, key=node.textContent.trim();
  if(Object.hasOwn(english,key))staticText.push([node,node.textContent,key]);
 }
-for(const node of document.querySelectorAll('[aria-label], [placeholder]')){
- for(const attr of ['aria-label','placeholder']){
+for(const node of document.querySelectorAll('[aria-label], [placeholder], [title]')){
+ for(const attr of ['aria-label','placeholder','title']){
   const key=node.getAttribute(attr);
   if(Object.hasOwn(english,key))staticAttributes.push([node,attr,key]);
  }

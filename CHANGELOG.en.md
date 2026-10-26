@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Failed saves of delivery authorization settings no longer show only a generic error: the seven server-side validation messages about delivery mode, workflow path, fixed tag, commit SHA, health URL and automatic rollback now come with actionable localized guidance in Chinese, with matching English translations.
+- The full commit SHA inputs for release/deploy tags now validate exactly like the server (40 lowercase hex characters). Uppercase input is blocked before saving with an explanation and is never silently rewritten; the post-deploy health URL must be HTTPS without credentials, query or fragment already in the browser.
+- When listing release/deploy workflows fails, the dropdown no longer stays on "Loading workflows…": it shows an error item and retries through the existing refresh button; a successful reload clears the stale failure message.
+- When the project's GitHub repository does not match its local origin, the server returns the fixed validation message and the interface explains how to align the repository with the origin before retrying.
+
 ## 0.5.117
 
 <!-- adaptive-rsi-release:0.5.117;base:366d91099b42a38e8c3c8c89bfe0372bcaa267a1 -->
