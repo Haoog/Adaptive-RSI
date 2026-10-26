@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.108
+
+<!-- adaptive-rsi-release:0.5.108;base:2cc8dcbd17190de8d9b2d55c35deff4d507ec316 -->
+
 - Reject retries and requirement supplements until a cancelled active run stops, preventing old workers from resuming or overwriting new queued work; show an actionable wait message.
 - Atomically invalidate undelivered candidates and queued approvals when requirements change, and recheck candidate validity before publishing. Existing PRs and merge records remain available.
 - Periodic inspections preserve quota-backoff deadlines instead of requeuing model calls early.
