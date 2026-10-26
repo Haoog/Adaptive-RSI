@@ -122,6 +122,133 @@ test('settings edited during the acknowledgement refresh keep the saved baseline
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
 });
 
+function settingsSavePage(scope = 'project') {
+  const page = browser(), field = page.node('weight'), posts = [];
+  Object.assign(field, {type: 'number', dataset: {path: 'schedule.weight'}, checked: false});
+  const fields = [field, ...['schedule-mode', 'work-start', 'work-end', 'issue-labels', 'checks-json', 'advanced-json'].map(page.node)];
+  page.document.querySelectorAll = selector => selector === '[data-path]' ? [field] : [];
+  page.node('settings-form').querySelectorAll = selector => selector === 'input,textarea,select' ? fields : selector === '[data-path]' ? [field] : [];
+  page.node('config-scope').value = scope;
+  const config = {schedule: {weight: 1, working_hours: [0, 24]}, github: {labels: []}, checks: []};
+  page.context.initialState.config = structuredClone(config);
+  page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); });
+  // Only rendering and unrelated refreshes are isolated; app.js owns submit, input,
+  // scope/project navigation, baseline acknowledgement and draft persistence/restoration.
+  vm.runInContext(`view='settings';renderNavigation=()=>{};renderSettings=()=>{
+    settingsBaseline=structuredClone(settingsKey()==='global'?state.config:currentProject().config);
+    settingsContext=settingsKey();settingsModes.set(settingsBaseline,'custom');
+    $('weight').value=String(settingsBaseline.schedule.weight);$('schedule-mode').value='custom';
+    $('work-start').value='0';$('work-end').value='24';$('checks-json').value='[]';
+    settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();
+  };render=()=>{if(!settingsBaseline)renderSettings();};render();`, page.context);
+  page.context.refresh = async () => {};
+  let resolveSave, rejectSave;
+  page.context.fetch = async (_url, options) => {
+    const post = JSON.parse(options.body); posts.push(post);
+    return new Promise((resolve, reject) => { resolveSave = resolve; rejectSave = reject; });
+  };
+  return Object.assign(page, {
+    posts, field,
+    edit(value) { field.value = String(value); page.input('weight', 'settings-form'); page.node('settings-form').handlers.input(); },
+    project(id) { page.node('project-select').value = id; page.node('project-select').handlers.change(); },
+    scope(value) { page.context.changeSettingsScope(value); },
+    finish(outcome = 'success') {
+      if (outcome === 'network') { rejectSave(new TypeError('connection lost')); return; }
+      if (outcome === 'failure') { resolveSave(response({error: 'Project not found'}, 404)); return; }
+      if (outcome === 'timeout') { resolveSave(rejected()); return; }
+      const post = posts.at(-1), target = post.project === null ? page.context.initialState : page.context.initialState.projects.find(project => project.id === post.project);
+      target.config.schedule.weight = post.values.schedule?.weight ?? target.config.schedule.weight;
+      resolveSave(response({saved: true, config: structuredClone(target.config)}));
+    },
+    storedWeight(key) { return vm.runInContext(`draftStore.get('settings',${JSON.stringify(key)})?.values.find(entry=>entry.path==='schedule.weight')`, page.context); }
+  });
+}
+
+for (const scope of ['project', 'global']) {
+  for (const navigation of ['same', 'project-away', 'project-round-trip', 'scope-away', 'scope-round-trip']) {
+    for (const newer of [1, 2, 3]) {
+      test(`pending settings save preserves ${scope} weight ${newer} after ${navigation}`, async () => {
+        const page = settingsSavePage(scope), key = scope === 'project' ? 'a' : 'global';
+        page.edit(2); const pending = page.submit('settings-form');
+        page.edit(newer);
+        const leave = () => navigation.startsWith('project-') ? page.project('b') : page.scope(scope === 'project' ? 'global' : 'project');
+        const back = () => navigation.startsWith('project-') ? page.project('a') : page.scope(scope);
+        if (navigation !== 'same') {
+          leave();
+          // Project navigation shares the global scope; all other destinations own a separate draft.
+          if (scope !== 'global' || !navigation.startsWith('project-')) page.edit(4);
+          if (navigation.endsWith('round-trip')) back();
+        }
+        const visibleBefore = page.field.value;
+        page.finish(); await pending;
+        if (navigation.endsWith('away')) {
+          assert.equal(page.field.value, visibleBefore, 'an acknowledgement cannot overwrite the visible scope'); back();
+        }
+        assert.equal(page.field.value, String(newer));
+        assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), 2);
+        assert.equal(vm.runInContext('pendingSettingsSaves.size', page.context), 0);
+        if (newer === 2) {
+          assert.equal(vm.runInContext(`settingsDrafts.has(${JSON.stringify(key)})`, page.context), false);
+          assert.equal(page.storedWeight(key), undefined, 'equal acknowledged input is no longer dirty');
+        } else {
+          assert.equal(page.storedWeight(key).value, String(newer));
+          assert.equal(page.storedWeight(key).baselineValue, 2);
+        }
+        const savedAgain = page.submit('settings-form'); page.finish(); await savedAgain;
+        assert.deepEqual(page.posts[1], {project: scope === 'project' ? 'a' : null, values: newer === 2 ? {} : {schedule: {weight: newer}}});
+        assert.equal(page.storedWeight(key), undefined, 'a subsequent save clears the draft');
+        // Undoing to the new baseline must also clear a fresh draft once pending ownership is gone.
+        page.edit(5); page.edit(newer);
+        assert.equal(vm.runInContext(`settingsDrafts.has(${JSON.stringify(key)})`, page.context), false);
+        assert.equal(page.storedWeight(key), undefined);
+        if (navigation !== 'same' && (scope !== 'global' || !navigation.startsWith('project-'))) {
+          leave(); assert.equal(page.field.value, '4', 'the other scope retains its independent draft');
+        }
+      });
+    }
+  }
+}
+
+for (const outcome of ['failure', 'network', 'timeout']) {
+  for (const navigation of ['same', 'project-away', 'project-round-trip', 'scope-away']) {
+    for (const newer of [1, 3]) {
+      test(`pending settings save ${outcome} cleans against the old baseline after ${navigation} with weight ${newer}`, async () => {
+        const page = settingsSavePage(); page.edit(2); const pending = page.submit('settings-form');
+        // Attach rejection handling before resolving the mock transport.
+        const failed = assert.rejects(pending, outcome === 'failure' ? /项目已不存在/ : outcome === 'network' ? /无法连接本地服务/ : /更新尚未完成/);
+        page.edit(newer);
+        if (navigation.startsWith('project-')) page.project('b');
+        if (navigation === 'scope-away') page.scope('global');
+        if (navigation === 'project-round-trip') page.project('a');
+        const visibleBefore = page.field.value;
+        page.finish(outcome);
+        if (outcome === 'timeout') {
+          // Exercise api()'s real update timeout without waiting two minutes.
+          await new Promise(setImmediate);
+          vm.runInContext('Date.now=()=>Number.MAX_SAFE_INTEGER', page.context);
+          page.context.fetch = async () => response({...snapshot(), update: {busy: true}});
+          await page.resume();
+        }
+        await failed;
+        if (outcome === 'timeout') vm.runInContext('Date.now=()=>'+Date.now(), page.context);
+        assert.equal(page.field.value, visibleBefore);
+        assert.equal(vm.runInContext('pendingSettingsSaves.size', page.context), 0);
+        if (navigation === 'scope-away') page.scope('project'); else if (navigation === 'project-away') page.project('a');
+        assert.equal(page.field.value, String(newer));
+        assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), 1);
+        assert.equal(vm.runInContext('settingsDrafts.has("a")', page.context), newer !== 1);
+        assert.equal(page.storedWeight('a')?.baselineValue, newer === 1 ? undefined : 1);
+        // The failed request must release ownership so retry and ordinary undo work.
+        page.context.fetch = async (_url, options) => { page.posts.push(JSON.parse(options.body)); page.context.initialState.projects[0].config.schedule.weight = newer; return response({saved: true, config: {schedule: {weight: newer}}}); };
+        await page.submit('settings-form');
+        assert.equal(page.posts.length, 2);
+        assert.deepEqual(page.posts[1].values, newer === 1 ? {} : {schedule: {weight: newer}});
+        page.edit(5); page.edit(newer); assert.equal(page.storedWeight('a'), undefined);
+      });
+    }
+  }
+}
+
 test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
   const page=browser();
   vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdateExtras=()=>{};renderUpdate()',page.context);

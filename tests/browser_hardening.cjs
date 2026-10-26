@@ -282,6 +282,72 @@ async function checkUpdateRateLimit(browser,url,errors) {
   }finally{await page.close();}
 }
 
+async function checkPendingSettingsDraft(browser, url, errors) {
+  for (const scenario of ['project-away', 'project-round-trip', 'scope-away', 'failure-away']) {
+    const page = await browser.newPage();
+    page.on('pageerror', error => errors.push(error.message));
+    let release, arrived;
+    const gate = new Promise(resolve => release = resolve), received = new Promise(resolve => arrived = resolve);
+    const posts = [];
+    await page.route('**/api/config', async route => {
+      posts.push(route.request().postDataJSON());
+      if (posts.length === 1) {
+        arrived(); await gate;
+        if (scenario === 'failure-away') return reply(route, {error: 'Project not found'}, 404);
+      }
+      // The fixture owns temporary paused projects only. Commit the request after navigation
+      // so no poll can observe the new baseline before the held acknowledgement.
+      const response = await route.fetch(); assert.equal(response.status(), 200, await response.text()); await route.fulfill({response});
+    });
+    try {
+      await page.goto(url);
+      await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await page.locator('#project-settings').click();
+      await page.locator('#advanced-settings > summary').click();
+      const weight = page.locator('[data-path="schedule.weight"]');
+      const project = await page.locator('#project-select').inputValue();
+      const other = await page.locator('#project-select option').evaluateAll((options, id) => options.find(option => option.value !== id).value, project);
+      const original = await weight.inputValue(), submitted = original === '2' ? '3' : '2';
+      await weight.fill(submitted); await page.locator('#settings-save').click(); await received;
+      await weight.fill(original);
+      const navigate = async returning => {
+        if (scenario === 'scope-away') await page.locator('[data-settings-scope="' + (returning ? 'project' : 'global') + '"]').click();
+        else await page.locator('#project-select').selectOption(returning ? project : other);
+        // Settle the navigation GET before releasing the save, so this test controls
+        // the save acknowledgement rather than racing an unrelated state response.
+        await page.waitForFunction(() => !refreshPromise && state.selected_project === document.getElementById('project-select').value);
+      };
+      const leave = () => navigate(false), back = () => navigate(true);
+      await leave(); await weight.fill('4');
+      if (scenario === 'project-round-trip') await back();
+      release(); await page.locator('#settings-save:not([disabled])').waitFor();
+      if (scenario !== 'project-round-trip') {
+        assert.equal(await weight.inputValue(), '4', 'acknowledgement must preserve the other scope');
+        await back();
+      }
+      assert.equal(await weight.inputValue(), original, 'post-submit return to the old baseline must survive navigation');
+      const draft = await page.evaluate(id => window.RSIDraftStore.get('settings', id), project);
+      if (scenario === 'failure-away') assert.equal(draft, null, 'failure cleans the draft against the old baseline');
+      else {
+        assert.ok(draft, JSON.stringify({scenario, original, submitted, posts, baseline: await weight.inputValue(), storage: await page.evaluate(() => sessionStorage.getItem('rsi-ui-drafts'))}));
+        const saved = draft.values.find(entry => entry.path === 'schedule.weight');
+        assert.equal(saved.value, original); assert.equal(saved.baselineValue, Number(submitted));
+        await page.reload(); await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+        await page.locator('#project-settings').click(); await page.locator('#advanced-settings > summary').click();
+        assert.equal(await weight.inputValue(), original, 'the rebased safe draft survives reload');
+        await page.locator('#save-note').filter({hasText: '未保存'}).waitFor();
+      }
+      await page.locator('#settings-save').click(); await page.locator('#settings-save:not([disabled])').waitFor();
+      assert.equal(posts.length, 2);
+      assert.equal(posts[1].project, project);
+      assert.equal(posts[1].values.schedule?.weight, scenario === 'failure-away' ? undefined : Number(original));
+      assert.equal(await page.evaluate(id => window.RSIDraftStore.get('settings', id), project), null);
+      await leave(); assert.equal(await weight.inputValue(), '4', 'the other scope keeps its independent draft');
+      console.log('Pending settings draft browser check passed: ' + scenario);
+    } finally { release(); await page.close(); }
+  }
+}
+
 async function checkDraftRecovery(browser, url, errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   const secret='BROWSER-SECRET-MUST-NOT-PERSIST';
@@ -453,6 +519,7 @@ async function main() {
       server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
+    if(process.env.RSI_BROWSER_SETTINGS_ONLY){await checkPendingSettingsDraft(browser,url,errors);assert.deepEqual(errors,[]);return;}
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
     if(process.env.RSI_BROWSER_PROVIDERS_ONLY){await checkProviderSaveRace(browser,url,errors);await checkProviderSaveRace(browser,url,errors,true);assert.deepEqual(errors,[]);console.log('Provider creation acknowledgement checks passed.');return;}
     if(process.env.RSI_BROWSER_ROUTES_ONLY){await checkRouteSaveRace(browser,url,errors);return;}
@@ -467,6 +534,7 @@ async function main() {
     await checkRouteSaveRace(browser,url,errors);
     await checkUpdatePending(browser,url,errors);
     await checkUpdateRateLimit(browser,url,errors);
+    await checkPendingSettingsDraft(browser,url,errors);
     await checkDraftRecovery(browser,url,errors);
     await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);
