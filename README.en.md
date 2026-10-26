@@ -59,6 +59,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 3. Connect a model and choose models for planning, implementation, and review.
 4. Click **Start** for the project.
 
+Custom model IDs allow up to 256 characters. Display names are optional and default to the full ID. Custom display names allow up to 160 characters and survive catalog refreshes; names supplied by the service continue to follow catalog updates.
+
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.
 
 ### Run from source

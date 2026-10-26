@@ -362,7 +362,7 @@ window.RSIModelCenter = (() => {
         const authentication={mode:$('mc-input-auth').value,value:$('mc-input-key').value};$('mc-input-key').value='';
         const result=await api('model-center/provider',{project,provider,authentication});
         if(editorSession===session)editing={...provider,id:result.id};
-        for(const id of models)await api('model-center/model',{project,provider:result.id,model:{id,name:id.slice(0,160),manual:true}});
+        for(const id of models)await api('model-center/model',{project,provider:result.id,model:{id,manual:true}});
         if(scope===project){await refresh();await load();if(unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
         await fetchProvider(result.id,project);
       }catch(error){$('mc-provider-error').textContent=message(error);}finally{button.disabled=false;}
@@ -371,7 +371,7 @@ window.RSIModelCenter = (() => {
     $('mc-add-model').addEventListener('click',()=>{$('mc-custom-form').reset();$('mc-custom-error').textContent='';$('mc-custom-dialog').showModal();});
     $('mc-custom-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
       const unchanged=unchangedForm(event.target),project=scope,provider=active,button=event.target.querySelector('button[type="submit"]');button.disabled=true;$('mc-custom-error').textContent='';
-      try{const id=$('mc-custom-id').value.trim();await api('model-center/model',{project,provider,model:{id,name:$('mc-custom-name').value.trim()||id,manual:true}});if(unchanged()&&scope===project)$('mc-custom-dialog').close();if(scope===project)await load();}
+      try{const id=$('mc-custom-id').value.trim();await api('model-center/model',{project,provider,model:{id,name:$('mc-custom-name').value.trim(),manual:true}});if(unchanged()&&scope===project)$('mc-custom-dialog').close();if(scope===project)await load();}
       catch(error){if(unchanged()&&scope===project)$('mc-custom-error').textContent=message(error);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
       finally{button.disabled=false;}
     },event.target);});

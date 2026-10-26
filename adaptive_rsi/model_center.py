@@ -235,7 +235,7 @@ class ModelCenter:
             self._forget_credential(provider)
         if old and self.signature(old) != self.signature(provider):
             previous = self.directory(old, project)
-            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "enabled", "manual", "favorite", "unit_price"]}
+            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual", "favorite", "unit_price"]}
                            for model in previous["models"]]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
@@ -261,6 +261,12 @@ class ModelCenter:
             raise CenterError("provider_in_use") from None
         self.cleanup_credentials()
         return {"removed": True}
+
+    @staticmethod
+    def _has_custom_name(model):
+        # 旧目录没有标记；仅将手动模型中不同于 ID 的名称视为用户名称。
+        return model.get("name_override", bool(model.get("manual") and model.get("name")
+                                               and model["name"] != model["id"]))
 
     def fetch(self, provider_id, project=None):
         with self.runtime.dispatch_lock:
@@ -289,7 +295,10 @@ class ModelCenter:
             models = []
             for model in result["models"]:
                 old = before.pop(model["id"], {})
-                models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT), "manual": False, "missing": False,
+                custom_name = self._has_custom_name(old)
+                models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT),
+                               "manual": old.get("manual", False), "missing": False, "name_override": custom_name,
+                               **({"name": old["name"]} if custom_name else {}),
                                **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price"] if k in old}})
             models.extend({**model, "missing": not model.get("manual", False)} for model in before.values())
             directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"]}
@@ -301,7 +310,8 @@ class ModelCenter:
             raise CenterError("invalid_model")
         if "enabled" in data and type(data["enabled"]) is not bool or "manual" in data and type(data["manual"]) is not bool:
             raise CenterError("invalid_model")
-        if "name" in data and (not isinstance(data["name"], str) or not 1 <= len(data["name"].strip()) <= 160):
+        if "name" in data and (not isinstance(data["name"], str)
+                               or len(data["name"].strip()) > 160 and data["name"].strip() != data["id"]):
             raise CenterError("invalid_model")
         if "favorite" in data and type(data["favorite"]) is not bool:
             raise CenterError("invalid_model")
@@ -318,7 +328,10 @@ class ModelCenter:
                 directory["models"].append(model)
             if model.get("kind") in NON_AGENT and data.get("enabled"):
                 raise CenterError("unsupported_model_kind")
-            model.update({k: v for k, v in data.items() if k in ["name", "enabled", "favorite", "unit_price"]})
+            if "name" in data:
+                name = data["name"].strip()
+                model.update(name=name or data["id"], name_override=bool(name and name != data["id"]))
+            model.update({k: v for k, v in data.items() if k in ["enabled", "favorite", "unit_price"]})
             if data.get("manual"):
                 model.update(manual=True, missing=False)
             self.store.put_setting(self.key(provider, project), directory)

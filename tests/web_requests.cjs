@@ -2130,6 +2130,31 @@ function modelScopePage(savedDrafts = new Map()) {
   };
 }
 
+for(const length of [160,161,256])for(const name of ['', '短显示名'])test(`custom model form preserves ${length}-character ID with ${name?'explicit':'blank'} name`,async()=>{
+  const page=modelScopePage();await page.show('a');
+  page.node('mc-custom-form').querySelector=()=>page.node('custom-submit');
+  page.node('mc-custom-dialog').showModal();
+  const id='x'.repeat(length);
+  page.node('mc-custom-id').value=id;page.node('mc-custom-name').value=name;
+  await page.submit('mc-custom-form');
+  assert.deepEqual(page.posts[0],{path:'model-center/model',body:{project:'a',provider:'ollama',model:{id,name,manual:true}}});
+  assert.equal(page.node('mc-custom-dialog').open,false);
+});
+
+test('provider form sends full custom IDs without inventing truncated display names',async()=>{
+  const page=modelScopePage();await page.show('a');
+  page.node('mc-provider-form').reset=()=>{page.node('mc-provider-preset').value='custom';};
+  page.node('mc-input-auth').querySelector=()=>page.node('keychain-option');
+  page.node('mc-add-provider').handlers.click();
+  page.node('mc-input-name').value='Fixture';page.node('mc-input-url').value='http://fixture.invalid';
+  page.node('mc-input-protocol').value='chat_completions';page.node('mc-input-auth').value='none';
+  const id='x'.repeat(256);page.node('mc-input-models').value=id;
+  const api=page.context.api;
+  page.context.api=async(path,body)=>path==='model-center/provider'?{id:'ollama'}:api(path,body);
+  await page.submit('mc-provider-form');
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/model').body.model,{id,manual:true});
+});
+
 test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{
   const page=modelScopePage();await page.show('a');
   assert.equal(page.node('mc-save-routes').disabled,true);
