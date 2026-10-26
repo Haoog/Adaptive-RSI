@@ -1,6 +1,6 @@
 'use strict';
 window.RSIUsage=(()=>{
- let offset=0,sequence=0,detailSequence=0,report=null,searchTimer=null,refreshTimer=null;
+ let offset=0,sequence=0,detailSequence=0,report=null,renderedOffset=0,searchTimer=null,refreshTimer=null;
  function clearTimers(){clearTimeout(searchTimer);clearTimeout(refreshTimer);searchTimer=refreshTimer=null;}
  function cancel(){clearTimers();sequence++;$('usage-refresh').disabled=false;pageBar();clearDetail();}
  function pageBar(){if(!report)return;offset=Math.min(offset,Math.max(0,Math.ceil(report.total/25)-1)*25);
@@ -15,14 +15,14 @@ window.RSIUsage=(()=>{
  function parameters(){return new URLSearchParams({...range(),project:$('usage-scope').value==='all'?'':projectId||'',q:$('usage-search').value,sort:$('usage-sort').value,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC',offset,limit:25});}
  async function load(){
   if(view!=='usage')return;
-  clearTimers();const ticket=++sequence;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
+  clearTimers();const ticket=++sequence,requested=offset;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
   try{const result=await api('usage?'+parameters());if(ticket!==sequence||view!=='usage')return;report=result;
    const last=Math.max(0,Math.ceil((report.total||0)/25)-1)*25;
    if(offset>last){offset=last;safe(load);return;}
-   render();}
+   renderedOffset=requested;render();}
   catch(error){
    if(ticket!==sequence||view!=='usage')return;
-   if(error.status!==404)throw error;
+   if(error.status!==404){offset=renderedOffset;throw error;}
    unsupported=true;report=null;
    for(const id of ['usage-totals','usage-role-summary','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
    $('usage-tasks').replaceChildren(el('p',t('当前服务版本尚不支持用量页面，请先升级服务后再刷新。'),'muted'));

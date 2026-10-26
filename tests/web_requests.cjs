@@ -2694,6 +2694,21 @@ test('usage pagination stays disabled during a load and re-enables at the bounda
   assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
 });
 
+test('usage pagination restores the rendered page when a request fails', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two', 500); await second.catch(() => {});
+  assert.equal(page.title(), 'Initial', 'a failed page load must keep the previous rows');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 1–25', 'the page label must match the rendered rows after a failure');
+  assert.equal(page.node('usage-refresh').disabled, false);
+  page.node('usage-next').onclick(); const retry = page.context.lastAction;
+  assert.equal(page.requests[2].params.get('offset'), '25', 'the retry must request the failed page again instead of skipping it');
+  page.requests[2].finish('Page two retried'); await retry;
+  assert.equal(page.title(), 'Page two retried');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+});
+
 test('usage clamps an offset beyond the total and reloads the clamped page', async () => {
   const page = usagePage(), initial = page.show();
   page.requests[0].finish('Initial'); await initial;
