@@ -1,7 +1,9 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
 import os
 import sqlite3
+import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 
 from .store import Store, uid
@@ -11,17 +13,20 @@ def backup(store):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
     path = folder / (uid() + ".sqlite3")
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(fd)
+    fd, name = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=folder)
+    staging = Path(name)
     try:
-        with store.connect() as source, sqlite3.connect(str(path)) as target:
+        os.close(fd)
+        with store.connect() as source, closing(sqlite3.connect(str(staging))) as target:
             source.backup(target)
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
+        # Publish only the closed snapshot; a name collision must preserve the old backup.
+        os.link(staging, path)
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
 def restore(source, destination):
