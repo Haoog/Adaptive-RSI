@@ -157,7 +157,22 @@ def publish(runtime, project, task, run, workspace, config):
         existing_pr = pr_view(repo, url)
         if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName") != identity["branch"]:
             raise RuntimeError("Existing PR head or target differs from evaluated candidate")
-        authorize_write()
+        # Recover an observed remote fact before any later cancellation can discard it.
+        # This path performs no remote write, so fresh publishing authorization is unnecessary.
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            original = db.execute("SELECT state,result FROM runs WHERE id=?", (run["id"],)).fetchone()
+            receipt = json.loads(original["result"])
+            receipt["pr"] = url
+            state = "superseded" if original["state"] == "superseded" else "pr_open"
+            if state == "superseded":
+                receipt.update(replanned=True, close_pending=True)
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(
+                {"head": sha, "base": run["base"], "branch": base_branch, "repository": repo})))
+            db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (state, encode(receipt), run["id"]))
+            if state == "pr_open":
+                db.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=? AND state='awaiting_approval'",
+                           (time.time(), task["id"]))
     else:
         if current != run["base"]:
             raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")

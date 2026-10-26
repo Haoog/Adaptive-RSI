@@ -941,7 +941,7 @@ class Runtime:
                     db.execute("BEGIN IMMEDIATE")
                     current = db.execute("SELECT state FROM runs WHERE id=?", (original["id"],)).fetchone()
                     # 已发 PR 的回执必须落盘，但不能把重试后的新任务改回 pr_open。
-                    state = "pr_open" if current["state"] == "awaiting_approval" else "superseded"
+                    state = "pr_open" if current["state"] in ["awaiting_approval", "pr_open"] else "superseded"
                     if state == "superseded":
                         outcome.update(replanned=True, close_pending=True)
                     db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (state, encode(outcome), original["id"]))
