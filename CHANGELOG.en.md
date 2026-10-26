@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Usage search manages debounce and automatic refresh separately and invalidates old requests on input, preventing earlier responses from cancelling new queries or replacing later results.
+- Settings retain edits made while saving, including changes back to old values followed by a project switch. Acknowledgments preserve those drafts and compare them with the newly saved values.
+
 ## 0.5.114
 
 <!-- adaptive-rsi-release:0.5.114;base:744220e7beba2eed0cecf32caa83deedf0c884ea -->

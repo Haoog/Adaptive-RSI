@@ -1,6 +1,8 @@
 'use strict';
 window.RSIUsage=(()=>{
- let offset=0,sequence=0,detailSequence=0,report=null,timer=null;
+ let offset=0,sequence=0,detailSequence=0,report=null,searchTimer=null,refreshTimer=null;
+ function clearTimers(){clearTimeout(searchTimer);clearTimeout(refreshTimer);searchTimer=refreshTimer=null;}
+ function cancel(){clearTimers();sequence++;$('usage-refresh').disabled=false;clearDetail();}
  const usageRoleNames={triage:'价值初筛',acceptance:'验收设计'};
  const number=value=>Number(value||0).toLocaleString(language);
  const token=value=>value.unknown_calls?(Number(value.tokens)>0?number(value.tokens)+' + '+t('部分未知'):t('用量未知')):number(value.tokens);
@@ -11,7 +13,7 @@ window.RSIUsage=(()=>{
  function parameters(){return new URLSearchParams({...range(),project:$('usage-scope').value==='all'?'':projectId||'',q:$('usage-search').value,sort:$('usage-sort').value,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC',offset,limit:25});}
  async function load(){
   if(view!=='usage')return;
-  const ticket=++sequence;let unsupported=false;$('usage-refresh').disabled=true;
+  clearTimers();const ticket=++sequence;let unsupported=false;$('usage-refresh').disabled=true;
   try{const result=await api('usage?'+parameters());if(ticket!==sequence||view!=='usage')return;report=result;render();}
   catch(error){
    if(ticket!==sequence||view!=='usage')return;
@@ -20,7 +22,7 @@ window.RSIUsage=(()=>{
    for(const id of ['usage-totals','usage-role-summary','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
    $('usage-tasks').replaceChildren(el('p',t('当前服务版本尚不支持用量页面，请先升级服务后再刷新。'),'muted'));
    $('usage-prev').disabled=$('usage-next').disabled=true;
-  }finally{if(ticket===sequence)$('usage-refresh').disabled=false;if(ticket===sequence){clearTimeout(timer);if(view==='usage'&&!unsupported)timer=setTimeout(()=>safe(load),document.visibilityState==='hidden'?60000:30000);}}
+  }finally{if(ticket===sequence){$('usage-refresh').disabled=false;clearTimeout(refreshTimer);if(view==='usage'&&!unsupported)refreshTimer=setTimeout(()=>safe(load),document.visibilityState==='hidden'?60000:30000);}}
  }
  function metric(label,value,note){const node=el('div',undefined,'usage-metric');node.append(el('span',t(label)),el('strong',value));if(note)node.append(el('small',t(note)));return node;}
  function render(){if(!report)return;const totals=report.summary,summary=$('usage-totals');summary.replaceChildren(metric('已记录 tokens',token(totals)),metric('任务数',number(totals.tasks)),metric('模型运行耗时',seconds(totals.model_seconds)),metric('缓存读取 tokens',number(totals.cache_read_tokens)));
@@ -36,7 +38,13 @@ window.RSIUsage=(()=>{
   const pages=el('div',undefined,'task-pagination');if(page)pages.append(action(t('上一页'),()=>detail(task,title,Math.max(0,page-25))));pages.append(el('span',number(data.call_total)+' '+t('次调用')));if(page+25<data.call_total)pages.append(action(t('下一页'),()=>detail(task,title,page+25)));content.append(pages);if(!dialog.open)dialog.showModal();
  }
  function clearDetail(){detailSequence++;const dialog=$('usage-detail');if(dialog.open)dialog.close();}
- function show(){offset=0;clearDetail();safe(load);}
- document.addEventListener('DOMContentLoaded',()=>{for(const id of ['usage-period','usage-scope','usage-sort','usage-start','usage-end'])$(id).addEventListener('change',()=>{$('usage-custom').hidden=$('usage-period').value!=='custom';show();});$('usage-search').addEventListener('input',()=>{clearDetail();clearTimeout(timer);timer=setTimeout(show,350);});$('usage-refresh').onclick=()=>safe(load);$('usage-prev').onclick=()=>{offset=Math.max(0,offset-25);safe(load);};$('usage-next').onclick=()=>{offset+=25;safe(load);};$('project-select').addEventListener('change',()=>{if(view==='usage')show();});});
+ function show(){cancel();offset=0;safe(load);}
+ document.addEventListener('DOMContentLoaded',()=>{
+  new MutationObserver(()=>{if($('view-usage').hidden)cancel();}).observe($('view-usage'),{attributes:true,attributeFilter:['hidden']});
+  for(const id of ['usage-period','usage-scope','usage-sort','usage-start','usage-end'])$(id).addEventListener('change',()=>{$('usage-custom').hidden=$('usage-period').value!=='custom';show();});
+  $('usage-search').addEventListener('input',()=>{cancel();offset=0;if(view==='usage')searchTimer=setTimeout(show,350);});
+  $('usage-refresh').onclick=()=>safe(load);$('usage-prev').onclick=()=>{offset=Math.max(0,offset-25);safe(load);};$('usage-next').onclick=()=>{offset+=25;safe(load);};
+  $('project-select').addEventListener('change',()=>{if(view==='usage')show();else cancel();});
+ });
  return {show,translate:()=>{render();clearDetail();}};
 })();

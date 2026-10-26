@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/app.js'), 'utf8');
 const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/auth.js'), 'utf8');
 const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/experience.js'), 'utf8');
+const usageSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/usage.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
 async function waitFor(predicate) {
@@ -120,6 +121,228 @@ test('settings edited during the acknowledgement refresh keep the saved baseline
   assert.equal(field.value, '20');
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
 });
+
+function settingsSavePage(scope = 'project') {
+  const page = browser(), field = page.node('weight'), posts = [];
+  Object.assign(field, {type: 'number', dataset: {path: 'schedule.weight'}, checked: false});
+  const fields = [field, ...['schedule-mode', 'work-start', 'work-end', 'issue-labels', 'checks-json', 'advanced-json'].map(page.node)];
+  page.document.querySelectorAll = selector => selector === '[data-path]' ? [field] : [];
+  page.node('settings-form').querySelectorAll = selector => selector === 'input,textarea,select' ? fields : selector === '[data-path]' ? [field] : [];
+  page.node('config-scope').value = scope;
+  const config = {schedule: {weight: 1, working_hours: [0, 24]}, github: {labels: []}, checks: []};
+  page.context.initialState.config = structuredClone(config);
+  page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); });
+  // Only rendering and unrelated refreshes are isolated; app.js owns submit, input,
+  // scope/project navigation, baseline acknowledgement and draft persistence/restoration.
+  vm.runInContext(`view='settings';renderNavigation=()=>{};renderSettings=()=>{
+    settingsBaseline=structuredClone(settingsKey()==='global'?state.config:currentProject().config);
+    settingsContext=settingsKey();settingsModes.set(settingsBaseline,'custom');
+    $('weight').value=String(settingsBaseline.schedule.weight);$('schedule-mode').value='custom';
+    $('work-start').value='0';$('work-end').value='24';$('checks-json').value='[]';
+    settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();
+  };render=()=>{if(!settingsBaseline)renderSettings();};render();`, page.context);
+  page.context.refresh = async () => {};
+  let resolveSave, rejectSave;
+  page.context.fetch = async (_url, options) => {
+    const post = JSON.parse(options.body); posts.push(post);
+    return new Promise((resolve, reject) => { resolveSave = resolve; rejectSave = reject; });
+  };
+  return Object.assign(page, {
+    posts, field,
+    edit(value) { field.value = String(value); page.input('weight', 'settings-form'); page.node('settings-form').handlers.input(); },
+    project(id) { page.node('project-select').value = id; page.node('project-select').handlers.change(); },
+    scope(value) { page.context.changeSettingsScope(value); },
+    finish(outcome = 'success') {
+      if (outcome === 'network') { rejectSave(new TypeError('connection lost')); return; }
+      if (outcome === 'failure') { resolveSave(response({error: 'Project not found'}, 404)); return; }
+      if (outcome === 'timeout') { resolveSave(rejected()); return; }
+      const post = posts.at(-1), target = post.project === null ? page.context.initialState : page.context.initialState.projects.find(project => project.id === post.project);
+      target.config.schedule.weight = post.values.schedule?.weight ?? target.config.schedule.weight;
+      resolveSave(response({saved: true, config: structuredClone(target.config)}));
+    },
+    storedWeight(key) { return vm.runInContext(`draftStore.get('settings',${JSON.stringify(key)})?.values.find(entry=>entry.path==='schedule.weight')`, page.context); }
+  });
+}
+
+function productionSettingsPage(scope) {
+  const page = browser(), fields = [];
+  const html = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/index.html'), 'utf8').split('<form id="settings-form">')[1].split('</form>')[0];
+  for (const match of html.matchAll(/<(input|select|textarea)\b([^>]*)>/g)) {
+    const attrs = Object.fromEntries([...match[2].matchAll(/([\w-]+)="([^"]*)"/g)].map(item => [item[1], item[2]]));
+    const node = page.node(attrs.id || 'control-' + fields.length);
+    Object.assign(node, {id: attrs.id || '', type: attrs.type || match[1], tagName: match[1].toUpperCase(), checked: false, form: page.node('settings-form')});
+    for (const [key, value] of Object.entries(attrs)) if (key.startsWith('data-')) node.dataset[key.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
+    node.hasAttribute = key => Object.hasOwn(attrs, key);
+    let value = ''; Object.defineProperty(node, 'value', {get: () => value, set: next => { value = String(next); }});
+    const content = html.slice(match.index + match[0].length).split('</' + match[1] + '>')[0];
+    node.options = match[1] === 'select' ? [...content.matchAll(/<option value="([^"]*)"/g)].map(item => ({value: item[1]})) : [];
+    fields.push(node);
+  }
+  const select = selector => {
+    if (selector === 'input,textarea,select') return fields;
+    if (selector === '[data-path]') return fields.filter(node => node.dataset.path);
+    if (selector === '[data-unit-for]') return fields.filter(node => node.dataset.unitFor);
+    if (selector === '[data-schedule-preset]') return fields.filter(node => node.dataset.schedulePreset);
+    if (selector === '[data-unit-for], [data-schedule-preset]') return fields.filter(node => node.dataset.unitFor || node.dataset.schedulePreset);
+    const exact = selector.match(/^\[data-(path|unit-for)="([^"]+)"\]$/);
+    if (exact) return fields.filter(node => node.dataset[exact[1] === 'path' ? 'path' : 'unitFor'] === exact[2]);
+    const prefix = selector.match(/^\[data-path\^="([^"]+)"\]$/);
+    return prefix ? fields.filter(node => node.dataset.path?.startsWith(prefix[1])) : [];
+  };
+  page.document.querySelectorAll = select; page.document.querySelector = selector => select(selector)[0] || null;
+  page.node('settings-form').querySelectorAll = select;
+  const prior = page.node('settings-form').querySelector.bind(page.node('settings-form'));
+  page.node('settings-form').querySelector = selector => select(selector)[0] || prior(selector);
+  const config = JSON.parse(require('node:child_process').execFileSync(process.env.PYTHON || 'python3', ['-B', '-c', 'import json; from adaptive_rsi.config import DEFAULTS; print(json.dumps(DEFAULTS))'], {cwd: path.join(__dirname, '..'), encoding: 'utf8'}));
+  page.context.initialState.config = structuredClone(config);
+  page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); project.overrides = {}; });
+  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}}, language: 'zh-CN'});
+  page.context.window.addEventListener = () => {}; page.context.window.scrollTo = () => {};
+  vm.runInContext(experienceSource, page.context);
+  // Keep production renderSettings, refresh, draft restoration and dirty status.
+  // Isolate only unrelated panels and their background requests.
+  vm.runInContext(`view='settings';renderCapabilities=async()=>{};loadReleaseWorkflows=async()=>{};
+    renderUpdateExtras=()=>{};renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
+    render=()=>{if(!settingsBaseline)renderSettings();};`, page.context);
+  page.node('config-scope').value = scope; page.context.renderSettings();
+  const server = structuredClone(page.context.initialState), posts = [];
+  let acknowledge;
+  page.context.fetch = async (url, options) => {
+    if (url.includes('/state?')) return response({...structuredClone(server), selected_project: new URLSearchParams(url.split('?')[1]).get('project')});
+    const post = JSON.parse(options.body); posts.push(post);
+    const target = post.project === null ? server : server.projects.find(project => project.id === post.project);
+    page.context.deepMerge(target.config, post.values);
+    if (post.project !== null) page.context.deepMerge(target.overrides, post.values);
+    const saved = structuredClone(target.config);
+    return new Promise(resolve => { acknowledge = () => resolve(response({saved: true, config: saved})); });
+  };
+  const weight = select('[data-path="schedule.weight"]')[0];
+  return Object.assign(page, {server, posts, weight,
+    edit(selector, value) {
+      const node = select(selector)[0]; node.value = value;
+      page.input(node.id || 'control-' + fields.indexOf(node), 'settings-form');
+      page.node('settings-form').handlers.input(); page.context.window.RSIProduct.dirtyStatus();
+    },
+    async navigate(back) {
+      if (scope === 'project') { page.node('project-select').value = back ? 'a' : 'b'; page.node('project-select').handlers.change(); }
+      else page.context.changeSettingsScope(back ? 'global' : 'project');
+      await page.context.refresh();
+    },
+    finish() { acknowledge(); }
+  });
+}
+
+for (const scope of ['project', 'global']) {
+  for (const external of ['none', 'unrelated-field', 'same-field']) {
+    test(`production settings restore after GET sees pending ${scope} save with ${external} conflict`, async () => {
+      const page = productionSettingsPage(scope), key = scope === 'project' ? 'a' : 'global';
+      const target = scope === 'project' ? page.server.projects[0] : page.server;
+      page.edit('[data-path="schedule.weight"]', '2'); const pending = page.submit('settings-form');
+      page.edit('[data-path="schedule.weight"]', '1');
+      if (external === 'unrelated-field') page.edit('[data-path="limits.retries"]', '7');
+      if (external === 'same-field') target.config.schedule.weight = 6;
+      if (external === 'unrelated-field') target.config.limits.retries = 8;
+      assert.equal(target.config.schedule.weight, external === 'same-field' ? 6 : 2, 'server commits before POST acknowledgement');
+      await page.navigate(false); await page.navigate(true);
+      assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), external === 'same-field' ? 6 : 2, 'navigation GET observes the committed baseline');
+      assert.equal(page.weight.value, external === 'same-field' ? '6' : '1', 'only a baseline change belonging to this save preserves the newer draft');
+      if (external === 'unrelated-field') assert.equal(page.document.querySelector('[data-path="limits.retries"]').value, '8', 'unrelated external conflicts retain server values');
+      if (external !== 'none') assert.match(page.node('toast').textContent, /冲突字段/);
+      page.finish(); await pending;
+      if (external === 'same-field') return;
+      assert.equal(page.weight.value, '1');
+      assert.equal(page.node('save-note').dataset.state, 'dirty');
+      const stored = vm.runInContext(`draftStore.get('settings',${JSON.stringify(key)})`, page.context);
+      assert.equal(stored.values.find(entry => entry.path === 'schedule.weight').baselineValue, 2);
+      assert.equal(stored.values.find(entry => entry.path === 'schedule.weight').value, '1');
+    });
+  }
+}
+
+for (const scope of ['project', 'global']) {
+  for (const navigation of ['same', 'project-away', 'project-round-trip', 'scope-away', 'scope-round-trip']) {
+    for (const newer of [1, 2, 3]) {
+      test(`pending settings save preserves ${scope} weight ${newer} after ${navigation}`, async () => {
+        const page = settingsSavePage(scope), key = scope === 'project' ? 'a' : 'global';
+        page.edit(2); const pending = page.submit('settings-form');
+        page.edit(newer);
+        const leave = () => navigation.startsWith('project-') ? page.project('b') : page.scope(scope === 'project' ? 'global' : 'project');
+        const back = () => navigation.startsWith('project-') ? page.project('a') : page.scope(scope);
+        if (navigation !== 'same') {
+          leave();
+          // Project navigation shares the global scope; all other destinations own a separate draft.
+          if (scope !== 'global' || !navigation.startsWith('project-')) page.edit(4);
+          if (navigation.endsWith('round-trip')) back();
+        }
+        const visibleBefore = page.field.value;
+        page.finish(); await pending;
+        if (navigation.endsWith('away')) {
+          assert.equal(page.field.value, visibleBefore, 'an acknowledgement cannot overwrite the visible scope'); back();
+        }
+        assert.equal(page.field.value, String(newer));
+        assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), 2);
+        assert.equal(vm.runInContext('pendingSettingsSaves.size', page.context), 0);
+        if (newer === 2) {
+          assert.equal(vm.runInContext(`settingsDrafts.has(${JSON.stringify(key)})`, page.context), false);
+          assert.equal(page.storedWeight(key), undefined, 'equal acknowledged input is no longer dirty');
+        } else {
+          assert.equal(page.storedWeight(key).value, String(newer));
+          assert.equal(page.storedWeight(key).baselineValue, 2);
+        }
+        const savedAgain = page.submit('settings-form'); page.finish(); await savedAgain;
+        assert.deepEqual(page.posts[1], {project: scope === 'project' ? 'a' : null, values: newer === 2 ? {} : {schedule: {weight: newer}}});
+        assert.equal(page.storedWeight(key), undefined, 'a subsequent save clears the draft');
+        // Undoing to the new baseline must also clear a fresh draft once pending ownership is gone.
+        page.edit(5); page.edit(newer);
+        assert.equal(vm.runInContext(`settingsDrafts.has(${JSON.stringify(key)})`, page.context), false);
+        assert.equal(page.storedWeight(key), undefined);
+        if (navigation !== 'same' && (scope !== 'global' || !navigation.startsWith('project-'))) {
+          leave(); assert.equal(page.field.value, '4', 'the other scope retains its independent draft');
+        }
+      });
+    }
+  }
+}
+
+for (const outcome of ['failure', 'network', 'timeout']) {
+  for (const navigation of ['same', 'project-away', 'project-round-trip', 'scope-away']) {
+    for (const newer of [1, 3]) {
+      test(`pending settings save ${outcome} cleans against the old baseline after ${navigation} with weight ${newer}`, async () => {
+        const page = settingsSavePage(); page.edit(2); const pending = page.submit('settings-form');
+        // Attach rejection handling before resolving the mock transport.
+        const failed = assert.rejects(pending, outcome === 'failure' ? /项目已不存在/ : outcome === 'network' ? /无法连接本地服务/ : /更新尚未完成/);
+        page.edit(newer);
+        if (navigation.startsWith('project-')) page.project('b');
+        if (navigation === 'scope-away') page.scope('global');
+        if (navigation === 'project-round-trip') page.project('a');
+        const visibleBefore = page.field.value;
+        page.finish(outcome);
+        if (outcome === 'timeout') {
+          // Exercise api()'s real update timeout without waiting two minutes.
+          await new Promise(setImmediate);
+          vm.runInContext('Date.now=()=>Number.MAX_SAFE_INTEGER', page.context);
+          page.context.fetch = async () => response({...snapshot(), update: {busy: true}});
+          await page.resume();
+        }
+        await failed;
+        if (outcome === 'timeout') vm.runInContext('Date.now=()=>'+Date.now(), page.context);
+        assert.equal(page.field.value, visibleBefore);
+        assert.equal(vm.runInContext('pendingSettingsSaves.size', page.context), 0);
+        if (navigation === 'scope-away') page.scope('project'); else if (navigation === 'project-away') page.project('a');
+        assert.equal(page.field.value, String(newer));
+        assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), 1);
+        assert.equal(vm.runInContext('settingsDrafts.has("a")', page.context), newer !== 1);
+        assert.equal(page.storedWeight('a')?.baselineValue, newer === 1 ? undefined : 1);
+        // The failed request must release ownership so retry and ordinary undo work.
+        page.context.fetch = async (_url, options) => { page.posts.push(JSON.parse(options.body)); page.context.initialState.projects[0].config.schedule.weight = newer; return response({saved: true, config: {schedule: {weight: newer}}}); };
+        await page.submit('settings-form');
+        assert.equal(page.posts.length, 2);
+        assert.deepEqual(page.posts[1].values, newer === 1 ? {} : {schedule: {weight: newer}});
+        page.edit(5); page.edit(newer); assert.equal(page.storedWeight('a'), undefined);
+      });
+    }
+  }
+}
 
 test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
   const page=browser();
@@ -1893,6 +2116,157 @@ test('pending completion catalog refresh cannot invoke duplicate callbacks',asyn
   run.release();await run.tick();await run.tick();
   assert.equal(run.calls.catalog,1);
   assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+function usagePage() {
+  const page = browser(), requests = [];
+  let ready, hiddenChanged;
+  page.context.language = 'zh-CN';
+  page.document.visibilityState = 'visible';
+  page.document.addEventListener = (type, callback) => { if (type === 'DOMContentLoaded') ready = callback; };
+  page.context.MutationObserver = class {
+    constructor(callback) { hiddenChanged = callback; }
+    observe(node, options) {
+      assert.equal(node, page.node('view-usage'));
+      assert.deepEqual(Array.from(options.attributeFilter), ['hidden']);
+    }
+  };
+  vm.runInContext(usageSource, page.context);
+  ready();
+  page.node('view-usage').hidden = false;
+  page.node('usage-period').value = 'all';
+  page.node('usage-scope').value = 'current';
+  page.node('usage-sort').value = 'recent';
+  vm.runInContext('view="usage"', page.context);
+  page.context.fetch = url => new Promise(resolve => {
+    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200) {
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
+        tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
+    }});
+  });
+  return Object.assign(page, {
+    requests,
+    show() { page.context.window.RSIUsage.show(); return page.context.lastAction; },
+    search(query) { page.node('usage-search').value = query; page.node('usage-search').handlers.input(); },
+    hide() { vm.runInContext('view="overview"', page.context); page.node('view-usage').hidden = true; hiddenChanged(); },
+    active(delay) { return page.timers.filter(timer => timer.active && timer.delay === delay).length; },
+    title() { return page.node('usage-tasks').children[0]?.children[0]?.children[0]?.textContent; }
+  });
+}
+
+for (const timing of ['before-input', 'during-debounce', 'after-search']) {
+  for (const status of timing === 'before-input' ? [200] : [200, 404, 500]) {
+    test(`usage search survives an old ${status} response ${timing}`, async () => {
+      const page = usagePage(), old = page.show();
+      if (timing === 'before-input') { page.requests[0].finish('Old result'); await old; }
+      page.search('latest query');
+      assert.equal(page.active(350), 1);
+      assert.equal(page.active(30000), 0);
+      assert.equal(page.node('usage-refresh').disabled, false);
+      if (timing === 'during-debounce') {
+        page.requests[0].finish('Old result', status); await old;
+        assert.equal(page.active(350), 1, 'old finalization must preserve the search');
+        assert.equal(page.title(), undefined, 'old data must not render after input');
+        assert.equal(page.active(30000), 0);
+      }
+      page.fireTimer(350);
+      const search = page.context.lastAction;
+      assert.equal(page.requests.length, 2);
+      assert.equal(page.requests[1].params.get('q'), 'latest query');
+      assert.equal(page.requests[1].params.get('offset'), '0');
+      page.requests[1].finish('Latest result'); await search;
+      if (timing === 'after-search') { page.requests[0].finish('Old result', status); await old; }
+      assert.equal(page.title(), 'Latest result');
+      assert.equal(page.node('usage-search').value, 'latest query');
+      assert.equal(page.active(350), 0);
+      assert.equal(page.active(30000), 1);
+    });
+  }
+}
+
+test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const next = page.context.lastAction;
+  assert.equal(page.requests[1].params.get('offset'), '25');
+  page.requests[1].finish('Page two'); await next;
+  page.search('first'); page.search('latest');
+  assert.equal(page.active(350), 1);
+  assert.equal(page.active(30000), 0);
+  page.fireTimer(350); const search = page.context.lastAction;
+  assert.equal(page.requests.length, 3);
+  assert.equal(page.requests[2].params.get('q'), 'latest');
+  assert.equal(page.requests[2].params.get('offset'), '0');
+  page.document.visibilityState = 'hidden';
+  page.requests[2].finish('Latest'); await search;
+  assert.equal(page.active(60000), 1);
+  page.document.visibilityState = 'visible';
+  page.fireTimer(60000); const refresh = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('q'), 'latest');
+  page.requests[3].finish('Refreshed'); await refresh;
+  assert.equal(page.active(30000), 1);
+});
+
+for (const trigger of ['project', 'period', 'refresh', 'hide']) {
+  test(`usage ${trigger} cancels pending search and discards late responses`, async () => {
+    const page = usagePage();
+    if (trigger === 'refresh') {
+      const initial = page.show(); page.requests[0].finish('Initial'); await initial;
+      page.requests.length = 0;
+      page.node('usage-next').onclick();
+    } else page.show();
+    const old = page.context.lastAction;
+    page.search('new query');
+    if (trigger === 'project') {
+      vm.runInContext('projectId="b"', page.context);
+      page.node('project-select').handlers.change();
+    } else if (trigger === 'period') {
+      page.node('usage-period').value = '7'; page.node('usage-period').handlers.change();
+    } else if (trigger === 'refresh') page.node('usage-refresh').onclick();
+    else page.hide();
+    const current = page.context.lastAction;
+    assert.equal(page.active(350), 0);
+    page.requests[0].finish('Stale'); await old;
+    assert.equal(page.title(), trigger === 'refresh' ? 'Initial' : undefined);
+    if (trigger === 'hide') {
+      assert.equal(page.requests.length, 1);
+      assert.equal(page.active(30000), 0);
+      assert.equal(page.node('usage-refresh').disabled, false);
+      vm.runInContext('view="usage"', page.context); page.node('view-usage').hidden = false;
+      page.show();
+    } else {
+      assert.equal(page.node('usage-refresh').disabled, true, 'old finalization cannot enable the current request');
+      assert.equal(page.active(30000), 0);
+    }
+    const latest = trigger === 'hide' ? page.context.lastAction : current;
+    assert.equal(page.requests.length, 2);
+    assert.equal(page.requests[1].params.get('q'), 'new query');
+    assert.equal(page.requests[1].params.get('offset'), '0');
+    assert.equal(page.requests[1].params.get('project'), trigger === 'project' ? 'b' : 'a');
+    page.requests[1].finish('Current'); await latest;
+    assert.equal(page.title(), 'Current');
+    assert.equal(page.active(30000), 1);
+  });
+}
+
+test('leaving usage clears auto refresh and pending detail without reopening the dialog', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-tasks').children[0].children[2].handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[1].params.get('task'), 'Initial');
+  page.hide();
+  assert.equal(page.active(30000), 0);
+  page.requests[1].finish('Old detail'); await detail;
+  assert.notEqual(page.node('usage-detail').open, true);
+});
+
+test('a current unsupported usage response stops auto refresh', async () => {
+  const page = usagePage(), pending = page.show();
+  page.requests[0].finish('Unsupported', 404); await pending;
+  assert.equal(page.node('usage-refresh').disabled, false);
+  assert.equal(page.active(30000), 0);
+  assert.match(page.node('usage-tasks').children[0].textContent, /尚不支持用量页面/);
 });
 
 test('the live run stage marks an in-progress review before its stage row exists', () => {

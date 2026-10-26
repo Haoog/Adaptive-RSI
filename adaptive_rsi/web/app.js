@@ -16,7 +16,7 @@ let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
 let readinessSequence=0;
 const loadedStateSections={analyticsProject:null,analyticsAt:0,candidatesProject:null,candidatesAt:0};
-const pendingForms=new WeakSet(),listSnapshots=new WeakMap();
+const pendingForms=new WeakSet(),pendingSettingsSaves=new Map(),listSnapshots=new WeakMap();
 function changedList(node,rows){const signature=JSON.stringify([projectId,language,rows]);if(listSnapshots.get(node)===signature)return false;listSnapshots.set(node,signature);return true;}
 const draftStore=(()=>{
  const storageKey=()=> 'rsi-ui-drafts'+(window.__RSI_MACHINE_KEY__?':'+window.__RSI_MACHINE_KEY__:''),version=1,ttl=7*24*60*60*1000;
@@ -467,10 +467,16 @@ function writePersistentSettingsDraft(scope,values,baseline,mode){
  const saved=values.filter(v=>persistableDraftEntry(v)&&!sameValue(v,cleanByPath.get(v.path||v.id))).map(v=>({...v,baselineValue:settingBaselineValue(v,baseline,mode)}));
  if(saved.length)draftStore.set('settings',scope,{values:saved,mode});else draftStore.remove('settings',scope);
 }
+function finishPendingSettingsSave(key){
+ if(!pendingSettingsSaves.delete(key))return;
+ const draft=settingsDrafts.get(key);
+ if(draft&&JSON.stringify(draft.values)===settingsClean.get(key)){settingsDrafts.delete(key);draftStore.remove('settings',key);}
+}
 function stashSettings(){
  if(!settingsBaseline||!settingsContext)return;
  const values=settingsValues();
- if(JSON.stringify(values)===settingsClean.get(settingsContext)){settingsDrafts.delete(settingsContext);draftStore.remove('settings',settingsContext);return;}
+ // The old clean value can become an unsaved edit when an in-flight save is acknowledged.
+ if(!pendingSettingsSaves.has(settingsContext)&&JSON.stringify(values)===settingsClean.get(settingsContext)){settingsDrafts.delete(settingsContext);draftStore.remove('settings',settingsContext);return;}
  const mode=$('schedule-mode').value,baselineValues=Object.fromEntries(values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,settingsBaseline,mode)]));
  settingsDrafts.set(settingsContext,{baseline:structuredClone(settingsBaseline),baselineValues,mode,values});
  writePersistentSettingsDraft(settingsContext,persistentSettingsValues(),settingsBaseline,mode);
@@ -480,7 +486,10 @@ function restoreSettingsDraft(){
  const currentMode=settingsModes.get(settingsBaseline),restored=[];let conflicts=0;
  for(const saved of draft.values||[]){const node=saved.id?$(saved.id):$('settings-form').querySelector('[data-path="'+saved.path+'"]');if(!node)continue;
   const oldBase=memory?draft.baselineValues?.[saved.path||saved.id]:saved.baselineValue,currentBase=settingBaselineValue(saved,settingsBaseline,currentMode);
-  if(!sameValue(oldBase,currentBase)){conflicts++;continue;}
+  // A navigation GET can observe this save before its POST acknowledgement.
+  // Accept only the submitted baseline for this field; unrelated changes still conflict.
+  const pending=memory&&pendingSettingsSaves.get(key);
+  if(!sameValue(oldBase,currentBase)&&!(pending&&sameValue(currentBase,settingBaselineValue(saved,pending.config,pending.mode)))){conflicts++;continue;}
   node.value=saved.value;node.checked=saved.checked;if(saved.unit&&saved.path){const unit=document.querySelector('[data-unit-for="'+saved.path+'"]');if(unit){unit.value=saved.unit;unit.dataset.previous=saved.unit;}}restored.push(saved);
  }
  document.querySelectorAll('[data-unit-for]').forEach(unit=>{unit.dataset.previous=unit.value;const node=document.querySelector('[data-path="'+unit.dataset.unitFor+'"]');node.min=5/Number(unit.value);node.max=525600/Number(unit.value);});
@@ -651,13 +660,14 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  const inherit=scope==='project'&&$('schedule-mode').value==='inherit'?schedulePaths:[];
  const scheduleMode=$('schedule-mode').value;
  if(scope==='project'&&scheduleMode==='custom'&&settingsModes.get(baseline)==='inherit')for(const path of schedulePaths){const node=document.querySelector('[data-path="'+path+'"]');setPath(patch,path,fieldValue(node));}
- patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const submittedValues=settingsValues();window.RSIProduct?.savingStatus(true,false,key);const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=deepMerge(structuredClone(baseline),saved.config||patch);
+ patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const submittedValues=settingsValues(),pendingConfig=deepMerge(structuredClone(baseline),structuredClone(patch));for(const path of inherit)setPath(pendingConfig,path,getPath(state.config,path));settingsModes.set(pendingConfig,scheduleMode);pendingSettingsSaves.set(key,{config:pendingConfig,mode:scheduleMode});window.RSIProduct?.savingStatus(true,false,key);const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=deepMerge(structuredClone(baseline),saved.config||patch);
  settingsModes.set(acknowledged,scheduleMode);
  settingsClean.set(key,JSON.stringify(acknowledgedSettingsValues(submittedValues,acknowledged,scheduleMode)));
  const draft=settingsDrafts.get(key);if(draft){draft.baseline=structuredClone(acknowledged);draft.baselineValues=Object.fromEntries(draft.values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,acknowledged,scheduleMode)]));writePersistentSettingsDraft(key,draft.values.filter(persistableDraftEntry),acknowledged,scheduleMode);}
+ finishPendingSettingsSave(key);
  if(settingsBaseline&&(settingsBaseline===baseline||settingsContext===key)&&settingsKey()===key){settingsBaseline=acknowledged;stashSettings();}
  readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'&&sameValue(settingsValues(),submittedValues)){settingsDrafts.delete(key);renderSettings();}
- window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
+ window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{finishPendingSettingsSave(saveKey);button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));},event.target);});
 const updateNames={checking:'正在检查更新',recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
 const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
