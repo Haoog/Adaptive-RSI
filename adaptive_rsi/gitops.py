@@ -2,7 +2,7 @@ import os
 import shutil
 from pathlib import Path
 
-from .process import checked, scrub_tree
+from .process import ProcessError, checked, scrub_tree
 
 
 def git(root, *args, timeout=60):
@@ -14,9 +14,13 @@ def git(root, *args, timeout=60):
 
 def repository(path):
     root = Path(path).expanduser().resolve()
-    if not root.is_dir() or git(root, "rev-parse", "--show-toplevel") != str(root):
-        raise ValueError("Select the root of an existing Git repository")
-    git(root, "rev-parse", "--verify", "HEAD")
+    try:
+        if not root.is_dir() or git(root, "rev-parse", "--show-toplevel") != str(root):
+            raise ValueError("Select the root of an existing Git repository")
+        git(root, "rev-parse", "--verify", "HEAD")
+    except ProcessError:
+        # 目录存在但不是可用仓库根（或还没有提交）时给出固定提示，而不是内部错误。
+        raise ValueError("Select the root of an existing Git repository") from None
     return root
 
 

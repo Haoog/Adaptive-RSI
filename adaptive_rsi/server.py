@@ -109,6 +109,13 @@ Wait for the active run to finish stopping before retrying or supplementing this
 Wait until active runs finish before registering projects so every worker uses the same isolation boundaries
 Only project scan settings can inherit global defaults
 An inherited setting cannot also have an override
+Task overrides cannot grant delivery permissions
+Invalid submission ID
+Unknown inspection type
+This task cannot be retried
+Task not found
+This task has finished and can no longer be cancelled
+Submission ID was already used with different content
 """.strip().splitlines())
 
 
