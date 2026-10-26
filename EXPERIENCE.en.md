@@ -18,6 +18,8 @@ Minimum requirements follow the browser: the console needs a modern browser equi
 
 The submit button retains a request ID for the same unconfirmed submission. Retrying an ambiguous response returns the original task; submitting after success creates a new task. CLI users can specify `goal --request-id`. Reusing an ID with different content is rejected; project submissions remain isolated.
 
+Newly claimed tasks use the settings saved before their claim; active runs retain their sealed settings. Pausing retains a stop request for current runs, and quickly resuming does not withdraw it. Interrupted tasks can be explicitly retried. Editing or removing a model connection retains its old credential until referencing runs finish, after which periodic maintenance removes it.
+
 The queue shows ordering, urgency, and reasons for waiting: pause, backoff, working hours, current work or a predecessor. Urgency is separate from value. A waiting task can depend on another task in the same project. Once that task merges, downstream work starts from a fresh baseline. Cycles are rejected, and independent work can proceed.
 
 After cancellation, retrying or supplementing requirements waits until the active run has stopped completely. The dashboard explains this wait. Supplementing requirements invalidates undelivered candidates and their queued approvals, requiring fresh verification against the new requirements. Existing PRs and merge records remain available.
