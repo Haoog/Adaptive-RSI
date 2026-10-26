@@ -286,6 +286,112 @@ class OperabilityTest(unittest.TestCase):
         self.assertNotIn("task-proof:proj01:stale-old", keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
 
+    def test_retention_settings_batches_drain_remaining_runs(self):
+        store = self.store
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        protected = ["pr_open", "merged", "unverified_merge", "releasing", "deploying", "pr_closed"]
+        remaining_keys = set()
+        preserved_keys = set()
+        with store.connect() as db:
+            # 已清理运行排在前面时，也必须继续找到仍有派生键的运行。
+            for index in range(450):
+                run = "old-%03d" % index
+                db.execute("INSERT INTO runs(id,state,started,ended) VALUES (?,'completed',?,?)", (run, stale, stale))
+                if index < 200:
+                    continue
+                for prefix, suffix in [("run-baseline:", ""), ("delivery:", ""),
+                                       ("automation:", ":release"), ("automation:", ":deploy")]:
+                    key = prefix + run + suffix
+                    remaining_keys.add(key)
+                    db.execute("INSERT INTO settings VALUES (?, '{}')", (key,))
+            for state in protected + ["fresh", "active"]:
+                run = "keep-" + state
+                ended = None if state == "active" else now if state == "fresh" else stale
+                db.execute("INSERT INTO runs(id,state,started,ended) VALUES (?,?,?,?)",
+                           (run, state if state in protected else "completed", stale, ended))
+                for prefix, suffix in [("run-baseline:", ""), ("delivery:", ""), ("automation:", ":release")]:
+                    key = prefix + run + suffix
+                    preserved_keys.add(key)
+                    db.execute("INSERT INTO settings VALUES (?, '{}')", (key,))
+            # 相似前缀不是这个运行的派生键。
+            for key in ["delivery:old-200-extra", "unrelated:old-200", "automation:orphan:release"]:
+                preserved_keys.add(key)
+                db.execute("INSERT INTO settings VALUES (?, '{}')", (key,))
+
+        for passes, expected_remaining in [(0, 200), (1, 0), (2, 0)]:
+            with self.subTest(passes=passes + 1), patch("adaptive_rsi.runtime.time.time", return_value=now + passes * 3601):
+                self.runtime.maintenance()
+                keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+                self.assertEqual(len(keys & remaining_keys), expected_remaining)
+                self.assertTrue(preserved_keys <= keys)
+        self.assertEqual(store.one("SELECT count(*) AS n FROM runs")["n"], 458)
+
+    def test_retention_settings_uses_indexed_lookups_with_large_clean_history(self):
+        store = self.store
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        prefixes = ("run-baseline:", "automation:", "delivery:")
+        remaining_keys = set()
+        unrelated_keys = {"unrelated:%04d" % index for index in range(2000)}
+        with store.connect() as db:
+            db.executemany("INSERT INTO runs(id,state,started,ended) VALUES (?,'completed',?,?)",
+                           [("history-%04d" % index, stale, stale) for index in range(5000)])
+            db.executemany("INSERT INTO settings VALUES (?, '{}')", [(key,) for key in unrelated_keys])
+            # 201 runs with all six key shapes: the first pass must still stop at 200 runs.
+            for index in range(4799, 5000):
+                for prefix in prefixes:
+                    for suffix in ("", ":release"):
+                        key = prefix + "history-%04d" % index + suffix
+                        remaining_keys.add(key)
+                        db.execute("INSERT INTO settings VALUES (?, '{}')", (key,))
+
+        original_query = store.query
+        plans = []
+
+        def checked_query(sql, args=()):
+            if not sql.startswith("SELECT r.id FROM runs r"):
+                return original_query(sql, args)
+            with store.connect() as db:
+                plan = [row["detail"] for row in db.execute("EXPLAIN QUERY PLAN " + sql, args)]
+                searches = [detail for detail in plan if "SEARCH s USING" in detail]
+                self.assertEqual(len(searches), 6, plan)
+                self.assertTrue(all("INDEX" in detail for detail in searches), plan)
+                self.assertFalse(any("SCAN s" in detail for detail in plan), plan)
+                self.assertEqual(sum("key=?" in detail for detail in searches), 3, plan)
+                self.assertEqual(sum("key>? AND key<?" in detail for detail in searches), 3, plan)
+                plans.append(plan)
+                return [dict(row) for row in db.execute(sql, args)]
+
+        with patch.object(store, "query", side_effect=checked_query):
+            for passes, expected in [(0, 6), (1, 0)]:
+                with self.subTest(passes=passes + 1), patch("adaptive_rsi.runtime.time.time", return_value=now + passes * 3601):
+                    self.runtime.maintenance()
+                    keys = {row["key"] for row in original_query("SELECT key FROM settings")}
+                    self.assertEqual(len(keys & remaining_keys), expected)
+                    self.assertTrue(unrelated_keys <= keys)
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(store.one("SELECT count(*) AS n FROM runs")["n"], 5000)
+
+    def test_retention_settings_matches_literal_run_id_and_colon_suffix_only(self):
+        store = self.store
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        run = "old_%Case"
+        removed = set()
+        preserved = set()
+        with store.connect() as db:
+            db.execute("INSERT INTO runs(id,state,started,ended) VALUES (?,'completed',?,?)", (run, stale, stale))
+            for prefix in ("run-baseline:", "automation:", "delivery:"):
+                removed.update(prefix + run + suffix for suffix in ("", ":", ":release", ":nested:deploy"))
+                preserved.update(prefix + other for other in (run + "-extra", run + ";", run + "0", "oldABCase:release", "old_%case:release"))
+            db.executemany("INSERT INTO settings VALUES (?, '{}')", [(key,) for key in removed | preserved])
+        with patch("adaptive_rsi.runtime.time.time", return_value=now):
+            self.runtime.maintenance()
+        keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+        self.assertFalse(keys & removed)
+        self.assertTrue(preserved <= keys)
+
     def test_workflow_metrics_scales_past_sql_variable_limit(self):
         # 运行数超过连接变量上限时聚合查询不能失败（评审实测回归）。
         store = self.store

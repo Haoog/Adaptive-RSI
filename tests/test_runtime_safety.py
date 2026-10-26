@@ -638,7 +638,7 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.runtime.configure({"github": {"repository": "example/project"},
                                 "delivery": {"mode": "pr"}, "limits": {"retries": 3}}, self.project)
         task = self.store.add_task(self.project, "issue", "issue:91", "Fix addition", "old requirements",
-                                   [{"number": 91, "updated": "2026-10-20T10:00:00Z"}])
+                                   [{"number": 91, "updated": "2026-10-20T10:00:00Z", "url": "https://github.com/example/project/issues/91"}])
         original = self.store.claim(self.project, self.runtime.config(self.project))
         base = git(self.repo, "rev-parse", "HEAD")
         run_dir = self.root / "awaiting-approval"
@@ -673,7 +673,7 @@ class RuntimeSafetyTest(unittest.TestCase):
     def test_closed_issue_revision_stays_durable_until_active_task_can_be_obsoleted(self):
         config = merge(self.runtime.config(self.project), {"github": {"repository": "example/project", "max_issues": 1}})
         task = self.store.add_task(self.project, "issue", "issue:73", "Active issue", "old body",
-                                   [{"number": 73, "updated": "2026-10-20T10:00:00Z"}])
+                                   [{"number": 73, "updated": "2026-10-20T10:00:00Z", "url": "https://github.com/example/project/issues/73"}])
         self.store.execute("UPDATE tasks SET state='executing' WHERE id=?", (task,))
         issue = {"number": 73, "title": "Closed issue", "body": "closed while running", "labels": [], "state": "closed",
                  "updated_at": "2026-10-21T10:00:00Z", "html_url": "https://github.com/example/project/issues/73"}

@@ -220,6 +220,63 @@ class SchedulerIsolationTest(unittest.TestCase):
         event = self.errors("maintenance_run")[0]
         self.assertEqual((event["project"], event["run"]), ("broken", bad["id"]))
 
+    def test_retention_rejects_symlinked_run_and_malicious_paths(self):
+        runs = self.store.root / "runs"
+        runs.mkdir()
+        outside = self.root / "outside"
+        (outside / "candidate").mkdir(parents=True)
+        marker = outside / "candidate" / "keep.txt"
+        marker.write_text("must remain")
+        sibling = self.historical_run("healthy", "awaiting_approval")
+        sibling_marker = Path(sibling["path"]) / "candidate" / "keep.txt"
+        sibling_marker.parent.mkdir(parents=True)
+        sibling_marker.write_text("another run must remain")
+        linked = self.historical_run("broken", "awaiting_approval")
+        Path(linked["path"]).symlink_to(outside, target_is_directory=True)
+        malicious_paths = [
+            runs / ".." / ".." / "outside",
+            Path(sibling["path"]),
+            runs,
+            runs / "nested" / "run",
+            Path("relative-run"),
+        ]
+        bad_runs = [linked]
+        for path in malicious_paths:
+            bad_runs.append(self.historical_run("broken", "awaiting_approval", path))
+        # 单独保留健康运行，确认拒绝坏路径不会阻塞正常清理。
+        good = self.historical_run("broken", "awaiting_approval")
+        (Path(good["path"]) / "candidate").mkdir(parents=True)
+        self.store.execute("UPDATE runs SET ended=? WHERE id=?", (time.time(), sibling["id"]))
+
+        self.runtime.maintenance()
+
+        self.assertEqual(marker.read_text(), "must remain")
+        self.assertEqual(sibling_marker.read_text(), "another run must remain")
+        self.assertTrue(Path(linked["path"]).is_symlink())
+        for run in bad_runs:
+            with self.subTest(path=run["path"]):
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "awaiting_approval")
+        self.assertEqual({event["run"] for event in self.errors("maintenance_run")},
+                         {run["id"] for run in bad_runs})
+        self.assertFalse((Path(good["path"]) / "candidate").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (good["id"],))["state"], "expired")
+
+    def test_retention_rejects_symlinked_runs_parent(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.store.root / "runs").symlink_to(outside, target_is_directory=True)
+        run = self.historical_run("broken", "awaiting_approval")
+        marker = outside / run["id"] / "candidate" / "keep.txt"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("must remain")
+
+        self.runtime.maintenance()
+
+        self.assertEqual(marker.read_text(), "must remain")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
+        self.assertEqual(self.errors("maintenance_run")[0]["run"], run["id"])
+
     def test_invalid_maintenance_project_does_not_block_other_project_cleanup(self):
         run = self.historical_run("healthy", "awaiting_approval")
         (Path(run["path"]) / "candidate").mkdir(parents=True)

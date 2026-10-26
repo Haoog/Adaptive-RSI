@@ -9,6 +9,11 @@
 - New tasks reread saved configuration, working hours and scheduling parameters under the claim lock, preventing stale settings after a completed save. Active runs retain their sealed settings.
 - Pause requests persist for unfinished runs. Quickly resuming a project no longer withdraws the old worker's stop signal; it finishes as interrupted, while new runs can proceed after resumption.
 - Editing or removing model connections retains old credentials referenced by unfinished runs, preventing missing-key errors on later calls. Periodic maintenance safely removes retired credentials after their runs finish and retains failed deletions for retry.
+- Historical run cleanup verifies expected and resolved paths and rejects symlinked ancestors or out-of-bounds paths, preventing deletion in other directories while retaining the existing cleanup scope and run evidence.
+- Derived-setting cleanup batches only records with remaining settings, allowing backlogs beyond 200 historical runs to drain.
+- Issue task identities include repository and number, preventing same-number Issues from overwriting each other or inheriting delivery state after repository changes. Legacy identities migrate only with verifiable source evidence, retaining history.
+- Relaxing Issue label policy restores previously excluded task states without waiting for remote content changes. Existing planning decisions and backoff remain intact, without repeatedly requeuing unchanged obsolete work.
+- Task details synchronize state and actions even before any run exists, preserving unsaved requirements and applicable dependency and urgency drafts. Shrinking last pages trigger a bounded valid-page fetch, avoiding empty pages and inverted ranges while discarding results after navigation changes.
 
 ## 0.5.110
 
