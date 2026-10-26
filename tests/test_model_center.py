@@ -135,7 +135,7 @@ class ActiveRunCredentialTest(unittest.TestCase):
 
     def assert_retired(self, provider):
         self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"),
-                         {provider["secret_ref"]: provider["credential"]})
+                         {provider["secret_ref"]: [provider["credential"]]})
 
     def test_rotation_keeps_sealed_native_run_working_until_last_run_ends(self):
         first = self.run_snapshot()
@@ -217,11 +217,141 @@ class ActiveRunCredentialTest(unittest.TestCase):
         with patch.object(self.center, "cleanup_credentials", side_effect=RuntimeError("Fixture cleanup failure")):
             self.runtime.maintenance()
         self.assertGreater(self.runtime.store.setting("maintenance-last", 0), 0)
-        self.assertEqual(self.runtime.store.one("SELECT data FROM events WHERE kind='scheduler_error'")["data"].find("credential_cleanup") >= 0, True)
+        self.assertIn("credential_cleanup", self.runtime.store.one("SELECT data FROM events WHERE kind='scheduler_error'")["data"])
         self.assert_retired(self.old)
         self.runtime.store.put_setting("maintenance-last", 0)
         self.runtime.maintenance()
         self.assert_missing(self.old)
+
+    def test_maintenance_skips_credentials_during_update_and_retries_afterward(self):
+        self.run_snapshot()
+        self.rotate()
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        pending = self.runtime.store.setting("credential-cleanup-pending")
+        with patch.object(self.runtime.updates, "is_busy", return_value=True), patch.object(
+                self.center.credentials, "delete", wraps=self.center.credentials.delete) as delete:
+            self.runtime.maintenance()
+            delete.assert_not_called()
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), pending)
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.runtime.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_malformed_registry_preserved_and_rejected_before_provider_mutations(self):
+        reference = self.old["secret_ref"]
+        invalid = [None, [], 42, "bad", {reference: "env"}, {reference: []},
+                   {reference: ["file", "invalid"]}, {reference: [None]}, {"bad": "keychain"},
+                   {reference: ["file"] * 4}]
+        for pending in invalid:
+            with self.subTest(pending=pending):
+                self.runtime.store.put_setting("credential-cleanup-pending", pending)
+                self.runtime.store.put_setting("issue-comments:p:fixture", {"checked_at": 0})
+                with patch.object(self.center.credentials, "put") as put, patch.object(
+                        self.center.credentials, "delete") as delete:
+                    with self.assertRaises(CenterError):
+                        self.rotate()
+                    with self.assertRaises(CenterError):
+                        self.center.remove_provider("gateway")
+                    self.runtime.store.put_setting("maintenance-last", 0)
+                    self.runtime.maintenance()
+                    put.assert_not_called()
+                    delete.assert_not_called()
+                self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), pending)
+                self.assertEqual(self.center.provider("gateway"), self.old)
+                self.assertGreater(self.runtime.store.setting("maintenance-last"), 0)
+                self.assertIsNone(self.runtime.store.setting("issue-comments:p:fixture"))
+        # 损坏的原始 JSON 同样不能被当作空队列覆盖。
+        self.runtime.store.execute("UPDATE settings SET value='{' WHERE key='credential-cleanup-pending'")
+        self.runtime.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertEqual(self.runtime.store.one("SELECT value FROM settings WHERE key='credential-cleanup-pending'")["value"], "{")
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+
+    def test_registry_limit_rejects_new_intents_without_dropping_existing_entries(self):
+        pending = {format(index, "032x"): "session" for index in range(4096)}
+        self.runtime.store.put_setting("credential-cleanup-pending", pending)
+        with patch.object(self.center.credentials, "put") as put:
+            with self.assertRaises(CenterError) as error:
+                self.rotate()
+            put.assert_not_called()
+        self.assertEqual(error.exception.code, "credential_registry_full")
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), pending)
+        pending["f" * 32] = "session"
+        self.runtime.store.put_setting("credential-cleanup-pending", pending)
+        with self.assertRaises(CenterError):
+            self.center.cleanup_credentials()
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), pending)
+
+    def test_same_reference_in_two_backends_does_not_overwrite_retirement(self):
+        file_provider = {**self.old, "credential": "file"}
+        self.center.credentials.put(file_provider["secret_ref"], "file", "fixture-file")
+        self.run_snapshot("keychain-run")
+        self.runtime.configure({"providers": [file_provider]}, "p")
+        self.run_snapshot("file-run")
+        self.rotate()
+        # 模拟旧版注册表：项目 file 引用不能把已退役的 keychain 身份抹去。
+        self.runtime.store.put_setting("credential-cleanup-pending", {self.old["secret_ref"]: "keychain"})
+        self.center.remove_provider("gateway", "p")
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"),
+                         {self.old["secret_ref"]: ["file", "keychain"]})
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='keychain-run'", (time.time(),))
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.center.credentials.get(file_provider), "fixture-file")
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"),
+                         {self.old["secret_ref"]: ["file"]})
+        self.runtime.store.execute("UPDATE runs SET ended=?", (time.time(),))
+        self.runtime.maintenance()
+        self.assert_missing(file_provider)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_post_commit_event_failure_never_deletes_new_live_key(self):
+        event = self.runtime.store.event
+        def fail_config_event(kind, *args, **kwargs):
+            if kind == "config":
+                raise OSError("Fixture event failure after commit")
+            return event(kind, *args, **kwargs)
+        with patch.object(self.runtime.store, "event", side_effect=fail_config_event):
+            with self.assertRaises(OSError):
+                self.rotate()
+        current = self.center.provider("gateway")
+        self.assertNotEqual(current["secret_ref"], self.old["secret_ref"])
+        self.assertEqual(self.center.credentials.get(current), "fixture-new")
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.center.credentials.get(current), "fixture-new")
+
+    def test_fresh_intent_precedes_put_and_survives_interruption_with_failed_rollback(self):
+        real_put = self.center.credentials.put
+        def interrupted_put(reference, mode, value):
+            self.assertIn(mode, self.runtime.store.setting("credential-cleanup-pending")[reference])
+            real_put(reference, mode, value)
+            raise SystemExit("Fixture interrupted after put")
+        with patch.object(self.center.credentials, "put", side_effect=interrupted_put), patch.object(
+                self.center.credentials, "delete", side_effect=CredentialError("keychain_locked")):
+            with self.assertRaises(SystemExit):
+                self.rotate()
+        self.assertEqual(len(self.keys), 2)
+        restarted = Runtime(Store(self.runtime.store.root))
+        try:
+            restarted.model_center.cleanup_credentials()
+            self.assertEqual(len(self.keys), 1)
+            self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        finally:
+            restarted.close()
+
+    def test_failed_configure_and_rollback_delete_keep_fresh_intent_for_retry(self):
+        with patch.object(self.runtime, "configure", side_effect=ValueError("Fixture configure failure")), patch.object(
+                self.center.credentials, "delete", side_effect=PermissionError("Fixture rollback failure")):
+            with self.assertRaisesRegex(ValueError, "Fixture configure failure"):
+                self.rotate()
+        self.assertEqual(len(self.keys), 2)
+        self.center.cleanup_credentials()
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
 
     def test_completed_snapshot_does_not_pin_old_credential(self):
         self.run_snapshot(state="planning", ended=time.time())
@@ -256,7 +386,9 @@ class ActiveRunCredentialTest(unittest.TestCase):
 
     def test_failed_configuration_keeps_old_key_and_durable_retirement(self):
         def fail_configure(*args):
-            self.assert_retired(self.old)
+            pending = self.runtime.store.setting("credential-cleanup-pending")
+            self.assertEqual(pending[self.old["secret_ref"]], ["keychain"])
+            self.assertEqual(len(pending), 2)
             raise ValueError("Fixture configuration failure")
         with patch.object(self.runtime, "configure", side_effect=fail_configure):
             with self.assertRaises(ValueError):
