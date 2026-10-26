@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.116
+
+<!-- adaptive-rsi-release:0.5.116;base:e7787fc46becf2b9649bab47bfd51b075e41b350 -->
+
 - Catalog refreshes retain custom display names, manual model status and preferences such as pricing while updating service-provided names and capabilities, with compatibility for existing directory records.
 - Blank custom model names use the full ID, fixing rejection of valid IDs with 161–256 characters. Connection forms no longer generate truncated default names, and Chinese and English hints explain the limits.
 

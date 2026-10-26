@@ -1,3 +1,3 @@
 """Adaptive RSI: local orchestration with host-owned evaluation."""
 
-__version__ = "0.5.115"
+__version__ = "0.5.116"
