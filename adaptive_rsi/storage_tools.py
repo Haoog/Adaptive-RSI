@@ -57,8 +57,7 @@ def restore(source, destination):
             db.execute("UPDATE runs SET path=NULL")
             for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
                 result = json.loads(row["result"])
-                result["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
-                                      "previous": result.get("feedback", {})}
+                result["feedback"] = unavailable_feedback(result.get("feedback", {}))
                 db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), row["id"]))
             # Local verification caches describe artifacts/environments absent from this restore.
             # Keep sealed remote identities, PR receipts and automation reconciliation state.
@@ -83,6 +82,25 @@ def _file_info(paths, follow_symlinks=False):
 
 MISSING_ARTIFACTS = ("Run artifacts are unavailable in this state directory. Restore the original acceptance and "
                      "dependency artifacts into this run's directory, or run fresh verification before release/deploy.")
+
+
+def pending_investigation(report):
+    """Find actionable database evidence, including wrappers written by older restores."""
+    while isinstance(report, dict):
+        if "investigation_pending" in report:
+            if not report["investigation_pending"]:
+                return None  # A completed wrapper supersedes its historical pending flag.
+            return report.get("investigation_report", report)
+        report = report.get("previous")
+    return None
+
+
+def unavailable_feedback(previous):
+    report = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS, "previous": previous}
+    investigation = pending_investigation(previous)
+    if investigation is not None:
+        report.update(investigation_pending=True, investigation_report=investigation)
+    return report
 
 
 def run_artifact_path(store, run, name=""):

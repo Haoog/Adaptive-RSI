@@ -176,7 +176,8 @@ def publish(runtime, project, task, run, workspace, config):
 
 
 def monitoring_due(outcome, config, now):
-    if outcome.get("feedback", {}).get("investigation_pending"):
+    from .storage_tools import pending_investigation
+    if pending_investigation(outcome.get("feedback", {})) is not None:
         return True
     if outcome.get("monitoring_completed"):
         return False
@@ -368,22 +369,24 @@ def tick(runtime, now=None, project_id=None, active_run=None):
 def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if not monitoring_due(outcome, config, now):
         return
-    if outcome.get("feedback", {}).get("investigation_pending"):
+    from .storage_tools import pending_investigation
+    if pending_investigation(outcome.get("feedback", {})) is not None:
         investigate(runtime, project, run, outcome)
+        if not monitoring_due(outcome, config, now):
+            return
     # Expiration ends monitoring even when its local artifacts were not restored.
     # Pending investigations above must finish (or remain retryable) before completion.
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
-    from .storage_tools import MISSING_ARTIFACTS, run_artifact_path
+    from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
     saved = json.loads(run["config"])
 
     def missing_artifacts():
         previous = outcome.get("feedback", {})
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
-            outcome["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
-                                   "previous": previous}
+            outcome["feedback"] = unavailable_feedback(previous)
             runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
             runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
 
@@ -476,7 +479,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
 
 
 def investigate(runtime, project, run, outcome):
-    report = outcome["feedback"]
+    from .storage_tools import pending_investigation
+    feedback_status = outcome["feedback"]
+    report = pending_investigation(feedback_status)
     failures = []
     for label, rows in report["evaluation"].get("checks", {}).items():
         for check in rows:
@@ -491,5 +496,6 @@ def investigate(runtime, project, run, outcome):
                                   evidence=[{"run": run["id"], "head": report["head"], "checks": failures}], priority=100)
     report["investigation_pending"] = False
     report["investigation_task"] = task
+    feedback_status.update(investigation_pending=False, investigation_task=task)
     runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
     runtime.wake.set()

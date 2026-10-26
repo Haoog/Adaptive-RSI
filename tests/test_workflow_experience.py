@@ -465,6 +465,82 @@ class ExperienceTest(unittest.TestCase):
         finally:
             restored.close()
 
+    def test_restored_pending_regression_investigation_retries_without_artifacts_or_duplicates(self):
+        from adaptive_rsi.delivery import monitoring_due, schedule, tick
+        from adaptive_rsi.storage_tools import backup, restore, MISSING_ARTIFACTS
+        from adaptive_rsi.store import encode
+        self.runtime.configure({"github": {"repository": "example/project"}}, self.project)
+        run, directory, outcome = self.artifact_run()
+        report = {"state": "regressed", "head": "regressed-head", "investigation_pending": True,
+                  "evaluation": {"checks": {"candidate": [{"name": "regression", "passed": False,
+                                                           "stderr": "retained database evidence"}]}}}
+        outcome.update(monitoring_completed=True, feedback=report)
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+        saved = backup(self.store)
+        original_files = {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                destination = self.root / ("pending-restore-" + str(legacy))
+                restore(self.store.root / "backups" / (saved["id"] + ".sqlite3"), destination)
+                restored = Runtime(Store(destination))
+                try:
+                    result = json.loads(restored.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                    self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+                    self.assertTrue(result["feedback"]["investigation_pending"])
+                    self.assertEqual(result["feedback"]["investigation_report"], report)
+                    if legacy:
+                        result["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
+                                              "previous": {"state": "insufficient_evidence", "previous": report}}
+                        restored.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(result), run["id"]))
+                    restored.pause(self.project, False)
+                    now = time.time()
+                    self.assertTrue(monitoring_due(result, restored.config(self.project), now))
+                    schedule(restored, now)
+                    job = restored.store.one("SELECT * FROM tasks WHERE source='system_delivery'")
+                    self.assertIsNotNone(job)
+                    self.assertEqual(job["state"], "queued")
+                    original_add = restored.store.add_task
+                    attempts = []
+                    def add(*args, **kwargs):
+                        attempts.append(True)
+                        if len(attempts) == 1:
+                            raise RuntimeError("temporary investigation failure")
+                        task = original_add(*args, **kwargs)
+                        if len(attempts) == 2:
+                            raise RuntimeError("acknowledgement lost after task insert")
+                        return task
+                    with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project"), patch("adaptive_rsi.storage_tools.run_artifact_path", side_effect=AssertionError("investigation must use database evidence")), patch("adaptive_rsi.delivery.baseline") as fetch, patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(restored.evaluator, "evaluate") as evaluate, patch.object(restored.store, "add_task", side_effect=add):
+                        for index in range(3):
+                            tick(restored, now + index * 61, project_id=self.project)
+                            current = json.loads(restored.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                            self.assertEqual(current["feedback"]["state"], "insufficient_evidence")
+                            self.assertEqual(monitoring_due(current, restored.config(self.project), now + (index + 1) * 61), index < 2)
+                        tick(restored, now + 183, project_id=self.project)
+                    self.assertEqual(len(attempts), 3)
+                    tasks = restored.store.query("SELECT * FROM tasks WHERE fingerprint LIKE 'postmerge:%'")
+                    self.assertEqual(len(tasks), 1)
+                    self.assertIn("retained database evidence", tasks[0]["body"])
+                    self.assertEqual(current["feedback"]["investigation_task"], tasks[0]["id"])
+                    restored.store.execute("UPDATE tasks SET state='completed' WHERE id=?", (job["id"],))
+                    schedule(restored, now + 244)
+                    self.assertEqual(restored.store.one("SELECT state FROM tasks WHERE id=?", (job["id"],))["state"], "completed")
+                    from adaptive_rsi.release import advance
+                    imported = restored.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+                    saved_config = json.loads(imported["config"])
+                    saved_config["delivery"]["release"]["enabled"] = True
+                    imported["config"] = encode(saved_config)
+                    with patch("adaptive_rsi.release.api", side_effect=AssertionError("missing artifacts must not authorize dispatch")):
+                        automation = advance(restored, restored.project(self.project), imported, current)
+                    self.assertEqual(automation["release"]["state"], "blocked_verification")
+                    fetch.assert_not_called()
+                    snapshot.assert_not_called()
+                    evaluate.assert_not_called()
+                    self.assertFalse((destination / "runs").exists())
+                    self.assertEqual(original_files, {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()})
+                finally:
+                    restored.close()
+
     def test_patch_and_feedback_reject_foreign_paths_and_symlinked_evidence(self):
         from adaptive_rsi.delivery import feedback
         run, directory, outcome = self.artifact_run()
