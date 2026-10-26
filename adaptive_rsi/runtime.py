@@ -1347,7 +1347,13 @@ class Runtime:
                         if run["state"] == "pr_open" or run["state"] == "merged" and not json.loads(run["result"]).get("monitoring_completed"):
                             continue
                         directory = Path(run["path"])
-                        directory.relative_to(self.store.root / "runs")
+                        runs_root = self.store.root / "runs"
+                        relative = directory.relative_to(runs_root)
+                        # 只清理该运行的直属目录；词法包含检查不能阻止 .. 或祖先符号链接。
+                        if (relative.parts != (run["id"],) or run["id"] in (".", "..") or
+                                any(path.is_symlink() for path in (directory, *directory.parents))):
+                            raise ValueError("Unsafe retention run path")
+                        directory.resolve().relative_to(runs_root.resolve())
                         for name in ["workspace", "candidate", "baseline", "evaluation", "experiments", "dependencies", "acceptance-design"]:
                             target = directory / name
                             if target.is_dir() and not target.is_symlink():
@@ -1374,9 +1380,15 @@ class Runtime:
                            "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed'))", (stale,))
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
+        # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
         for run in self.store.query(
-                "SELECT id FROM runs WHERE ended IS NOT NULL AND ended<? AND state NOT IN "
-                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') LIMIT 200", (stale,)):
+                "SELECT r.id FROM runs r WHERE r.ended IS NOT NULL AND r.ended<? AND r.state NOT IN "
+                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') AND EXISTS "
+                "(SELECT 1 FROM settings s WHERE s.key IN "
+                "('run-baseline:'||r.id, 'automation:'||r.id, 'delivery:'||r.id) "
+                "OR s.key LIKE 'run-baseline:'||r.id||':%' "
+                "OR s.key LIKE 'automation:'||r.id||':%' "
+                "OR s.key LIKE 'delivery:'||r.id||':%') LIMIT 200", (stale,)):
             for prefix in ("run-baseline:", "automation:", "delivery:"):
                 self.store.execute("DELETE FROM settings WHERE key=? OR key LIKE ?",
                                    (prefix + run["id"], prefix + run["id"] + ":%"))

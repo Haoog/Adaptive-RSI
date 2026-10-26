@@ -251,6 +251,32 @@ def _issue_comment_response(entry, status):
             "fetched_at": entry.get("last_success_at")}
 
 
+def _issue_task(store, project, repository, number):
+    """Adopt a legacy key only when its evidence proves the repository identity."""
+    key = "issue:" + repository.lower() + ":" + str(number)
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                              (project, key)).fetchone()
+        if existing:
+            return key, dict(existing)
+        legacy = db.execute("SELECT * FROM tasks WHERE project=? AND source='issue' AND fingerprint=?",
+                            (project, "issue:" + str(number))).fetchone()
+        if legacy:
+            try:
+                evidence = json.loads(legacy["evidence"])
+            except (TypeError, ValueError):
+                evidence = []
+            expected = "https://github.com/" + repository.lower() + "/issues/" + str(number)
+            if (isinstance(evidence, list) and evidence and isinstance(evidence[0], dict) and
+                    evidence[0].get("number") == number and
+                    str(evidence[0].get("url", "")).lower().rstrip("/") == expected):
+                # Only the lookup key changes; runs, decisions and user actions keep their task ID.
+                db.execute("UPDATE tasks SET fingerprint=? WHERE id=?", (key, legacy["id"]))
+                return key, {**dict(legacy), "fingerprint": key}
+    return key, None
+
+
 def sync(runtime, project, config, checked, cancel=None):
     repo = config["github"]["repository"]
     if not repo:
@@ -273,18 +299,25 @@ def sync(runtime, project, config, checked, cancel=None):
             return
         number = int(issue["number"])
         held = pending.pop(str(number), None)
-        existing = store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project["id"], "issue:" + str(number)))
+        task_key, existing = _issue_task(store, project["id"], repo, number)
         try:
             previous = json.loads(existing["evidence"]) if existing else []
         except (TypeError, ValueError):
             previous = []
+        if not isinstance(previous, list) or not previous or not isinstance(previous[0], dict):
+            previous = []
         revised = not previous or previous[0].get("updated") != issue["updated_at"]
+        exclusion = previous[0].get("sync_exclusion") if previous else None
         labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
             not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
         if issue["state"].lower() != "open" or not allowed:
             if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]:
-                store.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (time.time(), existing["id"]))
+                excluded_at = time.time()
+                excluded_evidence = [dict(previous[0]), *previous[1:]] if previous else [{}]
+                excluded_evidence[0]["sync_exclusion"] = {"state": existing["state"], "at": excluded_at}
+                store.execute("UPDATE tasks SET state='obsolete',evidence=?,updated=? WHERE id=? AND state=?",
+                              (encode(excluded_evidence), excluded_at, existing["id"], existing["state"]))
             elif existing and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
                 # 记录关闭快照，让下一次重新打开可以被识别为「重开」。
                 closed_evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
@@ -313,7 +346,15 @@ def sync(runtime, project, config, checked, cancel=None):
                               (encode(evidence), time.time(), existing["id"]))
             return
         if existing:
-            if existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
+            if (existing["state"] == "obsolete" and not revised and isinstance(exclusion, dict) and
+                    exclusion.get("at") == existing["updated"] and exclusion.get("state") in
+                    ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]):
+                # Restore the prior decision, including deferral, rather than paying to plan it again.
+                restored_evidence = [dict(previous[0]), *previous[1:]]
+                restored_evidence[0].pop("sync_exclusion", None)
+                store.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
+                              (exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
+            elif existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
                 store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
             elif revised:
@@ -324,7 +365,7 @@ def sync(runtime, project, config, checked, cancel=None):
                     store.event("issue_revision", "Issue changed during execution; recheck before delivery", project["id"],
                                 data={"task": existing["id"], "updated": issue["updated_at"]})
         else:
-            store.add_task(project["id"], "issue", "issue:" + str(number), issue["title"], issue["body"] or "", evidence, priority=60)
+            store.add_task(project["id"], "issue", task_key, issue["title"], issue["body"] or "", evidence, priority=60)
         consumed += 1
 
     for issue in list(pending.values()):

@@ -227,7 +227,7 @@ class ReliabilityTest(unittest.TestCase):
     def test_issue_revision_held_by_active_run_survives_sync_watermark(self):
         config = merge(self.runtime.config(self.project), {"github": {"repository": "owner/repo"}})
         task = self.store.add_task(self.project, "issue", "issue:1", "Old issue", "old",
-                                  [{"number": 1, "updated": "2020-01-01T00:00:00Z"}])
+                                  [{"number": 1, "updated": "2020-01-01T00:00:00Z", "url": "https://github.com/owner/repo/issues/1"}])
         self.store.execute("UPDATE tasks SET state='executing' WHERE id=?", (task,))
         self.store.put_setting("issue-sync:" + self.project,
                                {"repository": "owner/repo", "policy": fingerprint({"labels": [], "exclude": config["github"]["exclude_labels"]}),

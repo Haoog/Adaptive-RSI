@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Historical run cleanup verifies expected and resolved paths and rejects symlinked ancestors or out-of-bounds paths, preventing deletion in other directories while retaining the existing cleanup scope and run evidence.
+- Derived-setting cleanup batches only records with remaining settings, allowing backlogs beyond 200 historical runs to drain.
+- Issue task identities include repository and number, preventing same-number Issues from overwriting each other or inheriting delivery state after repository changes. Legacy identities migrate only with verifiable source evidence, retaining history.
+- Relaxing Issue label policy restores previously excluded task states without waiting for remote content changes. Existing planning decisions and backoff remain intact, without repeatedly requeuing unchanged obsolete work.
+
 ## 0.5.109
 
 <!-- adaptive-rsi-release:0.5.109;base:87cbab342c238c6b8e58808ae6dd2b57ec7b74a3 -->
