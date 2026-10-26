@@ -130,6 +130,31 @@ class ModelCenterTest(unittest.TestCase):
             finally:
                 restarted.close()
 
+    def test_custom_readd_revives_missing_model_and_survives_catalog_refresh(self):
+        with DirectoryServer() as fixture:
+            self.save(fixture, "none", value="")
+            self.center.fetch("gateway")
+            self.center.edit_model("gateway", {"id": "coder-a", "favorite": True, "unit_price": 2})
+            fixture.models = [{"id": "coder-b"}]
+            self.center.fetch("gateway")
+            missing = next(m for m in self.center.directory(self.center.provider("gateway"))["models"] if m["id"] == "coder-a")
+            self.assertTrue(missing["missing"])
+            self.assertFalse(missing["manual"])
+
+            result = self.center.edit_model("gateway", {"id": "coder-a", "name": "Custom coder", "manual": True})
+            self.assertEqual(result, {"saved": True})
+            for directory in [self.center.directory(self.center.provider("gateway")), self.center.fetch("gateway")]:
+                model = next(m for m in directory["models"] if m["id"] == "coder-a")
+                self.assertTrue(model["manual"])
+                self.assertFalse(model["missing"])
+                self.assertTrue(model["enabled"])
+                self.assertEqual(model["name"], "Custom coder")
+                self.assertTrue(model["favorite"])
+                self.assertEqual(model["unit_price"], 2)
+            snapshot = self.center.snapshot()
+            models = next(p for p in snapshot["providers"] if p["id"] == "gateway")["catalog"]["models"]
+            self.assertIn("coder-a", [m["id"] for m in models if m["enabled"] and not m.get("missing") and not m.get("kind")])
+
     def test_failed_refresh_keeps_previous_directory(self):
         with DirectoryServer() as fixture:
             self.save(fixture, "none", value="")

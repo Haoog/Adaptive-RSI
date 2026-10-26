@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Edits made while creating a model connection are subsequently saved to the same connection. Reopened editors do not inherit IDs from old responses, and saves retain their originating project scope.
+- Manually re-adding a model missing from the catalog makes it selectable again, preserves existing preferences, and keeps it available after later catalog refreshes.
+- Auto-merge rechecks the current repository, branch and sealed target after fetching the baseline, preventing merges to an old target after authorization changes.
+- Workflow authorization acknowledgments update the saved baseline while preserving newer disable choices and authorization field edits made while waiting.
+- Saving login credentials immediately invalidates account-status caches. Cancelled or replaced sessions ignore late poll results and errors while keeping the new session visible and polled.
+
 ## 0.5.109
 
 <!-- adaptive-rsi-release:0.5.109;base:87cbab342c238c6b8e58808ae6dd2b57ec7b74a3 -->

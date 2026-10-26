@@ -44,9 +44,10 @@ window.RSIAuth = (() => {
   async function poll(){
     if(polling||pollingStopped)return;polling=true;
     try{for(const [id,session] of sessions){if(terminal.has(session.state))continue;
-      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));sessions.set(id,{...next,refresh:session.refresh,pollMessage:''});
+      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(sessions.get(id)!==session)continue;sessions.set(id,{...next,refresh:session.refresh,pollMessage:''});
         if(next.state==='completed'){snapshot=null;readinessCache.clear();await status(true);await session.refresh();}
       }catch(error){
+        if(sessions.get(id)!==session)continue;
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
         const terminalState={auth_expired:'expired',auth_timeout:'expired',process_interrupted:'interrupted',unknown_session:'interrupted',invalid_auth_state:'interrupted',authorization_failed:'failed'}[error.code];
         if(terminalState){sessions.set(id,{...session,state:terminalState,error:error.code,pollMessage:''});continue;}

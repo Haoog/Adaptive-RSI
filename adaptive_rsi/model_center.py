@@ -233,6 +233,8 @@ class ModelCenter:
             if model.get("kind") in NON_AGENT and data.get("enabled"):
                 raise CenterError("unsupported_model_kind")
             model.update({k: v for k, v in data.items() if k in ["name", "enabled", "favorite", "unit_price"]})
+            if data.get("manual"):
+                model.update(manual=True, missing=False)
             self.store.put_setting(self.key(provider, project), directory)
         return {"saved": True}
 

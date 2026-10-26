@@ -28,7 +28,7 @@ window.RSIModelCenter = (() => {
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set();
-  let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, picking=null, busy=false, loading=false;
+  let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, editorSession=null, picking=null, busy=false, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null;
   const pageSize=20;
   const scopeKey = () => scope || 'global';
@@ -271,7 +271,7 @@ window.RSIModelCenter = (() => {
   }
   function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session','file'].includes(mode);$('mc-input-key').disabled=!['keychain','session','file'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
   function openEditor(provider=null){
-    editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
+    editorSession={project:scope};editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
     $('mc-connection-advanced').open=false;$('mc-go-hint').hidden=true;
     $('mc-provider-preset-field').hidden=!!provider;
     $('mc-input-auth').querySelector('[value="keychain"]').disabled=!data.keychain;
@@ -324,17 +324,17 @@ window.RSIModelCenter = (() => {
     $('mc-picker-provider').addEventListener('change',()=>{pickerPage=0;renderPicker();});
     $('mc-picker-prev').addEventListener('click',()=>{pickerPage--;renderPicker();});$('mc-picker-next').addEventListener('click',()=>{pickerPage++;renderPicker();});
     $('mc-fetch').addEventListener('click',()=>safe(()=>fetchProvider()));
-    $('mc-provider-dialog').addEventListener('close',()=>{$('mc-input-key').value='';});
+    $('mc-provider-dialog').addEventListener('close',()=>{editorSession=null;$('mc-input-key').value='';});
     $('mc-provider-form').addEventListener('invalid',event=>{const detail=event.target.closest('details');if(detail)detail.open=true;},true);
     $('mc-provider-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
-      const button=$('mc-provider-submit'),project=scope,unchanged=unchangedForm(event.target);if(button.disabled)return;button.disabled=true;$('mc-provider-error').textContent='';
+      const button=$('mc-provider-submit'),session=editorSession;if(button.disabled||!session)return;const project=session.project,unchanged=unchangedForm(event.target);button.disabled=true;$('mc-provider-error').textContent='';
       try{const provider={name:$('mc-input-name').value.trim(),base_url:$('mc-input-url').value.trim(),protocol:$('mc-input-protocol').value,env_key:$('mc-input-env').value.trim()};if(editing)provider.id=editing.id;
         const models=[...new Set($('mc-input-models').value.split(/\r?\n/).map(id=>id.trim()).filter(Boolean))];
         if(models.some(id=>id.length>256)||models.length>50)throw Error(t('最多添加 50 个模型，每个模型 ID 不超过 256 个字符。'));
         if(models.some(id=>!(/^[a-zA-Z0-9._/:-]+$/).test(id)))throw Error(t('模型 ID 只能包含字母、数字、点、下划线、斜线、冒号和连字符。'));
         const authentication={mode:$('mc-input-auth').value,value:$('mc-input-key').value};$('mc-input-key').value='';
         const result=await api('model-center/provider',{project,provider,authentication});
-        if(unchanged()&&scope===project)editing={...provider,id:result.id};
+        if(editorSession===session)editing={...provider,id:result.id};
         for(const id of models)await api('model-center/model',{project,provider:result.id,model:{id,name:id.slice(0,160),manual:true}});
         if(scope===project){await refresh();await load();if(unchanged()&&scope===project){active=result.id;tab='providers';render();$('mc-provider-dialog').close();}setStatus(t('连接配置已保存。'));}
         await fetchProvider(result.id,project);
