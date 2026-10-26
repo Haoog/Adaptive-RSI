@@ -81,7 +81,7 @@ The launcher reuses an existing service. Task details offer paginated dependency
 - **Isolation and verification:** implementation and review use separate contexts. The host runs new behavior tests in isolation on the baseline and candidate, then runs frozen regression and full-candidate checks. Unsupported runners, high-risk, and performance tasks use independent acceptance; model claims do not establish success.
 - **Code review:** check correctness, security, maintainability, architecture, tests, and scope. Blocking findings or insufficient evidence stop delivery.
 - **Controlled delivery:** keep candidates local by default. Each project can opt into automatic PRs, merging after checks, and release or deployment through pinned workflows.
-- **Multiple projects and providers:** clone and manage repositories separately with support for official providers, gateways, local models, Codex, and OpenCode.
+- **Multiple projects and providers:** clone and manage repositories separately. The project selector shows both name and path so same-name repositories remain distinguishable, with support for official providers, gateways, local models, Codex, and OpenCode.
 
 ## Model Support
 

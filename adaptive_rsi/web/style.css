@@ -206,6 +206,13 @@ main {
 .page-heading {
   margin:24px 0 20px;
 }
+.page-heading>div {
+  min-width:0;
+}
+#workspace-path {
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
 #view-settings>.page-heading {
   display:none;
 }

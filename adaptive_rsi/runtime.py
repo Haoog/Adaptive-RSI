@@ -111,9 +111,15 @@ class Runtime:
                 self._baseline_locks[project] = lock
             return lock
 
-    def add_project(self, path, name=None, enabled=False):
+    def add_project(self, path, name=None, enabled=False, details=False):
         with self.dispatch_lock:
-            return self._add_project(path, name, enabled)
+            project = self._add_project(path, name, enabled)
+            return project if details else project["id"]
+
+    @staticmethod
+    def project_name(name, path):
+        # 空名称或纯空格回退到目录名，避免选择器和标题出现空白项。
+        return name.strip() if isinstance(name, str) and name.strip() else Path(path).name
 
     def _add_project(self, path, name=None, enabled=False):
         root = repository(path)
@@ -121,7 +127,10 @@ class Runtime:
             raise ValueError("Project and controller state must be in separate directory trees")
         existing = self.store.one("SELECT * FROM projects WHERE path=?", (str(root),))
         if existing:
-            return existing["id"]
+            # 已接入路径不重复注册，也不静默改变已有名称或启用状态。
+            return {"id": existing["id"], "existing": True,
+                    "name": self.project_name(existing["name"], existing["path"]),
+                    "path": existing["path"], "paused": bool(existing["paused"])}
         if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
             raise ValueError("Wait until active runs finish before registering projects so every worker uses the same isolation boundaries")
         for item in self.store.query("SELECT path FROM projects"):
@@ -129,12 +138,14 @@ class Runtime:
             if root in other.parents or other in root.parents:
                 raise ValueError("Projects must not contain each other's directories")
         project = uid()
+        project_name = self.project_name(name, root)
         overrides = {"github": {"repository": origin_repository(root)}}
         self.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
-                           (project, name or root.name, str(root), encode(overrides), not enabled, time.time()))
+                           (project, project_name, str(root), encode(overrides), not enabled, time.time()))
         self.store.event("project", "Project registered" + (" and enabled" if enabled else " (paused)"), project)
         self.wake.set()
-        return project
+        return {"id": project, "existing": False, "name": project_name,
+                "path": str(root), "paused": not enabled}
 
     def import_project(self, url, directory=None):
         from .gitops import github_url

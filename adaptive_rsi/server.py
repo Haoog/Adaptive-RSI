@@ -115,6 +115,11 @@ class RequestError(ValueError):
     """本模块固定的用户提示；其余异常一律通过安全错误边界处理。"""
 
 
+def project_display_name(name, path):
+    """旧记录中的空名称也回退到目录名，避免界面出现空白项目。"""
+    return name.strip() if isinstance(name, str) and name.strip() else Path(path).name
+
+
 def configuration_error(exc, raw_config):
     """保留可修复的配置诊断，绝不返回底层异常文本。"""
     if isinstance(exc, json.JSONDecodeError):
@@ -417,7 +422,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond({"install_url": self.server.origin + "/install", "remote": self.server.origin.startswith("https://")})
             elif parsed.path == "/api/attention":
                 data = records(store, group="attention", include_system=False, limit=200)
-                data["projects"] = store.query("SELECT id,name FROM projects ORDER BY created")
+                data["projects"] = store.query("SELECT id,name,path FROM projects ORDER BY created")
+                for project in data["projects"]:
+                    project["name"] = project_display_name(project["name"], project["path"])
                 from .store import encode, uid
                 store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
                 data["instance"] = store.setting("instance-id")
@@ -460,6 +467,7 @@ class Handler(BaseHTTPRequestHandler):
                 projects = store.query("SELECT * FROM projects ORDER BY created")
                 raw_project_configs = {}
                 for project in projects:
+                    project["name"] = project_display_name(project["name"], project["path"])
                     raw_config = project["config"]
                     raw_project_configs[project["id"]] = raw_config
                     overrides = None
@@ -681,7 +689,8 @@ class Handler(BaseHTTPRequestHandler):
                 path = urlparse(self.path).path
                 runtime.updates.require_ready()
                 if path == "/api/projects":
-                    result = {"id": runtime.add_project(body["path"], body.get("name"), body.get("enabled", False))}
+                    # id 保持兼容旧客户端；新客户端读取 existing/name/paused 准确提示重复路径。
+                    result = runtime.add_project(body["path"], body.get("name"), body.get("enabled", False), details=True)
                 elif path == "/api/updates/check":
                     started = runtime.updates.check_async()
                     result = {"started": started, "update": runtime.updates.snapshot()}

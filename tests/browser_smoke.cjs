@@ -147,8 +147,9 @@ async function main() {
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();
     assert.equal(await page.locator('#project-status').innerText(), '已暂停');
     const draftProject = await page.locator('#project-select').inputValue();
+    const otherProject = await page.locator('#project-select option').evaluateAll(options => options.find(option => option.textContent.includes('另一个独立项目')).value);
     await page.locator('#goal-text').fill('只属于浏览器验证项目的草稿');
-    await page.locator('#project-select').selectOption({label: '另一个独立项目'});
+    await page.locator('#project-select').selectOption(otherProject);
     await page.waitForFunction(() => document.getElementById('goal-project-target').textContent === '另一个独立项目');
     assert.equal(await page.locator('#goal-text').inputValue(), '');
     await page.locator('#goal-text').fill('只属于另一个项目的草稿');
@@ -156,7 +157,7 @@ async function main() {
     await page.waitForFunction(() => document.getElementById('goal-project-target').textContent === '浏览器验证项目');
     assert.equal(await page.locator('#goal-text').inputValue(), '只属于浏览器验证项目的草稿');
     await page.locator('#goal-text').fill('');
-    await page.locator('#project-select').selectOption({label: '另一个独立项目'});
+    await page.locator('#project-select').selectOption(otherProject);
     assert.equal(await page.locator('#goal-text').inputValue(), '只属于另一个项目的草稿');
     await page.locator('#goal-text').fill('');
     await page.locator('#project-select').selectOption(draftProject);
@@ -278,7 +279,7 @@ async function main() {
     await page.locator('#tasks-next').click();
     await page.locator('#tasks-page').filter({hasText: '51'}).waitFor();
     assert.equal(await page.locator('#tasks-list .task-row').count(), 6);
-    await page.locator('#project-select').selectOption({label: '另一个独立项目'});
+    await page.locator('#project-select').selectOption(otherProject);
     await page.locator('#tasks-list').filter({hasText: '另一个项目专属任务'}).waitFor();
     assert.equal(await page.locator('#tasks-list .task-row').filter({hasText:'等待修复线上检查'}).count(),0);
     assert.equal(await page.locator('#tasks-list .task-row').count(), 1);

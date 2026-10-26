@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- The project selector shows both name and full path, blank names fall back to the directory name, and same-name local repositories remain distinguishable. A newly added project is persisted immediately and stays selected after reload.
+- Re-adding an existing path now reports the existing project name and paused state instead of silently ignoring the name or enabled option or claiming success.
+
 ## 0.5.116
 
 <!-- adaptive-rsi-release:0.5.116;base:e7787fc46becf2b9649bab47bfd51b075e41b350 -->

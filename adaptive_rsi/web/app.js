@@ -163,6 +163,9 @@ async function pendingGoalSubmission(project,text){
  saveGoalSubmissions(project,entries);await renderGoalRecovery();return submission;
 }
 function currentProject(){return state.projects.find(p=>p.id===projectId);}
+function projectPath(project){return typeof project?.path==='string'?project.path:'';}
+function projectName(project){const name=typeof project?.name==='string'?project.name.trim():'';return name||projectPath(project).split(/[\\/]/).filter(Boolean).pop()||t('未命名项目');}
+function projectLabel(project){const path=projectPath(project);return projectName(project)+(path?' — '+path:'');}
 function stashGoalDraft(){if(!projectId)return;const value=$('goal-text').value;if(value){goalDrafts.set(projectId,value);draftStore.set('goal',projectId,value);}else{goalDrafts.delete(projectId);draftStore.remove('goal',projectId);}}
 function restoreGoalDraft(){if(!projectId){$('goal-text').value='';return;}const value=goalDrafts.has(projectId)?goalDrafts.get(projectId):draftStore.get('goal',projectId)||'';if(value)goalDrafts.set(projectId,value);$('goal-text').value=value;}
 function scoped(rows){return rows.filter(row=>row.project===projectId);}
@@ -242,7 +245,7 @@ async function refresh(){
    if(returned.has('candidates')){loadedStateSections.candidatesProject=next.selected_project??null;loadedStateSections.candidatesAt=Date.now();}
    $('connection').textContent=t('已连接');$('version').textContent='Adaptive RSI '+state.version;
    const select=$('project-select'),old=projectId;if(!state.projects.some(p=>p.id===projectId)){stashGoalDraft();projectId=state.projects[0]?.id||'';restoreGoalDraft();goalDraftRestoredProject=projectId;}
-   if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,p.name]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',p.name);o.value=p.id;return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
+   if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
    select.value=projectId;if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localStorage.setItem('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
    render();window.RSIExperience?.refreshed();
@@ -254,13 +257,13 @@ async function refresh(){
 function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
- document.title=(project?project.name+' · ':'')+t('Adaptive RSI · 控制台');
+ const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
  $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录',usage:'记录与用量'}[parent]);
  $('project-settings').hidden=parent==='settings'||!projectId;$('back-workspace').hidden=parent==='overview';
  $('global-settings').classList.toggle('active',parent==='settings'&&configScope==='global');
- $('settings-context-title').textContent=configScope==='global'?t('通用默认设置'):(currentProject()?.name||t('当前项目'))+' · '+t('项目设置');
+ $('settings-context-title').textContent=configScope==='global'?t('通用默认设置'):(project?projectName(project):t('当前项目'))+' · '+t('项目设置');
  $('settings-context-note').textContent=t(configScope==='global'?'未单独设置的项目会沿用这里的配置。':'仅修改当前项目，其他项目不受影响。');
  document.querySelectorAll('[data-settings-scope]').forEach(node=>{node.classList.toggle('active',node.dataset.settingsScope===configScope);node.setAttribute('aria-pressed',String(node.dataset.settingsScope===configScope));node.disabled=node.dataset.settingsScope==='project'&&!projectId;});
 }
@@ -288,8 +291,11 @@ function render(){
   configurationRepairBusy=true;repair.disabled=true;let result;try{result=await api('config/repair',{project,confirmation:'reset-invalid-overrides-to-global-defaults'});}finally{configurationRepairBusy=false;repair.disabled=false;}
   if(result.repaired){await refresh();toast(t('项目设置已修复为通用默认，项目仍保持暂停。'));}
  }));$('project-config-error').append(repair);}
- $('workspace-title').textContent=project?.name||t('从一个项目开始');
- $('goal-project-target').textContent=project?.name||t('尚未接入项目');
+ $('workspace-title').textContent=project?projectName(project):t('从一个项目开始');
+ $('workspace-path').textContent=project?projectPath(project):'';
+ $('workspace-path').hidden=!project;
+ $('workspace-path').title=project?projectPath(project):'';
+ $('goal-project-target').textContent=project?projectName(project):t('尚未接入项目');
  $('workspace-description').hidden=!!project;
  $('workspace-description').textContent=t(project?'自主发现，也随时接受你的目标。':'连接项目与模型，让它持续发现值得做的改进。');
  $('project-status').textContent=t(configError?'设置异常':!project||project.paused?'已暂停':'运行中');$('project-status').className='badge '+(configError?'bad':project&&!project.paused?'good':'neutral');
@@ -633,7 +639,7 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
  const unchanged=unchangedForm(event.target,{projectSensitive:false});
  $('project-submit').disabled=true;
  try{
-  let addedProject;
+  let addedProject,existingProject=null;
   if($('project-source').value==='github'){
    const urls=$('project-urls').value.split(/\s+/).filter(Boolean),directory=$('project-directory').value||null;if(!urls.length||urls.length>10)throw Error(t('一次请输入 1 至 10 个仓库链接'));
    const failed=[],failedUrls=[];
@@ -642,9 +648,14 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
     try{const added=await api('projects/import',{url:urls[i],directory});addedProject=added.id;}catch(error){failed.push(urls[i]+': '+error.message);failedUrls.push(urls[i]);}
    }
    if(failed.length){if(unchanged()){$('project-urls').value=failedUrls.join('\n');$('import-status').textContent=t('未成功的链接已保留，已接入的项目不会重复导入。')+'\n'+failed.join('\n');}await refresh();return;}
-  }else{const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;}
-  if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
-  await refresh();toast(t('项目已接入'));
+  }else{
+   const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
+   if(added.existing)existingProject=added;
+  }
+  if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;localStorage.setItem('rsi-project',projectId);settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
+  await refresh();
+  if(existingProject)toast(t('该路径已接入')+'：'+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'));
+  else toast(t('项目已接入'));
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
