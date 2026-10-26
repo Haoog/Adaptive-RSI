@@ -1739,12 +1739,36 @@ test('reset edits survive failed save, reload, and a changed default on retry',a
   assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.savedDrafts.has('a'),false);
 });
 
-test('legacy equal-valued reset drafts follow changed defaults',async()=>{
-  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');
-  delete original.savedDrafts.get('a').resetModels;
-  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
-  await page.click('mc-save-routes');assert.equal(page.overrides.get('a').planning,undefined);
-  assert.equal(page.draft().planning.effort,'low');
+for(const projectEffort of ['medium','high'])for(const draftEffort of ['medium','xhigh'])test(`parent reset draft with project ${projectEffort} and draft ${draftEffort} requires an explicit reset`,async()=>{
+  // 642 stores the project baseline and reset routes, but no resetModels.
+  const route=effort=>({planning:{provider:'ollama',model:'scope-coder',effort,fallback:null}});
+  const savedDrafts=new Map([['a',{baseline:route(projectEffort),routes:route(draftEffort),resetInheritance:true}]]);
+  const page=modelScopePage(savedDrafts);page.overrides.set('a',route(projectEffort));page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,draftEffort);
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.node('mc-undo').disabled,false);
+  assert.match(page.node('mc-dirty').textContent,/未保存/);
+  assert.match(page.node('mc-feedback').textContent,/缺少继承基线.*重新点击/);
+  await page.click('mc-save-routes');assert.equal(page.posts.length,0);
+  await page.show('b');await page.show('a');assert.equal(page.draft().planning.effort,draftEffort);
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.match(page.node('mc-feedback').textContent,/缺少继承基线/);
+  page.edit('xhigh');await page.click('mc-save-routes');assert.equal(page.posts.length,0);
+  const reopened=modelScopePage(savedDrafts);reopened.globals.planning.effort='low';await reopened.show('a');
+  assert.equal(reopened.draft().planning.effort,'xhigh');assert.equal(reopened.node('mc-save-routes').disabled,true);
+  assert.equal(savedDrafts.get('a').resetInheritance,true);assert.equal(savedDrafts.get('a').resetModels,undefined);
+  reopened.click('mc-reset-inheritance');assert.equal(reopened.node('mc-save-routes').disabled,false);
+  assert.equal(reopened.draft().planning.effort,'low');await reopened.click('mc-save-routes');
+  assert.deepEqual(reopened.posts[0].body.inherit,['planning']);assert.equal(reopened.overrides.get('a').planning,undefined);
+  assert.equal(reopened.node('mc-save-routes').disabled,true);assert.equal(savedDrafts.has('a'),false);
+});
+
+test('undo discards an ambiguous parent reset draft and allows ordinary editing',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  delete page.savedDrafts.get('a').resetModels;
+  const restored=modelScopePage(page.savedDrafts);await restored.show('a');
+  assert.equal(restored.node('mc-save-routes').disabled,true);restored.click('mc-undo');
+  assert.equal(restored.savedDrafts.has('a'),false);assert.equal(restored.node('mc-undo').disabled,true);
+  restored.edit('high');assert.equal(restored.node('mc-save-routes').disabled,false);
+  await restored.click('mc-save-routes');assert.equal(restored.overrides.get('a').planning.effort,'high');
 });
 
 test('undo clears equal-valued inheritance reset intent',async()=>{

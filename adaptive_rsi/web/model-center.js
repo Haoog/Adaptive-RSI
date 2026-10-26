@@ -43,7 +43,7 @@ window.RSIModelCenter = (() => {
     else window.RSIDraftStore?.set('routes',key,draft);
   }
   function inheritedRoles(models,reset){
-    return reset?Object.keys(models).filter(role=>JSON.stringify(safeRoute(models[role]))===JSON.stringify(reset.models[role])):[];
+    return reset?.models?Object.keys(models).filter(role=>JSON.stringify(safeRoute(models[role]))===JSON.stringify(reset.models[role])):[];
   }
   function rebaseReset(models,reset){
     for(const role of inheritedRoles(models,reset)){
@@ -54,6 +54,8 @@ window.RSIModelCenter = (() => {
   const selected = () => data?.providers.find(p=>p.id===active);
   const routes = () => drafts.get(scopeKey());
   const modified = () => data?.project===scope && routes() && (inheritanceResets.has(scopeKey())||JSON.stringify(routes())!==JSON.stringify(data.models));
+  const resetConflict = key => inheritanceResets.has(key)&&!inheritanceResets.get(key).models;
+  const resetConflictCopy = '重置草稿缺少继承基线，已保留修改。请重新点击「跟随通用设置」后再保存，或撤销修改。';
   const jobKey = (provider,project=scope) => (project||'global')+':'+provider;
   function errorCopy(code,fallback='模型服务暂时不可用，请稍后重试。'){
     const match=String(code||'').match(/^opencode_incompatible_(\d+\.\d+\.\d+)$/);
@@ -87,7 +89,7 @@ window.RSIModelCenter = (() => {
       const saved=window.RSIDraftStore?.get('routes',key),restored=structuredClone(data.models);
       if(saved?.baseline&&saved?.routes){
         if(scope&&saved.resetInheritance){
-          const reset={models:saved.resetModels||saved.baseline};inheritanceResets.set(key,reset);
+          const reset={models:saved.resetModels};inheritanceResets.set(key,reset);
           for(const role of Object.keys(data.models))if(saved.routes[role])restored[role]={...data.models[role],...saved.routes[role]};
           rebaseReset(restored,reset);
         }else for(const role of Object.keys(data.models)){const old=saved.baseline[role],incoming=safeRoute(data.models[role]),candidate=saved.routes[role];if(candidate&&JSON.stringify(old)===JSON.stringify(incoming))restored[role]={...data.models[role],...candidate};else if(candidate&&JSON.stringify(candidate)!==JSON.stringify(incoming))conflicts=true;}
@@ -234,7 +236,7 @@ window.RSIModelCenter = (() => {
     updateDirty();
     persistRouteDraft();
   }
-  function updateDirty(){const saving=savingRoutes.has(scopeKey());$('mc-dirty').textContent=t(saving?'正在保存模型分工…':modified()?'模型分工有未保存的修改':'模型分工已保存');$('mc-save-routes').disabled=saving||!modified();$('mc-undo').disabled=!modified();}
+  function updateDirty(){const saving=savingRoutes.has(scopeKey());$('mc-dirty').textContent=t(saving?'正在保存模型分工…':modified()?'模型分工有未保存的修改':'模型分工已保存');$('mc-save-routes').disabled=saving||resetConflict(scopeKey())||!modified();$('mc-undo').disabled=!modified();if(resetConflict(scopeKey()))setStatus(t(resetConflictCopy),true);}
   function openPicker(role){
     picking=role;pickerPage=0;renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[role])+' · '+t('选择模型');$('mc-picker-search').value='';renderPicker();$('mc-picker-dialog').showModal();$('mc-picker-search').focus();
   }
@@ -337,7 +339,7 @@ window.RSIModelCenter = (() => {
     $('mc-search').addEventListener('input',()=>{modelPage=0;renderModels();});
     $('mc-model-filter').addEventListener('change',()=>{modelPage=0;renderModels();});
     $('mc-prev').addEventListener('click',()=>{modelPage--;renderModels();});$('mc-next').addEventListener('click',()=>{modelPage++;renderModels();});
-    $('mc-undo').addEventListener('click',()=>{inheritanceResets.delete(scopeKey());drafts.set(scopeKey(),structuredClone(data.models));renderRoles();});
+    $('mc-undo').addEventListener('click',()=>{if(resetConflict(scopeKey()))setStatus('');inheritanceResets.delete(scopeKey());drafts.set(scopeKey(),structuredClone(data.models));renderRoles();});
     $('mc-resume').addEventListener('click',()=>safe(async()=>{await request('resume',{provider:active});await load();setStatus(t('已恢复请求，下次调用将重新检查。'));}));
     $('mc-fallback-provider').addEventListener('change',()=>renderFallbackModels());$('mc-fallback-model').addEventListener('change',()=>renderFallbackEffort());
     $('mc-price-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
@@ -375,6 +377,7 @@ window.RSIModelCenter = (() => {
     },event.target);});
     $('mc-save-routes').addEventListener('click',()=>safe(async()=>{
       const project=scope,key=scopeKey();if(savingRoutes.has(key))return;
+      if(resetConflict(key)){setStatus(t(resetConflictCopy),true);return;}
       const models=structuredClone(routes()),submittedReset=inheritanceResets.get(key);savingRoutes.add(key);updateDirty();setStatus(t('正在保存模型分工…'));
       try{
         const inherit=inheritedRoles(models,submittedReset);

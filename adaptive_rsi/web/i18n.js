@@ -1231,6 +1231,7 @@ const english = {
   "正在加载改进方案…": "Loading improvement proposals…",
   "服务器设置已变化，冲突字段未从旧草稿恢复。": "Server settings changed; conflicting fields were not restored from the draft.",
   "服务器模型设置已变化，冲突分工未从旧草稿恢复。": "Server model settings changed; conflicting roles were not restored from the draft.",
+  "重置草稿缺少继承基线，已保留修改。请重新点击「跟随通用设置」后再保存，或撤销修改。": "The reset draft is missing its inheritance baseline. Your edits have been kept. Click “Inherit global configuration” again before saving, or undo the changes.",
   "查看原始诊断": "View original diagnostics",
   "尚未配置项目检查命令，请先在设置中添加。": "Project checks are not configured. Add checks in Settings before running.",
   "没有可用的独立运行环境，请检查运行环境设置。": "No isolated runtime is available. Check the runtime settings.",
