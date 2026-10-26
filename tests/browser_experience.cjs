@@ -305,6 +305,74 @@ async function checkQueueEditor(page, evidence) {
       assert.deepEqual(errors, []);
       return;
     }
+    // Unconfigured sources/repository cannot schedule a check or pretend success.
+    assert.equal(await page.locator('[data-inspect="light"]').isDisabled(), true);
+    assert.equal(await page.locator('[data-inspect="issues"]').isDisabled(), true);
+    const issueRequestError = await page.evaluate(async () => {
+      try {
+        await api('request', {project: projectId, kind: 'issues'});
+        return 'unexpected success';
+      } catch (error) {
+        return error.message;
+      }
+    });
+    assert.equal(issueRequestError, '请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。');
+    // Incomplete scans are visible as unfinished work with a continuation, not a completed sync.
+    const issueRoute = async route => {
+      const response = await route.fetch(), data = await response.json();
+      data.events = [{
+        seq: 999999, project: data.projects[0]?.id, kind: 'issues', created: Date.now() / 1000,
+        message: 'Scanned 3 Issues; 1 updates synchronized; sync continues next cycle',
+        data: JSON.stringify({complete: false, scanned: 3, changed: 1, next_page: 2, pages_read: 2}),
+      }, ...(data.events || [])];
+      await route.fulfill({json: data});
+    };
+    await page.route('**/api/state*', issueRoute);
+    try {
+      await page.locator('.sidebar nav [data-view="overview"]').click();
+      await page.getByText('最近活动', {exact: true}).click();
+      await page.locator('#activity').getByText(
+        '已检查 3 个 Issue，同步 1 条更新；本次同步未完成，下一轮继续', {exact: true},
+      ).waitFor();
+    } finally {
+      await page.unroute('**/api/state*', issueRoute);
+    }
+    // A synced Issue revision keeps queued state but updates the open detail without losing a draft.
+    const liveTask = page.locator('#tasks-list .task-title').first();
+    const liveTitle = await liveTask.innerText();
+    await liveTask.click();
+    await page.locator('#detail-dialog[open] #detail-title').filter({hasText: liveTitle}).waitFor();
+    const liveDraft = page.locator('#detail-dialog .task-controls textarea').first();
+    await liveDraft.fill('本地未保存草稿');
+    let syncedDetail = false;
+    const syncDetail = async route => {
+      const response = await route.fetch(), data = await response.json();
+      if (syncedDetail) {
+        data.title = '同步后的 Issue 标题';
+        data.body = '同步后的 Issue 正文';
+        data.evidence = JSON.stringify([{number: 7, updated: 'new', state: 'open'}]);
+        data.updated = (data.updated || 0) + 1;
+      }
+      await route.fulfill({json: data});
+    };
+    await page.route('**/api/task?id=*', syncDetail);
+    try {
+      syncedDetail = true;
+      await page.locator('#detail-dialog[open] #detail-title')
+        .filter({hasText: '同步后的 Issue 标题'}).waitFor({timeout: 15000});
+      await page.locator('#detail-dialog').getByText('来源与证据', {exact: true}).click();
+      await page.locator('#detail-dialog #detail-body')
+        .getByText('同步后的 Issue 正文', {exact: true}).waitFor();
+      assert.equal(await page.locator('#detail-dialog .task-controls textarea').first().inputValue(),
+        '本地未保存草稿');
+    } finally {
+      await page.unroute('**/api/task?id=*', syncDetail);
+    }
+    await page.evaluate(() => {
+      RSIDraftStore.remove('task-supplement',
+        new URLSearchParams(location.hash.slice(1)).get('task'));
+    });
+    await page.locator('#detail-dialog .close-dialog').click();
     for (const name of ["overview", "models", "usage"])
       assert.equal(
         await page.locator(`.sidebar nav [data-view="${name}"]`).isVisible(),

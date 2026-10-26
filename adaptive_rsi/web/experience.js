@@ -601,8 +601,10 @@ window.RSIExperience = (() => {
         "task?id=" + task.id + "&project=" + task.project,
       );
       if (!current()) return;
-      // Task state can change before any run exists. Keep forms intact on unchanged polls.
-      if (metadata.state !== task.state) {
+      // Issue sync may revise title, body or evidence while the task stays queued.
+      // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
+      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated]);
+      if (snapshot(metadata) !== snapshot(task)) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
         const queueDraft = readQueueDraft();
         await showTask(metadata, restore, queueDraft);

@@ -79,7 +79,7 @@ function browser(savedSession = new Map()) {
   vm.runInContext(source, context);
   // The app starts a boot refresh; abort its isolated request so each test owns its fetches.
   vm.runInContext('refreshController?.abort();refreshSequence++;refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;refreshQueued=false;refreshWaiters.splice(0);clearTimeout(refreshPollTimer);', context);
-  vm.runInContext('originalSafe=safe; state=initialState; scopeInitialized=true; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
+  vm.runInContext('originalSafe=safe; originalRender=render; state=initialState; scopeInitialized=true; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
   node('project-select').options = [{value: 'a', text: 'A'}, {value: 'b', text: 'B'}];
   return {
     context, node, document, timers, sessionData: session,
@@ -628,6 +628,97 @@ for (const kind of ['release', 'deploy']) {
     });
   }
 }
+
+test('issue sync activity separates scans, real changes and unfinished continuation', () => {
+  const page = browser();
+  const copy = event => vm.runInContext(`eventCopy(${JSON.stringify(event)})`, page.context);
+  const data = values => JSON.stringify(values);
+  assert.equal(copy({kind:'issues',message:'Scanned 7 Issues; 2 updates synchronized',
+    data:data({complete:true,scanned:7,changed:2})}), '已检查 7 个 Issue，同步 2 条更新');
+  assert.equal(copy({kind:'issues',message:'Scanned 7 Issues; 0 updates synchronized',
+    data:data({complete:true,scanned:7,changed:0})}), '已检查 7 个 Issue，没有需要同步的变化');
+  assert.equal(copy({kind:'issues',message:'Scanned 7 Issues; 2 updates synchronized; sync continues next cycle',
+    data:data({complete:false,scanned:7,changed:2})}),
+  '已检查 7 个 Issue，同步 2 条更新；本次同步未完成，下一轮继续');
+  assert.equal(copy({kind:'issues',message:'Scanned 7 Issues; 0 updates synchronized; sync continues next cycle',
+    data:data({complete:false,scanned:7,changed:0})}),
+  '已检查 7 个 Issue，暂未发现变化；本次同步未完成，下一轮继续');
+  // Historical events keep their old message but no longer imply a finished sync.
+  assert.equal(copy({kind:'issues',message:'3 Issue updates synchronized',
+    data:data({complete:false,next_page:2,pages_read:1})}),
+  '已同步 Issue 更新 · 3；本次同步未完成，下一轮继续');
+});
+
+test('inspection entry points follow repository and source availability', () => {
+  const page = browser();
+  const buttons = ['light', 'issues'].map(kind => {
+    const button = page.node('inspect-' + kind); button.dataset.inspect = kind; return button;
+  });
+  const config = {
+    sources: {inspection: false, issues: false},
+    github: {repository: '', labels: []},
+    schedule: {light_minutes: 60, issues_minutes: 60, timezone: 'UTC'},
+    delivery: {mode: 'local', auto_merge: false},
+  };
+  Object.assign(page.context.initialState, {
+    projects: [{id: 'a', name: 'A', paused: true, config}],
+    config, tasks: [], runs: [], task_counts: [], schedules: [], events: [],
+    quality: [], usage: [], model_usage: [], candidates: [], update: {},
+  });
+  page.document.querySelectorAll = selector => selector === '[data-inspect]' ? buttons : [];
+  page.node('config-scope').value = 'project';
+  vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});renderUpdateExtras=()=>{};originalRender()', page.context);
+  assert.equal(buttons[0].disabled, true, 'disabled inspection source cannot schedule a check');
+  assert.equal(buttons[1].disabled, true, 'missing repository cannot schedule Issue sync');
+  page.context.initialState.projects[0].config.sources = {inspection: true, issues: true};
+  page.context.initialState.projects[0].config.github.repository = 'owner/project';
+  vm.runInContext('originalRender()', page.context);
+  assert.equal(buttons[0].disabled, false);
+  assert.equal(buttons[1].disabled, false);
+  page.context.initialState.projects[0].config.github.repository = '';
+  vm.runInContext('originalRender()', page.context);
+  assert.equal(buttons[1].disabled, true, 'Issue sync stays disabled without a repository');
+});
+
+test('live task details rerender when synced input changes but keep unchanged polls and drafts', async () => {
+  const page = experiencePage(), task = {
+    id: 'issue-task', project: 'a', title: '旧标题', source: 'issue', state: 'queued',
+    body: '旧正文', evidence: '[{"number":7,"updated":"old"}]', updated: 1,
+  };
+  let metadata = {...task, dependency: null, revisions: []}, polls = 0, renders = 0;
+  const originalShow = page.context.showTask;
+  page.context.showTask = (...args) => { renders++; return originalShow(...args); };
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/task?')) { polls++; return response(metadata); }
+    if (url.includes('/state?')) return response({tasks: []});
+    return response({saved: true});
+  };
+  vm.runInContext("draftStore.set('task-supplement','issue-task','未保存补充草稿')", page.context);
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  assert.equal(renders, 1);
+  const draft = node => node.tagName === 'TEXTAREA' ? node :
+    (node.children || []).map(draft).find(Boolean);
+  assert.equal(draft(page.node('detail-body')).value, '未保存补充草稿');
+  // A synced Issue revision keeps state=queued but changes the visible input.
+  metadata = {...metadata, title: '同步后的标题', body: '同步后的正文',
+    evidence: '[{"number":7,"updated":"new"}]', updated: 2};
+  const before = polls;
+  page.fireTimer(5000);
+  await waitFor(() => renders === 2 && polls > before);
+  assert.equal(page.node('detail-title').textContent, '同步后的标题');
+  assert.match(draft(page.node('detail-body')).value, /未保存补充草稿/);
+  assert.ok(page.node('detail-body').children.some(node =>
+    node.className === 'detail-section' && node.children.some(child => child.textContent === '同步后的正文')));
+  // Unchanged polls must not rebuild the dialog.
+  const settled = polls;
+  await waitFor(() => page.timers.some(timer => timer.active && timer.delay === 5000));
+  page.fireTimer(5000);
+  await waitFor(() => polls > settled);
+  await new Promise(setImmediate);
+  assert.equal(renders, 2, 'unchanged live polls reuse the rendered detail');
+});
 
 test('out-of-order task details cannot attach cancellation for the previous task', async () => {
   const page = browser(), cancellations = [];

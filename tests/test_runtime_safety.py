@@ -323,7 +323,8 @@ class RuntimeSafetyTest(unittest.TestCase):
                 self.store.transition(fresh["id"], "completed", {}, True)
 
     def test_system_requests_preserve_cancellation_until_worker_stops(self):
-        self.runtime.configure({"sources": {"inspection": True, "issues": False}}, self.project)
+        self.runtime.configure({"sources": {"inspection": True, "issues": False},
+                                "github": {"repository": "owner/project"}}, self.project)
         config = self.runtime.config(self.project)
         for kind in ["light", "issues", "evolve", "reassess"]:
             with self.subTest(kind=kind):

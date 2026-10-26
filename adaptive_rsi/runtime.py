@@ -332,6 +332,9 @@ class Runtime:
             raise ValueError("Unknown inspection type")
         kind = "light" if kind == "deep" else kind
         self.project(project)
+        config = self.config(project)
+        if kind == "issues" and not config["github"]["repository"]:
+            raise ValueError("No GitHub repository configured")
         # Coalesce manual and timer triggers for the same system job.
         key = "system:" + kind
         with self.store.connect() as db:

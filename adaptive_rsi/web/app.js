@@ -59,7 +59,8 @@ const apiErrors={
  "Wait until active runs finish before registering projects so every worker uses the same isolation boundaries": "还有任务正在运行，请等任务结束后再接入项目。",
  "Only project scan settings can inherit global defaults": "只能让项目扫描设置跟随通用设置。",
  "An inherited setting cannot also have an override": "跟随通用的扫描项不能同时填写 JSON 覆盖，请先选择单独设置。",
- "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。"
+ "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。",
+ "No GitHub repository configured": "请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
 for(const type of ['input','change','reset'])document.addEventListener(type,event=>{
@@ -270,10 +271,17 @@ function renderNavigation(){
 const activeStates=['releasing','deploying','queued','planning','executing','evaluating','pr_open'];
 const attentionStates=['release_failed','deploy_failed','waiting_budget','awaiting_approval','blocked','failed','insufficient_evidence','interrupted','regressed','unverified_merge','ci_failed','expired'];
 function visibleTasks(rows,filter,includeSystem=false){return rows.filter(task=>(includeSystem||!task.source.startsWith('system_'))&&(filter==='all'||(filter==='active'?activeStates.includes(task.display_state||task.state):filter==='attention'?attentionStates.includes(task.display_state||task.state):!activeStates.includes(task.display_state||task.state)&&!attentionStates.includes(task.display_state||task.state))));}
+function issueSyncCopy(scanned,changed,complete){
+ const key=complete?(changed?'已检查 {scanned} 个 Issue，同步 {changed} 条更新':'已检查 {scanned} 个 Issue，没有需要同步的变化'):(changed?'已检查 {scanned} 个 Issue，同步 {changed} 条更新；本次同步未完成，下一轮继续':'已检查 {scanned} 个 Issue，暂未发现变化；本次同步未完成，下一轮继续');
+ return t(key).replace('{scanned}',scanned).replace('{changed}',changed);
+}
 function eventCopy(event){
 const known={'Project registered (paused)':'项目已接入，等待启动','Project registered and enabled':'项目已接入并启动','Settings saved; active runs retain their snapshot':'设置已保存','Model routes updated':'模型分工已保存','Project paused':'项目已暂停','Project enabled':'项目已启动','Cancellation requested':'已申请取消任务','Dependency snapshot frozen':'已准备独立工作环境','Committed snapshot unchanged; no model call':'项目没有新改动，本次检查未调用模型','Fresh run scheduled with bounded backoff':'已安排重试','Provider resumed by user':'模型连接已恢复','Issue closed or excluded during execution; recheck before delivery':'运行期间 Issue 已关闭或被排除，将在交付前复核','Earlier attempt ended without a fix; rediscovered finding queued for fresh verification':'此前尝试未产出修复；重新发现的问题已入队等待全新验证','Dependency will not merge; waiting released and the task needs manual review':'前置任务无法合并；等待已解除，任务需要人工复核后重试'};
  if(known[event.message])return t(known[event.message]);
- const issues=event.message.match(/^(\d+) Issue updates synchronized$/);if(issues)return t('已同步 Issue 更新')+' · '+issues[1];
+ let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data);}catch{}}
+ if(event.kind==='issues'&&data&&Number.isInteger(data.scanned)&&Number.isInteger(data.changed))return issueSyncCopy(data.scanned,data.changed,data.complete);
+ const issues=event.message.match(/^(\d+) Issue updates synchronized$/);
+ if(issues){const copy=t('已同步 Issue 更新')+' · '+issues[1];return data?.complete===false?copy+'；'+t('本次同步未完成，下一轮继续'):copy;}
  return event.message;
 }
 function render(){
@@ -318,7 +326,7 @@ function render(){
   $(kind+'-due').textContent=t(!enabled?'未启用':project?.paused?'项目已暂停':schedule?'下次 ':'等待首次检查')+(enabled&&!project?.paused&&schedule?scheduleStamp(scheduleTime(schedule),scheduleTimezone)+' · '+scheduleTimezone:'');
  }
  $('scan-summary').textContent=['light','issues'].map(kind=>t({light:'项目扫描',issues:'GitHub 问题同步',deep:'深度检查'}[kind])+' '+($(kind+'-due').textContent===t('未启用')?t('未启用'):t('每')+' '+$(kind+'-interval').textContent)).join(' · ')+' · '+t('项目时区')+' '+scheduleTimezone;
- document.querySelectorAll('[data-inspect]').forEach(button=>button.disabled=!project||!!configError);
+ document.querySelectorAll('[data-inspect]').forEach(button=>{const kind=button.dataset.inspect,enabled=kind==='light'?config.sources.inspection:kind==='issues'?config.sources.issues&&!!config.github.repository:true;button.disabled=!project||!!configError||!enabled;});
  const activity=$('activity'),events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,6);
  if(changedList(activity,events)){activity.replaceChildren();
  if(!events.length)activity.append(el('p',t('运行记录将在这里出现。'),'empty-copy'));

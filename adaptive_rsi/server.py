@@ -87,6 +87,7 @@ Deployment health URL requires HTTPS without credentials, query or fragment
 Automatic deployment rollback requires an explicit health URL
 Feedback interval must be at least 5 minutes
 Invalid base branch
+No GitHub repository configured
 Seed a dependency directory, not the entire repository
 Invalid dependency snapshot size limit
 Check must contain name, cwd, argv

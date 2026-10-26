@@ -645,6 +645,11 @@ const english = {
   "已安排重试": "Retry scheduled",
   "模型连接已恢复": "Model connection resumed",
   "已同步 Issue 更新": "Issue updates synchronized",
+  "已检查 {scanned} 个 Issue，同步 {changed} 条更新": "Scanned {scanned} Issues; {changed} updates synchronized",
+  "已检查 {scanned} 个 Issue，没有需要同步的变化": "Scanned {scanned} Issues; no changes to synchronize",
+  "已检查 {scanned} 个 Issue，同步 {changed} 条更新；本次同步未完成，下一轮继续": "Scanned {scanned} Issues; {changed} updates synchronized; this sync did not finish and will continue next cycle",
+  "已检查 {scanned} 个 Issue，暂未发现变化；本次同步未完成，下一轮继续": "Scanned {scanned} Issues; no changes yet; this sync did not finish and will continue next cycle",
+  "本次同步未完成，下一轮继续": "This sync did not finish and will continue next cycle",
 
   "后台已更新，当前输入已保留。刷新页面可加载新版界面。": "The service has updated and your input is retained. Refresh to load the new interface.",
   "已保存提交的配置，后续修改仍未保存。": "Submitted settings are saved; your later edits are still unsaved.",

@@ -219,6 +219,59 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.assertEqual(len(self.store.query("SELECT * FROM tasks")), 205)
         self.assertEqual(self.store.setting("issue-sync:p")["page"], 1)
 
+    def sync_event(self):
+        return self.store.one("SELECT * FROM events WHERE kind='issues' ORDER BY seq DESC LIMIT 1")
+
+    def test_issue_sync_counts_real_changes_instead_of_every_overlapping_scan(self):
+        issue = self.issue(number=1)
+        self.synchronize([issue])
+        event = self.sync_event()
+        data = json.loads(event["data"])
+        self.assertEqual((data["scanned"], data["changed"], data["complete"]), (1, 1, True))
+        self.assertEqual(event["message"], "Scanned 1 Issues; 1 updates synchronized")
+        # The next cycle overlaps the previous `since` window; an unchanged scan is not an update.
+        self.synchronize([issue])
+        data = json.loads(self.sync_event()["data"])
+        self.assertEqual((data["scanned"], data["changed"], data["complete"]), (1, 0, True))
+        self.assertEqual(self.sync_event()["message"], "Scanned 1 Issues; 0 updates synchronized")
+        # A real revision remains one update even when the row is read again.
+        revised = {**issue, "body": "revised body", "updated_at": "2026-10-21T00:00:00Z"}
+        self.synchronize([revised])
+        self.synchronize([revised])
+        events = self.store.query("SELECT * FROM events WHERE kind='issues' ORDER BY seq")
+        self.assertEqual([json.loads(event["data"])["changed"] for event in events[-2:]], [1, 0])
+
+    def test_issue_sync_marks_incomplete_scans_and_continues_without_false_completion(self):
+        issues = [{"number": number, "title": "Issue " + str(number), "body": "body",
+                   "labels": [], "state": "open", "updated_at": "2026-10-20T00:00:00Z",
+                   "html_url": "https://github.com/owner/project/issues/" + str(number)}
+                  for number in range(1, 102)]
+
+        def checked(args, **kwargs):
+            page = int(next(value.split("=", 1)[1] for value in args if value.startswith("page=")))
+            return encode(issues[(page - 1) * 100:page * 100])
+
+        with patch("adaptive_rsi.discovery.ISSUE_SYNC_MAX_PAGES", 1):
+            sync(self.runtime, self.project, self.config, checked)
+            first = self.sync_event()
+            first_data = json.loads(first["data"])
+            self.assertEqual((first_data["complete"], first_data["scanned"], first_data["changed"],
+                              first_data["next_page"]), (False, 100, 100, 2))
+            self.assertIn("sync continues next cycle", first["message"])
+            # Retrying the persisted cursor completes the remaining page only.
+            sync(self.runtime, self.project, self.config, checked)
+            second = json.loads(self.sync_event()["data"])
+            self.assertEqual((second["complete"], second["scanned"], second["changed"],
+                              second["next_page"]), (True, 1, 1, 1))
+            # A new cycle re-scans from the first page, but unchanged rows are not updates.
+            sync(self.runtime, self.project, self.config, checked)
+            third = self.sync_event()
+            third_data = json.loads(third["data"])
+            self.assertEqual((third_data["complete"], third_data["scanned"], third_data["changed"],
+                              third_data["next_page"]), (False, 100, 0, 2))
+            self.assertIn("sync continues next cycle", third["message"])
+        self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='issue'")), 101)
+
     def add_related(self, task_id, title, paths, result=None, updated=1, state="merged"):
         self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,updated) "
                            "VALUES (?,'p','inspection',?,?,'',?,?,?)",
