@@ -14,7 +14,13 @@ window.RSIExperience = (() => {
     lastDetail = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueDraftReaders = new WeakMap();
+  const queueSaves = new Map();
+  let queueEditor;
+  const queueKey = task => JSON.stringify([task.project, task.id]);
+  function queueEditorCurrent(editor) {
+    return queueEditor === editor && $("detail-dialog").open &&
+      projectId === editor.project && detailTask?.id === editor.task;
+  }
   const notificationKey = "rsi-notifications:" + location.origin;
   function readSaved(key, fallback) {
     try {
@@ -318,8 +324,8 @@ window.RSIExperience = (() => {
         ),
       );
   }
-  async function taskControls(task, body, ticket, queueDraft) {
-    const project = projectId;
+  async function taskControls(task, body, ticket, queueDraft, editor) {
+    const project = projectId, baselineVersion = editor.version;
     const current = () => projectId === project && ticket === detailSequence && body.isConnected;
     async function refreshTaskDetail() {
       await refresh();
@@ -413,7 +419,10 @@ window.RSIExperience = (() => {
         none = el("option", t("无前置任务"));
       none.value = "";
       select.append(none);
-      const dependency = metadata.dependency?.dependency || "";
+      if (!editor.baseline || (!queueSaves.has(editor.key) && editor.version === baselineVersion))
+        editor.baseline = {dependency: metadata.dependency?.dependency || "", urgency: !!metadata.urgency};
+      queueDraft = readQueueDraft();
+      const dependency = editor.baseline.dependency;
       const pager = el("div", undefined, "task-pagination"),
         pageNote = el("span");
       pageNote.setAttribute("aria-live", "polite");
@@ -480,31 +489,33 @@ window.RSIExperience = (() => {
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");
       urgency.type = "checkbox";
-      urgency.checked = queueDraft?.urgency ?? !!metadata.urgency;
-      let baseline = {dependency, urgency: !!metadata.urgency};
-      queueDraftReaders.set(body, () => ({
-        ...(select.value !== baseline.dependency ? {dependency: select.value} : {}),
-        ...(urgency.checked !== baseline.urgency ? {urgency: urgency.checked} : {}),
-      }));
+      urgency.checked = queueDraft?.urgency ?? editor.baseline.urgency;
+      editor.read = () => ({dependency: select.value, urgency: urgency.checked});
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
+      editor.submit = submit;
+      submit.disabled = queueSaves.has(editor.key);
       form.append(label, urgencyLabel, submit, pager);
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
-          if (!current()) return;
+          if (!current() || queueSaves.has(editor.key)) return;
+          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
-            const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
             await api("task/schedule", submitted);
-            if (!current()) return;
-            // The endpoint acknowledges these exact values; newer edits stay in the controls.
-            baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            // Rebase even if this form was rebuilt. Its editor still owns newer edits.
+            editor.baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            editor.version++;
+            if (!queueEditorCurrent(editor)) return;
             await refresh();
-            if (current()) toast(t("排队设置已保存"));
+            if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
           } finally {
-            submit.disabled = false;
+            queueSaves.delete(editor.key);
+            if (queueEditor?.key === editor.key && queueEditor.submit)
+              queueEditor.submit.disabled = false;
           }
         }, form);
       };
@@ -535,11 +546,19 @@ window.RSIExperience = (() => {
     body.append(controls);
   }
   function readQueueDraft() {
-    return queueDraftReaders.get($("detail-body"))?.();
+    if (!queueEditor || !queueEditorCurrent(queueEditor)) return;
+    const values = queueEditor.read?.();
+    if (!values) return queueEditor.draft;
+    if (queueSaves.has(queueEditor.key)) return values;
+    return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== queueEditor.baseline[key]));
   }
   function taskOpened(task, queueDraft) {
-    queueDraftReaders.delete($("detail-body"));
-    if (queueDraft) queueDraftReaders.set($("detail-body"), () => queueDraft);
+    const key = queueKey(task);
+    if (queueEditor?.key !== key)
+      queueEditor = {key, project: task.project, task: task.id, version: 0};
+    queueEditor.draft = queueDraft;
+    queueEditor.read = null;
+    queueEditor.submit = null;
     clearTimeout(liveTimer);
     lastDetail = "";
     const url = new URL(location.href);
@@ -549,7 +568,7 @@ window.RSIExperience = (() => {
     }).toString();
     history.replaceState(null, "", url);
     const ticket = detailSequence;
-    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft));
+    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft, queueEditor));
     liveTimer = setTimeout(liveDetail, 5000);
   }
   function detailsSnapshot(root) {
@@ -930,7 +949,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
 })();
 
 'use strict';

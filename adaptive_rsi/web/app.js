@@ -617,7 +617,7 @@ $('schedule-mode').addEventListener('change',syncScheduleMode);
 document.querySelectorAll('[data-schedule-preset]').forEach(select=>select.addEventListener('change',()=>{if(select.value==='custom')return;const node=document.querySelector('[data-path="schedule.'+select.dataset.schedulePreset+'_minutes"]'),unit=document.querySelector('[data-unit-for="'+node.dataset.duration+'"]'),value=Number(select.value),factor=value%1440===0?1440:60;unit.value=String(factor);unit.dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}));
 document.querySelectorAll('[data-duration]').forEach(node=>node.addEventListener('input',syncSchedulePresets));
 $('delivery-project-settings').addEventListener('click',()=>changeSettingsScope('project'));
-$('detail-dialog').addEventListener('close',()=>{detailSequence++;detailTask=null;});
+$('detail-dialog').addEventListener('close',()=>{detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();});
 document.querySelectorAll('[data-settings-scope]').forEach(button=>button.addEventListener('click',()=>changeSettingsScope(button.dataset.settingsScope)));
 document.querySelectorAll('[data-task-filter]').forEach(button=>button.addEventListener('click',()=>{$('task-filter').value=button.dataset.taskFilter;taskOffset=0;safe(refresh);}));
 $('show-system-tasks').addEventListener('change',()=>{taskOffset=0;safe(refresh);});

@@ -1441,6 +1441,114 @@ for (const trigger of ['language', 'supplement']) {
   }
 }
 
+for (const trigger of ['language', 'revision', 'periodic']) {
+  for (const serverVisible of [false, true]) {
+    test(`queue save rebases post-submit undo across ${trigger} rebuild (server visible: ${serverVisible})`, async () => {
+      const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+      let metadata = {...task, dependency: null, urgency: 0}, acknowledge;
+      vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+      page.context.fetch = async (url, options) => {
+        if (url.endsWith('/task/schedule')) {
+          const submitted = JSON.parse(options.body); posts.push(submitted);
+          const commit = () => {metadata = {...metadata, dependency: submitted.dependency ? {dependency: submitted.dependency} : null, urgency: submitted.urgency};};
+          if (posts.length > 1) {commit(); return response({saved: true});}
+          if (serverVisible) commit();
+          return new Promise(resolve => {acknowledge = () => {commit(); resolve(response({saved: true}));};});
+        }
+        if (url.endsWith('/task/revise')) {metadata = {...metadata, state: 'deferred'}; return response({saved: true});}
+        if (url.includes('/task-runs?')) return response([]);
+        if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+        return response(url.includes('id=parent&') ? fixtureTask('parent') : metadata);
+      };
+      await openExperienceTask(page, task);
+      let form = queueForm(page);
+      form.children[0].children[0].value = 'parent'; form.children[1].children[0].checked = true;
+      form.onsubmit({preventDefault() {}}); const pending = page.context.lastAction;
+      form.children[0].children[0].value = ''; form.children[1].children[0].checked = false;
+      if (trigger === 'language') await changeDetailLanguage(page);
+      if (trigger === 'revision') {
+        const supplement = page.node('detail-body').children.find(node => node.className === 'task-controls').children.find(node => node.tagName === 'FORM');
+        supplement.children[0].children[0].value = 'Rebuild during schedule save';
+        supplement.onsubmit({preventDefault() {}}); await page.context.lastAction;
+      }
+      if (trigger === 'periodic') {
+        metadata = {...metadata, state: 'deferred'};
+        page.fireTimer(5000); await new Promise(setImmediate); await page.context.lastAction;
+      }
+      await new Promise(setImmediate);
+      form = queueForm(page);
+      assert.equal(form.children[0].children[0].value, ''); assert.equal(form.children[1].children[0].checked, false);
+      assert.equal(form.children[2].disabled, true, 'logical task save remains pending in the rebuilt form');
+      form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+      assert.equal(posts.length, 1, 'rebuilt form cannot issue a concurrent POST, even by programmatic submit');
+      acknowledge(); await pending;
+      assert.equal(form.children[2].disabled, false);
+      await changeDetailLanguage(page, 'zh-CN'); await new Promise(setImmediate);
+      form = queueForm(page);
+      assert.equal(form.children[0].children[0].value, '', 'undo remains dirty against acknowledged parent');
+      assert.equal(form.children[1].children[0].checked, false);
+      form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+      assert.deepEqual(posts, [{task: 'child', dependency: 'parent', urgency: 1}, {task: 'child', dependency: null, urgency: 0}]);
+      assert.equal(metadata.dependency, null); assert.equal(metadata.urgency, 0);
+    });
+  }
+}
+
+for (const navigation of ['close-reopen', 'other-task-return', 'project-return']) {
+  test(`pending task save blocks duplicate POST but ends draft on ${navigation}`, async () => {
+    const page = experiencePage(), task = fixtureTask('child', 'queued');
+    let metadata = {...task, dependency: null, urgency: 0}, acknowledge, writes = 0;
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) {
+        writes++;
+        return new Promise(resolve => {acknowledge = () => {metadata = {...metadata, dependency: {dependency: 'parent'}, urgency: 1}; resolve(response({saved: true}));};});
+      }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+      return response(url.includes('id=other&') ? fixtureTask('other', 'queued') : metadata);
+    };
+    await openExperienceTask(page, task);
+    let form = queueForm(page);
+    form.children[0].children[0].value = 'parent'; form.children[1].children[0].checked = true;
+    form.onsubmit({preventDefault() {}}); const pending = page.context.lastAction;
+    if (navigation === 'other-task-return') await openExperienceTask(page, fixtureTask('other', 'queued'));
+    else page.context.closeTaskDetail();
+    if (navigation === 'project-return') vm.runInContext('projectId="b"', page.context);
+    vm.runInContext('projectId="a"', page.context);
+    await openExperienceTask(page, task); form = queueForm(page);
+    assert.equal(form.children[0].children[0].value, '', 'new opening does not inherit an unsaved draft');
+    assert.equal(form.children[1].children[0].checked, false);
+    assert.equal(form.children[2].disabled, true);
+    form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+    assert.equal(writes, 1);
+    acknowledge(); await pending;
+    assert.equal(form.children[2].disabled, false);
+    assert.equal(form.children[0].children[0].value, '', 'old session acknowledgement does not restore its draft');
+  });
+}
+
+test('a failed task save releases rebuilt controls and retains post-submit undo', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued');
+  let rejectSave, writes = 0;
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/schedule')) {writes++; return new Promise((_resolve, reject) => {rejectSave = reject;});}
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+    return response(task);
+  };
+  await openExperienceTask(page, task);
+  let form = queueForm(page);
+  form.children[0].children[0].value = 'parent'; form.children[1].children[0].checked = true;
+  form.onsubmit({preventDefault() {}}); const pending = page.context.lastAction;
+  form.children[0].children[0].value = ''; form.children[1].children[0].checked = false;
+  await changeDetailLanguage(page); await new Promise(setImmediate);
+  rejectSave(Error('offline')); await assert.rejects(pending);
+  form = queueForm(page); assert.equal(form.children[2].disabled, false);
+  await changeDetailLanguage(page, 'zh-CN'); await new Promise(setImmediate);
+  assert.equal(queueForm(page).children[0].children[0].value, '');
+  assert.equal(queueForm(page).children[1].children[0].checked, false); assert.equal(writes, 1);
+});
+
 test('consecutive language rebuilds retain the draft while controls are still loading', async () => {
   const page = experiencePage(), task = fixtureTask('child', 'queued');
   let hold = false, release;
