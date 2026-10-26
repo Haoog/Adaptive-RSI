@@ -648,6 +648,10 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
             return urllib.error.HTTPError("https://127.0.0.1:1/api/retry", code, "Bad Request",
                                           {}, io.BytesIO(body))
 
+        def error_for_json(raw, code=400):
+            return urllib.error.HTTPError("https://127.0.0.1:1/api/retry", code, "Bad Request",
+                                          {}, io.BytesIO(raw.encode()))
+
         with patch("urllib.request.urlopen", side_effect=error_for(
                 {"error": "This task cannot be retried", "error_code": "validation_error"})):
             with self.assertRaises(RuntimeError) as caught:
@@ -662,6 +666,12 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 cli.api(state, "/api/retry", {"task": "missing-task"})
         self.assertEqual(str(caught.exception), "HTTP Error 502")
+        # 合规代理可能返回合法 JSON 但不是对象；一行固定错误，不打印堆栈。
+        for body in ("null", "[]", '"gateway"'):
+            with patch("urllib.request.urlopen", side_effect=error_for_json(body, 502)):
+                with self.assertRaises(RuntimeError) as caught:
+                    cli.api(state, "/api/retry", {"task": "missing-task"})
+            self.assertEqual(str(caught.exception), "HTTP Error 502")
 
 
 if __name__ == "__main__":

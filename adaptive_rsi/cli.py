@@ -101,6 +101,8 @@ def api(root, path, data=None):
             payload = json.loads(exc.read().decode() or "{}")
         except (ValueError, UnicodeDecodeError):
             payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
         message = payload.get("error") if isinstance(payload.get("error"), str) else ""
         code = payload.get("error_code") or payload.get("catalog_error")
         code = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,64}", code) else ""
