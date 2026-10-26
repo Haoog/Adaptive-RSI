@@ -372,6 +372,15 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         investigate(runtime, project, run, outcome)
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path
     saved = json.loads(run["config"])
+
+    def missing_artifacts():
+        previous = outcome.get("feedback", {})
+        if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
+            outcome["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
+                                   "previous": previous}
+            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
+
     try:
         output_name = "feedback/" + str(time.time_ns()) + "-" + uid()
         directory = run_artifact_path(runtime.store, run, output_name)
@@ -410,15 +419,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         for relative in saved["environment"]["seed_paths"]:
             if not run_artifact_path(runtime.store, run, "dependencies/" + relative).is_dir():
                 raise ValueError(MISSING_ARTIFACTS)
-        directory.parent.mkdir(exist_ok=True)
-        directory.mkdir(mode=0o700)  # Exclusive: refuse collisions instead of overwriting evidence.
     except (ValueError, OSError, RuntimeError):
-        previous = outcome.get("feedback", {})
-        if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
-            outcome["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
-                                   "previous": previous}
-            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
-            runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
+        missing_artifacts()
         return
     previous = outcome.get("feedback", {})
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
@@ -438,6 +440,16 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if previous.get("head") == head:
         outcome["feedback_polled_at"] = now
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        return
+    try:
+        # Fetching can take time; recheck destinations before exclusively creating output.
+        for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
+                     "evaluation", "evaluation/report.json"):
+            output_path(name)
+        directory.parent.mkdir(exist_ok=True)
+        directory.mkdir(mode=0o700)  # Exclusive: refuse collisions instead of overwriting evidence.
+    except (ValueError, OSError, RuntimeError):
+        missing_artifacts()
         return
     baseline_tree = snapshot(source, output_path("baseline"), outcome["merged_sha"])
     current_tree = snapshot(source, output_path("current"), head)

@@ -596,6 +596,71 @@ class ExperienceTest(unittest.TestCase):
         acceptance.write_text(original)
         self.assertFalse((directory / "feedback").exists())
 
+    def test_feedback_early_returns_do_not_accumulate_output_directories(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        config = self.runtime.config(self.project)
+        existing = directory / "feedback" / "existing-evidence"
+        existing.mkdir(parents=True)
+        (existing / "marker").write_bytes(b"keep existing evidence")
+        before = set(directory.rglob("*"))
+        now = time.time()
+        for reason in ("same-head", "interval", "expired"):
+            with self.subTest(reason=reason):
+                result = json.loads(json.dumps(outcome))
+                if reason == "interval":
+                    result["feedback"]["checked_at"] = now
+                    result["feedback"]["investigation_pending"] = True
+                elif reason == "expired":
+                    result["merged_at"] = now - (config["limits"]["retention_days"] + 1) * 86400
+                with patch("adaptive_rsi.delivery.baseline", return_value=("fixture", "old-head", "main")) as fetch, patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(self.runtime.evaluator, "evaluate") as evaluate, patch("adaptive_rsi.delivery.investigate"):
+                    for index in range(24):
+                        step = config["delivery"]["feedback_minutes"] * 60 + 1 if reason == "same-head" else 1
+                        feedback(self.runtime, self.runtime.project(self.project), run, result, config, now + index * step)
+                self.assertEqual(fetch.call_count, 24 if reason == "same-head" else 0)
+                snapshot.assert_not_called()
+                evaluate.assert_not_called()
+                self.assertEqual(set(directory.rglob("*")), before)
+                self.assertEqual((existing / "marker").read_bytes(), b"keep existing evidence")
+
+    def test_feedback_output_collision_or_write_failure_after_fetch_is_insufficient(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        for collision in (True, False):
+            with self.subTest(collision=collision):
+                nonce = "collision" if collision else "write-failure"
+                output = directory / "feedback" / ("123-" + nonce)
+                def fetch(*args):
+                    output.parent.mkdir(exist_ok=True)
+                    if collision:
+                        output.mkdir()
+                        (output / "marker").write_bytes(b"keep evidence")
+                    else:
+                        output.parent.rmdir()
+                        output.parent.write_bytes(b"not a directory")
+                    return "fixture", "new-head", "main"
+                result = dict(outcome)
+                with patch("adaptive_rsi.delivery.time.time_ns", return_value=123), patch("adaptive_rsi.delivery.uid", return_value=nonce), patch("adaptive_rsi.delivery.baseline", side_effect=fetch), patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+                    feedback(self.runtime, self.runtime.project(self.project), run, result, self.runtime.config(self.project), time.time())
+                snapshot.assert_not_called()
+                evaluate.assert_not_called()
+                self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+                if collision:
+                    self.assertEqual((output / "marker").read_bytes(), b"keep evidence")
+                    (output / "marker").unlink()
+                    output.rmdir()
+                else:
+                    self.assertEqual(output.parent.read_bytes(), b"not a directory")
+
+    def test_patch_symlink_loop_returns_artifact_error(self):
+        run, directory, outcome = self.artifact_run()
+        patch_path = directory / "candidate.patch"
+        patch_path.unlink()
+        patch_path.symlink_to(patch_path.name)
+        self.assertEqual(self.patch_response(self.store, run)[0], 400)
+        with patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+            self.assertEqual(self.patch_response(self.store, run)[0], 400)
+
     def test_feedback_with_local_evidence_still_verifies_inside_own_run(self):
         from adaptive_rsi.delivery import feedback
         run, directory, outcome = self.artifact_run()

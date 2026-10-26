@@ -589,7 +589,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not path.is_file():
                         raise ValueError("Missing patch")
                     payload = path.read_bytes()
-                except (ValueError, OSError):
+                except (ValueError, OSError, RuntimeError):
                     raise RequestError("Run has no artifacts in this state directory") from None
                 self.respond(payload, content_type="text/plain; charset=utf-8")
             elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
