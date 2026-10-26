@@ -19,7 +19,7 @@ from adaptive_rsi.credentials import CredentialError, Credentials
 from adaptive_rsi.model_center import CenterError
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Server
-from adaptive_rsi.store import Store
+from adaptive_rsi.store import Store, encode
 from tests.test_runtime import fixture
 
 
@@ -74,6 +74,206 @@ class DirectoryServer:
     def provider(self):
         return {"id": "gateway", "name": "Local gateway", "protocol": "chat_completions",
                 "base_url": "http://127.0.0.1:" + str(self.server.server_port), "env_key": ""}
+
+
+class ActiveRunCredentialTest(unittest.TestCase):
+    """仅使用临时数据库和内存钥匙串替身，不访问宿主凭据或网络。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.keys = {}
+        backend_patch = patch("adaptive_rsi.credentials.MacKeychain")
+        self.backend = backend_patch.start()
+        self.addCleanup(backend_patch.stop)
+        self.backend.return_value.request.side_effect = self.keychain_request
+        network_patch = patch("adaptive_rsi.native.post_json", return_value={
+            "choices": [{"message": {"role": "assistant", "tool_calls": [{
+                "id": "finish", "type": "function", "function": {
+                    "name": "finish", "arguments": '{"findings": []}'}}]}}],
+            "usage": {"total_tokens": 1}})
+        self.network = network_patch.start()
+        self.addCleanup(network_patch.stop)
+        self.runtime = Runtime(Store(self.root / "state"))
+        self.addCleanup(self.runtime.close)
+        self.center = self.runtime.model_center
+        self.data = {"id": "gateway", "name": "Fixture", "protocol": "chat_completions",
+                     "base_url": "https://fixture.invalid/v1", "env_key": ""}
+        self.center.save_provider(self.data, {"mode": "keychain", "value": "fixture-old"})
+        self.old = self.center.provider("gateway")
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.runtime.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                                   ("p", "Fixture", str(self.workspace), "{}", 0, time.time()))
+
+    def keychain_request(self, service, reference, operation, value=None):
+        if operation == "put":
+            self.keys[(service, reference)] = value
+        elif operation == "delete":
+            self.keys.pop((service, reference), None)
+        else:
+            return self.keys.get((service, reference), "")
+        return ""
+
+    def run_snapshot(self, run="r", state="planning", ended=None):
+        config = self.runtime.config("p")
+        config["models"]["analysis"] = {"provider": "gateway", "model": "fixture",
+                                          "effort": "default", "fallback": None}
+        task = self.runtime.store.add_task("p", "manual", run, "Fixture task")
+        self.runtime.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) VALUES (?,?,?,?,?,?,?)",
+                                   (run, task, "p", state, encode(config), time.time(), ended))
+        return self.runtime.store.one("SELECT * FROM runs WHERE id=?", (run,))
+
+    def rotate(self, mode="keychain"):
+        self.center.save_provider(self.data, {"mode": mode, "value": "fixture-new"})
+
+    def assert_missing(self, provider):
+        with self.assertRaises(CredentialError) as error:
+            self.center.credentials.get(provider)
+        self.assertEqual(error.exception.code, "missing_key")
+
+    def assert_retired(self, provider):
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"),
+                         {provider["secret_ref"]: provider["credential"]})
+
+    def test_rotation_keeps_sealed_native_run_working_until_last_run_ends(self):
+        first = self.run_snapshot()
+        # ended 而非状态名称决定运行是否仍可能调用模型。
+        self.run_snapshot("second", "waiting_provider")
+        self.rotate()
+        current = self.center.provider("gateway")
+        self.assertNotEqual(current["secret_ref"], self.old["secret_ref"])
+        self.assert_retired(self.old)
+        self.assertEqual(self.runtime.invoke("analysis", "Fixture only", self.workspace, first), {"findings": []})
+        self.assertEqual(self.network.call_args.args[2]["Authorization"], "Bearer fixture-old")
+        self.assertEqual(self.center.credentials.get(current), "fixture-new")
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        self.center.cleanup_credentials()
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='second'", (time.time(),))
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+        self.center.cleanup_credentials()
+        self.assertEqual(self.center.credentials.get(current), "fixture-new")
+
+    def test_removal_keeps_sealed_native_run_working_then_cleanup_survives_restart(self):
+        run = self.run_snapshot()
+        self.center.remove_provider("gateway")
+        self.assertEqual(self.runtime.config()["providers"], [])
+        self.assert_retired(self.old)
+        self.assertEqual(self.runtime.invoke("analysis", "Fixture only", self.workspace, run), {"findings": []})
+        self.assertEqual(self.network.call_args.args[2]["Authorization"], "Bearer fixture-old")
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        restarted = Runtime(Store(self.runtime.store.root))
+        try:
+            restarted.model_center.cleanup_credentials()
+            self.assert_missing(self.old)
+            self.assertEqual(restarted.store.setting("credential-cleanup-pending"), {})
+        finally:
+            restarted.close()
+
+    def test_malformed_unfinished_snapshot_defers_cleanup_conservatively(self):
+        self.run_snapshot()
+        for raw in ["{", "null", "{}", '{"providers": null}', '{"providers": [null]}']:
+            with self.subTest(config=raw):
+                self.runtime.store.execute("UPDATE runs SET config=? WHERE id='r'", (raw,))
+                self.rotate()
+                self.center.cleanup_credentials()
+                self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_file_backend_delete_failure_is_retryable(self):
+        self.rotate("file")
+        provider = self.center.provider("gateway")
+        with patch.object(self.center.credentials, "delete", side_effect=PermissionError("Fixture permissions")):
+            self.center.remove_provider("gateway")
+        self.assert_retired(provider)
+        self.assertEqual(self.center.credentials.get(provider), "fixture-new")
+        self.center.cleanup_credentials()
+        self.assert_missing(provider)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_completed_snapshot_does_not_pin_old_credential(self):
+        self.run_snapshot(state="planning", ended=time.time())
+        self.rotate()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_shared_project_reference_stays_until_final_current_reference_removed(self):
+        self.runtime.configure({"providers": [self.old]}, "p")
+        self.rotate()
+        self.center.cleanup_credentials()
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.assert_retired(self.old)
+        self.center.remove_provider("gateway", "p")
+        self.assert_missing(self.old)
+        self.assertEqual(self.center.credentials.get(self.center.provider("gateway")), "fixture-new")
+
+    def test_cleanup_failure_is_retryable_and_registry_contains_no_secret_material(self):
+        with patch.object(self.center.credentials, "delete", side_effect=CredentialError("keychain_locked")):
+            self.rotate()
+        self.assert_retired(self.old)
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.assertEqual(self.runtime.store.one("SELECT kind FROM events WHERE kind='credential_cleanup_failed'")["kind"],
+                         "credential_cleanup_failed")
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+        for file in self.runtime.store.root.iterdir():
+            if file.is_file():
+                self.assertNotIn(b"fixture-old", file.read_bytes())
+                self.assertNotIn(b"fixture-new", file.read_bytes())
+
+    def test_failed_configuration_keeps_old_key_and_durable_retirement(self):
+        def fail_configure(*args):
+            self.assert_retired(self.old)
+            raise ValueError("Fixture configuration failure")
+        with patch.object(self.runtime, "configure", side_effect=fail_configure):
+            with self.assertRaises(ValueError):
+                self.rotate()
+        self.assertEqual(len(self.keys), 1)
+        self.center.cleanup_credentials()
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.assert_retired(self.old)
+        self.center.remove_provider("gateway")
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_failed_removal_keeps_current_key_and_durable_retirement(self):
+        with patch.object(self.runtime, "configure", side_effect=ValueError("Fixture failure")):
+            with self.assertRaises(CenterError):
+                self.center.remove_provider("gateway")
+        self.assert_retired(self.old)
+        self.center.cleanup_credentials()
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+
+    def test_retirement_write_failure_rolls_back_new_key_without_changing_config(self):
+        with patch.object(self.center, "_retire_credential", side_effect=OSError("Fixture storage failure")):
+            with self.assertRaises(OSError):
+                self.rotate()
+        self.assertEqual(len(self.keys), 1)
+        self.assertEqual(self.center.provider("gateway"), self.old)
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+
+    def test_switching_storage_mode_retires_previous_backend(self):
+        self.run_snapshot()
+        self.rotate("session")
+        self.assert_retired(self.old)
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.runtime.store.execute("UPDATE runs SET ended=?", (time.time(),))
+        self.center.cleanup_credentials()
+        self.assert_missing(self.old)
+        self.assertEqual(self.center.credentials.get(self.center.provider("gateway")), "fixture-new")
+
+    def test_switching_to_no_auth_retires_previous_backend(self):
+        self.center.save_provider(self.data, {"mode": "none"})
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
 
 
 class ModelCenterTest(unittest.TestCase):
