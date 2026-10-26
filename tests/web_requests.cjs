@@ -1394,6 +1394,157 @@ async function openExperienceTask(page, task) {
   return page.node('detail-body').children.find(node => node.className === 'task-controls');
 }
 
+function queueForm(page) {
+  return page.node('detail-body').children.find(node => node.className === 'task-controls')
+    .children.filter(node => node.tagName === 'FORM').at(-1);
+}
+function changeDetailLanguage(page, language = 'en') {
+  Object.assign(page.context, {language: 'zh-CN', english: {}, translateStatic() {}});
+  page.node('language-select').value = language;
+  page.node('language-select').handlers.change();
+  return page.context.lastAction;
+}
+
+for (const trigger of ['language', 'supplement']) {
+  for (const remove of [false, true]) {
+    test(`${trigger} detail rebuild preserves queue ${remove ? 'removal' : 'new selection'} and posts the draft`, async () => {
+      const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+      let metadata = {...task, dependency: remove ? {dependency: 'parent'} : null, urgency: remove ? 1 : 0};
+      page.context.fetch = async (url, options) => {
+        if (options?.method === 'POST') {
+          posts.push({url, body: JSON.parse(options.body)});
+          if (url.endsWith('/task/revise')) metadata = {...metadata, state: 'deferred'};
+          return response({saved: true});
+        }
+        if (url.includes('/task-runs?')) return response([]);
+        if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+        return response(url.includes('id=parent&') ? fixtureTask('parent') : metadata);
+      };
+      const controls = await openExperienceTask(page, task);
+      let form = queueForm(page);
+      form.children[0].children[0].value = remove ? '' : 'parent';
+      form.children[1].children[0].checked = !remove;
+      if (trigger === 'language') await changeDetailLanguage(page);
+      else {
+        const supplement = controls.children.find(node => node.tagName === 'FORM');
+        supplement.children[0].children[0].value = 'Additional requirement';
+        supplement.onsubmit({preventDefault() {}}); await page.context.lastAction;
+      }
+      await new Promise(setImmediate);
+      form = queueForm(page);
+      assert.equal(form.children[0].children[0].value, remove ? '' : 'parent');
+      assert.equal(form.children[1].children[0].checked, !remove);
+      assert.equal(posts.filter(post => post.url.endsWith('/task/schedule')).length, 0);
+      form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+      assert.deepEqual(posts.at(-1).body, {task: task.id, dependency: remove ? null : 'parent', urgency: remove ? 0 : 1});
+    });
+  }
+}
+
+test('consecutive language rebuilds retain the draft while controls are still loading', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued');
+  let hold = false, release;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+    if (hold && url.includes('id=child&')) { hold = false; return new Promise(resolve => {release = () => resolve(response(task));}); }
+    return response(url.includes('id=parent&') ? fixtureTask('parent') : task);
+  };
+  await openExperienceTask(page, task);
+  queueForm(page).children[0].children[0].value = 'parent';
+  queueForm(page).children[1].children[0].checked = true;
+  hold = true;
+  await changeDetailLanguage(page);
+  assert.equal(typeof release, 'function');
+  await changeDetailLanguage(page, 'zh-CN'); await new Promise(setImmediate);
+  release(); await new Promise(setImmediate);
+  assert.equal(queueForm(page).children[0].children[0].value, 'parent');
+  assert.equal(queueForm(page).children[1].children[0].checked, true);
+});
+
+test('dependency pages reach the 202nd old failed parent with bounded reads and retain edits across paging and rebuild', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), requests = [], posts = [];
+  const tasks = [task, ...Array.from({length: 200}, (_, i) => fixtureTask('visible-' + i, 'queued')), fixtureTask('old-failed-parent')];
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push(JSON.parse(options.body)); return response({saved: true});}
+    if (url.includes('/task-runs?')) return response([]);
+    const params = new URL(url, 'http://fixture.test').searchParams;
+    if (url.includes('/state?')) {
+      requests.push(url);
+      assert.equal(params.get('project'), 'a'); assert.equal(params.get('limit'), '200');
+      assert.equal(params.get('filter'), 'all'); assert.equal(params.get('system'), 'false'); assert.equal(params.get('sections'), 'core');
+      const offset = Number(params.get('offset'));
+      return response({tasks: tasks.slice(offset, offset + 200), pagination: {has_more: offset + 200 < tasks.length, total: tasks.length}});
+    }
+    return response(fixtureTask(params.get('id'), params.get('id') === 'child' ? 'queued' : 'failed'));
+  };
+  await openExperienceTask(page, task);
+  let form = queueForm(page), select = form.children[0].children[0], pager = form.children[3];
+  assert.equal(requests.length, 1, 'opening must not download every page');
+  assert.equal(pager.children[0].disabled, true); assert.equal(pager.children[2].disabled, false);
+  assert.ok(!select.children.some(option => option.value === 'child'));
+  assert.ok(!select.children.some(option => option.value === 'old-failed-parent'));
+  pager.children[2].handlers.click(); await page.context.lastAction;
+  assert.equal(requests.length, 2); assert.equal(pager.children[2].disabled, true);
+  select.value = 'old-failed-parent'; form.children[1].children[0].checked = true;
+  pager.children[0].handlers.click(); await page.context.lastAction;
+  assert.equal(select.value, 'old-failed-parent'); assert.equal(form.children[1].children[0].checked, true);
+  assert.ok(select.children.length <= 202, 'pages replace candidates instead of accumulating the entire queue');
+  await page.context.refresh();
+  assert.equal(select.value, 'old-failed-parent');
+  await changeDetailLanguage(page); await new Promise(setImmediate);
+  form = queueForm(page); select = form.children[0].children[0];
+  assert.equal(select.value, 'old-failed-parent', 'off-page draft is restored after translation');
+  assert.equal(select.children.find(option => option.value === 'old-failed-parent').textContent, 'Task old-failed-parent');
+  form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+  assert.deepEqual(posts, [{task: 'child', dependency: 'old-failed-parent', urgency: 1}]);
+});
+
+for (const navigation of ['stay', 'close', 'project', 'other-task']) {
+  test(`pending dependency page preserves ${navigation} scope and edits; failed page can retry`, async () => {
+    const page = experiencePage(), task = fixtureTask('child', 'queued');
+    let release, fail = true, delayed = false, reads = 0;
+    page.context.fetch = async url => {
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) {
+        reads++;
+        if (url.includes('offset=200')) {
+          if (fail) {fail = false; return response({error: 'offline'}, 503);}
+          delayed = true; return new Promise(resolve => {release = () => resolve(response({tasks: [fixtureTask('late-parent')], pagination: {has_more: false}}));});
+        }
+        return response({tasks: [fixtureTask('parent'), fixtureTask('new-parent')], pagination: {has_more: true}});
+      }
+      return response(url.includes('id=other&') ? fixtureTask('other', 'queued') : task);
+    };
+    await openExperienceTask(page, task);
+    const form = queueForm(page), select = form.children[0].children[0], pager = form.children[3];
+    select.value = 'parent';
+    pager.children[2].handlers.click(); await assert.rejects(page.context.lastAction);
+    assert.equal(pager.children[2].disabled, false); assert.equal(select.value, 'parent');
+    pager.children[2].handlers.click(); const pending = page.context.lastAction;
+    await new Promise(setImmediate); assert.equal(delayed, true);
+    pager.children[2].handlers.click(); await page.context.lastAction;
+    assert.equal(reads, 3, 'double clicks do not issue overlapping page reads');
+    select.value = 'new-parent'; form.children[1].children[0].checked = true;
+    if (navigation === 'close') page.context.closeTaskDetail();
+    if (navigation === 'project') {page.context.closeTaskDetail(); vm.runInContext('projectId="b"', page.context);}
+    if (navigation === 'other-task') await openExperienceTask(page, fixtureTask('other', 'queued'));
+    const before = page.node('detail-body').children.slice();
+    release(); await pending;
+    if (navigation === 'stay') {
+      assert.equal(select.value, 'new-parent'); assert.equal(form.children[1].children[0].checked, true);
+      assert.ok(select.children.some(option => option.value === 'late-parent'));
+    } else {
+      assert.deepEqual(page.node('detail-body').children, before);
+      assert.ok(!select.children.some(option => option.value === 'late-parent'), 'late page cannot mutate obsolete controls');
+      if (navigation === 'other-task') {
+        assert.equal(queueForm(page).children[0].children[0].value, '');
+        assert.equal(queueForm(page).children[1].children[0].checked, false);
+      }
+    }
+  });
+}
+
 test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'queued');
   let metadata = task, reads = 0;

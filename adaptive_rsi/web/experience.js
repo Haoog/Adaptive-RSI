@@ -413,28 +413,69 @@ window.RSIExperience = (() => {
         none = el("option", t("无前置任务"));
       none.value = "";
       select.append(none);
-      const candidates = await api(
-        "state?project=" +
-          task.project +
-          "&limit=200&filter=all&system=false&sections=core",
-      );
-      if (!current()) return;
-      for (const other of candidates.tasks || [])
-        if (other.id !== task.id) {
-          const option = el("option", other.title);
-          option.value = other.id;
-          select.append(option);
-        }
       const dependency = metadata.dependency?.dependency || "";
+      const pager = el("div", undefined, "task-pagination"),
+        pageNote = el("span");
+      pageNote.setAttribute("aria-live", "polite");
+      let offset = 0, hasMore = false, loading = false;
+      const previous = action(t("上一页"), () => loadCandidates(Math.max(0, offset - 200)), "text-button"),
+        next = action(t("下一页"), () => loadCandidates(offset + 200), "text-button");
+      previous.type = next.type = "button";
+      pager.append(previous, pageNote, next);
+      function pagingState() {
+        previous.disabled = loading || offset === 0;
+        next.disabled = loading || !hasMore;
+      }
+      async function loadCandidates(requestedOffset) {
+        if (!current() || loading) return;
+        loading = true;
+        pagingState();
+        try {
+          const candidates = await api(
+            "state?project=" + encodeURIComponent(task.project) +
+            "&limit=200&offset=" + requestedOffset + "&filter=all&system=false&sections=core",
+          );
+          if (!current()) return;
+          // Read at response time so edits made while a page loads remain selected.
+          const selected = select.value || "", pinned = new Map();
+          for (const option of select.children)
+            if (option.value && [dependency, selected].includes(option.value))
+              pinned.set(option.value, {id: option.value, title: option.textContent});
+          const choices = new Map(pinned);
+          for (const other of candidates.tasks || [])
+            if (other.id !== task.id) choices.set(other.id, other);
+          select.replaceChildren(none);
+          for (const other of choices.values()) {
+            const option = el("option", other.title);
+            option.value = other.id;
+            select.append(option);
+          }
+          select.value = selected;
+          offset = requestedOffset;
+          hasMore = !!candidates.pagination?.has_more;
+          pageNote.textContent = t("前置任务候选页") + " " + (offset / 200 + 1);
+        } finally {
+          loading = false;
+          if (current()) pagingState();
+        }
+      }
+      // Seed saved/draft selections before loading, including an off-page parent.
       for (const id of new Set([dependency, queueDraft?.dependency])) {
-        if (!id || (candidates.tasks || []).some(other => other.id === id)) continue;
-        const parent = await api("task?id=" + encodeURIComponent(id) + "&project=" + encodeURIComponent(task.project));
-        if (!current()) return;
-        const option = el("option", parent.title);
-        option.value = parent.id;
+        if (!id) continue;
+        const option = el("option", id);
+        option.value = id;
         select.append(option);
       }
       select.value = queueDraft?.dependency ?? dependency;
+      // Resolve seed titles once; subsequent pages pin only the saved and selected parent.
+      for (const option of [...select.children]) {
+        if (!option.value) continue;
+        const parent = await api("task?id=" + encodeURIComponent(option.value) + "&project=" + encodeURIComponent(task.project));
+        if (!current()) return;
+        option.textContent = parent.title;
+      }
+      await loadCandidates(0);
+      if (!current()) return;
       label.append(select);
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");
@@ -448,7 +489,7 @@ window.RSIExperience = (() => {
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
-      form.append(label, urgencyLabel, submit);
+      form.append(label, urgencyLabel, submit, pager);
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
@@ -493,8 +534,12 @@ window.RSIExperience = (() => {
     }
     body.append(controls);
   }
+  function readQueueDraft() {
+    return queueDraftReaders.get($("detail-body"))?.();
+  }
   function taskOpened(task, queueDraft) {
     queueDraftReaders.delete($("detail-body"));
+    if (queueDraft) queueDraftReaders.set($("detail-body"), () => queueDraft);
     clearTimeout(liveTimer);
     lastDetail = "";
     const url = new URL(location.href);
@@ -537,7 +582,7 @@ window.RSIExperience = (() => {
       // Task state can change before any run exists. Keep forms intact on unchanged polls.
       if (metadata.state !== task.state) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
-        const queueDraft = queueDraftReaders.get($("detail-body"))?.();
+        const queueDraft = readQueueDraft();
         await showTask(metadata, restore, queueDraft);
         if (detailSequence === ticket + 1 && projectId === task.project && $("detail-dialog").open) {
           restore($("detail-body"));
@@ -885,7 +930,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, taskOpened, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
 })();
 
 'use strict';

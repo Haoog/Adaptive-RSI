@@ -97,6 +97,13 @@ def main():
                 for name in ["过时任务重试入口", "过时任务补充入口"]:
                     obsolete = runtime.store.add_task(project, "goal", name, name)
                     runtime.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete,))
+            if os.environ.get("RSI_BROWSER_QUEUE_ONLY"):
+                child = runtime.store.add_task(project, "goal", "queue-child", "排队草稿验证")
+                for index in range(200):
+                    runtime.store.add_task(project, "goal", "queue-page-" + str(index), "依赖分页任务 " + str(index))
+                parent = runtime.store.add_task(project, "goal", "queue-old-parent", "旧失败前置任务")
+                runtime.store.execute("UPDATE tasks SET state='failed',updated=1 WHERE id=?", (parent,))
+                runtime.store.execute("UPDATE tasks SET urgency=1 WHERE id=?", (child,))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()

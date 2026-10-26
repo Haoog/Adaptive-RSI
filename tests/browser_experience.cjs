@@ -144,6 +144,49 @@ async function checkGoalRecovery(page, evidence) {
     await page.unroute('**/api/goal', intercept);
   }
 }
+async function checkQueueEditor(page, evidence) {
+  await page.locator('#language-select').selectOption('zh-CN');
+  await page.getByRole('button', {name: '排队草稿验证', exact: true}).click();
+  const box = page.getByRole('dialog', {name: '排队草稿验证', exact: true});
+  const select = box.getByRole('combobox', {name: '前置任务（合并后再开始）', exact: true});
+  await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+  assert.equal(await select.getByRole('option', {name: '旧失败前置任务', exact: true}).count(), 0);
+  await box.getByRole('button', {name: '下一页', exact: true}).click();
+  await box.getByText('前置任务候选页 2', {exact: true}).waitFor();
+  await select.selectOption({label: '旧失败前置任务'});
+  const parent = await select.inputValue();
+  await box.getByRole('checkbox', {name: '优先处理', exact: true}).uncheck();
+  await box.getByRole('button', {name: '上一页', exact: true}).click();
+  await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+  assert.equal(await select.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: '优先处理', exact: true}).isChecked(), false);
+  await page.locator('#language-select').selectOption('en');
+  const english = box.getByRole('combobox', {name: 'Predecessor (start after it merges)', exact: true});
+  await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Queue supplement preserves original draft');
+  await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
+  await box.getByText('Requirement revisions', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  const saved = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule' && r.request().method() === 'POST');
+  await box.getByRole('button', {name: 'Save queue settings', exact: true}).click();
+  const result = await saved;
+  assert.equal(result.status(), 200, await result.text());
+  assert.deepEqual(result.request().postDataJSON(), {task: new URL(page.url()).hash.match(/task=([^&]+)/)[1], dependency: parent, urgency: 0});
+  const size = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
+  assert.ok(size.scroll <= size.width, JSON.stringify(size));
+  await page.reload();
+  await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent, 'real server persists the off-page dependency');
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  const stored = await evidence([]);
+  assert.ok(stored.projects.every(project => project.paused));
+  assert.equal(stored.calls, 0);
+  console.log('Queue editor browser passed: old failed parent, bounded paging, bilingual drafts, supplement, real schedule persistence, mobile layout, paused projects and zero model calls.');
+}
+
 (async () => {
   const server = spawn(
     process.env.PYTHON || "python3",
@@ -185,6 +228,11 @@ async function checkGoalRecovery(page, evidence) {
       .locator("#project-status")
       .filter({ hasText: "已暂停" })
       .waitFor();
+    if (process.env.RSI_BROWSER_QUEUE_ONLY) {
+      await checkQueueEditor(page, evidence);
+      assert.deepEqual(errors, []);
+      return;
+    }
     for (const name of ["overview", "models", "usage"])
       assert.equal(
         await page.locator(`.sidebar nav [data-view="${name}"]`).isVisible(),

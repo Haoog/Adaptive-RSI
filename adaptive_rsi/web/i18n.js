@@ -1167,6 +1167,7 @@ const english = {
   "全部模型": "All models",
   "仅已启用": "Enabled only",
   "仅收藏": "Favorites only",
+  "前置任务候选页": "Dependency candidate page",
   "上一页": "Previous",
   "下一页": "Next",
   "个模型": "models",
