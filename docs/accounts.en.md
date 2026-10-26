@@ -43,7 +43,7 @@ Choose the service, enter its endpoint and key, then save and fetch models. Loca
 
 ## Storage and recovery
 
-- Successful login refreshes the model directory without automatically running potentially paid model tests.
+- Successful login refreshes the model directory without automatically running potentially paid model tests. A manually opened model test uses the project scope captured when it opened. Switching projects or settings scopes closes the old dialog, and late results cannot replace feedback in the new project.
 - Credentials use the runtime machine's CLI authentication location with `0600` file permissions. Codes, authorization links and keys are not written to project tasks, events or browser local storage.
 - macOS uses local CLIs. Linux servers without host CLIs use the cached trusted worker image. Authentication containers mount only a temporary HOME; the temporary OpenCode endpoint is loopback-only and password-protected.
 - If a CLI or image is missing, install the corresponding CLI or rebuild `deploy/Dockerfile.worker`. Restarting is not a replacement for login. Ordinary saved settings take effect immediately.
