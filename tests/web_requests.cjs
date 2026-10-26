@@ -1039,6 +1039,79 @@ for (const dependency of ['draft-parent', '']) {
   });
 }
 
+for (const editTiming of ['after acknowledgement', 'during save']) {
+  test(`queue save rebases drafts while preserving edits ${editTiming}`, async () => {
+    const page = experiencePage(), task = fixtureTask('runless', 'deferred'), posts = [];
+    let metadata = task, acknowledge;
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) {
+        const submitted = JSON.parse(options.body); posts.push(submitted);
+        return new Promise(resolve => { acknowledge = () => {
+          metadata = {...metadata, dependency: {dependency: submitted.dependency}, urgency: submitted.urgency};
+          resolve(response({saved: true}));
+        }; });
+      }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+      return response(metadata);
+    };
+    const controls = await openExperienceTask(page, task);
+    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const dependency = form.children[0].children[0], urgency = form.children[1].children[0];
+    dependency.value = 'parent'; urgency.checked = true;
+    form.onsubmit({preventDefault() {}});
+    const pending = page.context.lastAction;
+    await new Promise(setImmediate);
+    if (editTiming === 'during save') { dependency.value = ''; urgency.checked = false; }
+    acknowledge(); await pending;
+    if (editTiming === 'after acknowledgement') { dependency.value = ''; urgency.checked = false; }
+    assert.deepEqual(posts, [{task: task.id, dependency: 'parent', urgency: 1}]);
+    assert.equal(dependency.value, '', 'acknowledgement keeps the newer selection');
+    assert.equal(urgency.checked, false, 'acknowledgement keeps the newer urgency');
+    metadata = {...metadata, state: 'queued'};
+    page.fireTimer(5000); await new Promise(setImmediate);
+    await page.context.lastAction;
+    const updated = page.node('detail-body').children.find(node => node.className === 'task-controls');
+    const rebuilt = updated.children.filter(node => node.tagName === 'FORM').at(-1);
+    assert.equal(rebuilt.children[0].children[0].value, '', 'returning to the opened value remains an unsaved edit after saving');
+    assert.equal(rebuilt.children[1].children[0].checked, false);
+  });
+}
+
+for (const navigation of ['close', 'project', 'other-task']) {
+  test(`a queue save acknowledgement cannot affect ${navigation} navigation`, async () => {
+    const page = experiencePage(), task = fixtureTask('runless', 'deferred');
+    let acknowledge, refreshes = 0;
+    page.context.refresh = async () => { refreshes++; };
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) return new Promise(resolve => { acknowledge = () => resolve(response({saved: true})); });
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+      return response(url.includes('id=other&') ? fixtureTask('other', 'queued') : task);
+    };
+    const controls = await openExperienceTask(page, task);
+    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    form.children[0].children[0].value = 'parent';
+    form.children[1].children[0].checked = true;
+    form.onsubmit({preventDefault() {}});
+    const pending = page.context.lastAction;
+    await new Promise(setImmediate);
+    if (navigation === 'close') page.context.closeTaskDetail();
+    if (navigation === 'project') { page.context.closeTaskDetail(); vm.runInContext('projectId="b"', page.context); }
+    if (navigation === 'other-task') await openExperienceTask(page, fixtureTask('other', 'queued'));
+    const before = page.node('detail-body').children.slice(), toast = page.node('toast').textContent;
+    acknowledge(); await pending;
+    assert.deepEqual(page.node('detail-body').children, before);
+    assert.equal(refreshes, 0, 'obsolete save does not refresh the new context');
+    assert.equal(page.node('toast').textContent, toast, 'obsolete save does not announce success in the new context');
+    if (navigation === 'other-task') {
+      const other = page.node('detail-body').children.find(node => node.className === 'task-controls').children.filter(node => node.tagName === 'FORM').at(-1);
+      assert.equal(other.children[0].children[0].value, '');
+      assert.equal(other.children[1].children[0].checked, false);
+    }
+  });
+}
+
 test('runless metadata rebuilding accepts server queue changes for untouched fields', async () => {
   const page = experiencePage(), task = fixtureTask('runless', 'deferred');
   let metadata = task;

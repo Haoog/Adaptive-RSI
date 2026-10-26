@@ -440,9 +440,10 @@ window.RSIExperience = (() => {
         urgency = el("input");
       urgency.type = "checkbox";
       urgency.checked = queueDraft?.urgency ?? !!metadata.urgency;
+      let baseline = {dependency, urgency: !!metadata.urgency};
       queueDraftReaders.set(body, () => ({
-        ...(select.value !== dependency ? {dependency: select.value} : {}),
-        ...(urgency.checked !== !!metadata.urgency ? {urgency: urgency.checked} : {}),
+        ...(select.value !== baseline.dependency ? {dependency: select.value} : {}),
+        ...(urgency.checked !== baseline.urgency ? {urgency: urgency.checked} : {}),
       }));
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
@@ -451,13 +452,14 @@ window.RSIExperience = (() => {
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
-          await api("task/schedule", {
-            task: task.id,
-            dependency: select.value || null,
-            urgency: urgency.checked ? 1 : 0,
-          });
+          if (!current()) return;
+          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          await api("task/schedule", submitted);
+          if (!current()) return;
+          // The endpoint acknowledges these exact values; newer edits stay in the controls.
+          baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
           await refresh();
-          toast(t("排队设置已保存"));
+          if (current()) toast(t("排队设置已保存"));
         });
       };
       controls.append(form);
