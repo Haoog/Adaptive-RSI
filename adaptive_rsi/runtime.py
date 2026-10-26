@@ -1338,6 +1338,8 @@ class Runtime:
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < 3600:
             return
+        with self.scheduler_scope("credential_cleanup"):
+            self.model_center.cleanup_credentials()
         for project in self.store.query("SELECT * FROM projects"):
             with self.scheduler_scope("maintenance_project", project["id"]):
                 config = self.config(project["id"])

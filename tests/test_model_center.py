@@ -198,6 +198,31 @@ class ActiveRunCredentialTest(unittest.TestCase):
         self.assert_missing(provider)
         self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
 
+    def test_maintenance_reclaims_retired_key_after_run_finishes(self):
+        self.run_snapshot()
+        self.rotate()
+        self.runtime.maintenance()
+        self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
+        self.assert_retired(self.old)
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        self.runtime.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assert_missing(self.old)
+        self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
+
+    def test_maintenance_cleanup_failure_does_not_block_other_retention(self):
+        self.run_snapshot()
+        self.rotate()
+        self.runtime.store.execute("UPDATE runs SET ended=? WHERE id='r'", (time.time(),))
+        with patch.object(self.center, "cleanup_credentials", side_effect=RuntimeError("Fixture cleanup failure")):
+            self.runtime.maintenance()
+        self.assertGreater(self.runtime.store.setting("maintenance-last", 0), 0)
+        self.assertEqual(self.runtime.store.one("SELECT data FROM events WHERE kind='scheduler_error'")["data"].find("credential_cleanup") >= 0, True)
+        self.assert_retired(self.old)
+        self.runtime.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assert_missing(self.old)
+
     def test_completed_snapshot_does_not_pin_old_credential(self):
         self.run_snapshot(state="planning", ended=time.time())
         self.rotate()
