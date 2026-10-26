@@ -5,7 +5,7 @@ from pathlib import Path
 from .config import merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, checked
-from .store import encode
+from .store import encode, uid
 
 
 class StaleCandidate(RuntimeError):
@@ -373,11 +373,36 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path
     saved = json.loads(run["config"])
     try:
-        directory = run_artifact_path(runtime.store, run, "feedback/" + str(int(now)))
+        output_name = "feedback/" + str(time.time_ns()) + "-" + uid()
+        directory = run_artifact_path(runtime.store, run, output_name)
+
+        def output_path(name):
+            target = run_artifact_path(runtime.store, run, output_name + "/" + name)
+            if target != directory / name:
+                raise ValueError(MISSING_ARTIFACTS)
+            return target
+
+        # Check actual destinations, including Git metadata and the evaluator report,
+        # before any fetch or write. An old output tree must never be reused.
+        for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
+                     "evaluation", "evaluation/report.json"):
+            output_path(name)
+        if directory.exists():
+            raise ValueError(MISSING_ARTIFACTS)
         if not run_artifact_path(runtime.store, run).is_dir():
             raise ValueError(MISSING_ARTIFACTS)
         acceptance_path = run_artifact_path(runtime.store, run, "acceptance.json")
         acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
+        if acceptance_path.exists():
+            from .agent import SCHEMAS, object_schema, validate_output
+            if not isinstance(acceptance, dict):
+                raise ValueError(MISSING_ARTIFACTS)
+            validate_output({key: acceptance.get(key) for key in ("hash", "criteria", "checks", "spec")},
+                            object_schema({"hash": {"type": "string"},
+                                           "criteria": {"type": "array", "items": {"type": "string"}},
+                                           "checks": {"type": "array", "items": object_schema({
+                                               "name": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
+                                               "cwd": {"type": "string"}})}, "spec": SCHEMAS["acceptance"]}))
         expected_acceptance = outcome.get("evaluation", {}).get("acceptance_hash")
         if expected_acceptance and (not acceptance or acceptance.get("hash") != expected_acceptance):
             raise ValueError(MISSING_ARTIFACTS)
@@ -385,7 +410,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         for relative in saved["environment"]["seed_paths"]:
             if not run_artifact_path(runtime.store, run, "dependencies/" + relative).is_dir():
                 raise ValueError(MISSING_ARTIFACTS)
-    except (ValueError, OSError):
+        directory.parent.mkdir(exist_ok=True)
+        directory.mkdir(mode=0o700)  # Exclusive: refuse collisions instead of overwriting evidence.
+    except (ValueError, OSError, RuntimeError):
         previous = outcome.get("feedback", {})
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
@@ -412,14 +439,15 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         outcome["feedback_polled_at"] = now
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
-    baseline_tree = snapshot(source, directory / "baseline", outcome["merged_sha"])
-    current_tree = snapshot(source, directory / "current", head)
+    baseline_tree = snapshot(source, output_path("baseline"), outcome["merged_sha"])
+    current_tree = snapshot(source, output_path("current"), head)
     from .adapters import detect
     if acceptance:
         acceptance["change_kind"] = "preservation"
     checks = saved["checks"] or detect(baseline_tree)["checks"]
     effective = {**config, "environment": saved["environment"]}
-    result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, directory / "evaluation", effective,
+    output_path("evaluation/report.json")
+    result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"), effective,
                                        cancel=cancel, acceptance=acceptance, seeds=seeds)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")

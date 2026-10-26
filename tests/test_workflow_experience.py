@@ -395,7 +395,9 @@ class ExperienceTest(unittest.TestCase):
         directory = self.store.root / "runs" / run["id"]
         directory.mkdir(parents=True)
         (directory / "candidate.patch").write_bytes(b"PRIVATE original patch")
-        (directory / "acceptance.json").write_text(encode({"hash": "sealed-hash", "spec": {"files": []}}))
+        (directory / "acceptance.json").write_text(encode({"hash": "sealed-hash", "criteria": ["preserves behavior"],
+            "checks": [{"name": "preservation", "argv": ["python3", "-V"], "cwd": "."}],
+            "spec": {"files": [], "checks": []}}))
         (directory / "dependencies").mkdir()
         outcome = {"pr": "https://github.com/example/project/pull/7", "merged_sha": "a" * 40,
                    "merged_at": time.time(), "evaluation": {"acceptance_hash": "sealed-hash"},
@@ -491,13 +493,14 @@ class ExperienceTest(unittest.TestCase):
         from adaptive_rsi.delivery import feedback
         run, directory, outcome = self.artifact_run()
         config = self.runtime.config(self.project)
+        acceptance = (directory / "acceptance.json").read_text()
         for missing in ("acceptance", "dependencies"):
             with self.subTest(missing=missing):
                 saved = json.loads(run["config"])
                 if missing == "acceptance":
                     (directory / "acceptance.json").unlink()
                 else:
-                    (directory / "acceptance.json").write_text('{"hash":"sealed-hash"}')
+                    (directory / "acceptance.json").write_text(acceptance)
                     saved["environment"]["seed_paths"] = ["vendor"]
                 current = {**run, "config": json.dumps(saved)}
                 result = dict(outcome)
@@ -508,6 +511,91 @@ class ExperienceTest(unittest.TestCase):
                 self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
                 self.assertIn("fresh verification", result["feedback"]["reason"])
                 self.assertFalse((directory / "feedback").exists())
+
+    def test_feedback_rejects_preexisting_nested_output_symlinks_before_fetch(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        outputs = ("baseline", "baseline/.git", "baseline/.git/config", "current", "current/.git",
+                   "current/.git/config", "evaluation", "evaluation/report.json",
+                   "evaluation/baseline", "evaluation/candidate", "evaluation/acceptance_baseline",
+                   "evaluation/acceptance_candidate")
+        for index, name in enumerate(outputs):
+            with self.subTest(output=name):
+                nonce = "nested-" + str(index)
+                output = directory / "feedback" / ("123-" + nonce)
+                target = output / name
+                target.parent.mkdir(parents=True)
+                outside = self.root / ("outside-" + str(index))
+                outside.mkdir()
+                (outside / "marker").write_bytes(b"PRIVATE untouched")
+                (outside / ".git").mkdir()
+                (outside / ".git" / "config").write_bytes(b"PRIVATE git config")
+                if name.endswith(("config", "report.json")):
+                    target.symlink_to(outside / "marker")
+                else:
+                    target.symlink_to(outside, target_is_directory=True)
+                before = {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()}
+                result = dict(outcome)
+                with patch("adaptive_rsi.delivery.time.time_ns", return_value=123), patch("adaptive_rsi.delivery.uid", return_value=nonce), patch("adaptive_rsi.delivery.baseline") as fetch, patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+                    feedback(self.runtime, self.runtime.project(self.project), run, result, self.runtime.config(self.project), time.time())
+                fetch.assert_not_called()
+                snapshot.assert_not_called()
+                evaluate.assert_not_called()
+                self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+                self.assertEqual(before, {p.relative_to(outside): p.read_bytes() for p in outside.rglob("*") if p.is_file()})
+
+    def test_feedback_same_timestamp_uses_fresh_exclusive_output_directories(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        destinations = []
+        def snapshot(source, target, sha):
+            target.mkdir()
+            destinations.append(target)
+            return target
+        with patch("adaptive_rsi.delivery.time.time_ns", return_value=123), patch("adaptive_rsi.delivery.uid", side_effect=["first", "second"]), patch("adaptive_rsi.delivery.baseline", return_value=("fixture", "new-head", "main")), patch("adaptive_rsi.delivery.snapshot", side_effect=snapshot), patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}):
+            for _ in range(2):
+                feedback(self.runtime, self.runtime.project(self.project), run, dict(outcome), self.runtime.config(self.project), time.time())
+        self.assertEqual({p.parent.name for p in destinations}, {"123-first", "123-second"})
+        self.assertTrue(all(p.is_relative_to(directory) for p in destinations))
+        output = directory / "feedback" / "123-first"
+        (output / "marker").write_bytes(b"existing evidence")
+        with patch("adaptive_rsi.delivery.time.time_ns", return_value=123), patch("adaptive_rsi.delivery.uid", return_value="first"), patch("adaptive_rsi.delivery.baseline") as fetch, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, dict(outcome), self.runtime.config(self.project), time.time())
+        fetch.assert_not_called()
+        evaluate.assert_not_called()
+        self.assertEqual((output / "marker").read_bytes(), b"existing evidence")
+
+    def test_feedback_malformed_acceptance_and_symlink_loops_still_reconcile_receipts(self):
+        from adaptive_rsi.delivery import tick
+        from adaptive_rsi.store import encode
+        self.runtime.configure({"github": {"repository": "example/project"}}, self.project)
+        run, directory, outcome = self.artifact_run()
+        receipt = {"state": "submitted", "operation_id": "receipt"}
+        self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.put_setting("automation:" + run["id"] + ":deploy", receipt)
+        acceptance = directory / "acceptance.json"
+        original = acceptance.read_text()
+        for index, malformed in enumerate(("[1]", '{"hash":"sealed-hash","spec":[]}', "not JSON", "loop")):
+            with self.subTest(evidence=malformed):
+                if malformed == "loop":
+                    acceptance.unlink()
+                    acceptance.symlink_to(acceptance.name)
+                else:
+                    acceptance.write_text(malformed)
+                self.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+                with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project"), patch("adaptive_rsi.delivery.baseline") as fetch, patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(self.runtime.evaluator, "evaluate") as evaluate, patch("adaptive_rsi.release.reconcile", return_value=receipt) as reconcile:
+                    tick(self.runtime, time.time() + index * 61, project_id=self.project)
+                fetch.assert_not_called()
+                snapshot.assert_not_called()
+                evaluate.assert_not_called()
+                reconcile.assert_called_once()
+                result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+                self.assertEqual(result["feedback"]["previous"]["state"], "verified")
+                self.assertEqual(self.store.query("SELECT * FROM events WHERE kind='delivery_error'"), [])
+        acceptance.unlink()
+        acceptance.write_text(original)
+        self.assertFalse((directory / "feedback").exists())
 
     def test_feedback_with_local_evidence_still_verifies_inside_own_run(self):
         from adaptive_rsi.delivery import feedback
