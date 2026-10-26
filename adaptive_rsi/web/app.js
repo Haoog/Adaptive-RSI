@@ -156,7 +156,7 @@ function requestedStateSections(){
  return sections;
 }
 async function refresh(){
- const requestedProject=projectId,sections=requestedStateSections(),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
+ const requestedProject=projectId,requestedView=view,sections=requestedStateSections(),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
  const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
  if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
  const ticket=++refreshSequence;clearTimeout(refreshPollTimer);
@@ -164,7 +164,16 @@ async function refresh(){
  refreshController=controller;refreshProject=requestedProject;refreshKey=key;let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
  const operation=(async()=>{
   try{
-   const next=await api('state?'+query,undefined,{signal:controller.signal});if(ticket!==refreshSequence||requestedProject!==projectId)return;
+   const current=()=>!controller.signal.aborted&&ticket===refreshSequence&&requestedProject===projectId&&requestedView===view&&(!taskView||(taskOffset===offset&&$('task-filter').value===filter&&String($('show-system-tasks').checked)===system));
+   let next=await api('state?'+query,undefined,{signal:controller.signal});if(!current())return;
+   // A shrinking group can strand the last page. Retry its first page once, under the same cancellation guard.
+   const correctPage=taskView&&next.selected_project===requestedProject&&offset>0&&next.pagination?.offset===offset&&offset>=next.pagination.total;
+   if(correctPage){
+    query.set('offset','0');
+    next=await api('state?'+query,undefined,{signal:controller.signal});if(!current())return;
+    if(next.selected_project!==requestedProject||next.pagination?.offset!==0)return;
+    taskOffset=0;
+   }
    if(bootBuild&&next.build&&bootBuild!==next.build)$('reload-ui').hidden=false;if(state&&state.version!==next.version&&next.version!==lastUpdateToast){lastUpdateToast=next.version;toast(t('后台已更新，当前输入已保留。刷新页面可加载新版界面。'));}
    const previousProject=state?.selected_project,returned=new Set(Array.isArray(next.sections)?next.sections:[]);
    if(!next.sections){if(Object.hasOwn(next,'candidates'))returned.add('candidates');if(['cases','quality','usage','model_usage'].every(key=>Object.hasOwn(next,key)))returned.add('analytics');}
@@ -281,11 +290,13 @@ function showView(name){
 }
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
- if(!changedList(list,[filter,$('show-system-tasks').checked,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs)]))return;
+ if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs)]))return;
  list.replaceChildren();
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
- const page=state.selected_project&&state.selected_project!==projectId?null:state.pagination;$('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(page.total?taskOffset+1:0)+'–'+Math.min(taskOffset+page.limit,page.total)+' / '+page.total:'';
+ const candidate=state.selected_project&&state.selected_project!==projectId?null:state.pagination;
+ const page=candidate&&candidate.offset===taskOffset&&(candidate.total===0?candidate.offset===0:candidate.offset<candidate.total)?candidate:null;
+ $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
  if(!tasks.length)list.append(el('p',t('这里暂无任务。其他分组中可能有历史记录。'),'empty-copy'));
  for(const task of tasks){
   const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');
@@ -318,9 +329,9 @@ function taskOutcome(data){
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
  if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}outcome.append(stageProgress(data));return outcome;
 }
-async function showTask(task,restoreView){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
+async function showTask(task,restoreView,queueDraft){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
- window.RSIExperience?.taskOpened(task);
+ window.RSIExperience?.taskOpened(task,queueDraft);
  const evidence=el('details',undefined,'detail-section');evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',JSON.stringify(JSON.parse(task.evidence),null,2)));body.append(evidence);
  const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(ticket!==detailSequence||projectId!==project)return;
  async function loadRun(run,index,section){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;

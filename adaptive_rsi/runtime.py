@@ -1347,7 +1347,13 @@ class Runtime:
                         if run["state"] == "pr_open" or run["state"] == "merged" and not json.loads(run["result"]).get("monitoring_completed"):
                             continue
                         directory = Path(run["path"])
-                        directory.relative_to(self.store.root / "runs")
+                        runs_root = self.store.root / "runs"
+                        relative = directory.relative_to(runs_root)
+                        # 只清理该运行的直属目录；词法包含检查不能阻止 .. 或祖先符号链接。
+                        if (relative.parts != (run["id"],) or run["id"] in (".", "..") or
+                                any(path.is_symlink() for path in (directory, *directory.parents))):
+                            raise ValueError("Unsafe retention run path")
+                        directory.resolve().relative_to(runs_root.resolve())
                         for name in ["workspace", "candidate", "baseline", "evaluation", "experiments", "dependencies", "acceptance-design"]:
                             target = directory / name
                             if target.is_dir() and not target.is_symlink():
@@ -1374,12 +1380,23 @@ class Runtime:
                            "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed'))", (stale,))
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
+        # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
+        prefixes = ("run-baseline:", "automation:", "delivery:")
+        # 独立的精确键/冒号前缀范围查询可使用 settings 主键索引，避免逐运行全表扫描。
+        # ':' 的后继字符是 ';'，二进制排序范围只覆盖该运行的冒号后缀键。
+        remaining = " OR ".join(
+            "EXISTS (SELECT 1 FROM settings s WHERE s.key='" + prefix + "'||r.id) OR "
+            "EXISTS (SELECT 1 FROM settings s WHERE s.key>='" + prefix + "'||r.id||':' "
+            "AND s.key<'" + prefix + "'||r.id||';')"
+            for prefix in prefixes)
         for run in self.store.query(
-                "SELECT id FROM runs WHERE ended IS NOT NULL AND ended<? AND state NOT IN "
-                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') LIMIT 200", (stale,)):
-            for prefix in ("run-baseline:", "automation:", "delivery:"):
-                self.store.execute("DELETE FROM settings WHERE key=? OR key LIKE ?",
-                                   (prefix + run["id"], prefix + run["id"] + ":%"))
+                "SELECT r.id FROM runs r WHERE r.ended IS NOT NULL AND r.ended<? AND r.state NOT IN "
+                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') AND (" +
+                remaining + ") LIMIT 200", (stale,)):
+            for prefix in prefixes:
+                key = prefix + run["id"]
+                self.store.execute("DELETE FROM settings WHERE key=? OR (key>=? AND key<?)",
+                                   (key, key + ":", key + ";"))
         for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? LIMIT 200", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", ("triage-state:" + task["id"],))
         # 过滤在 LIMIT 之前完成：新鲜条目占满一批时，过期条目仍能在本轮被删除。

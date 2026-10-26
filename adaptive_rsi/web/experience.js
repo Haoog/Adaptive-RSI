@@ -14,6 +14,7 @@ window.RSIExperience = (() => {
     lastDetail = "",
     inboxBusy = false,
     inboxAt = 0;
+  const queueDraftReaders = new WeakMap();
   const notificationKey = "rsi-notifications:" + location.origin;
   function readSaved(key, fallback) {
     try {
@@ -317,7 +318,7 @@ window.RSIExperience = (() => {
         ),
       );
   }
-  async function taskControls(task, body, ticket) {
+  async function taskControls(task, body, ticket, queueDraft) {
     const project = projectId;
     const current = () => projectId === project && ticket === detailSequence && body.isConnected;
     async function refreshTaskDetail() {
@@ -425,19 +426,25 @@ window.RSIExperience = (() => {
           select.append(option);
         }
       const dependency = metadata.dependency?.dependency || "";
-      if (dependency && !(candidates.tasks || []).some(other => other.id === dependency)) {
-        const parent = await api("task?id=" + encodeURIComponent(dependency) + "&project=" + encodeURIComponent(task.project));
+      for (const id of new Set([dependency, queueDraft?.dependency])) {
+        if (!id || (candidates.tasks || []).some(other => other.id === id)) continue;
+        const parent = await api("task?id=" + encodeURIComponent(id) + "&project=" + encodeURIComponent(task.project));
         if (!current()) return;
         const option = el("option", parent.title);
         option.value = parent.id;
         select.append(option);
       }
-      select.value = dependency;
+      select.value = queueDraft?.dependency ?? dependency;
       label.append(select);
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");
       urgency.type = "checkbox";
-      urgency.checked = !!metadata.urgency;
+      urgency.checked = queueDraft?.urgency ?? !!metadata.urgency;
+      let baseline = {dependency, urgency: !!metadata.urgency};
+      queueDraftReaders.set(body, () => ({
+        ...(select.value !== baseline.dependency ? {dependency: select.value} : {}),
+        ...(urgency.checked !== baseline.urgency ? {urgency: urgency.checked} : {}),
+      }));
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
@@ -445,13 +452,14 @@ window.RSIExperience = (() => {
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
-          await api("task/schedule", {
-            task: task.id,
-            dependency: select.value || null,
-            urgency: urgency.checked ? 1 : 0,
-          });
+          if (!current()) return;
+          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          await api("task/schedule", submitted);
+          if (!current()) return;
+          // The endpoint acknowledges these exact values; newer edits stay in the controls.
+          baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
           await refresh();
-          toast(t("排队设置已保存"));
+          if (current()) toast(t("排队设置已保存"));
         });
       };
       controls.append(form);
@@ -480,7 +488,8 @@ window.RSIExperience = (() => {
     }
     body.append(controls);
   }
-  function taskOpened(task) {
+  function taskOpened(task, queueDraft) {
+    queueDraftReaders.delete($("detail-body"));
     clearTimeout(liveTimer);
     lastDetail = "";
     const url = new URL(location.href);
@@ -490,7 +499,7 @@ window.RSIExperience = (() => {
     }).toString();
     history.replaceState(null, "", url);
     const ticket = detailSequence;
-    safe(() => taskControls(task, $("detail-body"), ticket));
+    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft));
     liveTimer = setTimeout(liveDetail, 5000);
   }
   function detailsSnapshot(root) {
@@ -514,18 +523,31 @@ window.RSIExperience = (() => {
     liveBusy = true;
     const task = detailTask,
       ticket = detailSequence;
+    const current = () => ticket === detailSequence && projectId === task.project && $("detail-dialog").open;
     try {
       const metadata = await api(
-          "task?id=" + task.id + "&project=" + task.project,
-        ),
-        history = await api(
-          "task-runs?task=" + task.id + "&project=" + task.project,
-        );
-      if (ticket !== detailSequence) return;
+        "task?id=" + task.id + "&project=" + task.project,
+      );
+      if (!current()) return;
+      // Task state can change before any run exists. Keep forms intact on unchanged polls.
+      if (metadata.state !== task.state) {
+        const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
+        const queueDraft = queueDraftReaders.get($("detail-body"))?.();
+        await showTask(metadata, restore, queueDraft);
+        if (detailSequence === ticket + 1 && projectId === task.project && $("detail-dialog").open) {
+          restore($("detail-body"));
+          $("detail-dialog").scrollTop = scroll;
+        }
+        return;
+      }
+      const history = await api(
+        "task-runs?task=" + task.id + "&project=" + task.project,
+      );
+      if (!current()) return;
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);
-        if (ticket !== detailSequence) return;
+        if (!current()) return;
         const signature = JSON.stringify([
           latest.id,
           data.state,
@@ -543,24 +565,19 @@ window.RSIExperience = (() => {
           enhanceOutcome(outcome, data);
           previous.replaceWith(outcome);
           await renderReleaseOutcome(outcome, data, task.project);
-          if (ticket !== detailSequence) return;
+          if (!current()) return;
           restore(outcome);
           $("detail-dialog").scrollTop = scroll;
           lastDetail = signature;
-        }
-        if (metadata.state !== task.state) {
-          detailTask = metadata;
-          const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
-          await showTask(metadata, restore);
-          restore($("detail-body"));
-          $("detail-dialog").scrollTop = scroll;
         }
       }
     } catch {
     } finally {
       liveBusy = false;
-      if (detailTask && $("detail-dialog").open)
+      if (detailTask && $("detail-dialog").open) {
+        clearTimeout(liveTimer);
         liveTimer = setTimeout(liveDetail, 5000);
+      }
     }
   }
   async function showDiff(run) {
