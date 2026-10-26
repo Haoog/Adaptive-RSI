@@ -41,13 +41,15 @@ ssh -N -L 6090:127.0.0.1:6090 用户@服务器
 - API：页面添加官方或兼容服务；Linux 默认以 0600 私有文件保存密钥，重启后继续使用。也可使用环境变量或仅会话密钥。
 - OpenCode：镜像已包含 1.19.3。在页面选择 OpenCode 及实际供应商，使用其支持的官方登录或密钥连接；无需宿主 CLI，认证和模型目录均可使用执行镜像。也可使用 `opencode auth login` 或全局 `provider` 配置。
 - Codex：镜像包含 0.163.0。在页面发起设备授权，在个人电脑浏览器打开官方地址并输入一次性验证码；凭据写入服务器服务账号的 `~/.codex/auth.json`。也可使用 Responses API 或兼容服务。操作及故障恢复见 [账号连接](docs/accounts.md)。
-- 依赖：默认检查镜像是 `python:3.12-slim`，需事先 `docker pull python:3.12-slim`；本项目可把项目高级 JSON 设为 `{"sandbox":{"image":"adaptive-rsi-worker:local"}}`。其他语言请构建包含对应工具链和缓存依赖的可信镜像。需要下载依赖时在受信任的准备环境完成，检查容器不联网。
+- 依赖：默认检查镜像是 `python:3.12-slim`，需事先 `docker pull python:3.12-slim`；本项目可用 CLI 设置项目检查镜像：`adaptive-rsi config --project <项目ID> --json '{"sandbox":{"image":"adaptive-rsi-worker:local"}}'`。其他语言请构建包含对应工具链和缓存依赖的可信镜像。需要下载依赖时在受信任的准备环境完成，检查容器不联网。
 
 CLI 容器只挂载该次工作区与独立 HOME；不挂载控制器、其他项目、评估集、SSH/GitHub 凭据或 Docker socket。只读角色不能修改源代码，所有角色不能写 Git 元数据。CLI 为调用模型需要联网，独立检查和原生命令工具不联网。CLI 能访问执行所需的所选模型连接凭据；这不构成对任意恶意程序的机密计算隔离。
 
 镜像默认以 `node` 用户运行。执行器已有显式 `--user`，仍使用服务账号的宿主 UID/GID，并保留只读根文件系统、`--cap-drop=ALL` 和 `no-new-privileges`；镜像默认用户不会覆盖这些边界。请避免以 root 账号运行服务，拥有宿主 Docker 管理权限的账号仍拥有高权限。
 
-基础镜像默认仍为可变标签 `node:22-bookworm`；本次环境无法从 Docker Hub 可靠获取 manifest digest，未填写未经核验的摘要。生产构建可先执行 `docker buildx imagetools inspect node:22-bookworm`，核对官方仓库的 digest，再通过 `docker build --build-arg NODE_IMAGE='node:22-bookworm@sha256:实际核验的摘要' -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .` 固定基础镜像。该命令中的摘要必须替换；基础镜像固定也不代表 npm 安装的全部传递依赖已锁定。自定义检查镜像可在 `sandbox.image` 中使用经核验的 digest 引用。
+基础镜像默认固定为 `node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384`，通过多架构 OCI index 让 Docker 选择对应平台。2026-10-25 从 Docker 官方 registry 的 [`library/node:22-bookworm` manifest](https://registry-1.docker.io/v2/library/node/manifests/22-bookworm) 核验：标签与摘要地址返回的原始 JSON SHA-256 均匹配 `Docker-Content-Digest`，index 包含 `linux/amd64`、`linux/arm/v7`、`linux/arm64/v8` 和 `linux/ppc64le`；另核验 amd64 与 arm64 子 manifest 的摘要和长度。`docker buildx imagetools inspect node:22-bookworm` 返回相同 index digest。
+
+升级基础镜像时先执行上述 inspect 命令并核验官方 registry，再使用 `docker build --build-arg NODE_IMAGE='node:22-bookworm@sha256:实际核验的摘要' -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .` 覆盖；摘要占位符必须替换。固定 digest 后不会自动跟随标签更新，安全更新需显式更换摘要并重新构建。本次验证不依赖 Docker daemon，未执行镜像构建或容器运行；基础镜像固定也不代表 npm 安装的全部传递依赖已锁定。自定义检查镜像可在 `sandbox.image` 中使用经核验的 digest 引用。
 
 ## HTTPS 域名访问
 

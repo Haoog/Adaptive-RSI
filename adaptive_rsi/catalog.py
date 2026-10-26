@@ -101,7 +101,23 @@ def get_json(url, headers, deadline):
         raise CatalogError("invalid_response") from None
 
 
+def _official_go_directory(base):
+    endpoint = urllib.parse.urlsplit(base)
+    return (endpoint.scheme == "https" and endpoint.hostname == "opencode.ai" and
+            endpoint.port in (None, 443) and not endpoint.username and not endpoint.password and
+            not endpoint.query and not endpoint.fragment and endpoint.path.rstrip("/") in {
+                "/inference/go/openai/v1", "/inference/go/anthropic/v1", "/inference/go/google/v1beta"})
+
+
 def http_models(provider, key_override=None):
+    if _official_go_directory(provider["base_url"]):
+        # Go's public directory is independent of inference protocol and needs no key.
+        data = get_json("https://opencode.ai/inference/go/v1/models", {"User-Agent": "Adaptive-RSI"},
+                        time.monotonic() + TIMEOUT)
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            raise CatalogError("invalid_response")
+        return normalize(rows[:MAX_MODELS], "chat_completions"), len(rows) > MAX_MODELS
     protocol = provider.get("protocol", "codex")
     key_name = provider["env_key"]
     key = key_override if key_override is not None else os.environ.get(key_name, "") if key_name else ""

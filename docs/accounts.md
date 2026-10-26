@@ -24,7 +24,18 @@
 
 ### OpenCode Go
 
-OpenCode Go 使用 OpenCode 提供的 API Key。请在 OpenCode 账号中获取 Go 密钥，再在 OpenCode 连接中选择对应供应商并使用「保存供应商密钥」；也可添加原生 API 服务，填写 Go 官方提供的地址、协议和模型 ID。ChatGPT 订阅的 Codex 登录不会提供 Go 凭据。不要把 Go 密钥填到 OpenAI 官方 API 地址。官方路径见 [OpenCode Go](https://opencode.ai/v2/docs/console/go/)；实际可用模型和服务条款以官方账号为准。获取目录与保存密钥不会自动执行付费模型测试。
+已核验 [OpenCode Go 官方文档](https://opencode.ai/v2/docs/console/go/)：在 [OpenCode 控制台](https://opencode.ai/console) 获取 Go API Key；OpenCode TUI 中运行 `/connect`、选择 **OpenCode Go** 并粘贴密钥，再用 `/models` 选择模型。供应商 ID 是 `opencode-go`，OpenCode 路由写作 `opencode-go/<model-id>`。在本控制台的 OpenCode 连接中选择对应供应商并使用「保存供应商密钥」，或使用「OpenCode Go API Key」预设添加原生 API 服务。ChatGPT 订阅的 Codex 登录不会提供 Go 凭据，不要把 Go 密钥填到 OpenAI 官方 API 地址。
+
+原生 API 的地址与协议须按模型选择；下列是基础地址，调用时由对应协议追加路径：
+
+| 界面协议 | 基础地址 | 调用路径 |
+| --- | --- | --- |
+| Responses API | `https://opencode.ai/inference/go/openai/v1` | `/responses` |
+| Chat Completions API | `https://opencode.ai/inference/go/openai/v1` | `/chat/completions` |
+| Anthropic Messages | `https://opencode.ai/inference/go/anthropic/v1` | `/messages` |
+| Gemini GenerateContent | `https://opencode.ai/inference/go/google/v1beta` | `/models/<model-id>:generateContent` |
+
+例如，官方当前将 `gpt-6-luna` 列为 Responses，`kimi-k3` 列为 Chat Completions，`minimax-m3` 列为 Anthropic Messages。Go 预设默认 Chat Completions，其他模型须在「高级连接设置」选择匹配协议。本控制台对上述官方 Go 基础地址自动使用独立公开目录 `GET https://opencode.ai/inference/go/v1/models`，目录请求不发送推理密钥。目录不提供协议元信息，选择模型后仍须按官方说明选择匹配协议；目录遗漏的模型可手动添加 ID。实际模型、地址、剩余额度与服务条款以官方控制台为准。官方文档核验不等于真实推理已验证；获取目录与保存密钥不会自动执行付费模型测试。
 
 ## 官方 API、中转站和本地服务
 

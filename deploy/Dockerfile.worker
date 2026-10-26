@@ -1,6 +1,6 @@
-# 生产环境可将 NODE_IMAGE 覆盖为已核验的 node:22-bookworm@sha256:...。
-# Production builds can override NODE_IMAGE with a verified node:22-bookworm@sha256:... reference.
-ARG NODE_IMAGE=node:22-bookworm
+# 默认固定 Docker 官方多架构 OCI index；升级时核验 registry manifest 后覆盖 NODE_IMAGE。
+# Pin the official multi-platform OCI index; verify the registry manifest before overriding NODE_IMAGE.
+ARG NODE_IMAGE=node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
 FROM ${NODE_IMAGE}
 ARG CODEX_VERSION=0.163.0
 # 固定为已验证的最低支持版本以保证可复现构建；代码同时兼容 OpenCode 2.x，

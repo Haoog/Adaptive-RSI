@@ -359,6 +359,7 @@ window.RSIExperience = (() => {
         "interrupted",
         "expired",
         "cancelled",
+        "obsolete",
       ].includes(metadata.state) &&
       !task.source.startsWith("system_")
     ) {

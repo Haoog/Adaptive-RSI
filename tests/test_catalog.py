@@ -130,6 +130,76 @@ class CatalogFixture:
 
 
 class CatalogTest(unittest.TestCase):
+    def test_official_go_protocol_bases_use_public_independent_directory(self):
+        cases = [("chat_completions", "openai/v1"), ("responses", "openai/v1"),
+                 ("codex", "openai/v1"), ("anthropic", "anthropic/v1"), ("gemini", "google/v1beta")]
+        for protocol, path in cases:
+            for suffix in ("", "/"):
+                with self.subTest(protocol=protocol, suffix=suffix):
+                    provider = {"id": "go", "name": "Go", "protocol": protocol,
+                                "base_url": "https://opencode.ai/inference/go/" + path + suffix,
+                                "env_key": "RSI_GO_CATALOG_TEST_KEY"}
+                    with patch.dict(os.environ, {}, clear=True), \
+                            patch("adaptive_rsi.catalog.get_json", return_value={"object": "list", "data": [
+                                {"id": "glm-5.1", "object": "model", "owned_by": "opencode"},
+                                {"id": "gemini-4-argon", "object": "model", "owned_by": "opencode"}]}) as get:
+                        data = list_models(provider, key="private-go-test-key")
+                    self.assertEqual([model["id"] for model in data["models"]], ["gemini-4-argon", "glm-5.1"])
+                    self.assertFalse(data["truncated"])
+                    self.assertEqual(get.call_args.args[0], "https://opencode.ai/inference/go/v1/models")
+                    headers = {key.lower(): value for key, value in get.call_args.args[1].items()}
+                    self.assertFalse(set(headers) & {"authorization", "x-api-key", "x-goog-api-key"})
+                    self.assertEqual(headers["user-agent"], "Adaptive-RSI")
+                    self.assertNotIn("private-go-test-key", str(get.call_args))
+        # The documented directory is public even when the inference key is not set yet.
+        with patch.dict(os.environ, {}, clear=True), \
+                patch("adaptive_rsi.catalog.get_json", return_value={"data": [{"id": "glm-5.1"}]}):
+            self.assertEqual(list_models(provider)["models"][0]["id"], "glm-5.1")
+
+    def test_official_go_directory_keeps_response_validation_and_size_bound(self):
+        provider = {"id": "go", "name": "Go", "protocol": "anthropic", "env_key": "",
+                    "base_url": "https://opencode.ai/inference/go/anthropic/v1"}
+        with patch("adaptive_rsi.catalog.get_json", return_value={"data": [{"id": "m" + str(i)} for i in range(1001)]}):
+            result = list_models(provider)
+            self.assertEqual(len(result["models"]), 1000)
+            self.assertTrue(result["truncated"])
+        with patch("adaptive_rsi.catalog.get_json", return_value={"models": []}), \
+                self.assertRaises(CatalogError) as error:
+            list_models(provider)
+        self.assertEqual(error.exception.code, "invalid_response")
+
+    def test_go_directory_rewrite_never_matches_custom_hosts_ports_or_paths(self):
+        bases = ["https://gateway.example/inference/go/openai/v1", "https://opencode.ai.example/inference/go/openai/v1",
+                 "https://sub.opencode.ai/inference/go/openai/v1", "https://opencode.ai:8443/inference/go/openai/v1",
+                 "https://opencode.ai/inference/go/openai/v1/custom", "https://opencode.ai/inference/zen/openai/v1",
+                 "https://opencode.ai/inference/go/unknown/v1", "https://opencode.ai/inference/go/openai/v10"]
+        for base in bases:
+            with self.subTest(base=base), patch("adaptive_rsi.catalog.get_json", return_value={"data": [{"id": "custom"}]}) as get:
+                list_models({"id": "custom", "name": "Custom Go", "protocol": "chat_completions", "base_url": base, "env_key": ""}, key="private-custom-key")
+                self.assertEqual(get.call_args.args[0], base + "/models")
+                self.assertEqual(get.call_args.args[1]["Authorization"], "Bearer private-custom-key")
+
+    def test_official_go_redirect_cannot_forward_inference_key(self):
+        provider = {"id": "go", "name": "Go", "protocol": "gemini", "env_key": "",
+                    "base_url": "https://opencode.ai/inference/go/google/v1beta"}
+        opener = urllib.request.build_opener
+        with CatalogFixture(behavior="redirect") as fixture:
+            def transport(*handlers):
+                real = opener(*handlers)
+                original = real.open
+                def open_local(request, **kwargs):
+                    self.assertEqual(request.full_url, "https://opencode.ai/inference/go/v1/models")
+                    local = urllib.request.Request(fixture.url + "/go-models", headers=dict(request.header_items()))
+                    return original(local, **kwargs)
+                real.open = open_local
+                return real
+            with patch("adaptive_rsi.catalog.urllib.request.build_opener", side_effect=transport), \
+                    self.assertRaises(CatalogError) as error:
+                list_models(provider, key="private-go-test-key")
+            self.assertEqual(error.exception.code, "http_error")
+            self.assertEqual(len(fixture.requests), 1)
+            self.assertNotIn("private-go-test-key", str(fixture.requests))
+
     def test_protocols_auth_pagination_and_model_ids(self):
         for protocol in ["responses", "chat_completions", "codex", "anthropic", "gemini", "ollama"]:
             with self.subTest(protocol=protocol), CatalogFixture(protocol) as fixture, patch.dict(os.environ, {"RSI_CATALOG_TEST_KEY": "test-only-secret"}):

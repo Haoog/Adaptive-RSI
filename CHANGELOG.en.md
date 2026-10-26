@@ -13,7 +13,7 @@
 - Update downloads have a 15-minute total budget; the launcher serializes double-starts with a file lock; delivery baseline fetches get a 180-second timeout.
 - Auth containers inherit environment variable values with only variable names in argv, keeping authentication passwords out of command arguments; shutdown flows wait at most 10 seconds for stuck processes; check, auth and CLI worker containers encode complete CSV mount fields to preserve commas, quotes and newlines in paths.
 - Native API implementation/review timeouts are relaxed to 900/600 seconds; model probe failures are no longer masked by catalog update errors; workspace comparison reports a diagnosable error for escaping symlinks; the runtime releases data-layer connections on close.
-- The model center includes an OpenCode Go API Key preset and official Console link. Users copy their current endpoint from the Console; existing OpenCode configuration, API keys and other login methods remain distinct, and model usage is not presented as remaining subscription allowance.
+- The model center includes an OpenCode Go API Key preset and official Console link. Protocol endpoints are verified, and official Go endpoints discover models through the independent public directory without sending inference keys. Existing OpenCode configuration, API keys and other login methods remain distinct, and model usage is not presented as remaining subscription allowance.
 - Checks and acceptance results use readable cards with expandable original commands and output. Candidate approval summarizes repository, branch, baseline, gates and current authorization on desktop and mobile.
 - Settings use a structured check editor, collapse internal policy controls by default, and no longer require arbitrary JSON editing. Unsaved, saving and saved states explain when schedules change, new runs capture configuration and delivery authorization is rechecked.
 - The workspace overview includes blocked work, recent failures and model verification evidence. Missing connection or task evidence remains explicitly unknown; it does not claim real model testing.
@@ -27,7 +27,7 @@
 - Dark mode covers the model center and dialog accent variables; desktop exit force-kills a stuck engine after 10 seconds; the update download no longer has a double-click race; the unused Tauri global API is disabled.
 - Access sessions and restart journals are atomically written through randomly named private temporary files. Failed rotation preserves existing credentials; the desktop proxy updates its Cookie and CSRF together so requests continue after rotation.
 - Backup downloads stream with size, concurrency and duration limits. Failed authentication is rate limited with bounded credential-free auditing. API failures return fixed messages and allowlisted codes while preserving actionable configuration diagnostics.
-- The Caddy example includes HSTS; the worker image defaults to a non-root user and accepts a configurable base image. Managed containers still use the host UID/GID. The base-image digest has not been verified or pinned, as documented.
+- The Caddy example includes HSTS. The worker image defaults to a non-root user and pins a verified official Docker Node multi-platform OCI index digest, with a build-argument override. Managed containers still use the host UID/GID.
 - The release smoke retries transient GitHub API network errors.
 
 ## 0.5.105
