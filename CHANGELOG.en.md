@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.106
+
+<!-- adaptive-rsi-release:0.5.106;base:e1ae12f1b643fb0ad6573ee144712f1c64df0f1d -->
+
 - Tasks judged obsolete by planning are no longer requeued by inspections (avoiding repeated paid planning every scan cycle); manual retry and requirement supplements remain available for obsolete tasks.
 - Only authorized publishing tasks are requeued automatically on startup; ordinary interrupted tasks retain their evidence and await manual retry. Budget-backoff tasks return to the queue as soon as their wait expires instead of waiting for the next working-hours window.
 - Local commands and model adapters carry separate structured failure codes, which take precedence in retry, provider circuit-breaker and fallback decisions. Timeout, connection or quota words in local setup/check output no longer imply provider failures. Older CLIs still support their own stderr diagnostics while excluding project tool output in stdout.
