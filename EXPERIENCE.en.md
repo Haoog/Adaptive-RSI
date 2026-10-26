@@ -16,7 +16,7 @@ Minimum requirements follow the browser: the console needs a modern browser equi
 
 ## Tasks and recovery
 
-The submit button retains a request ID for the same unconfirmed submission. Retrying an ambiguous response returns the original task; submitting after success creates a new task. CLI users can specify `goal --request-id`. Reusing an ID with different content is rejected; project submissions remain isolated.
+The submit button retains the original text, content digest and request ID for up to 32 unconfirmed goals per project in the current browser session. After changing text or reloading, select an unconfirmed goal in the form to restore its text, then submit explicitly using its original ID. Restoring replaces the current draft without sending automatically. Success removes only the matching record, freeing capacity for new goals. Legacy digest-only records require the original text to match. Invalid records or storage failures prevent sending without a retained deduplication ID. Retrying an ambiguous response returns the original task; submitting after success creates a new task. CLI users can specify `goal --request-id`. Reusing an ID with different content is rejected; project submissions remain isolated.
 
 Newly claimed tasks use the settings saved before their claim; active runs retain their sealed settings. Pausing retains a stop request for current runs, and quickly resuming does not withdraw it. Interrupted tasks can be explicitly retried. Editing or removing a model connection retains its old credential until referencing runs finish, after which periodic maintenance removes it.
 
@@ -54,6 +54,6 @@ Restore into a new state directory:
 adaptive-rsi --state-dir /NEW/STATE restore /PATH/BACKUP.sqlite3
 ```
 
-Existing state is never overwritten. Restored projects remain paused, active runs become interrupted, old candidate approvals expire, and queued deliveries are blocked for reconciliation. Database backups exclude candidate workspaces and machine credentials. On another machine, reconnect credentials, verify project paths and remote delivery state before enabling projects.
+Existing state is never overwritten. Restored projects remain paused, active runs become interrupted, old candidate approvals expire, and queued deliveries are blocked for reconciliation. Imported runs stop using source-state artifact paths and local verification caches expire; known PR receipts and remote delivery records remain. Missing acceptance or dependency artifacts produce insufficient evidence during post-merge verification. Supply trusted artifacts inside the current state directory or verify again; evidence from another directory cannot be reused. Database backups exclude candidate workspaces and machine credentials. On another machine, reconnect credentials, verify project paths and remote delivery state before enabling projects.
 
 Candidate files expire under project retention settings and cannot be approved afterward. Retry expired tasks to verify the latest code again. Original summaries remain; cleanup does not imply successful delivery.
