@@ -98,6 +98,74 @@ async function checkModelForms(browser, url, errors) {
   } finally { await page.close(); }
 }
 
+async function checkProviderSaveRace(browser, url, errors, reopen = false) {
+  const page = await browser.newPage();
+  page.on('pageerror', error => errors.push(error.message));
+  const posts = [];
+  let release, arrived;
+  const gate = new Promise(resolve => release = resolve), received = new Promise(resolve => arrived = resolve);
+  let created;
+  await page.route('**/api/model-center/provider', async route => {
+    posts.push(route.request().postDataJSON());
+    const response = await route.fetch();
+    if (posts.length === 1) { created = await response.json(); arrived(); await gate; }
+    await route.fulfill({response});
+  });
+  try {
+    await page.goto(url);
+    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    await page.locator('#project-settings').click();
+    await page.locator('[data-settings-scope="project"]').click();
+    await page.locator('[data-mc-tab="providers"]').click();
+    await page.locator('#view-models[data-scope]:not([data-scope="global"])').waitFor();
+    const project = await page.locator('#project-select').inputValue();
+    const snapshot = await (await page.request.get(new URL('/api/model-center?project=' + project, url).href)).json();
+    const endpoint = snapshot.providers.find(provider => provider.name === '测试目录服务').base_url;
+    const original = reopen ? 'Previous scope provider' : 'Pending provider creation';
+    const revised = reopen ? 'New scope provider' : 'Edited provider creation';
+    await page.locator('#mc-add-provider').click();
+    await page.locator('#mc-input-name').fill(original);
+    await page.locator('#mc-input-url').fill(endpoint);
+    await page.locator('#mc-connection-advanced summary').click();
+    await page.locator('#mc-input-protocol').selectOption('responses');
+    await page.locator('#mc-input-auth').selectOption('none');
+    await page.locator('#mc-provider-submit').click();
+    await received;
+    if (reopen) {
+      await page.locator('#mc-provider-dialog .close-dialog').click();
+      await page.locator('[data-settings-scope="global"]').click();
+      await page.locator('#view-models[data-scope="global"]').waitFor();
+      await page.locator('#mc-add-provider').click();
+      await page.locator('#mc-input-url').fill(endpoint);
+      await page.locator('#mc-connection-advanced summary').click();
+      await page.locator('#mc-input-protocol').selectOption('responses');
+      await page.locator('#mc-input-auth').selectOption('none');
+    }
+    await page.locator('#mc-input-name').fill(revised);
+    release();
+    await page.locator('#mc-provider-submit:not([disabled])').waitFor();
+    assert.equal(await page.locator('#mc-provider-dialog').isVisible(), true);
+    assert.equal(await page.locator('#mc-input-name').inputValue(), revised);
+    assert.equal(await page.locator('#mc-input-url').inputValue(), endpoint);
+    assert.equal(await page.locator('#mc-input-auth').inputValue(), 'none');
+    assert.equal(await page.locator('#mc-input-key').inputValue(), '');
+    await page.locator('#mc-provider-submit').click();
+    await page.locator('#mc-provider-dialog').waitFor({state: 'hidden'});
+    assert.equal(posts.length, 2);
+    assert.equal(posts[0].provider.id, undefined);
+    assert.equal(posts[1].provider.id, reopen ? undefined : created.id, 'the acknowledgement must belong only to its originating editor');
+    assert.deepEqual(posts.map(post => post.project), [project, reopen ? null : project]);
+    const saved = await (await page.request.get(new URL('/api/model-center?project=' + project, url).href)).json();
+    const connections = saved.providers.filter(provider => [original, revised].includes(provider.name));
+    assert.deepEqual(connections.map(provider => ({id: provider.id, name: provider.name})), [{id: created.id, name: reopen ? original : revised}]);
+    const global = await (await page.request.get(new URL('/api/model-center', url).href)).json();
+    assert.equal(global.providers.some(provider => provider.id === created.id), false);
+    const newer = global.providers.filter(provider => provider.name === revised);
+    assert.equal(newer.length, reopen ? 1 : 0);
+    if (reopen) assert.notEqual(newer[0].id, created.id);
+  } finally { release(); await page.close(); }
+}
+
 async function checkRouteSaveRace(browser,url,errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   let release,arrived;const gate=new Promise(resolve=>release=resolve),received=new Promise(resolve=>arrived=resolve);
@@ -323,12 +391,15 @@ async function main() {
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
+    if(process.env.RSI_BROWSER_PROVIDERS_ONLY){await checkProviderSaveRace(browser,url,errors);await checkProviderSaveRace(browser,url,errors,true);assert.deepEqual(errors,[]);console.log('Provider creation acknowledgement checks passed.');return;}
     if(process.env.RSI_BROWSER_ROUTES_ONLY){await checkRouteSaveRace(browser,url,errors);return;}
     await checkReadiness(browser, url, false, errors);
     await checkReadiness(browser, url, true, errors);
     await checkReadinessInstallAction(browser,url,errors);
     await checkRunProgress(browser,url,errors);
     await checkModelForms(browser, url, errors);
+    await checkProviderSaveRace(browser, url, errors);
+    await checkProviderSaveRace(browser, url, errors, true);
     await checkRouteSaveRace(browser,url,errors);
     await checkUpdatePending(browser,url,errors);
     await checkDraftRecovery(browser,url,errors);

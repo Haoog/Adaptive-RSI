@@ -504,6 +504,53 @@ print('BOUNDARIES_OK')
             tick(self.runtime)
         command.assert_not_called()
 
+    def test_merge_rechecks_target_and_sealed_authorization_after_baseline_fetch(self):
+        run = self.tracked_pr()
+        self.runtime.configure({"delivery": {"base_branch": "main"}}, self.project)
+        original_config = self.runtime.config(self.project)
+        original_policy = self.store.setting("delivery:" + run["id"])
+        original_identity = self.store.setting("run-baseline:" + run["id"])
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        for change in ["repository", "branch", "origin", "policy", "identity", "run", "permission", "unrelated", "unchanged"]:
+            with self.subTest(change=change):
+                self.runtime.configure({"github": original_config["github"], "delivery": original_config["delivery"]}, self.project)
+                self.store.put_setting("delivery:" + run["id"], original_policy)
+                self.store.put_setting("run-baseline:" + run["id"], original_identity)
+                self.store.execute("UPDATE runs SET state='pr_open' WHERE id=?", (run["id"],))
+                git(self.repo, "remote", "set-url", "origin", "https://github.com/example/project.git")
+                self.store.put_setting("delivery-tick", 0)
+
+                def change_during_fetch(*args):
+                    if change == "repository":
+                        self.runtime.configure({"github": {"repository": "example/replacement"}}, self.project)
+                    elif change == "branch":
+                        self.runtime.configure({"delivery": {"base_branch": "release"}}, self.project)
+                    elif change == "origin":
+                        git(self.repo, "remote", "set-url", "origin", "https://github.com/example/replacement.git")
+                    elif change == "policy":
+                        self.store.put_setting("delivery:" + run["id"], {**original_policy, "head": "replacement"})
+                    elif change == "identity":
+                        self.store.put_setting("run-baseline:" + run["id"], {**original_identity, "branch": "release"})
+                    elif change == "run":
+                        self.store.execute("UPDATE runs SET state='superseded' WHERE id=?", (run["id"],))
+                    elif change == "permission":
+                        self.runtime.configure({"delivery": {"auto_merge": False}}, self.project)
+                    elif change == "unrelated":
+                        self.runtime.configure({"schedule": {"weight": 2}}, self.project)
+                    return str(self.repo), "base", "main"
+
+                with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                        patch("adaptive_rsi.delivery.baseline", side_effect=change_during_fetch) as fetch, \
+                        patch("adaptive_rsi.delivery.checked", return_value="") as command:
+                    tick(self.runtime)
+                fetch.assert_called_once()
+                if change in {"unchanged", "unrelated"}:
+                    command.assert_called_once_with(["gh", "pr", "merge", "https://github.com/example/project/pull/1",
+                                                     "--repo", "example/project", "--squash", "--match-head-commit", "head"])
+                else:
+                    command.assert_not_called()
+
     def test_publishing_cannot_change_original_target_even_with_identical_commit(self):
         git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
         self.runtime.configure({"github": {"repository": "example/project"}, "delivery": {"mode": "pr", "auto_merge": True, "base_branch": "main"}}, self.project)

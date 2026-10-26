@@ -1247,6 +1247,7 @@ const english = {
   "提交未被接受。修复授权或工作流配置后，可以安全重试。": "The dispatch was rejected. Fix authorization or workflow settings, then retry safely.",
   "控制台登录已失效，请重新打开控制台后继续授权。": "The console session expired. Reopen the console to continue authorization.",
   "暂时无法连接，授权状态已保留，正在重试。": "Connection is unavailable. Authorization status is retained; retrying.",
+  "登录已完成，账号状态或模型目录更新失败，正在重试。": "Signed in. Account status or model catalog refresh failed; retrying.",
   "项目时区": "Project timezone",
   "等待模型服务恢复用量": "Waiting for provider usage to recover",
   "这个版本更新了什么": "What is new in this version",
