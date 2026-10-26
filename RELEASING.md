@@ -53,6 +53,8 @@ GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并�
 
 检查期间显示「正在检查更新」，暂时禁用再次检查和安装操作，但不阻止普通项目工作。临时网络错误保留已明确确认且绑定原版本的空闲安装请求；发现目标版本变化后须重新确认。默认每日检查正式 GitHub Release 并提醒。`updates.mode` 可设为 `manual`、`notify`、`automatic`；自动模式还须选择 `updates.auto_policy`：`patch`（默认，仅同 major/minor）、`minor`（同 major）、`stable`（任何更高稳定版本）。草稿、预发布、同版本和降级均不安装。自动更新等待项目运行、模型测试和浏览器授权全部空闲；调用与 tokens 只记录，不设额度。
 
+内置服务更新器仅在官方 latest Release API 返回 HTTP 403、`X-RateLimit-Remaining: 0`，且 `X-RateLimit-Reset` 是未来一小时内的有效整数时间戳时识别主额度冷却。界面显示本地可重试时间；到期前服务端阻止手动检查、安装和调度重试，普通项目工作继续。冷却持久保存，保留目标版本、原安装确认及已有普通失败计数，不额外消耗三次安装重试。到期后，提醒模式恢复检查，已获确认或符合自动策略的安装恢复重试资格并等待空闲；手动模式下尚未确认安装的用户可再次点击检查。其他 403、缺失或无效及超出一小时的重置时间沿用原错误处理；不使用 `Retry-After` 扩展识别范围。此规则仅适用于内置服务更新器。
+
 更新源固定为 `Haoog/Adaptive-RSI`。每个正式版本必须有 `adaptive-rsi-X.Y.Z-plugin.zip` 和同名 `.zip.sha256`；ZIP 根目录为 `adaptive-rsi/`。目前没有独立发布签名，校验和仍由同一 GitHub Release 提供。`update.json` 只接受 `format: 1`、`python_min: [3, 9]`、`state_schema: 1`；不兼容的数据迁移会被拒绝，不能仅改版本号绕过协议。
 
 桌面版同批随正式版本提供 `adaptive-rsi-X.Y.Z-macos-arm64-adhoc.dmg` 和 `.dmg.sha256`。桌面包从同一经过验证的版本提交构建，并检查 Rust 桥接测试、引擎版本、应用签名完整性及 DMG 校验；目前只有 macOS ARM64 构建。临时 ad-hoc 签名不是 Apple Developer ID 签名或公证，macOS 可能显示安全警告，不能宣称为已公证安装包。桌面 app 需用户手动下载替换；服务器自动更新不替换桌面应用。

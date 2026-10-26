@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- The built-in updater recognizes exhausted GitHub anonymous API primary quotas, shows the retry time, and blocks checks and installation requests until reset. It retains installation consent for the original version without spending ordinary installation retries, then becomes eligible to retry at the deadline.
+
 ## 0.5.110
 
 <!-- adaptive-rsi-release:0.5.110;base:9433d4de98aa3ac6a4b5139b4a26f0d64da07d80 -->

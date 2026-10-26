@@ -139,6 +139,29 @@ test('update check acknowledgment preserves a fast completed result', async () =
   assert.equal(page.node('apply-update').disabled,true);
 });
 
+test('primary rate limit shows retry time in both languages and enables checking at reset', () => {
+  const reset=1792998274;
+  for(const locale of ['zh-CN','en']){
+    const page=browser();
+    const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+    // Load the real dictionary and translator without static DOM traversal.
+    vm.runInContext(i18n.slice(0,i18n.indexOf('const staticText =')),page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};Date.now=()=>${(reset-1)*1000};state.update={state:'error',reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',rate_limit_until:${reset},busy:false};renderUpdateExtras=()=>{};renderUpdate();`,page.context);
+    const expectedTime=vm.runInContext(`new Date(${reset}*1000).toLocaleString(language)`,page.context);
+    assert.ok(page.node('update-status').textContent.includes(expectedTime));
+    assert.match(page.node('update-status').textContent,locale==='en'?/anonymous API quota is exhausted/:/匿名 API 额度已用尽/);
+    assert.match(page.node('update-status').textContent,locale==='en'?/paused until then/:/暂停更新请求/);
+    assert.equal(page.node('check-update').disabled,true);
+    assert.equal(page.node('apply-update').disabled,true);
+    vm.runInContext(`Date.now=()=>${reset*1000};renderUpdate();`,page.context);
+    assert.equal(page.node('check-update').disabled,false);
+    assert.match(page.node('update-status').textContent,locale==='en'?/ready to retry/:/已到，可重试/);
+    vm.runInContext('state.update={state:"error",reason:"GitHub HTTP 403",busy:false};renderUpdate();',page.context);
+    assert.match(page.node('update-status').textContent,/GitHub HTTP 403/);
+    assert.equal(page.node('check-update').disabled,false);
+  }
+});
+
 test('an explicit update rejection retries the original payload with fresh CSRF', async () => {
   const page = browser(), posts = [];
   page.context.fetch = async (url, options) => {
