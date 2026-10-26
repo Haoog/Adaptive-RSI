@@ -102,6 +102,39 @@ def main():
                 for name in ["过时任务重试入口", "过时任务补充入口"]:
                     obsolete = runtime.store.add_task(project, "goal", name, name)
                     runtime.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete,))
+            if os.environ.get("RSI_BROWSER_TASK_DETAIL"):
+                # 任务详情专项：多运行历史懒加载、待交付取消、等待额度/过时任务详情内重试。
+                now = time.time()
+                detail_config = json.dumps({"models": {}, "checks": CHECKS})
+                detail_task = runtime.store.add_task(project, "goal", "detail-history", "详情历史任务")
+                runtime.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (detail_task,))
+                for run_id, state, started, result in [
+                    ("detail-h1", "merged", now - 9000, {"summary": "第一次修复已合并", "delivery_status": "merged"}),
+                    ("detail-h2", "failed", now - 6000, {"reason": "中间一次没有通过固定检查"}),
+                    ("detail-h3", "failed", now - 3000, {"reason": "最新一次仍未通过固定检查",
+                                                          "failure": {"code": "checks", "message": "unittest failed"},
+                                                          "files": ["calculator.py"]}),
+                ]:
+                    runtime.store.execute(
+                        "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (run_id, detail_task, project, state, detail_config, "basemain", None, 3, 1200,
+                         started, started + 60, json.dumps(result)))
+                approval_task = runtime.store.add_task(project, "goal", "detail-approval", "待交付详情任务")
+                runtime.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (approval_task,))
+                runtime.store.execute(
+                    "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
+                    "VALUES ('detail-appr',?,?,'awaiting_approval',?,'basemain',NULL,3,1200,?,?,?)",
+                    (approval_task, project, detail_config, now - 1200, now - 1100,
+                     json.dumps({"summary": "修复已通过独立检查，等待批准", "reason": "验证过的算术缺陷"})))
+                for name, state in [("额度等待详情任务", "waiting_budget"), ("过时详情任务", "obsolete")]:
+                    retry_task = runtime.store.add_task(project, "goal", "detail-retry-" + state, name)
+                    runtime.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, retry_task))
+                    runtime.store.execute(
+                        "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
+                        "VALUES (?,?,?,'failed',?,'basemain',NULL,3,1200,?,?,?)",
+                        ("detail-" + state, retry_task, project, detail_config, now - 900, now - 800,
+                         json.dumps({"reason": "早前一次尝试没有通过"})))
             if os.environ.get("RSI_BROWSER_QUEUE_ONLY"):
                 child = runtime.store.add_task(project, "goal", "queue-child", "排队草稿验证")
                 for index in range(200):

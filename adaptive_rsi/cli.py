@@ -2,10 +2,12 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import sys
 import threading
+import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -90,8 +92,25 @@ def api(root, path, data=None):
     if data is not None:
         headers.update({"Content-Type": "application/json", "Origin": session["origin"], "X-RSI-CSRF": session["csrf"]})
     request = urllib.request.Request(session.get("local_origin", session["origin"]) + path, data=json.dumps(data).encode() if data is not None else None, headers=headers)
-    with urllib.request.urlopen(request, timeout=200 if path == "/api/projects/import" else 20) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=200 if path == "/api/projects/import" else 20) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        # 服务端只为固定文案发放用户提示；原样透传，不回显请求字段或异常栈。
+        try:
+            payload = json.loads(exc.read().decode() or "{}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        message = payload.get("error") if isinstance(payload.get("error"), str) else ""
+        code = payload.get("error_code") or payload.get("catalog_error")
+        code = code if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,64}", code) else ""
+        if message and code and code not in ("validation_error", "invalid_request"):
+            raise RuntimeError(f"{message} ({code})") from None
+        if message:
+            raise RuntimeError(message) from None
+        raise RuntimeError(f"HTTP Error {exc.code}") from None
 
 
 def main(argv=None):

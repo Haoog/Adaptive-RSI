@@ -85,6 +85,8 @@ Automation requires the trusted workflow tag's full commit SHA
 Release/deploy requires an explicit project and a pinned workflow tag
 Deployment health URL requires HTTPS without credentials, query or fragment
 Automatic deployment rollback requires an explicit health URL
+Workflow repository must match the selected project's origin
+Workflow must be an existing repository file
 Feedback interval must be at least 5 minutes
 Invalid base branch
 No GitHub repository configured
@@ -109,6 +111,13 @@ Wait for the active run to finish stopping before retrying or supplementing this
 Wait until active runs finish before registering projects so every worker uses the same isolation boundaries
 Only project scan settings can inherit global defaults
 An inherited setting cannot also have an override
+Task overrides cannot grant delivery permissions
+Invalid submission ID
+Unknown inspection type
+This task cannot be retried
+Task not found
+This task has finished and can no longer be cancelled
+Submission ID was already used with different content
 """.strip().splitlines())
 
 

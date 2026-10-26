@@ -31,6 +31,7 @@ window.RSIExperience = (() => {
   }
   let seen = readSaved(notificationKey + ":seen", {});
   let seenInstance = '';
+  let notifyFailureToasted = false;
   const phaseNames = {preparation:'准备运行环境', implementation:'正在修改代码', review:'正在评审改动', acceptance:'验收设计'};
   function queueCopy(task) {
     return [
@@ -138,11 +139,14 @@ window.RSIExperience = (() => {
     try {
       const data = await api("attention");
       if (seenInstance !== data.instance) {
-        const next = readSaved(notificationKey + ':seen:' + data.instance, {});
         if (seenInstance) localStorage.removeItem(notificationKey + ':seen:' + seenInstance);
         localStorage.removeItem(notificationKey + ':seen');
-        seen = next;
         seenInstance = data.instance;
+        seen = readSaved(notificationKey + ':seen:' + seenInstance, {});
+      } else {
+        // 多标签页共用同一份记录：每批处理前都以 localStorage 最新值合并内存 seen，
+        // 其他标签页已提醒过的状态变化不再重复弹窗。
+        seen = { ...seen, ...readSaved(notificationKey + ':seen:' + seenInstance, {}) };
       }
       inboxAt = Date.now();
       $("attention-inbox").textContent =
@@ -162,6 +166,7 @@ window.RSIExperience = (() => {
         "deploy_failed",
       ]);
       const next = {};
+      let displayFailures = 0, displayed = 0;
       for (const task of data.notifications || []) {
         let result = {};
         try {
@@ -179,7 +184,7 @@ window.RSIExperience = (() => {
             result.automation?.release?.state,
             result.automation?.deploy?.state,
           ]);
-        next[task.id] = signature;
+        let displayFailed = false;
         if (
           seen[task.id] !== signature &&
           (attention.has(status) || status === "ci_failed") &&
@@ -189,26 +194,53 @@ window.RSIExperience = (() => {
             title =
               "Adaptive RSI · " +
               (data.projects.find((p) => p.id === task.project)?.name || "");
-          if (window.RSIDesktop)
-            window.RSIDesktop.invoke("notify", { title, body, task: task.id, project: task.project }).catch(() => {});
-          else if (
-            "Notification" in window &&
-            Notification.permission === "granted"
-          ) {
-            const notification = new Notification(title, {
-              body,
-              tag: task.id,
-            });
-            notification.onclick = () => {
-              window.focus();
-              safe(() => openTask(task));
-              notification.close();
-            };
+          try {
+            if (window.RSIDesktop)
+              window.RSIDesktop.invoke("notify", { title, body, task: task.id, project: task.project }).catch(() => {});
+            else if (
+              "Notification" in window &&
+              Notification.permission === "granted"
+            ) {
+              const notification = new Notification(title, {
+                body,
+                tag: task.id,
+              });
+              notification.onclick = () => {
+                window.focus();
+                safe(() => openTask(task));
+                notification.close();
+              };
+            }
+          } catch {
+            // 单条显示失败只跳过该条，同批其余提醒继续；不写入 seen，下一轮重试，
+            // 构造器持续不可用（如 iOS PWA）时也不会永久静默。
+            displayFailed = true;
+            displayFailures++;
           }
         }
+        if (displayFailed) continue;
+        displayed++;
+        next[task.id] = signature;
       }
-      seen = Object.fromEntries(Object.entries({ ...seen, ...next }).slice(-5000));
-      localStorage.setItem(notificationKey + ":seen:" + seenInstance, JSON.stringify(seen));
+      if (displayFailures) {
+        if (!notifyFailureToasted) {
+          notifyFailureToasted = true;
+          toast(t("系统通知暂时无法显示，任务仍在待办列表中。"), true);
+        }
+      } else if (displayed) {
+        notifyFailureToasted = false;
+      }
+      // 写盘前重读 localStorage 合并其他标签页的最新记录，缩小并写互相覆盖的窗口；
+      // 本批观察到的条目触新（移到末尾），裁剪只逐出长期未再出现的任务，
+      // 活跃待办不会因超过 5000 条被无变化逐出后重复弹窗。
+      const persisted = readSaved(notificationKey + ':seen:' + seenInstance, {});
+      const merged = { ...persisted };
+      for (const [id, signature] of Object.entries(next)) {
+        delete merged[id];
+        merged[id] = signature;
+      }
+      seen = Object.fromEntries(Object.entries(merged).slice(-5000));
+      localStorage.setItem(notificationKey + ':seen:' + seenInstance, JSON.stringify(seen));
     } catch {
     } finally {
       inboxBusy = false;
@@ -349,12 +381,14 @@ window.RSIExperience = (() => {
       [
         "failed",
         "blocked",
+        "waiting_budget",
         "interrupted",
         "expired",
         "insufficient_evidence",
         "deferred",
         "rejected",
         "cancelled",
+        "obsolete",
       ].includes(metadata.state)
     )
       controls.append(

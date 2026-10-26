@@ -304,5 +304,43 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                     self.assertEqual(posts, ["actions/runs/" + str(target["workflow_run_id"]) + "/rerun"])
 
 
+class WorkflowChoicesFeedbackTest(unittest.TestCase):
+    def test_origin_mismatch_is_a_safe_actionable_validation_error(self):
+        import http.client
+        from adaptive_rsi import server as server_module
+        for message in ["Workflow repository must match the selected project's origin",
+                        "Workflow must be an existing repository file"]:
+            self.assertIn(message, server_module.SAFE_VALIDATION_MESSAGES)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            runtime = Runtime(Store(root / "state"), FakeAgent())
+            project = runtime.add_project(fixture(root / "project"), "工作流列表项目")
+            runtime.configure({"github": {"repository": "example-owner/example-repo"}}, project)
+            with self.assertRaises(ValueError) as caught:
+                release.workflow_choices(runtime, project)
+            self.assertEqual(str(caught.exception),
+                             "Workflow repository must match the selected project's origin")
+            server = server_module.Server(runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+                try:
+                    connection.request("GET", "/api/release-workflows?project=" + project,
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(3)
+                runtime.close()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(payload, {"error": "Workflow repository must match the selected project's origin",
+                                       "error_code": "validation_error"})
+
+
 if __name__ == "__main__":
     unittest.main()

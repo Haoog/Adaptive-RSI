@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+- System notifications now share one deduplication record across browser tabs: a state change alerted by one tab is no longer alerted again by the others, while the existing restore-after-reload semantics are preserved.
+- A single failing system notification no longer swallows the rest of its batch: the failed item retries on the next poll with at most one hint per failure streak; when the constructor is unavailable (such as an iOS Home Screen app) the interface says so explicitly and resumes after recovery instead of failing silently forever.
+- Notification deduplication entries are touched on each observation before trimming, so active attention items are no longer evicted unchanged past the 5000-entry bound and re-alerted; storage stays bounded.
+- Failed saves of delivery authorization settings no longer show only a generic error: the seven server-side validation messages about delivery mode, workflow path, fixed tag, commit SHA, health URL and automatic rollback now come with actionable localized guidance in Chinese, with matching English translations.
+- The full commit SHA inputs for release/deploy tags now validate exactly like the server (40 lowercase hex characters). Uppercase input is blocked before saving with an explanation and is never silently rewritten; the post-deploy health URL must be HTTPS without credentials, query or fragment already in the browser.
+- When listing release/deploy workflows fails, the dropdown no longer stays on "Loading workflows…": it shows an error item and retries through the existing refresh button; a successful reload clears the stale failure message.
+- When the project's GitHub repository does not match its local origin, the server returns the fixed validation message and the interface explains how to align the repository with the origin before retrying.
+- When a historical run in the task detail fails to load, the section now shows an error message with a retry entry, and collapsing and reopening reloads it instead of staying blank forever; duplicate requests are not sent while one load is in flight.
+- "Cancel task" in the task detail now covers every state the server allows cancelling: awaiting_approval, waiting_budget, blocked, deferred, insufficient_evidence, failed and interrupted tasks can all be cancelled. Cancelling a pending-approval candidate first confirms the consequences (the candidate is revoked, fresh verification is required; existing PRs are not affected).
+- "Recheck with current inputs" inside the task detail is now also available for waiting_budget and obsolete tasks, matching the task list and the server's retryable states.
+
 ## 0.5.117
 
 <!-- adaptive-rsi-release:0.5.117;base:366d91099b42a38e8c3c8c89bfe0372bcaa267a1 -->

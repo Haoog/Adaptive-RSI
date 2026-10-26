@@ -558,5 +558,121 @@ class ReleaseDispatchRejectionTest(unittest.TestCase):
         self.assertEqual(calls["dispatch"], 1)
 
 
+class CliAndRepositoryErrorTest(unittest.TestCase):
+    """固定业务校验必须以 400 与原文到达 CLI 和面板，而不是内部错误。"""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_repository_rejects_unusable_roots_with_fixed_message(self):
+        from adaptive_rsi.gitops import repository
+        plain = self.root / "plain"
+        plain.mkdir()
+        commitless = self.root / "empty-repo"
+        commitless.mkdir()
+        git(commitless, "init", "--quiet")
+        for path in (plain, commitless):
+            with self.assertRaises(ValueError) as caught:
+                repository(path)
+            self.assertEqual(str(caught.exception), "Select the root of an existing Git repository")
+        usable = fixture(self.root / "usable")
+        self.assertEqual(repository(usable), usable)
+
+    def test_add_retry_cancel_and_goal_conflicts_map_to_fixed_validation_messages(self):
+        runtime = Runtime(Store(self.root / "state"), object())
+        self.addCleanup(runtime.close)
+        plain = self.root / "plain"
+        plain.mkdir()
+        repo = fixture(self.root / "project")
+        project = runtime.add_project(repo)
+        runtime.goal(project, "First requirement text", request_id="probe-1")
+        with self.assertRaises(ValueError) as goal_conflict:
+            runtime.goal(project, "Different text entirely", request_id="probe-1")
+        self.assertEqual(str(goal_conflict.exception), "Submission ID was already used with different content")
+        with self.assertRaises(ValueError) as retry_missing:
+            runtime.retry("missing-task")
+        self.assertEqual(str(retry_missing.exception), "This task cannot be retried")
+        with self.assertRaises(ValueError) as cancel_missing:
+            runtime.cancel_task("missing-task")
+        self.assertEqual(str(cancel_missing.exception), "Task not found")
+
+        server = Server(runtime)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server_thread.join, 3)
+
+        import http.client
+
+        def post(path, payload):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+            try:
+                body = json.dumps(payload).encode()
+                connection.request("POST", path, body=body, headers={
+                    "Content-Type": "application/json", "Content-Length": str(len(body)),
+                    "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                    "Cookie": server.cookie + "=" + server.token})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        status, payload = post("/api/projects", {"path": str(plain)})
+        self.assertEqual(status, 400)
+        self.assertEqual(payload, {"error": "Select the root of an existing Git repository",
+                                   "error_code": "validation_error"})
+        status, payload = post("/api/retry", {"task": "missing-task"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "This task cannot be retried", "validation_error"))
+        status, payload = post("/api/cancel", {"task": "missing-task"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "Task not found", "validation_error"))
+
+    def test_cli_api_surfaces_fixed_server_messages(self):
+        import io
+        import urllib.error
+        from adaptive_rsi import cli
+        state = self.root / "cli-state"
+        state.mkdir()
+        (state / "server.json").write_text(json.dumps(
+            {"origin": "https://127.0.0.1:1", "cookie": "rsi", "token": "t", "csrf": "c"}))
+
+        def error_for(payload, code=400):
+            body = json.dumps(payload).encode()
+            return urllib.error.HTTPError("https://127.0.0.1:1/api/retry", code, "Bad Request",
+                                          {}, io.BytesIO(body))
+
+        def error_for_json(raw, code=400):
+            return urllib.error.HTTPError("https://127.0.0.1:1/api/retry", code, "Bad Request",
+                                          {}, io.BytesIO(raw.encode()))
+
+        with patch("urllib.request.urlopen", side_effect=error_for(
+                {"error": "This task cannot be retried", "error_code": "validation_error"})):
+            with self.assertRaises(RuntimeError) as caught:
+                cli.api(state, "/api/retry", {"task": "missing-task"})
+        self.assertEqual(str(caught.exception), "This task cannot be retried")
+        with patch("urllib.request.urlopen", side_effect=error_for(
+                {"error": "Request could not be completed", "error_code": "internal_error"}, 500)):
+            with self.assertRaises(RuntimeError) as caught:
+                cli.api(state, "/api/retry", {"task": "missing-task"})
+        self.assertEqual(str(caught.exception), "Request could not be completed (internal_error)")
+        with patch("urllib.request.urlopen", side_effect=error_for({}, 502)):
+            with self.assertRaises(RuntimeError) as caught:
+                cli.api(state, "/api/retry", {"task": "missing-task"})
+        self.assertEqual(str(caught.exception), "HTTP Error 502")
+        # 合规代理可能返回合法 JSON 但不是对象；一行固定错误，不打印堆栈。
+        for body in ("null", "[]", '"gateway"'):
+            with patch("urllib.request.urlopen", side_effect=error_for_json(body, 502)):
+                with self.assertRaises(RuntimeError) as caught:
+                    cli.api(state, "/api/retry", {"task": "missing-task"})
+            self.assertEqual(str(caught.exception), "HTTP Error 502")
+
+
 if __name__ == "__main__":
     unittest.main()
