@@ -5,6 +5,7 @@
 ## Unreleased
 
 - The built-in updater recognizes exhausted GitHub anonymous API primary quotas, shows the retry time, and blocks checks and installation requests until reset. It retains installation consent for the original version without spending ordinary installation retries, then becomes eligible to retry at the deadline.
+- SQLite backups become visible atomically only after copying, portability preparation and file closure. Incomplete files are neither listed nor successfully downloaded as empty backups; failures remove staging files and retain existing backups.
 
 ## 0.5.110
 

@@ -44,6 +44,8 @@ Metrics also report average time to PR and merge with sample counts, repeated fa
 
 **Data and diagnostics** provides storage totals, consistent online SQLite backups, downloads and diagnostic previews. Backups contain private task content and configuration; keep them private. Diagnostic summaries include only version, counts, failure codes and storage size, excluding credentials, paths, code, task text and full prompts.
 
+Backups remain absent from the download list while being generated. They become downloadable only after copying, portability preparation and file closure, preventing incomplete snapshots from being exported as successful backups. Failures remove staging files without overwriting existing backups.
+
 Restore into a new state directory:
 
 ```sh
