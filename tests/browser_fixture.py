@@ -93,6 +93,10 @@ def main():
             runtime.store.execute("INSERT INTO runs(id,task,project,state,config,result,started,ended) "
                                   "VALUES ('browser-ci',?,?,'pr_open','{}',?,1,2)",
                                   (failed_ci, project, json.dumps({"delivery_status": "ci_failed"})))
+            if os.environ.get("RSI_BROWSER_OBSOLETE_ONLY"):
+                for name in ["过时任务重试入口", "过时任务补充入口"]:
+                    obsolete = runtime.store.add_task(project, "goal", name, name)
+                    runtime.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete,))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -70,7 +70,7 @@ python3 scripts/start.py
 python3 scripts/rsi doctor
 ```
 
-The launcher reuses an existing service. Add projects and configure models, scan intervals, and delivery in the dashboard; saved settings take effect immediately. See [server deployment](SERVER.en.md) for Linux and systemd setup.
+The launcher reuses an existing service. The dashboard persistently shows save status: saving scan timing reschedules scans, model assignments are saved separately for new tasks, active tasks retain their configuration, and delivery permissions are rechecked before execution. No restart is required. Edit fixed checks as structured fields and read check results and mobile approval summaries with expandable original evidence. See [server deployment](SERVER.en.md) for Linux and systemd setup.
 
 ## Core Capabilities
 

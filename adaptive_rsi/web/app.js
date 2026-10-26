@@ -73,7 +73,12 @@ async function sendApi(path,body,signal){
  if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;throw error;}
  let data;
  try{data=await response.json();}catch(error){const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;throw invalid;}
- if(!response.ok){const error=Error(t(apiErrors[data.error]||data.error||String(response.status)));error.code=data.error_code||data.catalog_error;error.status=response.status;throw error;}
+ if(!response.ok){
+  // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
+  const known=apiErrors[data.error];
+  const message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
+  if(!known&&data.error)console.warn('[adaptive-rsi]',data.error);
+  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.evidence={status:response.status,code:error.code,error:data.error};throw error;}
  if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
 }
@@ -102,13 +107,13 @@ function stamp(seconds){try{return new Date(seconds*1000).toLocaleString(languag
 function scheduleStamp(seconds,timezone){try{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:timezone});}catch{return stamp(seconds);}}
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
 function action(text,callback,cls='button'){const node=el('button',text,cls);node.type='button';node.addEventListener('click',()=>safe(callback));return node;}
-function uiConfirm(message){
+function uiConfirm(message,content){
  // 原生 confirm 无法跟随界面语言且风格割裂；用统一的对话框获取确认结果。
  return new Promise(resolve=>{
   const box=el('dialog',undefined,'confirm-dialog'),text=el('p',message),row=el('div',undefined,'confirm-actions');
   const no=el('button',t('取消'),'button');no.type='button';
   const yes=el('button',t('确认'),'button primary');yes.type='button';
-  row.append(no,yes);box.append(text,row);document.body.append(box);
+  row.append(no,yes);box.append(text);if(content)box.append(content);box.append(row);document.body.append(box);
   let settled=false;
   const finish=value=>{if(settled)return;settled=true;resolve(value);box.close();box.remove();};
   no.addEventListener('click',()=>finish(false));
@@ -134,7 +139,7 @@ async function safe(fn,form){
   const message=error instanceof SyntaxError?t('JSON 格式有误，请检查逗号、引号和括号；输入已保留。'):error.message;
   if(form&&!feedbackCurrent()){toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);return;}
   if(form){if(!feedback){feedback=el('p',undefined,'form-error');feedback.dataset.formError='';feedback.setAttribute('role','alert');form.append(feedback);}feedback.textContent=message;feedback.hidden=false;}
-  toast(message,true);
+  toast(message,true);if(error.evidence&&window.RSIProduct){const evidence=window.RSIProduct.raw(error.evidence,'查看原始诊断');$('toast').append(evidence);}
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submit.textContent=label;}}
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
@@ -287,7 +292,7 @@ function renderTasks(){
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
-  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
  }
@@ -298,7 +303,7 @@ function taskOutcome(data){
  const result=data.result,outcome=el('section',undefined,'task-outcome');outcome.append(el('h3',t('这次的结果')));
  outcome.append(el('h4',t('改了什么')),el('p',result.summary||result.reason||t('还没有完成结果。')));
  if(result.value){const reason=el('details',undefined,'outcome-value');reason.open=true;reason.append(el('summary',t('为什么值得做')),valueReport(result.value,result.plan_reason,result.scope));outcome.append(reason);}
- if(result.failure)outcome.append(el('p',failureCopy(result.failure),'form-error'));
+ if(result.failure){outcome.append(el('p',failureCopy(result.failure),'form-error'));if(window.RSIProduct)outcome.append(window.RSIProduct.raw({failure:result.failure,reason:result.reason},'查看原始诊断'));}
  if(result.files?.length)outcome.append(el('p',t('修改文件')+' · '+result.files.join(', '),'muted'));
  for(const [key,title]of [['evaluation','运行检查'],['review','代码评审']]){const row=el('p');row.append(el('strong',t(title)+' · '),result[key]?badge(result[key].decision):document.createTextNode(t('尚未完成')));outcome.append(row);}
  const next=result.delivery_status?t(deliveryNames[result.delivery_status]||result.delivery_status):t(statusNames[data.state]||data.state);
@@ -306,7 +311,7 @@ function taskOutcome(data){
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
- outcome.append(stageProgress(data));return outcome;
+ if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}outcome.append(stageProgress(data));return outcome;
 }
 async function showTask(task,restoreView){const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
@@ -331,7 +336,7 @@ async function showTask(task,restoreView){const ticket=++detailSequence,project=
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
   if(data.result.files){delivery.append(action(t('阅读代码差异'),()=>window.RSIExperience?.showDiff(run.id),'text-button'));if(!window.RSIDesktop){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
-  if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!(await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'))))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
+  if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async()=>{if(!(await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),window.RSIProduct?.approval(data))))return;await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}));
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
@@ -353,7 +358,7 @@ function setPath(obj,path,value){const keys=path.split('.');let node=obj;keys.sl
 function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typeof value==='object'&&!Array.isArray(value))a[key]=deepMerge(a[key]||{},value);else a[key]=value;}return a;}
 function settingsKey(){return $('config-scope').value==='global'?'global':projectId;}
 function sensitiveField(node){return node.type==='password'||/(?:api.?key|oauth|secret|password|credential|authorization|token)/i.test([node.id,node.name,node.dataset.path,node.autocomplete].join(' '));}
-function settingsValues(){return [...$('settings-form').querySelectorAll('input,textarea,select')].filter(node=>!sensitiveField(node)&&!node.hasAttribute('data-unit-for')).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));}
+function settingsValues(){return [...$('settings-form').querySelectorAll('input,textarea,select')].filter(node=>!sensitiveField(node)&&!node.hasAttribute('data-unit-for')&&!node.hasAttribute('data-check-field')&&!node.hasAttribute('data-check-arg')).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));}
 function draftSettingPath(path){return !!path&&!sensitiveField({id:'',name:'',dataset:{path},autocomplete:''})&&path!=='delivery.deploy.health_url';}
 function persistentSettingsValues(){const values=[...$('settings-form').querySelectorAll('[data-path]')].filter(node=>draftSettingPath(node.dataset.path)).map(node=>({id:node.id,path:node.dataset.path,value:node.value,checked:node.checked,unit:node.dataset.duration?document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value:undefined}));for(const id of ['work-start','work-end','issue-labels']){const node=$(id);values.push({id,value:node.value,checked:node.checked});}values.push({id:'schedule-mode',value:$('schedule-mode').value});return values;}
 function persistableDraftEntry(entry){return !!(entry.path&&draftSettingPath(entry.path)||['schedule-mode','work-start','work-end','issue-labels'].includes(entry.id));}
@@ -369,6 +374,18 @@ function settingBaselineValue(entry,baseline,mode){
  return undefined;
 }
 function sameValue(a,b){return JSON.stringify(a)===JSON.stringify(b);}
+function acknowledgedSettingsValues(values,config,mode){
+ return values.map(entry=>{const saved={...entry},value=settingBaselineValue(entry,config,mode);
+  if(entry.path){if(typeof value==='boolean')saved.checked=value;else if(value!==undefined)saved.value=String(entry.unit?value/Number(entry.unit):value);}
+  else if(['work-start','work-end'].includes(entry.id))saved.value=String(value);
+  else if(entry.id==='issue-labels'){if(!sameValue(entry.value.split(',').map(x=>x.trim()).filter(Boolean),value))saved.value=value.join(', ');}
+  else if(entry.id==='checks-json'){try{if(!sameValue(JSON.parse(entry.value),value))saved.value=JSON.stringify(value,null,2);}catch{saved.value=JSON.stringify(value,null,2);}}
+  else if(entry.id==='schedule-mode')saved.value=mode;
+  else if(entry.id==='delivery-choice')saved.value=config.delivery.mode==='pr'?(config.delivery.auto_merge?'auto':'pr'):config.delivery.auto_merge?'custom':'local';
+  else if(entry.id==='advanced-json')saved.value='';
+  return saved;
+ });
+}
 function writePersistentSettingsDraft(scope,values,baseline,mode){
  const clean=JSON.parse(settingsClean.get(scope)||'[]'),cleanByPath=new Map(clean.map(v=>[v.path||v.id,v]));
  const saved=values.filter(v=>persistableDraftEntry(v)&&!sameValue(v,cleanByPath.get(v.path||v.id))).map(v=>({...v,baselineValue:settingBaselineValue(v,baseline,mode)}));
@@ -442,7 +459,7 @@ function renderSettings(){settingsGeneration++;const feedback=$('settings-form')
  renderUpdate();
  $('schedule-mode').value=schedulePaths.some(path=>getPath(currentProject()?.overrides,path)!==undefined)?'custom':'inherit';
  settingsModes.set(settingsBaseline,$('schedule-mode').value);
- $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';settingsContext=settingsKey();syncDelivery();syncScheduleMode();settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();syncDelivery();syncScheduleMode();
+ $('work-start').value=settingsBaseline.schedule.working_hours[0];$('work-end').value=settingsBaseline.schedule.working_hours[1];$('issue-labels').value=settingsBaseline.github.labels.join(', ');$('checks-json').value=JSON.stringify(settingsBaseline.checks,null,2);$('advanced-json').value='';settingsContext=settingsKey();syncDelivery();syncScheduleMode();settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();syncDelivery();syncScheduleMode();window.RSIProduct?.renderEditor();window.RSIProduct?.dirtyStatus();
  safe(renderCapabilities);safe(loadReleaseWorkflows);}
 async function renderCapabilities(){
  const ticket=++capabilitySequence,project=projectId,target=$('capabilities');target.replaceChildren();if(!project){target.append(el('p',t('接入项目后识别运行环境。'),'muted'));return;}const capabilities=await api('capabilities?project='+encodeURIComponent(project));if(ticket!==capabilitySequence||project!==projectId)return;if(!capabilities.modules.length)target.append(el('p',t('未识别到标准构建清单。可手动配置验收命令。'),'muted'));for(const module of capabilities.modules){const row=el('div',undefined,'capability-row');row.append(el('strong',module.language),el('code',module.manifest),el('span',{executable:t('检查可执行 · 已验证'),unverified:t('待隔离验证'),analysis_only:t('可分析 · 需配置检查'),environment_blocked:t('环境缺少工具')}[module.status],'badge '+(module.status==='environment_blocked'?'warn':module.status==='executable'?'good':'neutral')));target.append(row);}
@@ -484,7 +501,7 @@ async function checkReadiness(force=false){
  catch(error){if(!current()){discard();return;}discard();$('readiness-summary').textContent=error.message;$('readiness-check').disabled=false;throw error;}
 }
 function renderReadiness(){
- const result=readinessCache.get(projectId);if(!result)return;$('readiness-check').disabled=!!result.loading;
+ window.RSIProduct?.health();const result=readinessCache.get(projectId);if(!result)return;$('readiness-check').disabled=!!result.loading;
  $('readiness-panel').classList.toggle('needs-attention',!result.loading&&!result.ready);
  if(!result.loading&&!result.ready)$('readiness-panel').open=true;
  $('readiness-summary').textContent=t(result.loading?'正在检查运行条件…':result.ready?'基础条件已就绪，实际效果将在任务中验证。':'还有运行条件需要处理，请按提示设置。');
@@ -551,19 +568,20 @@ document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListe
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
 $('settings-form').addEventListener('invalid',event=>{let detail=event.target.closest('details');while(detail){detail.open=true;detail=detail.parentElement.closest('details');}},true);
 $('settings-form').addEventListener('input',stashSettings);$('settings-form').addEventListener('change',stashSettings);
-$('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{const button=$('settings-save');if(button.disabled)return;button.disabled=true;try{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));const unchanged=unchangedForm(event.target),baseline=settingsBaseline,scope=$('config-scope').value,project=projectId,key=settingsKey();let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=fieldValue(node);if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});
+$('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{const button=$('settings-save'),saveKey=settingsKey();if(button.disabled)return;button.disabled=true;try{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));const unchanged=unchangedForm(event.target),baseline=settingsBaseline,scope=$('config-scope').value,project=projectId,key=settingsKey();let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=fieldValue(node);if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});
  const hours=[Number($('work-start').value),Number($('work-end').value)];if(JSON.stringify(hours)!==JSON.stringify(settingsBaseline.schedule.working_hours))setPath(patch,'schedule.working_hours',hours);
  const labels=$('issue-labels').value.split(',').map(x=>x.trim()).filter(Boolean);if(JSON.stringify(labels)!==JSON.stringify(settingsBaseline.github.labels))setPath(patch,'github.labels',labels);
- const checks=JSON.parse($('checks-json').value);if(JSON.stringify(checks)!==JSON.stringify(settingsBaseline.checks))patch.checks=checks;
+ const checks=JSON.parse($('checks-json').value);window.RSIProduct?.validateChecks(checks);if(JSON.stringify(checks)!==JSON.stringify(settingsBaseline.checks))patch.checks=checks;
  const inherit=scope==='project'&&$('schedule-mode').value==='inherit'?schedulePaths:[];
  const scheduleMode=$('schedule-mode').value;
  if(scope==='project'&&scheduleMode==='custom'&&settingsModes.get(baseline)==='inherit')for(const path of schedulePaths){const node=document.querySelector('[data-path="'+path+'"]');setPath(patch,path,fieldValue(node));}
- patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=saved.config||deepMerge(structuredClone(baseline),patch);
+ patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const submittedValues=settingsValues();window.RSIProduct?.savingStatus(true,false,key);const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=deepMerge(structuredClone(baseline),saved.config||patch);
  settingsModes.set(acknowledged,scheduleMode);
- const draft=settingsDrafts.get(key);if(draft?.baseline===baseline)draft.baseline=acknowledged;
- if(settingsBaseline===baseline&&projectId===project&&$('config-scope').value===scope)settingsBaseline=acknowledged;
+ settingsClean.set(key,JSON.stringify(acknowledgedSettingsValues(submittedValues,acknowledged,scheduleMode)));
+ const draft=settingsDrafts.get(key);if(draft){draft.baseline=structuredClone(acknowledged);draft.baselineValues=Object.fromEntries(draft.values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,acknowledged,scheduleMode)]));writePersistentSettingsDraft(key,draft.values.filter(persistableDraftEntry),acknowledged,scheduleMode);}
+ if(settingsBaseline===baseline&&projectId===project&&$('config-scope').value===scope){settingsBaseline=acknowledged;stashSettings();}
  readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'){settingsDrafts.delete(key);renderSettings();}
- toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{button.disabled=false;}},event.target);});
+ window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));},event.target);});
 const updateNames={recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
 const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
@@ -614,10 +632,10 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
 });
 
 const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升级）',managed:'内置自更新'};
-let desktopUpdate=null,desktopUpdateTimer=null;
+let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 async function checkDesktopUpdate(force=false){
  if(!window.RSIDesktop?.invoke)return;
- try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;}catch{desktopUpdate=null;}
+ try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  renderUpdate();
 }
 async function startDesktopUpdate(){
@@ -653,7 +671,7 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  $('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);
  $('check-update').disabled=update.busy??['downloading','restarting'].includes(update.state);
  renderUpdateExtras(update);}
-$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
+$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}await api('updates/check',{});toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
 if(window.RSIDesktop)safe(checkDesktopUpdate);
@@ -666,7 +684,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  if(!projectId&&$('project-select').options.length)$('project-select').options[0].textContent=t('尚未接入项目');
  $('toast').hidden=true;
  if(!state)return;
- render();if(settingsBaseline)syncDelivery();
+ render();if(settingsBaseline){syncDelivery();window.RSIProduct?.renderEditor();window.RSIProduct?.dirtyStatus();}
  window.RSIModelCenter?.translate();
  window.RSIUsage?.translate();
  window.RSIDesktop?.translate?.();

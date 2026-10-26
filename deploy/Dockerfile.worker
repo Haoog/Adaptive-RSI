@@ -1,4 +1,7 @@
-FROM node:22-bookworm
+# 默认固定 Docker 官方多架构 OCI index；升级时核验 registry manifest 后覆盖 NODE_IMAGE。
+# Pin the official multi-platform OCI index; verify the registry manifest before overriding NODE_IMAGE.
+ARG NODE_IMAGE=node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384
+FROM ${NODE_IMAGE}
 ARG CODEX_VERSION=0.163.0
 # 固定为已验证的最低支持版本以保证可复现构建；代码同时兼容 OpenCode 2.x，
 # 升级本镜像前需在 Linux CI 完整通过 tests.test_opencode_integration。
@@ -7,4 +10,8 @@ RUN python3 --version && git --version \
     && npm install -g @openai/codex@${CODEX_VERSION} opencode-ai@${OPENCODE_VERSION} \
     && npm cache clean --force
 ENV PYTHONDONTWRITEBYTECODE=1 CI=1
+RUN mkdir -p /workspace && chown node:node /workspace
 WORKDIR /workspace
+# 默认交互运行不使用 root；执行器仍通过 --user 显式使用宿主 UID/GID。
+# Default interactive runs use a non-root user; executors still set the host UID/GID via --user.
+USER node

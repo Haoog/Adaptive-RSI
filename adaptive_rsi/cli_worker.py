@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from .process import Sandbox, run_process
+from .process import Sandbox, docker_mount, run_process
 
 
 CODEX_AUTH_LOCK = threading.RLock()
@@ -93,15 +93,15 @@ def run_cli(argv, workspace, home, config, cancel=None, protected=(), read_only=
                "--pids-limit=" + str(limits["pids"]), "--memory=" + str(limits["memory_mb"]) + "m",
                "--cpus=" + str(limits["cpus"]),
                "--add-host", "host.docker.internal:host-gateway",
-               "--tmpfs", "/tmp:rw,nosuid,size=256m", "--mount", "type=bind,src=" + root + ",dst=" + root +
-               (",readonly" if read_only else ""), "-w", root]
+               "--tmpfs", "/tmp:rw,nosuid,size=256m", "--mount", docker_mount(root, root, read_only),
+               "-w", root]
     # 只读角色仅允许将 CLI 输出写入内部目录，不可写项目代码。
     if read_only:
         internal = str(Path(workspace).resolve() / ".rsi-agent")
-        command += ["--mount", "type=bind,src=" + internal + ",dst=" + internal]
+        command += ["--mount", docker_mount(internal, internal)]
     metadata = Path(workspace) / ".git"
     if metadata.exists():
-        command += ["--mount", "type=bind,src=" + str(metadata) + ",dst=" + str(metadata) + ",readonly"]
+        command += ["--mount", docker_mount(metadata, metadata, read_only=True)]
     for key in env:
         if key != "PATH":
             command += ["--env", key]

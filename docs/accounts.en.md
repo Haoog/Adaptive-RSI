@@ -22,6 +22,21 @@ Device authorization must be enabled in ChatGPT account security settings or wor
 
 OpenCode `1.19.3` and `2.1.3` are supported. The runtime detects the version and adapts its CLI arguments automatically; if a version is unsupported, the page reports it and suggests an upgrade. Methods requiring a local-browser callback that cannot work reliably on the server are explained rather than offered as working logins; choose device authorization or a key instead. Account connection does not load project plugins, MCP or project instructions.
 
+### OpenCode Go
+
+Verified against the [official OpenCode Go documentation](https://opencode.ai/v2/docs/console/go/): obtain a Go API key in the [OpenCode console](https://opencode.ai/console). In the OpenCode TUI, run `/connect`, select **OpenCode Go**, paste the key, then use `/models`. The provider ID is `opencode-go`; OpenCode routes use `opencode-go/<model-id>`. In this dashboard, select the matching provider under the OpenCode connection and use **Save provider key**, or add a native API service using the **OpenCode Go API Key** preset. Signing in to Codex through a ChatGPT subscription does not supply Go credentials. Do not send a Go key to the official OpenAI API endpoint.
+
+Choose the native API protocol and endpoint for the model. These are base URLs; the selected protocol appends its request path:
+
+| Dashboard protocol | Base URL | Request path |
+| --- | --- | --- |
+| Responses API | `https://opencode.ai/inference/go/openai/v1` | `/responses` |
+| Chat Completions API | `https://opencode.ai/inference/go/openai/v1` | `/chat/completions` |
+| Anthropic Messages | `https://opencode.ai/inference/go/anthropic/v1` | `/messages` |
+| Gemini GenerateContent | `https://opencode.ai/inference/go/google/v1beta` | `/models/<model-id>:generateContent` |
+
+For example, the current official list assigns `gpt-6-luna` to Responses, `kimi-k3` to Chat Completions and `minimax-m3` to Anthropic Messages. The Go preset defaults to Chat Completions; select the matching protocol under **Advanced connection settings** for other models. For the official Go base URLs above, this dashboard automatically uses the separate public directory `GET https://opencode.ai/inference/go/v1/models` without sending inference keys. The directory has no protocol metadata, so select each model's matching protocol using the official documentation; missing model IDs can still be added manually. Current models, endpoints, remaining allowance and terms come from the official console. Verifying the documentation does not establish successful inference. Fetching the catalog and saving a key do not automatically run paid model tests.
+
 ## Official APIs, gateways and local services
 
 Choose the service, enter its endpoint and key, then save and fetch models. Local services without authentication can select **No key**. Services without OAuth use API-key setup instead of a nonfunctional login button.

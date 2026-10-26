@@ -194,7 +194,8 @@ class NativeProtocolsTest(unittest.TestCase):
             implementation = NativeAgent(self.store).invoke("implementation", "Implement it", self.workspace, "timeout-implementation", "timeout", config, route, provider)
         self.assertEqual(probe, {"summary": "RSI_OK"})
         self.assertEqual(implementation, {"summary": "RSI_OK"})
-        self.assertEqual(captured, [30, 300])
+        # 实现角色常触发长推理：预算放宽到 900 秒（探针仍是 30 秒）。
+        self.assertEqual(captured, [30, 900])
 
     def test_tool_loop_continues_past_old_call_and_turn_limits(self):
         with ProtocolFixture("chat_completions", "long_loop") as fixture:

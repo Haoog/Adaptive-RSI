@@ -42,7 +42,9 @@ LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaitin
 # 用户明确做出的决定（不采纳、取消）同样压制重复发现，只有用户重新考虑才回池。
 SUPPRESSING_STATES = LIVE_FINDING_STATES + ("rejected", "cancelled")
 # 到达这些状态的发现可以被巡检重新入队：此前尝试已结束且没有产出修复。
-REDISCOVERABLE_STATES = ("failed", "blocked", "expired", "obsolete", "insufficient_evidence", "interrupted")
+# obsolete 不在其中：规划明确判定「过时/不再适用」属于结论而非失败，
+# 重新入队会在每个扫描周期重复付费规划；用户可通过手动重试重新考虑。
+REDISCOVERABLE_STATES = ("failed", "blocked", "expired", "insufficient_evidence", "interrupted")
 # 依赖到达这些终态意味着永远不会合并；等待它的任务需要人工复核。
 DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejected",
                           "pr_closed", "unverified_merge", "reverted", "superseded")
@@ -342,9 +344,10 @@ class Runtime:
         row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
         # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
         scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
-        if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired"]:
+        if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
             raise ValueError("This task cannot be retried")
-        self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (time.time(), task))
+        # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
+        self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (time.time(), task))
         self.store.event("manual_retry", "User requested fresh verification", row["project"], data={"task": task})
         self.wake.set()
 
@@ -354,7 +357,7 @@ class Runtime:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
-            if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled"]:
+            if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
                 raise ValueError("Pause or finish active work before supplementing this task")
             body = row["body"] + "\n\n" + supplement.strip()
             if len(body) > 30000:
@@ -476,7 +479,9 @@ class Runtime:
                 self.store.execute("UPDATE projects SET paused=1")
             self.updates.restore_startup()
             self.store.recover()
-            self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
+            # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
+            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
+                               "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
             self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
             self.thread.start()
         except BaseException:
@@ -494,6 +499,8 @@ class Runtime:
         self.pool.shutdown(wait=True)
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
             self.maintenance_thread.join(timeout=10)
+        # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
+        self.store.close()
         if self.lockfile:
             self.lockfile.close()
 
@@ -667,8 +674,10 @@ class Runtime:
                         config = self.config(project["id"])
                         hour = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).hour
                         start, end = config["schedule"]["working_hours"]
+                        # 额度退避到期即恢复排队：是否执行由工作时段统一决定，
+                        # 不能让退避结束的任务再等到下一个时段窗口才回到队列。
+                        self.resume_budget(project["id"], config)
                         if start <= hour < end:
-                            self.resume_budget(project["id"], config)
                             self.schedule(project["id"], config)
                             eligible.append((project, config))
                 self.dispatch(eligible)
@@ -1089,7 +1098,7 @@ class Runtime:
                         prior = legacy
                         finding_key = legacy["fingerprint"]
                 if prior and prior["state"] == "merged":
-                    self.store.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
+                    self.store.execute("UPDATE tasks SET state='queued',available=0,attempts=0,infra_retries=0,budget_waits=0,evidence=?,updated=? WHERE id=?",
                                        (encode([{"path": item["path"], "quote": item["quote"], "base": head,
                                                  "source": "reported_recurrence"}]), time.time(), prior["id"]))
                     self.store.event("recurrence_reported", "Inspection reported a possible recurrence; planning must reproduce it", project["id"], run["id"], {"task": prior["id"]})

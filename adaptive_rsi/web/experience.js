@@ -205,22 +205,11 @@ window.RSIExperience = (() => {
   }
   function enhanceOutcome(outcome, data) {
     const result = data.result;
-    for (const stage of ["candidate", "candidate_full"]) {
-      for (const check of result.evaluation?.checks?.[stage] || []) {
-        if (check.passed) continue;
-        const card = el("section", undefined, "blocking-finding");
-        card.append(el("h4", t("未通过的固定检查") + " · " + check.name),
-          el("p", t(evaluationNames[stage] || stage) + " · " + t("退出码") + " " + check.exit_code));
-        const excerpt = String(check.stderr || check.stdout || check.error || "").slice(-1800);
-        if (excerpt) card.append(el("pre", excerpt));
-        outcome.append(card);
-      }
-    }
     if (result.evaluation?.criteria?.length) {
       const criteria = el("details");
       criteria.append(el("summary", t("验收标准与覆盖")));
       for (const [index, criterion] of result.evaluation.criteria.entries()) {
-        const checks = (result.evaluation.coverage || []).filter(c => c.criteria.includes(index)).map(c => c.name);
+        const checks = (result.evaluation.coverage || []).filter(c => c.criteria?.includes(index)).map(c => c.name);
         criteria.append(el("p", (index + 1) + ". " + criterion + " · " + (checks.join(", ") || t("覆盖记录未知"))));
       }
       outcome.append(criteria);
@@ -370,6 +359,7 @@ window.RSIExperience = (() => {
         "interrupted",
         "expired",
         "cancelled",
+        "obsolete",
       ].includes(metadata.state) &&
       !task.source.startsWith("system_")
     ) {
@@ -866,5 +856,151 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, taskOpened, enhanceOutcome, showDiff, refreshed };
+  return { queueCopy, taskOpened, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
+})();
+
+'use strict';
+// Presentation only: server evidence and delivery checks remain authoritative.
+window.RSIProduct = (() => {
+  const saveStates=new Map();
+  const saveState=()=>saveStates.get(settingsKey())||{};
+  function raw(value, title='原始证据') {
+    const node=el('details',undefined,'raw-evidence');
+    node.append(el('summary',t(title)),el('pre',typeof value==='string'?value:JSON.stringify(value,null,2)));
+    return node;
+  }
+  function checkList(groups) {
+    const container=el('div',undefined,'check-results');
+    for(const [stage, rows] of Object.entries(groups||{})) {
+      if(!Array.isArray(rows))continue;
+      const section=el('section',undefined,'check-stage');
+      section.append(el('h4',t(evaluationNames[stage]||stage)+' · '+rows.filter(row=>row.passed===true).length+'/'+rows.length));
+      if(!rows.length)section.append(el('p',t('没有检查记录，不能据此认定通过。'),'muted'));
+      for(const check of rows) {
+        const card=el('article',undefined,'check-result');
+        const header=el('div',undefined,'check-result-heading');
+        header.append(el('strong',check.name||t('未命名检查')),badge(check.passed===true?'pass':check.passed===false?'fail':'insufficient_evidence'));
+        card.append(header);
+        const meta=[];
+        if(check.exit_code!==undefined&&check.exit_code!==null)meta.push(t('退出码')+' '+check.exit_code);
+        if(Number.isFinite(check.seconds))meta.push(elapsedCopy(check.seconds));
+        if(check.cwd)meta.push(t('运行目录')+' '+check.cwd);
+        if(meta.length)card.append(el('p',meta.join(' · '),'muted'));
+        const command=check.argv||check.command;
+        if(command)card.append(el('code',Array.isArray(command)?command.map(arg=>JSON.stringify(arg)).join(' '):String(command)));
+        if(check.passed===false)card.append(el('p',t('此检查未通过。展开输出定位原因，修正后重新运行。'),'form-error'));
+        card.append(raw(check,'命令与完整输出'));section.append(card);
+      }
+      container.append(section);
+    }
+    return container;
+  }
+  function deliveryMode(config) {
+    return t(config?.delivery?.mode==='pr'?(config.delivery.auto_merge?'检查通过后自动合并':'自动提交修改，等待合并'):'先保存，暂不提交');
+  }
+  function approval(data) {
+    const result=data.result||{}, live=currentProject(), frozen=data.config||{};
+    const box=el('section',undefined,'approval-summary');box.append(el('h3',t('交付前核对')));
+    const list=el('dl');
+    for(const [label,value] of [
+      ['当前项目',live?.name||data.project||t('未知')],
+      ['GitHub 仓库',frozen.github?.repository||t('未配置')],
+      ['主线分支',frozen.delivery?.base_branch||t('仓库默认分支（交付时复核）')],
+      ['本次检查基线',data.base||t('未知')],
+      ['本次交付设置',deliveryMode(frozen)],
+      ['当前交付授权',deliveryMode(live?.config)],
+      ['项目运行状态',t(live?.paused?'已暂停':'运行中')],
+      ['运行检查',t(result.evaluation?.decision==='pass'?'通过':'尚未通过')],
+      ['代码评审',t(result.review?.decision==='pass'?'通过':'尚未通过')],
+      ['问题解决证据',t(result.evaluation?.improvement?.decision==='pass'?'通过':'未提供通过证据')],
+    ])list.append(el('dt',t(label)),el('dd',value));
+    const current=live?.config||{},merge=!!(frozen.delivery?.auto_merge&&current.delivery?.auto_merge);
+    list.append(el('dt',t('后续自动合并')),el('dd',t(merge?'本次与当前均已授权：门禁通过后可自动合并。':'本次与当前未同时授权：不会自动合并。')));
+    for(const [kind,title] of [['release','发布'],['deploy','部署']]){
+      const saved=frozen.delivery?.[kind],now=current.delivery?.[kind];
+      const enabled=!!(saved?.enabled&&now?.enabled&&current.delivery?.mode==='pr'&&frozen.github?.repository===current.github?.repository&&sameValue(saved,now));
+      list.append(el('dt',t(title)),el('dd',t(enabled?'本次与当前工作流授权一致：合并并验证后可自动执行。':'未授权或授权已变化：不会自动执行。')+(enabled?' · '+saved.workflow+' @ '+saved.ref+' · '+saved.sha:'')));
+    }
+    box.append(list,el('p',t('批准会推送本次候选并创建 PR；后续可能按下列有效授权自动合并、发布或部署。只有本次与当前授权同时允许时才执行。仓库、分支、基线和候选在执行前复核，GitHub 检查与必需评审仍须通过。'),'muted'));
+    if(live?.paused)box.append(el('p',t('项目已暂停：批准后只会排队，启动项目后才执行。'),'muted'));
+    if(frozen.github?.repository!==live?.config?.github?.repository||frozen.delivery?.base_branch!==live?.config?.delivery?.base_branch)
+      box.append(el('p',t('当前交付目标与本次运行不同，请重新运行以获取最新基线。'),'form-error'));
+    return box;
+  }
+  function dirtyStatus() {
+    if(!settingsBaseline)return;
+    const {savedAt='',saving=false}=saveState();
+    const dirty=JSON.stringify(settingsValues())!==settingsClean.get(settingsContext);
+    const node=$('save-note');if(!node)return;
+    node.textContent=t(saving?'正在保存设置…':dirty?'有未保存的修改；点击保存后才会生效。':savedAt?'设置已保存；新任务使用新配置，运行中任务保留原配置。':'当前显示已保存设置；新任务使用这些配置。')+(savedAt&&!dirty&&!saving?' · '+savedAt:'');
+    node.dataset.state=saving?'saving':dirty?'dirty':'saved';
+    const scope=$('config-scope').value==='project'?(currentProject()?.name||t('当前项目')):t('通用默认设置');
+    $('settings-effect').textContent=scope+' · '+t('扫描时间保存后重新安排；模型分工单独保存，从新任务生效。交付授权在执行前复核。无需重启。');
+  }
+  function savingStatus(value,success=false,key=settingsKey()) {const prior=saveStates.get(key)||{};saveStates.set(key,{saving:value,savedAt:success?new Date().toLocaleTimeString(language):prior.savedAt});if(key===settingsKey())dirtyStatus();}
+  function renderEditor() {
+    const host=$('checks-editor');if(!host)return;
+    let checks;try{checks=JSON.parse($('checks-json').value||'[]');}catch{return;}
+    host.replaceChildren();
+    checks.forEach((check,index)=>{
+      const card=el('fieldset',undefined,'check-editor-row');card.append(el('legend',t('固定检查')+' '+(index+1)));
+      for(const [key,label,value] of [['name','检查名称',check.name||''],['cwd','运行目录',check.cwd??'.']]){
+        const wrap=el('label',t(label)),input=el('input');input.value=value;input.dataset.checkField=key;
+        input.setAttribute('aria-label',t(label)+' '+(index+1));wrap.append(input);card.append(wrap);
+        input.addEventListener('input',syncEditor);
+      }
+      const args=el('div',undefined,'check-arguments');
+      const addArgument=value=>{
+        const row=el('div',undefined,'check-argument'),label=el('label'),input=el('textarea');
+        const number=args.children.length,title=number===0?'执行程序':'独立参数';
+        label.append(el('span',t(title)+' '+(number||'')));input.value=value;input.rows=2;input.spellcheck=false;input.dataset.checkArg='';input.setAttribute('aria-label',t(title)+' '+(index+1)+' / '+(number+1));
+        label.append(input);row.append(label);input.addEventListener('input',syncEditor);
+        if(number)row.append(action(t('删除参数'),()=>{row.remove();syncEditor();},'text-button'));args.append(row);
+      };
+      for(const argument of check.argv||[''])addArgument(argument);
+      card.append(args,action(t('添加参数'),()=>{addArgument('');syncEditor();args.lastElementChild.querySelector('textarea').focus();},'button'));
+      card.append(action(t('删除检查'),()=>{card.remove();syncEditor();},'text-button'));host.append(card);
+    });
+    if(!checks.length)host.append(el('p',t('未指定固定检查，将按项目自动识别；识别不到时会阻塞交付。'),'muted'));
+  }
+  function syncEditor() {
+    const checks=[...$('checks-editor').querySelectorAll('fieldset')].map(card=>{
+      const read=key=>card.querySelector('[data-check-field="'+key+'"]').value;
+      return {name:read('name'),cwd:read('cwd'),argv:[...card.querySelectorAll('[data-check-arg]')].map(input=>input.value)};
+    });
+    $('checks-json').value=JSON.stringify(checks);$('checks-json').dispatchEvent(new Event('input',{bubbles:true}));
+  }
+  function validateChecks(checks) {
+    if(!Array.isArray(checks))throw Error(t('固定检查必须是检查列表。'));
+    for(const check of checks){
+      if(!check.name?.trim()||!Array.isArray(check.argv)||!check.argv.length||!check.argv[0]?.trim())throw Error(t('请填写检查名称和程序；每个输入框是一个参数，无需 shell 引号。'));
+      if(check.argv.some(arg=>typeof arg!=='string'||arg.includes('\0')||arg.length>=2000))throw Error(t('检查参数不可含空字符，且每项必须少于 2000 字符。'));
+      const cwd=check.cwd??'.';if(typeof cwd!=='string'||cwd.startsWith('/')||cwd.includes('\\')||cwd.includes('\0')||cwd.split('/').some(part=>part==='..'||part==='.git'))throw Error(t('运行目录必须在项目内，例如 . 或 tests。'));
+    }
+    return checks;
+  }
+  function health() {
+    const node=$('service-status');if(!node)return;
+    node.textContent=$('connection').textContent;
+    const project=currentProject(), result=readinessCache.get(projectId);
+    const counts=state?.task_counts||[],blocked=counts.filter(row=>['blocked','failed','insufficient_evidence','interrupted','ci_failed','release_failed','deploy_failed','regressed'].includes(row.state)).reduce((sum,row)=>sum+row.count,0);
+    $('workspace-health').textContent=t(project?.configuration_error?'设置异常':result?.loading?'正在检查运行条件…':result&&!result.ready?'运行条件受阻':result?.ready?'基础条件已就绪，实际效果将在任务中验证。':'运行条件尚未检查')+' · '+t('阻塞或失败任务')+' '+blocked;
+    const host=$('workspace-health-evidence');if(!host)return;
+    const restore=window.RSIExperience?.detailsSnapshot?.(host);host.replaceChildren();
+    const models=el('details');models.append(el('summary',t('模型连接与验证证据')));
+    if(!result?.model_evidence?.length)models.append(el('p',t('未知：尚未取得当前模型的验证记录。'),'muted'));
+    for(const proof of result?.model_evidence||[])models.append(el('p',t(roleNames[proof.role]||proof.role)+' · '+t(proof.task_verified?'真实任务已验证':proof.tool_tested?'基础工具测试通过':proof.configured?'连接已配置':'需要检查连接')));
+    models.append(el('p',t('连接已配置不代表模型调用成功；获取目录与运行准备检查不会启动付费测试。'),'muted'));host.append(models);
+    const recent=(state?.runs||[]).filter(run=>run.project===projectId&&(run.failure||['failed','blocked','insufficient_evidence','interrupted'].includes(run.state))).slice(0,3);
+    if(recent.length){const failures=el('details');failures.append(el('summary',t('近期失败（当前已载入记录）')));for(const run of recent){failures.append(el('p',stamp(run.ended||run.started)+' · '+(run.failure?failureCopy(run.failure):t(statusNames[run.state]||run.state))));failures.append(raw({run:run.id,failure:run.failure,reason:run.reason},'查看原始诊断'));}host.append(failures);}
+    restore?.(host);
+  }
+  document.addEventListener('DOMContentLoaded',()=>{
+    $('checks-add').addEventListener('click',()=>{
+      const checks=JSON.parse($('checks-json').value||'[]');checks.push({name:'',cwd:'.',argv:['']});$('checks-json').value=JSON.stringify(checks);renderEditor();$('checks-json').dispatchEvent(new Event('input',{bubbles:true}));$('checks-editor').lastElementChild.querySelector('input').focus();
+    });
+    $('settings-form').addEventListener('input',dirtyStatus);$('settings-form').addEventListener('change',dirtyStatus);
+    new MutationObserver(health).observe($('connection'),{childList:true,characterData:true,subtree:true});
+  });
+  return {raw,checkList,approval,renderEditor,validateChecks,dirtyStatus,savingStatus,health};
 })();

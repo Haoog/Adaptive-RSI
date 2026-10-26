@@ -116,6 +116,12 @@ const { chromium } = require("playwright");
       .click();
     await page.locator("#live-task-outcome").waitFor();
     assert.equal(await page.locator(".evidence-table").count(), 0);
+    assert.ok(await page.locator('.check-result').count() > 0);
+    await page.locator('.approval-summary').filter({hasText:'本次检查基线'}).waitFor();
+    await page.getByRole('button',{name:'批准推送并创建 PR',exact:true}).click();
+    await page.locator('.confirm-dialog .approval-summary').filter({hasText:'项目已暂停'}).waitFor();
+    await page.locator('.confirm-dialog').getByRole('button',{name:'取消',exact:true}).click();
+    await page.locator('.confirm-dialog').waitFor({state:'detached'});
     await page
       .getByRole("button", { name: "阅读代码差异", exact: true })
       .click();
@@ -149,6 +155,8 @@ const { chromium } = require("playwright");
       if (liveSummary) data.result.summary = liveSummary;
       data.state = 'merged';
       data.phases = [{phase:'implementation',started:phaseStart,ended:null}];
+      data.result.evaluation.checks.acceptance_baseline=[{name:'Browser acceptance evidence',passed:false,exit_code:1,stderr:'<img src=x onerror="window.__evidenceExecuted=true"> original baseline failure'}];
+      data.result.evaluation.checks.acceptance_candidate=[{name:'Browser acceptance evidence',passed:true,exit_code:0,stdout:'fixture acceptance passed'}];
       await route.fulfill({ json: data });
     });
     await page.route('**/api/release-status?*', route => route.fulfill({json:{deploy:{state:'failed',workflow_run_id:42,error:'connection'}}}));
@@ -159,6 +167,12 @@ const { chromium } = require("playwright");
       .click();
     await page.locator("#live-task-outcome").waitFor();
     assert.equal(runRequests, 1, "collapsed history must not fetch full runs");
+    assert.equal(await page.locator('.evidence-table').count(),1);
+    const acceptanceCard=page.locator('.check-result').filter({hasText:'original baseline failure'});
+    await acceptanceCard.locator('summary').click();
+    assert.match(await acceptanceCard.locator('pre').innerText(),/<img src=x/);
+    assert.equal(await acceptanceCard.locator('img').count(),0);
+    assert.equal(await page.evaluate(()=>window.__evidenceExecuted),undefined);
     await page.locator('[data-run="old-run-1"] > summary').click();
     await page.waitForFunction(() =>
       document.querySelector('[data-run="old-run-1"] pre'),
@@ -222,7 +236,81 @@ const { chromium } = require("playwright");
     await pollNotifications(3);
     notificationState = 'regressed';
     await pollNotifications(4);
+    // Structured checks save exact argv (including spaces), keep unrelated config,
+    // survive a reload, and never start a model task.
+    await page.locator('#project-settings').click();
+    const beforeConfig=await page.evaluate(()=>structuredClone(currentProject().config));
+    await page.locator('#checks-add').click();
+    const editor=page.locator('#checks-editor fieldset').last();
+    await editor.locator('[data-check-field="name"]').fill('UI argv regression');
+    await editor.locator('[data-check-field="cwd"]').fill('tests');
+    await editor.locator('[data-check-arg]').fill('python3');
+    await editor.getByRole('button',{name:'添加参数',exact:true}).click();
+    await editor.locator('[data-check-arg]').nth(1).fill('-c');
+    await editor.getByRole('button',{name:'添加参数',exact:true}).click();
+    await editor.locator('[data-check-arg]').nth(2).fill('print("argument with spaces")\nprint(2)');
+    await editor.locator('[data-check-field="name"]').fill('UI argv regression renamed');
+    await page.locator('#save-note').filter({hasText:'未保存'}).waitFor();
+    const persisted=page.waitForResponse(response=>response.url().endsWith('/api/config')&&response.request().method()==='POST');
+    await page.locator('#settings-save').click();
+    assert.equal((await persisted).status(),200);
+    await page.locator('#save-note[data-state="saved"]').filter({hasText:'设置已保存'}).waitFor();
+    const savedConfig=await page.evaluate(()=>currentProject().config);
+    assert.deepEqual(savedConfig.checks.at(-1),{name:'UI argv regression renamed',cwd:'tests',argv:['python3','-c','print("argument with spaces")\nprint(2)']});
+    assert.deepEqual(savedConfig.limits,beforeConfig.limits);
+    assert.deepEqual(savedConfig.evolution,beforeConfig.evolution);
+    assert.equal(await page.locator('#advanced-json:visible, #checks-json:visible').count(),0);
+    assert.equal(await page.evaluate(()=>currentProject().paused),1);
+    await page.locator('#language-select').selectOption('zh-CN');
+    await page.reload();
+    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('#project-settings').click();
+    assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'UI argv regression renamed');
+    assert.deepEqual(await page.locator('#checks-editor fieldset').last().locator('[data-check-arg]').evaluateAll(nodes=>nodes.map(node=>node.value)),['python3','-c','print("argument with spaces")\nprint(2)']);
+    // Acknowledging weight=2 must keep a newer weight=1 draft visibly dirty.
+    await page.locator('#advanced-settings > summary').click();
+    const weight=page.locator('[data-path="schedule.weight"]');
+    await weight.fill('2');
+    let releaseSave,saveArrived;
+    const arrived=new Promise(resolve=>saveArrived=resolve),gate=new Promise(resolve=>releaseSave=resolve);
+    const delayedSave=async route=>{const response=await route.fetch();saveArrived();await gate;await route.fulfill({response});};
+    await page.route('**/api/config',delayedSave);
+    await page.locator('#settings-save').click();await arrived;
+    await weight.fill('1');releaseSave();
+    await page.locator('#settings-save:not([disabled])').waitFor();
+    await page.locator('#save-note[data-state="dirty"]').waitFor();
+    assert.equal(await weight.inputValue(),'1');
+    assert.equal(await page.evaluate(()=>settingsBaseline.schedule.weight),2);
+    await page.unroute('**/api/config',delayedSave);
+    await page.locator('#settings-save').click();
+    await page.locator('#save-note[data-state="saved"]').waitFor();
+    // A name edit never changes the multiline argument restored from the server.
+    assert.deepEqual(await page.evaluate(()=>JSON.parse(document.getElementById('checks-json').value).at(-1).argv),['python3','-c','print("argument with spaces")\nprint(2)']);
+    for(const saved of [false,true])for(const live of [false,true]){
+      const copy=await page.evaluate(({saved,live})=>{const prior=currentProject().config.delivery.auto_merge;currentProject().config.delivery.auto_merge=live;const section=RSIProduct.approval({config:{...structuredClone(currentProject().config),delivery:{...structuredClone(currentProject().config.delivery),auto_merge:saved}}});currentProject().config.delivery.auto_merge=prior;return section.textContent;},{saved,live});
+      assert.ok(copy.includes(saved&&live?'本次与当前均已授权':'本次与当前未同时授权'));
+      assert.ok(!copy.includes('批准仅用于'));
+    }
     await page.locator("#language-select").selectOption("en");
+    await page.locator('#settings-effect').filter({hasText:'No restart required'}).waitFor();
+    assert.equal(await page.locator('#checks-add').innerText(),'Add check');
+    await page.locator('#checks-editor [data-check-field="name"]').last().fill('Project A unsaved');
+    await page.locator('#save-note[data-state="dirty"]').waitFor();
+    const projects=await page.locator('#project-select option').evaluateAll(nodes=>nodes.map(node=>node.value));
+    await page.locator('#project-select').selectOption(projects.find(id=>id!==ids[2]));
+    await page.locator('#save-note[data-state="saved"]').waitFor();
+    assert.doesNotMatch(await page.locator('#save-note').innerText(),/Unsaved/);
+    await page.locator('#project-select').selectOption(ids[2]);
+    await page.locator('#save-note[data-state="dirty"]').waitFor();
+    assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'Project A unsaved');
+    await page.emulateMedia({colorScheme:'dark'});
+    assert.notEqual(await page.locator('.mc-route-picker').first().evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(255, 255, 255)');
+    await page.locator('#mc-add-provider').click();
+    await page.locator('#mc-provider-preset').selectOption('opencode_go');
+    assert.equal(await page.locator('#mc-input-name').inputValue(),'OpenCode Go');
+    assert.equal(await page.locator('#mc-input-url').inputValue(),'');
+    await page.locator('#mc-go-hint').filter({hasText:'official OpenCode console'}).waitFor();
+    await page.locator('#mc-provider-dialog .close-dialog').click();
     assert.equal(
       await page.locator("#mobile-install").innerText(),
       "Install on phone",

@@ -24,7 +24,7 @@ from .opencode import (AUTH_LOCK, OpenCodeCompatibilityError, auth_path, auth_pr
                        detect_opencode, export_auth, import_auth, install_legacy_credential,
                        load_auth_export, logout_provider, merge_auth_export, remove_auth_export,
                        _parse_auth_export)
-from .process import run_process
+from .process import docker_mount, run_process
 
 
 ACTIVE = {"starting", "awaiting_authorization", "completing"}
@@ -162,7 +162,7 @@ class _Process:
                        "--security-opt=no-new-privileges", "--user", str(os.getuid()) + ":" + str(os.getgid()),
                        "--pids-limit=128", "--memory=" + str(limits.get("memory_mb", 2048)) + "m",
                        "--cpus=" + str(limits.get("cpus", 2)), "--tmpfs", "/tmp:rw,nosuid,size=256m",
-                       "--mount", "type=bind,src=" + str(self.home) + ",dst=" + str(self.home),
+                       "--mount", docker_mount(self.home, self.home),
                        "--workdir", str(self.home)]
             if stdin == subprocess.PIPE:
                 command.append("-i")
@@ -170,6 +170,7 @@ class _Process:
                 command += ["--publish", "127.0.0.1::4096"]
             for key in self.environment:
                 if key != "PATH":
+                    # Docker 从 Popen env 继承变量值；argv 仅保留名称，避免暴露认证密码。
                     command += ["--env", key]
             argv = command + [self.image, *argv]
         read_fd, self.control = os.pipe()
@@ -208,7 +209,11 @@ class _Process:
                         pass
                     except PermissionError:
                         self.process.kill()
-                self.process.wait()
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    # SIGKILL 后仍处 D 状态的进程留给系统收尸；关闭流程不能被无限挂起。
+                    pass
                 for stream in (self.process.stdin, self.process.stdout):
                     if stream:
                         stream.close()

@@ -42,8 +42,8 @@ def pr_body(task, run, outcome):
     return "\n".join(lines) + "\n"
 
 
-def github_git(root, *args):
-    return git(root, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args)
+def github_git(root, *args, timeout=60):
+    return git(root, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args, timeout=timeout)
 
 
 def baseline(runtime, project, config):
@@ -60,7 +60,7 @@ def baseline(runtime, project, config):
         if not cache.exists():
             checked(["git", "init", "--bare", "--quiet", str(cache)])
         github_git(cache, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
-            "+refs/heads/" + branch + ":refs/heads/rsi-baseline")
+            "+refs/heads/" + branch + ":refs/heads/rsi-baseline", timeout=180)
         sha = git(cache, "rev-parse", "refs/heads/rsi-baseline")
         runtime.store.put_setting("baseline:" + project["id"], {"sha": sha, "branch": branch})
         return str(cache), sha, branch
@@ -134,7 +134,14 @@ def publish(runtime, project, task, run, workspace, config):
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
     branch = prefix + "/rsi-" + run["id"]
     if git(workspace, "branch", "--show-current") != branch:
-        git(workspace, "checkout", "-b", branch)
+        # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
+        existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
+        if existing_head:
+            if existing_head != git(workspace, "rev-parse", "HEAD"):
+                raise RuntimeError("Existing delivery branch differs from evaluated candidate")
+            git(workspace, "checkout", branch)
+        else:
+            git(workspace, "checkout", "-b", branch)
     if git(workspace, "diff", "--cached", "--name-only"):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + task["title"])

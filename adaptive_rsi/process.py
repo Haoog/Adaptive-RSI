@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import platform
@@ -63,7 +65,37 @@ def _cached_probe(key, probe):
 
 
 class Cancelled(RuntimeError):
-    pass
+    def __init__(self, message, result=None):
+        self.result = result
+        super().__init__(message)
+
+
+def capture_cancel(function, *args, **kwargs):
+    """Let CLI adapters retain partial evidence before propagating cancellation."""
+    try:
+        return function(*args, **kwargs), None
+    except Cancelled as exc:
+        if exc.result is None:
+            raise
+        return exc.result, exc
+
+
+class ProcessError(RuntimeError):
+    """Local command failure; command output never grants provider semantics."""
+    failure_code = "execution"
+
+    def __init__(self, result, message=None):
+        self.result = result
+        self.code = "process_" + process_error_kind(result)
+        super().__init__(message or (result.get("error") or result.get("stderr") or
+                                    result.get("stdout") or "Command failed")[-2000:])
+
+
+def process_error_kind(result):
+    # Exact legacy controller messages support injected/older runners too.
+    return result.get("error_kind") or {
+        "Command timed out": "timeout", "Command output limit exceeded": "output_limit",
+    }.get(result.get("error"), "exit")
 
 
 def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None):
@@ -103,21 +135,34 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
             return stream.read().decode("utf-8", "replace")
         result = {"argv": [str(x) for x in argv], "exit_code": process.returncode,
                   "stdout": tail(stdout), "stderr": tail(stderr),
-                  "seconds": round(time.monotonic() - started, 3), "error": reason}
+                  "seconds": round(time.monotonic() - started, 3), "error": reason,
+                  "error_kind": {"Command timed out": "timeout",
+                                 "Command output limit exceeded": "output_limit",
+                                 "Cancelled": "cancelled"}.get(reason, "exit" if process.returncode else None)}
         if reason == "Cancelled":
-            raise Cancelled(reason)
+            raise Cancelled(reason, result)
         return result
 
 
 def checked(argv, cwd=None, timeout=60, env=None):
     result = run_process(argv, cwd, timeout, env=env)
     if result["exit_code"] or result["error"]:
-        raise RuntimeError((result["stderr"] or result["error"] or result["stdout"])[-2000:])
+        raise ProcessError(result)
     return result["stdout"].rstrip("\n")
 
 
 def quote_sb(path):
     return json.dumps(str(Path(path).resolve()))
+
+
+def docker_mount(source, destination, read_only=False):
+    """Docker --mount 按 CSV 解析，必须对完整 key=value 字段编码。"""
+    fields = ["type=bind", "src=" + str(source), "dst=" + str(destination)]
+    if read_only:
+        fields.append("readonly")
+    stream = io.StringIO(newline="")
+    csv.writer(stream).writerow(fields)
+    return stream.getvalue()[:-2]  # 仅移除 writer 添加的 CRLF，保留路径中的换行。
 
 
 def scrub_tree(root):
@@ -224,7 +269,7 @@ class Sandbox:
                     "--security-opt=no-new-privileges", "--pids-limit=" + str(limits["pids"]),
                     "--memory=" + str(limits["memory_mb"]) + "m", "--cpus=" + str(limits["cpus"]),
                     "--user=" + str(os.getuid()) + ":" + str(os.getgid()),
-                    "--mount", "type=bind,src=" + str(workspace) + ",dst=/workspace",
+                    "--mount", docker_mount(workspace, "/workspace"),
                     "--tmpfs", "/tmp:rw,nosuid,size=256m", "--env", "HOME=/tmp",
                     "-w", "/workspace/" + cwd]
             import uuid
@@ -232,7 +277,7 @@ class Sandbox:
             for item in protected:
                 item = Path(item).resolve()
                 relative = item.relative_to(workspace).as_posix()
-                command += ["--mount", "type=bind,src=" + str(item) + ",dst=/workspace/" + relative + ",readonly"]
+                command += ["--mount", docker_mount(item, "/workspace/" + relative, read_only=True)]
             return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",

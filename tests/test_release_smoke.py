@@ -63,6 +63,21 @@ class ReleaseMetadataTest(unittest.TestCase):
                 self.read_with(MetadataTransport(code), "isolated-test-token")
             self.assertEqual(error.exception.code, code)
 
+    def test_transient_metadata_failures_retry_without_relaxing_source(self):
+        from unittest.mock import Mock
+        success = io.BytesIO(b'{"tag_name":"v0.3.0"}')
+        opener = Mock()
+        opener.open.side_effect = [
+            urllib.error.URLError("fixture connection failure"),
+            urllib.error.HTTPError(release_smoke.RELEASE_API, 503, "fixture", {}, None),
+            success,
+        ]
+        with patch.object(release_smoke.urllib.request, "build_opener", return_value=opener), patch.object(release_smoke.time, "sleep") as delay:
+            self.assertEqual(release_smoke.latest_release(), {"tag_name": "v0.3.0"})
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertEqual(delay.call_count, 2)
+        self.assertTrue(all(call.args[0].full_url == release_smoke.RELEASE_API for call in opener.open.call_args_list))
+
     def test_oversized_or_invalid_metadata_fails(self):
         for body in [b"x" * (2 * 1024 * 1024 + 1), b"invalid-json"]:
             with self.assertRaises(ValueError):

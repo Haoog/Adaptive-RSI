@@ -10,18 +10,23 @@ from pathlib import Path
 from .agent import SCHEMAS, TEXT, object_schema, validate_output
 from .config import relative_path
 from .credentials import Credentials
-from .provider_health import error_code
+from .provider_health import ModelFailure, error_code, http_failure, provider_text_code
 from .process import Cancelled, Sandbox, scrub_tree
 
 
-class ProviderUnavailable(RuntimeError):
-    pass
+class ProviderUnavailable(ModelFailure):
+    def __init__(self, message, code=None):
+        # Preserve compatibility for callers supplying legacy provider diagnostics.
+        super().__init__(message, code or provider_text_code(message))
+        self.failure_code = "provider"
 
 
-class ProviderInterrupted(RuntimeError):
+class ProviderInterrupted(ModelFailure):
+    fallback_allowed = False
+
     def __init__(self, cause):
-        self.code = error_code(cause)
-        super().__init__("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations")
+        super().__init__("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations",
+                         error_code(cause))
 
 
 class ArgumentsError(ValueError):
@@ -56,11 +61,16 @@ def post_json(url, payload, headers, timeout, max_bytes):
     except urllib.error.HTTPError as exc:
         # Provider error bodies may echo authentication headers or private prompts.
         error = "Model API HTTP " + str(exc.code)
+        problem = http_failure(error + "; check endpoint, credentials and model capabilities", exc.code)
         if exc.code in [404, 429, 502, 503, 504]:
-            raise ProviderUnavailable(error) from None
-        raise RuntimeError(error + "; check endpoint, credentials and model capabilities") from None
-    except (urllib.error.URLError, TimeoutError, OSError):
-        raise ProviderUnavailable("Model API connection failed or timed out") from None
+            raise ProviderUnavailable(error, problem.code) from None
+        raise problem from None
+    except (TimeoutError, ):
+        raise ProviderUnavailable("Model API connection timed out", "timeout") from None
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        code = "timeout" if isinstance(reason, TimeoutError) else "connection"
+        raise ProviderUnavailable("Model API connection failed or timed out", code) from None
     except ValueError:
         raise RuntimeError("Model API did not return valid JSON") from None
 
@@ -223,30 +233,34 @@ class Conversation:
         if p == "responses":
             output = response.get("output", [])
             self.history.extend(output)
-            usage = response.get("usage", {})
+            usage = response.get("usage") or {}
             calls = [(x["call_id"], x["name"], parse_arguments(x["name"], x.get("arguments"))) for x in output if x.get("type") == "function_call"]
-            return calls, int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+            return calls, int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
         if p in ["chat_completions", "ollama"]:
             message = response["message"] if p == "ollama" else response["choices"][0]["message"]
             # Keep reasoning_content returned by gateways that require it on subsequent turns.
             self.history.append(message)
-            usage = response.get("usage", {})
+            usage = response.get("usage") or {}
             calls = [(x.get("id", str(i)), x["function"]["name"], parse_arguments(x["function"]["name"], x["function"].get("arguments")))
                      for i, x in enumerate(message.get("tool_calls", []))]
-            tokens = int(response.get("prompt_eval_count", 0)) + int(response.get("eval_count", 0)) if p == "ollama" else int(usage.get("total_tokens", 0))
+            tokens = int(response.get("prompt_eval_count") or 0) + int(response.get("eval_count") or 0) if p == "ollama" else int(usage.get("total_tokens") or 0)
             return calls, tokens
         if p == "anthropic":
             content = response.get("content", [])
             self.history.append({"role": "assistant", "content": content})
-            usage = response.get("usage", {})
+            usage = response.get("usage") or {}
             calls = [(x["id"], x["name"], parse_arguments(x["name"], x.get("input"))) for x in content if x.get("type") == "tool_use"]
-            return calls, sum(int(usage.get(k, 0)) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
-        content = response["candidates"][0]["content"]
+            return calls, sum(int(usage.get(k) or 0) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
+        candidates = response.get("candidates") or []
+        if not candidates:
+            # prompt 被安全策略拦截时 candidates 为空；按可诊断错误处理而不是裸 IndexError。
+            raise RuntimeError("Gemini returned no candidates; the request may have been blocked by safety settings")
+        content = candidates[0]["content"]
         self.history.append(content)  # Preserve opaque thoughtSignature fields verbatim.
         calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"],
                   parse_arguments(x["functionCall"]["name"], x["functionCall"].get("args", {})))
                  for i, x in enumerate(content["parts"]) if "functionCall" in x]
-        return calls, int(response.get("usageMetadata", {}).get("totalTokenCount", 0))
+        return calls, int((response.get("usageMetadata") or {}).get("totalTokenCount") or 0)
 
     def results(self, results):
         if self.protocol == "responses":
@@ -278,7 +292,8 @@ class NativeAgent:
         began = time.monotonic()
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
         # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
-        timeout = 30 if role == "probe" else 300
+        # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
+        timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
         for turn in range(200):
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
@@ -290,11 +305,12 @@ class NativeAgent:
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
             try:
                 response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, timeout, max_bytes)
+                # A malformed/blocked response can still contain billable usage.
+                from .usage import native_usage
+                self.store.record_usage(call, run, native_usage(protocol, response), time.monotonic() - started)
                 calls, tokens = conversation.receive(response)
                 if tokens < 0:
                     raise ValueError("Invalid token usage")
-                from .usage import native_usage
-                self.store.record_usage(call, run, native_usage(protocol, response), time.monotonic() - started)
                 if cancel and cancel():
                     raise Cancelled("Cancelled after model response")
                 if not calls:
@@ -335,7 +351,10 @@ class NativeAgent:
                 if tools.changed:
                     raise ProviderInterrupted(exc) from None
                 raise
-            except Exception:
+            except Exception as exc:
+                if not getattr(exc, "failure_code", None) and not isinstance(exc, Cancelled):
+                    exc.failure_code = "execution"
+                    exc.code = "tool_format"
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
                 raise
         raise RuntimeError("Native model exceeded the maximum tool-call turns")

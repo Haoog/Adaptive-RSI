@@ -124,12 +124,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     environment = capture(Path(project["path"]), seeds, config)
     runtime.store.event("environment", "Dependency snapshot frozen", project["id"], run["id"], environment)
     restore(seeds, workspace, config)
-    from .process import Sandbox
+    from .process import ProcessError, Sandbox
     for setup in config["environment"]["setup"]:
         prepared = Sandbox(runtime.store.root, config).check(setup, workspace, lambda: runtime.is_cancelled(run),
                      hidden=[p["path"] for p in runtime.store.query("SELECT path FROM projects")])
         if prepared["exit_code"] or prepared["error"]:
-            raise RuntimeError("Dependency preparation failed before planning: " + prepared["stderr"])
+            raise ProcessError(prepared, "Dependency preparation failed before planning: " +
+                               (prepared.get("error") or prepared.get("stderr") or prepared.get("stdout") or "Command failed"))
     from .context import code_map
     from .recovery import signature, cached, save
     from .discovery import related_work

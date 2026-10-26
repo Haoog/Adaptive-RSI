@@ -41,9 +41,15 @@ ssh -N -L 6090:127.0.0.1:6090 用户@服务器
 - API：页面添加官方或兼容服务；Linux 默认以 0600 私有文件保存密钥，重启后继续使用。也可使用环境变量或仅会话密钥。
 - OpenCode：镜像已包含 1.19.3。在页面选择 OpenCode 及实际供应商，使用其支持的官方登录或密钥连接；无需宿主 CLI，认证和模型目录均可使用执行镜像。也可使用 `opencode auth login` 或全局 `provider` 配置。
 - Codex：镜像包含 0.163.0。在页面发起设备授权，在个人电脑浏览器打开官方地址并输入一次性验证码；凭据写入服务器服务账号的 `~/.codex/auth.json`。也可使用 Responses API 或兼容服务。操作及故障恢复见 [账号连接](docs/accounts.md)。
-- 依赖：默认检查镜像是 `python:3.12-slim`，需事先 `docker pull python:3.12-slim`；本项目可把项目高级 JSON 设为 `{"sandbox":{"image":"adaptive-rsi-worker:local"}}`。其他语言请构建包含对应工具链和缓存依赖的可信镜像。需要下载依赖时在受信任的准备环境完成，检查容器不联网。
+- 依赖：默认检查镜像是 `python:3.12-slim`，需事先 `docker pull python:3.12-slim`；本项目可用 CLI 设置项目检查镜像：`adaptive-rsi config --project <项目ID> --json '{"sandbox":{"image":"adaptive-rsi-worker:local"}}'`。其他语言请构建包含对应工具链和缓存依赖的可信镜像。需要下载依赖时在受信任的准备环境完成，检查容器不联网。
 
 CLI 容器只挂载该次工作区与独立 HOME；不挂载控制器、其他项目、评估集、SSH/GitHub 凭据或 Docker socket。只读角色不能修改源代码，所有角色不能写 Git 元数据。CLI 为调用模型需要联网，独立检查和原生命令工具不联网。CLI 能访问执行所需的所选模型连接凭据；这不构成对任意恶意程序的机密计算隔离。
+
+镜像默认以 `node` 用户运行。执行器已有显式 `--user`，仍使用服务账号的宿主 UID/GID，并保留只读根文件系统、`--cap-drop=ALL` 和 `no-new-privileges`；镜像默认用户不会覆盖这些边界。请避免以 root 账号运行服务，拥有宿主 Docker 管理权限的账号仍拥有高权限。
+
+基础镜像默认固定为 `node:22-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384`，通过多架构 OCI index 让 Docker 选择对应平台。2026-10-25 从 Docker 官方 registry 的 [`library/node:22-bookworm` manifest](https://registry-1.docker.io/v2/library/node/manifests/22-bookworm) 核验：标签与摘要地址返回的原始 JSON SHA-256 均匹配 `Docker-Content-Digest`，index 包含 `linux/amd64`、`linux/arm/v7`、`linux/arm64/v8` 和 `linux/ppc64le`；另核验 amd64 与 arm64 子 manifest 的摘要和长度。`docker buildx imagetools inspect node:22-bookworm` 返回相同 index digest。
+
+升级基础镜像时先执行上述 inspect 命令并核验官方 registry，再使用 `docker build --build-arg NODE_IMAGE='node:22-bookworm@sha256:实际核验的摘要' -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .` 覆盖；摘要占位符必须替换。固定 digest 后不会自动跟随标签更新，安全更新需显式更换摘要并重新构建。本次验证不依赖 Docker daemon，未执行镜像构建或容器运行；基础镜像固定也不代表 npm 安装的全部传递依赖已锁定。自定义检查镜像可在 `sandbox.image` 中使用经核验的 digest 引用。
 
 ## HTTPS 域名访问
 
@@ -55,6 +61,12 @@ ADAPTIVE_RSI_PUBLIC_URL=https://rsi.example.com
 
 然后执行 `systemctl --user restart adaptive-rsi`，从新的启动认证地址登录。公网入口使用 HTTPS；应用仍只监听回环地址。Host、Origin、会话 Cookie 和 CSRF 检查继续有效，域名访问的 Cookie 带 `Secure`。不要将模型执行服务或 Docker API 暴露到公网。
 
+Caddy 示例在 HTTPS 入口设置 `Strict-Transport-Security: max-age=31536000`，浏览器随后一年会优先使用 HTTPS。只有确认全部子域都支持 HTTPS 后才考虑 `includeSubDomains` 或 preload；应用的本地 HTTP 入口不发送 HSTS。
+
+认证失败在每个监听器内以 60 秒窗口计数，前 30 次返回原有 401，之后返回带 `Retry-After` 的 429。有效 Cookie 或启动链接仍可登录、使用 API 和健康探测；代理后的不同访问者共享失败计数，不根据可伪造的转发 IP 头建立身份。Host/Origin/CSRF 拒绝及会话失败共用每分钟至多一条安全审计，记录固定原因和抑制数量，不保存 URL、令牌、Cookie 或请求正文。`/api/health` 保留 Host 与 Cookie 认证。
+
+API 异常只返回固定提示或白名单机器错误码，避免将底层异常中的路径、凭据或远端响应正文发回浏览器。会话轮换先原子写入私有文件再更新内存；失败时原会话继续有效。
+
 ## 管理与数据
 
 ```sh
@@ -65,5 +77,7 @@ journalctl --user -u adaptive-rsi -f
 ```
 
 运行状态默认存于 `~/.local/share/adaptive-rsi`，项目克隆在旁边的 `adaptive-rsi-projects`。备份状态、私有凭据目录和项目；不要将它们提交到 GitHub。运行器更新由原有监督流程处理，用户服务跟踪更新后的进程；失败会尝试恢复旧版本。执行镜像更新需重新构建，已有任务保留自己的配置。
+
+备份下载保持 Cookie 认证，单个文件最多 1 GiB，至多同时传输两个备份。二进制响应按 64 KiB 分块，单次写入最长等待 30 秒，总传输预算 120 秒；JSON 分片保持每次最多 512 KiB。拒绝符号链接及非普通文件，下载失败时关闭连接；超限时应使用服务账号在本机备份状态文件。
 
 项目检查和 Issues 同步默认均每小时；只保留两种计划。发现、调用、任务时长和改动文件数不设额度，暂停与取消随时有效。日志大小、网络请求超时及容器执行边界属于实现保护，不作为发现或任务数量额度。

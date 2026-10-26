@@ -2,6 +2,7 @@
 window.RSIModelCenter = (() => {
   const presets = {
     custom: {name:'我的中转站',protocol:'chat_completions',base_url:'',env_key:'MODEL_API_KEY'},
+    opencode_go: {name:'OpenCode Go',protocol:'chat_completions',base_url:'',env_key:'OPENCODE_API_KEY'},
     openai: {name:'OpenAI API',protocol:'responses',base_url:'https://api.openai.com/v1',env_key:'OPENAI_API_KEY'},
     anthropic: {name:'Anthropic',protocol:'anthropic',base_url:'https://api.anthropic.com/v1',env_key:'ANTHROPIC_API_KEY'},
     gemini: {name:'Gemini',protocol:'gemini',base_url:'https://generativelanguage.googleapis.com/v1beta',env_key:'GEMINI_API_KEY'},
@@ -263,13 +264,14 @@ window.RSIModelCenter = (() => {
   }
   function applyPreset(){
     const preset=presets[$('mc-provider-preset').value];
+    $('mc-go-hint').hidden=$('mc-provider-preset').value!=='opencode_go';
     $('mc-input-name').value=t(preset.name);$('mc-input-url').value=preset.base_url;$('mc-input-protocol').value=preset.protocol;$('mc-input-env').value=preset.env_key;
     $('mc-input-auth').value=preset.env_key?(data.keychain?'keychain':'file'):'none';syncAuth();
   }
   function syncAuth(){const mode=$('mc-input-auth').value;$('mc-key-field').hidden=!['keychain','session','file'].includes(mode);$('mc-input-key').disabled=!['keychain','session','file'].includes(mode);$('mc-env-field').hidden=mode!=='env';$('mc-input-env').disabled=mode!=='env';$('mc-input-env').required=mode==='env';$('mc-input-env').pattern='[A-Za-z_][A-Za-z0-9_]*';$('mc-session-hint').hidden=mode!=='session';}
   function openEditor(provider=null){
     editing=provider;$('mc-provider-form').reset();$('mc-provider-error').textContent='';$('mc-provider-dialog-title').textContent=t(provider?'连接设置':'添加模型服务');
-    $('mc-connection-advanced').open=false;
+    $('mc-connection-advanced').open=false;$('mc-go-hint').hidden=true;
     $('mc-provider-preset-field').hidden=!!provider;
     $('mc-input-auth').querySelector('[value="keychain"]').disabled=!data.keychain;
     if(provider){$('mc-input-name').value=provider.name;$('mc-input-url').value=provider.base_url;$('mc-input-protocol').value=provider.protocol;$('mc-input-env').value=provider.env_key;$('mc-input-auth').value=provider.credential||'env';syncAuth();}

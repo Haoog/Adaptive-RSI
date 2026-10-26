@@ -118,7 +118,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#work-end').fill('17');
     await page.locator('#issue-labels').fill('bug, urgent');
     const checks=page.locator('#checks-json'),serverChecks=await checks.inputValue();
-    await checks.fill('["RAW-CHECKS-MUST-NOT-PERSIST"]');
+    await page.locator('#checks-editor textarea').first().fill('RAW-CHECKS-MUST-NOT-PERSIST');
     await page.waitForFunction(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('125'));
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('bug, urgent')||false),true);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('RAW-CHECKS-MUST-NOT-PERSIST')||false),false);
@@ -227,6 +227,34 @@ async function checkRunProgress(browser,url,errors) {
   }finally{await page.close();}
 }
 
+async function checkObsoleteActions(browser,url,errors) {
+  const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+  let paid=0;page.on('request',request=>{if(/\/api\/(?:model-center\/probe|pause|request)$/.test(new URL(request.url()).pathname)&&request.method()==='POST')paid++;});
+  try {
+    await page.goto(url);
+    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('[data-task-filter="history"]').click();
+    const retryRow=page.locator('.task-row').filter({has:page.getByRole('button',{name:'过时任务重试入口',exact:true})});
+    await retryRow.filter({hasText:'已过时'}).waitFor();
+    const retryResponse=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/retry'&&response.request().method()==='POST');
+    await retryRow.getByRole('button',{name:'重试',exact:true}).click();
+    const retried=await retryResponse;assert.equal(retried.status(),200);
+    const task=JSON.parse(retried.request().postData()).task;
+    const project=await page.locator('#project-select').inputValue();
+    assert.equal((await (await page.request.get(new URL('/api/task?id='+task+'&project='+project,url).href)).json()).state,'queued');
+    await page.getByRole('button',{name:'过时任务补充入口',exact:true}).click();
+    await page.locator('.task-controls textarea').fill('补充过时任务的新验收要求');
+    const revised=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/task/revise'&&response.request().method()==='POST');
+    await page.getByRole('button',{name:'保存补充并重新评估',exact:true}).click();
+    assert.equal((await revised).status(),200);
+    await page.locator('#detail-body').filter({hasText:'补充过时任务的新验收要求'}).waitFor();
+    assert.equal(await page.locator('#detail-body .badge').first().innerText(),'排队中');
+    assert.equal(paid,0,'obsolete actions must not enable projects or start model tests');
+    assert.deepEqual(errors,[]);
+    console.log('Obsolete history retry and detail revision passed against real HTTP; project remains paused.');
+  } finally {await page.close();}
+}
+
 async function main() {
   const server = spawn(process.env.PYTHON || 'python3', ['-m', 'tests.browser_fixture'], {
     stdio: ['pipe', 'pipe', 'pipe'], env: {...process.env, PYTHONDONTWRITEBYTECODE: '1'}
@@ -241,6 +269,7 @@ async function main() {
       server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
+    if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
     await checkReadiness(browser, url, false, errors);
     await checkReadiness(browser, url, true, errors);
     await checkReadinessInstallAction(browser,url,errors);
