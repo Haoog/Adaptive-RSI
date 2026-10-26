@@ -633,8 +633,8 @@ print('BOUNDARIES_OK')
         with patch.object(self.runtime, "pool", Pool()), patch.object(self.runtime, "config", side_effect=counting):
             self.runtime.futures.clear()
             self.runtime.dispatch(eligible)
-        # 并发上限只在本次 dispatch 读取一次；此前每轮 while 迭代都会重读配置。
-        self.assertEqual(calls, [None])
+        # 锁内刷新一次项目配置和全局并发，while 领取多项任务时不再重读。
+        self.assertEqual(calls, [self.project, None])
 
     def test_long_regression_output_survives_investigation_failure_and_retries_once(self):
         from adaptive_rsi.delivery import feedback

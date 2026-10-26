@@ -698,12 +698,16 @@ function renderUpdateExtras(update){
 function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};
  const progress=update.state==='downloading'&&Number.isFinite(update.progress)?' · '+Math.max(0,Math.min(100,Math.round(update.progress)))+'%':'';
  const channel=updateChannels[update.channel]?' · '+t('安装渠道')+t('：')+t(updateChannels[update.channel]):'';
- let status=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(update.reason?' · '+t(apiErrors[update.reason]||update.reason):'')+progress;
+ const limited=!update.desktop_managed&&update.reason_code==='github_primary_rate_limit'&&Number.isFinite(update.rate_limit_until);
+ const cooling=limited&&Date.now()<update.rate_limit_until*1000;
+ const retryTime=limited?new Date(update.rate_limit_until*1000).toLocaleString(typeof language==='undefined'?'zh-CN':language):'';
+ const reason=limited?t('GitHub 匿名 API 额度已用尽。')+' '+t('可重试时间：')+retryTime+(cooling?' '+t('此时间前暂停更新请求。'):t('（已到，可重试）')):update.reason?t(apiErrors[update.reason]||update.reason):'';
+ let status=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(reason?' · '+reason:'')+progress;
  if(update.desktop_managed)status=t('桌面版请安装新版软件，项目和记录会保留。')+channel;
  else status=t('后台服务')+' · '+status+channel;
  $('update-status').textContent=status;
- $('apply-update').disabled=!!update.desktop_managed||!['available','waiting_idle'].includes(update.state);
- $('check-update').disabled=update.state==='checking'||(update.busy??['downloading','restarting'].includes(update.state));
+ $('apply-update').disabled=!!update.desktop_managed||cooling||!['available','waiting_idle'].includes(update.state);
+ $('check-update').disabled=cooling||update.state==='checking'||(update.busy??['downloading','restarting'].includes(update.state));
  renderUpdateExtras(update);}
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));

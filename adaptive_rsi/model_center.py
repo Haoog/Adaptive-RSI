@@ -18,6 +18,8 @@ from .provider_health import ProviderHealth, error_code
 
 
 NON_AGENT = {"embedding", "embeddings", "image", "audio", "rerank"}
+CREDENTIAL_MODES = {"keychain", "session", "file"}
+MAX_RETIRED_REFERENCES = 4096
 
 
 class CenterError(RuntimeError):
@@ -85,22 +87,100 @@ class ModelCenter:
                 "keychain": platform.system() == "Darwin", "project": project,
                 "global_models": self.runtime.config()["models"]}
 
-    def _credential_in_use(self, reference):
-        """共享的 secret_ref 可能仍被通用或其他项目配置引用；被引用时不删除。"""
+    def _credential_in_use(self, reference, mode):
+        """当前配置和未结束运行的封存配置都可能继续使用旧凭据。"""
         configs = [self.runtime.config()]
         for row in self.store.query("SELECT id FROM projects"):
             configs.append(self.runtime.config(row["id"]))
+        for row in self.store.query("SELECT config FROM runs WHERE ended IS NULL"):
+            try:
+                config = json.loads(row["config"])
+            except (ValueError, TypeError):
+                return True
+            if (not isinstance(config, dict) or not isinstance(config.get("providers"), list)
+                    or any(not isinstance(provider, dict) for provider in config["providers"])):
+                # 无法证明旧快照不再引用凭据时，保守保留，待快照修复或运行结束后重试。
+                return True
+            configs.append(config)
         for config in configs:
             for provider in [*BUILTINS, *config["providers"]]:
-                if provider.get("secret_ref") == reference:
+                if provider.get("secret_ref") == reference and provider.get("credential") == mode:
                     return True
         return False
 
+    def _pending_credentials(self):
+        try:
+            pending = self.store.setting("credential-cleanup-pending", {})
+        except (ValueError, TypeError):
+            raise CenterError("invalid_credential_registry") from None
+        if not isinstance(pending, dict) or len(pending) > MAX_RETIRED_REFERENCES:
+            raise CenterError("invalid_credential_registry")
+        normalized = {}
+        for reference, modes in pending.items():
+            try:
+                Credentials.check_reference(reference)
+            except CredentialError:
+                raise CenterError("invalid_credential_registry") from None
+            # 兼容最初的 reference -> mode 格式，新的条目保留同一引用的各存储后端。
+            modes = [modes] if isinstance(modes, str) else modes
+            if (not isinstance(modes, list) or not 1 <= len(modes) <= len(CREDENTIAL_MODES)
+                    or any(not isinstance(mode, str) or mode not in CREDENTIAL_MODES for mode in modes)):
+                raise CenterError("invalid_credential_registry")
+            normalized[reference] = sorted(set(modes))
+        return normalized
+
+    def _retire_credential(self, provider):
+        if provider and provider.get("credential") in CREDENTIAL_MODES and provider.get("secret_ref"):
+            # 在创建凭据或改变配置前持久登记；不保存密钥材料。
+            pending = self._pending_credentials()
+            reference, mode = provider["secret_ref"], provider["credential"]
+            Credentials.check_reference(reference)
+            if reference not in pending and len(pending) >= MAX_RETIRED_REFERENCES:
+                raise CenterError("credential_registry_full")
+            pending[reference] = sorted(set(pending.get(reference, []) + [mode]))
+            self.store.put_setting("credential-cleanup-pending", pending)
+
+    def _forget_credential(self, provider):
+        pending = self._pending_credentials()
+        reference, mode = provider["secret_ref"], provider["credential"]
+        modes = pending.get(reference, [])
+        if mode in modes:
+            modes.remove(mode)
+            if not modes:
+                del pending[reference]
+            self.store.put_setting("credential-cleanup-pending", pending)
+
+    def cleanup_credentials(self):
+        """重试清理已登记且没有当前配置或未结束运行引用的凭据。"""
+        with self.runtime.dispatch_lock:
+            if self.runtime.updates.is_busy():
+                return
+            pending = self._pending_credentials()
+            for reference, modes in list(pending.items()):
+                for mode in list(modes):
+                    if self._credential_in_use(reference, mode):
+                        continue
+                    try:
+                        self.credentials.delete(reference, mode)
+                    except (CredentialError, OSError):
+                        self.store.event("credential_cleanup_failed",
+                                         "Retired provider credential could not be deleted; cleanup will retry")
+                    else:
+                        modes.remove(mode)
+                if not modes:
+                    del pending[reference]
+            self.store.put_setting("credential-cleanup-pending", pending)
+
     def save_provider(self, data, authentication, project=None):
+        with self.runtime.dispatch_lock:
+            return self._save_provider(data, authentication, project)
+
+    def _save_provider(self, data, authentication, project=None):
         if not isinstance(data, dict) or not isinstance(authentication, dict):
             raise CenterError("invalid_provider")
         if set(data) - {"id", "name", "base_url", "protocol", "env_key"} or set(authentication) - {"mode", "value"}:
             raise CenterError("invalid_provider")
+        self._pending_credentials()
         config = self.runtime.config(project)
         provider = {**data}
         provider.setdefault("id", "provider_" + uid()[:10])
@@ -130,14 +210,28 @@ class ModelCenter:
         if not project:
             for row in self.store.query("SELECT config FROM projects"):
                 validate(merge(updated, json.loads(row["config"])))
-        if fresh:
-            self.credentials.put(provider["secret_ref"], mode, secret)
+        registered = False
         try:
-            self.runtime.configure({"providers": providers}, project)
-        except Exception:
+            if old and (old.get("secret_ref"), old.get("credential")) != (provider.get("secret_ref"), mode):
+                self._retire_credential(old)
             if fresh:
-                self.credentials.delete(provider["secret_ref"], mode)
+                self._retire_credential(provider)
+                registered = True
+                self.credentials.put(provider["secret_ref"], mode, secret)
+            self.runtime.configure({"providers": providers}, project)
+        except BaseException:
+            if registered:
+                try:
+                    # configure 可能在配置已提交、事件写入失败时抛出；先证明新密钥未被引用。
+                    if not self.runtime.updates.is_busy() and not self._credential_in_use(provider["secret_ref"], mode):
+                        self.credentials.delete(provider["secret_ref"], mode)
+                        self._forget_credential(provider)
+                except Exception:
+                    # 持久意向保留供维护重试，不以回滚故障覆盖原始异常。
+                    pass
             raise
+        if fresh:
+            self._forget_credential(provider)
         if old and self.signature(old) != self.signature(provider):
             previous = self.directory(old, project)
             preferences = [{k: v for k, v in model.items() if k in ["id", "name", "enabled", "manual", "favorite", "unit_price"]}
@@ -145,35 +239,26 @@ class ModelCenter:
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
             self.store.put_setting(self.key(provider, project), {"models": preferences, "fetched": None, "truncated": False})
-        if (fresh and old and old.get("credential") == mode and old.get("secret_ref")
-                and old["secret_ref"] != provider["secret_ref"]
-                and not self._credential_in_use(old["secret_ref"])):
-            # 密钥轮换成功后删除旧凭据，避免钥匙串/凭据文件累积孤儿条目。
-            try:
-                self.credentials.delete(old["secret_ref"], mode)
-            except CredentialError:
-                self.store.event("credential_cleanup_failed",
-                                 "Previous provider credential could not be removed; delete it manually", project)
+        self.cleanup_credentials()
         return {"id": provider["id"], "saved": True}
 
     def remove_provider(self, provider_id, project=None):
+        with self.runtime.dispatch_lock:
+            return self._remove_provider(provider_id, project)
+
+    def _remove_provider(self, provider_id, project=None):
+        self._pending_credentials()
         config = self.runtime.config(project)
         removed = self.provider(provider_id, project)
         if provider_id in {p["id"] for p in BUILTINS}:
             raise CenterError("builtin_provider")
         providers = [p for p in config["providers"] if p["id"] != provider_id]
+        self._retire_credential(removed)
         try:
             self.runtime.configure({"providers": providers}, project)
         except ValueError:
             raise CenterError("provider_in_use") from None
-        if (removed.get("credential") in ["keychain", "session", "file"] and removed.get("secret_ref")
-                and not self._credential_in_use(removed["secret_ref"])):
-            # 移除连接时同步删除已存密钥，不把密钥材料留在钥匙串或凭据目录。
-            try:
-                self.credentials.delete(removed["secret_ref"], removed["credential"])
-            except CredentialError:
-                self.store.event("credential_cleanup_failed",
-                                 "Removed provider credential could not be deleted; delete it manually", project)
+        self.cleanup_credentials()
         return {"removed": True}
 
     def fetch(self, provider_id, project=None):

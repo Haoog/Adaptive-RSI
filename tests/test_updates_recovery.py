@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
+from email.message import Message
 import tempfile
 import time
 import threading
@@ -22,7 +23,7 @@ from unittest.mock import Mock, patch
 from adaptive_rsi import __version__
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from adaptive_rsi.updates import atomic_json, commit_installation, installed_root, supervise_restart, valid_backup
+from adaptive_rsi.updates import RELEASE_API, UpdateManager, atomic_json, commit_installation, installed_root, supervise_restart, valid_backup
 
 
 class UpdateJournalRecoveryTest(unittest.TestCase):
@@ -324,6 +325,223 @@ class UpdateCheckLifecycleTest(unittest.TestCase):
         self.assertTrue(self.manager.status()["requested"])
         self.assertEqual(self.manager.status()["version"], self.target)
         self.manager.require_ready()
+
+
+class UpdateRateLimitTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.runtime = Runtime(Store(self.temp.name), object())
+        self.manager = self.runtime.updates
+        self.manager.shutdown = Mock()
+        self.runtime.configure({"updates": {"mode": "notify"}})
+        self.now = 1792996474
+        self.reset = 1792998274
+        self.clock = patch("adaptive_rsi.updates.time.time", side_effect=lambda: self.now)
+        self.clock.start()
+        # Any unmocked network operation fails without opening a connection.
+        self.network = patch("socket.socket.connect", side_effect=AssertionError("Network forbidden"))
+        self.network.start()
+
+    def tearDown(self):
+        self.network.stop()
+        self.clock.stop()
+        self.runtime.close()
+        self.temp.cleanup()
+
+    def error(self, code=403, remaining="0", reset=None, url=RELEASE_API):
+        headers = Message()
+        if remaining is not None:
+            headers["x-ratelimit-remaining"] = remaining
+        if reset is not None:
+            headers["x-ratelimit-reset"] = str(reset)
+        headers["Retry-After"] = "999999999"  # Does not broaden the primary-limit contract.
+        return urllib.error.HTTPError(url, code, "Forbidden", headers,
+                                      io.BytesIO(b'{"message":"API rate limit exceeded for fixture"}'))
+
+    def pending(self, failures=0):
+        return {"state": "waiting_idle", "version": "99.0.0", "current": __version__,
+                "requested": True, "checked": self.now, "failures": failures}
+
+    def inline_thread(self, target, args=(), **kwargs):
+        return SimpleNamespace(start=lambda: target(*args))
+
+    def test_check_cooldown_guards_all_entry_points_and_survives_manager_restart(self):
+        previous = self.pending(failures=1)
+        self.runtime.store.put_setting("update-status", previous)
+        with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=self.reset)) as request:
+            self.assertTrue(self.manager.check())
+            status = self.manager.status()
+            self.assertEqual(status["reason_code"], "github_primary_rate_limit")
+            self.assertEqual(status["rate_limit_until"], self.reset)
+            for key in ["version", "requested", "failures"]:
+                self.assertEqual(status[key], previous[key])
+            self.assertNotIn("retry_after", status)
+            # A replacement manager uses the persisted cooldown, not an in-memory timer.
+            self.manager = UpdateManager(self.runtime)
+            self.manager.shutdown = Mock()
+            for moment in [self.now, self.now + 120, self.reset - 1]:
+                self.now = moment
+                self.assertFalse(self.manager.check())
+                self.assertFalse(self.manager.check_async())
+                with self.assertRaisesRegex(ValueError, "rate limit reset"):
+                    self.manager.apply_async()
+                self.manager.tick()
+                self.assertTrue(self.manager.lock.acquire(False))
+                self.manager.apply(status)  # Worker guard also preserves the status.
+                self.assertFalse(self.manager.lock.locked())
+                self.assertEqual(self.manager.status(), status)
+            request.assert_called_once()
+            self.assertFalse(self.manager.installing)
+            self.manager.require_ready()
+        self.now = self.reset
+        # The preserved installation remains eligible immediately at the reset.
+        with patch.object(self.manager, "apply_async") as apply:
+            self.manager.tick()
+        apply.assert_called_once_with(requested=True)
+
+    def test_install_cooldown_does_not_spend_retry_budget_and_resumes_at_reset(self):
+        previous = self.pending(failures=2)
+        self.runtime.store.put_setting("update-status", previous)
+        with patch("adaptive_rsi.updates.threading.Thread", side_effect=self.inline_thread), patch(
+                "adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=self.reset)) as request:
+            self.manager.apply_async()
+            status = self.manager.status()
+            self.assertEqual(status["failures"], 2)
+            self.assertTrue(status["requested"])
+            self.assertEqual(status["version"], previous["version"])
+            self.assertEqual(status["rate_limit_until"], self.reset)
+            for moment in [self.now + 120, self.now + 360, self.reset - 1]:
+                self.now = moment
+                self.manager.tick()
+            request.assert_called_once()
+        self.now = self.reset
+        # A different error after the deadline spends the next generic retry normally.
+        with patch("adaptive_rsi.updates.threading.Thread", side_effect=self.inline_thread), patch(
+                "adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(remaining="1", reset=self.reset + 100)) as request:
+            self.manager.tick()
+            request.assert_called_once()
+        status = self.manager.status()
+        self.assertEqual(status["failures"], 3)
+        self.assertEqual(status["retry_after"], self.now + 480)
+        self.assertNotIn("reason_code", status)
+        self.assertNotIn("rate_limit_until", status)
+        self.assertFalse(self.manager.installing)
+        self.manager.shutdown.assert_not_called()
+
+    def test_notify_checks_resume_at_reset_but_manual_checks_require_a_click(self):
+        for mode in ["notify", "manual"]:
+            with self.subTest(mode=mode):
+                self.now = self.reset - 1800
+                self.runtime.configure({"updates": {"mode": mode}})
+                self.runtime.store.put_setting("update-status", {"state": "unchecked"})
+                with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=self.reset)) as request:
+                    self.manager.check()
+                    self.now = self.reset - 1
+                    self.manager.tick()
+                    request.assert_called_once()
+                self.now = self.reset
+                with patch.object(self.manager, "check_async") as check:
+                    self.manager.tick()
+                    self.assertEqual(check.call_count, int(mode == "notify"))
+                with patch("adaptive_rsi.updates.download", return_value=b'{"tag_name":"v0.0.1"}') as download:
+                    self.assertTrue(self.manager.check())
+                    download.assert_called_once()
+                self.assertEqual(self.manager.status()["state"], "up_to_date")
+                self.assertNotIn("rate_limit_until", self.manager.status())
+
+    def test_nonrate_and_malformed_responses_keep_existing_check_and_install_behavior(self):
+        controls = [
+            {"remaining": None, "reset": self.reset},
+            {"remaining": "1", "reset": self.reset},
+            {"reset": None}, {"reset": "not-a-time"}, {"reset": "NaN"},
+            {"reset": "1792998274.0"}, {"reset": "9" * 5000},
+            {"reset": self.now}, {"reset": self.now - 1}, {"reset": self.now + 3601},
+            {"code": 429, "reset": self.reset},
+            {"url": "https://github.com/fixture", "reset": self.reset},
+        ]
+        for options in controls:
+            with self.subTest(options={k: str(v)[:40] for k, v in options.items()}):
+                self.runtime.store.put_setting("update-status", self.pending())
+                with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(**options)) as request:
+                    self.manager.check()
+                    self.assertTrue(self.manager.check())
+                    self.assertEqual(request.call_count, 2)
+                checked = self.manager.status()
+                self.assertEqual(checked["reason"], "GitHub HTTP " + str(options.get("code", 403)))
+                self.assertNotIn("reason_code", checked)
+                self.assertNotIn("rate_limit_until", checked)
+                with patch("adaptive_rsi.updates.threading.Thread", side_effect=self.inline_thread), patch(
+                        "adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(**options)):
+                    self.manager.apply_async()
+                failed = self.manager.status()
+                self.assertEqual(failed["failures"], 1)
+                self.assertEqual(failed["retry_after"], self.now + 120)
+                self.assertNotIn("rate_limit_until", failed)
+
+    def test_repeated_primary_limits_extend_wait_without_exhausting_install_retries(self):
+        self.runtime.store.put_setting("update-status", self.pending())
+        with patch("adaptive_rsi.updates.threading.Thread", side_effect=self.inline_thread):
+            for _ in range(4):
+                deadline = self.now + 3600  # Inclusive maximum accepted primary window.
+                with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=deadline)) as request:
+                    self.manager.tick()
+                    request.assert_called_once()
+                self.assertEqual(self.manager.status()["failures"], 0)
+                self.assertEqual(self.manager.status()["rate_limit_until"], deadline)
+                self.now = deadline
+        with patch.object(self.manager, "apply_async") as apply:
+            self.manager.tick()
+        apply.assert_called_once_with(requested=True)
+
+    def test_automatic_target_keeps_authorization_and_notify_target_rechecks_after_reset(self):
+        major, minor, patch_version = map(int, __version__.split("."))
+        previous = {**self.pending(), "state": "available", "requested": False,
+                    "version": f"{major}.{minor}.{patch_version + 1}"}
+        self.runtime.configure({"updates": {"mode": "automatic"}})
+        self.runtime.store.put_setting("update-status", previous)
+        with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=self.reset)):
+            self.manager.check()
+        self.assertFalse(self.manager.status()["requested"])
+        self.assertEqual(self.manager.status()["version"], previous["version"])
+        self.now = self.reset
+        with patch.object(self.manager, "apply_async") as apply:
+            self.manager.tick()
+        apply.assert_called_once_with(requested=False)
+        self.runtime.configure({"updates": {"mode": "notify"}})
+        with patch.object(self.manager, "check_async") as check, patch.object(self.manager, "apply_async") as apply:
+            self.manager.tick()
+        check.assert_called_once()
+        apply.assert_not_called()
+
+    def test_successful_check_after_reset_keeps_only_same_target_consent(self):
+        for target in ["99.0.0", "99.0.1"]:
+            with self.subTest(target=target):
+                self.now = self.reset - 1800
+                self.runtime.store.put_setting("update-status", self.pending())
+                with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error(reset=self.reset)):
+                    self.manager.check()
+                self.now = self.reset
+                name = "adaptive-rsi-" + target + "-plugin.zip"
+                prefix = "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + target + "/"
+                feed = json.dumps({"tag_name": "v" + target, "assets": [
+                    {"name": name, "browser_download_url": prefix + name},
+                    {"name": name + ".sha256", "browser_download_url": prefix + name + ".sha256"}]}).encode()
+                with patch("adaptive_rsi.updates.download", return_value=feed):
+                    self.assertTrue(self.manager.check())
+                status = self.manager.status()
+                self.assertEqual(status["state"], "waiting_idle" if target == "99.0.0" else "available")
+                self.assertEqual(bool(status.get("requested")), target == "99.0.0")
+                self.assertNotIn("reason_code", status)
+                self.assertNotIn("rate_limit_until", status)
+
+    def test_expired_cooldown_does_not_survive_an_unrelated_check_error(self):
+        previous = {**self.pending(), "reason_code": "github_primary_rate_limit", "rate_limit_until": self.now}
+        self.runtime.store.put_setting("update-status", previous)
+        with patch("adaptive_rsi.updates.urllib.request.urlopen", side_effect=self.error()):
+            self.manager.check()
+        self.assertNotIn("reason_code", self.manager.status())
+        self.assertNotIn("rate_limit_until", self.manager.status())
+        self.assertTrue(self.manager.status()["requested"])
 
 
 class UpdateIdleAndRetryTest(unittest.TestCase):

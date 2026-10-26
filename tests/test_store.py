@@ -1,4 +1,5 @@
 import contextlib
+import json
 import os
 import sqlite3
 import tempfile
@@ -16,6 +17,30 @@ class StorePoolTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = Store(Path(self.temp.name) / "state")
         self.addCleanup(self.store.close)
+
+    def test_transition_resolves_stop_before_completion_and_retry_fields(self):
+        from adaptive_rsi.config import validate
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        for requested in ["executing", "completed", "awaiting_approval", "failed", "waiting_budget", "pr_open", "merged"]:
+            for cancelled in [False, True]:
+                with self.subTest(requested=requested, cancelled=cancelled):
+                    task = self.store.add_task("p", "goal", requested + str(cancelled), "fixture")
+                    run = self.store.claim("p", validate({}))
+                    self.store.put_setting("run-stop:" + run["id"], True)
+                    if cancelled:
+                        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task,))
+                    self.assertTrue(self.store.transition(run["id"], requested, {"receipt": "preserved"}, requested != "executing",
+                        task_fields={"state": "queued", "available": 123, "infra_retries": 2, "budget_waits": 1}))
+                    saved = self.store.one("SELECT state,ended,result FROM runs WHERE id=?", (run["id"],))
+                    expected = requested if requested in ["pr_open", "merged"] else "cancelled" if cancelled else "interrupted"
+                    self.assertEqual(saved["state"], expected)
+                    self.assertIsNotNone(saved["ended"])
+                    self.assertEqual(json.loads(saved["result"])["receipt"], "preserved")
+                    if requested not in ["pr_open", "merged"]:
+                        self.assertEqual(self.store.one("SELECT state,available,infra_retries,budget_waits FROM tasks WHERE id=?", (task,)),
+                                         {"state": expected, "available": 0, "infra_retries": 0, "budget_waits": 0})
+                    self.assertFalse(self.store.transition(run["id"], "completed", {}, True))
+                    self.store.execute("UPDATE tasks SET state='completed' WHERE id=?", (task,))
 
     def count_new_connections(self):
         """Patch Store._new_connection and return the list of created connections."""

@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- The built-in updater recognizes exhausted GitHub anonymous API primary quotas, shows the retry time, and blocks checks and installation requests until reset. It retains installation consent for the original version without spending ordinary installation retries, then becomes eligible to retry at the deadline.
+- SQLite backups become visible atomically only after copying, portability preparation and file closure. Incomplete files are neither listed nor successfully downloaded as empty backups; failures remove staging files and retain existing backups. Storage totals tolerate disappearing temporary files, preventing data and diagnostics refresh failures.
+- New tasks reread saved configuration, working hours and scheduling parameters under the claim lock, preventing stale settings after a completed save. Active runs retain their sealed settings.
+- Pause requests persist for unfinished runs. Quickly resuming a project no longer withdraws the old worker's stop signal; it finishes as interrupted, while new runs can proceed after resumption.
+- Editing or removing model connections retains old credentials referenced by unfinished runs, preventing missing-key errors on later calls. Periodic maintenance safely removes retired credentials after their runs finish and retains failed deletions for retry. Fresh credentials receive durable cleanup intent before storage, exceptions after committed configuration do not delete live credentials, and update recovery suspends cleanup.
+
 ## 0.5.111
 
 <!-- adaptive-rsi-release:0.5.111;base:81e24d5f40f864de545b06d2461f1d8f5634b933 -->

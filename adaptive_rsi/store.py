@@ -340,6 +340,7 @@ class Store:
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
     def transition(self, run, state, result=None, terminal=False, task_fields=None):
+        """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -347,8 +348,14 @@ class Store:
             if not row or row["ended"] is not None:
                 return False
             task = db.execute("SELECT state FROM tasks WHERE id=?", (row["task"],)).fetchone()
-            if task and task["state"] == "cancelled" and state not in ["merged", "pr_open"]:
-                state, terminal = "cancelled", True
+            # 已发出的远端操作保留事实；其余状态和自动重试必须服从同事务读取的停止请求。
+            if state not in ["merged", "pr_open"]:
+                if task and task["state"] == "cancelled":
+                    state, terminal, task_fields = "cancelled", True, None
+                    result = {**(result or {}), "reason": "Task cancellation requested"}
+                elif db.execute("SELECT 1 FROM settings WHERE key=?", ("run-stop:" + run,)).fetchone():
+                    state, terminal, task_fields = "interrupted", True, None
+                    result = {**(result or {}), "reason": "Project pause requested; retry creates a fresh run"}
             previous = json.loads(row["result"])
             phase = (result or {}).get("stage", state)
             active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()

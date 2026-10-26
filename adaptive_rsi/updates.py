@@ -24,6 +24,21 @@ REPOSITORY = "Haoog/Adaptive-RSI"
 RELEASE_API = "https://api.github.com/repos/" + REPOSITORY + "/releases/latest"
 
 
+def primary_rate_limit_reset(exc):
+    """Recognize only the official API's bounded primary quota reset."""
+    if not isinstance(exc, urllib.error.HTTPError) or exc.code != 403 or exc.url != RELEASE_API:
+        return None
+    headers = exc.headers
+    if headers is None or headers.get("X-RateLimit-Remaining") != "0":
+        return None
+    reset = headers.get("X-RateLimit-Reset", "")
+    if not re.fullmatch(r"[0-9]{1,12}", reset):
+        return None
+    reset = int(reset)
+    # GitHub's primary quota window is one hour; reject stale or unbounded waits.
+    return reset if 0 < reset - time.time() <= 3600 else None
+
+
 class UpdateInProgress(RuntimeError):
     code = "update_in_progress"
 
@@ -304,7 +319,12 @@ class UpdateManager:
             return
         config = self.runtime.config()["updates"]
         status = self.status()
-        if config["mode"] != "manual" and time.time() - status.get("checked", 0) >= config["interval_minutes"] * 60:
+        if self.cooling_down(status):
+            return
+        pending_install = status.get("version") and (status.get("requested") or
+                          config["mode"] == "automatic" and automatic_allowed(status, config["auto_policy"]))
+        reset_due = status.get("reason_code") == "github_primary_rate_limit" and not pending_install
+        if config["mode"] != "manual" and (reset_due or time.time() - status.get("checked", 0) >= config["interval_minutes"] * 60):
             self.check_async()
         elif (status.get("state") in ["available", "waiting_idle"] or
               status.get("state") == "error" and status.get("version") and status.get("failures", 0) < 3 and time.time() >= status.get("retry_after", 0)) and (
@@ -319,7 +339,22 @@ class UpdateManager:
                 getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))
 
     @staticmethod
+    def cooling_down(status):
+        return (status.get("reason_code") == "github_primary_rate_limit" and
+                time.time() < status.get("rate_limit_until", 0))
+
+    @staticmethod
+    def without_rate_limit(status):
+        return {key: value for key, value in status.items() if key not in ["reason_code", "rate_limit_until"]}
+
+    @staticmethod
+    def rate_limit_failure(previous, reset):
+        return {**previous, "state": "error", "current": __version__, "checked": time.time(),
+                "reason": "GitHub HTTP 403", "reason_code": "github_primary_rate_limit", "rate_limit_until": reset}
+
+    @staticmethod
     def check_failure(previous, reason):
+        previous = UpdateManager.without_rate_limit(previous)
         # A failed observation cannot revoke consent for a specific pending target.
         pending = (previous.get("state") in ["waiting_idle", "error"] and
                    previous.get("requested") is True and previous.get("version"))
@@ -331,6 +366,9 @@ class UpdateManager:
             return None
         try:
             previous = self.status()
+            if self.cooling_down(previous):
+                self.lock.release()
+                return None
             self.store.put_setting("update-status", {"state": "checking", "current": __version__,
                                                     "check_started": time.time(), "checked": previous.get("checked", 0),
                                                     "previous_status": previous})
@@ -366,7 +404,9 @@ class UpdateManager:
                 result = release_info(json.loads(download(RELEASE_API, 2 * 1024 * 1024)))
             except urllib.error.HTTPError as exc:
                 reason = "GitHub HTTP " + str(exc.code)
-                result = ({"state": "no_release", "reason": reason} if exc.code == 404 else
+                reset = primary_rate_limit_reset(exc)
+                result = (self.rate_limit_failure(previous, reset) if reset is not None else
+                          {"state": "no_release", "reason": reason} if exc.code == 404 else
                           self.check_failure(previous, reason))
             except Exception:
                 result = self.check_failure(previous, "Unable to verify the official release feed")
@@ -386,6 +426,9 @@ class UpdateManager:
         if not self.lock.acquire(False):
             raise ValueError("An update check or installation is already in progress")
         status = self.status()
+        if self.cooling_down(status):
+            self.lock.release()
+            raise ValueError("GitHub API rate limit reset is pending")
         if status.get("state") not in ["available", "waiting_idle", "error"] or not status.get("version"):
             self.lock.release()
             raise ValueError("Check for an available release first")
@@ -397,6 +440,9 @@ class UpdateManager:
     def apply(self, status):
         staging = None
         try:
+            if self.cooling_down(self.status()):
+                return
+            status = self.without_rate_limit(status)
             if self.work_busy():
                 self.store.put_setting("update-status", {**status, "state": "waiting_idle"})
                 return
@@ -456,9 +502,13 @@ class UpdateManager:
                 log.close()
             self.shutdown()
         except Exception as exc:
-            failures = status.get("failures", 0) + 1
-            self.store.put_setting("update-status", {**status, "state": "error", "reason": str(exc)[:500],
-                                                    "failures": failures, "retry_after": time.time() + min(3600, 60 * 2 ** failures)})
+            reset = primary_rate_limit_reset(exc)
+            if reset is not None:
+                self.store.put_setting("update-status", self.rate_limit_failure(status, reset))
+            else:
+                failures = status.get("failures", 0) + 1
+                self.store.put_setting("update-status", {**status, "state": "error", "reason": str(exc)[:500],
+                                                        "failures": failures, "retry_after": time.time() + min(3600, 60 * 2 ** failures)})
             with self.runtime.dispatch_lock:
                 self.installing = False
         finally:

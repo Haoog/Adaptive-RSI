@@ -219,6 +219,69 @@ async function checkUpdatePending(browser,url,errors) {
   }finally{await page.close();}
 }
 
+async function checkUpdateRateLimit(browser,url,errors) {
+  const page=await browser.newPage({timezoneId:'Asia/Shanghai'});
+  page.on('pageerror',error=>errors.push(error.message));
+  const reset=1792998274,target='99.0.0',requests=[];
+  // Match UpdateManager.rate_limit_failure and snapshot; the cooldown is an error,
+  // not a separate state, and retains the approved installation target.
+  const update={state:'error',current:'0.5.110',version:target,requested:true,failures:0,
+    checked:reset-1800,reason:'GitHub HTTP 403',reason_code:'github_primary_rate_limit',
+    rate_limit_until:reset,busy:false,channel:'managed',desktop_managed:false};
+  await page.clock.setFixedTime(new Date((reset-1)*1000));
+  await page.route('**/api/state*',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    data.update=update;
+    await route.fulfill({response,body:JSON.stringify(data)});
+  });
+  await page.route('**/api/updates/*',route=>{
+    requests.push(new URL(route.request().url()).pathname);
+    assert.equal(route.request().method(),'POST');
+    assert.equal(requests.at(-1),'/api/updates/check','cooldown must never submit an installation');
+    return reply(route,{started:true,update:{state:'checking',busy:false,channel:'managed'}});
+  });
+  const screenshot=async name=>{
+    if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#update-status').locator('..').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/'+name+'.png'});
+  };
+  const verify=async(locale,expired)=>{
+    const text=await page.locator('#update-status').textContent();
+    const retryTime=new Date(reset*1000).toLocaleString(locale,{timeZone:'Asia/Shanghai'});
+    assert.ok(text.includes(retryTime),'retry deadline must be displayed in the selected language and local timezone');
+    assert.ok(text.includes(target),'the approved target must remain visible');
+    assert.match(text,locale==='en'?/GitHub anonymous API quota is exhausted/:/GitHub 匿名 API 额度已用尽/);
+    assert.match(text,expired?(locale==='en'?/ready to retry/:/已到，可重试/):(locale==='en'?/paused until then/:/此时间前暂停更新请求/));
+    assert.equal(await page.locator('#check-update').isDisabled(),!expired);
+    assert.equal(await page.locator('#apply-update').isDisabled(),true);
+    assert.equal(await page.locator('#settings-save').isDisabled(),false,'cooldown must not block ordinary settings');
+    assert.deepEqual(requests,[],'rendering, language changes and expiry must not issue update requests');
+    await screenshot('update-cooldown-'+locale+(expired?'-expired':''));
+  };
+  try{
+    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('#project-settings').click();
+    await page.locator('#advanced-settings > summary').click();
+    await page.locator('#update-status').filter({hasText:'GitHub 匿名 API 额度已用尽'}).waitFor();
+    await verify('zh-CN',false);
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#update-status').filter({hasText:'GitHub anonymous API quota is exhausted'}).waitFor();
+    await verify('en',false);
+    // Jump to the exact deadline without a real wait or invoking application functions.
+    // A normal language change rerenders the unchanged intercepted cooldown snapshot.
+    await page.clock.setFixedTime(new Date(reset*1000));
+    await page.locator('#language-select').selectOption('zh-CN');
+    await page.locator('#update-status').filter({hasText:'已到，可重试'}).waitFor();
+    await verify('zh-CN',true);
+    await page.locator('#language-select').selectOption('en');
+    await page.locator('#update-status').filter({hasText:'ready to retry'}).waitFor();
+    await verify('en',true);
+    await page.locator('#check-update').click();
+    await page.locator('#update-status').filter({hasText:'Checking for updates'}).waitFor();
+    assert.deepEqual(requests,['/api/updates/check']);
+    assert.equal(await page.locator('#check-update').isDisabled(),true);
+    assert.equal(await page.locator('#apply-update').isDisabled(),true);
+  }finally{await page.close();}
+}
+
 async function checkDraftRecovery(browser, url, errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   const secret='BROWSER-SECRET-MUST-NOT-PERSIST';
@@ -393,6 +456,7 @@ async function main() {
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
     if(process.env.RSI_BROWSER_PROVIDERS_ONLY){await checkProviderSaveRace(browser,url,errors);await checkProviderSaveRace(browser,url,errors,true);assert.deepEqual(errors,[]);console.log('Provider creation acknowledgement checks passed.');return;}
     if(process.env.RSI_BROWSER_ROUTES_ONLY){await checkRouteSaveRace(browser,url,errors);return;}
+    if(process.env.RSI_BROWSER_UPDATES_ONLY){await checkUpdatePending(browser,url,errors);await checkUpdateRateLimit(browser,url,errors);assert.deepEqual(errors,[]);console.log('Update pending and primary rate-limit cooldown browser checks passed.');return;}
     await checkReadiness(browser, url, false, errors);
     await checkReadiness(browser, url, true, errors);
     await checkReadinessInstallAction(browser,url,errors);
@@ -402,6 +466,7 @@ async function main() {
     await checkProviderSaveRace(browser, url, errors, true);
     await checkRouteSaveRace(browser,url,errors);
     await checkUpdatePending(browser,url,errors);
+    await checkUpdateRateLimit(browser,url,errors);
     await checkDraftRecovery(browser,url,errors);
     await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);

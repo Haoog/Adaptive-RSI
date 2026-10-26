@@ -1,7 +1,10 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
 import os
 import sqlite3
+import stat
+import tempfile
 import time
+from contextlib import closing
 from pathlib import Path
 
 from .store import Store, uid
@@ -11,17 +14,20 @@ def backup(store):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
     path = folder / (uid() + ".sqlite3")
-    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    os.close(fd)
+    fd, name = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=folder)
+    staging = Path(name)
     try:
-        with store.connect() as source, sqlite3.connect(str(path)) as target:
+        os.close(fd)
+        with store.connect() as source, closing(sqlite3.connect(str(staging))) as target:
             source.backup(target)
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
+        # Publish only the closed snapshot; a name collision must preserve the old backup.
+        os.link(staging, path)
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
 def restore(source, destination):
@@ -49,13 +55,28 @@ def restore(source, destination):
     return {"restored": True, "paused": True, "artifacts_restored": False}
 
 
+def _file_info(paths, follow_symlinks=False):
+    for path in paths:
+        try:
+            info = path.stat() if follow_symlinks else path.lstat()
+        except FileNotFoundError:
+            continue  # SQLite sidecars can disappear during enumeration.
+        if stat.S_ISREG(info.st_mode):
+            yield path, info
+
+
 def overview(store):
     categories = {}
     for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups")]:
-        categories[label] = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file() and not p.is_symlink()) if directory.exists() else 0
-    categories["database"] = sum(p.stat().st_size for p in store.root.glob("state.sqlite3*") if p.is_file())
-    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": p.stat().st_size, "created": p.stat().st_mtime}
-            for p in sorted((store.root / "backups").glob("*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]],
+        paths = directory.rglob("*")
+        if label == "backups":
+            paths = (p for p in paths if not p.name.startswith(".backup-"))
+        categories[label] = sum(info.st_size for _, info in _file_info(paths))
+    categories["database"] = sum(info.st_size for _, info in _file_info(store.root.glob("state.sqlite3*"), True))
+    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3"), True),
+                     key=lambda item: item[1].st_mtime, reverse=True)
+    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+            for p, info in backups[:20]],
             "expiring": store.query("SELECT r.id,r.task,r.project,r.ended FROM runs r WHERE r.state='awaiting_approval' ORDER BY r.ended")}
 
 

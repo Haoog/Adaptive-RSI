@@ -1,8 +1,17 @@
+import base64
+import errno
+import io
 import json
+import os
 import platform
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -10,6 +19,276 @@ from adaptive_rsi.config import fingerprint
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 from tests.test_runtime import CHECKS, FakeAgent, fixture
+
+
+class BackupPublicationTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "state")
+        self.addCleanup(self.store.close)
+        self.payload = "private backup payload" * 50000
+        self.store.put_setting("backup-probe", self.payload)
+        self.folder = self.store.root / "backups"
+
+    @contextmanager
+    def source_progress(self, callback):
+        connect = self.store.connect
+
+        @contextmanager
+        def instrumented():
+            with connect() as source:
+                class Source:
+                    def __getattr__(self, name):
+                        return getattr(source, name)
+
+                    def backup(self, target):
+                        source.backup(target, pages=1, progress=callback)
+
+                yield Source()
+
+        with patch.object(self.store, "connect", instrumented):
+            yield
+
+    def handler(self):
+        from adaptive_rsi.server import Handler
+        handler = object.__new__(Handler)
+        handler.server = SimpleNamespace(_backup_gate=threading.BoundedSemaphore(2))
+        handler.connection = SimpleNamespace(settimeout=lambda _: None)
+        handler.wfile = io.BytesIO()
+        handler.send_response = lambda _: None
+        handler.headers_common = lambda: None
+        handler.send_header = lambda *_: None
+        handler.end_headers = lambda: None
+        return handler
+
+    def test_in_progress_snapshot_is_private_then_published_closed_and_portable(self):
+        from adaptive_rsi.server import RequestError
+        from adaptive_rsi.storage_tools import backup, overview
+        identifier = "a" * 16
+        final = self.folder / (identifier + ".sqlite3")
+        paused, resume = threading.Event(), threading.Event()
+        targets = []
+        connect, link = sqlite3.connect, os.link
+
+        def progress(status, remaining, total):
+            if remaining and not paused.is_set():
+                paused.set()
+                if not resume.wait(10):
+                    raise RuntimeError("Backup probe timed out")
+
+        def track_target(path, *args, **kwargs):
+            db = connect(path, *args, **kwargs)
+            if str(path).endswith(".tmp"):
+                targets.append(db)
+            return db
+
+        def publish(source, destination):
+            self.assertFalse(final.exists())
+            self.assertEqual(len(targets), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                targets[0].execute("SELECT 1")
+            link(source, destination)
+
+        self.assertGreater(Path(str(self.store.path) + "-wal").stat().st_size, 0)
+        with self.source_progress(progress), \
+                patch("adaptive_rsi.storage_tools.uid", return_value=identifier), \
+                patch("adaptive_rsi.storage_tools.sqlite3.connect", side_effect=track_target), \
+                patch("adaptive_rsi.storage_tools.os.link", side_effect=publish), \
+                ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(backup, self.store)
+            try:
+                self.assertTrue(paused.wait(10))
+                self.assertFalse(final.exists())
+                staging = list(self.folder.glob("*.tmp"))
+                self.assertEqual(len(staging), 1)
+                self.assertEqual(staging[0].stat().st_mode & 0o777, 0o600)
+                self.assertTrue(all(path.name.startswith(staging[0].name)
+                                    for path in self.folder.iterdir()))
+                snapshot = overview(self.store)
+                self.assertEqual(snapshot["backups"], [])
+                self.assertEqual(snapshot["bytes"]["backups"], 0)
+                for params in ({}, {"format": ["json"], "offset": ["0"]}):
+                    with self.assertRaisesRegex(RequestError, "Backup not found"):
+                        self.handler().backup(final, params)
+            finally:
+                resume.set()
+            saved = future.result(timeout=10)
+
+        self.assertEqual(saved["id"], identifier)
+        self.assertEqual(saved["bytes"], final.stat().st_size)
+        self.assertEqual(list(self.folder.iterdir()), [final])
+        self.assertEqual(final.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([item["id"] for item in overview(self.store)["backups"]], [identifier])
+        handler = self.handler()
+        handler.backup(final, {})
+        self.assertEqual(handler.wfile.getvalue(), final.read_bytes())
+        chunks = []
+        handler.respond = chunks.append
+        handler.backup(final, {"format": ["json"], "offset": ["0"]})
+        self.assertEqual(base64.b64decode(chunks[0]["data"]), final.read_bytes()[:512 * 1024])
+        # Copy only the database bytes: a WAL source must produce a standalone snapshot.
+        portable = self.root / "portable.sqlite3"
+        portable.write_bytes(final.read_bytes())
+        self.assertEqual(portable.read_bytes()[18:20], b"\x01\x01")
+        with closing(sqlite3.connect(portable.as_uri() + "?mode=ro", uri=True)) as db:
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            self.assertEqual(json.loads(db.execute(
+                "SELECT value FROM settings WHERE key='backup-probe'").fetchone()[0]), self.payload)
+        self.assertFalse(Path(str(portable) + "-wal").exists())
+        self.assertFalse(Path(str(portable) + "-shm").exists())
+
+    def test_overview_skips_files_disappearing_during_stat(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        for kind in ("runs", "backups", "database", "backup_listing"):
+            with self.subTest(kind=kind):
+                if kind == "database":
+                    transient = self.store.root / "state.sqlite3-journal"
+                elif kind == "runs":
+                    transient = self.store.root / "runs" / "run" / "temporary-journal"
+                else:
+                    saved = backup(self.store)
+                    transient = self.folder / (saved["id"] + ".sqlite3")
+                transient.parent.mkdir(parents=True, exist_ok=True)
+                if kind in ("runs", "database"):
+                    transient.write_bytes(b"temporary")
+                method = "stat" if kind in ("database", "backup_listing") else "lstat"
+                original = getattr(Path, method)
+                vanished = []
+
+                def disappear(path, *args, **kwargs):
+                    if path == transient and not vanished:
+                        vanished.append(path)
+                        path.unlink()
+                    return original(path, *args, **kwargs)
+
+                with patch.object(Path, method, disappear):
+                    snapshot = overview(self.store)
+                self.assertEqual(vanished, [transient])
+                self.assertEqual(snapshot["backups"], [])
+                self.assertEqual(snapshot["bytes"]["runs"], 0)
+                expected_database = sum(p.stat().st_size for p in self.store.root.glob("state.sqlite3*"))
+                self.assertEqual(snapshot["bytes"]["database"], expected_database)
+
+    def test_overview_propagates_permission_and_io_errors(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        saved = backup(self.store)
+        published = self.folder / (saved["id"] + ".sqlite3")
+        run_file = self.store.root / "runs" / "evidence"
+        run_file.parent.mkdir()
+        run_file.write_bytes(b"evidence")
+        for path, method in ((run_file, "lstat"), (published, "lstat"),
+                             (published, "stat"), (self.store.path, "stat")):
+            for error in (PermissionError(errno.EACCES, "Denied"), OSError(errno.EIO, "I/O failure")):
+                with self.subTest(path=path.name, method=method, error=error.errno):
+                    original = getattr(Path, method)
+
+                    def fail(candidate, *args, **kwargs):
+                        if candidate == path:
+                            raise error
+                        return original(candidate, *args, **kwargs)
+
+                    with patch.object(Path, method, fail):
+                        with self.assertRaises(type(error)) as raised:
+                            overview(self.store)
+                    self.assertIs(raised.exception, error)
+
+    def test_overview_during_concurrent_backup_publication(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        ready, done = threading.Event(), threading.Event()
+
+        def publish():
+            if not ready.wait(10):
+                raise RuntimeError("Overview probe timed out")
+            try:
+                return [backup(self.store) for _ in range(12)]
+            finally:
+                done.set()
+
+        observations = 0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(publish)
+            ready.set()
+            deadline = time.monotonic() + 10
+            while not done.is_set() or observations < 30:
+                self.assertLess(time.monotonic(), deadline)
+                snapshot = overview(self.store)
+                for saved in snapshot["backups"]:
+                    self.assertGreater(saved["bytes"], 0)
+                    self.assertTrue((self.folder / (saved["id"] + ".sqlite3")).is_file())
+                observations += 1
+            published = future.result(timeout=10)
+        snapshot = overview(self.store)
+        self.assertEqual(len(snapshot["backups"]), len(published))
+        self.assertEqual(snapshot["bytes"]["backups"], sum(saved["bytes"] for saved in published))
+        self.assertTrue(all(path.suffix == ".sqlite3" for path in self.folder.iterdir()))
+
+    def test_copy_failure_cleans_staging_and_preserves_existing_backup(self):
+        from adaptive_rsi.storage_tools import backup
+        saved = backup(self.store)
+        existing = self.folder / (saved["id"] + ".sqlite3")
+        original = existing.read_bytes()
+
+        def fail(status, remaining, total):
+            raise sqlite3.OperationalError("Injected copy failure")
+
+        with self.source_progress(fail):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "Injected copy failure"):
+                backup(self.store)
+        self.assertEqual(list(self.folder.iterdir()), [existing])
+        self.assertEqual(existing.read_bytes(), original)
+
+    def test_journal_conversion_failure_closes_target_and_cleans_staging(self):
+        from adaptive_rsi.storage_tools import backup
+        targets = []
+        connect = sqlite3.connect
+
+        class FailingJournal(sqlite3.Connection):
+            def execute(self, sql, *args, **kwargs):
+                if sql == "PRAGMA journal_mode=DELETE":
+                    raise sqlite3.OperationalError("Injected journal failure")
+                return super().execute(sql, *args, **kwargs)
+
+        def failing_target(path):
+            target = connect(path, factory=FailingJournal)
+            targets.append(target)
+            return target
+
+        with patch("adaptive_rsi.storage_tools.sqlite3.connect", side_effect=failing_target):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "Injected journal failure"):
+                backup(self.store)
+        self.assertEqual(list(self.folder.iterdir()), [])
+        with self.assertRaises(sqlite3.ProgrammingError):
+            targets[0].execute("SELECT 1")
+
+    def test_publication_failure_cleans_staging_and_preserves_existing_backup(self):
+        from adaptive_rsi.storage_tools import backup
+        saved = backup(self.store)
+        existing = self.folder / (saved["id"] + ".sqlite3")
+        original = existing.read_bytes()
+        with patch("adaptive_rsi.storage_tools.os.link", side_effect=OSError("Injected publication failure")):
+            with self.assertRaisesRegex(OSError, "Injected publication failure"):
+                backup(self.store)
+        self.assertEqual(list(self.folder.iterdir()), [existing])
+        self.assertEqual(existing.read_bytes(), original)
+
+    def test_name_collision_never_overwrites_or_removes_valid_backup(self):
+        from adaptive_rsi.storage_tools import backup
+        saved = backup(self.store)
+        existing = self.folder / (saved["id"] + ".sqlite3")
+        original = existing.read_bytes()
+        self.store.put_setting("backup-probe", "new value")
+        with patch("adaptive_rsi.storage_tools.uid", return_value=saved["id"]):
+            with self.assertRaises(FileExistsError):
+                backup(self.store)
+        self.assertEqual(list(self.folder.iterdir()), [existing])
+        self.assertEqual(existing.read_bytes(), original)
+        with closing(sqlite3.connect(existing)) as db:
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(json.loads(db.execute(
+                "SELECT value FROM settings WHERE key='backup-probe'").fetchone()[0]), self.payload)
 
 
 class ExperienceTest(unittest.TestCase):
@@ -353,10 +632,10 @@ class ExperienceTest(unittest.TestCase):
         self.runtime.pause(self.project, False)
         run = self.store.claim(self.project, self.runtime.config(self.project))
         transition = self.store.transition
-        def concurrent_cancel(run_id, state, result=None, terminal=False):
+        def concurrent_cancel(run_id, state, result=None, terminal=False, **kwargs):
             if state == "blocked":
                 self.runtime.cancel_task(task)
-            return transition(run_id, state, result, terminal)
+            return transition(run_id, state, result, terminal, **kwargs)
         with patch.object(self.store, "transition", side_effect=concurrent_cancel), \
                 patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
                 patch.object(self.runtime, "invoke", side_effect=RuntimeError("HTTP 503 connection failed")):
