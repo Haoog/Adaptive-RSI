@@ -68,7 +68,12 @@ const apiErrors={
  "Verifying restored service":"正在验证恢复后的服务",
  "A newer deployment owns this target; no stale rollback will be issued":"已有更新版本接管此服务，本次不会恢复旧版本。",
  "A newer deployment owns this target; rollback was cancelled":"已有更新版本接管此服务，本次恢复已取消。",
+ "A newer deployment owns this target; old health evidence was discarded":"已有更新版本接管此服务，本次部署的健康检查结果已作废。",
  "Another deployment is still active on this target":"同一服务的上次部署还未结束，将在结束后继续。",
+ "Post-merge verification must pass before release/deploy":"合并后检查尚未通过，发布与部署会在检查通过后自动继续。",
+ "Deployment target already has this or a newer commit; refusing a stale or diverged deployment":"部署目标已包含本次或更新的提交，继续部署会回退服务，已拒绝这次过期部署。",
+ "Deployment ownership changed during validation":"校验期间同一服务的部署归属发生了变化，本次部署会等最新部署结束后继续。",
+ "Workflow run identity differs from the authorized operation":"工作流执行记录与授权的部署操作不一致，请到 GitHub 核对本次部署对应的工作流记录。",
  "Select a compatible existing workflow from this project": "请先为项目添加支持自动交付的工作流，再刷新列表。",
  "Trusted workflow tag points to a different commit": "工作流标签已指向其他版本，请重新授权。",
  "Trusted workflow tag changed; authorize the workflow again": "工作流标签已改变，请重新授权。",
@@ -797,7 +802,9 @@ async function renderReleaseOutcome(node,run,project){
  const section=el('section',undefined,'release-outcome');section.append(el('h4',t('发布与上线')));
  for(const [kind,title]of [['release','发布'],['deploy','部署']]){const operation=automation[kind];if(!operation)continue;const row=el('div',undefined,'release-status-row');row.append(el('strong',t(title)+' · '),el('span',t(releaseStates[operation.state]||operation.state)));
   const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&operation.dispatch_receipt==='rejected'&&!operation.workflow_run_id;
-  if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),'form-error'));
+  // 等待中的状态（合并后检查、同服务前次部署、等待发布成功）属进行中，提示用中性样式；其余错误保持红色。
+  const waitingNotice=['waiting_verification','waiting_target','waiting_release'].includes(operation.state);
+  if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),waitingNotice?'muted':'form-error'));
   if(dispatchRejected)row.append(el('p',t('提交未被接受。修复授权或工作流配置后，可以安全重试。'),'muted'));
   if(kind==='deploy'&&operation.state==='workflow_succeeded')row.append(el('p',t('部署工作流已完成，服务健康状态尚未验证。'),'muted'));
   if(operation.rollback_unavailable)row.append(el('p',t('没有已验证的历史版本可恢复，请人工检查服务。'),'form-error'));
