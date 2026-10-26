@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.110
+
+<!-- adaptive-rsi-release:0.5.110;base:9433d4de98aa3ac6a4b5139b4a26f0d64da07d80 -->
+
 - Edits made while creating a model connection are subsequently saved to the same connection. Reopened editors do not inherit IDs from old responses, and saves retain their originating project scope.
 - Manually re-adding a model missing from the catalog makes it selectable again, preserves existing preferences, and keeps it available after later catalog refreshes.
 - Auto-merge rechecks the current repository, branch and sealed target after fetching the baseline, preventing merges to an old target after authorization changes.
