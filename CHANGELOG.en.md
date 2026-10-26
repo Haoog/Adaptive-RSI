@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Deferred/rejected decisions from batch triage are recorded in the task decision store when the finding lands: tasks without any run now show the concrete reason in the task list and detail instead of a bare state badge, consistent with deferrals produced by full planning. Decision records persist with the task and are no longer affected by the 90-day derived-data cleanup; legacy internal triage-state keys from earlier upgrades are still migrated at the next deferred reassessment, and wake-up, deduplication and manual reconsideration behave unchanged.
+- The task detail block "Deferral decision and wake conditions" renders structured content instead of raw JSON: the reason, the baseline (short SHA with the full commit on hover) and the wake condition (machine enums get Chinese/English copy; unknown enums are shown verbatim), while the raw decision record stays expandable. For rejected tasks the block title and guidance become "Rejection reason" instead of the deferral wording.
+
 ## 0.5.118
 
 <!-- adaptive-rsi-release:0.5.118;base:947ad7b0cb1f3aa6c03c8a4e8de181adcae5a9ba -->

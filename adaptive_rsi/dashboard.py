@@ -6,7 +6,8 @@ ACTIVE = ["queued", "planning", "executing", "evaluating", "pr_open", "releasing
 ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insufficient_evidence", "interrupted", "regressed", "unverified_merge", "ci_failed", "release_failed", "deploy_failed", "expired"]
 
 # Derive attention from the latest attempt without changing the PR tracking state.
-TASKS = """(SELECT t.*, CASE
+# decision_reason 来自 task_decisions：批量初筛或规划暂缓/不采纳的理由，供无运行记录的任务显示。
+TASKS = """(SELECT t.*, json_extract(d.data,'$.reason') AS decision_reason, CASE
     WHEN t.state='pr_open' AND json_extract(r.result, '$.delivery_status')='ci_failed' THEN 'ci_failed'
     WHEN t.state='merged' AND json_extract(r.result, '$.feedback.state')='regressed' THEN 'regressed'
     WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('failed','health_failed','rollback_failed','blocked','blocked_verification','dispatch_unknown','rerun_unknown') THEN 'deploy_failed'
@@ -14,7 +15,8 @@ TASKS = """(SELECT t.*, CASE
     WHEN t.state='merged' AND json_extract(r.result, '$.automation.deploy.state') IN ('pending','dispatching','submitted','queued','running','rerunning','rolling_back','waiting_target','waiting_verification','waiting_release') THEN 'deploying'
     WHEN t.state='merged' AND json_extract(r.result, '$.automation.release.state') IN ('pending','dispatching','submitted','queued','running','rerunning','waiting_verification') THEN 'releasing'
     ELSE t.state END AS display_state FROM tasks t LEFT JOIN runs r
-    ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1))"""
+    ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1)
+    LEFT JOIN task_decisions d ON d.task=t.id)"""
 
 
 def records(store, project=None, limit=50, offset=0, group="all", include_system=True):

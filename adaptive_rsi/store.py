@@ -259,6 +259,21 @@ class Store:
             db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (task, encode(decision), time.time()))
             db.execute("UPDATE tasks SET state='deferred',updated=? WHERE id=?", (time.time(), task))
 
+    def decide(self, task, state, decision):
+        """批量初筛决定落库：决定与理由写入 task_decisions，状态仅从排队转变。
+
+        同指纹的既有任务（如已完成、过时）不被覆盖；此时也不写决定，
+        与升级前「守卫失败即无可见变化」的行为一致。
+        """
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            changed = db.execute("UPDATE tasks SET state=?,updated=? WHERE id=? AND state='queued'",
+                                 (state, time.time(), task)).rowcount
+            if changed:
+                db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)",
+                           (task, encode(decision), time.time()))
+        return bool(changed)
+
     def phase(self, run, name):
         now = time.time()
         with self.connect() as db:

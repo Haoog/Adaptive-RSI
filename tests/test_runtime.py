@@ -268,6 +268,65 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(reads), 1)
         self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='inspection'")), 2)
 
+    def test_batch_triage_decisions_land_in_task_decisions_and_stay_visible(self):
+        findings = {"findings": [
+            {"title": "Weak evidence duplicate", "body": "add(2, 3) returns -1", "path": "calculator.py",
+             "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 40},
+            {"title": "Comment style churn", "body": "Switch comments to docstrings", "path": "tests/test_calculator.py",
+             "quote": "def test_add(self):", "acceptance": ["style unified"], "priority": 40}]}
+        reasons = ["Evidence is weak: the quoted line does not match the report.",
+                   "Cosmetic churn with disproportionate cost."]
+
+        def invoke(role, *args, **kwargs):
+            if role == "analysis":
+                return findings
+            if role == "triage":
+                return {"findings": [
+                    {"index": 0, "decision": "deferred", "confidence": "high", "reason": reasons[0]},
+                    {"index": 1, "decision": "rejected", "confidence": "high", "reason": reasons[1]}]}
+            raise AssertionError(role)
+
+        with patch.object(self.runtime, "invoke", side_effect=invoke):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        base = git(self.repo, "rev-parse", "HEAD").strip()
+        deferred = self.store.one("SELECT * FROM tasks WHERE title='Weak evidence duplicate'")
+        rejected = self.store.one("SELECT * FROM tasks WHERE title='Comment style churn'")
+        self.assertEqual(deferred["state"], "deferred")
+        self.assertEqual(rejected["state"], "rejected")
+        # 批量初筛的决定与理由直接进入 task_decisions：/api/task 与暂缓复核共用这份记录，
+        # 没有运行记录的不采纳/暂缓任务也能在列表与详情看到理由。
+        records = {}
+        for task, decision, reason in [(deferred, "deferred", reasons[0]), (rejected, "rejected", reasons[1])]:
+            row = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
+            self.assertIsNotNone(row, decision + " decision must be recorded for the task detail")
+            payload = json.loads(row["data"])
+            records[decision] = payload
+            self.assertEqual(payload["decision"], decision)
+            self.assertEqual(payload["reason"], reason)
+            self.assertEqual(payload["base"], base)
+            self.assertTrue(payload.get("triage_input"))
+        # 暂缓记录带唤醒条件；不采纳不承诺自动唤醒，只能手动重新考虑。
+        self.assertEqual(records["deferred"].get("wake_condition"), "inputs_policy_or_relevant_baseline_change")
+        self.assertNotIn("wake_condition", records["rejected"])
+        # 决定落库后不再依赖内部 triage-state 设置键。
+        self.assertEqual(self.store.query("SELECT key FROM settings WHERE key LIKE 'triage-state:%'"), [])
+        # 保留期清理不删除决定记录：理由在 90 天后仍然可见。
+        stale = time.time() - 120 * 86400
+        self.store.execute("UPDATE tasks SET updated=? WHERE id IN (?,?)", (stale, deferred["id"], rejected["id"]))
+        self.runtime.maintenance()
+        for task in [deferred, rejected]:
+            self.assertIsNotNone(self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],)))
+        # 唤醒语义不变：基线变化后暂缓任务重新入队，不采纳任务保持原状。
+        (self.repo / "notes.txt").write_text("baseline moved\n")
+        git(self.repo, "add", "notes.txt")
+        git(self.repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.com",
+            "commit", "--quiet", "-m", "Move baseline")
+        self.runtime.reassess_deferred(self.project, self.runtime.config(self.project),
+                                       git(self.repo, "rev-parse", "HEAD").strip())
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (deferred["id"],))["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (rejected["id"],))["state"], "rejected")
+
     def test_calls_are_recorded_without_daily_quotas(self):
         config = merge(self.runtime.config(self.project), {"limits": {"daily_calls": 1}})
         route = config["models"]["planning"]

@@ -31,6 +31,10 @@ window.RSIExperience = (() => {
   }
   let seen = readSaved(notificationKey + ":seen", {});
   let seenInstance = '';
+  // 唤醒条件是后端机器枚举；未知的枚举原样显示，不虚构解释。
+  const wakeConditions = {
+    inputs_policy_or_relevant_baseline_change: "输入、策略或相关代码变化后",
+  };
   let notifyFailureToasted = false;
   const phaseNames = {preparation:'准备运行环境', implementation:'正在修改代码', review:'正在评审改动', acceptance:'验收设计'};
   function queueCopy(task) {
@@ -559,13 +563,35 @@ window.RSIExperience = (() => {
       controls.append(form);
     }
     if (metadata.decision) {
+      const rejected = metadata.state === "rejected";
+      let record = {};
+      try {
+        record = JSON.parse(metadata.decision.data) || {};
+      } catch {}
       const decision = el("details");
+      decision.open = ["deferred", "rejected"].includes(metadata.state);
+      decision.append(el("summary", t(rejected ? "不采纳理由" : "暂缓决定与唤醒条件")));
+      if (record.reason) decision.append(el("p", record.reason));
+      if (record.base) {
+        const baseline = el("p", t("基线") + " · " + String(record.base).slice(0, 7), "muted");
+        baseline.title = record.base;
+        decision.append(baseline);
+      }
+      if (record.wake_condition)
+        decision.append(
+          el("p", t("唤醒条件") + " · " + t(wakeConditions[record.wake_condition] || record.wake_condition), "muted"),
+        );
+      const raw = el("details", undefined, "review-report");
+      raw.append(el("summary", t("原始记录")), el("pre", JSON.stringify(record, null, 2)));
+      decision.append(raw);
       decision.append(
-        el("summary", t("暂缓决定与唤醒条件")),
-        el("pre", JSON.stringify(JSON.parse(metadata.decision.data), null, 2)),
         el(
           "p",
-          t("输入、策略或相关代码变化后重新评估，也可手动补充需求。"),
+          t(
+            rejected
+              ? "不采纳的任务需手动重新考虑；可通过重试或补充需求重新评估。"
+              : "输入、策略或相关代码变化后重新评估，也可手动补充需求。",
+          ),
           "muted",
         ),
       );

@@ -385,7 +385,10 @@ function renderTasks(){
   const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');
   title.append(action(task.title,()=>showTask(task),'task-title'),el('span',t(sourceNames[task.source]||task.source)+' · '+stamp(task.updated),'task-meta'));
   if(task.wait_reason)title.append(el('p',window.RSIExperience?.queueCopy(task)||'','task-meta'));
-  const latest=scoped(state.runs).find(run=>run.task===task.id),reason=latest?.reason||latest?.plan_reason;
+  // 暂缓/不采纳的任务可能没有运行记录：理由回退到 task_decisions 的决定记录（批量初筛或规划）。
+  const latest=scoped(state.runs).find(run=>run.task===task.id),
+        decisionReason=['deferred','rejected'].includes(task.state)&&task.decision_reason?task.decision_reason:'',
+        reason=latest?.reason||latest?.plan_reason||decisionReason;
   if(reason)title.append(el('p',latest?.failure?failureCopy(latest.failure):reason,'task-reason'));
   if(latest?.summary&&latest.summary!==reason)title.append(el('p',latest.summary,'task-result-summary'));
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
