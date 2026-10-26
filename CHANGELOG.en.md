@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.109
+
+<!-- adaptive-rsi-release:0.5.109;base:87cbab342c238c6b8e58808ae6dd2b57ec7b74a3 -->
+
 - Inspection requests preserve cancellation until the active run stops. Cancellation no longer overwrites concurrent completion, preventing delivered tasks from being executed again.
 - Preserve prerequisite links during automatic retries and recheck current state when releasing dead dependencies, so temporary failures do not discard execution ordering.
 - Successful cross-project submissions clear their submitted goal draft while retaining later edits. Expired candidates remain visible in attention, and delayed notification navigation cannot replace a newer project or detail selection.
