@@ -8,6 +8,11 @@
 - The predecessor selector supports explicit pagination, retries and selection retention across pages, making same-project tasks beyond the first 200 selectable.
 - Inspection and Issue sync read current settings under the schedule-write lock. Older scheduler ticks cannot overwrite deadlines set by interval saves or restored inheritance, or trigger disabled sources from stale snapshots.
 - Next inspection times match working-hour eligibility, skipping entire windows missing during daylight-saving transitions and handling half-hour jumps, repeated windows and day changes.
+
+## 0.5.115
+
+<!-- adaptive-rsi-release:0.5.115;base:eeec1271316933db544cac66343b3484bb9c5497 -->
+
 - Usage search manages debounce and automatic refresh separately and invalidates old requests on input, preventing earlier responses from cancelling new queries or replacing later results.
 - Settings retain edits made while saving, including changes back to old values followed by a project switch. Acknowledgments preserve those drafts and compare them with the newly saved values.
 
