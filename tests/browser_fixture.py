@@ -102,7 +102,23 @@ def main():
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print("Browser fixture: console ready", file=sys.stderr, flush=True)
             print(server.url, flush=True)
-            input()
+            # Browser regressions may inspect committed fixture rows without adding
+            # a test-only HTTP endpoint or exposing the temporary state directory.
+            for line in sys.stdin:
+                if not line.strip():
+                    break
+                texts = json.loads(line)["goal_evidence"]
+                placeholders = ",".join("?" for _ in texts)
+                print(json.dumps({
+                    "tasks": runtime.store.query(
+                        "SELECT id,project,body,state,attempts FROM tasks "
+                        "WHERE source='goal' AND body IN (" + placeholders + ")", texts),
+                    "submissions": runtime.store.query(
+                        "SELECT s.project,s.request,s.task FROM submissions s "
+                        "JOIN tasks t ON t.id=s.task WHERE t.body IN (" + placeholders + ")", texts),
+                    "projects": runtime.store.query("SELECT id,paused FROM projects"),
+                    "calls": runtime.store.one("SELECT count(*) AS n FROM calls")["n"],
+                }, ensure_ascii=False), flush=True)
         finally:
             directory.shutdown()
             directory.server_close()

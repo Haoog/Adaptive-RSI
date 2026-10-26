@@ -1,7 +1,149 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
 const { createInterface } = require("node:readline");
+const { once } = require("node:events");
 const { chromium } = require("playwright");
+
+async function checkGoalRecovery(page, evidence) {
+  // The install-page check shares localStorage and previously selected English.
+  await page.locator('#language-select').selectOption('zh-CN');
+  const original = '手机测试目标\n  保留原文空格、换行与 <tag> & English details。  ',
+    changed = '换文本后的失败目标',
+    otherText = '另一个项目的待确认目标',
+    texts = [original, changed, otherText],
+    requests = [];
+  let accepted;
+  const intercept = async (route) => {
+    requests.push(route.request().postDataJSON());
+    if (requests.length === 1) {
+      // Commit through the real server, then lose only the browser response.
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, await response.text());
+      accepted = await response.json();
+      await route.abort('failed');
+    } else if (requests.length <= 3) {
+      // New text fails before reaching the server and must get its own record.
+      await route.abort('failed');
+    } else {
+      await route.continue();
+    }
+  };
+  await page.route('**/api/goal', intercept);
+  try {
+    const project = await page.locator('#project-select').inputValue(),
+      other = await page.locator('#project-select option').evaluateAll(
+        (nodes, current) => nodes.map(node => node.value).find(id => id && id !== current), project,
+      ),
+      input = page.locator('#goal-text'),
+      submit = page.locator('#goal-form button[type="submit"]'),
+      recovery = page.locator('[data-goal-recovery]');
+    const failGoal = async (text) => {
+      const count = requests.length;
+      await input.fill(text);
+      await submit.click();
+      await page.locator('#goal-form [data-form-error]:visible').waitFor();
+      assert.equal(await submit.isEnabled(), true);
+      assert.equal(await input.inputValue(), text);
+      assert.equal(requests.length, count + 1);
+    };
+    const options = (select) => select.locator('option').evaluateAll(
+      nodes => nodes.filter(node => node.value).map(node => ({id: node.value, text: node.textContent})),
+    );
+    const noOverflow = async (language) => {
+      const width = page.viewportSize().width;
+      const size = await page.evaluate(() => ({
+        width: innerWidth, scroll: document.documentElement.scrollWidth,
+      }));
+      assert.ok(size.width <= width + 1 && size.scroll <= width + 1,
+        `${language} recovery overflows ${width}px viewport: ${JSON.stringify(size)}`);
+    };
+    await failGoal(original);
+    assert.ok(accepted.id);
+    await failGoal(changed);
+    assert.notEqual(requests[0].request_id, requests[1].request_id);
+    assert.deepEqual(requests.slice(0, 2).map(({project: id, text}) => [id, text]),
+      [[project, original], [project, changed]]);
+    await page.reload();
+    await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+    const chinese = page.getByRole('combobox', {name: '待确认的目标', exact: true});
+    await chinese.waitFor();
+    assert.equal(await input.inputValue(), changed, 'reload keeps the newer draft');
+    assert.deepEqual(await options(chinese), [
+      {id: requests[0].request_id, text: original},
+      {id: requests[1].request_id, text: changed},
+    ]);
+    assert.equal(await chinese.locator('option').first().innerText(), '选择要恢复的目标');
+    await noOverflow('Chinese');
+    let stored = await evidence(texts);
+    assert.deepEqual(stored.tasks, [{id: accepted.id, project, body: original, state: 'queued', attempts: 0}]);
+    assert.deepEqual(stored.submissions, [{project, request: requests[0].request_id, task: accepted.id}]);
+
+    await page.locator('#project-select').selectOption(other);
+    await recovery.waitFor({state: 'hidden'});
+    assert.equal(await input.inputValue(), '', 'another project must not inherit the draft');
+    await failGoal(otherText);
+    assert.deepEqual(await options(chinese), [{id: requests[2].request_id, text: otherText}]);
+    assert.equal(requests[2].project, other);
+    assert.ok(!requests.slice(0, 2).some(request => request.request_id === requests[2].request_id));
+    await page.locator('#language-select').selectOption('en');
+    const english = page.getByRole('combobox', {name: 'Unconfirmed goals', exact: true});
+    await english.waitFor();
+    assert.equal(await english.locator('option').first().innerText(), 'Select a goal to restore');
+    await english.selectOption(requests[2].request_id);
+    await page.getByRole('button', {name: 'Restore to input (replace current draft)', exact: true}).click();
+    assert.equal(await input.inputValue(), otherText);
+    await noOverflow('English, other project');
+
+    await page.locator('#project-select').selectOption(project);
+    await english.waitFor();
+    assert.deepEqual(await options(english), [
+      {id: requests[0].request_id, text: original},
+      {id: requests[1].request_id, text: changed},
+    ], 'each project exposes only its own pending goals');
+    assert.equal(await input.inputValue(), changed);
+    await english.selectOption(requests[0].request_id);
+    await page.getByRole('button', {name: 'Restore to input (replace current draft)', exact: true}).click();
+    assert.equal(await input.inputValue(), original);
+    await noOverflow('English, original project');
+    await page.locator('#language-select').selectOption('zh-CN');
+    await chinese.waitFor();
+    await input.fill('等待被恢复入口替换的草稿');
+    await chinese.selectOption(requests[0].request_id);
+    await page.getByRole('button', {name: '恢复到输入框（替换当前草稿）', exact: true}).click();
+    assert.equal(await input.inputValue(), original, 'restore preserves exact multiline text');
+    await noOverflow('Chinese, restored');
+    assert.equal(requests.length, 3, 'reload, project/language switches and restoration must not submit');
+
+    const response = page.waitForResponse(r => new URL(r.url()).pathname === '/api/goal' && r.request().method() === 'POST');
+    await submit.click();
+    const confirmed = await response;
+    assert.equal(confirmed.status(), 200, await confirmed.text());
+    const confirmedGoal = await confirmed.json();
+    assert.equal(confirmedGoal.id, accepted.id);
+    await page.locator('#toast').filter({hasText: '目标已入队'}).waitFor();
+    assert.equal(requests.length, 4);
+    assert.deepEqual(requests[3], requests[0], 'explicit retry must reuse the original request ID and payload');
+    assert.equal(await input.inputValue(), '');
+    assert.deepEqual(await options(chinese), [{id: requests[1].request_id, text: changed}],
+      'acknowledgement removes only the recovered record');
+    stored = await evidence(texts);
+    assert.deepEqual(stored.tasks, [{id: accepted.id, project, body: original, state: 'queued', attempts: 0}],
+      'real SQLite contains exactly one task after response loss and retry');
+    assert.deepEqual(stored.submissions, [{project, request: requests[0].request_id, task: accepted.id}]);
+    assert.ok(stored.projects.every(item => item.paused));
+    assert.equal(stored.calls, 0);
+    await page.locator('#project-select').selectOption(other);
+    await chinese.waitFor();
+    assert.deepEqual(await options(chinese), [{id: requests[2].request_id, text: otherText}],
+      'confirming the original project leaves the other project record intact');
+    await page.locator('#project-select').selectOption(project);
+    await chinese.waitFor();
+    console.log('Chromium goal recovery passed: response loss after server commit, changed text failure, reload, bilingual restoration, explicit original-ID retry, one SQLite task, project isolation, mobile overflow, zero model calls.');
+    return [accepted.id, confirmedGoal.id, project];
+  } finally {
+    await page.unroute('**/api/goal', intercept);
+  }
+}
 (async () => {
   const server = spawn(
     process.env.PYTHON || "python3",
@@ -9,11 +151,17 @@ const { chromium } = require("playwright");
     { stdio: ["pipe", "pipe", "pipe"] },
   );
   server.stderr.on("data", (chunk) => process.stderr.write(chunk));
+  const output = createInterface({ input: server.stdout });
+  const evidence = async (texts) => {
+    const next = once(output, 'line', {signal: AbortSignal.timeout(10000)});
+    server.stdin.write(JSON.stringify({goal_evidence: texts}) + '\n');
+    return JSON.parse((await next)[0]);
+  };
   let browser;
   try {
     const url = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error("Fixture timed out")), 30000);
-      createInterface({ input: server.stdout }).once("line", (line) => {
+      output.once("line", (line) => {
         clearTimeout(timer);
         resolve(line);
       });
@@ -81,22 +229,7 @@ const { chromium } = require("playwright");
       );
     await installPage.close();
     await page.locator('.sidebar nav [data-view="overview"]').click();
-    const ids = await page.evaluate(async () => {
-      const project = projectId;
-      const first = await api("goal", {
-        project,
-        text: "手机测试目标",
-        request_id: "mobile-browser-request",
-      });
-      const second = await api("goal", {
-        project,
-        text: "手机测试目标",
-        request_id: "mobile-browser-request",
-      });
-      return [first.id, second.id, project];
-    });
-    assert.equal(ids[0], ids[1]);
-    await page.evaluate(() => refresh());
+    const ids = await checkGoalRecovery(page, evidence);
     await page
       .getByRole("button", { name: "手机测试目标", exact: true })
       .click();
@@ -332,8 +465,13 @@ const { chromium } = require("playwright");
     );
   } finally {
     if (browser) await browser.close();
-    server.stdin.end("\n");
-    await new Promise((resolve) => server.once("exit", resolve));
+    if (server.exitCode === null && server.signalCode === null) {
+      const ended = once(server, 'exit');
+      server.stdin.end("\n");
+      const timeout = setTimeout(() => server.kill('SIGTERM'), 5000);
+      await ended;
+      clearTimeout(timeout);
+    }
   }
 })().catch((error) => {
   console.error(error);
