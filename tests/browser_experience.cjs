@@ -305,8 +305,8 @@ async function checkQueueEditor(page, evidence) {
       assert.deepEqual(errors, []);
       return;
     }
-    // Unconfigured sources/repository cannot schedule a check or pretend success.
-    assert.equal(await page.locator('[data-inspect="light"]').isDisabled(), true);
+    // Disabled sources keep manual entry points; only a missing repository blocks Issue sync.
+    assert.equal(await page.locator('[data-inspect="light"]').isDisabled(), false);
     assert.equal(await page.locator('[data-inspect="issues"]').isDisabled(), true);
     const issueRequestError = await page.evaluate(async () => {
       try {
@@ -317,6 +317,16 @@ async function checkQueueEditor(page, evidence) {
       }
     });
     assert.equal(issueRequestError, '请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。');
+    await page.locator('#language-select').selectOption('en');
+    assert.equal(await page.evaluate(async () => {
+      try {
+        await api('request', {project: projectId, kind: 'issues'});
+        return 'unexpected success';
+      } catch (error) {
+        return error.message;
+      }
+    }), 'Configure a GitHub repository in project settings before scheduling Issue sync.');
+    await page.locator('#language-select').selectOption('zh-CN');
     // Incomplete scans are visible as unfinished work with a continuation, not a completed sync.
     const issueRoute = async route => {
       const response = await route.fetch(), data = await response.json();

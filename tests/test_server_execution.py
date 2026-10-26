@@ -60,6 +60,16 @@ class ServerExecutionTest(unittest.TestCase):
             self.runtime.request(self.project, "issues")
         self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='system_issues'"), [])
 
+    def test_manual_requests_stay_available_while_sources_are_disabled(self):
+        self.runtime.configure({"github": {"repository": "owner/project"},
+                                "sources": {"inspection": False, "issues": False}}, self.project)
+        light = self.runtime.request(self.project, "light")
+        issues = self.runtime.request(self.project, "issues")
+        self.assertEqual(
+            {self.store.one("SELECT source FROM tasks WHERE id=?", (task,))["source"]
+             for task in (light, issues)},
+            {"system_light", "system_issues"})
+
     def test_unlimited_calls_and_legacy_tasks_recover(self):
         config = validate({"limits": {"daily_calls": 1, "run_calls": 1, "run_seconds": 1, "max_changed_files": 1}})
         task = self.runtime.goal(self.project, "record usage")

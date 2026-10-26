@@ -649,7 +649,7 @@ test('issue sync activity separates scans, real changes and unfinished continuat
   '已同步 Issue 更新 · 3；本次同步未完成，下一轮继续');
 });
 
-test('inspection entry points follow repository and source availability', () => {
+test('inspection entry points follow project, configuration and repository availability', () => {
   const page = browser();
   const buttons = ['light', 'issues'].map(kind => {
     const button = page.node('inspect-' + kind); button.dataset.inspect = kind; return button;
@@ -668,7 +668,7 @@ test('inspection entry points follow repository and source availability', () => 
   page.document.querySelectorAll = selector => selector === '[data-inspect]' ? buttons : [];
   page.node('config-scope').value = 'project';
   vm.runInContext('language="zh-CN";view="settings";settingsBaseline={};readinessCache.set("a",{ready:true,items:[]});renderUpdateExtras=()=>{};originalRender()', page.context);
-  assert.equal(buttons[0].disabled, true, 'disabled inspection source cannot schedule a check');
+  assert.equal(buttons[0].disabled, false, 'manual check stays available when its source is disabled');
   assert.equal(buttons[1].disabled, true, 'missing repository cannot schedule Issue sync');
   page.context.initialState.projects[0].config.sources = {inspection: true, issues: true};
   page.context.initialState.projects[0].config.github.repository = 'owner/project';
@@ -677,7 +677,27 @@ test('inspection entry points follow repository and source availability', () => 
   assert.equal(buttons[1].disabled, false);
   page.context.initialState.projects[0].config.github.repository = '';
   vm.runInContext('originalRender()', page.context);
+  assert.equal(buttons[0].disabled, false, 'disabling Issue sync never hides manual checks');
   assert.equal(buttons[1].disabled, true, 'Issue sync stays disabled without a repository');
+  page.context.initialState.projects[0].configuration_error = 'broken configuration';
+  vm.runInContext('originalRender()', page.context);
+  assert.equal(buttons[0].disabled, true, 'configuration errors disable manual checks');
+  assert.equal(buttons[1].disabled, true);
+});
+
+test('no-repository and historical Issue copy use English punctuation and messages', () => {
+  const page = browser();
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  const english = vm.runInNewContext(i18n.slice(0, i18n.indexOf('let language')) + ';english');
+  page.context.t = value => english[value] ?? value;
+  assert.equal(page.context.t('请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。'),
+    'Configure a GitHub repository in project settings before scheduling Issue sync.');
+  assert.equal(vm.runInContext('t(apiErrors["No GitHub repository configured"])', page.context),
+    'Configure a GitHub repository in project settings before scheduling Issue sync.');
+  const event = {kind: 'issues', message: '3 Issue updates synchronized',
+    data: JSON.stringify({complete: false, next_page: 2, pages_read: 1})};
+  assert.equal(vm.runInContext(`eventCopy(${JSON.stringify(event)})`, page.context),
+    'Issue updates synchronized · 3; This sync did not finish and will continue next cycle');
 });
 
 test('live task details rerender when synced input changes but keep unchanged polls and drafts', async () => {

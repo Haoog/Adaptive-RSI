@@ -281,7 +281,7 @@ const known={'Project registered (paused)':'项目已接入，等待启动','Pro
  let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data);}catch{}}
  if(event.kind==='issues'&&data&&Number.isInteger(data.scanned)&&Number.isInteger(data.changed))return issueSyncCopy(data.scanned,data.changed,data.complete);
  const issues=event.message.match(/^(\d+) Issue updates synchronized$/);
- if(issues){const copy=t('已同步 Issue 更新')+' · '+issues[1];return data?.complete===false?copy+'；'+t('本次同步未完成，下一轮继续'):copy;}
+ if(issues){const copy=t('已同步 Issue 更新')+' · '+issues[1];return data?.complete===false?copy+t('；')+t('本次同步未完成，下一轮继续'):copy;}
  return event.message;
 }
 function render(){
@@ -326,7 +326,7 @@ function render(){
   $(kind+'-due').textContent=t(!enabled?'未启用':project?.paused?'项目已暂停':schedule?'下次 ':'等待首次检查')+(enabled&&!project?.paused&&schedule?scheduleStamp(scheduleTime(schedule),scheduleTimezone)+' · '+scheduleTimezone:'');
  }
  $('scan-summary').textContent=['light','issues'].map(kind=>t({light:'项目扫描',issues:'GitHub 问题同步',deep:'深度检查'}[kind])+' '+($(kind+'-due').textContent===t('未启用')?t('未启用'):t('每')+' '+$(kind+'-interval').textContent)).join(' · ')+' · '+t('项目时区')+' '+scheduleTimezone;
- document.querySelectorAll('[data-inspect]').forEach(button=>{const kind=button.dataset.inspect,enabled=kind==='light'?config.sources.inspection:kind==='issues'?config.sources.issues&&!!config.github.repository:true;button.disabled=!project||!!configError||!enabled;});
+ document.querySelectorAll('[data-inspect]').forEach(button=>{const kind=button.dataset.inspect;button.disabled=!project||!!configError||(kind==='issues'&&!config.github.repository);});
  const activity=$('activity'),events=state.events.filter(e=>!e.project||e.project===projectId).slice(0,6);
  if(changedList(activity,events)){activity.replaceChildren();
  if(!events.length)activity.append(el('p',t('运行记录将在这里出现。'),'empty-copy'));
