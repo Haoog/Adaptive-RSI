@@ -251,29 +251,59 @@ def _issue_comment_response(entry, status):
             "fetched_at": entry.get("last_success_at")}
 
 
-def _issue_task(store, project, repository, number):
+def issue_requirements(db, task):
+    """Separate imported text from durable local additions, including legacy revisions."""
+    try:
+        evidence = json.loads(task["evidence"] or "[]")
+    except (TypeError, ValueError):
+        evidence = []
+    first = evidence[0] if isinstance(evidence, list) and evidence and isinstance(evidence[0], dict) else {}
+    saved = first.get("requirements")
+    if (isinstance(saved, dict) and isinstance(saved.get("upstream_body"), str) and
+            isinstance(saved.get("local_supplements"), list) and
+            all(isinstance(item, str) for item in saved["local_supplements"])):
+        return saved
+    revisions = db.execute("SELECT previous_body,supplement FROM task_revisions WHERE task=? ORDER BY id",
+                           (task["id"],)).fetchall()
+    upstream = task["body"]
+    # Match complete historical append operations, never substrings in upstream
+    # prose. Earlier additions may already have been lost by legacy sync.
+    for revision in reversed(revisions):
+        if upstream == revision["previous_body"] + "\n\n" + revision["supplement"]:
+            upstream = revision["previous_body"]
+    return {"upstream_body": upstream, "local_supplements": [row["supplement"] for row in revisions]}
+
+
+def issue_requirements_body(requirements):
+    body = "\n\n".join([requirements["upstream_body"], *requirements["local_supplements"]])
+    if len(body) > 30000:
+        # Leave the previous snapshot and sync cursor intact rather than truncate
+        # either upstream requirements or user additions.
+        raise ValueError("Combined requirements exceed 30000 characters")
+    return body
+
+
+def _issue_task(db, project, repository, number):
     """Adopt a legacy key only when its evidence proves the repository identity."""
     key = "issue:" + repository.lower() + ":" + str(number)
-    with store.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        existing = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
-                              (project, key)).fetchone()
-        if existing:
-            return key, dict(existing)
-        legacy = db.execute("SELECT * FROM tasks WHERE project=? AND source='issue' AND fingerprint=?",
-                            (project, "issue:" + str(number))).fetchone()
-        if legacy:
-            try:
-                evidence = json.loads(legacy["evidence"])
-            except (TypeError, ValueError):
-                evidence = []
-            expected = "https://github.com/" + repository.lower() + "/issues/" + str(number)
-            if (isinstance(evidence, list) and evidence and isinstance(evidence[0], dict) and
-                    evidence[0].get("number") == number and
-                    str(evidence[0].get("url", "")).lower().rstrip("/") == expected):
-                # Only the lookup key changes; runs, decisions and user actions keep their task ID.
-                db.execute("UPDATE tasks SET fingerprint=? WHERE id=?", (key, legacy["id"]))
-                return key, {**dict(legacy), "fingerprint": key}
+    existing = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                          (project, key)).fetchone()
+    if existing:
+        return key, dict(existing)
+    legacy = db.execute("SELECT * FROM tasks WHERE project=? AND source='issue' AND fingerprint=?",
+                        (project, "issue:" + str(number))).fetchone()
+    if legacy:
+        try:
+            evidence = json.loads(legacy["evidence"])
+        except (TypeError, ValueError):
+            evidence = []
+        expected = "https://github.com/" + repository.lower() + "/issues/" + str(number)
+        if (isinstance(evidence, list) and evidence and isinstance(evidence[0], dict) and
+                evidence[0].get("number") == number and
+                str(evidence[0].get("url", "")).lower().rstrip("/") == expected):
+            # Only the lookup key changes; runs, decisions and user actions keep their task ID.
+            db.execute("UPDATE tasks SET fingerprint=? WHERE id=?", (key, legacy["id"]))
+            return key, {**dict(legacy), "fingerprint": key}
     return key, None
 
 
@@ -298,8 +328,27 @@ def sync(runtime, project, config, checked, cancel=None):
         if "pull_request" in issue:
             return
         number = int(issue["number"])
+        # Serialize the snapshot read and write with revise_task and run claims.
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task_key, existing = _issue_task(db, project["id"], repo, number)
+            if existing:
+                apply_existing(issue, existing, db)
+                return
+        labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
+        allowed = not set(config["github"]["exclude_labels"]) & labels and (
+            not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
+        if issue["state"].lower() == "open" and allowed:
+            evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
+                         "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
+            store.add_task(project["id"], "issue", task_key, issue["title"], issue["body"] or "", evidence, priority=60)
+            consumed += 1
+
+    def apply_existing(issue, existing, db):
+        nonlocal consumed
+        number = int(issue["number"])
         held = pending.pop(str(number), None)
-        task_key, existing = _issue_task(store, project["id"], repo, number)
+        active = db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (existing["id"],)).fetchone()
         try:
             previous = json.loads(existing["evidence"]) if existing else []
         except (TypeError, ValueError):
@@ -312,60 +361,78 @@ def sync(runtime, project, config, checked, cancel=None):
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
             not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
         if issue["state"].lower() != "open" or not allowed:
-            if existing and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]:
+            if not active and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]:
                 excluded_at = time.time()
                 excluded_evidence = [dict(previous[0]), *previous[1:]] if previous else [{}]
                 excluded_evidence[0]["sync_exclusion"] = {"state": existing["state"], "at": excluded_at}
-                store.execute("UPDATE tasks SET state='obsolete',evidence=?,updated=? WHERE id=? AND state=?",
+                db.execute("UPDATE tasks SET state='obsolete',evidence=?,updated=? WHERE id=? AND state=?",
                               (encode(excluded_evidence), excluded_at, existing["id"], existing["state"]))
-            elif existing and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
+            elif not active and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
                 # 记录关闭快照，让下一次重新打开可以被识别为「重开」。
                 closed_evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
-                                    "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
-                store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
+                                    "state": issue["state"], "comments": int(issue.get("comments") or 0),
+                                    "requirements": issue_requirements(db, existing)}]
+                db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
                               (encode(closed_evidence), time.time(), existing["id"]))
-            elif existing and existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
+            elif active or existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
                 pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
                 if not held or held["updated_at"] != issue["updated_at"]:
-                    store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project["id"],
-                                data={"task": existing["id"], "updated": issue["updated_at"]})
+                    db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
+                               (project["id"], "issue_revision", "Issue closed or excluded during execution; recheck before delivery",
+                                encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
             return
+        requirements = issue_requirements(db, existing)
         evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
-                     "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
-        if existing and existing["state"] in ["completed", "merged", "pr_closed"]:
+                     "state": issue["state"], "comments": int(issue.get("comments") or 0),
+                     "requirements": requirements}]
+        if not active and existing["state"] in ["completed", "merged", "pr_closed"]:
             # 已交付的任务不因 Issue 的普通编辑重新入队；只有 Issue 从关闭重新打开才值得重跑。
             reopened = bool(previous and isinstance(previous[0], dict) and
                             previous[0].get("state") and str(previous[0]["state"]).lower() != "open")
             if revised and reopened:
-                store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
-                    (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
+                requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}
+                evidence[0]["requirements"] = requirements
+                body = issue_requirements_body(requirements)
+                db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
+                    (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
                 consumed += 1
             elif revised:
-                store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
+                db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
                               (encode(evidence), time.time(), existing["id"]))
             return
         if existing:
-            if (existing["state"] == "obsolete" and not revised and isinstance(exclusion, dict) and
+            if (not active and existing["state"] == "obsolete" and not revised and isinstance(exclusion, dict) and
                     exclusion.get("at") == existing["updated"] and exclusion.get("state") in
                     ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]):
                 # Restore the prior decision, including deferral, rather than paying to plan it again.
                 restored_evidence = [dict(previous[0]), *previous[1:]]
                 restored_evidence[0].pop("sync_exclusion", None)
-                store.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
+                db.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
                               (exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
-            elif existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
-                store.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
-                    (issue["title"][:300], (issue["body"] or "")[:30000], encode(evidence), time.time(), existing["id"]))
+            elif not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
+                requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}
+                evidence[0]["requirements"] = requirements
+                body = issue_requirements_body(requirements)
+                db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
+                    (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
+            elif (not active and not revised and existing["state"] in
+                  ["queued", "deferred", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and
+                  requirements["local_supplements"] and
+                  (not previous or not previous[0].get("requirements") or
+                   issue_requirements_body(requirements) != existing["body"])):
+                # Repair an already lost legacy supplement without waking a held
+                # task or pretending that the source Issue changed.
+                db.execute("UPDATE tasks SET body=?,evidence=? WHERE id=?",
+                           (issue_requirements_body(requirements), encode(evidence), existing["id"]))
             elif revised:
                 # Keep active runs' evidence immutable. The new revision remains visible for next sync.
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
                 pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
                 if not held or held["updated_at"] != issue["updated_at"]:
-                    store.event("issue_revision", "Issue changed during execution; recheck before delivery", project["id"],
-                                data={"task": existing["id"], "updated": issue["updated_at"]})
-        else:
-            store.add_task(project["id"], "issue", task_key, issue["title"], issue["body"] or "", evidence, priority=60)
+                    db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
+                               (project["id"], "issue_revision", "Issue changed during execution; recheck before delivery",
+                                encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
         consumed += 1
 
     for issue in list(pending.values()):

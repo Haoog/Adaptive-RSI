@@ -385,7 +385,21 @@ class Runtime:
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
             if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
                 raise ValueError("Pause or finish active work before supplementing this task")
+            evidence = row["evidence"]
             body = row["body"] + "\n\n" + supplement.strip()
+            if row["source"] == "issue":
+                from .discovery import issue_requirements, issue_requirements_body
+                requirements = issue_requirements(db, row)
+                requirements = {**requirements, "local_supplements": [*requirements["local_supplements"], supplement.strip()]}
+                body = issue_requirements_body(requirements)
+                try:
+                    items = json.loads(evidence or "[]")
+                except (TypeError, ValueError):
+                    items = []
+                if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+                    items = [{}]
+                items[0]["requirements"] = requirements
+                evidence = encode(items)
             if len(body) > 30000:
                 raise ValueError("Combined requirements exceed 30000 characters")
             now = time.time()
@@ -397,7 +411,7 @@ class Runtime:
                        "(SELECT id FROM runs WHERE task=? AND state='awaiting_approval')",
                        (now, row["project"], task))
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
-            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, now, task))
+            db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
         self.store.event("requirements_revised", "Requirements supplemented; fresh verification required", row["project"], data={"task": task})
         self.wake.set()
 
