@@ -145,10 +145,13 @@ window.RSIModelCenter = (() => {
     $('mc-fetch').disabled=jobs.has(jobKey(provider.id));$('mc-fetch').textContent=t(jobs.has(jobKey(provider.id))?'获取中…':'获取模型');
     $('mc-directory-error').hidden=!catalog.error;
     $('mc-directory-error').textContent=catalog.error?errorCopy(catalog.error):'';
-    const connected=!!window.RSIAuth?.isConnected?.(provider.id);
+    const oauthAccount=['openai','opencode'].includes(provider.id);
+    const connected=oauthAccount&&!!window.RSIAuth?.isConnected?.(provider.id);
+    // OAuth 连接以本机登录状态为准；密钥/本地连接凭据由「连接设置」管理，无需密钥或已配置即完成，待配置时保持当前步骤。
+    const accountReady=connected||(!oauthAccount&&provider.credential_status!=='missing');
     $('mc-step-provider').dataset.state='done';
-    $('mc-step-account').dataset.state=connected?'done':'current';
-    $('mc-step-models').dataset.state=catalog.fetched?'done':connected?'current':'pending';
+    $('mc-step-account').dataset.state=accountReady?'done':'current';
+    $('mc-step-models').dataset.state=catalog.fetched?'done':accountReady?'current':'pending';
     $('mc-truncated').hidden=!catalog.truncated;
     $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
     $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';
@@ -367,7 +370,11 @@ window.RSIModelCenter = (() => {
         await fetchProvider(result.id,project);
       }catch(error){$('mc-provider-error').textContent=message(error);}finally{button.disabled=false;}
     });});
-    $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{await request('remove',{provider:active});await load();await refresh();setStatus(t('连接已移除。'));}));
+    $('mc-remove-provider').addEventListener('click',()=>safe(async()=>{
+      // 移除立即退役连接并删除本机凭据，重新添加生成新 id；必须先确认，取消路径不发出任何请求。
+      if(!(await uiConfirm(t('此连接与本机保存的凭据（钥匙串或私有文件）会一并删除且不可恢复；重新添加将生成新连接，启用、收藏、验证与价格记录不会恢复。若仍被角色分工或备用模型引用，服务端会拒绝移除。'))))return;
+      await request('remove',{provider:active});await load();await refresh();setStatus(t('连接已移除。'));
+    }));
     $('mc-add-model').addEventListener('click',()=>{$('mc-custom-form').reset();$('mc-custom-error').textContent='';$('mc-custom-dialog').showModal();});
     $('mc-custom-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
       const unchanged=unchangedForm(event.target),project=scope,provider=active,button=event.target.querySelector('button[type="submit"]');button.disabled=true;$('mc-custom-error').textContent='';
