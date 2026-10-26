@@ -48,5 +48,6 @@ Choose the service, enter its endpoint and key, then save and fetch models. Loca
 - macOS uses local CLIs. Linux servers without host CLIs use the cached trusted worker image. Authentication containers mount only a temporary HOME; the temporary OpenCode endpoint is loopback-only and password-protected.
 - If a CLI or image is missing, install the corresponding CLI or rebuild `deploy/Dockerfile.worker`. Restarting is not a replacement for login. Ordinary saved settings take effect immediately.
 - Pausing a project does not sign out. Signing out does not automatically change model assignments or delivery authorization.
+- After choosing to follow shared model assignments for a project, save to remove its overrides. Inheritance resolves against shared settings at save time, so defaults changed while a reset draft is pending do not pin old values. Roles manually edited after reset retain those edits; active runs continue using their sealed configuration.
 
 Official references: [Codex authentication](https://learn.chatgpt.com/docs/auth), [Codex App Server](https://learn.chatgpt.com/docs/app-server), [OpenCode Server](https://opencode.ai/docs/server/). Actual account authorization remains subject to the provider's official service.

@@ -48,5 +48,6 @@
 - macOS 使用本机 CLI；没有宿主 CLI 的 Linux 服务器使用已缓存的可信执行镜像，认证容器只挂载临时 HOME。临时 OpenCode 服务只允许本机访问，并要求随机密码。
 - 页面提示连接工具或镜像缺失时，安装对应 CLI 或重新构建 `deploy/Dockerfile.worker`。重启不代替登录；普通配置保存后立即生效。
 - 暂停项目不会退出模型账号；退出账号也不会自动改变项目的模型分工或交付授权。
+- 项目模型分工选择跟随通用设置后，需保存才能清除对应覆盖。保存按当时的通用设置解析继承，即使重置草稿期间默认值变化也不会固定旧值；重置后手动编辑的角色按编辑值保存，运行中的任务继续使用其封存配置。
 
 官方依据：[Codex 认证](https://learn.chatgpt.com/docs/auth)、[Codex App Server](https://learn.chatgpt.com/docs/app-server)、[OpenCode Server](https://opencode.ai/docs/server/)。真实供应商是否允许你的账号登录由其官方服务决定。
