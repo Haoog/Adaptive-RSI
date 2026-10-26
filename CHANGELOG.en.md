@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.111
+
+<!-- adaptive-rsi-release:0.5.111;base:81e24d5f40f864de545b06d2461f1d8f5634b933 -->
+
 - Historical run cleanup verifies expected and resolved paths and rejects symlinked ancestors or out-of-bounds paths, preventing deletion in other directories while retaining the existing cleanup scope and run evidence.
 - Derived-setting cleanup batches only records with remaining settings, allowing backlogs beyond 200 historical runs to drain.
 - Issue task identities include repository and number, preventing same-number Issues from overwriting each other or inheriting delivery state after repository changes. Legacy identities migrate only with verifiable source evidence, retaining history.
