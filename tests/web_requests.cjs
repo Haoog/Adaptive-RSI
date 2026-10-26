@@ -388,6 +388,168 @@ test('scheduled check times use and label the project timezone', () => {
   assert.equal(english['项目时区'],'Project timezone');
 });
 
+function paginationPage(offset = 50) {
+  const page = browser();
+  page.context.language = 'zh-CN';
+  page.node('task-filter').value = 'active';
+  page.node('show-system-tasks').checked = false;
+  vm.runInContext(`taskOffset=${offset};render=()=>renderTasks()`, page.context);
+  return page;
+}
+
+function taskPage(total, offset, {project = 'a', filter = 'active', system = false} = {}) {
+  const count = Math.max(0, Math.min(50, total - offset));
+  return {...snapshot(), selected_project: project, sections: ['core'],
+    tasks: Array.from({length: count}, (_, i) => ({
+      ...fixtureTask(String(offset + i), filter === 'attention' ? 'failed' : 'queued'),
+      project, source: system ? 'system_light' : 'goal', updated: 1
+    })), runs: [], pagination: {total, offset, limit: 50, has_more: offset + 50 < total}};
+}
+
+for (const total of [50, 0]) {
+  test(`a shrinking task group refetches page zero before rendering (${total} remaining)`, async () => {
+    const page = paginationPage(), requests = [], rendered = [];
+    page.context.recordPage = () => rendered.push(page.node('tasks-page').textContent);
+    vm.runInContext('render=()=>{renderTasks();recordPage()}', page.context);
+    page.context.fetch = async (url, {signal}) => {
+      const params = new URLSearchParams(url.split('?')[1]);
+      requests.push({params, signal});
+      return response(taskPage(total, Number(params.get('offset'))));
+    };
+    await page.context.refresh();
+    assert.deepEqual(requests.map(r => r.params.get('offset')), ['50', '0']);
+    assert.equal(requests[0].signal, requests[1].signal, 'correction shares cancellation and timeout');
+    for (const {params} of requests) {
+      assert.equal(params.get('project'), 'a');
+      assert.equal(params.get('filter'), 'active');
+      assert.equal(params.get('system'), 'false');
+    }
+    assert.deepEqual(rendered, [total ? '1–50 / 50' : '0–0 / 0']);
+    assert.equal(vm.runInContext('taskOffset', page.context), 0);
+    assert.equal(page.node('tasks-prev').disabled, true);
+    assert.equal(page.node('tasks-next').disabled, true);
+  });
+}
+
+test('a valid final page is kept and renders its returned range', async () => {
+  const page = paginationPage(); let calls = 0;
+  page.context.fetch = async () => { calls++; return response(taskPage(51, 50)); };
+  await page.context.refresh();
+  assert.equal(calls, 1);
+  assert.equal(page.node('tasks-page').textContent, '51–51 / 51');
+  assert.equal(vm.runInContext('taskOffset', page.context), 50);
+  vm.runInContext('taskOffset=100;renderTasks()', page.context);
+  assert.equal(page.node('tasks-page').textContent, '', 'old page must not be relabeled with the requested offset');
+  vm.runInContext('state={...state,tasks:[],pagination:{total:50,offset:100,limit:50,has_more:false}};renderTasks()', page.context);
+  assert.equal(page.node('tasks-page').textContent, '', 'invalid ranges are never clamped into a fictitious loaded page');
+});
+
+for (const navigation of ['project', 'group', 'system']) {
+  for (const stage of ['initial', 'correction']) {
+    test(`pagination correction respects ${navigation} navigation during ${stage}`, async () => {
+      const page = paginationPage(), requests = []; let release, oldSignal;
+      page.context.fetch = async (url, {signal}) => {
+        const params = new URLSearchParams(url.split('?')[1]); requests.push(params);
+        if (requests.length === (stage === 'initial' ? 1 : 2)) {
+          oldSignal = signal;
+          // A response may complete even after its transport was aborted.
+          return new Promise(resolve => { release = () => resolve(response(taskPage(50, Number(params.get('offset'))))); });
+        }
+        return response(taskPage(50, Number(params.get('offset')), {
+          project: params.get('project'), filter: params.get('filter'), system: params.get('system') === 'true'
+        }));
+      };
+      const pending = page.context.refresh(); await new Promise(setImmediate);
+      assert.equal(typeof release, 'function');
+      if (navigation === 'project') vm.runInContext('projectId="b";taskOffset=0', page.context);
+      if (navigation === 'group') vm.runInContext('$("task-filter").value="attention";taskOffset=0', page.context);
+      if (navigation === 'system') vm.runInContext('$("show-system-tasks").checked=true;taskOffset=0', page.context);
+      const navigated = page.context.refresh();
+      assert.equal(oldSignal.aborted, true);
+      release(); await Promise.all([pending, navigated]);
+      assert.equal(requests.length, stage === 'initial' ? 2 : 3);
+      const last = requests.at(-1);
+      assert.equal(last.get('project'), navigation === 'project' ? 'b' : 'a');
+      assert.equal(last.get('filter'), navigation === 'group' ? 'attention' : 'active');
+      assert.equal(last.get('system'), String(navigation === 'system'));
+      assert.equal(last.get('offset'), '0');
+      assert.equal(page.node('tasks-page').textContent, '1–50 / 50');
+      assert.equal(vm.runInContext('state.selected_project', page.context), last.get('project'));
+    });
+  }
+}
+
+test('same-scope refreshes share the corrective GET and an aborted correction releases queued navigation', async () => {
+  const page = paginationPage(), requests = []; let correctingSignal;
+  page.context.fetch = async (url, {signal}) => {
+    const params = new URLSearchParams(url.split('?')[1]); requests.push(params);
+    if (requests.length === 1) return response(taskPage(50, 50));
+    if (requests.length === 2) {
+      correctingSignal = signal;
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true}));
+    }
+    return response(taskPage(1, 0, {project: 'b'}));
+  };
+  const pending = page.context.refresh(); await new Promise(setImmediate);
+  const duplicate = page.context.refresh(); await new Promise(setImmediate);
+  assert.equal(requests.length, 2, 'same scope must not start another correction');
+  vm.runInContext('projectId="b";taskOffset=0', page.context);
+  const navigated = page.context.refresh();
+  await Promise.all([pending, duplicate, navigated]);
+  assert.equal(correctingSignal.aborted, true);
+  assert.equal(requests.length, 3);
+  assert.equal(page.node('tasks-page').textContent, '1–1 / 1');
+  assert.equal(vm.runInContext('state.selected_project', page.context), 'b');
+});
+
+test('a changed group cannot trigger a correction even before a replacement refresh starts', async () => {
+  const page = paginationPage(); let release, calls = 0;
+  page.context.fetch = () => { calls++; return new Promise(resolve => { release = () => resolve(response(taskPage(50, 50))); }); };
+  const pending = page.context.refresh(); await new Promise(setImmediate);
+  page.node('task-filter').value = 'attention';
+  release(); await pending;
+  assert.equal(calls, 1);
+  assert.equal(vm.runInContext('taskOffset', page.context), 50);
+  assert.equal(vm.runInContext('state.pagination', page.context), undefined);
+});
+
+test('a corrective response with the old offset is discarded without looping or relabeling data', async () => {
+  const page = paginationPage(); let calls = 0;
+  page.context.fetch = async () => { calls++; return response(taskPage(50, 50)); };
+  await page.context.refresh();
+  assert.equal(calls, 2);
+  assert.equal(vm.runInContext('taskOffset', page.context), 50);
+  assert.equal(vm.runInContext('state.pagination', page.context), undefined);
+});
+
+test('a timed-out pagination correction cannot apply a late success or start another correction', async () => {
+  const page = paginationPage(); let release, calls = 0, signal;
+  page.context.fetch = async (_url, options) => {
+    calls++; signal = options.signal;
+    if (calls === 1) return response(taskPage(50, 50));
+    return new Promise(resolve => { release = () => resolve(response(taskPage(50, 0))); });
+  };
+  const pending = page.context.refresh(); await new Promise(setImmediate);
+  page.fireTimer(15000); assert.equal(signal.aborted, true);
+  release(); await pending;
+  assert.equal(calls, 2);
+  assert.equal(vm.runInContext('taskOffset', page.context), 50);
+  assert.equal(vm.runInContext('state.pagination', page.context), undefined);
+});
+
+test('a failed corrective GET leaves the loaded state intact and releases refresh ownership', async () => {
+  const page = paginationPage(); let calls = 0;
+  page.context.fetch = async () => {
+    if (++calls === 1) return response(taskPage(50, 50));
+    throw new Error('offline');
+  };
+  await assert.rejects(page.context.refresh(), /无法连接本地服务/);
+  assert.equal(calls, 2);
+  assert.equal(vm.runInContext('taskOffset', page.context), 50);
+  assert.equal(vm.runInContext('state.pagination', page.context), undefined);
+  assert.equal(vm.runInContext('refreshPromise', page.context), null);
+});
+
 test('a slow refresh merges same-scope manual and periodic requests into one GET', async () => {
   const page=browser();let finish,calls=0;
   page.context.fetch=(url,{signal}={})=>{
@@ -724,6 +886,59 @@ async function openExperienceTask(page, task) {
   await page.context.showTask(task);
   await page.context.lastAction;
   return page.node('detail-body').children.find(node => node.className === 'task-controls');
+}
+
+test('runless detail polling updates cancellation controls and preserves supplement drafts', async () => {
+  const page = experiencePage(), task = fixtureTask('runless', 'queued');
+  let metadata = task, reads = 0;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    reads++; return response(metadata);
+  };
+  const controls = await openExperienceTask(page, task);
+  const supplement = controls.children.find(node => node.tagName === 'FORM').children[0].children[0];
+  supplement.value = 'Keep this unfinished supplement'; supplement.handlers.input();
+  const before = page.node('detail-body').children.slice();
+  page.fireTimer(5000); await new Promise(setImmediate);
+  assert.deepEqual(page.node('detail-body').children, before, 'unchanged state retains the form nodes');
+  assert.equal(supplement.value, 'Keep this unfinished supplement');
+  const text = node => [node.textContent, ...(node.children || []).flatMap(text)];
+  assert.ok(text(page.node('detail-body')).includes('取消任务'));
+  metadata = {...task, state: 'cancelled'};
+  page.node('detail-dialog').scrollTop = 42;
+  page.fireTimer(5000); await new Promise(setImmediate);
+  assert.equal(vm.runInContext('detailTask.state', page.context), 'cancelled');
+  assert.ok(text(page.node('detail-body')).includes('基于当前输入重新检查'));
+  assert.equal(text(page.node('detail-body')).includes('取消任务'), false);
+  const updatedControls = page.node('detail-body').children.find(node => node.className === 'task-controls');
+  assert.equal(updatedControls.children.find(node => node.tagName === 'FORM').children[0].children[0].value, supplement.value);
+  assert.equal(page.node('detail-dialog').scrollTop, 42);
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 5000).length, 1, 'one live poll after rebuilding details');
+  assert.ok(reads >= 4);
+});
+
+for (const navigation of ['close', 'project', 'other-task']) {
+  test(`a runless detail poll cannot overwrite ${navigation} navigation`, async () => {
+    const page = experiencePage(), task = fixtureTask('runless', 'queued');
+    let polling = false, release;
+    page.context.fetch = async url => {
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: []});
+      if (polling && url.includes('id=runless&')) return new Promise(resolve => { release = () => resolve(response({...task, state: 'cancelled'})); });
+      return response(url.includes('id=other&') ? fixtureTask('other') : task);
+    };
+    await openExperienceTask(page, task);
+    polling = true; page.fireTimer(5000); await new Promise(setImmediate);
+    if (navigation === 'close') page.node('detail-dialog').close();
+    if (navigation === 'project') vm.runInContext('projectId="b"', page.context);
+    if (navigation === 'other-task') await openExperienceTask(page, fixtureTask('other'));
+    const before = page.node('detail-body').children.slice();
+    release(); await new Promise(setImmediate);
+    assert.deepEqual(page.node('detail-body').children, before);
+    assert.equal(page.node('detail-dialog').open, navigation !== 'close');
+    assert.equal(vm.runInContext('detailTask?.id', page.context), navigation === 'close' ? undefined : navigation === 'other-task' ? 'other' : 'runless');
+  });
 }
 
 for (const entry of ['notification', 'deep-link']) {

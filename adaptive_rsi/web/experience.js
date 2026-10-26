@@ -514,18 +514,30 @@ window.RSIExperience = (() => {
     liveBusy = true;
     const task = detailTask,
       ticket = detailSequence;
+    const current = () => ticket === detailSequence && projectId === task.project && $("detail-dialog").open;
     try {
       const metadata = await api(
-          "task?id=" + task.id + "&project=" + task.project,
-        ),
-        history = await api(
-          "task-runs?task=" + task.id + "&project=" + task.project,
-        );
-      if (ticket !== detailSequence) return;
+        "task?id=" + task.id + "&project=" + task.project,
+      );
+      if (!current()) return;
+      // Task state can change before any run exists. Keep forms intact on unchanged polls.
+      if (metadata.state !== task.state) {
+        const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
+        await showTask(metadata, restore);
+        if (detailSequence === ticket + 1 && projectId === task.project && $("detail-dialog").open) {
+          restore($("detail-body"));
+          $("detail-dialog").scrollTop = scroll;
+        }
+        return;
+      }
+      const history = await api(
+        "task-runs?task=" + task.id + "&project=" + task.project,
+      );
+      if (!current()) return;
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);
-        if (ticket !== detailSequence) return;
+        if (!current()) return;
         const signature = JSON.stringify([
           latest.id,
           data.state,
@@ -543,24 +555,19 @@ window.RSIExperience = (() => {
           enhanceOutcome(outcome, data);
           previous.replaceWith(outcome);
           await renderReleaseOutcome(outcome, data, task.project);
-          if (ticket !== detailSequence) return;
+          if (!current()) return;
           restore(outcome);
           $("detail-dialog").scrollTop = scroll;
           lastDetail = signature;
-        }
-        if (metadata.state !== task.state) {
-          detailTask = metadata;
-          const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
-          await showTask(metadata, restore);
-          restore($("detail-body"));
-          $("detail-dialog").scrollTop = scroll;
         }
       }
     } catch {
     } finally {
       liveBusy = false;
-      if (detailTask && $("detail-dialog").open)
+      if (detailTask && $("detail-dialog").open) {
+        clearTimeout(liveTimer);
         liveTimer = setTimeout(liveDetail, 5000);
+      }
     }
   }
   async function showDiff(run) {
