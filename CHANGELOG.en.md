@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.114
+
+<!-- adaptive-rsi-release:0.5.114;base:744220e7beba2eed0cecf32caa83deedf0c884ea -->
+
 - Manually retrying a task atomically invalidates undelivered candidate approvals and queued publication, preventing an old candidate from publishing after fresh verification fails. Existing PR receipts remain.
 - Stale PR replanning persists supersession and close intent before remote cleanup, allowing failed closes to reconcile. Old tracking cannot mark tasks closed after a new round begins.
 - Issue source text and local requirement supplements are stored separately and recomposed for task input on synchronization, preserving repeated supplements and recoverable legacy revisions so saved requirements reach planning.
