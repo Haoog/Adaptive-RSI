@@ -105,9 +105,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     """One production path for real tasks and paired experiments; experiments never deliver."""
     config = json.loads(run["config"])
     from .workflow import change_kind, evidence_contract, supports_test_first
-    def transition(state, result=None, terminal=False):
+    def transition(state, result=None, terminal=False, task_fields=None):
         if not experiment:
-            runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal)
+            runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal,
+                                     task_fields=task_fields)
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
     if not check["ready"]:
@@ -262,9 +263,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                        " AND (urgency>? OR (urgency=? AND priority>?)) LIMIT 1",
                                        (project["id"], task["id"], time.time(), task.get("urgency", 0), task.get("urgency", 0), rank))
             if higher:
-                transition("assessed", {"reason": "Value assessment saved; higher-priority work runs first"}, True)
-                runtime.store.execute("UPDATE tasks SET state='queued',attempts=max(0,attempts-1),available=0,updated=? WHERE id=?",
-                                      (time.time(), task["id"]))
+                transition("assessed", {"reason": "Value assessment saved; higher-priority work runs first"}, True,
+                           task_fields={"state": "queued", "attempts": max(0, task["attempts"] - 1), "available": 0})
                 return None
     if not checks:
         transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)

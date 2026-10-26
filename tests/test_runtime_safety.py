@@ -206,6 +206,52 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "interrupted")
         self.assertFalse(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='infrastructure_retry'", (run["id"],)))
 
+    def test_planning_yield_requeue_respects_pause_cancel_and_normal_yield(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        for stop in ["pause", "cancel", None]:
+            with self.subTest(stop=stop):
+                task = self.runtime.goal(self.project, "Assess before yielding " + str(stop))
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertEqual(run["task"], task)
+                higher = self.runtime.goal(self.project, "Higher priority work " + str(stop))
+                self.store.execute("UPDATE tasks SET urgency=1 WHERE id=?", (higher,))
+                transition = self.store.transition
+                yielded = []
+
+                def stop_before_yield(run_id, state, *args, **kwargs):
+                    if state == "assessed":
+                        yielded.append(run_id)
+                        if stop == "pause":
+                            self.runtime.pause(self.project, True)
+                            self.runtime.pause(self.project, False)
+                        elif stop == "cancel":
+                            self.runtime.cancel_task(task)
+                    return transition(run_id, state, *args, **kwargs)
+
+                with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                        patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                        patch.object(self.store, "transition", side_effect=stop_before_yield):
+                    self.runtime.process(run)
+                self.assertEqual(yielded, [run["id"]])
+                expected = "interrupted" if stop == "pause" else "cancelled" if stop == "cancel" else "assessed"
+                saved = self.store.one("SELECT state,ended FROM runs WHERE id=?", (run["id"],))
+                self.assertEqual(saved["state"], expected)
+                self.assertIsNotNone(saved["ended"])
+                self.assertEqual(self.store.one("SELECT state,attempts,available FROM tasks WHERE id=?", (task,)),
+                                 {"state": "queued" if stop is None else expected,
+                                  "attempts": 0 if stop is None else 1, "available": 0})
+                self.assertIsNone(self.store.setting("run-stop:" + run["id"]))
+                next_run = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertEqual(next_run["task"], higher)
+                self.store.transition(next_run["id"], "completed", {}, True)
+                fresh = self.store.claim(self.project, self.runtime.config(self.project))
+                if stop is None:
+                    self.assertEqual(fresh["task"], task)
+                    self.assertNotEqual(fresh["id"], run["id"])
+                    self.store.transition(fresh["id"], "completed", {}, True)
+                else:
+                    self.assertIsNone(fresh)
+
     def test_pause_stop_request_survives_runtime_reopen_and_recovery(self):
         task = self.runtime.goal(self.project, "Durable pause")
         run = self.store.claim(self.project, self.runtime.config(self.project))
