@@ -917,8 +917,8 @@ test('ambiguous goals retain separate IDs through failed edits, reload, and proj
   switchTo('a'); await submit('Goal A');
   assert.equal(posts[3].request_id, posts[0].request_id, 'A retry reuses its ID after failed B and reload');
   assert.equal(pending.entries.length, 2);
-  assert.ok(pending.entries.every(entry => /^[a-f0-9]{64}$/.test(entry.digest) && !('text' in entry)));
-  assert.ok(!JSON.stringify(pending).includes('Goal A'), 'pending records store digests instead of full goal text');
+  assert.ok(pending.entries.every(entry => /^[a-f0-9]{64}$/.test(entry.digest)));
+  assert.deepEqual(pending.entries.map(entry => entry.text), ['Goal A', 'Goal B'], 'pending text remains available for visible recovery');
   assert.equal([...tasks.keys()].filter(key => key.startsWith('a:')).length, 1, 'A is created exactly once');
   assert.deepEqual(JSON.parse(page.sessionData.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[1].request_id], 'A success removes only A');
   await submit('Goal B');
@@ -928,7 +928,7 @@ test('ambiguous goals retain separate IDs through failed edits, reload, and proj
   assert.notEqual(posts[5].request_id, posts[0].request_id, 'a new submission after acknowledgement gets a fresh ID');
 });
 
-test('legacy pending goals migrate without losing the old ID or retaining full text', async () => {
+test('legacy pending goals migrate without losing the old ID or recovery text', async () => {
   const session = new Map([['rsi-submission:a', JSON.stringify({text: 'Legacy goal', id: 'legacy-id'})]]);
   const page = browser(session), posts = [];
   page.context.refresh = async () => {};
@@ -938,15 +938,15 @@ test('legacy pending goals migrate without losing the old ID or retaining full t
   const saved = JSON.parse(session.get('rsi-submission:a'));
   assert.equal(saved.version, 2); assert.equal(saved.entries.length, 2);
   assert.equal(saved.entries[0].id, 'legacy-id');
-  assert.equal(saved.entries.some(entry => 'text' in entry), false);
+  assert.deepEqual(saved.entries.map(entry => entry.text), ['Legacy goal', 'Another goal']);
   page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
   page.node('goal-text').value = 'Legacy goal'; await page.submit('goal-form');
   assert.equal(posts[1].request_id, 'legacy-id');
   assert.deepEqual(JSON.parse(session.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[0].request_id]);
 });
 
-test('pending goal capacity blocks new content without evicting IDs and still allows recovery', async () => {
-  const page = browser(), posts = [];
+test('32 offline goals remain visibly recoverable after draft replacement and reload, freeing capacity on success', async () => {
+  let page = browser(); const posts = [];
   page.context.refresh = async () => {};
   page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
   for (let index = 0; index < 32; index++) {
@@ -954,15 +954,95 @@ test('pending goal capacity blocks new content without evicting IDs and still al
     await assert.rejects(page.submit('goal-form'));
   }
   const saved = page.sessionData.get('rsi-submission:a');
-  page.node('goal-text').value = 'Over capacity';
+  page.node('goal-text').value = 'Replacement draft'; page.input('goal-text', 'goal-form');
+  page = browser(page.sessionData); page.context.restoreGoalDraft();
+  assert.equal(page.node('goal-text').value, 'Replacement draft');
+  await page.context.renderGoalRecovery();
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  const select = panel.children[1].children[0], restore = panel.children[2];
+  assert.equal(select.children.length, 33, 'all 32 old texts are selectable without remembering them');
+  assert.equal(select.children[1].textContent, 'Pending 0');
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
   await assert.rejects(page.submit('goal-form'), /待确认的目标提交过多/);
   assert.equal(posts.length, 32); assert.equal(page.sessionData.get('rsi-submission:a'), saved);
-  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
-  page.node('goal-text').value = 'Pending 0'; await page.submit('goal-form');
-  assert.equal(posts[32].request_id, posts[0].request_id, 'an existing entry remains recoverable at capacity');
-  page.node('goal-text').value = 'Over capacity'; await page.submit('goal-form');
-  assert.equal(posts.length, 34, 'acknowledgement frees capacity');
+  select.value = select.children[1].value;
+  restore.handlers.click(); await page.context.lastAction;
+  assert.equal(posts.length, 32, 'restoring a goal requires an explicit submit to send it');
+  assert.equal(page.node('goal-text').value, 'Pending 0');
+  assert.equal(vm.runInContext('draftStore.get("goal","a")', page.context), 'Pending 0');
+  await page.submit('goal-form');
+  assert.equal(posts[32].request_id, posts[0].request_id, 'visible recovery uses the original ID at capacity');
+  const remaining = JSON.parse(page.sessionData.get('rsi-submission:a')).entries;
+  assert.deepEqual(remaining.map(entry => entry.id), posts.slice(1, 32).map(post => post.request_id), 'success removes only the recovered entry');
+  page.node('goal-text').value = 'New goal'; await page.submit('goal-form');
+  assert.equal(posts.length, 34, 'acknowledgement frees capacity for new content');
 });
+
+test('digest-only legacy records explain exact-text recovery and retain their IDs', async () => {
+  const digest = require('node:crypto').createHash('sha256').update(JSON.stringify('Original legacy goal')).digest('hex');
+  const session = new Map([['rsi-submission:a', JSON.stringify({version: 2, entries: [{digest, id: 'old-digest-id'}]})]]);
+  const page = browser(session), posts = [];
+  await page.context.renderGoalRecovery();
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  assert.ok(panel.children.some(node => node.textContent.includes('没有保留原文')));
+  assert.equal(JSON.parse(session.get('rsi-submission:a')).entries[0].id, 'old-digest-id');
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  page.node('goal-text').value = 'Original legacy goal';
+  await assert.rejects(page.submit('goal-form'));
+  assert.equal(posts[0].request_id, 'old-digest-id');
+  assert.equal(JSON.parse(session.get('rsi-submission:a')).entries[0].text, 'Original legacy goal');
+  const updated = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  assert.equal(updated.children[1].children[0].children[1].textContent, 'Original legacy goal');
+});
+
+test('pending goal restoration stays with its project and invalidates stale recovery controls', async () => {
+  const page = browser();
+  page.context.refresh = async () => {};
+  page.context.fetch = async () => {throw Error('offline');};
+  page.node('goal-text').value = 'A pending'; await assert.rejects(page.submit('goal-form'));
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  const select = panel.children[1].children[0], restore = panel.children[2];
+  select.value = select.children[1].value;
+  vm.runInContext('projectId="b"', page.context); page.node('goal-text').value = 'B draft';
+  await page.context.renderGoalRecovery();
+  assert.equal(panel.hidden, true);
+  restore.handlers.click(); await page.context.lastAction;
+  assert.equal(page.node('goal-text').value, 'B draft');
+  vm.runInContext('projectId="a"', page.context); await page.context.renderGoalRecovery();
+  assert.equal(panel.hidden, false);
+  assert.equal(panel.children[1].children[0].children[1].textContent, 'A pending');
+});
+
+const validPendingEntry = {digest: 'a'.repeat(64), id: 'valid-id'};
+for (const [name, saved] of [
+  ['invalid JSON', '{'], ['null record', 'null'], ['array record', '[]'],
+  ['invalid digest', JSON.stringify({version: 2, entries: [{...validPendingEntry, digest: 'bad'}]})],
+  ['empty ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: ''}]})],
+  ['oversized ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: 'x'.repeat(101)}]})],
+  ['nonstring ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: 1}]})],
+  ['duplicate ID', JSON.stringify({version: 2, entries: [validPendingEntry, {...validPendingEntry, digest: 'b'.repeat(64)}]})],
+  ['duplicate digest', JSON.stringify({version: 2, entries: [validPendingEntry, {...validPendingEntry, digest: 'A'.repeat(64), id: 'other'}]})],
+  ['text does not match digest', JSON.stringify({version: 2, entries: [{...validPendingEntry, text: 'Altered text'}]})],
+  ['oversized ledger', JSON.stringify({version: 2, entries: Array.from({length: 33}, (_, index) => ({digest: index.toString(16).padStart(64, '0'), id: 'id-' + index}))})],
+  ['invalid legacy ID', JSON.stringify({text: 'Original', id: ''})],
+]) {
+  test(`invalid pending goal ledger (${name}) preserves records and reports a local recovery error`, async () => {
+    const session = new Map([['rsi-submission:a', saved]]), page = browser(session); let posts = 0;
+    page.context.fetch = async () => {posts++; return response({id: 'unexpected'});};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.node('goal-text').value = 'Keep draft';
+    await page.submit('goal-form');
+    assert.equal(posts, 0); assert.equal(session.get('rsi-submission:a'), saved);
+    assert.equal(page.node('goal-text').value, 'Keep draft');
+    assert.match(page.node('toast').textContent, /无法读取目标提交记录/);
+    assert.doesNotMatch(page.node('toast').textContent, /JSON 格式有误/);
+    await page.context.renderGoalRecovery();
+    const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+    assert.match(panel.children[0].textContent, /无法读取目标提交记录/);
+  });
+}
 
 test('goals are never sent when their recovery IDs cannot be persisted', async () => {
   const page = browser(); let posts = 0;
