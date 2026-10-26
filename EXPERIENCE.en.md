@@ -52,7 +52,9 @@ Metrics also report average time to PR and merge with sample counts, repeated fa
 
 **Data and diagnostics** provides storage totals, consistent online SQLite backups, downloads and diagnostic previews. Backups contain private task content and configuration; keep them private. Diagnostic summaries include only version, counts, failure codes and storage size, excluding credentials, paths, code, task text and full prompts.
 
-Backups remain absent from the download list while being generated. They become downloadable only after copying, portability preparation and file closure, preventing incomplete snapshots from being exported as successful backups. Failures remove staging files without overwriting existing backups.
+Backups remain absent from the download list while being generated. They become downloadable only after copying, portability preparation and file closure, preventing incomplete snapshots from being exported as successful backups. Failures remove staging files without overwriting existing backups. The pending-approval count in **Data and diagnostics** includes only candidates that can still be approved; approved, delivering and cancelled candidates are excluded, and in-progress deliveries are reported separately.
+
+A failed restore removes only the state directory it newly created while empty, keeps the original error, and can be retried immediately. Existing directories, user data and symlink targets are never deleted.
 
 Restore into a new state directory:
 
@@ -62,4 +64,4 @@ adaptive-rsi --state-dir /NEW/STATE restore /PATH/BACKUP.sqlite3
 
 Existing state is never overwritten. Restored projects remain paused, active runs become interrupted, old candidate approvals expire, and queued deliveries are blocked for reconciliation. Imported runs stop using source-state artifact paths and local verification caches expire; known PR receipts and remote delivery records remain. Missing acceptance or dependency artifacts produce insufficient evidence during post-merge verification. Supply trusted artifacts inside the current state directory or verify again; evidence from another directory cannot be reused. Database backups exclude candidate workspaces and machine credentials. On another machine, reconnect credentials, verify project paths and remote delivery state before enabling projects.
 
-Candidate files expire under project retention settings and cannot be approved afterward. Retry expired tasks to verify the latest code again. Original summaries remain; cleanup does not imply successful delivery.
+Candidate files expire under project retention settings and cannot be approved afterward. Retry expired tasks to verify the latest code again. Original summaries remain; cleanup does not imply successful delivery. When restoring from a database backup, undelivered candidates are invalidated because candidate files are not in the backup; the interface states this restore reason instead of reporting retention cleanup.

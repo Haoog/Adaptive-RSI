@@ -318,7 +318,10 @@ window.RSIExperience = (() => {
         el(
           "p",
           t(
-            "候选文件已按保留策略清理。重试会基于最新代码重新检查，旧批准不能复用。",
+            data.result?.restore_invalidation?.reason ===
+              "candidate_not_in_backup"
+              ? "候选因从备份恢复而失效：数据库备份不包含候选文件，旧批准不能复用。请基于最新代码重新运行并重新批准。"
+              : "候选文件已按保留策略清理。重试会基于最新代码重新检查，旧批准不能复用。",
           ),
           "muted",
         ),
@@ -822,6 +825,26 @@ window.RSIExperience = (() => {
           t("待批准候选会在项目保留期限到达后清理；请及时交付或重新运行。") +
             " " +
             data.expiring.length,
+        ),
+      );
+    if (data.delivering?.length)
+      box.append(
+        el(
+          "p",
+          t("已批准候选正在交付，不再计入待批准；交付完成前保留审批记录。") +
+            " " +
+            data.delivering.length,
+          "muted",
+        ),
+      );
+    if (data.delivered?.length)
+      box.append(
+        el(
+          "p",
+          t("已交付候选保留在历史记录中，不再计入待批准。") +
+            " " +
+            data.delivered.length,
+          "muted",
         ),
       );
   }
