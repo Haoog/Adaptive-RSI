@@ -1624,7 +1624,7 @@ function modelScopePage(savedDrafts = new Map()) {
   page.context.api=async(path,body)=>{
     if(body){posts.push({path,body:structuredClone(body)});if(holdNext){holdNext=false;held=true;await new Promise(resolve=>{release=resolve;});held=false;}}
     if(path==='model-center/routes'){
-      overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>JSON.stringify(route)!==JSON.stringify(globals[role]))));
+      overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>!body.inherit?.includes(role)&&JSON.stringify(route)!==JSON.stringify(globals[role]))));
       return {saved:true,models:effective(body.project)};
     }
     if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};}
@@ -1664,6 +1664,34 @@ test('equal-valued project overrides can be reset, persisted across reload, and 
   assert.equal(restored.draft().planning.effort,'low');
 });
 
+for(const mode of ['reload','scope-round-trip','pending-save'])test(`reset follows defaults changed before acknowledgement after ${mode}`,async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');
+  const page=mode==='reload'?modelScopePage(original.savedDrafts):original;
+  if(mode==='pending-save'){
+    page.hold();const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+    page.globals.planning.effort='low';page.release();await saving;
+  }else{
+    page.globals.planning.effort='low';if(mode==='scope-round-trip')await page.show('b');
+    await page.show('a');assert.equal(page.draft().planning.effort,'low');
+    assert.equal(page.node('mc-save-routes').disabled,false);await page.click('mc-save-routes');
+  }
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/routes').body.inherit,['planning']);
+  assert.equal(page.overrides.get('a').planning,undefined);
+  assert.equal(page.draft().planning.effort,'low');assert.equal(page.node('mc-save-routes').disabled,true);
+  page.globals.planning.effort='high';await page.show('a');assert.equal(page.draft().planning.effort,'high');
+});
+
+for(const effort of ['high','low'])test(`reset preserves later ${effort} edit across changed defaults and persisted reload`,async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');original.edit(effort);
+  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,effort);
+  await page.show('b');await page.show('a');assert.equal(page.draft().planning.effort,effort);
+  await page.click('mc-save-routes');
+  assert.deepEqual(page.posts[0].body.inherit,[]);assert.equal(page.posts[0].body.models.planning.effort,effort);
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  assert.equal(page.overrides.get('a').planning?.effort,effort==='low'?undefined:effort);
+});
+
 for(const later of ['edit','reset','reset-then-edit'])test(`route acknowledgement retains later ${later} through a scope round trip`,async()=>{
   const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
   page.hold();const saving=page.click('mc-save-routes');await new Promise(setImmediate);
@@ -1694,8 +1722,29 @@ test('a failed route save preserves inheritance reset intent for retry',async()=
   const api=page.context.api;page.context.api=async(path,body)=>{if(path==='model-center/routes')throw new Error('Save failed');return api(path,body);};
   await page.click('mc-save-routes');
   assert.equal(page.node('mc-save-routes').disabled,false);assert.equal(page.savedDrafts.get('a').resetInheritance,true);
-  page.context.api=api;await page.click('mc-save-routes');
+  page.globals.planning.effort='low';await page.show('b');await page.show('a');
+  page.context.api=api;page.hold();const retry=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.globals.planning.effort='high';page.release();await retry;
+  assert.equal(page.draft().planning.effort,'high');
   assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.overrides.get('a').planning,undefined);
+});
+
+test('reset edits survive failed save, reload, and a changed default on retry',async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');original.edit('high');
+  const api=original.context.api;original.context.api=async(path,body)=>{if(path==='model-center/routes')throw new Error('Save failed');return api(path,body);};
+  await original.click('mc-save-routes');assert.equal(original.savedDrafts.get('a').resetInheritance,true);
+  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,'high');await page.click('mc-save-routes');
+  assert.deepEqual(page.posts[0].body.inherit,[]);assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.savedDrafts.has('a'),false);
+});
+
+test('legacy equal-valued reset drafts follow changed defaults',async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');
+  delete original.savedDrafts.get('a').resetModels;
+  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
+  await page.click('mc-save-routes');assert.equal(page.overrides.get('a').planning,undefined);
+  assert.equal(page.draft().planning.effort,'low');
 });
 
 test('undo clears equal-valued inheritance reset intent',async()=>{

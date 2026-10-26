@@ -34,11 +34,22 @@ window.RSIModelCenter = (() => {
   const scopeKey = () => scope || 'global';
   const safeRoute = route => ({provider:route.provider,model:route.model,effort:route.effort||'default',fallback:route.fallback?{provider:route.fallback.provider,model:route.fallback.model,effort:route.fallback.effort||'default'}:null});
   const safeRoutes = routes => Object.fromEntries(Object.entries(routes||{}).map(([role,route])=>[role,safeRoute(route)]));
+  function routeDraft(baseline,routes,key){
+    return {baseline:safeRoutes(baseline),routes:safeRoutes(routes),resetInheritance:inheritanceResets.has(key),resetModels:inheritanceResets.get(key)?.models};
+  }
   function persistRouteDraft(){
-    if(!data||!routes())return;const key=scopeKey(),current=safeRoutes(data.models),draft=safeRoutes(routes());
-    const resetInheritance=inheritanceResets.has(key);
-    if(!resetInheritance&&JSON.stringify(current)===JSON.stringify(draft))window.RSIDraftStore?.remove('routes',key);
-    else window.RSIDraftStore?.set('routes',key,{baseline:current,routes:draft,resetInheritance});
+    if(!data||!routes())return;const key=scopeKey(),draft=routeDraft(data.models,routes(),key);
+    if(!draft.resetInheritance&&JSON.stringify(draft.baseline)===JSON.stringify(draft.routes))window.RSIDraftStore?.remove('routes',key);
+    else window.RSIDraftStore?.set('routes',key,draft);
+  }
+  function inheritedRoles(models,reset){
+    return reset?Object.keys(models).filter(role=>JSON.stringify(safeRoute(models[role]))===JSON.stringify(reset.models[role])):[];
+  }
+  function rebaseReset(models,reset){
+    for(const role of inheritedRoles(models,reset)){
+      models[role]=structuredClone(data.global_models[role]);
+      reset.models[role]=safeRoute(data.global_models[role]);
+    }
   }
   const selected = () => data?.providers.find(p=>p.id===active);
   const routes = () => drafts.get(scopeKey());
@@ -75,10 +86,15 @@ window.RSIModelCenter = (() => {
     if((typeof reset==='function'?reset():reset)||!draft){
       const saved=window.RSIDraftStore?.get('routes',key),restored=structuredClone(data.models);
       if(saved?.baseline&&saved?.routes){
-        if(scope&&saved.resetInheritance)inheritanceResets.set(key,{});
-        for(const role of Object.keys(data.models)){const old=saved.baseline[role],incoming=safeRoute(data.models[role]),candidate=saved.routes[role];if(candidate&&JSON.stringify(old)===JSON.stringify(incoming))restored[role]={...data.models[role],...candidate};else if(candidate&&JSON.stringify(candidate)!==JSON.stringify(incoming))conflicts=true;}
+        if(scope&&saved.resetInheritance){
+          const reset={models:saved.resetModels||saved.baseline};inheritanceResets.set(key,reset);
+          for(const role of Object.keys(data.models))if(saved.routes[role])restored[role]={...data.models[role],...saved.routes[role]};
+          rebaseReset(restored,reset);
+        }else for(const role of Object.keys(data.models)){const old=saved.baseline[role],incoming=safeRoute(data.models[role]),candidate=saved.routes[role];if(candidate&&JSON.stringify(old)===JSON.stringify(incoming))restored[role]={...data.models[role],...candidate};else if(candidate&&JSON.stringify(candidate)!==JSON.stringify(incoming))conflicts=true;}
         drafts.set(key,restored);
       }else drafts.set(key,restored);
+    }else if(inheritanceResets.has(key)){
+      if(!savingRoutes.has(key))rebaseReset(draft,inheritanceResets.get(key));
     }else if(previous)for(const role of Object.keys(data.models)){
       if(savingRoutes.has(key))continue;
       // 仅在服务端基线未变化时保留本地分工草稿。
@@ -361,18 +377,19 @@ window.RSIModelCenter = (() => {
       const project=scope,key=scopeKey();if(savingRoutes.has(key))return;
       const models=structuredClone(routes()),submittedReset=inheritanceResets.get(key);savingRoutes.add(key);updateDirty();setStatus(t('正在保存模型分工…'));
       try{
-        const result=await api('model-center/routes',{project,models}),saved=result.models||models,current=drafts.get(key);
+        const inherit=inheritedRoles(models,submittedReset);
+        const result=await api('model-center/routes',{project,models,...(submittedReset?{inherit}:{})}),saved=result.models||models,current=drafts.get(key);
         const sameReset=inheritanceResets.get(key)===submittedReset;
         if(current&&sameReset)for(const role of Object.keys(saved))if(JSON.stringify(safeRoute(current[role]))===JSON.stringify(safeRoute(models[role])))current[role]=structuredClone(saved[role]);
         if(sameReset)inheritanceResets.delete(key);
         baselines.set(key,structuredClone(saved));
         if(data?.project===project)data.models=structuredClone(saved);
-        if(current){const baseline=safeRoutes(saved),draft=safeRoutes(current),resetInheritance=inheritanceResets.has(key);if(!resetInheritance&&JSON.stringify(baseline)===JSON.stringify(draft))window.RSIDraftStore?.remove('routes',key);else window.RSIDraftStore?.set('routes',key,{baseline,routes:draft,resetInheritance});}
+        if(current){const draft=routeDraft(saved,current,key);if(!draft.resetInheritance&&JSON.stringify(draft.baseline)===JSON.stringify(draft.routes))window.RSIDraftStore?.remove('routes',key);else window.RSIDraftStore?.set('routes',key,draft);}
         if(scope===project){await load();await refresh();if(scope===project)setStatus(t(modified()?'已保存提交的配置，后续修改仍未保存。':'模型分工已保存，从下一轮任务生效。'));}
       }catch(error){if(scope===project)setStatus(message(error),true);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
       finally{savingRoutes.delete(key);if(scope===project)updateDirty();}
     }));
-    $('mc-reset-inheritance').addEventListener('click',()=>{if(!scope)return;inheritanceResets.set(scopeKey(),{});drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
+    $('mc-reset-inheritance').addEventListener('click',()=>{if(!scope)return;inheritanceResets.set(scopeKey(),{models:safeRoutes(data.global_models)});drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
     $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
     $('mc-probe-dialog').addEventListener('close',()=>{if(!$('mc-probe-dialog').open)probeSession=null;});
     $('mc-probe-start').addEventListener('click',()=>safe(async()=>{

@@ -551,6 +551,73 @@ class ModelCenterTest(unittest.TestCase):
             self.center.save_routes(changed)
             self.assertEqual(self.runtime.config(project)["models"], changed)
 
+    def test_route_reset_resolves_current_defaults_and_keeps_edits_and_sealed_run(self):
+        self.runtime.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                                   ("p", "Fixture", str(self.root / "workspace"), "{}", 1, time.time()))
+        self.runtime.configure({"models": {"planning": {"effort": "medium"}}})
+        self.runtime.configure({"models": {"planning": {"effort": "medium"}}, "schedule": {"weight": 2}}, "p")
+        stale = copy.deepcopy(self.runtime.config("p")["models"])
+        sealed = encode(self.runtime.config("p"))
+        task = self.runtime.store.add_task("p", "manual", "Fixture", "Fixture")
+        self.runtime.store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                                   ("sealed", task, "p", "planning", sealed, time.time()))
+        stale["review"]["effort"] = "medium"
+        self.runtime.configure({"models": {"planning": {"effort": "low"}}})
+        inherit = [role for role in stale if role != "review"]
+        original = self.center._save_routes
+        def locked_save(*args):
+            self.assertTrue(self.runtime.dispatch_lock._is_owned())
+            return original(*args)
+        with patch.object(self.center, "_save_routes", side_effect=locked_save):
+            saved = self.center.save_routes(stale, "p", inherit)
+        override = json.loads(self.runtime.project("p")["config"])
+        self.assertEqual(saved["models"]["planning"]["effort"], "low")
+        self.assertEqual(set(override["models"]), {"review"})
+        self.assertEqual(override["models"]["review"]["effort"], "medium")
+        self.assertEqual(override["schedule"]["weight"], 2)
+        self.assertEqual(self.runtime.store.one("SELECT config FROM runs WHERE id='sealed'")["config"], sealed)
+        self.runtime.configure({"models": {"planning": {"effort": "high"}}})
+        self.assertEqual(self.runtime.config("p")["models"]["planning"]["effort"], "high")
+        # 旧客户端不传 inherit 时仍按完整 routes 保存。
+        self.center.save_routes(stale, "p")
+        self.assertEqual(self.runtime.config("p")["models"]["planning"]["effort"], "medium")
+
+    def test_routes_api_rejects_malformed_inherit_and_accepts_atomic_reset(self):
+        self.runtime.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                                   ("p", "Fixture", str(self.root / "workspace"), "{}", 1, time.time()))
+        self.runtime.configure({"models": {"planning": {"effort": "medium"}}}, "p")
+        routes = copy.deepcopy(self.runtime.config("p")["models"])
+        before = self.runtime.project("p")["config"]
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                   "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+        def post(body):
+            return urllib.request.urlopen(urllib.request.Request(
+                server.origin + "/api/model-center/routes", json.dumps(body).encode(), headers))
+        try:
+            for invalid in [None, False, "planning", {}, ["unknown"], [None], [["planning"]]]:
+                with self.subTest(inherit=invalid), self.assertRaises(urllib.error.HTTPError) as error:
+                    post({"project": "p", "models": routes, "inherit": invalid})
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
+                self.assertEqual(self.runtime.project("p")["config"], before)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                post({"models": routes, "inherit": []})
+            self.assertEqual(error.exception.code, 400)
+            error.exception.close()
+            self.runtime.configure({"models": {"planning": {"effort": "low"}}})
+            with post({"project": "p", "models": routes, "inherit": list(routes)}) as response:
+                self.assertEqual(json.load(response)["models"]["planning"]["effort"], "low")
+            self.assertNotIn("models", json.loads(self.runtime.project("p")["config"]))
+            with post({"project": "p", "models": routes}) as response:
+                self.assertEqual(json.load(response)["models"]["planning"]["effort"], "medium")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_credential_rotation_invalidates_directory_and_proof(self):
         with DirectoryServer() as fixture:
             self.save(fixture)

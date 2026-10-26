@@ -20,6 +20,7 @@ from .provider_health import ProviderHealth, error_code
 NON_AGENT = {"embedding", "embeddings", "image", "audio", "rerank"}
 CREDENTIAL_MODES = {"keychain", "session", "file"}
 MAX_RETIRED_REFERENCES = 4096
+_UNSET_INHERIT = object()
 
 
 class CenterError(RuntimeError):
@@ -329,9 +330,20 @@ class ModelCenter:
         self.store.event("provider_resumed", "Provider resumed by user", project, data={"provider": provider_id})
         return {"saved": True, "resumed_tasks": self.runtime.resume_provider_tasks(provider_id, project)}
 
-    def save_routes(self, routes, project=None):
-        if not isinstance(routes, dict) or set(routes) != set(self.runtime.config()["models"]):
+    def save_routes(self, routes, project=None, inherit=_UNSET_INHERIT):
+        with self.runtime.dispatch_lock:
+            return self._save_routes(routes, project, inherit)
+
+    def _save_routes(self, routes, project, inherit):
+        global_models = self.runtime.config()["models"]
+        if not isinstance(routes, dict) or set(routes) != set(global_models):
             raise CenterError("invalid_routes")
+        if inherit is not _UNSET_INHERIT:
+            if (not project or not isinstance(inherit, list)
+                    or any(not isinstance(role, str) or role not in global_models for role in inherit)):
+                raise CenterError("invalid_routes")
+            # 在同一配置锁内解析继承意图，旧草稿值不能成为项目覆盖。
+            routes = {**routes, **{role: copy.deepcopy(global_models[role]) for role in inherit}}
         config = self.runtime.config(project)
         validate(merge(config, {"models": routes}))
         if project:

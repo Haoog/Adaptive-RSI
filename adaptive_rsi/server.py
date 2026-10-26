@@ -658,7 +658,8 @@ class Handler(BaseHTTPRequestHandler):
                         elif path == "/api/model-center/model":
                             result = center.edit_model(body.get("provider"), body.get("model"), project)
                         elif path == "/api/model-center/routes":
-                            result = center.save_routes(body.get("models"), project)
+                            result = center.save_routes(body.get("models"), project,
+                                                        **({"inherit": body["inherit"]} if "inherit" in body else {}))
                         elif path == "/api/model-center/resume":
                             result = center.resume_provider(body.get("provider"), project)
                         else:
