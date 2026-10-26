@@ -89,6 +89,7 @@ const english = {
   "连接与环境故障": "Connection and environment failures",
   "通知已启用": "Notifications enabled",
   "通知未获授权，仍可在待办中处理。": "Notifications were not permitted. Tasks remain in the attention inbox.",
+  "系统通知暂时无法显示，任务仍在待办列表中。": "System notifications could not be displayed. Tasks remain in the attention inbox.",
   "阅读代码差异": "Read code diff",
   "队列位置": "Queue position",
   "阶段复用": "Reused stages",

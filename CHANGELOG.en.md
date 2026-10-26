@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- System notifications now share one deduplication record across browser tabs: a state change alerted by one tab is no longer alerted again by the others, while the existing restore-after-reload semantics are preserved.
+- A single failing system notification no longer swallows the rest of its batch: the failed item retries on the next poll with at most one hint per failure streak; when the constructor is unavailable (such as an iOS Home Screen app) the interface says so explicitly and resumes after recovery instead of failing silently forever.
+- Notification deduplication entries are touched on each observation before trimming, so active attention items are no longer evicted unchanged past the 5000-entry bound and re-alerted; storage stays bounded.
 - Failed saves of delivery authorization settings no longer show only a generic error: the seven server-side validation messages about delivery mode, workflow path, fixed tag, commit SHA, health URL and automatic rollback now come with actionable localized guidance in Chinese, with matching English translations.
 - The full commit SHA inputs for release/deploy tags now validate exactly like the server (40 lowercase hex characters). Uppercase input is blocked before saving with an explanation and is never silently rewritten; the post-deploy health URL must be HTTPS without credentials, query or fragment already in the browser.
 - When listing release/deploy workflows fails, the dropdown no longer stays on "Loading workflows…": it shows an error item and retries through the existing refresh button; a successful reload clears the stale failure message.
