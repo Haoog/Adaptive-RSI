@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.112
+
+<!-- adaptive-rsi-release:0.5.112;base:e4eaead279ee7cd823883168a7777c891a7613f1 -->
+
 - The built-in updater recognizes exhausted GitHub anonymous API primary quotas, shows the retry time, and blocks checks and installation requests until reset. It retains installation consent for the original version without spending ordinary installation retries, then becomes eligible to retry at the deadline.
 - SQLite backups become visible atomically only after copying, portability preparation and file closure. Incomplete files are neither listed nor successfully downloaded as empty backups; failures remove staging files and retain existing backups. Storage totals tolerate disappearing temporary files, preventing data and diagnostics refresh failures.
 - New tasks reread saved configuration, working hours and scheduling parameters under the claim lock, preventing stale settings after a completed save. Active runs retain their sealed settings.
