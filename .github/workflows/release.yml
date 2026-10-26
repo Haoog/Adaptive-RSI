@@ -156,7 +156,7 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
-      - run: python3 -m unittest discover -v
+      - run: python3 scripts/test_parallel.py
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
       - run: node --test tests/web_requests.cjs

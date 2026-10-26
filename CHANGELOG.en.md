@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Reject retries and requirement supplements until a cancelled active run stops, preventing old workers from resuming or overwriting new queued work; show an actionable wait message.
+- Atomically invalidate undelivered candidates and queued approvals when requirements change, and recheck candidate validity before publishing. Existing PRs and merge records remain available.
+- Periodic inspections preserve quota-backoff deadlines instead of requeuing model calls early.
+- Prevent background reconciliation from overwriting manual workflow retry state and causing duplicate rerun requests. Recover existing verified PRs before treating an advanced baseline as a stale unpublished candidate.
+- Settings and model-route acknowledgments use the server-confirmed baseline while retaining edits made during saving and project round trips. Block overlapping route saves within the same scope.
+- Preserve prerequisites absent from the current option page when changing urgency. Delayed retry/supplement responses no longer reopen dismissed task details or jump across projects.
+- Formal releases run the complete Python suite in parallel groups while retaining platform coverage, failure gates and final installation/upgrade verification.
+
 ## 0.5.107
 
 <!-- adaptive-rsi-release:0.5.107;base:bc434853392eb827d64942e7b787804d495cc0cd -->

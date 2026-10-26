@@ -27,7 +27,7 @@ window.RSIModelCenter = (() => {
     unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_routes:'角色配置不完整，请重新选择。'
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
-  const drafts = new Map(), baselines = new Map(), jobs = new Set();
+  const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set();
   let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, picking=null, busy=false, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null;
   const pageSize=20;
@@ -78,6 +78,7 @@ window.RSIModelCenter = (() => {
         drafts.set(key,restored);
       }else drafts.set(key,restored);
     }else if(previous)for(const role of Object.keys(data.models)){
+      if(savingRoutes.has(key))continue;
       // 仅在服务端基线未变化时保留本地分工草稿。
       const unchanged=JSON.stringify(draft[role])===JSON.stringify(previous[role]);
       if(unchanged)draft[role]=structuredClone(data.models[role]);
@@ -215,7 +216,7 @@ window.RSIModelCenter = (() => {
     updateDirty();
     persistRouteDraft();
   }
-  function updateDirty(){$('mc-dirty').textContent=modified()?t('模型分工有未保存的修改'):t('模型分工已保存');$('mc-save-routes').disabled=!modified();$('mc-undo').disabled=!modified();}
+  function updateDirty(){const saving=savingRoutes.has(scopeKey());$('mc-dirty').textContent=t(saving?'正在保存模型分工…':modified()?'模型分工有未保存的修改':'模型分工已保存');$('mc-save-routes').disabled=saving||!modified();$('mc-undo').disabled=!modified();}
   function openPicker(role){
     picking=role;pickerPage=0;renderPickerProviders();$('mc-picker-title').textContent=t(roleNames[role])+' · '+t('选择模型');$('mc-picker-search').value='';renderPicker();$('mc-picker-dialog').showModal();$('mc-picker-search').focus();
   }
@@ -347,7 +348,19 @@ window.RSIModelCenter = (() => {
       catch(error){if(unchanged()&&scope===project)$('mc-custom-error').textContent=message(error);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
       finally{button.disabled=false;}
     },event.target);});
-    $('mc-save-routes').addEventListener('click',()=>safe(async()=>{const project=scope,models=structuredClone(routes()),unchanged=()=>JSON.stringify(routes())===JSON.stringify(models);$('mc-save-routes').disabled=true;setStatus(t('正在保存模型分工…'));try{await api('model-center/routes',{project,models});if(scope===project){await load({reset:unchanged});await refresh();setStatus(t(unchanged()?'模型分工已保存，从下一轮任务生效。':'已保存提交的配置，后续修改仍未保存。'));}}catch(error){setStatus(message(error),true);updateDirty();}}));
+    $('mc-save-routes').addEventListener('click',()=>safe(async()=>{
+      const project=scope,key=scopeKey();if(savingRoutes.has(key))return;
+      const models=structuredClone(routes());savingRoutes.add(key);updateDirty();setStatus(t('正在保存模型分工…'));
+      try{
+        const result=await api('model-center/routes',{project,models}),saved=result.models||models,current=drafts.get(key);
+        if(current)for(const role of Object.keys(saved))if(JSON.stringify(safeRoute(current[role]))===JSON.stringify(safeRoute(models[role])))current[role]=structuredClone(saved[role]);
+        baselines.set(key,structuredClone(saved));
+        if(data?.project===project)data.models=structuredClone(saved);
+        if(current){const baseline=safeRoutes(saved),draft=safeRoutes(current);if(JSON.stringify(baseline)===JSON.stringify(draft))window.RSIDraftStore?.remove('routes',key);else window.RSIDraftStore?.set('routes',key,{baseline,routes:draft});}
+        if(scope===project){await load();await refresh();if(scope===project)setStatus(t(modified()?'已保存提交的配置，后续修改仍未保存。':'模型分工已保存，从下一轮任务生效。'));}
+      }catch(error){if(scope===project)setStatus(message(error),true);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
+      finally{savingRoutes.delete(key);if(scope===project)updateDirty();}
+    }));
     $('mc-reset-inheritance').addEventListener('click',()=>{drafts.set(scopeKey(),structuredClone(data.global_models));renderRoles();setStatus(t('已选择跟随通用设置，保存后生效。'));});
     $('mc-advanced-form').addEventListener('submit',event=>{event.preventDefault();try{const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value;const fallback=provider?{provider,model,effort:$('mc-fallback-effort').querySelector('select').value}:null,route=routes()[$('mc-advanced-dialog').dataset.role];if(provider&&!model)throw Error(t('请先获取并启用备用模型。'));if(fallback&&provider===route.provider&&model===route.model)throw Error(t('备用模型应与主模型不同。'));route.fallback=fallback;route.effort=$('mc-advanced-effort').querySelector('select').value;$('mc-advanced-dialog').close();renderRoles();}catch(error){$('mc-advanced-error').textContent=error.message;}});
     $('mc-probe-start').addEventListener('click',()=>safe(async()=>{

@@ -1,5 +1,6 @@
 """Regression checks for isolation, revoked delivery and bounded background work."""
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -50,6 +51,139 @@ class RuntimeSafetyTest(unittest.TestCase):
         git(workspace, "add", ".")
         return (self.runtime.project(self.project), self.store.one("SELECT * FROM tasks WHERE id=?", (task,)),
                 self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],)), workspace, job)
+
+    def test_cancelled_unfinished_run_blocks_retry_and_revision_until_it_stops(self):
+        for operation in ["retry", "revise"]:
+            with self.subTest(operation=operation):
+                task = self.runtime.goal(self.project, "Original requirements " + operation)
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                self.runtime.cancel_task(task)
+                before = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+                with self.assertRaisesRegex(ValueError, "Wait for the active run to finish stopping"):
+                    if operation == "retry":
+                        self.runtime.retry(task)
+                    else:
+                        self.runtime.revise_task(task, "Mandatory new criterion")
+                self.assertEqual(self.store.one("SELECT * FROM tasks WHERE id=?", (task,)), before)
+                self.assertTrue(self.runtime.is_cancelled(run))
+                self.assertFalse(self.store.query("SELECT * FROM task_revisions WHERE task=?", (task,)))
+                self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+                self.store.transition(run["id"], "interrupted", {"reason": "Worker stopped"}, True)
+                if operation == "retry":
+                    self.runtime.retry(task)
+                else:
+                    self.runtime.revise_task(task, "Mandatory new criterion")
+                fresh = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertNotEqual(fresh["id"], run["id"])
+                body = self.store.one("SELECT body FROM tasks WHERE id=?", (task,))["body"]
+                self.assertEqual("Mandatory new criterion" in body, operation == "revise")
+                self.store.transition(fresh["id"], "completed", {}, True)
+
+    def test_revision_supersedes_pending_candidates_and_only_cancels_queued_publish_jobs(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        pending = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(pending["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        queued = self.runtime.deliver(pending["id"])
+        for state in ["pr_open", "merged"]:
+            self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) "
+                               "VALUES (?,?,?,?,?,1,2,?)",
+                               (state, task, self.project, state, pending["config"], encode({"pr": state})))
+            self.store.add_task(self.project, "system_publish", "publish:" + state,
+                                "Previously delivered", body=state)
+        self.runtime.cancel_task(task)
+        self.runtime.revise_task(task, "New acceptance criterion")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (pending["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (queued,))["state"], "cancelled")
+        for state in ["pr_open", "merged"]:
+            self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (state,))["state"], state)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE body=? AND source='system_publish'", (state,))["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
+        with self.assertRaisesRegex(ValueError, "awaiting approval"):
+            self.runtime.deliver(pending["id"])
+
+    def test_revision_invalidation_rolls_back_with_requirement_update(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        queued = self.runtime.deliver(run["id"])
+        self.runtime.cancel_task(task)
+        self.store.execute("CREATE TRIGGER reject_revision BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected requirement write failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Injected requirement write failure"):
+                self.runtime.revise_task(task, "New acceptance criterion")
+        finally:
+            self.store.execute("DROP TRIGGER reject_revision")
+        self.assertEqual(self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "cancelled", "body": "Original requirements"})
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (queued,))["state"], "queued")
+        self.assertFalse(self.store.query("SELECT * FROM task_revisions WHERE task=?", (task,)))
+
+    def test_claimed_publish_job_rejects_superseded_candidate_before_loading_files(self):
+        _, task, original, _, job = self.candidate()
+        self.runtime.cancel_task(task["id"])
+        self.runtime.revise_task(task["id"], "New acceptance criterion")
+        with patch("adaptive_rsi.runtime.changes") as load, patch.object(self.runtime, "publish") as remote:
+            self.runtime.process(job)
+        load.assert_not_called()
+        remote.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "interrupted")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"], "queued")
+
+    def test_revision_during_publish_fetch_blocks_old_candidate_without_rewriting_source(self):
+        _, task, original, workspace, job = self.candidate()
+        outcome = json.loads(original["result"])
+        outcome["patch_hash"] = fingerprint(git(workspace, "diff", original["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
+                           (str(workspace.parent), encode(outcome), original["id"]))
+
+        def revise_during_fetch(*args):
+            self.runtime.cancel_task(task["id"])
+            self.runtime.revise_task(task["id"], "Mandatory: reject negative inputs")
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (job["task"],))["state"], "planning")
+            return str(self.repo), original["base"], "main"
+
+        with patch("adaptive_rsi.delivery.baseline", side_effect=revise_during_fetch) as fetch, \
+                patch("adaptive_rsi.delivery.checked", return_value="[]") as command, \
+                patch("adaptive_rsi.delivery.github_git") as push:
+            self.runtime.process(job)
+        fetch.assert_called_once()
+        push.assert_not_called()
+        self.assertFalse(any("create" in call.args[0] for call in command.call_args_list))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "interrupted")
+        source = self.store.one("SELECT state,body FROM tasks WHERE id=?", (task["id"],))
+        self.assertEqual(source["state"], "queued")
+        self.assertIn("Mandatory: reject negative inputs", source["body"])
+
+    def test_periodic_scan_preserves_quota_backoff_until_resume_budget(self):
+        self.runtime.configure({"sources": {"inspection": True, "issues": False},
+                                "schedule": {"light_minutes": 5}}, self.project)
+        config = self.runtime.config(self.project)
+        now = 1800000000
+        with patch("adaptive_rsi.runtime.time.time", return_value=now), \
+                patch("adaptive_rsi.store.time.time", return_value=now):
+            self.runtime.schedule(self.project, config, now=now)
+            run = self.store.claim(self.project, config)
+            self.store.transition(run["id"], "waiting_budget", {"failure": {"code": "budget"}}, True,
+                                  task_fields={"available": now + 900, "budget_waits": 1})
+        with patch("adaptive_rsi.runtime.time.time", return_value=now + 301), \
+                patch("adaptive_rsi.store.time.time", return_value=now + 301):
+            self.runtime.schedule(self.project, config, now=now + 301)
+            self.runtime.resume_budget(self.project, config)
+            self.assertEqual(self.store.one("SELECT state,available,budget_waits FROM tasks WHERE id=?", (run["task"],)),
+                             {"state": "waiting_budget", "available": now + 900, "budget_waits": 1})
+            self.assertIsNone(self.store.claim(self.project, config))
+        with patch("adaptive_rsi.runtime.time.time", return_value=now + 900), \
+                patch("adaptive_rsi.store.time.time", return_value=now + 900):
+            self.runtime.resume_budget(self.project, config)
+            fresh = self.store.claim(self.project, config)
+        self.assertEqual(fresh["task"], run["task"])
+        self.assertNotEqual(fresh["id"], run["id"])
 
     def test_publish_rechecks_pause_revocation_stop_and_cancellation_after_fetch(self):
         project, task, run, workspace, job = self.candidate()

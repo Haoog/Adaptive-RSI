@@ -6,6 +6,7 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/app.js'), 'utf8');
 const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/auth.js'), 'utf8');
+const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/experience.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
 const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
@@ -24,6 +25,7 @@ function browser(savedSession = new Map()) {
       closest() { return this.id.endsWith('-form') ? this : this.form; },
       replaceChildren(...children) { this.options = children; this.children = children; },
       append(...children) { this.children.push(...children); },
+      prepend(...children) { this.children.unshift(...children); },
       insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
       querySelectorAll() { return []; },
       querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
@@ -615,6 +617,197 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   assert.equal(english['通用'],'General');
   const definitions=[...i18n.matchAll(/^  "((?:[^"\\]|\\.)*)":/gm)].map(match=>match[1]);
   assert.equal(definitions.length,new Set(definitions).size,'english 对象存在重复定义的 key');
+});
+
+function experiencePage() {
+  const page = browser();
+  Object.assign(page.context, {
+    URL, history: {replaceState() {}},
+    location: {origin: 'http://fixture.test', href: 'http://fixture.test/', pathname: '/', search: ''}
+  });
+  // Load the real task-open/action wiring; all requests and timers stay in memory.
+  vm.runInContext(experienceSource, page.context);
+  const create = page.document.createElement;
+  page.document.createElement = tag => {
+    const node = create(tag);
+    if (tag === 'select') {
+      let value = '';
+      Object.defineProperty(node, 'value', {
+        get: () => value,
+        set: next => { value = node.children.some(option => option.value === next) ? next : ''; }
+      });
+    }
+    return node;
+  };
+  page.context.refresh = async () => {};
+  return page;
+}
+
+const fixtureTask = (id = 'child', state = 'failed') => ({
+  id, project: 'a', title: 'Task ' + id, source: 'goal', state, body: '', evidence: '[]'
+});
+
+async function openExperienceTask(page, task) {
+  await page.context.showTask(task);
+  await page.context.lastAction;
+  return page.node('detail-body').children.find(node => node.className === 'task-controls');
+}
+
+test('an urgency-only save preserves an off-page dependency; explicit removal still clears it', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+  page.context.fetch = async (url, options) => {
+    if (url.endsWith('/task/schedule')) {
+      posts.push(JSON.parse(options.body));
+      return response({saved: true});
+    }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({
+      tasks: Array.from({length: 200}, (_, i) => fixtureTask('visible-' + i, 'queued')),
+      pagination: {has_more: true}
+    });
+    if (url.includes('id=outside-page&')) return response(fixtureTask('outside-page'));
+    return response({...task, dependency: {dependency: 'outside-page'}, urgency: 0});
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  const select = form.children[0].children[0], urgency = form.children[1].children[0];
+  assert.equal(select.value, 'outside-page');
+  assert.equal(select.children.find(option => option.value === 'outside-page').textContent, 'Task outside-page');
+  urgency.checked = true;
+  form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+  assert.deepEqual(posts[0], {task: 'child', dependency: 'outside-page', urgency: 1});
+  select.value = '';
+  form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+  assert.deepEqual(posts[1], {task: 'child', dependency: null, urgency: 1});
+});
+
+for (const actionKind of ['retry', 'supplement']) {
+  for (const navigation of ['close', 'project', 'other-task', 'round-trip']) {
+    for (const delayedStage of ['mutation', 'metadata']) {
+      test(`${actionKind} completion cannot reopen old details after ${navigation} during ${delayedStage}`, async () => {
+        const page = experiencePage(), task = fixtureTask(), posts = [];
+        let release, actionStarted = false;
+        page.context.fetch = async (url, options) => {
+          if (options?.method === 'POST') {
+            actionStarted = true; posts.push(JSON.parse(options.body));
+            if (delayedStage === 'mutation') return new Promise(resolve => { release = () => resolve(response({saved: true})); });
+            return response({saved: true});
+          }
+          if (url.includes('/task-runs?')) return response([]);
+          if (actionStarted && url.includes('id=child&') && delayedStage === 'metadata') {
+            return new Promise(resolve => { release = () => resolve(response(task)); });
+          }
+          return response(url.includes('id=other&') ? fixtureTask('other') : task);
+        };
+        const controls = await openExperienceTask(page, task);
+        if (actionKind === 'retry') controls.children.find(node => node.textContent === '基于当前输入重新检查').handlers.click();
+        else {
+          const form = controls.children.find(node => node.tagName === 'FORM');
+          form.children[0].children[0].value = 'More requirements';
+          form.onsubmit({preventDefault() {}});
+        }
+        const pending = page.context.lastAction;
+        await new Promise(setImmediate);
+        assert.equal(typeof release, 'function');
+        if (navigation === 'other-task') await openExperienceTask(page, fixtureTask('other'));
+        else {
+          page.context.closeTaskDetail();
+          if (navigation !== 'close') vm.runInContext('projectId="b"', page.context);
+          if (navigation === 'round-trip') vm.runInContext('projectId="a"', page.context);
+        }
+        release(); await pending;
+        assert.equal(posts.length, 1);
+        assert.equal(page.node('detail-dialog').open, navigation === 'other-task');
+        if (navigation === 'other-task') assert.equal(page.node('detail-title').textContent, 'Task other');
+      });
+    }
+  }
+  test(`${actionKind} completion refreshes details when the original task is still open`, async () => {
+    const page = experiencePage(), task = fixtureTask();
+    let revised = false;
+    page.context.fetch = async (url, options) => {
+      if (options?.method === 'POST') { revised = true; return response({saved: true}); }
+      if (url.includes('/task-runs?')) return response([]);
+      return response({...task, title: revised ? 'Updated task' : task.title});
+    };
+    const controls = await openExperienceTask(page, task);
+    if (actionKind === 'retry') controls.children.find(node => node.textContent === '基于当前输入重新检查').handlers.click();
+    else {
+      const form = controls.children.find(node => node.tagName === 'FORM');
+      form.children[0].children[0].value = 'More requirements';
+      form.onsubmit({preventDefault() {}});
+    }
+    await page.context.lastAction;
+    assert.equal(page.node('detail-dialog').open, true);
+    assert.equal(page.node('detail-title').textContent, 'Updated task');
+  });
+}
+
+for (const draftWeight of [1, 3]) {
+  test(`settings acknowledgement rebases after A-B-A and preserves newer weight ${draftWeight}`, async () => {
+    const page = browser(), field = page.node('weight'), posts = [];
+    Object.assign(field, {type: 'number', dataset: {path: 'schedule.weight'}});
+    page.document.querySelectorAll = selector => selector === '[data-path]' ? [field] : [];
+    page.node('settings-form').querySelectorAll = selector => ['input,textarea,select', '[data-path]'].includes(selector) ? [field] : [];
+    page.node('config-scope').value = 'project'; page.node('schedule-mode').value = 'inherit';
+    page.node('work-start').value = '0'; page.node('work-end').value = '24'; page.node('checks-json').value = '[]';
+    const config = {schedule: {weight: 1, working_hours: [0, 24]}, github: {labels: []}, checks: []};
+    page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); });
+    // Minimal renderer retains the production draft restore and project-switch handlers.
+    vm.runInContext(`view="settings";render=()=>{if(!settingsBaseline){
+      settingsBaseline=structuredClone(currentProject().config);settingsContext=settingsKey();
+      settingsModes.set(settingsBaseline,"inherit");$("weight").value=String(settingsBaseline.schedule.weight);
+      settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();
+    }};renderSettings=()=>{settingsBaseline=null;render();};render();`, page.context);
+    let release;
+    page.context.refresh = async () => {};
+    page.context.fetch = async (_url, options) => {
+      const post = JSON.parse(options.body); posts.push(post);
+      if (posts.length === 1) return new Promise(resolve => { release = () => resolve(response({config: {...config, schedule: {...config.schedule, weight: 2}}})); });
+      return response({config: {...config, schedule: {...config.schedule, weight: draftWeight}}});
+    };
+    field.value = '2'; page.input('weight', 'settings-form');
+    const pending = page.submit('settings-form');
+    page.node('project-select').value = 'b'; page.node('project-select').handlers.change();
+    field.value = '4'; page.input('weight', 'settings-form');
+    page.node('project-select').value = 'a'; page.node('project-select').handlers.change();
+    field.value = String(draftWeight); page.input('weight', 'settings-form');
+    release(); await pending;
+    assert.equal(field.value, String(draftWeight));
+    assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), 2);
+    assert.equal(vm.runInContext('draftStore.get("settings","a").values.find(v=>v.path==="schedule.weight").baselineValue', page.context), 2);
+    assert.equal(vm.runInContext('settingsDrafts.get("b").values[0].value', page.context), '4');
+    await page.submit('settings-form');
+    assert.deepEqual(posts[1], {project: 'a', values: {schedule: {weight: draftWeight}}, inherit: ['schedule.light_minutes','schedule.issues_minutes','sources.inspection','sources.issues']});
+  });
+}
+
+test('an ordinary settings save accepts canonical response values and finishes visibly saved', async () => {
+  const page = experiencePage(), field = page.node('weight');
+  Object.assign(field, {type: 'number', value: '2.0', dataset: {path: 'schedule.weight'}});
+  page.context.language = 'zh-CN';
+  page.node('config-scope').value = 'project'; page.node('schedule-mode').value = 'inherit';
+  page.node('work-start').value = '0'; page.node('work-end').value = '24'; page.node('checks-json').value = '[]';
+  page.document.querySelectorAll = selector => selector === '[data-path]' ? [field] : [];
+  page.node('settings-form').querySelectorAll = selector => ['input,textarea,select', '[data-path]'].includes(selector) ? [field] : [];
+  vm.runInContext('view="settings";settingsContext="a";settingsBaseline={schedule:{weight:1,working_hours:[0,24]},github:{labels:[]},checks:[]}', page.context);
+  let rerenders = 0;
+  page.context.renderSettings = () => {
+    rerenders++;
+    field.value = '2';
+    vm.runInContext('settingsClean.set("a",JSON.stringify(settingsValues()))', page.context);
+  };
+  page.context.fetch = async () => response({saved: true, config: {schedule: {weight: 2}}});
+  await page.submit('settings-form');
+  assert.equal(rerenders, 1, 'unchanged submitted input must accept the canonical response');
+  assert.equal(page.node('save-note').dataset.state, 'saved');
+  assert.match(page.node('save-note').textContent, /设置已保存/);
+});
+
+test('an active run stopping error explains when retry and supplement become available', async () => {
+  const page = browser();
+  page.context.fetch = async () => response({error: 'Wait for the active run to finish stopping before retrying or supplementing this task'}, 400);
+  await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
 test('the live run stage marks an in-progress review before its stage row exists', () => {
