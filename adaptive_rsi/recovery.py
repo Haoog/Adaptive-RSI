@@ -7,7 +7,8 @@ from .store import encode
 
 
 class BudgetExhausted(RuntimeError):
-    pass
+    failure_code = "budget"
+    code = "budget_exhausted"
 
 
 # 额度类故障只匹配异常类型或明确的配额/额度耗尽措辞；"上下文/输出超限"
@@ -28,10 +29,10 @@ def failure(exc):
     text = str(exc)
     lower = text.lower()
     structured = getattr(exc, "failure_code", None)
-    if isinstance(exc, BudgetExhausted) or structured == "budget" or any(s in lower for s in QUOTA_EXHAUSTED):
-        code, action = "budget", "wait_or_adjust_budget"
-    elif structured in FAILURE_ACTIONS:
+    if isinstance(structured, str) and structured in FAILURE_ACTIONS:
         code, action = structured, FAILURE_ACTIONS[structured]
+    elif isinstance(exc, BudgetExhausted) or any(s in lower for s in QUOTA_EXHAUSTED):
+        code, action = "budget", "wait_or_adjust_budget"
     elif any(s in lower for s in ["credential", "api key", "environment variable", "unauthorized", "401"]):
         code, action = "credentials", "check_model_settings"
     elif "opencode_incompatible" in lower or "opencode command compatibility" in lower:

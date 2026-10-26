@@ -24,7 +24,7 @@ from .opencode import (AUTH_LOCK, OpenCodeCompatibilityError, auth_path, auth_pr
                        detect_opencode, export_auth, import_auth, install_legacy_credential,
                        load_auth_export, logout_provider, merge_auth_export, remove_auth_export,
                        _parse_auth_export)
-from .process import docker_mount_path, run_process
+from .process import docker_mount, run_process
 
 
 ACTIVE = {"starting", "awaiting_authorization", "completing"}
@@ -162,7 +162,7 @@ class _Process:
                        "--security-opt=no-new-privileges", "--user", str(os.getuid()) + ":" + str(os.getgid()),
                        "--pids-limit=128", "--memory=" + str(limits.get("memory_mb", 2048)) + "m",
                        "--cpus=" + str(limits.get("cpus", 2)), "--tmpfs", "/tmp:rw,nosuid,size=256m",
-                       "--mount", "type=bind,src=" + docker_mount_path(self.home) + ",dst=" + docker_mount_path(self.home),
+                       "--mount", docker_mount(self.home, self.home),
                        "--workdir", str(self.home)]
             if stdin == subprocess.PIPE:
                 command.append("-i")
@@ -170,8 +170,8 @@ class _Process:
                 command += ["--publish", "127.0.0.1::4096"]
             for key in self.environment:
                 if key != "PATH":
-                    # 显式 KEY=VALUE：不依赖 docker 客户端从自身环境继承（Popen env 恰好提供这些值）。
-                    command += ["--env", key + "=" + self.environment[key]]
+                    # Docker 从 Popen env 继承变量值；argv 仅保留名称，避免暴露认证密码。
+                    command += ["--env", key]
             argv = command + [self.image, *argv]
         read_fd, self.control = os.pipe()
         try:

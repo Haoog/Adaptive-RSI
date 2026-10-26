@@ -1,3 +1,6 @@
 rsi.example.com {
+    # 仅在 HTTPS 入口设置；未确认子域全部支持 HTTPS 前不要加 includeSubDomains/preload。
+    # Set at the HTTPS edge; add includeSubDomains/preload only after checking every subdomain.
+    header Strict-Transport-Security "max-age=31536000"
     reverse_proxy 127.0.0.1:6090
 }

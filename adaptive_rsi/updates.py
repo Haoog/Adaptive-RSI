@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -46,6 +47,7 @@ def download(url, limit, progress=None):
     if parsed.scheme != "https" or parsed.hostname not in ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"] or parsed.username or parsed.query:
         raise ValueError("Updates must come from official GitHub release URLs")
     request = urllib.request.Request(url, headers={"User-Agent": "Adaptive-RSI-updater", "Accept": "application/vnd.github+json" if parsed.hostname == "api.github.com" else "application/octet-stream"})
+    deadline = time.monotonic() + 900
     with urllib.request.urlopen(request, timeout=30) as response:
         final = urllib.parse.urlsplit(response.url)
         if final.scheme != "https" or final.hostname not in ["api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"]:
@@ -55,10 +57,12 @@ def download(url, limit, progress=None):
         length = headers.get("Content-Length") if headers else None
         total = int(length) if length and length.isdigit() and int(length) <= limit else None
         data = bytearray()
-        # 慢速滴注的发布服务器不能无限占用更新线程；总预算 15 分钟。
-        deadline = time.monotonic() + 900
+        # read1 避免缓慢滴注一直填不满 read(n)，总预算包含连接阶段。
+        read = getattr(response, "read1", response.read)
         while True:
-            chunk = response.read(65536)
+            if time.monotonic() >= deadline:
+                raise ValueError("Release download exceeded the total time budget")
+            chunk = read(65536)
             if not chunk:
                 break
             data.extend(chunk)
@@ -117,14 +121,19 @@ def extract_bundle(data, expected_hash, destination, target):
 
 
 def atomic_json(path, data):
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data), encoding="utf-8")
-    temp.chmod(0o600)
-    os.replace(temp, path)
+    path = Path(path)
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name + "-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
-# 新候选与回滚旧版本的启动健康检查窗口：大状态目录的首次启动（迁移/WAL 恢复）
-# 可能超过 start.py 的 30 秒等待，这里统一给足预算，避免把慢启动误判为失败。
+# 大状态目录的迁移和 WAL 恢复可能较慢；启动器和监督器采用相同健康检查预算。
 RESTART_HEALTH_SECONDS = 60
 
 
@@ -168,7 +177,7 @@ class UpdateManager:
 
     def completed(self, status):
         awaiting_restart = self.restart_target is not None or self.recovering or self.legacy_deadline is not None
-        if awaiting_restart and status.get("state") == "installed" and status.get("current") == (self.restart_target or __version__):
+        if awaiting_restart and status.get("state") in ["installed", "rolled_back"] and status.get("current") == (self.restart_target or __version__):
             self.installing = False
             self.restart_target = None
             self.recovering = False
@@ -257,7 +266,8 @@ class UpdateManager:
                 with (self.store.root / "update.log").open("ab") as log:
                     subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(self.store.root), "update-worker"],
                                      cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
-                if plan.get("candidate_pid") != os.getpid():
+                service_pid = plan.get("rollback_pid") if plan.get("phase") in ["rollback_health_check", "rollback_ack"] else plan.get("candidate_pid")
+                if service_pid != os.getpid():
                     self.shutdown()
             if not self.installing:
                 (self.store.root / "update-ready").unlink(missing_ok=True)
@@ -448,6 +458,36 @@ def candidate_health(plan):
         return False
 
 
+def complete_rollback(state, plan):
+    from .store import Store
+    # 旧运行器仅识别 installed 作为解除屏障的握手；先通过健康检查才发送。
+    store = Store(state)
+    try:
+        plan["phase"] = "rollback_ack"
+        atomic_json(state / "installations/restart.json", plan)
+        status = {"current": __version__, "checked": time.time(),
+                  "reason": "Previous code and database restored and health verified"}
+        store.put_setting("update-status", {**status, "state": "installed"})
+        session = plan["session"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/state",
+                    headers={"Cookie": session["cookie"] + "=" + session["token"]})
+                with urllib.request.urlopen(request, timeout=1) as response:
+                    ready = not json.load(response)["update"]["busy"]
+                if ready:
+                    store.put_setting("update-status", {**status, "state": "rolled_back"})
+                    (state / "update-ready").write_text("ready")
+                    return True
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            time.sleep(0.2)
+        return False
+    finally:
+        store.close()
+
+
 def process_present(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -503,7 +543,7 @@ def _supervise_restart(state):
         recovery_required(state, "Unsupported state migration; refusing automatic rollback")
         return
     status = Store(state).setting("update-status", {})
-    if status.get("state") == "installed":
+    if status.get("state") == "installed" and plan.get("phase") != "rollback_ack":
         # Work may already have been admitted. An old journal never authorizes rollback.
         plan_path.unlink(missing_ok=True)
         return
@@ -512,6 +552,19 @@ def _supervise_restart(state):
     plan["supervisor_pid"] = os.getpid()
     atomic_json(plan_path, plan)
     phase = plan.get("phase", "prepared")
+    if phase in ["rollback_health_check", "rollback_ack"]:
+        rollback_plan = {**plan, "target": __version__, "candidate_pid": plan.get("rollback_pid")}
+        deadline = time.monotonic() + RESTART_HEALTH_SECONDS
+        while time.monotonic() < deadline and process_present(plan.get("rollback_pid")):
+            if candidate_health(rollback_plan):
+                if complete_rollback(state, plan):
+                    plan_path.unlink(missing_ok=True)
+                else:
+                    recovery_required(state, "Restored service did not acknowledge the health-verified rollback")
+                return
+            time.sleep(0.2)
+        recovery_required(state, "Rolled-back service cannot be verified; preserve the database and restart plan")
+        return
     if phase == "committed":
         if candidate_health(plan):
             commit_installation(state, plan)
@@ -621,12 +674,15 @@ def _supervise_restart(state):
             for suffix in ["-wal", "-shm"]:
                 Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
             os.replace(restore, state / "state.sqlite3")
-        # 先落回滚状态再启动旧服务：服务启动时会读取该状态决定是否允许工作，
-        # 若仍读到 restarting 会进入更新忙态拒绝写请求。
-        Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
+        # 健康检查完成前保留调度屏障，避免旧服务启动后提前接纳工作。
+        Store(state).put_setting("update-status", {"state": "restarting", "current": __version__, "version": __version__, "checked": time.time(), "reason": "Verifying restored service"})
+        plan.update(phase="rollback_health_check")
+        atomic_json(plan_path, plan)
         atomic_json(state / "restart-session.json", session)
         previous_child = subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
                          cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        plan["rollback_pid"] = previous_child.pid
+        atomic_json(plan_path, plan)
         # 回滚重启的旧版本同样要通过启动健康检查；不能无条件宣布就绪后留下没有服务在跑的状态。
         deadline = time.monotonic() + RESTART_HEALTH_SECONDS
         previous_healthy = False
@@ -645,8 +701,11 @@ def _supervise_restart(state):
         if not previous_healthy:
             recovery_required(state, "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually")
             return
-        (state / "update-ready").write_text("ready")
+        if not complete_rollback(state, plan):
+            recovery_required(state, "Restored service did not acknowledge the health-verified rollback")
+            return
     finally:
-        if Store(state).setting("update-status", {}).get("state") in ["installed", "rolled_back"]:
+        final_state = Store(state).setting("update-status", {}).get("state")
+        if final_state == "rolled_back" or final_state == "installed" and plan.get("phase") != "rollback_ack":
             plan_path.unlink(missing_ok=True)
         log.close()

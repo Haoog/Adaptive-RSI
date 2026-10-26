@@ -45,6 +45,10 @@ ssh -N -L 6090:127.0.0.1:6090 用户@服务器
 
 CLI 容器只挂载该次工作区与独立 HOME；不挂载控制器、其他项目、评估集、SSH/GitHub 凭据或 Docker socket。只读角色不能修改源代码，所有角色不能写 Git 元数据。CLI 为调用模型需要联网，独立检查和原生命令工具不联网。CLI 能访问执行所需的所选模型连接凭据；这不构成对任意恶意程序的机密计算隔离。
 
+镜像默认以 `node` 用户运行。执行器已有显式 `--user`，仍使用服务账号的宿主 UID/GID，并保留只读根文件系统、`--cap-drop=ALL` 和 `no-new-privileges`；镜像默认用户不会覆盖这些边界。请避免以 root 账号运行服务，拥有宿主 Docker 管理权限的账号仍拥有高权限。
+
+基础镜像默认仍为可变标签 `node:22-bookworm`；本次环境无法从 Docker Hub 可靠获取 manifest digest，未填写未经核验的摘要。生产构建可先执行 `docker buildx imagetools inspect node:22-bookworm`，核对官方仓库的 digest，再通过 `docker build --build-arg NODE_IMAGE='node:22-bookworm@sha256:实际核验的摘要' -f deploy/Dockerfile.worker -t adaptive-rsi-worker:local .` 固定基础镜像。该命令中的摘要必须替换；基础镜像固定也不代表 npm 安装的全部传递依赖已锁定。自定义检查镜像可在 `sandbox.image` 中使用经核验的 digest 引用。
+
 ## HTTPS 域名访问
 
 如需直接通过域名访问，在服务器配置反向代理（示例见 [Caddyfile](deploy/Caddyfile.example)），并在 `~/.config/adaptive-rsi/server.env` 添加：
@@ -54,6 +58,12 @@ ADAPTIVE_RSI_PUBLIC_URL=https://rsi.example.com
 ```
 
 然后执行 `systemctl --user restart adaptive-rsi`，从新的启动认证地址登录。公网入口使用 HTTPS；应用仍只监听回环地址。Host、Origin、会话 Cookie 和 CSRF 检查继续有效，域名访问的 Cookie 带 `Secure`。不要将模型执行服务或 Docker API 暴露到公网。
+
+Caddy 示例在 HTTPS 入口设置 `Strict-Transport-Security: max-age=31536000`，浏览器随后一年会优先使用 HTTPS。只有确认全部子域都支持 HTTPS 后才考虑 `includeSubDomains` 或 preload；应用的本地 HTTP 入口不发送 HSTS。
+
+认证失败在每个监听器内以 60 秒窗口计数，前 30 次返回原有 401，之后返回带 `Retry-After` 的 429。有效 Cookie 或启动链接仍可登录、使用 API 和健康探测；代理后的不同访问者共享失败计数，不根据可伪造的转发 IP 头建立身份。Host/Origin/CSRF 拒绝及会话失败共用每分钟至多一条安全审计，记录固定原因和抑制数量，不保存 URL、令牌、Cookie 或请求正文。`/api/health` 保留 Host 与 Cookie 认证。
+
+API 异常只返回固定提示或白名单机器错误码，避免将底层异常中的路径、凭据或远端响应正文发回浏览器。会话轮换先原子写入私有文件再更新内存；失败时原会话继续有效。
 
 ## 管理与数据
 
@@ -65,5 +75,7 @@ journalctl --user -u adaptive-rsi -f
 ```
 
 运行状态默认存于 `~/.local/share/adaptive-rsi`，项目克隆在旁边的 `adaptive-rsi-projects`。备份状态、私有凭据目录和项目；不要将它们提交到 GitHub。运行器更新由原有监督流程处理，用户服务跟踪更新后的进程；失败会尝试恢复旧版本。执行镜像更新需重新构建，已有任务保留自己的配置。
+
+备份下载保持 Cookie 认证，单个文件最多 1 GiB，至多同时传输两个备份。二进制响应按 64 KiB 分块，单次写入最长等待 30 秒，总传输预算 120 秒；JSON 分片保持每次最多 512 KiB。拒绝符号链接及非普通文件，下载失败时关闭连接；超限时应使用服务账号在本机备份状态文件。
 
 项目检查和 Issues 同步默认均每小时；只保留两种计划。发现、调用、任务时长和改动文件数不设额度，暂停与取消随时有效。日志大小、网络请求超时及容器执行边界属于实现保护，不作为发现或任务数量额度。

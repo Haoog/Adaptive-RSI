@@ -134,8 +134,14 @@ def publish(runtime, project, task, run, workspace, config):
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
     branch = prefix + "/rsi-" + run["id"]
     if git(workspace, "branch", "--show-current") != branch:
-        # -B：push 成功但创建 PR 失败后的重试会再次进入本分支，此时分支已存在。
-        git(workspace, "checkout", "-B", branch)
+        # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
+        existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
+        if existing_head:
+            if existing_head != git(workspace, "rev-parse", "HEAD"):
+                raise RuntimeError("Existing delivery branch differs from evaluated candidate")
+            git(workspace, "checkout", branch)
+        else:
+            git(workspace, "checkout", "-b", branch)
     if git(workspace, "diff", "--cached", "--name-only"):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + task["title"])

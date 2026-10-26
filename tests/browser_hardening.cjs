@@ -118,7 +118,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#work-end').fill('17');
     await page.locator('#issue-labels').fill('bug, urgent');
     const checks=page.locator('#checks-json'),serverChecks=await checks.inputValue();
-    await checks.fill('["RAW-CHECKS-MUST-NOT-PERSIST"]');
+    await page.locator('#checks-editor textarea').first().fill('RAW-CHECKS-MUST-NOT-PERSIST');
     await page.waitForFunction(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('125'));
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('bug, urgent')||false),true);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('RAW-CHECKS-MUST-NOT-PERSIST')||false),false);

@@ -5,7 +5,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .process import Sandbox, run_process
+from .process import Cancelled, Sandbox, capture_cancel, run_process
 
 
 def object_schema(properties):
@@ -155,7 +155,7 @@ class CodexAgent:
         return True
 
     def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
-        from .provider_health import ProviderHealth, ProviderPaused
+        from .provider_health import ModelFailure, ProviderHealth, error_code, provider_text_code
         from .native import ProviderUnavailable
         health = ProviderHealth(self.store)
         primary = config["models"][role]
@@ -171,18 +171,25 @@ class CodexAgent:
             except Exception as exc:
                 exc.provider_id = provider_id
                 exc.role = role
+                if isinstance(exc, Cancelled):
+                    raise
                 health.record(config, provider_id, project, exc)
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
-                # Codex 与 OpenCode 的 CLI 失败都带前缀；瞬时网络类失败也允许切换备用。
-                cli_unavailable = str(exc).startswith(("Codex call failed:", "OpenCode call failed:")) and any(
-                    text in str(exc).lower() for text in ["model not found", "not supported", "does not exist",
-                                                          "rate limit", "usage limit", "timed out", "timeout",
-                                                          "connection", "429", "502", "503"])
-                can_fallback = index + 1 < len(routes) and (
-                    isinstance(exc, (ProviderUnavailable, ProviderPaused)) or cli_unavailable)
+                # 仅旧适配器无代码的 CLI 自身诊断允许文本兼容；明确的 execution
+                # 或认证/额度故障绝不被消息中的 timeout 等关键词覆盖。
+                known = getattr(exc, "failure_code", None) or getattr(exc, "code", None)
+                legacy_cli = not known and str(exc).startswith(("Codex call failed:", "OpenCode call failed:"))
+                code = provider_text_code(str(exc)) if legacy_cli else error_code(exc)
+                unavailable = bool(known or legacy_cli) and code in {
+                    "rate_limit", "timeout", "connection", "model_missing", "provider_paused"}
+                if not known and isinstance(exc, ProviderUnavailable):
+                    unavailable = True
+                can_fallback = (index + 1 < len(routes) and unavailable and
+                                getattr(exc, "fallback_allowed", True))
                 if can_fallback and workspace_before is not None and \
                         workspace_signature(workspace, config["limits"]["max_output_mb"] * 1024 * 1024) != workspace_before:
-                    raise RuntimeError("Primary implementation failed after changing the workspace; fallback refused to prevent mixing partial edits") from None
+                    raise ModelFailure("Primary implementation failed after changing the workspace; fallback refused to prevent mixing partial edits",
+                                       "execution") from None
                 if can_fallback:
                     self.store.event("fallback", "Primary provider unavailable; using configured fallback", project, run)
                     continue
@@ -272,8 +279,8 @@ class CodexAgent:
                     if secret:
                         forwarded["RSI_PROVIDER_API_KEY"] = secret
                     try:
-                        result = run_cli(argv, workspace, home, config, cancel, protected,
-                                         role != "implementation", forwarded, self.store.root, timeout=3600)
+                        result, cancelled = capture_cancel(run_cli, argv, workspace, home, config, cancel, protected,
+                                                           role != "implementation", forwarded, self.store.root, timeout=3600)
                     finally:
                         if login:
                             auth_file = home / ".codex/auth.json"
@@ -283,8 +290,8 @@ class CodexAgent:
                                 sync_codex_oauth(home, original_auth)
             else:
                 # 模型挂起不能永久占用并发槽位；上限 1 小时，仅靠取消无法覆盖所有情况。
-                result = run_process(argv, workspace, 3600, cancel,
-                                     config["limits"]["max_output_mb"], environment)
+                result, cancelled = capture_cancel(run_process, argv, workspace, 3600, cancel,
+                                                   config["limits"]["max_output_mb"], environment)
             for secret_value in [secret, *auth_secrets]:
                 if not isinstance(secret_value, str) or len(secret_value) <= 8:
                     # 过短的值会在脱敏替换时破坏 JSON 与统计记录，不进入脱敏列表。
@@ -310,9 +317,12 @@ class CodexAgent:
                 except (ValueError, TypeError):
                     continue
             self.store.record_usage(call, run, usage, time.time() - started)
-            if result["exit_code"] or result["error"]:
-                error = (result["stderr"] or result["error"] or result["stdout"])[-2000:]
-                raise RuntimeError("Codex call failed: " + error)
+            if cancelled is not None:
+                raise cancelled
+            from .provider_health import cli_failure
+            problem = cli_failure("Codex", result)
+            if problem is not None:
+                raise problem
             data = json.loads(output_path.read_text(encoding="utf-8"))
             validate_output(data, SCHEMAS[role])
             self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))

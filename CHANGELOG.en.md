@@ -5,23 +5,30 @@
 ## Unreleased
 
 - Tasks judged obsolete by planning are no longer requeued by inspections (avoiding repeated paid planning every scan cycle); manual retry and requirement supplements remain available for obsolete tasks.
-- Tasks interrupted by a crash or restart are requeued automatically on startup (attempt counters are preserved, poison tasks still respect retry limits); budget-backoff tasks return to the queue as soon as their wait expires instead of waiting for the next working-hours window.
-- Failure classification now prefers structured codes raised at the failure site: OpenCode CLI's own transient failures carry a code instead of relying on message text, so "timeout/connection" words in tested project output no longer misclassify as provider faults.
-- OpenCode parsing only accepts the final message's structured output, so a valid JSON in an intermediate step is no longer adopted; step events without ids are deduplicated by content so usage is not double-counted; string status codes from gateways now trigger the circuit breaker.
-- Post-crash/update startup health checks are relaxed to 60 seconds; a rollback writes its state before starting the previous version and only reports ready after that service passes its health check (fixing the restored service refusing writes).
+- Only authorized publishing tasks are requeued automatically on startup; ordinary interrupted tasks retain their evidence and await manual retry. Budget-backoff tasks return to the queue as soon as their wait expires instead of waiting for the next working-hours window.
+- Local commands and model adapters carry separate structured failure codes, which take precedence in retry, provider circuit-breaker and fallback decisions. Timeout, connection or quota words in local setup/check output no longer imply provider failures. Older CLIs still support their own stderr diagnostics while excluding project tool output in stdout.
+- Native model responses record known usage before content parsing can fail. Codex/OpenCode cancellation preserves usage and redacted events already produced, then propagates cancellation without triggering fallback.
+- OpenCode parsing only accepts the final message's structured output, so valid JSON in an intermediate step is no longer adopted; only duplicate steps with ids are deduplicated, while all usage from steps without ids is retained to avoid merging distinct steps with equal consumption; string status codes from gateways now trigger the circuit breaker.
+- Update and rollback startup health checks share a 60-second window. A restored service remains guarded until its version and process pass health checks; a compatible acknowledgment then releases the guard and records rollback completion. Interrupted supervisors retain phase evidence and verify the existing rollback process without restoring the database again.
 - Update downloads have a 15-minute total budget; the launcher serializes double-starts with a file lock; delivery baseline fetches get a 180-second timeout.
-- Auth containers receive environment variables explicitly as KEY=VALUE; shutdown flows wait at most 10 seconds for stuck processes; docker mount paths containing commas are escaped (check and auth containers).
+- Auth containers inherit environment variable values with only variable names in argv, keeping authentication passwords out of command arguments; shutdown flows wait at most 10 seconds for stuck processes; check, auth and CLI worker containers encode complete CSV mount fields to preserve commas, quotes and newlines in paths.
 - Native API implementation/review timeouts are relaxed to 900/600 seconds; model probe failures are no longer masked by catalog update errors; workspace comparison reports a diagnosable error for escaping symlinks; the runtime releases data-layer connections on close.
-- The model center gained a subscription-to-route onboarding note (ChatGPT/OpenCode subscription, API key, or local model).
+- The model center includes an OpenCode Go API Key preset and official Console link. Users copy their current endpoint from the Console; existing OpenCode configuration, API keys and other login methods remain distinct, and model usage is not presented as remaining subscription allowance.
+- Checks and acceptance results use readable cards with expandable original commands and output. Candidate approval summarizes repository, branch, baseline, gates and current authorization on desktop and mobile.
+- Settings use a structured check editor, collapse internal policy controls by default, and no longer require arbitrary JSON editing. Unsaved, saving and saved states explain when schedules change, new runs capture configuration and delivery authorization is rechecked.
+- The workspace overview includes blocked work, recent failures and model verification evidence. Missing connection or task evidence remains explicitly unknown; it does not claim real model testing.
 - A failed desktop update check no longer displays "up to date"; check errors are now distinct from "no update".
 - The English anti-flash bootstrap now has a 3-second safety net, so a broken translation script can no longer leave the page blank forever.
-- Sandbox snapshots exclude `.rsi-tmp`, so setup leftovers no longer pollute candidate patches; publishing retries use `checkout -B` so an existing branch no longer fails.
+- Sandbox snapshots exclude `.rsi-tmp`, so setup leftovers no longer pollute candidate patches; publishing retries only reuse an existing branch at the candidate HEAD and refuse to reset branches pointing to other commits.
 - Authentication token comparison treats non-ASCII input as a mismatch instead of raising and resetting the connection; CSP now includes `form-action 'self'`.
 - Manual retry resets the infrastructure backoff counter; recurrence requeue of merged tasks also resets attempt counters.
 - Native APIs tolerate null usage fields, and empty Gemini candidates return a diagnosable error instead of crashing.
 - OpenCode CLI timeouts, rate limits and connection failures can now trigger the configured fallback model.
 - Dark mode covers the model center and dialog accent variables; desktop exit force-kills a stuck engine after 10 seconds; the update download no longer has a double-click race; the unused Tauri global API is disabled.
-- Unknown UI errors now show a generic message (the original text stays in the browser console); the release smoke retries transient GitHub API network errors.
+- Access sessions and restart journals are atomically written through randomly named private temporary files. Failed rotation preserves existing credentials; the desktop proxy updates its Cookie and CSRF together so requests continue after rotation.
+- Backup downloads stream with size, concurrency and duration limits. Failed authentication is rate limited with bounded credential-free auditing. API failures return fixed messages and allowlisted codes while preserving actionable configuration diagnostics.
+- The Caddy example includes HSTS; the worker image defaults to a non-root user and accepts a configurable base image. Managed containers still use the host UID/GID. The base-image digest has not been verified or pinned, as documented.
+- The release smoke retries transient GitHub API network errors.
 
 ## 0.5.105
 

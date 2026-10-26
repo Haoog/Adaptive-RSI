@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .agent import SCHEMAS, validate_output
 from .cli_worker import clean_environment, cli_home, run_cli
-from .process import run_process
+from .process import capture_cancel, run_process
 
 
 AUTH_LOCK = threading.RLock()
@@ -570,7 +570,6 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
 
 def parse_events(text, strict=True):
     final, usage, seen, errors = [], [], set(), []
-    token_shapes = set()
     for line in text.splitlines():
         try:
             event = json.loads(line)
@@ -589,12 +588,7 @@ def parse_events(text, strict=True):
                 if part_id in seen:
                     continue
                 seen.add(part_id)
-            else:
-                # 缺少 id 的事件按 tokens 内容判重，同一步骤的重复事件不重复累计用量。
-                shape = json.dumps(part["tokens"], sort_keys=True)
-                if shape in token_shapes:
-                    continue
-                token_shapes.add(shape)
+            # 无 id 时无法证明事件重复；不同步骤可能恰好消耗相同 tokens，全部保留。
             usage.append(part["tokens"])
     if errors:
         if strict:
@@ -618,27 +612,12 @@ def parse_events(text, strict=True):
 
 def check_provider_errors(text):
     from .native import ProviderUnavailable
-    for line in text.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(event, dict) or event.get("type") != "error":
-            continue
-        error = event.get("error", {})
-        if not isinstance(error, dict):
-            continue
-        data = error.get("data", {})
-        status = data.get("statusCode") if isinstance(data, dict) else None
-        # 网关可能把状态码序列化为字符串；统一转成整数再比较。
-        try:
-            status = int(status) if status is not None else None
-        except (TypeError, ValueError):
-            status = None
-        if status in [404, 429, 502, 503, 504]:
-            raise ProviderUnavailable("OpenCode model API HTTP " + str(status))
-        if status in [401, 403] or error.get("name") == "ProviderAuthError":
-            raise RuntimeError("OpenCode model API unauthorized; check the runtime machine's authentication")
+    from .provider_health import cli_failure
+    problem = cli_failure("OpenCode", {"stdout": text, "exit_code": 0, "error": None})
+    if problem is not None:
+        if problem.failure_code == "provider":
+            raise ProviderUnavailable(str(problem), problem.code)
+        raise problem
 
 
 class OpenCodeAgent:
@@ -720,7 +699,8 @@ class OpenCodeAgent:
                 argv += ["Read the task in " + str(task) + ". Follow its instructions. Return the requested JSON."]
                 self.store.event("model", role + ": OpenCode / " + route["model"] + " / " + route["effort"], project, run)
                 try:
-                    result = run_cli(argv, workspace, home, config, cancel, protected, role != "implementation", environment, self.store.root, timeout=3600)
+                    result, cancelled = capture_cancel(run_cli, argv, workspace, home, config, cancel, protected,
+                                                       role != "implementation", environment, self.store.root, timeout=3600)
                 finally:
                     if capabilities.modern and host_capabilities and host_capabilities.modern:
                         with AUTH_LOCK:
@@ -767,22 +747,28 @@ class OpenCodeAgent:
                 data, steps = parse_events(raw, strict=False)
                 from .usage import opencode_usage
                 self.store.record_usage(call, run, opencode_usage(steps), time.monotonic() - started)
-                check_provider_errors(raw)
-                if result["exit_code"] or result["error"]:
-                    # 透传超时/输出超限等错误详情，供故障分类、基础设施重试与供应商熔断识别；
-                    # stderr 可能包含模型环境输出，先做与执行记录相同的脱敏。
-                    detail = str(result.get("error") or "").strip()
-                    stderr_tail = (result.get("stderr") or "").strip()[-2000:]
-                    summary = "\n".join(part for part in [detail, stderr_tail] if part)
-                    for secret in secrets:
-                        if secret:
-                            summary = summary.replace(secret, "[REDACTED]")
-                    error = RuntimeError("OpenCode call failed" + (": " + summary if summary else "; see the redacted execution record"))
-                    if any(word in summary.lower() for word in
-                           ["timed out", "timeout", "rate limit", "429", "503", "connection"]):
-                        # CLI 自身的瞬时故障在 raise 侧已知成因，携带结构化码优先于文本分类。
-                        error.failure_code = "provider"
-                    raise error
+                if cancelled is not None:
+                    # Exception results are visible to callers too; replace with redacted evidence.
+                    for field in ("stdout", "stderr"):
+                        value = result.get(field) or ""
+                        for secret in secrets:
+                            if secret:
+                                value = value.replace(secret, "[REDACTED]")
+                        result[field] = value
+                    raise cancelled
+                # 保留 CLI 自身 stderr 的兼容诊断，但从不分类 stdout 中的工具输出。
+                safe_result = {**result, "stdout": raw}
+                for field in ("stderr", "error"):
+                    value = result.get(field)
+                    if isinstance(value, str):
+                        for secret in secrets:
+                            if secret:
+                                value = value.replace(secret, "[REDACTED]")
+                    safe_result[field] = value
+                from .provider_health import cli_failure
+                problem = cli_failure("OpenCode", safe_result)
+                if problem is not None:
+                    raise problem
                 if data is None:
                     raise RuntimeError("OpenCode did not return valid structured output; see the redacted execution record")
                 validate_output(data, SCHEMAS[role])

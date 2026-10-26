@@ -177,9 +177,9 @@ def main(argv=None):
             try:
                 server = Server(runtime, args.port, session=session, public_url=args.public_url)
                 session = {"origin": server.origin, "local_origin": server.local_origin, "public_url": server.origin if server.origin != server.local_origin else None, "cookie": server.cookie, "token": server.token, "csrf": server.csrf, "url": server.url, "pid": os.getpid()}
+                from .updates import atomic_json
                 session_file = root / "server.json"
-                session_file.write_text(json.dumps(session))
-                session_file.chmod(0o600)
+                atomic_json(session_file, session)
                 print("Adaptive RSI " + __version__ + "\n" + server.url + "\nKeep this process running. Ctrl+C stops workers safely.", flush=True)
                 if args.open:
                     webbrowser.open(server.url)

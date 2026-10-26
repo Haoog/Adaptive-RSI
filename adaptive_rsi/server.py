@@ -2,8 +2,10 @@ import hmac
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from http.cookies import SimpleCookie
@@ -23,7 +25,112 @@ from .telemetry import quality_summary
 from .config import compatibility
 from .gitops import git
 from .evolution import Evolution
-from .updates import UpdateInProgress
+from .updates import UpdateInProgress, atomic_json
+
+
+# 只允许已知机器错误码离开服务端；异常文本可能包含路径、请求正文或凭据。
+SAFE_ERROR_CODES = frozenset("""
+unknown_provider invalid_provider invalid_mode invalid_key invalid_reference missing_key
+keychain_unavailable keychain_locked keychain_failed credential_file_unavailable
+builtin_provider provider_in_use update_in_progress connection_changed invalid_model
+invalid_routes too_many_models unsupported_model_kind probe_failed default_effort_required
+rate_limit auth connection unavailable unknown timeout too_large invalid_response
+unsupported http_error provider_paused model_missing tool_format budget_exhausted
+codex_missing codex_error opencode_missing opencode_error opencode_version_unknown
+opencode_version_unsupported opencode_capability_missing invalid_credentials
+invalid_backend invalid_auth_method invalid_auth_inputs invalid_auth_code invalid_auth_state
+unknown_session auth_busy auth_credentials_busy service_closed process_interrupted
+unsupported_auth_method invalid_api_key auth_protocol_error auth_timeout auth_expired
+authorization_failed device_auth_unavailable auth_container_unavailable auth_worker_image_missing
+""".split())
+
+
+# 精确匹配固定业务校验文案；不使用前缀匹配，也不携带用户提交的字段或值。
+SAFE_VALIDATION_MESSAGES = frozenset("""
+Invalid command timeout: command_seconds must be 60..86400
+Too many model providers
+Provider requires id, name, base_url, env_key and optional protocol; never store API keys
+Provider fields must be strings
+Invalid, duplicate or reserved provider id
+Provider URL requires HTTPS (HTTP allowed on loopback), without credentials or query
+Provider requires a short display name
+env_key must be an environment variable name, not a secret
+Unsupported model protocol
+Unsupported credential mode
+Stored credentials require a reference, not an environment variable or key
+Unexpected credential reference
+Nested fallback routes are not supported
+OpenCode model requires provider/model
+Luna supports max, not ultra
+Review blocking threshold must be low, medium or high
+Triage policy requires 1..4000 characters
+Invalid update mode or interval (minimum 60 minutes)
+Automatic update policy must be patch, minor or stable
+light_minutes must be between 5 and 525600
+issues_minutes must be between 5 and 525600
+deep_minutes must be between 5 and 525600
+working_hours must be [start, end], 0 <= start < end <= 24
+Maximum concurrency is 4
+Unsupported sandbox
+Invalid container image
+Sandbox limits must be positive
+Repository must be owner/name
+max_issues must be 1..1000
+Invalid issue labels
+Project weight must be 1..10
+Automatic merge requires PR delivery
+Automation workflow must be a fixed .github/workflows YAML file
+Automation requires a fixed trusted tag
+Automation requires the trusted workflow tag's full commit SHA
+Release/deploy requires an explicit project and a pinned workflow tag
+Deployment health URL requires HTTPS without credentials, query or fragment
+Automatic deployment rollback requires an explicit health URL
+Feedback interval must be at least 5 minutes
+Invalid base branch
+Seed a dependency directory, not the entire repository
+Invalid dependency snapshot size limit
+Check must contain name, cwd, argv
+Check requires a name and argv array
+Invalid check arguments
+Invalid evolution cost ratio
+Invalid relative path
+Path must remain inside the project
+Select the root of an existing Git repository
+Expected a GitHub repository URL
+Use a GitHub repository URL such as https://github.com/owner/repository
+Import directory already exists; register it as a local project instead
+Project not found
+Project and controller state must be in separate directory trees
+Projects must not contain each other's directories
+Goal must contain 1..30000 characters
+Wait until active runs finish before importing projects
+Wait until active runs finish before registering projects so every worker uses the same isolation boundaries
+Only project scan settings can inherit global defaults
+An inherited setting cannot also have an override
+""".strip().splitlines())
+
+
+class RequestError(ValueError):
+    """本模块固定的用户提示；其余异常一律通过安全错误边界处理。"""
+
+
+def configuration_error(exc, raw_config):
+    """保留可修复的配置诊断，绝不返回底层异常文本。"""
+    if isinstance(exc, json.JSONDecodeError):
+        return "Project configuration is invalid: Expecting value (invalid JSON)"
+    try:
+        values = json.loads(raw_config or "{}")
+        timezone = values.get("schedule", {}).get("timezone")
+    except (ValueError, TypeError, AttributeError):
+        timezone = None
+    # 仅回显配置中显式设置的短时区名称；路径、URL 和凭据不能匹配此格式。
+    from zoneinfo import ZoneInfoNotFoundError
+    if isinstance(exc, ZoneInfoNotFoundError) and isinstance(timezone, str) and re.fullmatch(
+            r"[A-Za-z_]{1,32}/[A-Za-z_]{1,32}(?:/[A-Za-z_]{1,32})?", timezone):
+        return "Project configuration is invalid: Unknown timezone " + timezone
+    if isinstance(exc, ValueError) and str(exc) in SAFE_VALIDATION_MESSAGES:
+        return "Project configuration is invalid: " + str(exc)
+    return "Project configuration is invalid; check field names, types, model routes and timezone"
 
 
 class Server(ThreadingHTTPServer):
@@ -49,6 +156,13 @@ class Server(ThreadingHTTPServer):
         self.token = secrets.token_urlsafe(32)
         self.csrf = secrets.token_urlsafe(32)
         self._connection_gate = threading.BoundedSemaphore(self.max_connections)
+        self._session_lock = threading.RLock()
+        self._backup_gate = threading.BoundedSemaphore(2)
+        self._security_lock = threading.Lock()
+        self._failure_window = 0.0
+        self._failures = 0
+        self._audit_after = 0.0
+        self._audit_suppressed = 0
         super().__init__(("127.0.0.1", port), Handler)
         self.local_origin = "http://127.0.0.1:" + str(self.server_port)
         self.origin = (public_url or (session or {}).get("public_url") or self.local_origin).rstrip("/")
@@ -79,25 +193,43 @@ class Server(ThreadingHTTPServer):
         return (self.cookie + "=" + self.token + "; Path=/; HttpOnly; SameSite=Strict" +
                 ("; Secure" if self.origin.startswith("https://") and host == urlparse(self.origin).netloc else ""))
 
+    def security_failure(self, reason, authentication=False):
+        """全监听器有界计数；不信任代理 IP 头，也不保留攻击者可扩展的键。"""
+        now = time.monotonic()
+        with self._security_lock:
+            if now >= self._failure_window:
+                self._failure_window, self._failures = now + 60, 0
+            if authentication:
+                self._failures += 1
+            limited = authentication and self._failures > 30
+            audit = now >= self._audit_after
+            suppressed = self._audit_suppressed
+            if audit:
+                self._audit_after, self._audit_suppressed = now + 60, 0
+            else:
+                self._audit_suppressed += 1
+        if audit:
+            try:
+                self.runtime.store.event("security_failure", "Console request rejected",
+                                         data={"reason": reason, "suppressed": suppressed})
+            except (OSError, RuntimeError, sqlite3.Error):
+                pass  # 审计不可用不能改变认证判断或回显数据库异常。
+        return max(1, int(self._failure_window - now) + 1) if limited else 0
+
     def rotate_session(self):
-        """轮换访问令牌：旧链接与旧会话立即失效；server.json 同步更新，重启后仍有效。"""
-        self.token = secrets.token_urlsafe(32)
-        self.csrf = secrets.token_urlsafe(32)
-        self.url = self.origin + "/?token=" + self.token
-        path = self.runtime.store.root / "server.json"
-        try:
-            session = json.loads(path.read_text())
-        except (OSError, ValueError):
-            session = {}
-        session.update({"origin": self.origin, "local_origin": self.local_origin,
-                        "public_url": self.origin if self.origin != self.local_origin else None,
-                        "cookie": self.cookie, "token": self.token, "csrf": self.csrf,
-                        "url": self.url, "pid": os.getpid()})
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(session))
-        tmp.chmod(0o600)
-        os.replace(tmp, path)
-        return {"url": self.url, "csrf": self.csrf}
+        """先私有原子落盘，成功后发布新会话；失败时保留现有登录。"""
+        with self._session_lock:
+            token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            url = self.origin + "/?token=" + token
+            path = self.runtime.store.root / "server.json"
+            # 不读取旧 session 文件，避免跟随链接读取任意文件；会话字段均由监听器生成。
+            session = {"origin": self.origin, "local_origin": self.local_origin,
+                       "public_url": self.origin if self.origin != self.local_origin else None,
+                       "cookie": self.cookie, "token": token, "csrf": csrf,
+                       "url": url, "pid": os.getpid()}
+            atomic_json(path, session)
+            self.token, self.csrf, self.url = token, csrf, url
+            return {"url": url, "csrf": csrf}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -130,6 +262,95 @@ class Handler(BaseHTTPRequestHandler):
             # Aborted browser fetches are normal during navigation; do not retry a response to a closed socket.
             self.close_connection = True
 
+    def api_error(self, exc):
+        if isinstance(exc, RequestError):
+            self.respond({"error": str(exc)}, 400)
+            return
+        code = getattr(exc, "code", None)
+        code = code if isinstance(code, str) and (code in SAFE_ERROR_CODES or
+                    re.fullmatch(r"opencode_incompatible_[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", code)) else None
+        if isinstance(exc, UpdateInProgress):
+            self.respond({"error": "Software update in progress", "error_code": "update_in_progress"}, 503)
+        elif code:
+            key = "catalog_error" if isinstance(exc, (CenterError, CredentialError, CatalogError)) else "error_code"
+            self.respond({"error": "Request failed: " + code, key: code},
+                         409 if code == "auth_credentials_busy" else 400)
+        elif isinstance(exc, ValueError) and str(exc) in SAFE_VALIDATION_MESSAGES:
+            self.respond({"error": str(exc), "error_code": "validation_error"}, 400)
+        elif isinstance(exc, (ValueError, KeyError, TypeError)):
+            path = urlparse(self.path).path
+            if path in {"/api/config", "/api/model-center/routes"}:
+                self.respond({"error": "Check configuration field names, types, model routes and timezone",
+                              "error_code": "invalid_configuration"}, 400)
+            else:
+                self.respond({"error": "Invalid request", "error_code": "invalid_request"}, 400)
+        else:
+            self.respond({"error": "Request could not be completed", "error_code": "internal_error"}, 500)
+
+    def backup(self, path, params):
+        if not self.server._backup_gate.acquire(blocking=False):
+            self.respond({"error": "Backup downloads busy"}, 429, headers={"Retry-After": "1"})
+            return
+        try:
+            # 同一个 fd 用于检查、长度和传输；不跟随符号链接，不打开 FIFO 阻塞线程。
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+            try:
+                descriptor = os.open(path, flags)
+            except FileNotFoundError:
+                raise RequestError("Backup not found") from None
+            with os.fdopen(descriptor, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise RequestError("Invalid backup file")
+                size = info.st_size
+                if size > 1024 * 1024 * 1024:
+                    raise RequestError("Backup exceeds download size limit")
+                if params.get("format", [""])[0] == "json":
+                    import base64
+                    offset = int(params.get("offset", [0])[0])
+                    if not 0 <= offset <= size:
+                        raise RequestError("Invalid backup offset")
+                    stream.seek(offset)
+                    chunk = stream.read(min(512 * 1024, size - offset))
+                    self.respond({"data": base64.b64encode(chunk).decode("ascii"),
+                                  "size": size, "offset": offset, "length": len(chunk)})
+                    return
+                self.send_response(200)
+                self.headers_common()
+                self.send_header("Content-Type", "application/vnd.sqlite3")
+                self.send_header("Content-Length", str(size))
+                self.end_headers()
+                remaining = size
+                deadline = time.monotonic() + 120
+                try:
+                    while remaining:
+                        budget = deadline - time.monotonic()
+                        if budget <= 0:
+                            break
+                        self.connection.settimeout(min(self.timeout, budget))
+                        chunk = stream.read(min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                except OSError:
+                    pass  # 响应头已发出；断线或磁盘错误时只关闭连接，不再追加 JSON。
+                finally:
+                    self.close_connection = True
+        finally:
+            self.server._backup_gate.release()
+
+    def authentication_failure(self):
+        retry = self.server.security_failure("session_required", authentication=True)
+        if retry:
+            self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
+                         429, headers={"Retry-After": str(retry)})
+        elif self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+            self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
+        else:
+            self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
+        return False
+
     @staticmethod
     def _token_matches(received, expected):
         """常量时间比较；非 ASCII 输入按不匹配处理而不是抛 TypeError 重置连接。"""
@@ -141,6 +362,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def authenticated(self):
         if self.headers.get("Host") not in self.server.allowed_hosts:
+            self.server.security_failure("invalid_host")
             self.respond({"error": "Invalid Host"}, 403)
             return False
         try:
@@ -149,11 +371,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             token = ""
         if not self._token_matches(token, self.server.token):
-            if self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
-                self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
-            else:
-                self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
-            return False
+            return self.authentication_failure()
         return True
 
     def do_GET(self):
@@ -164,6 +382,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path in ["/install", "/install.js", "/install.css", "/i18n.js", "/manifest.webmanifest", "/sw.js", "/icon-192.png", "/icon-512.png", "/favicon.svg"]:
             if self.headers.get("Host") not in self.server.allowed_hosts:
+                self.server.security_failure("invalid_host")
                 self.respond({"error": "Invalid Host"}, 403)
                 return
             name = "install.html" if parsed.path == "/install" else parsed.path[1:]
@@ -213,26 +432,13 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/backup":
                 identifier = params.get("id", [""])[0]
                 if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
-                    raise ValueError("Invalid backup ID")
+                    raise RequestError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
-                if not path.is_file():
-                    # 不回显文件系统路径；只说明备份不存在。
-                    raise ValueError("Backup not found")
-                if params.get("format", [""])[0] == "json":
-                    import base64
-                    offset = int(params.get("offset", [0])[0])
-                    if offset < 0 or offset > path.stat().st_size:
-                        raise ValueError("Invalid backup offset")
-                    with path.open("rb") as stream:
-                        stream.seek(offset)
-                        chunk = stream.read(512 * 1024)
-                    self.respond({"data": base64.b64encode(chunk).decode("ascii"), "size": path.stat().st_size, "offset": offset, "length": len(chunk)})
-                else:
-                    self.respond(path.read_bytes(), content_type="application/vnd.sqlite3")
+                self.backup(path, params)
             elif parsed.path == "/api/task":
                 task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not task:
-                    raise ValueError("Task not found")
+                    raise RequestError("Task not found")
                 task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id", (task["id"],))
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
                 task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
@@ -245,11 +451,11 @@ class Handler(BaseHTTPRequestHandler):
                 requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
                 unknown = requested - {"core", "candidates", "analytics"}
                 if unknown:
-                    raise ValueError("Unknown state section: " + ", ".join(sorted(unknown)))
+                    raise RequestError("Unknown state section; expected core, candidates or analytics")
                 try:
                     global_config = runtime.config()
                 except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-                    raise ValueError("Global configuration is invalid: " + str(exc)) from None
+                    raise RequestError("Global configuration is invalid") from None
                 projects = store.query("SELECT * FROM projects ORDER BY created")
                 raw_project_configs = {}
                 for project in projects:
@@ -263,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                         project["overrides"] = overrides
                         project["config"] = runtime.config(project["id"])
                     except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-                        project["configuration_error"] = str(exc)
+                        project["configuration_error"] = configuration_error(exc, raw_config)
                         project["configured_paused"] = bool(project["paused"])
                         project["paused"] = True
                         project["overrides"] = overrides
@@ -300,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                         schedule["next_effective"] = runtime.next_effective_schedule(schedule["project"], schedule["due"])
                     except (ValueError, TypeError, KeyError, AttributeError) as exc:
                         if project:
-                            project["configuration_error"] = str(exc)
+                            project["configuration_error"] = configuration_error(exc, raw_project_configs.get(project["id"]))
                             project["configured_paused"] = bool(project["paused"])
                             project["paused"] = True
                             project["raw_overrides"] = raw_project_configs.get(project["id"])
@@ -345,7 +551,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/task-runs":
                 task = store.one("SELECT project FROM tasks WHERE id=?", (params.get("task", [""])[0],))
                 if not task or task["project"] != params.get("project", [""])[0]:
-                    raise ValueError("Task not found")
+                    raise RequestError("Task not found")
                 self.respond(store.query("SELECT id,project,task,state,started,ended FROM runs WHERE task=? ORDER BY started DESC LIMIT 100", (params["task"][0],)))
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
@@ -363,7 +569,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/run":
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
-                    raise ValueError("Run not found")
+                    raise RequestError("Run not found")
                 run["result"] = json.loads(run["result"])
                 run["config"] = json.loads(run["config"])
                 run["stages"] = store.query("SELECT stage,created FROM stages WHERE run=? ORDER BY created", (run["id"],))
@@ -375,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/patch":
                 run = store.one("SELECT path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run or not run["path"]:
-                    raise ValueError("Run has no artifacts")
+                    raise RequestError("Run has no artifacts")
                 path = Path(run["path"]) / "candidate.patch"
                 self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
             elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
@@ -387,24 +593,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(payload, content_type=(mimetypes.guess_type(str(path))[0] or "application/octet-stream") + "; charset=utf-8")
             else:
                 self.respond({"error": "Not found"}, 404)
-        except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
-            self.respond({"error": str(exc), **({"error_code": exc.code} if hasattr(exc, "code") else {})}, 400)
+        except Exception as exc:
+            self.api_error(exc)
 
     def do_POST(self):
         if not self.authenticated():
             return
         if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
+            self.server.security_failure("origin_or_csrf")
             self.respond({"error": "Invalid origin or CSRF token"}, 403)
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 100000:
-                raise ValueError("Invalid request size")
+                raise RequestError("Invalid request size")
             if self.headers.get_content_type() != "application/json":
-                raise ValueError("Expected application/json")
+                raise RequestError("Expected application/json")
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
-                raise ValueError("Expected an object")
+                raise RequestError("Expected an object")
             runtime = self.server.runtime
             path = urlparse(self.path).path
             if path.startswith("/api/auth/"):
@@ -455,7 +662,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     self.respond(list_models(body.get("provider")))
                 except CatalogError as exc:
-                    self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
+                    self.api_error(exc)
                 return
             if path == "/api/projects/import":
                 runtime.updates.require_ready()
@@ -471,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"started": True}
                 elif path == "/api/updates/apply":
                     if body.get("confirm") is not True:
-                        raise ValueError("Confirm installation and idle restart")
+                        raise RequestError("Confirm installation and idle restart")
                     runtime.updates.apply_async()
                     result = {"started": True}
                 elif path == "/api/config":
@@ -516,17 +723,13 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"id": Evolution(runtime).import_case(body["project"], body["manifest"])}
                 elif path == "/api/session/rotate":
                     # 轮换后旧链接立即失效；响应携带新 cookie，当前浏览器保持登录。
-                    result = self.server.rotate_session()
-                    self.respond(result, headers={"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))})
+                    with self.server._session_lock:
+                        result = self.server.rotate_session()
+                        self.respond(result, headers={"Set-Cookie": self.server.cookie_header(self.headers.get("Host"))})
                     return
                 else:
                     self.respond({"error": "Not found"}, 404)
                     return
                 self.respond(result)
-        except UpdateInProgress as exc:
-            self.respond({"error": str(exc), "error_code": exc.code}, 503)
-        except (CenterError, CredentialError, CatalogError) as exc:
-            self.respond({"error": str(exc), "catalog_error": exc.code}, 400)
-        except (ValueError, OSError, RuntimeError, KeyError, TypeError, sqlite3.Error) as exc:
-            status = 409 if getattr(exc, "code", "") == "auth_credentials_busy" else 400
-            self.respond({"error": str(exc), **({"error_code": exc.code} if hasattr(exc, "code") else {})}, status)
+        except Exception as exc:
+            self.api_error(exc)

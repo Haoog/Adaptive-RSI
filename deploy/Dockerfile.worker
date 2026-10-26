@@ -1,4 +1,7 @@
-FROM node:22-bookworm
+# 生产环境可将 NODE_IMAGE 覆盖为已核验的 node:22-bookworm@sha256:...。
+# Production builds can override NODE_IMAGE with a verified node:22-bookworm@sha256:... reference.
+ARG NODE_IMAGE=node:22-bookworm
+FROM ${NODE_IMAGE}
 ARG CODEX_VERSION=0.163.0
 # 固定为已验证的最低支持版本以保证可复现构建；代码同时兼容 OpenCode 2.x，
 # 升级本镜像前需在 Linux CI 完整通过 tests.test_opencode_integration。
@@ -7,4 +10,8 @@ RUN python3 --version && git --version \
     && npm install -g @openai/codex@${CODEX_VERSION} opencode-ai@${OPENCODE_VERSION} \
     && npm cache clean --force
 ENV PYTHONDONTWRITEBYTECODE=1 CI=1
+RUN mkdir -p /workspace && chown node:node /workspace
 WORKDIR /workspace
+# 默认交互运行不使用 root；执行器仍通过 --user 显式使用宿主 UID/GID。
+# Default interactive runs use a non-root user; executors still set the host UID/GID via --user.
+USER node

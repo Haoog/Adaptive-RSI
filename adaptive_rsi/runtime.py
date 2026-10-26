@@ -479,9 +479,9 @@ class Runtime:
                 self.store.execute("UPDATE projects SET paused=1")
             self.updates.restore_startup()
             self.store.recover()
-            # 重启恢复把未结束 run 置为 interrupted；这些任务是被进程中断而非自身失败，
-            # 重新排队等待执行（尝试计数保留，poison 任务仍受重试上限约束）。
-            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE state='interrupted'", (time.time(),))
+            # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
+            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
+                               "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
             self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
             self.thread.start()
         except BaseException:

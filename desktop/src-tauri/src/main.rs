@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::Mutex,
+    sync::{Mutex, RwLock},
     time::Duration,
 };
 use tauri::{
@@ -35,6 +35,7 @@ struct RuntimeState {
     local: Mutex<Option<Connection>>,
     child: Mutex<Option<Child>>,
     error: Mutex<String>,
+    request_gate: RwLock<()>,
     update: Mutex<Option<DesktopUpdate>>,
 }
 
@@ -87,9 +88,19 @@ fn update_client() -> Result<Client, String> {
 
 fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     let mut numbers = value.trim().split('.');
-    let major = numbers.next()?.parse().ok()?;
-    let minor = numbers.next()?.parse().ok()?;
-    let patch = numbers.next()?.parse().ok()?;
+    let number = |part: &str| {
+        if part.is_empty()
+            || !part.bytes().all(|c| c.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            None
+        } else {
+            part.parse::<u64>().ok()
+        }
+    };
+    let major = number(numbers.next()?)?;
+    let minor = number(numbers.next()?)?;
+    let patch = number(numbers.next()?)?;
     if numbers.next().is_some() {
         return None;
     }
@@ -112,13 +123,17 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
         }
     }
     // 检查失败必须与「没有新版」区分：返回带 check_error 的结构，由前端提示重试。
-    let check_failed = || -> Option<Value> { Some(json!({"check_error": true, "error": "check_failed"})) };
+    let check_failed =
+        || -> Option<Value> { Some(json!({"check_error": true, "error": "check_failed"})) };
     let client = match update_client() {
         Ok(client) => client,
         Err(_) => return check_failed(),
     };
     let response = match client
-        .get(format!("https://api.github.com/repos/{}/releases/latest", UPDATE_REPO))
+        .get(format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            UPDATE_REPO
+        ))
         .header("User-Agent", "Adaptive-RSI-updater")
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -133,15 +148,21 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
         Ok(value) => value,
         Err(_) => return check_failed(),
     };
-    let tag = match release.get("tag_name").and_then(Value::as_str) {
-        Some(tag) => tag.trim_start_matches('v').to_string(),
-        None => return check_failed(),
+    let update = match desktop_release(&release, &app.package_info().version.to_string()) {
+        Ok(update) => update,
+        Err(()) => return check_failed(),
     };
-    let current = app.package_info().version.to_string();
-    match (parse_version(&tag), parse_version(&current)) {
-        (Some(target), Some(now)) if target > now => {}
-        _ => return None,
-    }
+    let state = app.state::<RuntimeState>();
+    let mut guard = state.update.lock().unwrap();
+    *guard = update;
+    guard.as_ref().map(DesktopUpdate::json)
+}
+
+fn desktop_release(release: &Value, current: &str) -> Result<Option<DesktopUpdate>, ()> {
+    let tag = release.get("tag_name").and_then(Value::as_str).ok_or(())?;
+    let tag = tag.strip_prefix('v').unwrap_or(tag);
+    let target = parse_version(tag).ok_or(())?;
+    let now = parse_version(current).ok_or(())?;
     let dmg_name = format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", tag);
     let mut url = None;
     let mut sha_url = None;
@@ -156,7 +177,22 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
             }
         }
     }
-    let (url, sha_url) = (url?, sha_url?);
+    let valid_asset = |url: Option<String>| -> Result<String, ()> {
+        let url = url.ok_or(())?;
+        let parsed = reqwest::Url::parse(&url).map_err(|_| ())?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(());
+        }
+        Ok(url)
+    };
+    let (url, sha_url) = (valid_asset(url)?, valid_asset(sha_url)?);
+    if target <= now {
+        return Ok(None);
+    }
     let notes = release
         .get("body")
         .and_then(Value::as_str)
@@ -164,9 +200,7 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
         .chars()
         .take(16000)
         .collect::<String>();
-    let state = app.state::<RuntimeState>();
-    let mut guard = state.update.lock().unwrap();
-    *guard = Some(DesktopUpdate {
+    Ok(Some(DesktopUpdate {
         version: tag.to_string(),
         notes,
         url,
@@ -176,8 +210,7 @@ fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<
         percent: AtomicU64::new(0),
         downloading: AtomicBool::new(false),
         opened: AtomicBool::new(false),
-    });
-    guard.as_ref().map(DesktopUpdate::json)
+    }))
 }
 
 fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
@@ -191,7 +224,11 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 update.percent.store(0, Ordering::Relaxed);
                 update.error.clear();
                 update.error_code.clear();
-                (update.url.clone(), update.sha_url.clone(), update.version.clone())
+                (
+                    update.url.clone(),
+                    update.sha_url.clone(),
+                    update.version.clone(),
+                )
             }
             _ => return Err("No desktop update available".into()),
         }
@@ -246,7 +283,8 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 return Err("Download failed".into());
             }
             let total = response.content_length().unwrap_or(0);
-            let mut file = std::fs::File::create(&path).map_err(|_| "Cannot write download".to_string())?;
+            let mut file =
+                std::fs::File::create(&path).map_err(|_| "Cannot write download".to_string())?;
             let mut downloaded: u64 = 0;
             let mut buffer = [0u8; 65536];
             loop {
@@ -263,7 +301,9 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                     let state = app.state::<RuntimeState>();
                     let guard = state.update.lock().unwrap();
                     if let Some(update) = guard.as_ref() {
-                        update.percent.store(downloaded * 10000 / total, Ordering::Relaxed);
+                        update
+                            .percent
+                            .store(downloaded * 10000 / total, Ordering::Relaxed);
                     }
                 }
             }
@@ -324,11 +364,35 @@ impl PendingChild {
     }
 }
 
+// try_wait 同时负责回收；kill 失败或系统迟迟不回收时也不能无限 wait。
+fn wait_for_child(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {}
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn stop_child(child: &mut Child, grace: Duration) {
+    drop(child.stdin.take());
+    if !wait_for_child(child, grace) {
+        let _ = child.kill();
+        let _ = wait_for_child(child, Duration::from_secs(2));
+    }
+}
+
 impl Drop for PendingChild {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(child, Duration::ZERO);
         }
     }
 }
@@ -370,9 +434,19 @@ fn valid_api_path(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-')
 }
 fn call(c: &Connection, path: &str, body: Option<Value>) -> Result<Reply, String> {
+    call_with_session(c, path, body, None).map(|(reply, _)| reply)
+}
+
+fn call_with_session(
+    c: &Connection,
+    path: &str,
+    body: Option<Value>,
+    timeout: Option<Duration>,
+) -> Result<(Reply, Option<(String, String)>), String> {
     if !valid_api_path(path) {
         return Err("Invalid API path".into());
     }
+    let rotating = path.split('?').next() == Some("session/rotate") && body.is_some();
     let mut request = if let Some(data) = body {
         c.client
             .post(format!("{}/api/{}", c.origin, path))
@@ -385,10 +459,27 @@ fn call(c: &Connection, path: &str, body: Option<Value>) -> Result<Reply, String
     if let Some(cookie) = &c.cookie {
         request = request.header("Cookie", cookie);
     }
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     let response = request
         .send()
         .map_err(|_| "Cannot connect to the selected runtime".to_string())?;
     let status = response.status().as_u16();
+    let session_cookie = if rotating && response.status().is_success() {
+        response
+            .cookies()
+            .find(|cookie| {
+                c.cookie
+                    .as_deref()
+                    .and_then(|value| value.split_once('='))
+                    .map(|(name, _)| cookie.name() == name)
+                    .unwrap_or_else(|| cookie.name().starts_with("rsi_"))
+            })
+            .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+    } else {
+        None
+    };
     let mut data = Vec::new();
     response
         .take(16 * 1024 * 1024 + 1)
@@ -397,11 +488,53 @@ fn call(c: &Connection, path: &str, body: Option<Value>) -> Result<Reply, String
     if data.len() > 16 * 1024 * 1024 {
         return Err("Response too large".into());
     }
-    Ok(Reply {
+    let reply = Reply {
         status,
         body: String::from_utf8(data).map_err(|_| "Invalid response encoding")?,
-    })
+    };
+    let credentials = if rotating && (200..300).contains(&status) {
+        let value: Value =
+            serde_json::from_str(&reply.body).map_err(|_| "Invalid session response")?;
+        let csrf = value
+            .get("csrf")
+            .and_then(Value::as_str)
+            .filter(|csrf| !csrf.is_empty())
+            .ok_or("Missing runtime authentication")?;
+        Some((
+            session_cookie.ok_or("Missing runtime session cookie")?,
+            csrf.to_string(),
+        ))
+    } else {
+        None
+    };
+    Ok((reply, credentials))
 }
+
+fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Result<Reply, String> {
+    // 常规请求可并发；轮换需等已有请求结束，并在发布新凭据前阻止旧凭据请求。
+    let rotating = path.split('?').next() == Some("session/rotate") && body.is_some();
+    let _rotation = rotating.then(|| state.request_gate.write().unwrap());
+    let _request = (!rotating).then(|| state.request_gate.read().unwrap());
+    let connection = state
+        .target
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| state.error.lock().unwrap().clone())?;
+    let (reply, credentials) = call_with_session(&connection, path, body, None)?;
+    if let Some((cookie, csrf)) = credentials {
+        for slot in [&state.target, &state.local] {
+            if let Some(current) = slot.lock().unwrap().as_mut() {
+                if current.origin == connection.origin && current.csrf == connection.csrf {
+                    current.cookie = Some(cookie.clone());
+                    current.csrf = csrf.clone();
+                }
+            }
+        }
+    }
+    Ok(reply)
+}
+
 fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     if cfg!(target_os = "windows") {
         return Err("Use a Linux/macOS server connection on Windows".into());
@@ -457,6 +590,7 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         "PATH",
         std::env::join_paths(paths).map_err(|_| "Cannot prepare tool paths")?,
     );
+    let health_deadline = std::time::Instant::now() + Duration::from_secs(60);
     let child = command
         .arg("desktop-runtime")
         .stdin(Stdio::piped())
@@ -480,7 +614,7 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         let _ = sender.send(result);
     });
     let handshake = receiver
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(health_deadline.saturating_duration_since(std::time::Instant::now()))
         .ok()
         .and_then(Result::ok);
     let session = handshake.and_then(|line| serde_json::from_str::<Session>(&line).ok());
@@ -508,9 +642,35 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         }
         .into(),
     };
-    let health = call(&connection, "health", None)?;
-    if health.status != 200 {
-        return Err("Runtime authentication failed".into());
+    loop {
+        let remaining = health_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("Runtime did not become healthy within 60 seconds".into());
+        }
+        match call_with_session(
+            &connection,
+            "health",
+            None,
+            Some(remaining.min(Duration::from_secs(2))),
+        ) {
+            Ok((health, _)) if health.status == 200 => break,
+            Ok((health, _)) if health.status == 401 || health.status == 403 => {
+                return Err("Runtime authentication failed".into());
+            }
+            _ => {}
+        }
+        if child
+            .get_mut()
+            .try_wait()
+            .map_err(|_| "Cannot inspect runtime")?
+            .is_some()
+        {
+            return Err("Runtime exited before becoming healthy".into());
+        }
+        std::thread::sleep(
+            Duration::from_millis(200)
+                .min(health_deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
     let state = app.state::<RuntimeState>();
     *state.local.lock().unwrap() = Some(connection.clone());
@@ -520,19 +680,15 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
 }
 #[tauri::command]
 async fn request(
-    state: tauri::State<'_, RuntimeState>,
+    app: tauri::AppHandle,
     path: String,
     body: Option<Value>,
 ) -> Result<Reply, String> {
-    let connection = state
-        .target
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| state.error.lock().unwrap().clone())?;
-    tauri::async_runtime::spawn_blocking(move || call(&connection, &path, body))
-        .await
-        .map_err(|_| "Request interrupted".to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        proxy_request(&app.state::<RuntimeState>(), &path, body)
+    })
+    .await
+    .map_err(|_| "Request interrupted".to_string())?
 }
 #[tauri::command]
 fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
@@ -545,16 +701,22 @@ fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
 }
 #[tauri::command]
 async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, String> {
-    let state = app.state::<RuntimeState>();
     if url.as_deref().unwrap_or("").is_empty() {
-        let local = state
-            .local
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or("Local runtime is unavailable")?;
-        *state.target.lock().unwrap() = Some(local);
-        return Ok(runtime_info(state));
+        let handle = app.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            let state = handle.state::<RuntimeState>();
+            let _gate = state.request_gate.write().unwrap();
+            let local = state
+                .local
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("Local runtime is unavailable")?;
+            *state.target.lock().unwrap() = Some(local);
+            Ok(runtime_info(state.clone()))
+        })
+        .await
+        .map_err(|_| "Connection interrupted".to_string())?;
     }
     let input = url.unwrap();
     if input.len() > 8192 {
@@ -611,16 +773,21 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
     })
     .await
     .map_err(|_| "Connection interrupted")??;
-    *state.target.lock().unwrap() = Some(connection);
-    Ok(runtime_info(state))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RuntimeState>();
+        let _gate = state.request_gate.write().unwrap();
+        *state.target.lock().unwrap() = Some(connection);
+        runtime_info(state.clone())
+    })
+    .await
+    .map_err(|_| "Connection interrupted".to_string())
 }
 #[tauri::command]
 async fn check_desktop_update(app: tauri::AppHandle, force: Option<bool>) -> Option<Value> {
     let force = force.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || check_desktop_update_blocking(&app, force))
         .await
-        .ok()
-        .flatten()
+        .unwrap_or_else(|_| Some(json!({"check_error": true, "error": "check_failed"})))
 }
 #[tauri::command]
 async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
@@ -763,21 +930,15 @@ fn main() {
         }
         if let tauri::RunEvent::ExitRequested { .. } = event {
             if let Some(mut child) = app.state::<RuntimeState>().child.lock().unwrap().take() {
-                drop(child.stdin.take());
-                // 引擎正常会在 stdin 关闭后退出；卡死时限时强杀，避免应用退出被永久挂起。
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while child.try_wait().ok().flatten().is_none() {
-                    if std::time::Instant::now() > deadline {
-                        let _ = child.kill();
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                let _ = child.wait();
+                // 正常关闭最多十秒，强杀后回收也有独立上限。
+                stop_child(&mut child, Duration::from_secs(10));
             }
         }
     });
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {
