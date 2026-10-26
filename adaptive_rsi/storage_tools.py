@@ -31,29 +31,46 @@ def backup(store):
             Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
-def _missing_directories(path):
-    """Record ancestors this restore would create, nearest first, without touching existing ones."""
+def _create_directories(destination):
+    """Create missing directories one level at a time and own only the ones this process created."""
     missing = []
-    current = path
+    current = destination
     while not current.exists():
         missing.append(current)
         if current.parent == current:
             break
         current = current.parent
-    return missing
+    created = []
+    try:
+        for path in reversed(missing):
+            try:
+                path.mkdir(mode=0o700 if path == destination else 0o777)
+            except FileExistsError:
+                if path == destination:
+                    raise ValueError(
+                        "Restore requires a new state directory; existing state is never overwritten") from None
+                # Another process won the race for an ancestor; reuse it but never claim ownership.
+                continue
+            created.append(path)
+    except BaseException:
+        _discard_incomplete_restore(destination, list(reversed(created)))
+        raise
+    return list(reversed(created))
 
 
 def _discard_incomplete_restore(destination, created):
-    """Remove only a failed restore's own state files and still-empty new directories."""
-    base = destination / "state.sqlite3"
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        target = Path(str(base) + suffix)
-        try:
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-        except OSError:
-            pass
-    # rmdir preserves any pre-existing or concurrently added data; retry remains possible when empty.
+    """Remove only a failed restore's own state files and self-created empty directories."""
+    created = list(created)
+    if destination in created:  # A concurrent process may own the destination; never delete its files.
+        base = destination / "state.sqlite3"
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            target = Path(str(base) + suffix)
+            try:
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+            except OSError:
+                pass
+    # rmdir preserves pre-existing or concurrently added data; retry remains possible when empty.
     for path in created:
         try:
             path.rmdir()
@@ -71,14 +88,7 @@ def restore(source, destination):
             raise ValueError("Backup integrity check failed")
         for table in ["projects", "tasks", "runs", "settings"]:
             db.execute("SELECT * FROM " + table + " LIMIT 0")
-        created = _missing_directories(destination)
-        try:
-            destination.mkdir(mode=0o700, parents=True)
-        except FileExistsError:
-            raise ValueError("Restore requires a new state directory; existing state is never overwritten") from None
-        except BaseException:
-            _discard_incomplete_restore(destination, created)
-            raise
+        created = _create_directories(destination)
         try:
             target = destination / "state.sqlite3"
             with sqlite3.connect(str(target)) as out:

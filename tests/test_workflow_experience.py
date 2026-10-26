@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import pathlib
 import platform
 import sqlite3
 import tempfile
@@ -10,7 +11,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -1204,6 +1205,37 @@ class RestoreRetryTest(unittest.TestCase):
         restore(self.backup, destination)
         self.assertTrue((destination / "state.sqlite3").is_file())
         self.assertEqual(marker.read_text(), "keep me")
+
+    def test_failed_restore_keeps_a_parent_created_by_a_concurrent_process(self):
+        from adaptive_rsi.storage_tools import restore
+        race = (self.root / "race").resolve()
+        concurrent = race / "parent"
+        destination = concurrent / "restored"
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *args, **kwargs):
+            # Simulate another process creating this empty parent between our scan and mkdir.
+            if Path(path) == concurrent and not concurrent.exists():
+                real_mkdir(path, mode)
+                raise FileExistsError(errno.EEXIST, "File exists", str(path))
+            return real_mkdir(path, mode)
+
+        # Python 3.9 routes Path.mkdir through _NormalAccessor; newer versions call os.mkdir.
+        targets = [patch("os.mkdir", side_effect=mkdir)]
+        if hasattr(pathlib, "_NormalAccessor"):
+            targets.append(patch("pathlib._NormalAccessor.mkdir", side_effect=mkdir))
+        with ExitStack() as stack:
+            for target in targets:
+                stack.enter_context(target)
+            stack.enter_context(patch("adaptive_rsi.storage_tools.Store.recover",
+                                      side_effect=RuntimeError("injected restore failure")))
+            with self.assertRaisesRegex(RuntimeError, "injected restore failure"):
+                restore(self.backup, destination)
+        self.assertTrue(concurrent.is_dir(), "a parent created by another process must not be removed")
+        self.assertFalse(destination.exists())
+        restore(self.backup, destination)
+        self.assertTrue((destination / "state.sqlite3").is_file())
+        self.assertTrue(concurrent.is_dir())
 
     def test_symlinked_destination_is_rejected_without_touching_its_target(self):
         from adaptive_rsi.storage_tools import restore
