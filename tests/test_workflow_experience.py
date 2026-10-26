@@ -14,7 +14,6 @@ from contextlib import closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
-from types import SimpleNamespace
 
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.runtime import Runtime
