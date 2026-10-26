@@ -623,6 +623,61 @@ class ExperienceTest(unittest.TestCase):
                 self.assertEqual(set(directory.rglob("*")), before)
                 self.assertEqual((existing / "marker").read_bytes(), b"keep existing evidence")
 
+    def test_expired_monitoring_without_artifacts_completes_and_stops_scheduling(self):
+        from adaptive_rsi.delivery import feedback, monitoring_due, schedule
+        from adaptive_rsi.store import encode
+        run, directory, outcome = self.artifact_run()
+        config = self.runtime.config(self.project)
+        now = time.time()
+        outcome["merged_at"] = now - (config["limits"]["retention_days"] + 1) * 86400
+        self.store.execute("UPDATE runs SET path=NULL,result=? WHERE id=?", (encode(outcome), run["id"]))
+        run["path"] = None
+        with patch("adaptive_rsi.storage_tools.run_artifact_path", side_effect=AssertionError("expired monitoring must not inspect artifacts")), patch("adaptive_rsi.delivery.baseline") as fetch, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome, config, now)
+        self.assertTrue(outcome["monitoring_completed"])
+        self.assertTrue(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["monitoring_completed"])
+        self.assertFalse(monitoring_due(outcome, config, now + 61))
+        schedule(self.runtime, now + 61)
+        self.assertEqual(self.store.query("SELECT * FROM tasks WHERE source='system_delivery'"), [])
+        fetch.assert_not_called()
+        evaluate.assert_not_called()
+        self.assertFalse((directory / "feedback").exists())
+
+    def test_active_bad_evidence_does_not_complete_monitoring(self):
+        from adaptive_rsi.delivery import feedback, monitoring_due
+        run, directory, outcome = self.artifact_run()
+        (directory / "acceptance.json").write_text("[1]")
+        now = time.time()
+        config = self.runtime.config(self.project)
+        with patch("adaptive_rsi.delivery.baseline") as fetch, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome, config, now)
+        self.assertEqual(outcome["feedback"]["state"], "insufficient_evidence")
+        self.assertFalse(outcome.get("monitoring_completed", False))
+        self.assertTrue(monitoring_due(outcome, config, now + config["delivery"]["feedback_minutes"] * 60))
+        fetch.assert_not_called()
+        evaluate.assert_not_called()
+
+    def test_expired_monitoring_finishes_pending_investigation_before_completion(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        config = self.runtime.config(self.project)
+        now = time.time()
+        outcome["merged_at"] = now - (config["limits"]["retention_days"] + 1) * 86400
+        outcome["feedback"]["investigation_pending"] = True
+        with patch("adaptive_rsi.delivery.investigate", side_effect=RuntimeError("temporary investigation failure")) as investigate:
+            with self.assertRaisesRegex(RuntimeError, "investigation failure"):
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome, config, now)
+        investigate.assert_called_once()
+        self.assertFalse(outcome.get("monitoring_completed", False))
+        self.assertTrue(outcome["feedback"]["investigation_pending"])
+        def finish(*args):
+            outcome["feedback"]["investigation_pending"] = False
+        with patch("adaptive_rsi.delivery.investigate", side_effect=finish) as investigate, patch("adaptive_rsi.storage_tools.run_artifact_path", side_effect=AssertionError("expired monitoring must not inspect artifacts")):
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome, config, now)
+        investigate.assert_called_once()
+        self.assertTrue(outcome["monitoring_completed"])
+        self.assertFalse(outcome["feedback"]["investigation_pending"])
+
     def test_feedback_output_collision_or_write_failure_after_fetch_is_insufficient(self):
         from adaptive_rsi.delivery import feedback
         run, directory, outcome = self.artifact_run()

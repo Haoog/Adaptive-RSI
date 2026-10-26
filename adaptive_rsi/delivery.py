@@ -370,6 +370,12 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         return
     if outcome.get("feedback", {}).get("investigation_pending"):
         investigate(runtime, project, run, outcome)
+    # Expiration ends monitoring even when its local artifacts were not restored.
+    # Pending investigations above must finish (or remain retryable) before completion.
+    if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
+        outcome["monitoring_completed"] = True
+        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path
     saved = json.loads(run["config"])
 
@@ -423,10 +429,6 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         missing_artifacts()
         return
     previous = outcome.get("feedback", {})
-    if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
-        outcome["monitoring_completed"] = True
-        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
-        return
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
