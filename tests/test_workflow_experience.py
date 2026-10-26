@@ -14,6 +14,7 @@ from contextlib import closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
 
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.runtime import Runtime
@@ -385,6 +386,143 @@ class ExperienceTest(unittest.TestCase):
             restore(self.store.path, destination)
         self.assertNotIn("DO_NOT_EXPORT", json.dumps(diagnostics(self.store)))
         self.assertNotIn(str(self.root), json.dumps(diagnostics(self.store)))
+
+    def artifact_run(self):
+        from adaptive_rsi.store import encode
+        task = self.runtime.goal(self.project, "Keep private verification evidence")
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        (directory / "candidate.patch").write_bytes(b"PRIVATE original patch")
+        (directory / "acceptance.json").write_text(encode({"hash": "sealed-hash", "spec": {"files": []}}))
+        (directory / "dependencies").mkdir()
+        outcome = {"pr": "https://github.com/example/project/pull/7", "merged_sha": "a" * 40,
+                   "merged_at": time.time(), "evaluation": {"acceptance_hash": "sealed-hash"},
+                   "feedback": {"state": "verified", "head": "old-head"}}
+        self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(directory), run["id"]))
+        self.store.transition(run["id"], "merged", outcome, True)
+        self.store.put_setting("run-baseline:" + run["id"], {"repository": "example/project", "branch": "main", "sha": "base"})
+        return self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],)), directory, outcome
+
+    def patch_response(self, store, run):
+        from adaptive_rsi.server import Handler
+        handler = object.__new__(Handler)
+        handler.path = "/api/patch?id=" + run["id"]
+        handler.server = SimpleNamespace(runtime=SimpleNamespace(store=store))
+        handler.authenticated = lambda: True
+        responses = []
+        handler.respond = lambda data, status=200, **kwargs: responses.append((status, data))
+        handler.do_GET()
+        return responses[0]
+
+    def test_restore_detaches_private_artifacts_and_local_proofs_but_keeps_remote_receipts(self):
+        from adaptive_rsi.storage_tools import backup, restore, MISSING_ARTIFACTS
+        self.runtime.configure({"github": {"repository": "example/project"}}, self.project)
+        run, directory, outcome = self.artifact_run()
+        self.assertEqual(self.patch_response(self.store, run), (200, b"PRIVATE original patch"))
+        remote = {"delivery:" + run["id"]: {"head": "head", "base": "base", "branch": "main"},
+                  "automation:" + run["id"] + ":deploy": {"state": "submitted", "operation_id": "receipt"}}
+        for key, value in remote.items():
+            self.store.put_setting(key, value)
+        local_keys = [prefix + self.project for prefix in
+                      ("evaluation-baseline:", "verified-checks:", "task-proof:", "task-proof-current:")]
+        for key in local_keys:
+            self.store.put_setting(key, {"path": str(directory), "state": "pass"})
+        before = {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+        saved = backup(self.store)
+        destination = self.root / "restored-private"
+        restore(self.store.root / "backups" / (saved["id"] + ".sqlite3"), destination)
+        restored = Runtime(Store(destination))
+        try:
+            imported = restored.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+            self.assertIsNone(imported["path"])
+            self.assertEqual(imported["state"], "merged")
+            result = json.loads(imported["result"])
+            self.assertEqual(result["pr"], outcome["pr"])
+            self.assertEqual(result["feedback"]["previous"], outcome["feedback"])
+            self.assertEqual(result["feedback"]["reason"], MISSING_ARTIFACTS)
+            for key, value in remote.items():
+                self.assertEqual(restored.store.setting(key), value)
+            self.assertEqual(restored.store.setting("run-baseline:" + run["id"])["branch"], "main")
+            for key in local_keys:
+                self.assertIsNone(restored.store.setting(key))
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("private artifact read")):
+                self.assertEqual(self.patch_response(restored.store, imported)[0], 400)
+            restored.pause(self.project, False)
+            from adaptive_rsi.delivery import tick
+            receipt = remote["automation:" + run["id"] + ":deploy"]
+            with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project"), patch("adaptive_rsi.delivery.baseline") as baseline, patch("adaptive_rsi.delivery.snapshot") as snapshot, patch.object(restored.evaluator, "evaluate") as evaluate, patch("adaptive_rsi.release.reconcile", return_value=receipt) as reconcile:
+                tick(restored, time.time(), project_id=self.project)
+            reconcile.assert_called_once()
+            baseline.assert_not_called()
+            snapshot.assert_not_called()
+            evaluate.assert_not_called()
+            self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+            self.assertEqual(before, {p.relative_to(directory): p.read_bytes() for p in directory.rglob("*") if p.is_file()})
+            self.assertFalse((destination / "runs").exists())
+        finally:
+            restored.close()
+
+    def test_patch_and_feedback_reject_foreign_paths_and_symlinked_evidence(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        foreign = self.root / "foreign-run"
+        foreign.mkdir()
+        (foreign / "candidate.patch").write_bytes(b"FOREIGN private patch")
+        (foreign / "acceptance.json").write_text('{"hash":"sealed-hash"}')
+        for location in (foreign, directory):
+            with self.subTest(location=location):
+                if location == directory:
+                    for name in ("candidate.patch", "acceptance.json"):
+                        (directory / name).unlink()
+                        (directory / name).symlink_to(foreign / name)
+                self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(location), run["id"]))
+                current = {**run, "path": str(location)}
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("foreign patch read")), patch.object(Path, "read_text", side_effect=AssertionError("foreign acceptance read")):
+                    self.assertEqual(self.patch_response(self.store, current)[0], 400)
+                    with patch("adaptive_rsi.delivery.baseline") as baseline, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+                        feedback(self.runtime, self.runtime.project(self.project), current, dict(outcome), self.runtime.config(self.project), time.time())
+                    baseline.assert_not_called()
+                    evaluate.assert_not_called()
+        self.assertEqual(sorted(p.name for p in foreign.iterdir()), ["acceptance.json", "candidate.patch"])
+
+    def test_feedback_missing_required_acceptance_or_dependencies_never_evaluates(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        config = self.runtime.config(self.project)
+        for missing in ("acceptance", "dependencies"):
+            with self.subTest(missing=missing):
+                saved = json.loads(run["config"])
+                if missing == "acceptance":
+                    (directory / "acceptance.json").unlink()
+                else:
+                    (directory / "acceptance.json").write_text('{"hash":"sealed-hash"}')
+                    saved["environment"]["seed_paths"] = ["vendor"]
+                current = {**run, "config": json.dumps(saved)}
+                result = dict(outcome)
+                with patch("adaptive_rsi.delivery.baseline") as baseline, patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+                    feedback(self.runtime, self.runtime.project(self.project), current, result, config, time.time())
+                baseline.assert_not_called()
+                evaluate.assert_not_called()
+                self.assertEqual(result["feedback"]["state"], "insufficient_evidence")
+                self.assertIn("fresh verification", result["feedback"]["reason"])
+                self.assertFalse((directory / "feedback").exists())
+
+    def test_feedback_with_local_evidence_still_verifies_inside_own_run(self):
+        from adaptive_rsi.delivery import feedback
+        run, directory, outcome = self.artifact_run()
+        run["path"] = None  # Explicitly copied artifacts can recover a restored run's evidence.
+        def snapshot(source, target, sha):
+            target.mkdir(parents=True)
+            self.assertTrue(target.is_relative_to(directory))
+            return target
+        with patch("adaptive_rsi.delivery.baseline", return_value=("fixture", "new-head", "main")), patch("adaptive_rsi.delivery.snapshot", side_effect=snapshot), patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}) as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome, self.runtime.config(self.project), time.time())
+        self.assertEqual(outcome["feedback"]["state"], "verified")
+        self.assertEqual(evaluate.call_args.kwargs["acceptance"]["change_kind"], "preservation")
+        self.assertEqual(evaluate.call_args.kwargs["seeds"], directory / "dependencies")
+        self.assertTrue(evaluate.call_args.args[3].is_relative_to(directory))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_review_rejection_reaches_next_implementation_without_sealed_source(self):

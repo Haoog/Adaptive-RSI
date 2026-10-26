@@ -370,11 +370,34 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         return
     if outcome.get("feedback", {}).get("investigation_pending"):
         investigate(runtime, project, run, outcome)
+    from .storage_tools import MISSING_ARTIFACTS, run_artifact_path
+    saved = json.loads(run["config"])
+    try:
+        directory = run_artifact_path(runtime.store, run, "feedback/" + str(int(now)))
+        if not run_artifact_path(runtime.store, run).is_dir():
+            raise ValueError(MISSING_ARTIFACTS)
+        acceptance_path = run_artifact_path(runtime.store, run, "acceptance.json")
+        acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
+        expected_acceptance = outcome.get("evaluation", {}).get("acceptance_hash")
+        if expected_acceptance and (not acceptance or acceptance.get("hash") != expected_acceptance):
+            raise ValueError(MISSING_ARTIFACTS)
+        seeds = run_artifact_path(runtime.store, run, "dependencies")
+        for relative in saved["environment"]["seed_paths"]:
+            if not run_artifact_path(runtime.store, run, "dependencies/" + relative).is_dir():
+                raise ValueError(MISSING_ARTIFACTS)
+    except (ValueError, OSError):
+        previous = outcome.get("feedback", {})
+        if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
+            outcome["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
+                                   "previous": previous}
+            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
+        return
+    previous = outcome.get("feedback", {})
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
-    previous = outcome.get("feedback", {})
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
@@ -389,19 +412,15 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         outcome["feedback_polled_at"] = now
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
-    directory = Path(run["path"]) / "feedback" / str(int(now))
     baseline_tree = snapshot(source, directory / "baseline", outcome["merged_sha"])
     current_tree = snapshot(source, directory / "current", head)
     from .adapters import detect
-    acceptance_path = Path(run["path"]) / "acceptance.json"
-    acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
     if acceptance:
         acceptance["change_kind"] = "preservation"
-    checks = json.loads(run["config"])["checks"] or detect(baseline_tree)["checks"]
-    saved = json.loads(run["config"])
+    checks = saved["checks"] or detect(baseline_tree)["checks"]
     effective = {**config, "environment": saved["environment"]}
     result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, directory / "evaluation", effective,
-                                       cancel=cancel, acceptance=acceptance, seeds=Path(run["path"]) / "dependencies")
+                                       cancel=cancel, acceptance=acceptance, seeds=seeds)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state,

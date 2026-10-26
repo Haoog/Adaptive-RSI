@@ -1,4 +1,5 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
+import json
 import os
 import sqlite3
 import stat
@@ -46,12 +47,27 @@ def restore(source, destination):
             db.backup(out)
         target.chmod(0o600)
     store = Store(destination)
-    store.recover()
-    store.execute("UPDATE projects SET paused=1")
-    store.execute("UPDATE tasks SET state='expired' WHERE state='awaiting_approval'")
-    store.execute("UPDATE runs SET state='expired' WHERE state='awaiting_approval'")
-    # Machine paths and external credentials need reconnecting; pending side effects need reconciliation.
-    store.execute("UPDATE tasks SET state='blocked' WHERE source IN ('system_publish','system_delivery') AND state='queued'")
+    try:
+        store.recover()
+        with store.connect() as db:
+            db.execute("UPDATE projects SET paused=1")
+            db.execute("UPDATE tasks SET state='expired' WHERE state='awaiting_approval'")
+            db.execute("UPDATE runs SET state='expired' WHERE state='awaiting_approval'")
+            # Only the database was copied. Never retain access to the source state's files.
+            db.execute("UPDATE runs SET path=NULL")
+            for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
+                result = json.loads(row["result"])
+                result["feedback"] = {"state": "insufficient_evidence", "reason": MISSING_ARTIFACTS,
+                                      "previous": result.get("feedback", {})}
+                db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), row["id"]))
+            # Local verification caches describe artifacts/environments absent from this restore.
+            # Keep sealed remote identities, PR receipts and automation reconciliation state.
+            for prefix in ("evaluation-baseline:", "verified-checks:", "task-proof:", "task-proof-current:"):
+                db.execute("DELETE FROM settings WHERE substr(key,1,?)=?", (len(prefix), prefix))
+            # Machine paths and external credentials need reconnecting; pending side effects need reconciliation.
+            db.execute("UPDATE tasks SET state='blocked' WHERE source IN ('system_publish','system_delivery') AND state='queued'")
+    finally:
+        store.close()
     return {"restored": True, "paused": True, "artifacts_restored": False}
 
 
@@ -63,6 +79,24 @@ def _file_info(paths, follow_symlinks=False):
             continue  # SQLite sidecars can disappear during enumeration.
         if stat.S_ISREG(info.st_mode):
             yield path, info
+
+
+MISSING_ARTIFACTS = ("Run artifacts are unavailable in this state directory. Restore the original acceptance and "
+                     "dependency artifacts into this run's directory, or run fresh verification before release/deploy.")
+
+
+def run_artifact_path(store, run, name=""):
+    """Resolve artifacts only inside this state's own direct run directory."""
+    identifier = run["id"]
+    if not identifier or Path(identifier).parts != (identifier,) or identifier in (".", ".."):
+        raise ValueError(MISSING_ARTIFACTS)
+    expected = store.root / "runs" / identifier
+    # A user may explicitly copy missing artifacts into the new state after restoration.
+    directory = Path(run["path"] or expected).resolve()
+    target = (directory / name).resolve()
+    if directory != expected or not target.is_relative_to(directory):
+        raise ValueError(MISSING_ARTIFACTS)
+    return target
 
 
 def overview(store):
