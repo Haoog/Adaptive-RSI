@@ -287,6 +287,95 @@ test('delivery summary preserves existing custom settings and disables global au
   assert.equal(page.node('delivery-choice').disabled, true);
 });
 
+for (const kind of ['release', 'deploy']) {
+  for (const navigation of ['unchanged', 'same', 'project-away', 'project-round-trip', 'scope-away', 'scope-round-trip', 'clean-project-away', 'clean-scope-away']) {
+    test(`${kind} authorization acknowledges only its fields and preserves newer edits after ${navigation}`, async () => {
+      const page = browser(), fields = new Map(), posts = [];
+      const policy = {enabled: false, workflow: '.github/workflows/old.yml', ref: 'old', sha: 'b'.repeat(40)};
+      const config = {schedule: {weight: 1, working_hours: [0, 24]}, github: {labels: []}, checks: [],
+        delivery: {mode: 'pr', auto_merge: false, release: {...policy}, deploy: {...policy, health_url: 'https://old.test/health', automatic_rollback: false}}};
+      for (const path of ['schedule.weight', ...['release', 'deploy'].flatMap(type => Object.keys(config.delivery[type]).map(name => `delivery.${type}.${name}`))]) {
+        const value = path.split('.').reduce((node, key) => node[key], config);
+        fields.set(path, Object.assign(page.node(path), {type: typeof value === 'boolean' ? 'checkbox' : typeof value === 'number' ? 'number' : 'text', dataset: {path}}));
+      }
+      const all = [...fields.values()];
+      page.document.querySelectorAll = selector => selector === '[data-path]' ? all : [];
+      page.document.querySelector = selector => fields.get(selector.match(/data-path="([^"]+)"/)?.[1]) || null;
+      page.node('settings-form').querySelectorAll = selector => ['input,textarea,select', '[data-path]'].includes(selector) ? all : [];
+      page.node('settings-form').querySelector = page.document.querySelector;
+      page.node('config-scope').value = 'project'; page.node('schedule-mode').value = 'custom';
+      page.node('work-start').value = '0'; page.node('work-end').value = '24'; page.node('checks-json').value = '[]';
+      page.context.initialState.config = structuredClone(config);
+      page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); });
+      // Exercise production draft restoration and navigation without unrelated rendering or requests.
+      vm.runInContext(`view="settings";syncDelivery=()=>{};renderNavigation=()=>{};
+        renderSettings=()=>{settingsBaseline=structuredClone(settingsKey()==="global"?state.config:currentProject().config);settingsContext=settingsKey();settingsModes.set(settingsBaseline,"custom");
+          for(const node of document.querySelectorAll('[data-path]')){const value=getPath(settingsBaseline,node.dataset.path);node.value=node.type==="checkbox"?"on":String(value);node.checked=node.type==="checkbox"?value:false;}
+          settingsClean.set(settingsContext,JSON.stringify(settingsValues()));restoreSettingsDraft();};
+        render=()=>{if(!settingsBaseline)renderSettings();};render();`, page.context);
+      page.context.refresh = async () => {};
+      const edit = (path, value) => { const node = fields.get(path); if (node.type === 'checkbox') node.checked = value; else node.value = value; page.input(path, 'settings-form'); page.context.stashSettings(); };
+      const switchProject = project => { page.node('project-select').value = project; page.node('project-select').handlers.change(); };
+      const switchScope = scope => page.context.changeSettingsScope(scope);
+      let finish;
+      const authorization = {enabled: true, workflow: '.github/workflows/chosen.yml', ref: 'trusted', sha: 'a'.repeat(40)};
+      page.context.fetch = async (_url, options) => {
+        posts.push(JSON.parse(options.body));
+        if (posts.length === 1) return new Promise(resolve => { finish = () => resolve(response({...authorization, health_url: 'https://old.test/health', automatic_rollback: false})); });
+        return response({saved: true});
+      };
+      page.node('release-workflow-list').value = authorization.workflow;
+      const pending = page.context.authorizeRelease(kind);
+      if (navigation !== 'unchanged') {
+        // Returning to the original false value is still a newer explicit disable choice.
+        edit(`delivery.${kind}.enabled`, true); edit(`delivery.${kind}.enabled`, false);
+        if (!navigation.startsWith('clean-')) edit(`delivery.${kind}.workflow`, '.github/workflows/newer.yml');
+      }
+      const other = kind === 'release' ? 'deploy' : 'release', cleanReturn = navigation.startsWith('clean-');
+      if (!cleanReturn) {
+        edit(`delivery.${other}.ref`, 'other-kind-draft');
+        edit('delivery.deploy.health_url', 'https://newer.test/health');
+        edit('delivery.deploy.automatic_rollback', true);
+        edit('schedule.weight', '2');
+      } else {
+        assert.equal(vm.runInContext('settingsDrafts.has("a")', page.context), false, 'returning to clean removes the draft');
+      }
+      if (navigation.includes('project-')) switchProject('b');
+      if (navigation.includes('scope-')) switchScope('global');
+      if (navigation.endsWith('round-trip')) {
+        edit('schedule.weight', '4');
+        if (navigation.startsWith('project-')) switchProject('a'); else switchScope('project');
+      }
+      const visibleBefore = JSON.stringify(page.context.settingsValues());
+      finish(); await pending;
+      if (navigation.endsWith('away')) {
+        assert.equal(JSON.stringify(page.context.settingsValues()), visibleBefore, 'acknowledgement must not touch another scope');
+        if (navigation.includes('project-')) switchProject('a'); else switchScope('project');
+      }
+      assert.equal(fields.get(`delivery.${kind}.enabled`).checked, navigation === 'unchanged');
+      assert.equal(fields.get(`delivery.${kind}.workflow`).value, navigation === 'unchanged' || cleanReturn ? authorization.workflow : '.github/workflows/newer.yml');
+      assert.equal(fields.get(`delivery.${kind}.ref`).value, 'trusted', 'untouched field accepts the acknowledgement');
+      assert.equal(fields.get(`delivery.${kind}.sha`).value, authorization.sha);
+      assert.equal(fields.get(`delivery.${other}.ref`).value, cleanReturn ? 'old' : 'other-kind-draft');
+      assert.equal(fields.get('delivery.deploy.health_url').value, cleanReturn ? 'https://old.test/health' : 'https://newer.test/health');
+      assert.equal(fields.get('delivery.deploy.automatic_rollback').checked, !cleanReturn);
+      assert.equal(fields.get('schedule.weight').value, cleanReturn ? '1' : '2');
+      assert.deepEqual(JSON.parse(vm.runInContext(`JSON.stringify(settingsBaseline.delivery.${kind})`, page.context)), {...config.delivery[kind], ...authorization});
+      if (navigation !== 'unchanged') assert.equal(vm.runInContext(`draftStore.get("settings","a").values.find(entry=>entry.path==="delivery.${kind}.enabled").baselineValue`, page.context), true);
+      await page.submit('settings-form');
+      assert.equal(posts[1].project, 'a');
+      const expectedKindPatch = {...(navigation === 'unchanged' ? {} : cleanReturn ? {enabled: false} : {enabled: false, workflow: '.github/workflows/newer.yml'}), ...(kind === 'deploy' && !cleanReturn ? {health_url: 'https://newer.test/health', automatic_rollback: true} : {})};
+      assert.deepEqual(posts[1].values.delivery[kind] || {}, expectedKindPatch);
+      if (cleanReturn) assert.deepEqual(posts[1].values, {delivery: {[kind]: {enabled: false}}});
+      else {assert.equal(posts[1].values.delivery[other].ref, 'other-kind-draft');assert.equal(posts[1].values.schedule.weight, 2);}
+      if (navigation.endsWith('round-trip')) {
+        if (navigation.startsWith('project-')) switchProject('b'); else switchScope('global');
+        assert.equal(fields.get('schedule.weight').value, '4', 'the other scope retains its draft');
+      }
+    });
+  }
+}
+
 test('out-of-order task details cannot attach cancellation for the previous task', async () => {
   const page = browser(), cancellations = [];
   const task = id => ({id, project: 'a', title: 'Task ' + id, body: '', evidence: '[]', state: 'executing'});
@@ -1143,8 +1232,155 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
+for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
+  const page=browser();let release,callback;
+  const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
+  // Expose the production closure with only rendering/load stubbed for this focused ownership test.
+  const instrumented=modelSource.replace('  init();','').replace('  return {show:(requested=null,reload=false)=>{',
+    '  return {testSetup(){renderProvider=()=>{};load=async()=>{};active="openai";scope="a";return ()=>fetchProvider("openai","a",true);},testSwitch(){active="opencode";setStatus("Provider B feedback");},show:(requested=null,reload=false)=>{');
+  page.context.english={};vm.runInContext(instrumented,page.context);
+  page.context.fetch=async()=>new Promise(resolve=>{release=()=>resolve(response({},fails?503:200));});
+  callback=page.context.window.RSIModelCenter.testSetup();
+  const result=callback();page.context.window.RSIModelCenter.testSwitch();release();
+  if(fails)await assert.rejects(result);else await result;
+  assert.equal(page.node('mc-feedback').textContent,'Provider B feedback');
+});
+
+async function authCompletionPage({failure='',direct=false,hold=''}={}) {
+  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
+  const tick=()=>new Promise(setImmediate),session={id:'completion-A',backend:'codex',provider:null,state:'awaiting_authorization',method:direct?'code':'auto'};
+  let release,held=false;
+  const waitHeld=async stage=>{if(hold===stage&&!held){held=true;await new Promise(resolve=>{release=resolve;});}};
+  page.context.fetch=async(url,options={})=>{
+    if(url.endsWith('/api/auth/status')){
+      calls.status++;if(calls.status>1){await waitHeld('status');if(calls.status===2&&failure==='status')return response({},503);if(failure==='session_required')return response({},401);}
+      return response({sessions:calls.status===1?[session]:[],codex:{available:true,state:calls.status===1?'signed_out':'authenticated'}});
+    }
+    if(url.includes('/api/auth/session?id=')){calls.session++;if(url.includes('completion-B'))return response({...session,id:'completion-B',state:'starting'});return response({...session,state:calls.session===1?'awaiting_authorization':'completed'});}
+    if(url.endsWith('/api/auth/complete')){calls.complete++;return response({...session,state:'completed'});}
+    if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});
+    if(url.endsWith('/api/auth/start')){calls.start++;return response({...session,id:'completion-B',state:'starting'});}
+    if(url.endsWith('/api/auth/logout'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('openai',async()=>{
+    calls.catalog++;await waitHeld('catalog');
+    if(calls.catalog===1&&failure==='catalog')throw Object.assign(new Error('Catalog unavailable'),{status:503});
+  });
+  await tick();await tick();
+  return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
+    async finish(){
+      if(direct){const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='TEST-CODE';form.handlers.submit({preventDefault(){}});}
+      else page.fireTimer(1500);
+      await tick();await tick();
+    }};
+}
+
+for(const direct of [false,true])for(const failure of ['status','catalog']){
+  test(`completed auth retries ${failure} refresh after ${direct?'code submission':'poll'} without repeating OAuth`,async()=>{
+    const run=await authCompletionPage({failure,direct});await run.finish();
+    assert.match(run.text(),/更新失败，正在重试/);
+    assert.equal(run.calls.catalog,failure==='status'?0:1);
+    run.page.fireTimer(1500);await run.tick();await run.tick();
+    assert.doesNotMatch(run.text(),/更新失败/);
+    assert.equal(run.calls.status,failure==='status'?3:2);
+    assert.equal(run.calls.catalog,failure==='status'?1:2);
+    assert.equal(run.calls.session,direct?1:2);
+    assert.equal(run.calls.complete,direct?1:0);
+    assert.equal(run.calls.start,0);
+    assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+  });
+}
+
+test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
+  const run=await authCompletionPage({failure:'session_required'});await run.finish();
+  assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
+  assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+for(const hold of ['status','catalog'])for(const restart of [false,true]){
+  test(`completion ${hold} pending cannot revive auth after ${restart?'restart':'cancel or logout'}`,async()=>{
+    const run=await authCompletionPage({hold,failure:hold==='status'?'session_required':'catalog'});await run.finish();
+    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'取消登录':'退出账号'));
+    assert.ok(button);button.handlers.click();await run.page.context.lastAction;
+    if(restart){
+      run.walk(run.page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});await run.page.context.lastAction;
+    }
+    run.release();await run.tick();await run.tick();
+    assert.equal(run.calls.catalog,hold==='status'?0:1);
+    assert.doesNotMatch(run.text(),/更新失败/);
+    if(restart)assert.match(run.text(),/正在准备官方登录/);
+    else assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+  });
+}
+
+test('pending completion catalog refresh cannot invoke duplicate callbacks',async()=>{
+  const run=await authCompletionPage({hold:'catalog'});await run.finish();
+  run.page.fireTimer(1500);await run.tick();assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.equal(run.calls.catalog,1);
+  assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
 test('the live run stage marks an in-progress review before its stage row exists', () => {
   const page = browser();
   assert.equal(vm.runInContext('runningStage({state:"evaluating",stage:"review"})', page.context), '正在评审改动');
   assert.equal(vm.runInContext('runningStage({state:"evaluating",last_stage:"review"})', page.context), '正在评审改动');
 });
+
+for (const restart of [false, true]) {
+  for (const reply of ['awaiting_authorization', 'completed', 'unknown_session', 'temporary_failure', 'session_required']) {
+    test(`stale auth poll ${reply} cannot replace ${restart ? 'a restarted' : 'a cancelled'} login`, async () => {
+      const page = browser(), requests = [];
+      const walk = node => [node, ...(node.children || []).flatMap(walk)];
+      const visibleText = () => walk(page.node('mc-auth')).map(node => node.textContent || '').join(' ');
+      const tick = () => new Promise(setImmediate);
+      const old = {id: 'old-session', backend: 'codex', provider: null, state: 'awaiting_authorization', method: 'auto', user_code: 'OLD-TEST-CODE'};
+      const replacement = {...old, id: 'replacement-session', state: 'starting', user_code: undefined};
+      let oldReads = 0, releaseOld, refreshes = 0;
+      page.context.fetch = async (url, options = {}) => {
+        requests.push({url, body: options.body ? JSON.parse(options.body) : null});
+        if (url.endsWith('/api/auth/status')) return response({sessions: [old], codex: {available: true, state: 'signed_out'}});
+        if (url.includes('/api/auth/session?id=old-session')) {
+          if (++oldReads === 1) return response(old);
+          return new Promise(resolve => {
+            releaseOld = () => resolve(
+              reply === 'unknown_session' ? response({error_code: reply}, 404) :
+              reply === 'temporary_failure' ? response({error: 'temporary'}, 503) :
+              reply === 'session_required' ? response({}, 401) : response({...old, state: reply}));
+          });
+        }
+        if (url.includes('/api/auth/session?id=replacement-session')) return response({...replacement, state: 'awaiting_authorization', user_code: 'NEW-TEST-CODE'});
+        if (url.endsWith('/api/auth/cancel')) return response({...old, state: 'cancelled', user_code: undefined});
+        if (url.endsWith('/api/auth/start')) return response(replacement);
+        throw new Error('Unexpected request ' + url);
+      };
+      vm.runInContext(authSource, page.context);
+      page.context.window.RSIAuth.show('openai', async () => { refreshes++; });
+      await tick(); await tick();
+      page.fireTimer(1500); await tick();
+      assert.equal(typeof releaseOld, 'function', 'the old session poll must be pending');
+      walk(page.node('mc-auth')).find(node => node.textContent === '取消登录').handlers.click();
+      await page.context.lastAction;
+      assert.match(visibleText(), /已取消登录/);
+      if (restart) {
+        walk(page.node('mc-auth')).find(node => node.tagName === 'FORM').handlers.submit({preventDefault() {}});
+        await page.context.lastAction;
+        assert.equal(requests.filter(request => request.url.endsWith('/api/auth/start')).length, 1);
+      }
+      releaseOld(); await tick(); await tick();
+      assert.doesNotMatch(visibleText(), /OLD-TEST-CODE|控制台登录已失效|登录已中断|授权状态已保留/);
+      assert.equal(refreshes, 0, 'discarded completion must not refresh the model catalog');
+      if (restart) {
+        assert.match(visibleText(), /正在准备官方登录/);
+        page.fireTimer(1500); await tick(); await tick();
+        assert.match(visibleText(), /NEW-TEST-CODE/);
+        assert.equal(requests.filter(request => request.url.includes('session?id=replacement-session')).length, 1);
+      } else {
+        assert.match(visibleText(), /已取消登录/);
+        assert.equal(page.timers.filter(timer => timer.active && timer.delay === 1500).length, 0);
+      }
+    });
+  }
+}

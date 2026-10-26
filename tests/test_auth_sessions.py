@@ -440,6 +440,117 @@ class AuthSessionTests(unittest.TestCase):
                 worker.temp.cleanup()
         self.assertEqual(manager.providers_cache, {}, "close should clear the providers cache")
 
+    def test_oauth_completion_invalidates_caches_populated_during_authorization(self):
+        self.manager.close()
+        self.manager = AuthSessions(self.root / "oauth-completion-cache", ttl=5)
+        with patch.object(self.manager, "factory", side_effect=lambda backend, cancel=None: self.factory(backend)), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            session = self.manager.start("opencode", "openai")
+            self.wait_state(session, "awaiting_authorization")
+            self.assertEqual(self.manager.snapshot()["opencode"]["state"], "signed_out")
+            self.manager.providers("opencode")
+            self.assertIn("opencode", self.manager.status_cache)
+            self.assertIn("opencode", self.manager.providers_cache)
+
+            self.gate.set()
+            self.wait_state(session, "completed")
+            self.assertNotIn("opencode", self.manager.status_cache)
+            self.assertNotIn("opencode", self.manager.providers_cache)
+            account = self.manager.snapshot()["opencode"]
+            self.assertEqual(account["state"], "authenticated")
+            self.assertEqual(account["authenticated_providers"], ["openai"])
+
+    def test_inflight_discovery_cannot_repopulate_caches_after_auth_changes(self):
+        for operation in ("save", "logout", "set_api_key", "start"):
+            with self.subTest(operation=operation):
+                self.manager.close()
+                self.manager = AuthSessions(self.root / ("inflight-" + operation), ttl=5)
+                self.gate = threading.Event()
+                path = self.root / "data/opencode/auth.json"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"openai": {"type": "api", "key": "TEST-KEY"}}
+                                          if operation == "logout" else {}))
+                entered = {kind: threading.Event() for kind in ("status", "providers")}
+                release = threading.Event()
+                calls = {kind: 0 for kind in entered}
+                errors = []
+
+                def discover(kind):
+                    calls[kind] += 1
+                    connected = "openai" in json.loads(path.read_text())
+                    if calls[kind] == 1:
+                        entered[kind].set()
+                        if not release.wait(3):
+                            raise AssertionError("Discovery was not released")
+                    return connected
+
+                class Discovery(FakeAuth):
+                    def providers(worker):
+                        rows = super().providers()
+                        rows[0]["connected"] = discover("providers")
+                        return rows
+
+                def factory(backend, cancel=None):
+                    worker = Discovery(backend, self.gate)
+                    self.created.append(worker)
+                    return worker
+
+                def lookup(kind):
+                    try:
+                        if kind == "status":
+                            self.manager.snapshot()
+                        else:
+                            self.manager.providers("opencode")
+                    except Exception as exc:
+                        errors.append(exc)
+
+                with patch.object(self.manager, "factory", side_effect=factory), patch(
+                        "adaptive_rsi.auth_sessions.shutil.which", return_value=None), patch(
+                        "adaptive_rsi.auth_sessions.auth_providers",
+                        side_effect=lambda *args: ["openai"] if discover("status") else []):
+                    if operation == "save":
+                        session = self.manager.start("opencode", "openai")
+                        self.wait_state(session, "awaiting_authorization")
+                    threads = [threading.Thread(target=lookup, args=(kind,)) for kind in entered]
+                    try:
+                        for thread in threads:
+                            thread.start()
+                        for event in entered.values():
+                            self.assertTrue(event.wait(1), "Discovery did not capture the old credentials")
+                        if operation == "save":
+                            self.gate.set()
+                            self.wait_state(session, "completed")
+                        elif operation == "logout":
+                            self.manager.logout("opencode", "openai")
+                        elif operation == "set_api_key":
+                            self.manager.set_api_key("opencode", "openai", "TEST-NEW-KEY")
+                        else:
+                            session = self.manager.start("opencode", "openai")
+                            self.wait_state(session, "awaiting_authorization")
+
+                        expected = operation in {"save", "set_api_key"}
+                        self.assertEqual(bool(self.manager.snapshot()["opencode"]["authenticated_providers"]), expected)
+                        self.assertEqual(self.manager.providers("opencode")[0]["connected"], expected)
+                        fresh_calls = dict(calls)
+                        fresh_status = self.manager.status_cache["opencode"]
+                        fresh_providers = self.manager.providers_cache["opencode"]
+                        # 先发布新结果，再允许旧发现返回，验证旧结果不能覆盖新缓存。
+                        release.set()
+                        for thread in threads:
+                            thread.join(1)
+                            self.assertFalse(thread.is_alive())
+                        self.assertEqual(errors, [])
+                        self.assertIs(self.manager.status_cache["opencode"], fresh_status)
+                        self.assertIs(self.manager.providers_cache["opencode"], fresh_providers)
+                        self.assertEqual(bool(self.manager.snapshot()["opencode"]["authenticated_providers"]), expected)
+                        self.assertEqual(self.manager.providers("opencode")[0]["connected"], expected)
+                        self.assertEqual(calls, fresh_calls, "Fresh discoveries should remain cached")
+                    finally:
+                        release.set()
+                        for thread in threads:
+                            thread.join(2)
+                        self.manager.close()
+
     def test_custom_factory_providers_skip_cache(self):
         first = self.manager.providers("opencode")
         second = self.manager.providers("opencode")

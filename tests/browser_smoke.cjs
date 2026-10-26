@@ -64,12 +64,12 @@ async function checkReleaseRetryUI(browser,url,errors){
 async function checkAccountAndReleaseUI(browser,url,errors){
  const page=await browser.newPage({viewport:{width:1100,height:900}}),requests=[];
  page.on('pageerror',error=>errors.push(error.message));
- let signedIn=false,complete=false,authActive=false,releaseStarted,authStarts=0,pollTransientFailure=true;
+ let signedIn=false,complete=false,authActive=false,releaseStarted,authStarts=0,pollTransientFailure=true,completionStatusFailures=0,catalogFailures=0;
  const session={id:'browser-auth-session',backend:'codex',provider:null,state:'awaiting_authorization',method:'code',verification_url:'https://auth.openai.com/device',user_code:'TEST-1234',expires_at:Math.floor(Date.now()/1000)+600};
  const reply=(route,data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
  await page.route('**/api/auth/**',async route=>{
   const path=new URL(route.request().url()).pathname,body=route.request().postDataJSON();requests.push({path,body});
-  if(path.endsWith('/status'))return reply(route,{codex:{state:signedIn?'authenticated':'signed_out'},opencode:{state:'signed_out',authenticated_providers:[]},sessions:authActive?[session]:[]});
+  if(path.endsWith('/status')){if(complete&&completionStatusFailures++===0)return reply(route,{error:'Temporary status failure'},503);return reply(route,{codex:{state:signedIn?'authenticated':'signed_out'},opencode:{state:'signed_out',authenticated_providers:[]},sessions:authActive?[session]:[]});}
   if(path.endsWith('/providers'))return reply(route,[{id:'openai',name:'OpenAI',methods:[{index:0,label:'Official login',type:'oauth',supported:true},{index:1,label:'API key',type:'api'}]},{id:'github-copilot',name:'GitHub Copilot',methods:[{index:0,label:'Device login',type:'oauth',supported:true,prompts:[{type:'select',key:'deployment',message:'Account type',options:[{label:'GitHub.com',value:'public'},{label:'Enterprise',value:'enterprise'}]},{type:'text',key:'domain',message:'Enterprise domain',when:{key:'deployment',op:'eq',value:'enterprise'}}]}]}]);
   if(path.endsWith('/start')){authStarts++;if(body.backend==='opencode'){await new Promise(resolve=>{releaseStarted=resolve;});return reply(route,{...session,id:'opencode-session',backend:'opencode',provider:body.provider});}complete=false;authActive=true;return reply(route,session);}
   if(path.endsWith('/session')){if(authActive&&pollTransientFailure){pollTransientFailure=false;return reply(route,{error_code:'temporary_network_error',error:'temporary network failure'},503);}if(complete){signedIn=true;authActive=false;}return reply(route,{...session,state:complete?'completed':'awaiting_authorization'});}
@@ -79,7 +79,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   return reply(route,{ok:true});
  });
  let catalogs=0,probes=0;
- await page.route('**/api/model-center/fetch',route=>{catalogs++;return reply(route,{ok:true});});
+ await page.route('**/api/model-center/fetch',route=>{catalogs++;if(catalogFailures++===0)return reply(route,{error:'Temporary catalog failure'},503);return reply(route,{ok:true});});
  await page.route('**/api/model-center/probe',route=>{probes++;return reply(route,{ok:true});});
  await page.route('**/api/release-workflows?*',route=>reply(route,{workflows:[{workflow:'.github/workflows/release.yml',name:'Release',compatible:true}]}));
  await page.route('**/api/release-authorize',route=>{requests.push({path:'/api/release-authorize',body:route.request().postDataJSON()});return reply(route,{enabled:true,workflow:'.github/workflows/release.yml',ref:'rsi-workflow-test',sha:'a'.repeat(40)});});
@@ -95,7 +95,8 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.getByRole('button',{name:'取消登录',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'已取消登录'}).waitFor();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();await code.fill('official-code');await page.getByRole('button',{name:'完成授权',exact:true}).click();
   await page.locator('#mc-auth').filter({hasText:'账号已连接'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/complete')).body.code,'official-code');
-  await page.waitForFunction(()=>document.getElementById('mc-feedback').textContent.includes('模型列表已更新'));assert.equal(catalogs,1);assert.equal(probes,0);
+  await page.waitForFunction(()=>document.getElementById('mc-feedback').textContent.includes('模型列表已更新'));assert.equal(catalogs,2);assert(completionStatusFailures>=2);assert.equal(probes,0);assert.equal(authStarts,2);assert.equal(requests.filter(r=>r.path.endsWith('/complete')).length,1);
+  await page.waitForTimeout(1650);assert.equal(catalogs,2,'successful completion refresh must stop retrying');
   await page.getByRole('button',{name:'退出账号',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'尚未登录'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/logout')).body.provider,null);
   await page.getByRole('button',{name:'OpenCode',exact:true}).click();await page.locator('#mc-auth-provider').selectOption('github-copilot');
   const domain=page.getByLabel('Enterprise domain');assert.equal(await domain.isVisible(),false);await page.getByLabel('Account type').selectOption('enterprise');await domain.fill('github.example.com');

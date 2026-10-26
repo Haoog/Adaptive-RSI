@@ -7,7 +7,7 @@ const statusNames = {expired:'候选已过期',releasing:'正在发布',deployin
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量检查',system_deep:'深度检查',system_issues:'GitHub 问题同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
-const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), goalDrafts=new Map(), goalDraftRevisions=new Map();
+const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), settingsFieldRevisions=new Map(), goalDrafts=new Map(), goalDraftRevisions=new Map();
 let navigationSequence=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
@@ -62,7 +62,10 @@ const apiErrors={
  "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
-for(const type of ['input','change','reset'])document.addEventListener(type,event=>reviseForm(event.target.closest('form')),true);
+for(const type of ['input','change','reset'])document.addEventListener(type,event=>{
+ const form=event.target.closest('form');reviseForm(form);
+ if(form?.id==='settings-form'&&event.target.dataset.path){const key=settingsKey(),revisions=settingsFieldRevisions.get(key)||new Map();revisions.set(event.target.dataset.path,(revisions.get(event.target.dataset.path)||0)+1);settingsFieldRevisions.set(key,revisions);}
+},true);
 document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')reviseForm(event.target.querySelector('form'));},true);
 function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&(!projectSensitive||projectId===project);}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
@@ -611,11 +614,29 @@ async function loadReleaseWorkflows(){
 async function authorizeRelease(kind){
  const project=projectId,scope=$('config-scope').value,workflow=$('release-workflow-list').value;if(!project||scope!=='project')return;
  if(!workflow)throw Error(t('请先选择可用工作流。'));
- const button=$(kind==='release'?'release-authorize':'deploy-authorize');button.disabled=true;
- try{const result=await api('release-authorize',{project,kind,workflow});if(project!==projectId||$('config-scope').value!==scope)return;
-  const authorization=result.authorization||result;for(const name of ['enabled','workflow','ref','sha']){const node=document.querySelector('[data-path="delivery.'+kind+'.'+name+'"]');if(node.type==='checkbox')node.checked=!!authorization[name];else node.value=authorization[name]||'';}
-  if(settingsBaseline)setPath(settingsBaseline,'delivery.'+kind,{...getPath(settingsBaseline,'delivery.'+kind),...authorization});
-  syncDelivery();$('release-authorization-feedback').textContent=t('工作流已授权。只影响当前项目，其他尚未保存的设置仍可继续修改。');readinessCache.clear();await refresh();
+ const button=$(kind==='release'?'release-authorize':'deploy-authorize');if(button.disabled)return;button.disabled=true;
+ const baseline=structuredClone(settingsBaseline),submitted=settingsValues(),submittedMode=$('schedule-mode').value,revisions=new Map(settingsFieldRevisions.get(project)),prefix='delivery.'+kind+'.';
+ try{const result=await api('release-authorize',{project,kind,workflow}),reply=result.authorization||result,authorization=Object.fromEntries(['enabled','workflow','ref','sha'].map(name=>[name,reply[name]]));
+  const current=project===projectId&&$('config-scope').value===scope&&settingsContext===project&&!!settingsBaseline;
+  if(current)stashSettings();
+  const draft=settingsDrafts.get(project),mode=current?$('schedule-mode').value:draft?.mode||submittedMode,acknowledged=structuredClone(current?settingsBaseline:draft?.baseline||state.projects.find(p=>p.id===project)?.config||baseline);
+  setPath(acknowledged,'delivery.'+kind,{...getPath(acknowledged,'delivery.'+kind),...authorization});settingsModes.set(acknowledged,mode);
+  const affected=entry=>entry.path?.startsWith(prefix)&&Object.hasOwn(authorization,entry.path.slice(prefix.length));
+  const clean=JSON.parse(settingsClean.get(project)||'[]');
+  settingsClean.set(project,JSON.stringify(clean.map(entry=>affected(entry)?acknowledgedSettingsValues([entry],acknowledged,mode)[0]:entry)));
+  const values=(current?settingsValues():draft?.values||clean).map(entry=>{
+   if(!affected(entry))return entry;
+   const before=submitted.find(value=>value.path===entry.path),unchanged=(settingsFieldRevisions.get(project)?.get(entry.path)||0)===(revisions.get(entry.path)||0)&&sameValue(entry,before);
+   return unchanged?acknowledgedSettingsValues([entry],acknowledged,mode)[0]:entry;
+  });
+  const target=state.projects.find(p=>p.id===project);if(target?.config)setPath(target.config,'delivery.'+kind,{...getPath(target.config,'delivery.'+kind),...authorization});
+  if(current){settingsBaseline=acknowledged;for(const entry of values.filter(affected)){const node=document.querySelector('[data-path="'+entry.path+'"]');node.value=entry.value;node.checked=entry.checked;}stashSettings();syncDelivery();$('release-authorization-feedback').textContent=t('工作流已授权。只影响当前项目，其他尚未保存的设置仍可继续修改。');window.RSIProduct?.dirtyStatus();}
+  else if(draft||values.some(entry=>affected(entry)&&(settingsFieldRevisions.get(project)?.get(entry.path)||0)!==(revisions.get(entry.path)||0))){
+   // A newer edit can return to the clean value and remove the old draft before navigation.
+   const rebased=draft||{mode,baselineValues:Object.fromEntries(values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,acknowledged,mode)]))};
+   rebased.baseline=acknowledged;rebased.values=values;for(const entry of values.filter(affected))rebased.baselineValues[entry.path]=settingBaselineValue(entry,acknowledged,mode);settingsDrafts.set(project,rebased);writePersistentSettingsDraft(project,values.filter(persistableDraftEntry),acknowledged,mode);
+  }
+  readinessCache.clear();await refresh();
  }finally{button.disabled=false;}
 }
 async function renderReleaseOutcome(node,run,project){

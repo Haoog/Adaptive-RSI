@@ -314,12 +314,32 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                         return
                                     checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
                                     continue
-                        if (remote == policy["base"] and branch == policy["branch"] and
-                                runtime.config(project["id"])["delivery"]["auto_merge"] and
-                                not runtime.project(project["id"])["paused"] and not tracking_cancelled()):
-                            checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
-                                     "--match-head-commit", policy["head"]])
-                            outcome["delivery_status"] = "merge_submitted"
+                        # Fetch and Issue checks can outlive a settings change. Re-read the complete
+                        # local authorization under the same lock used by configuration writes.
+                        with runtime.dispatch_lock:
+                            live_project = runtime.project(project["id"])
+                            live_config = runtime.config(project["id"])
+                            live_run = store.one("SELECT * FROM runs WHERE id=? AND project=?",
+                                                 (run["id"], project["id"]))
+                            live_policy = store.setting("delivery:" + run["id"])
+                            live_identity = store.setting("run-baseline:" + run["id"])
+                            if (remote == policy["base"] and branch == policy["branch"] and
+                                    live_run and live_run["state"] == "pr_open" and
+                                    json.loads(live_run["config"])["delivery"]["auto_merge"] and
+                                    json.loads(live_run["result"]).get("pr") == outcome["pr"] and
+                                    live_config["delivery"]["mode"] == "pr" and
+                                    live_config["delivery"]["auto_merge"] and
+                                    live_config["github"]["repository"] == repo and
+                                    live_config["delivery"]["base_branch"] == config["delivery"]["base_branch"] and
+                                    (not live_config["delivery"]["base_branch"] or
+                                     live_config["delivery"]["base_branch"] == policy["branch"]) and
+                                    repo.lower() == origin_repository(live_project["path"]).lower() and
+                                    live_policy == policy and live_identity == identity and
+                                    live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
+                                    not live_project["paused"] and not tracking_cancelled()):
+                                checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
+                                         "--match-head-commit", policy["head"]])
+                                outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
                         if tracking_cancelled():
                             return

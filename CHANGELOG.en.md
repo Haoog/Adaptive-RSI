@@ -8,6 +8,17 @@
 - Derived-setting cleanup batches only records with remaining settings, allowing backlogs beyond 200 historical runs to drain.
 - Issue task identities include repository and number, preventing same-number Issues from overwriting each other or inheriting delivery state after repository changes. Legacy identities migrate only with verifiable source evidence, retaining history.
 - Relaxing Issue label policy restores previously excluded task states without waiting for remote content changes. Existing planning decisions and backoff remain intact, without repeatedly requeuing unchanged obsolete work.
+- Task details synchronize state and actions even before any run exists, preserving unsaved requirements. Shrinking last pages trigger a bounded valid-page fetch, avoiding empty pages and inverted ranges while discarding results after navigation changes.
+
+## 0.5.110
+
+<!-- adaptive-rsi-release:0.5.110;base:9433d4de98aa3ac6a4b5139b4a26f0d64da07d80 -->
+
+- Edits made while creating a model connection are subsequently saved to the same connection. Reopened editors do not inherit IDs from old responses, and saves retain their originating project scope.
+- Manually re-adding a model missing from the catalog makes it selectable again, preserves existing preferences, and keeps it available after later catalog refreshes.
+- Auto-merge rechecks the current repository, branch and sealed target after fetching the baseline, preventing merges to an old target after authorization changes.
+- Workflow authorization acknowledgments update the saved baseline while preserving newer disable choices and authorization field edits made while waiting.
+- Saving login credentials immediately invalidates account-status caches. Cancelled or replaced sessions ignore late poll results and errors while keeping the new session visible and polled. Temporary post-login status/catalog failures retry their unfinished stage without repeating authorization or overwriting feedback for a newly selected provider.
 
 ## 0.5.109
 

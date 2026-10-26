@@ -758,6 +758,7 @@ class AuthSessions:
         self.providers_cache = {}
         # 状态快照的子进程发现结果同样短 TTL 缓存，登录/登出/密钥变更时失效。
         self.status_cache = {}
+        self.cache_generations = {backend: 0 for backend in ("codex", "opencode")}
         self.factory = factory or (lambda backend, cancel=None: (CodexAuth if backend == "codex" else OpenCodeAuth)(
             self.config() if callable(self.config) else self.config, cancel=cancel or self.shutdown))
         try:
@@ -782,6 +783,12 @@ class AuthSessions:
         _write_json(self.file, {key: {field: value for field, value in item.items()
                                      if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
                                 for key, item in rows})
+
+    def _invalidate_caches(self, backend):
+        # 调用方持有 self.lock；阻止失效前启动的发现任务重新发布旧结果。
+        self.cache_generations[backend] += 1
+        self.providers_cache.pop(backend, None)
+        self.status_cache.pop(backend, None)
 
     def _backend(self, backend):
         if not isinstance(backend, str) or backend not in {"codex", "opencode"}:
@@ -815,7 +822,9 @@ class AuthSessions:
                                            if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
                         capabilities = None
                     else:
-                        cached = self.status_cache.get("opencode")
+                        with self.lock:
+                            generation = self.cache_generations[backend]
+                            cached = self.status_cache.get(backend)
                         if cached and cached[0] > time.monotonic():
                             capabilities, providers = cached[1]
                         else:
@@ -841,7 +850,9 @@ class AuthSessions:
                                     except (OpenCodeCompatibilityError, OSError):
                                         capabilities = None
                             providers = auth_providers(None, capabilities)
-                            self.status_cache["opencode"] = (time.monotonic() + 25, (capabilities, providers))
+                            with self.lock:
+                                if not self.closed and generation == self.cache_generations[backend]:
+                                    self.status_cache[backend] = (time.monotonic() + 25, (capabilities, providers))
                     result[backend] = {"state": "authenticated" if providers else "signed_out",
                                        "available": available,
                                        "transport": "docker" if container or not shutil.which(backend) else "host",
@@ -876,6 +887,7 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            generation = self.cache_generations[backend]
             if not self.custom_factory:
                 cached = self.providers_cache.get(backend)
                 if cached and cached[0] > time.monotonic():
@@ -895,7 +907,7 @@ class AuthSessions:
             worker.close()
         # worker 已关闭，rows 只是纯数据，可安全缓存供短 TTL 内复用。
         with self.lock:
-            if not self.closed and not self.custom_factory:
+            if not self.closed and not self.custom_factory and generation == self.cache_generations[backend]:
                 self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
         return rows
 
@@ -934,8 +946,7 @@ class AuthSessions:
             self._persist()
             self._thread(lambda: self._run(session_id, method, inputs))
             # 认证状态即将变化，缓存的供应商发现结果不再可靠。
-            self.providers_cache.pop(backend, None)
-            self.status_cache.clear()
+            self._invalidate_caches(backend)
             return copy.deepcopy(self.sessions[session_id])
 
     def _update(self, session_id, **values):
@@ -1037,6 +1048,8 @@ class AuthSessions:
                     current = _read_json(auth_path())
                     current[provider] = value
                     _write_json(auth_path(), current)
+                # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
+                self._invalidate_caches(backend)
                 self._update(session_id, state="completed")
         finally:
             credential_lock.release()
@@ -1127,8 +1140,7 @@ class AuthSessions:
                 if worker:
                     worker.close()
         with self.lock:
-            self.providers_cache.pop(backend, None)
-            self.status_cache.clear()
+            self._invalidate_caches(backend)
         return self.snapshot()
 
     def set_api_key(self, backend, provider, key):
@@ -1167,8 +1179,7 @@ class AuthSessions:
                 worker.close()
             AUTH_LOCK.release()
         with self.lock:
-            self.providers_cache.pop(backend, None)
-            self.status_cache.clear()
+            self._invalidate_caches(backend)
         return self.snapshot()
 
     def close(self):
