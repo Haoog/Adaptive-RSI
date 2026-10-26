@@ -83,7 +83,7 @@ jobs:
             modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
           - name: 隔离、调度与体验
             os: ubuntu-latest
-            modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_experience tests.test_workflow_experience
+            modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_experience tests.test_workflow_experience
           - name: 交付循环
             os: ubuntu-latest
             modules: tests.test_delivery_loop

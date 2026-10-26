@@ -4,6 +4,8 @@
 
 ## Unreleased
 
+- Inspection and Issue sync read current settings under the schedule-write lock. Older scheduler ticks cannot overwrite deadlines set by interval saves or restored inheritance, or trigger disabled sources from stale snapshots.
+- Next inspection times match working-hour eligibility, skipping entire windows missing during daylight-saving transitions and handling half-hour jumps, repeated windows and day changes.
 - Usage search manages debounce and automatic refresh separately and invalidates old requests on input, preventing earlier responses from cancelling new queries or replacing later results.
 - Settings retain edits made while saving, including changes back to old values followed by a project switch. Acknowledgments preserve those drafts and compare them with the newly saved values.
 

@@ -179,7 +179,8 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(sum(r is not None for r in runs), 1)
 
     def test_resume_coalesces_missed_intervals(self):
-        config = merge(self.runtime.config(self.project), {"sources": {"inspection": True}})
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        config = self.runtime.config(self.project)
         self.runtime.schedule(self.project, config, now=100)
         self.runtime.schedule(self.project, config, now=1000000)
         self.runtime.schedule(self.project, config, now=1000000)
