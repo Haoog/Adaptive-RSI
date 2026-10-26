@@ -5,7 +5,7 @@ from pathlib import Path
 from .config import merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, checked
-from .store import encode
+from .store import encode, uid
 
 
 class StaleCandidate(RuntimeError):
@@ -176,7 +176,8 @@ def publish(runtime, project, task, run, workspace, config):
 
 
 def monitoring_due(outcome, config, now):
-    if outcome.get("feedback", {}).get("investigation_pending"):
+    from .storage_tools import pending_investigation
+    if pending_investigation(outcome.get("feedback", {})) is not None:
         return True
     if outcome.get("monitoring_completed"):
         return False
@@ -368,11 +369,67 @@ def tick(runtime, now=None, project_id=None, active_run=None):
 def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if not monitoring_due(outcome, config, now):
         return
-    if outcome.get("feedback", {}).get("investigation_pending"):
+    from .storage_tools import pending_investigation
+    if pending_investigation(outcome.get("feedback", {})) is not None:
         investigate(runtime, project, run, outcome)
+        if not monitoring_due(outcome, config, now):
+            return
+    # Expiration ends monitoring even when its local artifacts were not restored.
+    # Pending investigations above must finish (or remain retryable) before completion.
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        return
+    from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
+    saved = json.loads(run["config"])
+
+    def missing_artifacts():
+        previous = outcome.get("feedback", {})
+        if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
+            outcome["feedback"] = unavailable_feedback(previous)
+            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
+
+    try:
+        output_name = "feedback/" + str(time.time_ns()) + "-" + uid()
+        directory = run_artifact_path(runtime.store, run, output_name)
+
+        def output_path(name):
+            target = run_artifact_path(runtime.store, run, output_name + "/" + name)
+            if target != directory / name:
+                raise ValueError(MISSING_ARTIFACTS)
+            return target
+
+        # Check actual destinations, including Git metadata and the evaluator report,
+        # before any fetch or write. An old output tree must never be reused.
+        for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
+                     "evaluation", "evaluation/report.json"):
+            output_path(name)
+        if directory.exists():
+            raise ValueError(MISSING_ARTIFACTS)
+        if not run_artifact_path(runtime.store, run).is_dir():
+            raise ValueError(MISSING_ARTIFACTS)
+        acceptance_path = run_artifact_path(runtime.store, run, "acceptance.json")
+        acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
+        if acceptance_path.exists():
+            from .agent import SCHEMAS, object_schema, validate_output
+            if not isinstance(acceptance, dict):
+                raise ValueError(MISSING_ARTIFACTS)
+            validate_output({key: acceptance.get(key) for key in ("hash", "criteria", "checks", "spec")},
+                            object_schema({"hash": {"type": "string"},
+                                           "criteria": {"type": "array", "items": {"type": "string"}},
+                                           "checks": {"type": "array", "items": object_schema({
+                                               "name": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
+                                               "cwd": {"type": "string"}})}, "spec": SCHEMAS["acceptance"]}))
+        expected_acceptance = outcome.get("evaluation", {}).get("acceptance_hash")
+        if expected_acceptance and (not acceptance or acceptance.get("hash") != expected_acceptance):
+            raise ValueError(MISSING_ARTIFACTS)
+        seeds = run_artifact_path(runtime.store, run, "dependencies")
+        for relative in saved["environment"]["seed_paths"]:
+            if not run_artifact_path(runtime.store, run, "dependencies/" + relative).is_dir():
+                raise ValueError(MISSING_ARTIFACTS)
+    except (ValueError, OSError, RuntimeError):
+        missing_artifacts()
         return
     previous = outcome.get("feedback", {})
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
@@ -389,19 +446,26 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         outcome["feedback_polled_at"] = now
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
-    directory = Path(run["path"]) / "feedback" / str(int(now))
-    baseline_tree = snapshot(source, directory / "baseline", outcome["merged_sha"])
-    current_tree = snapshot(source, directory / "current", head)
+    try:
+        # Fetching can take time; recheck destinations before exclusively creating output.
+        for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
+                     "evaluation", "evaluation/report.json"):
+            output_path(name)
+        directory.parent.mkdir(exist_ok=True)
+        directory.mkdir(mode=0o700)  # Exclusive: refuse collisions instead of overwriting evidence.
+    except (ValueError, OSError, RuntimeError):
+        missing_artifacts()
+        return
+    baseline_tree = snapshot(source, output_path("baseline"), outcome["merged_sha"])
+    current_tree = snapshot(source, output_path("current"), head)
     from .adapters import detect
-    acceptance_path = Path(run["path"]) / "acceptance.json"
-    acceptance = json.loads(acceptance_path.read_text()) if acceptance_path.exists() else None
     if acceptance:
         acceptance["change_kind"] = "preservation"
-    checks = json.loads(run["config"])["checks"] or detect(baseline_tree)["checks"]
-    saved = json.loads(run["config"])
+    checks = saved["checks"] or detect(baseline_tree)["checks"]
     effective = {**config, "environment": saved["environment"]}
-    result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, directory / "evaluation", effective,
-                                       cancel=cancel, acceptance=acceptance, seeds=Path(run["path"]) / "dependencies")
+    output_path("evaluation/report.json")
+    result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"), effective,
+                                       cancel=cancel, acceptance=acceptance, seeds=seeds)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state,
@@ -415,7 +479,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
 
 
 def investigate(runtime, project, run, outcome):
-    report = outcome["feedback"]
+    from .storage_tools import pending_investigation
+    feedback_status = outcome["feedback"]
+    report = pending_investigation(feedback_status)
     failures = []
     for label, rows in report["evaluation"].get("checks", {}).items():
         for check in rows:
@@ -430,5 +496,6 @@ def investigate(runtime, project, run, outcome):
                                   evidence=[{"run": run["id"], "head": report["head"], "checks": failures}], priority=100)
     report["investigation_pending"] = False
     report["investigation_task"] = task
+    feedback_status.update(investigation_pending=False, investigation_task=task)
     runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
     runtime.wake.set()

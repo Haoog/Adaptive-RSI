@@ -580,11 +580,18 @@ class Handler(BaseHTTPRequestHandler):
                     stage["decision"] = json.loads(saved["data"]).get("decision")
                 self.respond(run)
             elif parsed.path == "/api/patch":
-                run = store.one("SELECT path FROM runs WHERE id=?", (params.get("id", [""])[0],))
-                if not run or not run["path"]:
+                from .storage_tools import run_artifact_path
+                run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
+                if not run:
                     raise RequestError("Run has no artifacts")
-                path = Path(run["path"]) / "candidate.patch"
-                self.respond(path.read_bytes(), content_type="text/plain; charset=utf-8")
+                try:
+                    path = run_artifact_path(store, run, "candidate.patch")
+                    if not path.is_file():
+                        raise ValueError("Missing patch")
+                    payload = path.read_bytes()
+                except (ValueError, OSError, RuntimeError):
+                    raise RequestError("Run has no artifacts in this state directory") from None
+                self.respond(payload, content_type="text/plain; charset=utf-8")
             elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
@@ -651,7 +658,8 @@ class Handler(BaseHTTPRequestHandler):
                         elif path == "/api/model-center/model":
                             result = center.edit_model(body.get("provider"), body.get("model"), project)
                         elif path == "/api/model-center/routes":
-                            result = center.save_routes(body.get("models"), project)
+                            result = center.save_routes(body.get("models"), project,
+                                                        **({"inherit": body["inherit"]} if "inherit" in body else {}))
                         elif path == "/api/model-center/resume":
                             result = center.resume_provider(body.get("provider"), project)
                         else:

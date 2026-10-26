@@ -9,6 +9,13 @@ const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/aut
 const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/experience.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, 'asynchronous request reached its expected checkpoint');
+    await new Promise(setImmediate);
+  }
+}
 const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
   version, csrf, update: {busy: false},
   projects: [{id: 'a', name: 'A', paused: true}, {id: 'b', name: 'B', paused: true}]
@@ -60,7 +67,7 @@ function browser(savedSession = new Map()) {
   const context = vm.createContext({
     document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
     localStorage: storage(local), sessionStorage: storage(session), t: value => value,
-    AbortController, DOMException, queueMicrotask, crypto: require('node:crypto').webcrypto,
+    AbortController, DOMException, queueMicrotask, TextEncoder, crypto: require('node:crypto').webcrypto,
     fetch: defaultFetch,
     setInterval() {}, clearInterval() {},
     setTimeout(callback, delay) { const timer = {id: ++nextTimer, callback, delay, active: true}; timers.push(timer); return timer.id; },
@@ -216,7 +223,7 @@ for (const switchProject of [false, true]) {
       return posts.length === 1 ? rejected() : response({id: 'task'});
     };
     const pending = page.submit('goal-form');
-    await new Promise(setImmediate);
+    await waitFor(() => posts.length === 1);
     if (switchProject) vm.runInContext('projectId="b"', page.context);
     page.node('goal-text').value = 'New unsaved task';
     page.input('goal-text', 'goal-form');
@@ -809,9 +816,9 @@ test('one form cannot submit twice while its first write is pending', async () =
   vm.runInContext('safe=fn=>{lastAction=originalSafe(fn,$("goal-form"));return lastAction;}',page.context);
   page.node('goal-text').value='one goal';
   const first=page.submit('goal-form');await page.submit('goal-form');
-  assert.equal(calls,1);release();await first;
+  await waitFor(()=>calls===1);assert.equal(calls,1);release();await first;
   page.node('goal-text').value='next goal';
-  const next=page.submit('goal-form');assert.equal(calls,2);release();await next;
+  const next=page.submit('goal-form');await waitFor(()=>calls===2);assert.equal(calls,2);release();await next;
 });
 
 test('form errors stay next to preserved input and clear on retry', async () => {
@@ -883,12 +890,175 @@ test('goal drafts stay with their project and submit only to that project', asyn
   assert.equal(page.node('goal-text').value,'Only project B: fix a typo');
 });
 
+test('ambiguous goals retain separate IDs through failed edits, reload, and project switches', async () => {
+  const posts = [], tasks = new Map(); let page = browser(), failure = 'after-commit';
+  const connect = () => {
+    page.context.refresh = async () => {};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      assert.equal(url, '/api/goal');
+      const body = JSON.parse(options.body); posts.push(body);
+      if (failure === 'before-commit') throw Error('offline');
+      tasks.set(body.project + ':' + body.request_id, body.text);
+      if (failure === 'after-commit') throw Error('lost acknowledgement');
+      return response({id: body.request_id});
+    };
+  };
+  const submit = async text => {page.node('goal-text').value = text; page.input('goal-text', 'goal-form'); await page.submit('goal-form');};
+  const switchTo = project => {page.node('project-select').value = project; page.node('project-select').handlers.change();};
+  connect();
+  await submit('Goal A');
+  failure = 'before-commit'; await submit('Goal B');
+  const pending = JSON.parse(page.sessionData.get('rsi-submission:a'));
+  page = browser(page.sessionData); connect();
+  switchTo('b'); failure = ''; await submit('Goal A');
+  assert.notEqual(posts[2].request_id, posts[0].request_id, 'the same text in another project has its own ID');
+  assert.equal(page.sessionData.has('rsi-submission:b'), false);
+  switchTo('a'); await submit('Goal A');
+  assert.equal(posts[3].request_id, posts[0].request_id, 'A retry reuses its ID after failed B and reload');
+  assert.equal(pending.entries.length, 2);
+  assert.ok(pending.entries.every(entry => /^[a-f0-9]{64}$/.test(entry.digest)));
+  assert.deepEqual(pending.entries.map(entry => entry.text), ['Goal A', 'Goal B'], 'pending text remains available for visible recovery');
+  assert.equal([...tasks.keys()].filter(key => key.startsWith('a:')).length, 1, 'A is created exactly once');
+  assert.deepEqual(JSON.parse(page.sessionData.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[1].request_id], 'A success removes only A');
+  await submit('Goal B');
+  assert.equal(posts[4].request_id, posts[1].request_id);
+  assert.equal(page.sessionData.has('rsi-submission:a'), false);
+  await submit('Goal A');
+  assert.notEqual(posts[5].request_id, posts[0].request_id, 'a new submission after acknowledgement gets a fresh ID');
+});
+
+test('legacy pending goals migrate without losing the old ID or recovery text', async () => {
+  const session = new Map([['rsi-submission:a', JSON.stringify({text: 'Legacy goal', id: 'legacy-id'})]]);
+  const page = browser(session), posts = [];
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  page.node('goal-text').value = 'Another goal';
+  await assert.rejects(page.submit('goal-form'));
+  const saved = JSON.parse(session.get('rsi-submission:a'));
+  assert.equal(saved.version, 2); assert.equal(saved.entries.length, 2);
+  assert.equal(saved.entries[0].id, 'legacy-id');
+  assert.deepEqual(saved.entries.map(entry => entry.text), ['Legacy goal', 'Another goal']);
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
+  page.node('goal-text').value = 'Legacy goal'; await page.submit('goal-form');
+  assert.equal(posts[1].request_id, 'legacy-id');
+  assert.deepEqual(JSON.parse(session.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[0].request_id]);
+});
+
+test('32 offline goals remain visibly recoverable after draft replacement and reload, freeing capacity on success', async () => {
+  let page = browser(); const posts = [];
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  for (let index = 0; index < 32; index++) {
+    page.node('goal-text').value = 'Pending ' + index;
+    await assert.rejects(page.submit('goal-form'));
+  }
+  const saved = page.sessionData.get('rsi-submission:a');
+  page.node('goal-text').value = 'Replacement draft'; page.input('goal-text', 'goal-form');
+  page = browser(page.sessionData); page.context.restoreGoalDraft();
+  assert.equal(page.node('goal-text').value, 'Replacement draft');
+  await page.context.renderGoalRecovery();
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  const select = panel.children[1].children[0], restore = panel.children[2];
+  assert.equal(select.children.length, 33, 'all 32 old texts are selectable without remembering them');
+  assert.equal(select.children[1].textContent, 'Pending 0');
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
+  await assert.rejects(page.submit('goal-form'), /待确认的目标提交过多/);
+  assert.equal(posts.length, 32); assert.equal(page.sessionData.get('rsi-submission:a'), saved);
+  select.value = select.children[1].value;
+  restore.handlers.click(); await page.context.lastAction;
+  assert.equal(posts.length, 32, 'restoring a goal requires an explicit submit to send it');
+  assert.equal(page.node('goal-text').value, 'Pending 0');
+  assert.equal(vm.runInContext('draftStore.get("goal","a")', page.context), 'Pending 0');
+  await page.submit('goal-form');
+  assert.equal(posts[32].request_id, posts[0].request_id, 'visible recovery uses the original ID at capacity');
+  const remaining = JSON.parse(page.sessionData.get('rsi-submission:a')).entries;
+  assert.deepEqual(remaining.map(entry => entry.id), posts.slice(1, 32).map(post => post.request_id), 'success removes only the recovered entry');
+  page.node('goal-text').value = 'New goal'; await page.submit('goal-form');
+  assert.equal(posts.length, 34, 'acknowledgement frees capacity for new content');
+});
+
+test('digest-only legacy records explain exact-text recovery and retain their IDs', async () => {
+  const digest = require('node:crypto').createHash('sha256').update(JSON.stringify('Original legacy goal')).digest('hex');
+  const session = new Map([['rsi-submission:a', JSON.stringify({version: 2, entries: [{digest, id: 'old-digest-id'}]})]]);
+  const page = browser(session), posts = [];
+  await page.context.renderGoalRecovery();
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  assert.ok(panel.children.some(node => node.textContent.includes('没有保留原文')));
+  assert.equal(JSON.parse(session.get('rsi-submission:a')).entries[0].id, 'old-digest-id');
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  page.node('goal-text').value = 'Original legacy goal';
+  await assert.rejects(page.submit('goal-form'));
+  assert.equal(posts[0].request_id, 'old-digest-id');
+  assert.equal(JSON.parse(session.get('rsi-submission:a')).entries[0].text, 'Original legacy goal');
+  const updated = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  assert.equal(updated.children[1].children[0].children[1].textContent, 'Original legacy goal');
+});
+
+test('pending goal restoration stays with its project and invalidates stale recovery controls', async () => {
+  const page = browser();
+  page.context.refresh = async () => {};
+  page.context.fetch = async () => {throw Error('offline');};
+  page.node('goal-text').value = 'A pending'; await assert.rejects(page.submit('goal-form'));
+  const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+  const select = panel.children[1].children[0], restore = panel.children[2];
+  select.value = select.children[1].value;
+  vm.runInContext('projectId="b"', page.context); page.node('goal-text').value = 'B draft';
+  await page.context.renderGoalRecovery();
+  assert.equal(panel.hidden, true);
+  restore.handlers.click(); await page.context.lastAction;
+  assert.equal(page.node('goal-text').value, 'B draft');
+  vm.runInContext('projectId="a"', page.context); await page.context.renderGoalRecovery();
+  assert.equal(panel.hidden, false);
+  assert.equal(panel.children[1].children[0].children[1].textContent, 'A pending');
+});
+
+const validPendingEntry = {digest: 'a'.repeat(64), id: 'valid-id'};
+for (const [name, saved] of [
+  ['invalid JSON', '{'], ['null record', 'null'], ['array record', '[]'],
+  ['invalid digest', JSON.stringify({version: 2, entries: [{...validPendingEntry, digest: 'bad'}]})],
+  ['empty ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: ''}]})],
+  ['oversized ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: 'x'.repeat(101)}]})],
+  ['nonstring ID', JSON.stringify({version: 2, entries: [{...validPendingEntry, id: 1}]})],
+  ['duplicate ID', JSON.stringify({version: 2, entries: [validPendingEntry, {...validPendingEntry, digest: 'b'.repeat(64)}]})],
+  ['duplicate digest', JSON.stringify({version: 2, entries: [validPendingEntry, {...validPendingEntry, digest: 'A'.repeat(64), id: 'other'}]})],
+  ['text does not match digest', JSON.stringify({version: 2, entries: [{...validPendingEntry, text: 'Altered text'}]})],
+  ['oversized ledger', JSON.stringify({version: 2, entries: Array.from({length: 33}, (_, index) => ({digest: index.toString(16).padStart(64, '0'), id: 'id-' + index}))})],
+  ['invalid legacy ID', JSON.stringify({text: 'Original', id: ''})],
+]) {
+  test(`invalid pending goal ledger (${name}) preserves records and reports a local recovery error`, async () => {
+    const session = new Map([['rsi-submission:a', saved]]), page = browser(session); let posts = 0;
+    page.context.fetch = async () => {posts++; return response({id: 'unexpected'});};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.node('goal-text').value = 'Keep draft';
+    await page.submit('goal-form');
+    assert.equal(posts, 0); assert.equal(session.get('rsi-submission:a'), saved);
+    assert.equal(page.node('goal-text').value, 'Keep draft');
+    assert.match(page.node('toast').textContent, /无法读取目标提交记录/);
+    assert.doesNotMatch(page.node('toast').textContent, /JSON 格式有误/);
+    await page.context.renderGoalRecovery();
+    const panel = page.node('goal-form').children.find(node => node.dataset.goalRecovery !== undefined);
+    assert.match(panel.children[0].textContent, /无法读取目标提交记录/);
+  });
+}
+
+test('goals are never sent when their recovery IDs cannot be persisted', async () => {
+  const page = browser(); let posts = 0;
+  page.context.fetch = async () => {posts++; return response({id: 'task'});};
+  page.context.sessionStorage.setItem = () => {throw Error('quota exceeded');};
+  page.node('goal-text').value = 'Keep input';
+  await assert.rejects(page.submit('goal-form'), /quota exceeded/);
+  assert.equal(posts, 0); assert.equal(page.node('goal-text').value, 'Keep input');
+});
+
 test('a successful goal save clears only its submitted draft and preserves newer input', async () => {
   const page=browser();let finish;
   page.context.refresh=()=>Promise.resolve();
   page.context.fetch=()=>new Promise(resolve=>{finish=()=>resolve(response({id:'created'}));});
   page.node('goal-text').value='Submitted goal';page.input('goal-text','goal-form');
-  const pending=page.submit('goal-form');await new Promise(setImmediate);
+  const pending=page.submit('goal-form');await waitFor(()=>!!finish);
   page.node('goal-text').value='New goal typed while saving';page.input('goal-text','goal-form');
   finish();await pending;
   assert.equal(page.node('goal-text').value,'New goal typed while saving');
@@ -904,6 +1074,7 @@ for (const newerDraft of [null, 'New A draft', 'Submitted goal']) {
     const input = value => { page.node('goal-text').value = value; page.input('goal-text', 'goal-form'); };
     input('Submitted goal');
     const pending = page.submit('goal-form');
+    await waitFor(() => !!finish);
     switchTo('b'); input('B draft');
     if (newerDraft !== null) {
       switchTo('a'); input('Intermediate A edit'); input(newerDraft); switchTo('b');
@@ -1059,6 +1230,44 @@ for (const dependency of ['draft-parent', '']) {
     form.onsubmit({preventDefault() {}}); await page.context.lastAction;
     assert.deepEqual(posts, [{task: task.id, dependency: dependency || null, urgency: dependency ? 1 : 0}]);
     assert.equal(page.timers.filter(timer => timer.active && timer.delay === 5000).length, 1);
+  });
+}
+
+for (const failFirst of [false, true]) {
+  test(`queue saves block overlapping submits and preserve later edits after ${failFirst ? 'failure' : 'success'}`, async () => {
+    const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+    let acknowledge, metadata = {...task, urgency: 0};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) {
+        const body = JSON.parse(options.body); posts.push(body);
+        return new Promise((resolve, reject) => {acknowledge = () => {
+          if (failFirst && posts.length === 1) {reject(Error('offline')); return;}
+          metadata = {...metadata, dependency: body.dependency ? {dependency: body.dependency} : null, urgency: body.urgency};
+          resolve(response({saved: true}));
+        };});
+      }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+      return response(metadata);
+    };
+    const controls = await openExperienceTask(page, task);
+    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const dependency = form.children[0].children[0], urgency = form.children[1].children[0], submit = form.children[2];
+    dependency.value = 'parent'; urgency.checked = true;
+    form.onsubmit({preventDefault() {}}); const first = page.context.lastAction;
+    assert.equal(submit.disabled, true);
+    dependency.value = ''; urgency.checked = false;
+    form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+    assert.equal(posts.length, 1, 'even a programmatic submit cannot overlap');
+    acknowledge(); await first;
+    assert.equal(submit.disabled, false, 'finally releases the button after success or failure');
+    assert.equal(dependency.value, ''); assert.equal(urgency.checked, false);
+    form.onsubmit({preventDefault() {}}); const later = page.context.lastAction;
+    assert.deepEqual(posts[1], {task: 'child', dependency: null, urgency: 0}, 'later manual save uses the newer draft');
+    acknowledge(); await later;
+    assert.equal(metadata.dependency, null); assert.equal(metadata.urgency, 0);
+    assert.equal(submit.disabled, false);
   });
 }
 
@@ -1399,6 +1608,200 @@ test('an active run stopping error explains when retry and supplement become ava
   const page = browser();
   page.context.fetch = async () => response({error: 'Wait for the active run to finish stopping before retrying or supplementing this task'}, 400);
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
+});
+
+function modelScopePage(savedDrafts = new Map()) {
+  const page=browser(),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
+  let release,held=false,holdNext=false,probeFailure=false;
+  const effective=project=>({...structuredClone(globals),...structuredClone(overrides.get(project)||{})});
+  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:[{id:'ollama',name:'Ollama',protocol:'ollama',catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}]});
+  page.context.english={};page.context.window.addEventListener=()=>{};
+  const tab=page.node('model-tab');tab.dataset.mcTab='roles';tab.parentElement=page.node('model-tabs');
+  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?[tab]:[];
+  for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
+  page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
+  page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
+  page.context.api=async(path,body)=>{
+    if(body){posts.push({path,body:structuredClone(body)});if(holdNext){holdNext=false;held=true;await new Promise(resolve=>{release=resolve;});held=false;}}
+    if(path==='model-center/routes'){
+      overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>!body.inherit?.includes(role)&&JSON.stringify(route)!==JSON.stringify(globals[role]))));
+      return {saved:true,models:effective(body.project)};
+    }
+    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};}
+    if(path.startsWith('model-center'))return modelSnapshot(path.includes('?')?decodeURIComponent(path.split('=')[1]):null);
+    throw new Error('Unexpected model request '+path);
+  };
+  page.context.refresh=async()=>{};
+  const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
+  // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
+  const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
+  window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
+  init();`);
+  vm.runInContext(instrumented,page.context);
+  return {...page,posts,globals,overrides,savedDrafts,
+    async show(project){page.context.window.RSIModelCenter.show(project,true);await page.context.lastAction;},
+    click(id){page.node(id).handlers.click();return page.context.lastAction;},
+    edit(effort){page.context.window.modelScopeTest.edit(effort);},
+    draft(){return page.context.window.modelScopeTest.draft();},
+    openProbe(){page.context.window.modelScopeTest.openProbe();},
+    hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
+  };
+}
+
+test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{
+  const page=modelScopePage();await page.show('a');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  page.click('mc-reset-inheritance');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  const restored=modelScopePage(page.savedDrafts);await restored.show('a');
+  assert.equal(restored.node('mc-save-routes').disabled,false);
+  await restored.click('mc-save-routes');
+  assert.equal(restored.overrides.get('a').planning,undefined);
+  assert.equal(restored.node('mc-save-routes').disabled,true);
+  assert.equal(restored.savedDrafts.has('a'),false);
+  restored.globals.planning.effort='low';await restored.show('a');
+  assert.equal(restored.draft().planning.effort,'low');
+});
+
+for(const mode of ['reload','scope-round-trip','pending-save'])test(`reset follows defaults changed before acknowledgement after ${mode}`,async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');
+  const page=mode==='reload'?modelScopePage(original.savedDrafts):original;
+  if(mode==='pending-save'){
+    page.hold();const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+    page.globals.planning.effort='low';page.release();await saving;
+  }else{
+    page.globals.planning.effort='low';if(mode==='scope-round-trip')await page.show('b');
+    await page.show('a');assert.equal(page.draft().planning.effort,'low');
+    assert.equal(page.node('mc-save-routes').disabled,false);await page.click('mc-save-routes');
+  }
+  assert.deepEqual(page.posts.find(post=>post.path==='model-center/routes').body.inherit,['planning']);
+  assert.equal(page.overrides.get('a').planning,undefined);
+  assert.equal(page.draft().planning.effort,'low');assert.equal(page.node('mc-save-routes').disabled,true);
+  page.globals.planning.effort='high';await page.show('a');assert.equal(page.draft().planning.effort,'high');
+});
+
+for(const effort of ['high','low'])test(`reset preserves later ${effort} edit across changed defaults and persisted reload`,async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');original.edit(effort);
+  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,effort);
+  await page.show('b');await page.show('a');assert.equal(page.draft().planning.effort,effort);
+  await page.click('mc-save-routes');
+  assert.deepEqual(page.posts[0].body.inherit,[]);assert.equal(page.posts[0].body.models.planning.effort,effort);
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  assert.equal(page.overrides.get('a').planning?.effort,effort==='low'?undefined:effort);
+});
+
+for(const later of ['edit','reset','reset-then-edit'])test(`route acknowledgement retains later ${later} through a scope round trip`,async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  page.hold();const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  if(later.includes('reset'))page.click('mc-reset-inheritance');
+  if(later.includes('edit'))page.edit('high');
+  await page.show('b');await page.show('a');
+  page.release();await saving;
+  assert.equal(page.draft().planning.effort,later.includes('edit')?'high':'medium');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,later.includes('reset'));
+  await page.click('mc-save-routes');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  assert.equal(page.savedDrafts.has('a'),false);
+});
+
+test('a reset during an ordinary pending route save survives its acknowledgement',async()=>{
+  const page=modelScopePage();await page.show('a');page.edit('high');page.hold();
+  const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.click('mc-reset-inheritance');await page.show('b');page.release();await saving;await page.show('a');
+  assert.equal(page.draft().planning.effort,'medium');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  await page.click('mc-save-routes');assert.equal(page.overrides.get('a').planning,undefined);
+});
+
+test('a failed route save preserves inheritance reset intent for retry',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  const api=page.context.api;page.context.api=async(path,body)=>{if(path==='model-center/routes')throw new Error('Save failed');return api(path,body);};
+  await page.click('mc-save-routes');
+  assert.equal(page.node('mc-save-routes').disabled,false);assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  page.globals.planning.effort='low';await page.show('b');await page.show('a');
+  page.context.api=api;page.hold();const retry=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.globals.planning.effort='high';page.release();await retry;
+  assert.equal(page.draft().planning.effort,'high');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.overrides.get('a').planning,undefined);
+});
+
+test('reset edits survive failed save, reload, and a changed default on retry',async()=>{
+  const original=modelScopePage();await original.show('a');original.click('mc-reset-inheritance');original.edit('high');
+  const api=original.context.api;original.context.api=async(path,body)=>{if(path==='model-center/routes')throw new Error('Save failed');return api(path,body);};
+  await original.click('mc-save-routes');assert.equal(original.savedDrafts.get('a').resetInheritance,true);
+  const page=modelScopePage(original.savedDrafts);page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,'high');await page.click('mc-save-routes');
+  assert.deepEqual(page.posts[0].body.inherit,[]);assert.equal(page.overrides.get('a').planning.effort,'high');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const projectEffort of ['medium','high'])for(const draftEffort of ['medium','xhigh'])test(`parent reset draft with project ${projectEffort} and draft ${draftEffort} requires an explicit reset`,async()=>{
+  // 642 stores the project baseline and reset routes, but no resetModels.
+  const route=effort=>({planning:{provider:'ollama',model:'scope-coder',effort,fallback:null}});
+  const savedDrafts=new Map([['a',{baseline:route(projectEffort),routes:route(draftEffort),resetInheritance:true}]]);
+  const page=modelScopePage(savedDrafts);page.overrides.set('a',route(projectEffort));page.globals.planning.effort='low';await page.show('a');
+  assert.equal(page.draft().planning.effort,draftEffort);
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.node('mc-undo').disabled,false);
+  assert.match(page.node('mc-dirty').textContent,/未保存/);
+  assert.match(page.node('mc-feedback').textContent,/缺少继承基线.*重新点击/);
+  await page.click('mc-save-routes');assert.equal(page.posts.length,0);
+  await page.show('b');await page.show('a');assert.equal(page.draft().planning.effort,draftEffort);
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.match(page.node('mc-feedback').textContent,/缺少继承基线/);
+  page.edit('xhigh');await page.click('mc-save-routes');assert.equal(page.posts.length,0);
+  const reopened=modelScopePage(savedDrafts);reopened.globals.planning.effort='low';await reopened.show('a');
+  assert.equal(reopened.draft().planning.effort,'xhigh');assert.equal(reopened.node('mc-save-routes').disabled,true);
+  assert.equal(savedDrafts.get('a').resetInheritance,true);assert.equal(savedDrafts.get('a').resetModels,undefined);
+  reopened.click('mc-reset-inheritance');assert.equal(reopened.node('mc-save-routes').disabled,false);
+  assert.equal(reopened.draft().planning.effort,'low');await reopened.click('mc-save-routes');
+  assert.deepEqual(reopened.posts[0].body.inherit,['planning']);assert.equal(reopened.overrides.get('a').planning,undefined);
+  assert.equal(reopened.node('mc-save-routes').disabled,true);assert.equal(savedDrafts.has('a'),false);
+});
+
+test('undo discards an ambiguous parent reset draft and allows ordinary editing',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  delete page.savedDrafts.get('a').resetModels;
+  const restored=modelScopePage(page.savedDrafts);await restored.show('a');
+  assert.equal(restored.node('mc-save-routes').disabled,true);restored.click('mc-undo');
+  assert.equal(restored.savedDrafts.has('a'),false);assert.equal(restored.node('mc-undo').disabled,true);
+  restored.edit('high');assert.equal(restored.node('mc-save-routes').disabled,false);
+  await restored.click('mc-save-routes');assert.equal(restored.overrides.get('a').planning.effort,'high');
+});
+
+test('undo clears equal-valued inheritance reset intent',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');page.click('mc-undo');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const switchWith of ['show','scope-control'])test(`probe dialog invalidates on ${switchWith} scope change before start`,async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();
+  assert.equal(page.node('mc-probe-dialog').open,true);
+  if(switchWith==='show')await page.show('b');
+  else{page.node('mc-scope').value='global';page.node('mc-scope').handlers.change();await page.context.lastAction;}
+  assert.equal(page.node('mc-probe-dialog').open,false);
+  await page.click('mc-probe-start');
+  assert.equal(page.posts.filter(p=>p.path==='model-center/probe').length,0);
+});
+
+test('a current probe renders its result and retains the opening project',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();await page.click('mc-probe-start');
+  assert.equal(page.posts[0].body.project,'a');assert.match(page.node('mc-probe-result').textContent,/基础能力测试通过/);
+  assert.equal(page.node('mc-probe-start').disabled,false);
+});
+
+for(const failure of [false,true])test(`delayed probe ${failure?'failure':'success'} cannot paint another project or a replacement dialog`,async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();if(failure)page.failProbe();
+  const probing=page.click('mc-probe-start');await new Promise(setImmediate);
+  assert.equal(page.posts[0].body.project,'a');
+  await page.show('b');assert.equal(page.node('mc-probe-result').textContent,'');
+  page.release();await probing;
+  assert.equal(page.node('mc-probe-result').textContent,'');assert.equal(page.node('mc-probe-dialog').open,false);
+  await page.show('a');page.openProbe();assert.equal(page.node('mc-probe-result').textContent,'');
+  page.node('mc-probe-dialog').close();
+  await page.click('mc-probe-start');assert.equal(page.posts.length,1);
 });
 
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{

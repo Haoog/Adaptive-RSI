@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Restoring a database disconnects source-state artifact paths and local verification caches while preserving history and remote delivery receipts. Artifact downloads and post-merge verification stay inside the current state directory, and missing required artifacts produce insufficient evidence.
+- Each project retains the original text, digest and request ID for up to 32 unconfirmed goals in the browser session. The form can restore their text for explicit retries, preventing duplicate tasks after text changes or reloads. Success clears only its matching record and frees capacity; invalid records block sending with a dedicated error.
+- Queue settings block overlapping saves so older requests cannot overwrite newer dependency or urgency choices, while retaining edits made after submission.
+- Project model settings can restore inheritance even when effective values equal global defaults. The server resolves inheritance under the save lock using current shared settings, preventing old-value overrides when defaults change before saving. Acknowledgments clear only the submitted reset intent and retain later edits and project round-trip drafts.
+- Switching projects or model scopes closes and invalidates old probe dialogs. Requests retain their original scope, and late results cannot overwrite another project's feedback.
+
 ## 0.5.112
 
 <!-- adaptive-rsi-release:0.5.112;base:e4eaead279ee7cd823883168a7777c891a7613f1 -->

@@ -453,14 +453,19 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
-          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
-          await api("task/schedule", submitted);
-          if (!current()) return;
-          // The endpoint acknowledges these exact values; newer edits stay in the controls.
-          baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
-          await refresh();
-          if (current()) toast(t("排队设置已保存"));
-        });
+          submit.disabled = true;
+          try {
+            const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+            await api("task/schedule", submitted);
+            if (!current()) return;
+            // The endpoint acknowledges these exact values; newer edits stay in the controls.
+            baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            await refresh();
+            if (current()) toast(t("排队设置已保存"));
+          } finally {
+            submit.disabled = false;
+          }
+        }, form);
       };
       controls.append(form);
     }

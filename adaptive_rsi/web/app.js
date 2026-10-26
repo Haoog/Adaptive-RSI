@@ -103,6 +103,65 @@ async function api(path,body,{signal}={}){
  }
  throw Error(t('更新尚未完成，已保留输入；请稍后再提交。'));
 }
+const goalSubmissionLimit=32;
+let goalRecoveryPanel,goalRecoveryKey,goalRecoverySequence=0;
+function goalRecordError(){return Error(t('无法读取目标提交记录。输入已保留，请检查浏览器会话存储后重试。'));}
+async function goalContentDigest(text){return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(text)))),byte=>byte.toString(16).padStart(2,'0')).join('');}
+async function goalSubmissions(project){
+ const raw=sessionStorage.getItem('rsi-submission:'+project);if(raw===null)return [];
+ let saved;try{saved=JSON.parse(raw);}catch{throw goalRecordError();}
+ if(!saved||typeof saved!=='object'||Array.isArray(saved))throw goalRecordError();
+ const validText=text=>typeof text==='string'&&!!text.trim()&&text.length<=30000;
+ let entries;
+ if(!Object.hasOwn(saved,'version')&&validText(saved.text))entries=[{digest:await goalContentDigest(saved.text),id:saved.id,text:saved.text}];
+ else if(saved.version===2&&Array.isArray(saved.entries)&&saved.entries.length<=goalSubmissionLimit)entries=saved.entries;
+ else throw goalRecordError();
+ const ids=new Set(),digests=new Set(),validated=[];
+ for(const entry of entries){
+  if(!entry||typeof entry.digest!=='string'||!/^[a-f0-9]{64}$/i.test(entry.digest)||typeof entry.id!=='string'||!entry.id.length||Array.from(entry.id).length>100)throw goalRecordError();
+  const digest=entry.digest.toLowerCase();
+  if(ids.has(entry.id)||digests.has(digest))throw goalRecordError();
+  if(Object.hasOwn(entry,'text')&&(!validText(entry.text)||await goalContentDigest(entry.text)!==digest))throw goalRecordError();
+  ids.add(entry.id);digests.add(digest);validated.push({digest,id:entry.id,...(Object.hasOwn(entry,'text')?{text:entry.text}:{})});
+ }
+ return validated;
+}
+function saveGoalSubmissions(project,entries){const key='rsi-submission:'+project;if(entries.length)sessionStorage.setItem(key,JSON.stringify({version:2,entries}));else sessionStorage.removeItem(key);}
+async function renderGoalRecovery(){
+ const project=projectId,key=JSON.stringify([project,typeof language==='undefined'?'':language,sessionStorage.getItem('rsi-submission:'+project)]);
+ if(goalRecoveryKey===key)return;
+ goalRecoveryKey=key;const ticket=++goalRecoverySequence;
+ if(!goalRecoveryPanel){goalRecoveryPanel=el('div');goalRecoveryPanel.dataset.goalRecovery='';$('goal-form').append(goalRecoveryPanel);}
+ const panel=goalRecoveryPanel;panel.replaceChildren();panel.hidden=true;
+ if(!project)return;
+ let entries;try{entries=await goalSubmissions(project);}catch(error){if(ticket===goalRecoverySequence&&project===projectId){panel.append(el('p',error.message,'form-error'));panel.hidden=false;}return;}
+ if(ticket!==goalRecoverySequence||project!==projectId||!entries.length)return;
+ panel.hidden=false;
+ panel.append(el('p',t('待确认目标的原文保留在当前浏览器会话中。恢复后点击添加，将沿用原提交记录确认结果。'),'muted'));
+ const recoverable=entries.filter(entry=>entry.text!==undefined);
+ if(recoverable.length){
+  const label=el('label',t('待确认的目标')),select=el('select'),placeholder=el('option',t('选择要恢复的目标'));placeholder.value='';select.append(placeholder);
+  for(const entry of recoverable){const option=el('option',entry.text.slice(0,100));option.value=entry.id;select.append(option);}
+  label.append(select);
+  const restore=action(t('恢复到输入框（替换当前草稿）'),()=>{
+   if(ticket!==goalRecoverySequence||project!==projectId)return;
+   const entry=recoverable.find(item=>item.id===select.value);if(!entry)return;
+   $('goal-text').value=entry.text;goalDraftRevisions.set(project,(goalDraftRevisions.get(project)||0)+1);reviseForm($('goal-form'));stashGoalDraft();$('goal-text').focus();
+  });
+  panel.append(label,restore);
+ }
+ if(recoverable.length!==entries.length)panel.append(el('p',t('部分旧提交记录没有保留原文。请输入当时的完整目标后重试，系统会沿用原提交记录；这些记录不会自动删除。'),'muted'));
+}
+async function pendingGoalSubmission(project,text){
+ const digest=await goalContentDigest(text),entries=await goalSubmissions(project);
+ let submission=entries.find(entry=>entry.digest===digest);
+ if(!submission){
+  if(entries.length>=goalSubmissionLimit)throw Error(t('待确认的目标提交过多。请从下方恢复一个目标并重试，确认成功后再提交新目标。'));
+  submission={digest,id:crypto.randomUUID(),text};entries.push(submission);
+ }else submission.text=text;
+ // Persist before sending; never evict an ID whose server outcome is still unknown.
+ saveGoalSubmissions(project,entries);await renderGoalRecovery();return submission;
+}
 function currentProject(){return state.projects.find(p=>p.id===projectId);}
 function stashGoalDraft(){if(!projectId)return;const value=$('goal-text').value;if(value){goalDrafts.set(projectId,value);draftStore.set('goal',projectId,value);}else{goalDrafts.delete(projectId);draftStore.remove('goal',projectId);}}
 function restoreGoalDraft(){if(!projectId){$('goal-text').value='';return;}const value=goalDrafts.has(projectId)?goalDrafts.get(projectId):draftStore.get('goal',projectId)||'';if(value)goalDrafts.set(projectId,value);$('goal-text').value=value;}
@@ -215,6 +274,7 @@ const known={'Project registered (paused)':'项目已接入，等待启动','Pro
  return event.message;
 }
 function render(){
+ void renderGoalRecovery();
  const project=currentProject(),tasks=scoped(state.tasks),runs=scoped(state.runs),config=project?.config||state.config;
  // 统一时间显示约定：活动与任务时间使用项目时区（与「下次检查」一致），未接入项目时用浏览器时区。
  displayTz=config?.schedule?.timezone||null;
@@ -579,7 +639,7 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
-$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const project=projectId,text=$('goal-text').value,draftRevision=goalDraftRevisions.get(project)||0;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const requestKey='rsi-submission:'+project,previous=JSON.parse(sessionStorage.getItem(requestKey)||'null');const submission=previous?.text===text?previous:{text,id:crypto.randomUUID()};sessionStorage.setItem(requestKey,JSON.stringify(submission));await api('goal',{project,text,request_id:submission.id});sessionStorage.removeItem(requestKey);if((goalDraftRevisions.get(project)||0)===draftRevision){if(goalDrafts.get(project)===text)goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);if(projectId===project&&$('goal-text').value===text)$('goal-text').value='';}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
+$('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const project=projectId,text=$('goal-text').value,draftRevision=goalDraftRevisions.get(project)||0;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const submission=await pendingGoalSubmission(project,text);await api('goal',{project,text,request_id:submission.id});saveGoalSubmissions(project,(await goalSubmissions(project)).filter(entry=>entry.id!==submission.id));await renderGoalRecovery();if((goalDraftRevisions.get(project)||0)===draftRevision){if(goalDrafts.get(project)===text)goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);if(projectId===project&&$('goal-text').value===text)$('goal-text').value='';}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
 $('settings-form').addEventListener('invalid',event=>{let detail=event.target.closest('details');while(detail){detail.open=true;detail=detail.parentElement.closest('details');}},true);
