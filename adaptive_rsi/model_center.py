@@ -260,7 +260,7 @@ class ModelCenter:
             self.runtime.wake.set()
         else:
             self.runtime.configure({"models": routes})
-        return {"saved": True}
+        return {"saved": True, "models": self.runtime.config(project)["models"]}
 
     def probe(self, provider_id, model_id, effort="default", project=None):
         config = self.runtime.config(project)

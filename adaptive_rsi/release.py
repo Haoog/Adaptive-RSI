@@ -170,9 +170,20 @@ def status(runtime, project_id, run_id):
     return {kind: runtime.store.setting(key(run_id, kind), {"state": "not_authorized"}) for kind in KINDS}
 
 
-def save(runtime, run, kind, data):
+_UNCONDITIONAL = object()
+
+
+class _AutomationChanged(RuntimeError):
+    """A concurrent action replaced the operation being reconciled."""
+
+
+def save(runtime, run, kind, data, expected=_UNCONDITIONAL):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        if expected is not _UNCONDITIONAL:
+            current = db.execute("SELECT value FROM settings WHERE key=?", (key(run["id"], kind),)).fetchone()
+            if (current["value"] if current else None) != expected:
+                raise _AutomationChanged("Automation changed during reconciliation")
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
@@ -290,7 +301,7 @@ def deployment_terminal(data, policy):
     return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded"}
 
 
-def deployment_health(runtime, project, run, data, policy, cancel):
+def deployment_health(runtime, project, run, data, policy, cancel, persist=save):
     if not policy.get("health_url"):
         return data
     owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
@@ -309,7 +320,7 @@ def deployment_health(runtime, project, run, data, policy, cancel):
             data.update(health=report, state="healthy" if report["healthy"] else "health_failed")
             if not report["healthy"]:
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
-            save(runtime, run, "deploy", data)
+            persist(runtime, run, "deploy", data)
             if report["healthy"]:
                 runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
                                           {"sha": data["sha"], "run": run["id"], "health": report})
@@ -329,7 +340,7 @@ def deployment_health(runtime, project, run, data, policy, cancel):
             rollback = {**{k: data[k] for k in ["repository", "workflow", "ref", "workflow_sha"]},
                         "sha": previous["sha"], "operation_id": data["operation_id"] + "-rollback", "state": "dispatching"}
             data.update(state="rolling_back", rollback=rollback)
-            save(runtime, run, "deploy", data)
+            persist(runtime, run, "deploy", data)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": rollback["operation_id"], "inputs[rsi_sha]": rollback["sha"]})
@@ -338,11 +349,11 @@ def deployment_health(runtime, project, run, data, policy, cancel):
                 rollback.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                                 dispatch_http_status=exc.status)
                 data.update(state="rollback_failed", error=rollback["error"])
-                save(runtime, run, "deploy", data)
+                persist(runtime, run, "deploy", data)
                 raise
             except Exception as exc:
                 rollback.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
-                save(runtime, run, "deploy", data)
+                persist(runtime, run, "deploy", data)
                 raise
     if data["state"] == "rolling_back":
         rollback = reconcile(runtime, run, "deploy", data["rollback"], persist=False)
@@ -366,26 +377,35 @@ def advance(runtime, project, run, outcome, cancel=None):
     for kind in KINDS:
         policy = saved["delivery"].get(kind, {})
         data = runtime.store.setting(key(run["id"], kind))
+        expected = encode(data) if data is not None else None
+
+        def persist(runtime, run, kind, value):
+            nonlocal expected
+            saved = save(runtime, run, kind, value, expected=expected)
+            expected = encode(saved)
+            return saved
+
         if not policy.get("enabled") and not data:
             continue
         try:
             if (not data or data.get("state") in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}) and outcome.get("feedback", {}).get("state") != "verified":
                 state = "waiting_verification" if not outcome.get("feedback") else "blocked_verification"
                 data = {"state": state, "error": "Post-merge verification must pass before release/deploy"}
-                result[kind] = save(runtime, run, kind, data)
+                result[kind] = persist(runtime, run, kind, data)
                 continue
             if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}:
-                data = reconcile(runtime, run, kind, data)
+                data = reconcile(runtime, run, kind, data, persist=False)
+                persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
-                data = deployment_health(runtime, project, run, data, policy, cancel)
-                save(runtime, run, kind, data)
+                data = deployment_health(runtime, project, run, data, policy, cancel, persist=persist)
+                persist(runtime, run, kind, data)
             if data and data["state"] not in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}:
                 result[kind] = data
                 continue
             if kind == "deploy" and saved["delivery"].get("release", {}).get("enabled"):
                 if result.get("release", {}).get("state") != "workflow_succeeded":
                     data = {**(data or {}), "state": "waiting_release"}
-                    result[kind] = save(runtime, run, kind, data)
+                    result[kind] = persist(runtime, run, kind, data)
                     continue
             with runtime.dispatch_lock:
                 repo = authorized(runtime, project, run, kind, policy, cancel)
@@ -396,16 +416,16 @@ def advance(runtime, project, run, outcome, cancel=None):
                     if owner and owner["run"] != run["id"]:
                         previous = runtime.store.setting(key(owner["run"], "deploy"), {})
                         if not deployment_terminal(previous, policy):
-                            result[kind] = save(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
+                            result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
                             continue
                         comparison = api(repo, "compare/" + owner["sha"] + "..." + outcome["merged_sha"])
                         if comparison.get("status") != "ahead":
-                            result[kind] = save(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
+                            result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
                             continue
                 validate_pin(repo, policy)
                 authorized(runtime, project, run, kind, policy, cancel)
                 if kind == "deploy" and runtime.store.setting(owner_key(project["id"], repo, policy)) != expected_owner:
-                    result[kind] = save(runtime, run, kind, {"state": "waiting_target", "error": "Deployment ownership changed during validation"})
+                    result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Deployment ownership changed during validation"})
                     continue
                 if not data or not data.get("operation_id"):
                     operation = "rsi-" + fingerprint({"project": project["id"], "run": run["id"], "kind": kind,
@@ -415,7 +435,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                             "operation_id": operation, "created_at": time.time(), "attempt": 0}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
-                save(runtime, run, kind, data)
+                persist(runtime, run, kind, data)
                 if kind == "deploy":
                     runtime.store.put_setting(owner_key(project["id"], repo, policy), {"run": run["id"], "sha": data["sha"]})
                 try:
@@ -429,8 +449,11 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
                     raise
                 data.update(state="submitted", dispatch_receipt="accepted")
-                save(runtime, run, kind, data)
+                persist(runtime, run, kind, data)
                 runtime.store.event("automation_dispatched", "Authorized " + kind + " workflow submitted", project["id"], run["id"], data)
+        except _AutomationChanged:
+            result[kind] = runtime.store.setting(key(run["id"], kind), {})
+            continue
         except Cancelled:
             if data and data.get("state") in {"pending", "blocked"}:
                 data.update(state="blocked", error="Project paused or operation cancelled")
@@ -443,7 +466,10 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data["state"] = "blocked"
             runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], {"kind": kind})
         if data:
-            result[kind] = save(runtime, run, kind, data)
+            try:
+                result[kind] = persist(runtime, run, kind, data)
+            except _AutomationChanged:
+                result[kind] = runtime.store.setting(key(run["id"], kind), {})
     return result
 
 
@@ -474,8 +500,11 @@ def retry(runtime, project_id, run_id, kind):
             runtime.wake.set()
             return data
         target = data
-        if kind == "deploy" and data.get("state") == "rollback_failed":
-            target = data["rollback"]
+        rollback = data.get("rollback", {})
+        if kind == "deploy" and (data.get("state") == "rollback_failed" or
+                data.get("state") == "rolling_back" and (rollback.get("rerun_pending") or
+                    rollback.get("state") in {"rerunning", "rerun_unknown"})):
+            target = rollback
             if target.get("state") == "workflow_succeeded":
                 data.update(state="rolling_back", error="")
                 save(runtime, run, kind, data)

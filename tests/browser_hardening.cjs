@@ -98,6 +98,34 @@ async function checkModelForms(browser, url, errors) {
   } finally { await page.close(); }
 }
 
+async function checkRouteSaveRace(browser,url,errors) {
+  const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
+  let release,arrived;const gate=new Promise(resolve=>release=resolve),received=new Promise(resolve=>arrived=resolve);
+  let posts=0;
+  await page.route('**/api/model-center/routes',async route=>{posts++;const response=await route.fetch();arrived();await gate;await route.fulfill({response});});
+  try{
+    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('#project-settings').click();
+    const effort=page.locator('#mc-role-effort-implementation');
+    const original=await effort.inputValue();
+    await effort.selectOption('default');await page.locator('#mc-save-routes').click();await received;
+    await effort.locator('xpath=ancestor::*[contains(@class,"mc-role-row")]').getByRole('button',{name:'高级参数',exact:true}).click();
+    await page.locator('#mc-advanced-effort select').selectOption(original);
+    await page.locator('#mc-advanced-form button[type="submit"]').click();
+    assert.equal(await page.locator('#mc-save-routes').isDisabled(),true,'editing during save must not allow overlapping submissions');
+    release();
+    await page.locator('#mc-save-routes:not([disabled])').waitFor();
+    assert.equal(await effort.inputValue(),original,'acknowledgment must preserve a newer same-role draft');
+    await page.locator('#mc-dirty').filter({hasText:'未保存'}).waitFor();
+    assert.equal(posts,1);
+    await page.unroute('**/api/model-center/routes');
+    await page.locator('#mc-save-routes').click();
+    await page.locator('#mc-dirty').filter({hasText:'模型分工已保存'}).waitFor();
+    await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
+    assert.equal(await effort.inputValue(),original);
+  }finally{release();await page.close();}
+}
+
 async function checkDraftRecovery(browser, url, errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   const secret='BROWSER-SECRET-MUST-NOT-PERSIST';
@@ -270,11 +298,13 @@ async function main() {
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
+    if(process.env.RSI_BROWSER_ROUTES_ONLY){await checkRouteSaveRace(browser,url,errors);return;}
     await checkReadiness(browser, url, false, errors);
     await checkReadiness(browser, url, true, errors);
     await checkReadinessInstallAction(browser,url,errors);
     await checkRunProgress(browser,url,errors);
     await checkModelForms(browser, url, errors);
+    await checkRouteSaveRace(browser,url,errors);
     await checkDraftRecovery(browser,url,errors);
     await checkInvalidConfigRepair(browser,url,errors);
     assert.deepEqual(errors, []);

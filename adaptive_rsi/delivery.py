@@ -103,6 +103,9 @@ def publish(runtime, project, task, run, workspace, config):
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
         pending = store.one("SELECT state FROM tasks WHERE id=?", (approval["id"],))
         source = store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))
+        original = store.one("SELECT state FROM runs WHERE id=? AND project=?", (run["id"], project["id"]))
+        if not original or original["state"] != "awaiting_approval":
+            raise Cancelled("Approved candidate was superseded; publishing stopped")
         if (runtime.stop.is_set() or runtime.project(project["id"])["paused"] or
                 not pending or pending["state"] != "planning" or (job and runtime.is_cancelled(job))):
             raise Cancelled("Publishing cancelled or project paused")
@@ -127,9 +130,10 @@ def publish(runtime, project, task, run, workspace, config):
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise RuntimeError("PR repository must match project origin")
     _, current, base_branch = baseline(runtime, project, config)
+    authorize_write()
     identity = store.setting("run-baseline:" + run["id"])
-    expected = {"repository": repo, "branch": base_branch, "sha": current}
-    if current != run["base"] or identity != expected:
+    expected = {"repository": repo, "branch": base_branch, "sha": run["base"]}
+    if identity != expected:
         raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
     branch = prefix + "/rsi-" + run["id"]
@@ -151,9 +155,12 @@ def publish(runtime, project, task, run, workspace, config):
     if existing:
         url = existing[0]["url"]
         existing_pr = pr_view(repo, url)
-        if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName", base_branch) != base_branch:
-            raise RuntimeError("Existing PR head differs from evaluated candidate")
+        if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName") != identity["branch"]:
+            raise RuntimeError("Existing PR head or target differs from evaluated candidate")
+        authorize_write()
     else:
+        if current != run["base"]:
+            raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
         authorize_write()
         github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)

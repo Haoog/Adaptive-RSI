@@ -1275,6 +1275,7 @@ const english = {
   "候选已超过保留期被清理，请重新生成后再发布。": "The candidate was cleaned up after the retention window; regenerate it before publishing.",
   "检查更新失败，请稍后重试。": "Update check failed; try again later.",
   "操作未完成，请稍后重试。": "The request did not complete; try again later.",
+  "任务仍在停止中，请等当前运行结束后再重试或补充需求。": "The task is still stopping. Wait for the current run to end before retrying or supplementing requirements.",
   "阻塞或失败任务":"Blocked or failed tasks",
   "模型连接与验证证据":"Model connection and validation evidence",
   "未知：尚未取得当前模型的验证记录。":"Unknown: no validation records for the current models have been retrieved.",

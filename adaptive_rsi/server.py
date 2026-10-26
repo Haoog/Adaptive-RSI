@@ -104,6 +104,7 @@ Project and controller state must be in separate directory trees
 Projects must not contain each other's directories
 Goal must contain 1..30000 characters
 Wait until active runs finish before importing projects
+Wait for the active run to finish stopping before retrying or supplementing this task
 Wait until active runs finish before registering projects so every worker uses the same isolation boundaries
 Only project scan settings can inherit global defaults
 An inherited setting cannot also have an override

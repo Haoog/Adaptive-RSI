@@ -245,6 +245,15 @@ class ServerHardeningTest(unittest.TestCase):
                       json.dumps({"schedule": {"timezone": "Mars/Olympus"}})))
         self.assertIn("Expecting value", configuration_error(json.JSONDecodeError(secret, "secret", 0), "secret"))
 
+    def test_stopping_task_errors_retain_actionable_guidance(self):
+        message = "Wait for the active run to finish stopping before retrying or supplementing this task"
+        def stopping(*args):
+            raise ValueError(message)
+        self.runtime.retry = stopping
+        status, _, body = self.request("/api/retry", "POST", {"task": "stopping-task"})
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body), {"error": message, "error_code": "validation_error"})
+
     def test_configuration_validation_retains_fixed_guidance_without_echoing_inputs(self):
         from adaptive_rsi.config import validate
         self.runtime.configure = lambda values, *_: validate(values)

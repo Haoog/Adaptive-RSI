@@ -89,7 +89,7 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_release tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store
+            modules: tests.test_release tests.test_release_parallel tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery

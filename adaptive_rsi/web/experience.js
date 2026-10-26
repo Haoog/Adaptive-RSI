@@ -314,13 +314,21 @@ window.RSIExperience = (() => {
       );
   }
   async function taskControls(task, body, ticket) {
+    const project = projectId;
+    const current = () => projectId === project && ticket === detailSequence && body.isConnected;
+    async function refreshTaskDetail() {
+      await refresh();
+      if (!current()) return;
+      const updated = await api("task?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project));
+      if (current()) await showTask(updated);
+    }
     const metadata = await api(
       "task?id=" +
         encodeURIComponent(task.id) +
         "&project=" +
         encodeURIComponent(task.project),
     );
-    if (ticket !== detailSequence || !body.isConnected) return;
+    if (!current()) return;
     const controls = el("section", undefined, "task-controls");
     controls.append(el("h3", t("下一步")));
     if (
@@ -339,11 +347,9 @@ window.RSIExperience = (() => {
         action(
           t("基于当前输入重新检查"),
           async () => {
+            if (!current()) return;
             await api("retry", { task: task.id });
-            await refresh();
-            await showTask(
-              await api("task?id=" + task.id + "&project=" + task.project),
-            );
+            await refreshTaskDetail();
           },
           "button",
         ),
@@ -378,6 +384,7 @@ window.RSIExperience = (() => {
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
+          if (!current()) return;
           submit.disabled = true;
           try {
             const value = input.value;
@@ -386,10 +393,7 @@ window.RSIExperience = (() => {
               supplement: value,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
-            await refresh();
-            await showTask(
-              await api("task?id=" + task.id + "&project=" + task.project),
-            );
+            await refreshTaskDetail();
           } finally {
             submit.disabled = false;
           }
@@ -409,14 +413,22 @@ window.RSIExperience = (() => {
           task.project +
           "&limit=200&filter=all&system=false&sections=core",
       );
-      if (ticket !== detailSequence) return;
+      if (!current()) return;
       for (const other of candidates.tasks || [])
         if (other.id !== task.id) {
           const option = el("option", other.title);
           option.value = other.id;
           select.append(option);
         }
-      select.value = metadata.dependency?.dependency || "";
+      const dependency = metadata.dependency?.dependency || "";
+      if (dependency && !(candidates.tasks || []).some(other => other.id === dependency)) {
+        const parent = await api("task?id=" + encodeURIComponent(dependency) + "&project=" + encodeURIComponent(task.project));
+        if (!current()) return;
+        const option = el("option", parent.title);
+        option.value = parent.id;
+        select.append(option);
+      }
+      select.value = dependency;
       label.append(select);
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");

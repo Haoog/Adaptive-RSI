@@ -27,6 +27,7 @@ const draftStore=(()=>{
 })();
 window.RSIDraftStore=draftStore;
 const apiErrors={
+ "Wait for the active run to finish stopping before retrying or supplementing this task":"任务仍在停止中，请等当前运行结束后再重试或补充需求。",
  "Restart plan is missing; inspect installations before admitting work":"缺少重启计划，请检查安装记录，确认当前版本后重新启动服务。",
  "A newer deployment owns this target; no stale rollback will be issued":"已有更新版本接管此服务，本次不会恢复旧版本。",
  "A newer deployment owns this target; rollback was cancelled":"已有更新版本接管此服务，本次恢复已取消。",
@@ -579,8 +580,8 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  settingsModes.set(acknowledged,scheduleMode);
  settingsClean.set(key,JSON.stringify(acknowledgedSettingsValues(submittedValues,acknowledged,scheduleMode)));
  const draft=settingsDrafts.get(key);if(draft){draft.baseline=structuredClone(acknowledged);draft.baselineValues=Object.fromEntries(draft.values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,acknowledged,scheduleMode)]));writePersistentSettingsDraft(key,draft.values.filter(persistableDraftEntry),acknowledged,scheduleMode);}
- if(settingsBaseline===baseline&&projectId===project&&$('config-scope').value===scope){settingsBaseline=acknowledged;stashSettings();}
- readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'){settingsDrafts.delete(key);renderSettings();}
+ if(settingsBaseline&&(settingsBaseline===baseline||settingsContext===key)&&settingsKey()===key){settingsBaseline=acknowledged;stashSettings();}
+ readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'&&sameValue(settingsValues(),submittedValues)){settingsDrafts.delete(key);renderSettings();}
  window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));},event.target);});
 const updateNames={recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};

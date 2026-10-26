@@ -316,7 +316,7 @@ class Runtime:
         # Coalesce manual and timer triggers for the same system job.
         key = "system:" + kind
         prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (project, key))
-        if prior and prior["state"] in ["queued", "planning", "executing", "evaluating"]:
+        if prior and prior["state"] in ["queued", "planning", "executing", "evaluating", "waiting_budget"]:
             if prior["state"] == "queued":
                 self.store.execute("UPDATE tasks SET priority=max(priority,?) WHERE id=?", (priority, prior["id"]))
             return prior["id"]
@@ -341,13 +341,17 @@ class Runtime:
         return task
 
     def retry(self, task):
-        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
-        # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
-        scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
-        if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
-            raise ValueError("This task cannot be retried")
-        # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
-        self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (time.time(), task))
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+            if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
+                raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
+            # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
+            scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
+            if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
+                raise ValueError("This task cannot be retried")
+            # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
+            db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (time.time(), task))
         self.store.event("manual_retry", "User requested fresh verification", row["project"], data={"task": task})
         self.wake.set()
 
@@ -357,14 +361,23 @@ class Runtime:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+            if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
+                raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
             if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
                 raise ValueError("Pause or finish active work before supplementing this task")
             body = row["body"] + "\n\n" + supplement.strip()
             if len(body) > 30000:
                 raise ValueError("Combined requirements exceed 30000 characters")
+            now = time.time()
             db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
-                       (task, row["body"], supplement.strip(), time.time()))
-            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, time.time(), task))
+                       (task, row["body"], supplement.strip(), now))
+            # 需求变化撤销旧候选的批准资格；只取消尚未领取的发布任务，保留已交付历史。
+            db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE project=? "
+                       "AND source='system_publish' AND state='queued' AND body IN "
+                       "(SELECT id FROM runs WHERE task=? AND state='awaiting_approval')",
+                       (now, row["project"], task))
+            db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
+            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, now, task))
         self.store.event("requirements_revised", "Requirements supplemented; fresh verification required", row["project"], data={"task": task})
         self.wake.set()
 
@@ -824,6 +837,8 @@ class Runtime:
                 if original["state"] in ["pr_open", "merged"] and outcome.get("pr"):
                     self.store.transition(run["id"], "completed", {"reason": "Existing delivery recovered", "pr": outcome["pr"]}, True)
                     return
+                if original["state"] != "awaiting_approval":
+                    raise Cancelled("Candidate approval is no longer valid; publishing stopped")
                 candidate = Path(original["path"]) / "candidate"
                 if not candidate.is_dir():
                     # maintenance 会清理超过保留期的候选；给用户可操作的指引而不是裸 git 错误。

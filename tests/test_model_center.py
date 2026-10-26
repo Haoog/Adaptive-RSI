@@ -153,7 +153,8 @@ class ModelCenterTest(unittest.TestCase):
             self.assertTrue(next(p for p in self.center.snapshot(other)["providers"] if p["id"] == "gateway")["catalog"]["models"][0]["enabled"])
             routes = copy.deepcopy(DEFAULTS["models"])
             routes["implementation"] = {"provider": "gateway", "model": "coder-b", "effort": "default", "fallback": None}
-            self.center.save_routes(routes, project)
+            saved = self.center.save_routes(routes, project)
+            self.assertEqual(saved["models"], self.runtime.config(project)["models"])
             self.assertEqual(self.runtime.config(project)["models"], routes)
             self.assertEqual(self.runtime.config(other)["models"], DEFAULTS["models"])
             self.runtime.configure({"models": {"planning": {"effort": "medium"}}})
