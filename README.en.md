@@ -59,6 +59,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 3. Connect a model and choose models for planning, implementation, and review.
 4. Click **Start** for the project.
 
+Custom model IDs allow up to 256 characters. Display names are optional and default to the full ID. Custom display names allow up to 160 characters and survive catalog refreshes; names supplied by the service continue to follow catalog updates.
+
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.
 
 ### Run from source
@@ -70,7 +72,7 @@ python3 scripts/start.py
 python3 scripts/rsi doctor
 ```
 
-The launcher reuses an existing service. Edits made while settings are saving survive project switches; usage searches invalidate old requests so late responses cannot replace newer queries. The dashboard persistently shows save status: saving scan timing reschedules scans, model assignments are saved separately for new tasks, active tasks retain their configuration, and delivery permissions are rechecked before execution. No restart is required. Edit fixed checks as structured fields and read check results and mobile approval summaries with expandable original evidence. Unconfirmed goals can restore their original text and reuse their request IDs. See [workflow and mobile use](EXPERIENCE.en.md) for recovery controls and evidence boundaries after database restoration, and [server deployment](SERVER.en.md) for Linux and systemd setup.
+The launcher reuses an existing service. Task details offer paginated dependency selection; unsaved queue settings survive language changes and requirement supplements. Edits made while settings are saving survive project switches; usage searches invalidate old requests so late responses cannot replace newer queries. The dashboard persistently shows save status: saving scan timing reschedules scans, model assignments are saved separately for new tasks, active tasks retain their configuration, and delivery permissions are rechecked before execution. No restart is required. Edit fixed checks as structured fields and read check results and mobile approval summaries with expandable original evidence. Unconfirmed goals can restore their original text and reuse their request IDs. See [workflow and mobile use](EXPERIENCE.en.md) for recovery controls and evidence boundaries after database restoration, and [server deployment](SERVER.en.md) for Linux and systemd setup.
 
 ## Core Capabilities
 

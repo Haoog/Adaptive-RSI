@@ -560,7 +560,14 @@ class Runtime:
             self.lockfile.close()
 
     def schedule(self, project, config, now=None):
-        now = now or time.time()
+        # 与保存共用 RLock：已开始的 tick 先完成，随后保存重排；等待中的
+        # tick 则读取最新配置。调用者的快照可能早于保存，不能再用于写计划。
+        # 锁内只有本地状态操作，request 不执行扫描或访问远端。
+        with self.dispatch_lock:
+            self._schedule(project, self.config(project), now)
+
+    def _schedule(self, project, config, now=None):
+        now = time.time() if now is None else now
         mapping = [("light", "inspection"), ("issues", "issues")]
         for kind, source in mapping:
             if not config["sources"][source] or (kind == "issues" and not config["github"]["repository"]):
@@ -584,36 +591,34 @@ class Runtime:
                 self.request(project, "reassess", priority=40)
             self.store.put_setting(key, now)
 
-    @staticmethod
-    def _zone_timestamp(day, hour, zone):
-        """DST 会让某个本地整点不存在或出现两次；返回该日该时刻的稳定时间戳。"""
-        naive = datetime.datetime.combine(day, datetime.time(hour=hour))
-        aware = naive.replace(tzinfo=zone)
-        shifted = aware.astimezone(datetime.timezone.utc).astimezone(zone).replace(tzinfo=None)
-        if shifted != naive:
-            # 不存在的本地时刻（DST 空洞）：平移到空洞结束后的等价时刻。
-            aware = aware + (shifted - naive)
-        return aware.timestamp()
-
     def next_effective_schedule(self, project, due, now=None):
         """Return the first instant at or after due that falls inside working hours."""
         schedule = self.config(project)["schedule"]
         now = time.time() if now is None else now
         candidate = max(float(due), float(now))
         zone = ZoneInfo(schedule["timezone"])
-        local = datetime.datetime.fromtimestamp(candidate, zone)
         start, end = schedule["working_hours"]
-        opening = datetime.datetime.fromtimestamp(self._zone_timestamp(local.date(), start, zone), zone)
-        if local < opening:
-            return opening.timestamp()
-        if end == 24:
-            closing = datetime.datetime.combine(local.date() + datetime.timedelta(days=1),
-                                                datetime.time.min).replace(tzinfo=zone)
-        else:
-            closing = datetime.datetime.fromtimestamp(self._zone_timestamp(local.date(), end, zone), zone)
-        if local >= closing:
-            return self._zone_timestamp(local.date() + datetime.timedelta(days=1), start, zone)
-        return candidate
+        while True:
+            local = datetime.datetime.fromtimestamp(candidate, zone)
+            # 与 loop/dispatch 使用同一资格条件；缺失窗口直接跳过，重复窗口
+            # 的两个 fold 都可工作，不能按墙上日期比较后直接跳到次日。
+            if start <= local.hour < end:
+                return candidate
+            # 用当前偏移计算到下一墙上整点的距离；回拨后的半小时可能
+            # 没有同一偏移下的 hour:00，不能 replace 后再转换时间戳。
+            boundary = candidate + 3600 - (local.minute * 60 + local.second + local.microsecond / 1000000)
+            if datetime.datetime.fromtimestamp(boundary, zone).utcoffset() != local.utcoffset():
+                # 小时之间也可能切换偏移（例如 Lord Howe 的半小时跳时）。
+                # 在时间戳轴上找到切换的首秒，避免跨过真正的窗口起点。
+                low, high = int(candidate // 1), int(boundary)
+                while high - low > 1:
+                    middle = (low + high) // 2
+                    if datetime.datetime.fromtimestamp(middle, zone).utcoffset() == local.utcoffset():
+                        low = middle
+                    else:
+                        high = middle
+                boundary = high
+            candidate = boundary
 
     def reassess_deferred(self, project, config, head):
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):

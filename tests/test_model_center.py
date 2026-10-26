@@ -512,6 +512,99 @@ class ModelCenterTest(unittest.TestCase):
             models = next(p for p in snapshot["providers"] if p["id"] == "gateway")["catalog"]["models"]
             self.assertIn("coder-a", [m["id"] for m in models if m["enabled"] and not m.get("missing") and not m.get("kind")])
 
+    def test_refresh_preserves_explicit_name_and_preferences_but_updates_catalog_metadata(self):
+        provider = self.center.provider("ollama")
+        self.center.edit_model("ollama", {"id": "coder-a", "name": "我的代码模型", "manual": True,
+                                           "enabled": False, "favorite": True, "unit_price": 2})
+        directory = self.center.directory(provider)
+        directory["models"][0].update(verified={"tools": True}, probes=[{"state": "completed"}], last_attempt=123)
+        self.runtime.store.put_setting(self.center.key(provider), directory)
+        with patch("adaptive_rsi.model_center.list_models", return_value={"models": [
+                {"id": "coder-a", "name": "Provider name", "efforts": ["high"]},
+                {"id": "coder-b", "name": "Catalog old"}], "truncated": False}) as listing:
+            first = self.center.fetch("ollama")["models"][0]
+            self.assertEqual(first["name"], "我的代码模型")
+            self.assertTrue(first["manual"])
+            self.assertFalse(first["missing"])
+            self.assertFalse(first["enabled"])
+            self.assertTrue(first["favorite"])
+            self.assertEqual(first["unit_price"], 2)
+            self.assertEqual(first["verified"], {"tools": True})
+            self.assertEqual(first["probes"], [{"state": "completed"}])
+            self.assertEqual(first["last_attempt"], 123)
+            listing.return_value["models"][0].update(name="Provider new", efforts=["low"], kind="audio")
+            listing.return_value["models"][1]["name"] = "Catalog new"
+            models = {m["id"]: m for m in self.center.fetch("ollama")["models"]}
+            self.assertEqual(models["coder-a"]["name"], "我的代码模型")
+            self.assertEqual(models["coder-a"]["efforts"], ["low"])
+            self.assertEqual(models["coder-a"]["kind"], "audio")
+            self.assertEqual(models["coder-b"]["name"], "Catalog new")
+            self.assertFalse(models["coder-b"]["manual"])
+
+    def test_legacy_manual_names_survive_refresh_and_store_restart(self):
+        provider = self.center.provider("ollama")
+        self.runtime.store.put_setting(self.center.key(provider), {"models": [
+            {"id": "coder-a", "name": "旧自定义名称", "manual": True, "enabled": True},
+            {"id": "coder-b", "name": "Old provider name", "manual": False, "enabled": True},
+            {"id": "coder-c", "name": "coder-c", "manual": True, "enabled": True}],
+            "fetched": None, "truncated": False})
+        result = {"models": [{"id": "coder-" + suffix, "name": "New " + suffix} for suffix in "abc"], "truncated": False}
+        with patch("adaptive_rsi.model_center.list_models", return_value=result):
+            self.center.fetch("ollama")
+            restarted = Runtime(Store(self.runtime.store.root))
+            try:
+                models = {m["id"]: m for m in restarted.model_center.fetch("ollama")["models"]}
+                self.assertEqual(models["coder-a"]["name"], "旧自定义名称")
+                self.assertTrue(models["coder-a"]["manual"])
+                self.assertEqual(models["coder-b"]["name"], "New b")
+                self.assertEqual(models["coder-c"]["name"], "New c")
+            finally:
+                restarted.close()
+
+    def test_optional_model_names_accept_full_ids_without_truncation(self):
+        for length in [160, 161, 256]:
+            for name in [None, "", "   ", "短显示名", "x" * length]:
+                with self.subTest(length=length, name=name):
+                    model_id = "x" * length
+                    payload = {"id": model_id, "manual": True}
+                    if name is not None:
+                        payload["name"] = name
+                    self.assertEqual(self.center.edit_model("ollama", payload), {"saved": True})
+                    model = next(m for m in self.center.directory(self.center.provider("ollama"))["models"] if m["id"] == model_id)
+                    self.assertEqual(model["id"], model_id)
+                    self.assertEqual(model["name"], name.strip() if name and name.strip() else model_id)
+        for payload in [{"id": "x" * 257}, {"id": "valid", "name": "y" * 161}, {"id": "valid", "name": 1}]:
+            with self.subTest(payload=payload), self.assertRaises(CenterError):
+                self.center.edit_model("ollama", payload)
+
+    def test_name_intent_survives_connection_changes_without_freezing_default_names(self):
+        with DirectoryServer() as fixture:
+            self.save(fixture, "none", value="")
+            self.center.fetch("gateway")
+            self.center.edit_model("gateway", {"id": "coder-a", "name": "用户名称"})
+            # 默认 ID 名称随后从供应商获取名称，但不能在连接变更后变为自定义名称。
+            self.center.edit_model("gateway", {"id": "coder-b", "name": "", "manual": True})
+            fixture.models = [{"id": "coder-a", "display_name": "Provider A"},
+                              {"id": "coder-b", "display_name": "Provider B"}]
+            self.center.fetch("gateway")
+            self.center.save_provider({**fixture.provider, "base_url": fixture.provider["base_url"] + "/v1"}, {"mode": "none"})
+            fixture.models[1]["display_name"] = "Provider B new"
+            models = {m["id"]: m for m in self.center.fetch("gateway")["models"]}
+            self.assertEqual(models["coder-a"]["name"], "用户名称")
+            self.assertFalse(models["coder-a"]["manual"])
+            self.assertEqual(models["coder-b"]["name"], "Provider B new")
+            self.assertTrue(models["coder-b"]["manual"])
+
+    def test_explicit_name_on_catalog_model_and_reset_to_id(self):
+        result = {"models": [{"id": "coder-a", "name": "Provider name"}], "truncated": False}
+        with patch("adaptive_rsi.model_center.list_models", return_value=result):
+            self.center.fetch("ollama")
+            self.center.edit_model("ollama", {"id": "coder-a", "name": "用户名称"})
+            self.assertEqual(self.center.fetch("ollama")["models"][0]["name"], "用户名称")
+            self.center.edit_model("ollama", {"id": "coder-a", "name": "  "})
+            self.assertEqual(self.center.directory(self.center.provider("ollama"))["models"][0]["name"], "coder-a")
+            self.assertEqual(self.center.fetch("ollama")["models"][0]["name"], "Provider name")
+
     def test_failed_refresh_keeps_previous_directory(self):
         with DirectoryServer() as fixture:
             self.save(fixture, "none", value="")

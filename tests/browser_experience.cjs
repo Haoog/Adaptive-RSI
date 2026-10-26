@@ -144,6 +144,121 @@ async function checkGoalRecovery(page, evidence) {
     await page.unroute('**/api/goal', intercept);
   }
 }
+async function checkQueueEditor(page, evidence) {
+  await page.locator('#language-select').selectOption('zh-CN');
+  await page.getByRole('button', {name: '排队草稿验证', exact: true}).click();
+  const box = page.getByRole('dialog', {name: '排队草稿验证', exact: true});
+  const select = box.getByRole('combobox', {name: '前置任务（合并后再开始）', exact: true});
+  await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+  assert.equal(await select.getByRole('option', {name: '旧失败前置任务', exact: true}).count(), 0);
+  await box.getByRole('button', {name: '下一页', exact: true}).click();
+  await box.getByText('前置任务候选页 2', {exact: true}).waitFor();
+  await select.selectOption({label: '旧失败前置任务'});
+  const parent = await select.inputValue();
+  await box.getByRole('checkbox', {name: '优先处理', exact: true}).uncheck();
+  await box.getByRole('button', {name: '上一页', exact: true}).click();
+  await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+  assert.equal(await select.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: '优先处理', exact: true}).isChecked(), false);
+  await page.locator('#language-select').selectOption('en');
+  const english = box.getByRole('combobox', {name: 'Predecessor (start after it merges)', exact: true});
+  await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Queue supplement preserves original draft');
+  await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
+  await box.getByText('Requirement revisions', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent);
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  const saved = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule' && r.request().method() === 'POST');
+  await box.getByRole('button', {name: 'Save queue settings', exact: true}).click();
+  const result = await saved;
+  assert.equal(result.status(), 200, await result.text());
+  assert.deepEqual(result.request().postDataJSON(), {task: new URL(page.url()).hash.match(/task=([^&]+)/)[1], dependency: parent, urgency: 0});
+  const size = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
+  assert.ok(size.scroll <= size.width, JSON.stringify(size));
+  await page.reload();
+  await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+  assert.equal(await english.inputValue(), parent, 'real server persists the off-page dependency');
+  assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  for (const trigger of ['language', 'revision', 'periodic']) {
+    const save = box.getByRole('button', {name: 'Save queue settings', exact: true});
+    const urgent = box.getByRole('checkbox', {name: 'Urgent', exact: true});
+    // Start each race at none/0, then let the real server commit parent/1 before holding its acknowledgement.
+    await english.selectOption(''); await urgent.uncheck(); await save.click();
+    await page.locator('#toast').filter({hasText: 'Queue settings saved'}).waitFor();
+    await save.waitFor({state: 'visible'});
+    await page.waitForFunction(() => !document.querySelector('.task-controls form button[type="submit"]:disabled'));
+    await box.getByRole('button', {name: 'Next', exact: true}).click();
+    await box.getByText('Dependency candidate page 2', {exact: true}).waitFor();
+    await english.selectOption(parent); await urgent.check();
+    let release, committed, writes = 0;
+    const arrived = new Promise(resolve => {committed = resolve;});
+    const gate = new Promise(resolve => {release = resolve;});
+    const holdAck = async route => {
+      writes++;
+      const response = await route.fetch();
+      assert.equal(response.status(), 200, await response.text());
+      committed(); await gate; await route.fulfill({response});
+    };
+    await page.route('**/api/task/schedule', holdAck);
+    const pollState = async route => {
+      const response = await route.fetch();
+      const data = await response.json();
+      await route.fulfill({json: {...data, state: 'blocked'}});
+    };
+    try {
+      await save.click(); await arrived;
+      await english.selectOption(''); await urgent.uncheck();
+      if (trigger === 'language') {
+        await page.locator('#language-select').selectOption('zh-CN');
+        await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+        assert.equal(await select.inputValue(), '');
+        assert.equal(await box.getByRole('button', {name: '保存排队设置', exact: true}).isDisabled(), true);
+        await page.locator('#language-select').selectOption('en');
+      } else if (trigger === 'revision') {
+        await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Save acknowledgement race supplement');
+        await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
+        await box.getByText('Save acknowledgement race supplement', {exact: false}).waitFor({state: 'attached'});
+      } else {
+        await page.route('**/api/task?id=*', pollState);
+        await box.getByText('Blocked', {exact: true}).waitFor();
+      }
+      await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+      assert.equal(await english.inputValue(), ''); assert.equal(await urgent.isChecked(), false);
+      assert.equal(await save.isDisabled(), true);
+      // A direct form submit also exercises the logical mutex beyond the disabled GUI button.
+      await save.evaluate(node => node.form.requestSubmit());
+      assert.equal(writes, 1);
+      const acknowledged = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule');
+      release(); await acknowledged;
+      await page.waitForFunction(() => ![...document.querySelectorAll('.task-controls button')].find(node => node.textContent === 'Save queue settings')?.disabled);
+      await page.locator('#language-select').selectOption('zh-CN');
+      await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
+      assert.equal(await select.inputValue(), '');
+      assert.equal(await box.getByRole('checkbox', {name: '优先处理', exact: true}).isChecked(), false);
+      await page.locator('#language-select').selectOption('en');
+      await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+    } finally {
+      release(); await page.unroute('**/api/task/schedule', holdAck);
+      if (trigger === 'periodic') await page.unroute('**/api/task?id=*', pollState);
+    }
+    const undone = page.waitForResponse(r => new URL(r.url()).pathname === '/api/task/schedule' && r.request().method() === 'POST');
+    await save.click(); const response = await undone;
+    assert.equal(response.status(), 200);
+    assert.equal(response.request().postDataJSON().dependency, null);
+    assert.equal(response.request().postDataJSON().urgency, 0);
+    await page.reload();
+    await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
+    assert.equal(await english.inputValue(), ''); assert.equal(await urgent.isChecked(), false);
+    console.log('Queue save race passed: committed server values, held acknowledgement, ' + trigger + ' rebuild, duplicate submit blocked, undo preserved and persisted.');
+  }
+  const stored = await evidence([]);
+  assert.ok(stored.projects.every(project => project.paused));
+  assert.equal(stored.calls, 0);
+  console.log('Queue editor browser passed: old failed parent, bounded paging, bilingual drafts, supplement, real schedule persistence, mobile layout, paused projects and zero model calls.');
+}
+
 (async () => {
   const server = spawn(
     process.env.PYTHON || "python3",
@@ -185,6 +300,11 @@ async function checkGoalRecovery(page, evidence) {
       .locator("#project-status")
       .filter({ hasText: "已暂停" })
       .waitFor();
+    if (process.env.RSI_BROWSER_QUEUE_ONLY) {
+      await checkQueueEditor(page, evidence);
+      assert.deepEqual(errors, []);
+      return;
+    }
     for (const name of ["overview", "models", "usage"])
       assert.equal(
         await page.locator(`.sidebar nav [data-view="${name}"]`).isVisible(),

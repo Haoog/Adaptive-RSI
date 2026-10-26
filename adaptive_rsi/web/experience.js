@@ -14,7 +14,13 @@ window.RSIExperience = (() => {
     lastDetail = "",
     inboxBusy = false,
     inboxAt = 0;
-  const queueDraftReaders = new WeakMap();
+  const queueSaves = new Map();
+  let queueEditor;
+  const queueKey = task => JSON.stringify([task.project, task.id]);
+  function queueEditorCurrent(editor) {
+    return queueEditor === editor && $("detail-dialog").open &&
+      projectId === editor.project && detailTask?.id === editor.task;
+  }
   const notificationKey = "rsi-notifications:" + location.origin;
   function readSaved(key, fallback) {
     try {
@@ -318,8 +324,8 @@ window.RSIExperience = (() => {
         ),
       );
   }
-  async function taskControls(task, body, ticket, queueDraft) {
-    const project = projectId;
+  async function taskControls(task, body, ticket, queueDraft, editor) {
+    const project = projectId, baselineVersion = editor.version;
     const current = () => projectId === project && ticket === detailSequence && body.isConnected;
     async function refreshTaskDetail() {
       await refresh();
@@ -413,57 +419,103 @@ window.RSIExperience = (() => {
         none = el("option", t("无前置任务"));
       none.value = "";
       select.append(none);
-      const candidates = await api(
-        "state?project=" +
-          task.project +
-          "&limit=200&filter=all&system=false&sections=core",
-      );
-      if (!current()) return;
-      for (const other of candidates.tasks || [])
-        if (other.id !== task.id) {
-          const option = el("option", other.title);
-          option.value = other.id;
-          select.append(option);
+      if (!editor.baseline || (!queueSaves.has(editor.key) && editor.version === baselineVersion))
+        editor.baseline = {dependency: metadata.dependency?.dependency || "", urgency: !!metadata.urgency};
+      queueDraft = readQueueDraft();
+      const dependency = editor.baseline.dependency;
+      const pager = el("div", undefined, "task-pagination"),
+        pageNote = el("span");
+      pageNote.setAttribute("aria-live", "polite");
+      let offset = 0, hasMore = false, loading = false;
+      const previous = action(t("上一页"), () => loadCandidates(Math.max(0, offset - 200)), "text-button"),
+        next = action(t("下一页"), () => loadCandidates(offset + 200), "text-button");
+      previous.type = next.type = "button";
+      pager.append(previous, pageNote, next);
+      function pagingState() {
+        previous.disabled = loading || offset === 0;
+        next.disabled = loading || !hasMore;
+      }
+      async function loadCandidates(requestedOffset) {
+        if (!current() || loading) return;
+        loading = true;
+        pagingState();
+        try {
+          const candidates = await api(
+            "state?project=" + encodeURIComponent(task.project) +
+            "&limit=200&offset=" + requestedOffset + "&filter=all&system=false&sections=core",
+          );
+          if (!current()) return;
+          // Read at response time so edits made while a page loads remain selected.
+          const selected = select.value || "", pinned = new Map();
+          for (const option of select.children)
+            if (option.value && [dependency, selected].includes(option.value))
+              pinned.set(option.value, {id: option.value, title: option.textContent});
+          const choices = new Map(pinned);
+          for (const other of candidates.tasks || [])
+            if (other.id !== task.id) choices.set(other.id, other);
+          select.replaceChildren(none);
+          for (const other of choices.values()) {
+            const option = el("option", other.title);
+            option.value = other.id;
+            select.append(option);
+          }
+          select.value = selected;
+          offset = requestedOffset;
+          hasMore = !!candidates.pagination?.has_more;
+          pageNote.textContent = t("前置任务候选页") + " " + (offset / 200 + 1);
+        } finally {
+          loading = false;
+          if (current()) pagingState();
         }
-      const dependency = metadata.dependency?.dependency || "";
+      }
+      // Seed saved/draft selections before loading, including an off-page parent.
       for (const id of new Set([dependency, queueDraft?.dependency])) {
-        if (!id || (candidates.tasks || []).some(other => other.id === id)) continue;
-        const parent = await api("task?id=" + encodeURIComponent(id) + "&project=" + encodeURIComponent(task.project));
-        if (!current()) return;
-        const option = el("option", parent.title);
-        option.value = parent.id;
+        if (!id) continue;
+        const option = el("option", id);
+        option.value = id;
         select.append(option);
       }
       select.value = queueDraft?.dependency ?? dependency;
+      // Resolve seed titles once; subsequent pages pin only the saved and selected parent.
+      for (const option of [...select.children]) {
+        if (!option.value) continue;
+        const parent = await api("task?id=" + encodeURIComponent(option.value) + "&project=" + encodeURIComponent(task.project));
+        if (!current()) return;
+        option.textContent = parent.title;
+      }
+      await loadCandidates(0);
+      if (!current()) return;
       label.append(select);
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");
       urgency.type = "checkbox";
-      urgency.checked = queueDraft?.urgency ?? !!metadata.urgency;
-      let baseline = {dependency, urgency: !!metadata.urgency};
-      queueDraftReaders.set(body, () => ({
-        ...(select.value !== baseline.dependency ? {dependency: select.value} : {}),
-        ...(urgency.checked !== baseline.urgency ? {urgency: urgency.checked} : {}),
-      }));
+      urgency.checked = queueDraft?.urgency ?? editor.baseline.urgency;
+      editor.read = () => ({dependency: select.value, urgency: urgency.checked});
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
-      form.append(label, urgencyLabel, submit);
+      editor.submit = submit;
+      submit.disabled = queueSaves.has(editor.key);
+      form.append(label, urgencyLabel, submit, pager);
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
-          if (!current()) return;
+          if (!current() || queueSaves.has(editor.key)) return;
+          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
-            const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
             await api("task/schedule", submitted);
-            if (!current()) return;
-            // The endpoint acknowledges these exact values; newer edits stay in the controls.
-            baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            // Rebase even if this form was rebuilt. Its editor still owns newer edits.
+            editor.baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            editor.version++;
+            if (!queueEditorCurrent(editor)) return;
             await refresh();
-            if (current()) toast(t("排队设置已保存"));
+            if (queueEditorCurrent(editor)) toast(t("排队设置已保存"));
           } finally {
-            submit.disabled = false;
+            queueSaves.delete(editor.key);
+            if (queueEditor?.key === editor.key && queueEditor.submit)
+              queueEditor.submit.disabled = false;
           }
         }, form);
       };
@@ -493,8 +545,20 @@ window.RSIExperience = (() => {
     }
     body.append(controls);
   }
+  function readQueueDraft() {
+    if (!queueEditor || !queueEditorCurrent(queueEditor)) return;
+    const values = queueEditor.read?.();
+    if (!values) return queueEditor.draft;
+    if (queueSaves.has(queueEditor.key)) return values;
+    return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== queueEditor.baseline[key]));
+  }
   function taskOpened(task, queueDraft) {
-    queueDraftReaders.delete($("detail-body"));
+    const key = queueKey(task);
+    if (queueEditor?.key !== key)
+      queueEditor = {key, project: task.project, task: task.id, version: 0};
+    queueEditor.draft = queueDraft;
+    queueEditor.read = null;
+    queueEditor.submit = null;
     clearTimeout(liveTimer);
     lastDetail = "";
     const url = new URL(location.href);
@@ -504,7 +568,7 @@ window.RSIExperience = (() => {
     }).toString();
     history.replaceState(null, "", url);
     const ticket = detailSequence;
-    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft));
+    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft, queueEditor));
     liveTimer = setTimeout(liveDetail, 5000);
   }
   function detailsSnapshot(root) {
@@ -537,7 +601,7 @@ window.RSIExperience = (() => {
       // Task state can change before any run exists. Keep forms intact on unchanged polls.
       if (metadata.state !== task.state) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
-        const queueDraft = queueDraftReaders.get($("detail-body"))?.();
+        const queueDraft = readQueueDraft();
         await showTask(metadata, restore, queueDraft);
         if (detailSequence === ticket + 1 && projectId === task.project && $("detail-dialog").open) {
           restore($("detail-body"));
@@ -885,7 +949,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, taskOpened, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
 })();
 
 'use strict';

@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Catalog refreshes retain custom display names, manual model status and preferences such as pricing while updating service-provided names and capabilities, with compatibility for existing directory records.
+- Blank custom model names use the full ID, fixing rejection of valid IDs with 161–256 characters. Connection forms no longer generate truncated default names, and Chinese and English hints explain the limits.
+
+- Language changes, requirement supplements and task-detail rebuilds preserve unsaved predecessor and urgency choices, preventing later saves from unintentionally restoring old queue settings.
+- The predecessor selector supports explicit pagination, retries and selection retention across pages, making same-project tasks beyond the first 200 selectable.
+- Inspection and Issue sync read current settings under the schedule-write lock. Older scheduler ticks cannot overwrite deadlines set by interval saves or restored inheritance, or trigger disabled sources from stale snapshots.
+- Next inspection times match working-hour eligibility, skipping entire windows missing during daylight-saving transitions and handling half-hour jumps, repeated windows and day changes.
+
 ## 0.5.115
 
 <!-- adaptive-rsi-release:0.5.115;base:eeec1271316933db544cac66343b3484bb9c5497 -->
