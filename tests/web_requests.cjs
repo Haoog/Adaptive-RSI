@@ -7,6 +7,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/app.js'), 'utf8');
 const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/auth.js'), 'utf8');
 const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/experience.js'), 'utf8');
+const usageSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/usage.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
 async function waitFor(predicate) {
@@ -1893,6 +1894,157 @@ test('pending completion catalog refresh cannot invoke duplicate callbacks',asyn
   run.release();await run.tick();await run.tick();
   assert.equal(run.calls.catalog,1);
   assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+function usagePage() {
+  const page = browser(), requests = [];
+  let ready, hiddenChanged;
+  page.context.language = 'zh-CN';
+  page.document.visibilityState = 'visible';
+  page.document.addEventListener = (type, callback) => { if (type === 'DOMContentLoaded') ready = callback; };
+  page.context.MutationObserver = class {
+    constructor(callback) { hiddenChanged = callback; }
+    observe(node, options) {
+      assert.equal(node, page.node('view-usage'));
+      assert.deepEqual(Array.from(options.attributeFilter), ['hidden']);
+    }
+  };
+  vm.runInContext(usageSource, page.context);
+  ready();
+  page.node('view-usage').hidden = false;
+  page.node('usage-period').value = 'all';
+  page.node('usage-scope').value = 'current';
+  page.node('usage-sort').value = 'recent';
+  vm.runInContext('view="usage"', page.context);
+  page.context.fetch = url => new Promise(resolve => {
+    requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200) {
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
+        tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
+    }});
+  });
+  return Object.assign(page, {
+    requests,
+    show() { page.context.window.RSIUsage.show(); return page.context.lastAction; },
+    search(query) { page.node('usage-search').value = query; page.node('usage-search').handlers.input(); },
+    hide() { vm.runInContext('view="overview"', page.context); page.node('view-usage').hidden = true; hiddenChanged(); },
+    active(delay) { return page.timers.filter(timer => timer.active && timer.delay === delay).length; },
+    title() { return page.node('usage-tasks').children[0]?.children[0]?.children[0]?.textContent; }
+  });
+}
+
+for (const timing of ['before-input', 'during-debounce', 'after-search']) {
+  for (const status of timing === 'before-input' ? [200] : [200, 404, 500]) {
+    test(`usage search survives an old ${status} response ${timing}`, async () => {
+      const page = usagePage(), old = page.show();
+      if (timing === 'before-input') { page.requests[0].finish('Old result'); await old; }
+      page.search('latest query');
+      assert.equal(page.active(350), 1);
+      assert.equal(page.active(30000), 0);
+      assert.equal(page.node('usage-refresh').disabled, false);
+      if (timing === 'during-debounce') {
+        page.requests[0].finish('Old result', status); await old;
+        assert.equal(page.active(350), 1, 'old finalization must preserve the search');
+        assert.equal(page.title(), undefined, 'old data must not render after input');
+        assert.equal(page.active(30000), 0);
+      }
+      page.fireTimer(350);
+      const search = page.context.lastAction;
+      assert.equal(page.requests.length, 2);
+      assert.equal(page.requests[1].params.get('q'), 'latest query');
+      assert.equal(page.requests[1].params.get('offset'), '0');
+      page.requests[1].finish('Latest result'); await search;
+      if (timing === 'after-search') { page.requests[0].finish('Old result', status); await old; }
+      assert.equal(page.title(), 'Latest result');
+      assert.equal(page.node('usage-search').value, 'latest query');
+      assert.equal(page.active(350), 0);
+      assert.equal(page.active(30000), 1);
+    });
+  }
+}
+
+test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const next = page.context.lastAction;
+  assert.equal(page.requests[1].params.get('offset'), '25');
+  page.requests[1].finish('Page two'); await next;
+  page.search('first'); page.search('latest');
+  assert.equal(page.active(350), 1);
+  assert.equal(page.active(30000), 0);
+  page.fireTimer(350); const search = page.context.lastAction;
+  assert.equal(page.requests.length, 3);
+  assert.equal(page.requests[2].params.get('q'), 'latest');
+  assert.equal(page.requests[2].params.get('offset'), '0');
+  page.document.visibilityState = 'hidden';
+  page.requests[2].finish('Latest'); await search;
+  assert.equal(page.active(60000), 1);
+  page.document.visibilityState = 'visible';
+  page.fireTimer(60000); const refresh = page.context.lastAction;
+  assert.equal(page.requests[3].params.get('q'), 'latest');
+  page.requests[3].finish('Refreshed'); await refresh;
+  assert.equal(page.active(30000), 1);
+});
+
+for (const trigger of ['project', 'period', 'refresh', 'hide']) {
+  test(`usage ${trigger} cancels pending search and discards late responses`, async () => {
+    const page = usagePage();
+    if (trigger === 'refresh') {
+      const initial = page.show(); page.requests[0].finish('Initial'); await initial;
+      page.requests.length = 0;
+      page.node('usage-next').onclick();
+    } else page.show();
+    const old = page.context.lastAction;
+    page.search('new query');
+    if (trigger === 'project') {
+      vm.runInContext('projectId="b"', page.context);
+      page.node('project-select').handlers.change();
+    } else if (trigger === 'period') {
+      page.node('usage-period').value = '7'; page.node('usage-period').handlers.change();
+    } else if (trigger === 'refresh') page.node('usage-refresh').onclick();
+    else page.hide();
+    const current = page.context.lastAction;
+    assert.equal(page.active(350), 0);
+    page.requests[0].finish('Stale'); await old;
+    assert.equal(page.title(), trigger === 'refresh' ? 'Initial' : undefined);
+    if (trigger === 'hide') {
+      assert.equal(page.requests.length, 1);
+      assert.equal(page.active(30000), 0);
+      assert.equal(page.node('usage-refresh').disabled, false);
+      vm.runInContext('view="usage"', page.context); page.node('view-usage').hidden = false;
+      page.show();
+    } else {
+      assert.equal(page.node('usage-refresh').disabled, true, 'old finalization cannot enable the current request');
+      assert.equal(page.active(30000), 0);
+    }
+    const latest = trigger === 'hide' ? page.context.lastAction : current;
+    assert.equal(page.requests.length, 2);
+    assert.equal(page.requests[1].params.get('q'), 'new query');
+    assert.equal(page.requests[1].params.get('offset'), '0');
+    assert.equal(page.requests[1].params.get('project'), trigger === 'project' ? 'b' : 'a');
+    page.requests[1].finish('Current'); await latest;
+    assert.equal(page.title(), 'Current');
+    assert.equal(page.active(30000), 1);
+  });
+}
+
+test('leaving usage clears auto refresh and pending detail without reopening the dialog', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-tasks').children[0].children[2].handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[1].params.get('task'), 'Initial');
+  page.hide();
+  assert.equal(page.active(30000), 0);
+  page.requests[1].finish('Old detail'); await detail;
+  assert.notEqual(page.node('usage-detail').open, true);
+});
+
+test('a current unsupported usage response stops auto refresh', async () => {
+  const page = usagePage(), pending = page.show();
+  page.requests[0].finish('Unsupported', 404); await pending;
+  assert.equal(page.node('usage-refresh').disabled, false);
+  assert.equal(page.active(30000), 0);
+  assert.match(page.node('usage-tasks').children[0].textContent, /尚不支持用量页面/);
 });
 
 test('the live run stage marks an in-progress review before its stage row exists', () => {
