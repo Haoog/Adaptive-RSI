@@ -212,7 +212,7 @@ class CodexAgent:
         container = platform.system() != "Darwin" or config["sandbox"]["backend"] == "docker"
         if not binary and not container:
             raise RuntimeError("Codex CLI is not installed for this route")
-        binary = binary or "codex"
+        binary = "codex" if container else str(Path(binary).resolve())
         billing_config = config
         environment = None
         secret = ""

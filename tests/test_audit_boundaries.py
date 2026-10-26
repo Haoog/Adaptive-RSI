@@ -3,6 +3,8 @@ import copy
 import csv
 import io
 import json
+import platform
+import shutil
 import sys
 import urllib.error
 import tempfile
@@ -25,6 +27,43 @@ from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 from adaptive_rsi.usage import opencode_usage
 from tests.test_runtime import FakeAgent, fixture
+
+
+class CodexExecutableTest(unittest.TestCase):
+    @unittest.skipUnless(platform.system() == "Darwin" and shutil.which("codex"), "installed macOS Codex")
+    def test_symlinked_codex_can_start_itself_inside_permissions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            executable = Path(shutil.which("codex")).resolve()
+            alias = root / "codex"
+            alias.symlink_to(executable)
+            store = Store(root / "state")
+            self.addCleanup(store.close)
+            commands = []
+
+            def local_process(argv, cwd, *args):
+                commands.append(argv)
+                profile = []
+                for index, argument in enumerate(argv[:-1]):
+                    if argument == "-c":
+                        profile.extend([argument, argv[index + 1]])
+                result = run_process([argv[0], "sandbox", "-P", "rsi", *profile,
+                                      "-C", str(workspace), argv[0], "--version"], workspace, timeout=15)
+                self.assertEqual(result["exit_code"], 0, result)
+                self.assertIn("codex-cli", result["stdout"])
+                Path(argv[argv.index("--output-last-message") + 1]).write_text('{"summary":"local startup verified"}')
+                return {"exit_code": 0, "error": None, "stderr": "", "stdout": ""}
+
+            original_which = shutil.which
+            with patch("adaptive_rsi.agent.shutil.which", side_effect=lambda name: str(alias) if name == "codex" else original_which(name)), \
+                    patch("adaptive_rsi.agent.run_process", side_effect=local_process):
+                config = copy.deepcopy(DEFAULTS)
+                config["models"]["probe"] = config["models"]["analysis"]
+                result = CodexAgent(store).invoke("probe", "local startup only", workspace, "project", "run", config)
+            self.assertEqual(commands[0][0], str(executable))
+            self.assertEqual(result["summary"], "local startup verified")
 
 
 class AuditRuntimeBoundariesTest(unittest.TestCase):

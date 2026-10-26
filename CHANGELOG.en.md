@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Native macOS Codex calls resolve executable symlinks before launch, allowing a CLI installed under `~/.codex` to start its sandbox helpers; Docker continues to use the container's `codex`.
+- Usage details reuse the list's friendly background-check title. When calls have unknown usage and no tokens are recorded, show “Unknown usage” instead of the misleading “0 + partly unknown”.
+
 ## 0.5.106
 
 <!-- adaptive-rsi-release:0.5.106;base:e1ae12f1b643fb0ad6573ee144712f1c64df0f1d -->

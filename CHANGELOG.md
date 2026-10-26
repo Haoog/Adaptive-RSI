@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- macOS 原生 Codex 调用先解析可执行文件的符号链接，避免安装在 `~/.codex` 下的 CLI 创建沙箱辅助进程时被拒绝；Docker 继续使用容器内的 `codex`。
+- 用量明细沿用列表中的后台检查友好名称；存在未知调用且没有已记录 tokens 时直接显示「用量未知」，不再显示容易误解的「0 + 部分未知」。
+
 ## 0.5.106
 
 <!-- adaptive-rsi-release:0.5.106;base:e1ae12f1b643fb0ad6573ee144712f1c64df0f1d -->
