@@ -11,6 +11,9 @@
 - The full commit SHA inputs for release/deploy tags now validate exactly like the server (40 lowercase hex characters). Uppercase input is blocked before saving with an explanation and is never silently rewritten; the post-deploy health URL must be HTTPS without credentials, query or fragment already in the browser.
 - When listing release/deploy workflows fails, the dropdown no longer stays on "Loading workflows…": it shows an error item and retries through the existing refresh button; a successful reload clears the stale failure message.
 - When the project's GitHub repository does not match its local origin, the server returns the fixed validation message and the interface explains how to align the repository with the origin before retrying.
+- When a historical run in the task detail fails to load, the section now shows an error message with a retry entry, and collapsing and reopening reloads it instead of staying blank forever; duplicate requests are not sent while one load is in flight.
+- "Cancel task" in the task detail now covers every state the server allows cancelling: awaiting_approval, waiting_budget, blocked, deferred, insufficient_evidence, failed and interrupted tasks can all be cancelled. Cancelling a pending-approval candidate first confirms the consequences (the candidate is revoked, fresh verification is required; existing PRs are not affected).
+- "Recheck with current inputs" inside the task detail is now also available for waiting_budget and obsolete tasks, matching the task list and the server's retryable states.
 
 ## 0.5.117
 

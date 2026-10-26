@@ -381,12 +381,14 @@ window.RSIExperience = (() => {
       [
         "failed",
         "blocked",
+        "waiting_budget",
         "interrupted",
         "expired",
         "insufficient_evidence",
         "deferred",
         "rejected",
         "cancelled",
+        "obsolete",
       ].includes(metadata.state)
     )
       controls.append(

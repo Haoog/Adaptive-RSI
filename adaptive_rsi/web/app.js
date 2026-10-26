@@ -441,10 +441,24 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
   restoreView?.(body);
   }
- for(const [index,run] of history.entries()){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));body.append(section);let loaded=false;section.addEventListener('toggle',()=>{if(section.open&&!loaded){loaded=true;safe(()=>loadRun(run,index,section));}});if(index===0){loaded=true;await loadRun(run,index,section);}}
+ for(const [index,run] of history.entries()){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));body.append(section);
+  // 加载失败不能让区块永久空白：失败后在区块内给出错误项与重试入口；进行中的请求不重复发起。
+  let loaded=false,loading=false;
+  const load=async()=>{if(loading||loaded)return;loading=true;
+   try{await loadRun(run,index,section);loaded=true;}
+   catch(error){
+    if(ticket!==detailSequence||projectId!==project)return;
+    section.replaceChildren(section.firstChild,el('p',t('运行记录加载失败。'),'form-error'),action(t('重试'),load,'text-button'));
+   }finally{loading=false;}};
+  section.addEventListener('toggle',()=>{if(section.open&&!loaded)load();});
+  if(index===0)await load();}
 
  if(ticket!==detailSequence||projectId!==project)return;
- if(['queued','planning','executing','evaluating'].includes(task.state))body.append(action(t('取消任务'),async()=>{if(ticket!==detailSequence||projectId!==project)return;await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
+ // 与 runtime.cancel_task 的 cancellable 状态保持一致；待批准的候选取消前需确认后果。
+ if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state))body.append(action(t('取消任务'),async()=>{
+  if(ticket!==detailSequence||projectId!==project)return;
+  if(task.state==='awaiting_approval'&&!(await uiConfirm(t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？'))))return;
+  await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
  restoreView?.(body);
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null))for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=(state.cases||[]).filter(c=>c.project===projectId).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}else summary.append(el('p',t('验证统计加载中。'),'muted'));

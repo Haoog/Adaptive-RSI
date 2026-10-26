@@ -1378,7 +1378,9 @@ const english = {
   "兼容配置覆盖":"Compatible configuration overrides",
   "OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。":"OpenCode Go uses an API key. Select the matching OpenCode service in the provider list and save its key. ChatGPT sign-in does not provide Go credentials.",
   "OpenCode Go 官方说明":"Official OpenCode Go documentation",
-  "从 OpenCode 官方控制台复制当前 Go API 地址与密钥。模型 ID 和剩余额度以官方控制台为准；保存和获取目录不代表推理成功。":"Copy the current Go API endpoint and key from the official OpenCode console. Model IDs and remaining allowance come from that console. Saving and fetching models do not establish successful inference."
+  "从 OpenCode 官方控制台复制当前 Go API 地址与密钥。模型 ID 和剩余额度以官方控制台为准；保存和获取目录不代表推理成功。":"Copy the current Go API endpoint and key from the official OpenCode console. Model IDs and remaining allowance come from that console. Saving and fetching models do not establish successful inference.",
+  "运行记录加载失败。":"Failed to load run records.",
+  "取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？":"Cancelling revokes the pending candidate. A fresh verification is required before it can be delivered again; existing PRs are not affected. Cancel this task?"
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }
