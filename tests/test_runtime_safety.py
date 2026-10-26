@@ -105,6 +105,107 @@ class RuntimeSafetyTest(unittest.TestCase):
                     self.assertEqual(self.runtime.invoke("implementation", "fixture", self.repo, fresh), {"summary": "fixture"})
                 self.store.transition(fresh["id"], "completed", {}, True)
 
+    def test_late_pause_before_approval_interrupts_process_without_auto_publish(self):
+        self.runtime.configure({"delivery": {"mode": "pr"}}, self.project)
+        for explicit_cancel in [False, True]:
+            with self.subTest(explicit_cancel=explicit_cancel):
+                task = self.runtime.goal(self.project, "Late pause " + str(explicit_cancel))
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                transition = self.store.transition
+                attempted = []
+
+                def pause_before_transition(run_id, state, *args, **kwargs):
+                    if state == "awaiting_approval":
+                        attempted.append(state)
+                        self.runtime.pause(self.project, True)
+                        self.runtime.pause(self.project, False)
+                        if explicit_cancel:
+                            self.runtime.cancel_task(task)
+                    return transition(run_id, state, *args, **kwargs)
+
+                outcome = {"decision": "pass", "summary": "fixture", "evaluation": {"decision": "pass"},
+                           "review": {"decision": "pass"}}
+                base = git(self.repo, "rev-parse", "HEAD")
+                with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                        patch.object(self.runtime, "execute_candidate", return_value=outcome), \
+                        patch.object(self.store, "transition", side_effect=pause_before_transition), \
+                        patch.object(self.runtime, "deliver", wraps=self.runtime.deliver) as deliver, \
+                        patch.object(self.runtime, "monitor_strategy") as monitor:
+                    self.runtime.process(run)
+                self.assertEqual(attempted, ["awaiting_approval"])
+                expected = "cancelled" if explicit_cancel else "interrupted"
+                saved = self.store.one("SELECT state,ended,result FROM runs WHERE id=?", (run["id"],))
+                self.assertEqual(saved["state"], expected)
+                self.assertIsNotNone(saved["ended"])
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], expected)
+                self.assertFalse(self.store.query("SELECT 1 FROM tasks WHERE source='system_publish'"))
+                self.assertFalse(self.store.query("SELECT 1 FROM skills WHERE task=?", (task,)))
+                self.assertFalse(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='awaiting_approval'", (run["id"],)))
+                self.assertIsNone(self.store.setting("run-stop:" + run["id"]))
+                deliver.assert_not_called()
+                monitor.assert_not_called()
+                self.runtime.retry(task)
+                fresh = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertFalse(self.runtime.is_cancelled(fresh))
+                self.store.transition(fresh["id"], "completed", {}, True)
+
+    def test_late_pause_before_failure_retry_interrupts_process_without_requeue(self):
+        self.runtime.configure({"limits": {"retries": 1}}, self.project)
+        task = self.runtime.goal(self.project, "Late pause before retry")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        transition = self.store.transition
+        attempted = []
+
+        def pause_before_transition(run_id, state, *args, **kwargs):
+            if state == "failed":
+                attempted.append(kwargs["task_fields"])
+                self.runtime.pause(self.project, True)
+                self.runtime.pause(self.project, False)
+            return transition(run_id, state, *args, **kwargs)
+
+        base = git(self.repo, "rev-parse", "HEAD")
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch.object(self.runtime, "execute_candidate", return_value={"decision": "fail", "reason": "fixture"}), \
+                patch.object(self.store, "transition", side_effect=pause_before_transition), \
+                patch.object(self.runtime, "monitor_strategy") as monitor:
+            self.runtime.process(run)
+        self.assertEqual(len(attempted), 1)
+        self.assertEqual(attempted[0]["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state,available FROM tasks WHERE id=?", (task,)),
+                         {"state": "interrupted", "available": 0})
+        saved = self.store.one("SELECT state,ended FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(saved["state"], "interrupted")
+        self.assertIsNotNone(saved["ended"])
+        self.assertFalse(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='retry'", (run["id"],)))
+        self.assertFalse(self.store.query("SELECT 1 FROM tasks WHERE source='system_publish'"))
+        self.assertIsNone(self.store.setting("run-stop:" + run["id"]))
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+        monitor.assert_not_called()
+
+    def test_late_pause_before_infrastructure_retry_does_not_requeue(self):
+        task = self.runtime.goal(self.project, "Late infrastructure pause")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        transition = self.store.transition
+        attempted = []
+
+        def pause_before_transition(run_id, state, *args, **kwargs):
+            if state == "blocked":
+                attempted.append(state)
+                self.runtime.pause(self.project, True)
+                self.runtime.pause(self.project, False)
+            return transition(run_id, state, *args, **kwargs)
+
+        base = git(self.repo, "rev-parse", "HEAD")
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch.object(self.runtime, "execute_candidate", side_effect=RuntimeError("HTTP 503 connection failed")), \
+                patch.object(self.store, "transition", side_effect=pause_before_transition):
+            self.runtime.process(run)
+        self.assertEqual(attempted, ["blocked"])
+        self.assertEqual(self.store.one("SELECT state,available,infra_retries FROM tasks WHERE id=?", (task,)),
+                         {"state": "interrupted", "available": 0, "infra_retries": 0})
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "interrupted")
+        self.assertFalse(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='infrastructure_retry'", (run["id"],)))
+
     def test_pause_stop_request_survives_runtime_reopen_and_recovery(self):
         task = self.runtime.goal(self.project, "Durable pause")
         run = self.store.claim(self.project, self.runtime.config(self.project))

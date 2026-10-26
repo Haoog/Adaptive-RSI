@@ -632,10 +632,10 @@ class ExperienceTest(unittest.TestCase):
         self.runtime.pause(self.project, False)
         run = self.store.claim(self.project, self.runtime.config(self.project))
         transition = self.store.transition
-        def concurrent_cancel(run_id, state, result=None, terminal=False):
+        def concurrent_cancel(run_id, state, result=None, terminal=False, **kwargs):
             if state == "blocked":
                 self.runtime.cancel_task(task)
-            return transition(run_id, state, result, terminal)
+            return transition(run_id, state, result, terminal, **kwargs)
         with patch.object(self.store, "transition", side_effect=concurrent_cancel), \
                 patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
                 patch.object(self.runtime, "invoke", side_effect=RuntimeError("HTTP 503 connection failed")):

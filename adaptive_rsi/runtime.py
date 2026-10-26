@@ -953,7 +953,10 @@ class Runtime:
                 return
             if self.is_cancelled(run):
                 raise Cancelled("Cancelled before delivery")
-            self.store.transition(run["id"], "awaiting_approval", outcome, True)
+            transitioned = self.store.transition(run["id"], "awaiting_approval", outcome, True)
+            # transition 的 True 表示已写入；暂停/取消可能在事务内改为停止终态。
+            if not transitioned or self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] != "awaiting_approval":
+                return
             if isinstance(self.agent, CodexAgent):
                 task_proofs = self.store.setting("task-proof-current:" + project["id"], {})
                 if not isinstance(task_proofs, dict):
@@ -997,10 +1000,11 @@ class Runtime:
                     import random
                     delay = min(900, 60 * 2 ** task["infra_retries"]) * random.uniform(0.85, 1.15)
                     problem["retry_at"] = time.time() + delay
-                    self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True)
-                    self.store.execute("UPDATE tasks SET state='queued',available=?,infra_retries=infra_retries+1,updated=? WHERE id=? AND state='blocked'",
-                                       (problem["retry_at"], time.time(), task["id"]))
-                    self.store.event("infrastructure_retry", "Temporary connection failure; fresh run scheduled", run["project"], run["id"], {"retry_at": problem["retry_at"]})
+                    transitioned = self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
+                                                         task_fields={"state": "queued", "available": problem["retry_at"],
+                                                                      "infra_retries": task["infra_retries"] + 1})
+                    if transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
+                        self.store.event("infrastructure_retry", "Temporary connection failure; fresh run scheduled", run["project"], run["id"], {"retry_at": problem["retry_at"]})
                     return
             elif problem["code"] == "budget" and task:
                 # 额度类故障按等待次数退避重排；达到上限后转 blocked，等待用户手动重试。
@@ -1047,7 +1051,7 @@ class Runtime:
             # run 保留失败证据，任务与退避同事务回队，依赖清理看不到临时 failed。
             task_fields = {"state": "queued", "available": time.time() + delay}
         transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)
-        if state == "failed":
+        if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
             checks = result.get("evaluation", {}).get("checks", {})
             regression = any(old.get("passed") and not new.get("passed")
                              for old, new in zip(checks.get("baseline", []), checks.get("candidate", [])))
