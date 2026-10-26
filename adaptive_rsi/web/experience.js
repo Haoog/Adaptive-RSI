@@ -14,6 +14,7 @@ window.RSIExperience = (() => {
     lastDetail = "",
     inboxBusy = false,
     inboxAt = 0;
+  const queueDraftReaders = new WeakMap();
   const notificationKey = "rsi-notifications:" + location.origin;
   function readSaved(key, fallback) {
     try {
@@ -317,7 +318,7 @@ window.RSIExperience = (() => {
         ),
       );
   }
-  async function taskControls(task, body, ticket) {
+  async function taskControls(task, body, ticket, queueDraft) {
     const project = projectId;
     const current = () => projectId === project && ticket === detailSequence && body.isConnected;
     async function refreshTaskDetail() {
@@ -425,19 +426,24 @@ window.RSIExperience = (() => {
           select.append(option);
         }
       const dependency = metadata.dependency?.dependency || "";
-      if (dependency && !(candidates.tasks || []).some(other => other.id === dependency)) {
-        const parent = await api("task?id=" + encodeURIComponent(dependency) + "&project=" + encodeURIComponent(task.project));
+      for (const id of new Set([dependency, queueDraft?.dependency])) {
+        if (!id || (candidates.tasks || []).some(other => other.id === id)) continue;
+        const parent = await api("task?id=" + encodeURIComponent(id) + "&project=" + encodeURIComponent(task.project));
         if (!current()) return;
         const option = el("option", parent.title);
         option.value = parent.id;
         select.append(option);
       }
-      select.value = dependency;
+      select.value = queueDraft?.dependency ?? dependency;
       label.append(select);
       const urgencyLabel = el("label", t("优先处理")),
         urgency = el("input");
       urgency.type = "checkbox";
-      urgency.checked = !!metadata.urgency;
+      urgency.checked = queueDraft?.urgency ?? !!metadata.urgency;
+      queueDraftReaders.set(body, () => ({
+        ...(select.value !== dependency ? {dependency: select.value} : {}),
+        ...(urgency.checked !== !!metadata.urgency ? {urgency: urgency.checked} : {}),
+      }));
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
@@ -480,7 +486,8 @@ window.RSIExperience = (() => {
     }
     body.append(controls);
   }
-  function taskOpened(task) {
+  function taskOpened(task, queueDraft) {
+    queueDraftReaders.delete($("detail-body"));
     clearTimeout(liveTimer);
     lastDetail = "";
     const url = new URL(location.href);
@@ -490,7 +497,7 @@ window.RSIExperience = (() => {
     }).toString();
     history.replaceState(null, "", url);
     const ticket = detailSequence;
-    safe(() => taskControls(task, $("detail-body"), ticket));
+    safe(() => taskControls(task, $("detail-body"), ticket, queueDraft));
     liveTimer = setTimeout(liveDetail, 5000);
   }
   function detailsSnapshot(root) {
@@ -523,7 +530,8 @@ window.RSIExperience = (() => {
       // Task state can change before any run exists. Keep forms intact on unchanged polls.
       if (metadata.state !== task.state) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
-        await showTask(metadata, restore);
+        const queueDraft = queueDraftReaders.get($("detail-body"))?.();
+        await showTask(metadata, restore, queueDraft);
         if (detailSequence === ticket + 1 && projectId === task.project && $("detail-dialog").open) {
           restore($("detail-body"));
           $("detail-dialog").scrollTop = scroll;

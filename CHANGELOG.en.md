@@ -8,7 +8,7 @@
 - Derived-setting cleanup batches only records with remaining settings, allowing backlogs beyond 200 historical runs to drain.
 - Issue task identities include repository and number, preventing same-number Issues from overwriting each other or inheriting delivery state after repository changes. Legacy identities migrate only with verifiable source evidence, retaining history.
 - Relaxing Issue label policy restores previously excluded task states without waiting for remote content changes. Existing planning decisions and backoff remain intact, without repeatedly requeuing unchanged obsolete work.
-- Task details synchronize state and actions even before any run exists, preserving unsaved requirements. Shrinking last pages trigger a bounded valid-page fetch, avoiding empty pages and inverted ranges while discarding results after navigation changes.
+- Task details synchronize state and actions even before any run exists, preserving unsaved requirements and applicable dependency and urgency drafts. Shrinking last pages trigger a bounded valid-page fetch, avoiding empty pages and inverted ranges while discarding results after navigation changes.
 
 ## 0.5.110
 

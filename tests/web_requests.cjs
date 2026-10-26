@@ -1007,6 +1007,79 @@ test('runless detail polling updates cancellation controls and preserves supplem
   assert.ok(reads >= 4);
 });
 
+for (const dependency of ['draft-parent', '']) {
+  test(`runless deferred-to-queued polling preserves queue edits (${dependency || 'remove dependency'})`, async () => {
+    const page = experiencePage(), task = fixtureTask('runless', 'deferred'), posts = [], parentReads = [];
+    let metadata = {...task, dependency: {dependency: 'saved-parent'}, urgency: dependency ? 0 : 1};
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) { posts.push(JSON.parse(options.body)); return response({saved: true}); }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: metadata.state === 'deferred' ? [fixtureTask('draft-parent')] : []});
+      const id = new URL(url, 'http://fixture.test').searchParams.get('id');
+      if (id !== task.id) { parentReads.push(id); return response(fixtureTask(id)); }
+      return response(metadata);
+    };
+    const controls = await openExperienceTask(page, task);
+    const original = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    original.children[0].children[0].value = dependency;
+    original.children[1].children[0].checked = !!dependency;
+    metadata = {...metadata, state: 'queued', dependency: {dependency: 'new-server-parent'}};
+    page.fireTimer(5000); await new Promise(setImmediate);
+    await page.context.lastAction;
+    const updated = page.node('detail-body').children.find(node => node.className === 'task-controls');
+    const form = updated.children.filter(node => node.tagName === 'FORM').at(-1);
+    assert.notEqual(form, original, 'metadata transition rebuilds controls');
+    assert.equal(form.children[0].children[0].value, dependency);
+    assert.equal(form.children[1].children[0].checked, !!dependency);
+    assert.ok(form.children[0].children[0].children.some(option => option.value === 'new-server-parent'), 'current server dependency remains available off-page');
+    if (dependency) assert.ok(parentReads.includes(dependency), 'off-page draft dependency is restored as an option');
+    form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+    assert.deepEqual(posts, [{task: task.id, dependency: dependency || null, urgency: dependency ? 1 : 0}]);
+    assert.equal(page.timers.filter(timer => timer.active && timer.delay === 5000).length, 1);
+  });
+}
+
+test('runless metadata rebuilding accepts server queue changes for untouched fields', async () => {
+  const page = experiencePage(), task = fixtureTask('runless', 'deferred');
+  let metadata = task;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks: []});
+    return response(url.includes('id=server-parent&') ? fixtureTask('server-parent') : metadata);
+  };
+  await openExperienceTask(page, task);
+  metadata = {...task, state: 'queued', dependency: {dependency: 'server-parent'}, urgency: 1};
+  page.fireTimer(5000); await new Promise(setImmediate);
+  await page.context.lastAction;
+  const controls = page.node('detail-body').children.find(node => node.className === 'task-controls');
+  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  assert.equal(form.children[0].children[0].value, 'server-parent');
+  assert.equal(form.children[1].children[0].checked, true);
+});
+
+test('runless terminal transition does not restore inapplicable queue controls', async () => {
+  const page = experiencePage(), task = fixtureTask('runless', 'deferred');
+  let metadata = task, candidateReads = 0;
+  page.context.fetch = async url => {
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) { candidateReads++; return response({tasks: [fixtureTask('draft-parent')]}); }
+    return response(metadata);
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  form.children[0].children[0].value = 'draft-parent';
+  form.children[1].children[0].checked = true;
+  metadata = {...task, state: 'cancelled'};
+  page.fireTimer(5000); await new Promise(setImmediate);
+  await page.context.lastAction;
+  const updated = page.node('detail-body').children.find(node => node.className === 'task-controls');
+  const text = node => [node.textContent, ...(node.children || []).flatMap(text)];
+  assert.equal(vm.runInContext('detailTask.state', page.context), 'cancelled');
+  assert.equal(text(updated).includes('保存排队设置'), false);
+  assert.ok(text(updated).includes('基于当前输入重新检查'));
+  assert.equal(candidateReads, 1, 'terminal controls do not load queue candidates');
+});
+
 for (const navigation of ['close', 'project', 'other-task']) {
   test(`a runless detail poll cannot overwrite ${navigation} navigation`, async () => {
     const page = experiencePage(), task = fixtureTask('runless', 'queued');
