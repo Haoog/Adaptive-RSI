@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Reloading the interface or switching the runtime machine while the desktop app is downloading a new installer image now resumes progress polling until completion or failure; the completion and failure notices match the non-reloaded flow instead of freezing at a percentage.
+- Desktop update checks (including an explicit "Check for updates") keep an in-flight download's progress instead of clearing its downloading state, so the button cannot be clicked into a duplicate download; downloads are guarded by a process-wide gate, and no path can run two download threads writing the same installer image.
+- After a download completes and the installer image opens, the button switches to a completed "Installer image is open. Drag to install." state that cannot be clicked into a full re-download; "Check for updates" remains the explicit way to re-check.
+
 ## 0.5.118
 
 <!-- adaptive-rsi-release:0.5.118;base:947ad7b0cb1f3aa6c03c8a4e8de181adcae5a9ba -->

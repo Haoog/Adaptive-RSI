@@ -133,6 +133,108 @@ fn session_rotation_refreshes_cookie_and_csrf_for_local_and_remote_connections()
     }
 }
 
+fn update_state(downloading: bool, percent: u64) -> DesktopUpdate {
+    DesktopUpdate {
+        version: "9.9.9".into(),
+        notes: String::new(),
+        url: "https://example.test/update.dmg".into(),
+        sha_url: "https://example.test/update.sha256".into(),
+        error: String::new(),
+        error_code: String::new(),
+        percent: AtomicU64::new(percent),
+        downloading: AtomicBool::new(downloading),
+        opened: AtomicBool::new(false),
+    }
+}
+
+#[test]
+fn force_recheck_never_replaces_an_inflight_download() {
+    let mut update = update_state(true, 4200);
+    // 下载中的状态无论是否 force 都必须保留给轮询：替换会把 downloading 清零，
+    // 让前端误判可重新下载，并使双下载防护失去依据。
+    for force in [false, true] {
+        assert!(should_preserve_update(&update, force), "force={force}");
+    }
+    // 下载已结束（成功打开/失败）时，常规轮询保留状态，显式 force 才允许重新检查。
+    update.downloading.store(false, Ordering::Relaxed);
+    update.opened.store(true, Ordering::Relaxed);
+    assert!(should_preserve_update(&update, false));
+    assert!(!should_preserve_update(&update, true));
+    update.opened.store(false, Ordering::Relaxed);
+    update.error = "Checksum verification failed".into();
+    assert!(should_preserve_update(&update, false));
+    assert!(!should_preserve_update(&update, true));
+    // 没有更新的普通状态不保留：每次检查都应重新请求发布信息。
+    assert!(!should_preserve_update(&update_state(false, 0), false));
+}
+
+#[test]
+fn a_second_download_is_refused_even_if_the_flag_was_cleared() {
+    let state = RuntimeState::default();
+    let gate = Mutex::new(());
+    *state.update.lock().unwrap() = Some(update_state(false, 6400));
+    let (url, sha_url, version, gate_guard) =
+        begin_desktop_download(&state, &gate).expect("first download starts");
+    assert_eq!(
+        (url.as_str(), sha_url.as_str(), version.as_str()),
+        (
+            "https://example.test/update.dmg",
+            "https://example.test/update.sha256",
+            "9.9.9"
+        )
+    );
+    assert!(
+        state
+            .update
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .downloading
+            .load(Ordering::Relaxed)
+    );
+    // 模拟下载推进与并发状态替换：进度已更新、downloading 标志被清零。
+    {
+        let update = state.update.lock().unwrap();
+        let update = update.as_ref().unwrap();
+        update.downloading.store(false, Ordering::Relaxed);
+        update.percent.store(3200, Ordering::Relaxed);
+    }
+    assert!(
+        begin_desktop_download(&state, &gate).is_err(),
+        "a second writer must be refused while the gate is held"
+    );
+    assert_eq!(
+        state
+            .update
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .percent
+            .load(Ordering::Relaxed),
+        3200,
+        "refused download must not reset progress"
+    );
+    drop(gate_guard);
+    // 闸门释放后才能再次开始下载。
+    assert!(begin_desktop_download(&state, &gate).is_ok());
+}
+
+#[test]
+fn download_refused_without_update_state_or_while_flagged_downloading() {
+    let state = RuntimeState::default();
+    let gate = Mutex::new(());
+    assert!(begin_desktop_download(&state, &gate).is_err());
+    *state.update.lock().unwrap() = Some(update_state(true, 1200));
+    assert!(begin_desktop_download(&state, &gate).is_err());
+    assert_eq!(
+        state.update.lock().unwrap().as_ref().unwrap().percent.load(Ordering::Relaxed),
+        1200,
+        "refused download must not reset progress"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn child_wait_deadline_does_not_wait_for_process_exit() {

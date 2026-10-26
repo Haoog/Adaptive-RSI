@@ -1294,6 +1294,7 @@ const english = {
   "有新版本可用": "A new version is available",
   "下载并安装新版本": "Download and install the new version",
   "正在下载新版本…": "Downloading the new version…",
+  "安装镜像已打开，请拖拽安装": "Installer image is open. Drag to install.",
   "下载已完成，安装镜像已打开；请拖拽安装后重启应用。": "Download complete and the installer image is open. Drag to install, then restart the app.",
   "新版本下载失败：": "Update download failed: ",
   "校验未通过，已删除下载文件。": "Checksum verification failed; the download was removed.",
