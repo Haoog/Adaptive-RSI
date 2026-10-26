@@ -207,7 +207,7 @@ class DeliveryLoopTest(unittest.TestCase):
         (self.repo / "notes.txt").write_text("user draft")
         git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
         config = merge(self.runtime.config(self.project), {"github": {"repository": "example/project"}, "delivery": {"base_branch": "main"}})
-        def fetch(root, *args):
+        def fetch(root, *args, timeout=None):
             argv = [str(remote) if a == "https://github.com/example/project.git" else a for a in args]
             return git(root, *argv)
         with patch("adaptive_rsi.delivery.github_git", side_effect=fetch):
@@ -232,7 +232,7 @@ class DeliveryLoopTest(unittest.TestCase):
             projects[name] = project
         active, peak, guard = [], 0, threading.Lock()
 
-        def fetch(root, *args):
+        def fetch(root, *args, timeout=None):
             nonlocal peak
             with guard:
                 active.append(root)
