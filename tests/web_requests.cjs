@@ -9,6 +9,13 @@ const authSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/aut
 const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/experience.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
+async function waitFor(predicate) {
+  const deadline = Date.now() + 5000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, 'asynchronous request reached its expected checkpoint');
+    await new Promise(setImmediate);
+  }
+}
 const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
   version, csrf, update: {busy: false},
   projects: [{id: 'a', name: 'A', paused: true}, {id: 'b', name: 'B', paused: true}]
@@ -60,7 +67,7 @@ function browser(savedSession = new Map()) {
   const context = vm.createContext({
     document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
     localStorage: storage(local), sessionStorage: storage(session), t: value => value,
-    AbortController, DOMException, queueMicrotask, crypto: require('node:crypto').webcrypto,
+    AbortController, DOMException, queueMicrotask, TextEncoder, crypto: require('node:crypto').webcrypto,
     fetch: defaultFetch,
     setInterval() {}, clearInterval() {},
     setTimeout(callback, delay) { const timer = {id: ++nextTimer, callback, delay, active: true}; timers.push(timer); return timer.id; },
@@ -216,7 +223,7 @@ for (const switchProject of [false, true]) {
       return posts.length === 1 ? rejected() : response({id: 'task'});
     };
     const pending = page.submit('goal-form');
-    await new Promise(setImmediate);
+    await waitFor(() => posts.length === 1);
     if (switchProject) vm.runInContext('projectId="b"', page.context);
     page.node('goal-text').value = 'New unsaved task';
     page.input('goal-text', 'goal-form');
@@ -809,9 +816,9 @@ test('one form cannot submit twice while its first write is pending', async () =
   vm.runInContext('safe=fn=>{lastAction=originalSafe(fn,$("goal-form"));return lastAction;}',page.context);
   page.node('goal-text').value='one goal';
   const first=page.submit('goal-form');await page.submit('goal-form');
-  assert.equal(calls,1);release();await first;
+  await waitFor(()=>calls===1);assert.equal(calls,1);release();await first;
   page.node('goal-text').value='next goal';
-  const next=page.submit('goal-form');assert.equal(calls,2);release();await next;
+  const next=page.submit('goal-form');await waitFor(()=>calls===2);assert.equal(calls,2);release();await next;
 });
 
 test('form errors stay next to preserved input and clear on retry', async () => {
@@ -883,12 +890,95 @@ test('goal drafts stay with their project and submit only to that project', asyn
   assert.equal(page.node('goal-text').value,'Only project B: fix a typo');
 });
 
+test('ambiguous goals retain separate IDs through failed edits, reload, and project switches', async () => {
+  const posts = [], tasks = new Map(); let page = browser(), failure = 'after-commit';
+  const connect = () => {
+    page.context.refresh = async () => {};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      assert.equal(url, '/api/goal');
+      const body = JSON.parse(options.body); posts.push(body);
+      if (failure === 'before-commit') throw Error('offline');
+      tasks.set(body.project + ':' + body.request_id, body.text);
+      if (failure === 'after-commit') throw Error('lost acknowledgement');
+      return response({id: body.request_id});
+    };
+  };
+  const submit = async text => {page.node('goal-text').value = text; page.input('goal-text', 'goal-form'); await page.submit('goal-form');};
+  const switchTo = project => {page.node('project-select').value = project; page.node('project-select').handlers.change();};
+  connect();
+  await submit('Goal A');
+  failure = 'before-commit'; await submit('Goal B');
+  const pending = JSON.parse(page.sessionData.get('rsi-submission:a'));
+  page = browser(page.sessionData); connect();
+  switchTo('b'); failure = ''; await submit('Goal A');
+  assert.notEqual(posts[2].request_id, posts[0].request_id, 'the same text in another project has its own ID');
+  assert.equal(page.sessionData.has('rsi-submission:b'), false);
+  switchTo('a'); await submit('Goal A');
+  assert.equal(posts[3].request_id, posts[0].request_id, 'A retry reuses its ID after failed B and reload');
+  assert.equal(pending.entries.length, 2);
+  assert.ok(pending.entries.every(entry => /^[a-f0-9]{64}$/.test(entry.digest) && !('text' in entry)));
+  assert.ok(!JSON.stringify(pending).includes('Goal A'), 'pending records store digests instead of full goal text');
+  assert.equal([...tasks.keys()].filter(key => key.startsWith('a:')).length, 1, 'A is created exactly once');
+  assert.deepEqual(JSON.parse(page.sessionData.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[1].request_id], 'A success removes only A');
+  await submit('Goal B');
+  assert.equal(posts[4].request_id, posts[1].request_id);
+  assert.equal(page.sessionData.has('rsi-submission:a'), false);
+  await submit('Goal A');
+  assert.notEqual(posts[5].request_id, posts[0].request_id, 'a new submission after acknowledgement gets a fresh ID');
+});
+
+test('legacy pending goals migrate without losing the old ID or retaining full text', async () => {
+  const session = new Map([['rsi-submission:a', JSON.stringify({text: 'Legacy goal', id: 'legacy-id'})]]);
+  const page = browser(session), posts = [];
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  page.node('goal-text').value = 'Another goal';
+  await assert.rejects(page.submit('goal-form'));
+  const saved = JSON.parse(session.get('rsi-submission:a'));
+  assert.equal(saved.version, 2); assert.equal(saved.entries.length, 2);
+  assert.equal(saved.entries[0].id, 'legacy-id');
+  assert.equal(saved.entries.some(entry => 'text' in entry), false);
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
+  page.node('goal-text').value = 'Legacy goal'; await page.submit('goal-form');
+  assert.equal(posts[1].request_id, 'legacy-id');
+  assert.deepEqual(JSON.parse(session.get('rsi-submission:a')).entries.map(entry => entry.id), [posts[0].request_id]);
+});
+
+test('pending goal capacity blocks new content without evicting IDs and still allows recovery', async () => {
+  const page = browser(), posts = [];
+  page.context.refresh = async () => {};
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); throw Error('offline');};
+  for (let index = 0; index < 32; index++) {
+    page.node('goal-text').value = 'Pending ' + index;
+    await assert.rejects(page.submit('goal-form'));
+  }
+  const saved = page.sessionData.get('rsi-submission:a');
+  page.node('goal-text').value = 'Over capacity';
+  await assert.rejects(page.submit('goal-form'), /待确认的目标提交过多/);
+  assert.equal(posts.length, 32); assert.equal(page.sessionData.get('rsi-submission:a'), saved);
+  page.context.fetch = async (_url, options) => {posts.push(JSON.parse(options.body)); return response({id: 'task'});};
+  page.node('goal-text').value = 'Pending 0'; await page.submit('goal-form');
+  assert.equal(posts[32].request_id, posts[0].request_id, 'an existing entry remains recoverable at capacity');
+  page.node('goal-text').value = 'Over capacity'; await page.submit('goal-form');
+  assert.equal(posts.length, 34, 'acknowledgement frees capacity');
+});
+
+test('goals are never sent when their recovery IDs cannot be persisted', async () => {
+  const page = browser(); let posts = 0;
+  page.context.fetch = async () => {posts++; return response({id: 'task'});};
+  page.context.sessionStorage.setItem = () => {throw Error('quota exceeded');};
+  page.node('goal-text').value = 'Keep input';
+  await assert.rejects(page.submit('goal-form'), /quota exceeded/);
+  assert.equal(posts, 0); assert.equal(page.node('goal-text').value, 'Keep input');
+});
+
 test('a successful goal save clears only its submitted draft and preserves newer input', async () => {
   const page=browser();let finish;
   page.context.refresh=()=>Promise.resolve();
   page.context.fetch=()=>new Promise(resolve=>{finish=()=>resolve(response({id:'created'}));});
   page.node('goal-text').value='Submitted goal';page.input('goal-text','goal-form');
-  const pending=page.submit('goal-form');await new Promise(setImmediate);
+  const pending=page.submit('goal-form');await waitFor(()=>!!finish);
   page.node('goal-text').value='New goal typed while saving';page.input('goal-text','goal-form');
   finish();await pending;
   assert.equal(page.node('goal-text').value,'New goal typed while saving');
@@ -904,6 +994,7 @@ for (const newerDraft of [null, 'New A draft', 'Submitted goal']) {
     const input = value => { page.node('goal-text').value = value; page.input('goal-text', 'goal-form'); };
     input('Submitted goal');
     const pending = page.submit('goal-form');
+    await waitFor(() => !!finish);
     switchTo('b'); input('B draft');
     if (newerDraft !== null) {
       switchTo('a'); input('Intermediate A edit'); input(newerDraft); switchTo('b');
@@ -1059,6 +1150,44 @@ for (const dependency of ['draft-parent', '']) {
     form.onsubmit({preventDefault() {}}); await page.context.lastAction;
     assert.deepEqual(posts, [{task: task.id, dependency: dependency || null, urgency: dependency ? 1 : 0}]);
     assert.equal(page.timers.filter(timer => timer.active && timer.delay === 5000).length, 1);
+  });
+}
+
+for (const failFirst of [false, true]) {
+  test(`queue saves block overlapping submits and preserve later edits after ${failFirst ? 'failure' : 'success'}`, async () => {
+    const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+    let acknowledge, metadata = {...task, urgency: 0};
+    vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+    page.context.fetch = async (url, options) => {
+      if (url.endsWith('/task/schedule')) {
+        const body = JSON.parse(options.body); posts.push(body);
+        return new Promise((resolve, reject) => {acknowledge = () => {
+          if (failFirst && posts.length === 1) {reject(Error('offline')); return;}
+          metadata = {...metadata, dependency: body.dependency ? {dependency: body.dependency} : null, urgency: body.urgency};
+          resolve(response({saved: true}));
+        };});
+      }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/state?')) return response({tasks: [fixtureTask('parent')]});
+      return response(metadata);
+    };
+    const controls = await openExperienceTask(page, task);
+    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const dependency = form.children[0].children[0], urgency = form.children[1].children[0], submit = form.children[2];
+    dependency.value = 'parent'; urgency.checked = true;
+    form.onsubmit({preventDefault() {}}); const first = page.context.lastAction;
+    assert.equal(submit.disabled, true);
+    dependency.value = ''; urgency.checked = false;
+    form.onsubmit({preventDefault() {}}); await page.context.lastAction;
+    assert.equal(posts.length, 1, 'even a programmatic submit cannot overlap');
+    acknowledge(); await first;
+    assert.equal(submit.disabled, false, 'finally releases the button after success or failure');
+    assert.equal(dependency.value, ''); assert.equal(urgency.checked, false);
+    form.onsubmit({preventDefault() {}}); const later = page.context.lastAction;
+    assert.deepEqual(posts[1], {task: 'child', dependency: null, urgency: 0}, 'later manual save uses the newer draft');
+    acknowledge(); await later;
+    assert.equal(metadata.dependency, null); assert.equal(metadata.urgency, 0);
+    assert.equal(submit.disabled, false);
   });
 }
 

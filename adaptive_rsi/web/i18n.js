@@ -512,6 +512,8 @@ const english = {
   "工作结束时间必须晚于开始时间，范围为 0 至 24 时。": "The end hour must follow the start hour, within 0 to 24.",
   "仓库请填写 owner/name，不是完整链接。": "Enter owner/name rather than the full repository URL.",
   "目标不能为空，且不能超过 30000 个字符。": "Enter a non-empty goal of at most 30,000 characters.",
+  "待确认的目标提交过多。请先重试先前未确认的目标，再提交新目标。": "Too many goal submissions await confirmation. Retry earlier unconfirmed goals before submitting a new one.",
+  "无法读取目标提交记录。输入已保留，请检查浏览器会话存储后重试。": "Cannot read goal submission records. Input is preserved. Check browser session storage before retrying.",
   "还有任务正在运行，请等任务结束后再接入项目。": "Tasks are still running. Wait for them to finish before connecting a project.",
   "页面安全校验已过期。输入已保留，请重新打开控制台后重试。": "The page security check has expired. Input is preserved. Reopen the console, then retry.",
 
