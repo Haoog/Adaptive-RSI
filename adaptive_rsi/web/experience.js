@@ -16,6 +16,7 @@ window.RSIExperience = (() => {
     inboxAt = 0;
   const queueSaves = new Map();
   let queueEditor;
+  let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
     return queueEditor === editor && $("detail-dialog").open &&
@@ -36,7 +37,7 @@ window.RSIExperience = (() => {
     inputs_policy_or_relevant_baseline_change: "输入、策略或相关代码变化后",
   };
   let notifyFailureToasted = false;
-  const phaseNames = {preparation:'准备运行环境', implementation:'正在修改代码', review:'正在评审改动', acceptance:'验收设计'};
+  const phaseNames = {preparation:'准备运行环境', implementation:'正在修改代码', review:'正在评审改动', acceptance:'验收设计', triage:'价值初筛'};
   function queueCopy(task) {
     return [
       t(waiting[task.wait_reason] || task.wait_reason),
@@ -980,7 +981,7 @@ window.RSIExperience = (() => {
       box.append(
         el(
           "p",
-          t(phaseNames[phase] || statusNames[phase] || phase) +
+          t(phaseNames[phase] || roleNames[phase] || statusNames[phase] || phase) +
             " · " +
             Math.round(seconds) +
             " " +
@@ -1025,8 +1026,8 @@ window.RSIExperience = (() => {
     $("attention-inbox").onclick = () => safe(inbox);
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);
-    const button = action(t("流程质量与耗时"), metrics, "text-button");
-    $("view-usage").prepend(button);
+    usageButton = action(t("流程质量与耗时"), metrics, "text-button");
+    $("view-usage").prepend(usageButton);
     $("detail-dialog").addEventListener("close", () => {
       clearTimeout(liveTimer);
       history.replaceState(null, "", location.pathname + location.search);
@@ -1034,7 +1035,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
 })();
 
 'use strict';

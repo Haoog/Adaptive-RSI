@@ -2671,6 +2671,80 @@ test('usage coalesces repeated input, resets pagination and refreshes the latest
   assert.equal(page.active(30000), 1);
 });
 
+test('usage pagination stays disabled during a load and re-enables at the boundaries', async () => {
+  const page = usagePage(), initial = page.show();
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must be disabled while a page loads');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled while a page loads');
+  page.requests[0].finish('Initial'); await initial;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 1–25');
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must stay disabled on the first page');
+  assert.equal(page.node('usage-next').disabled, false);
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must be disabled while a page loads');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled while a page loads');
+  page.requests[1].finish('Page two'); await second;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Page three'); await third;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 51–60');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled on the last page');
+  assert.equal(page.node('usage-prev').disabled, false);
+  page.node('usage-prev').onclick(); const previous = page.context.lastAction;
+  page.requests[3].finish('Page two again'); await previous;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+});
+
+test('usage clamps an offset beyond the total and reloads the clamped page', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two'); await second;
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Page three'); await third;
+  const shrunk = [];
+  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
+  page.context.fetch = url => new Promise(resolve => {
+    const params = new URLSearchParams(url.split('?')[1]);
+    shrunk.push({params, finish(total) {
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
+        tasks: [{task: 'Clamped', title: 'Clamped', project: 'a', state: 'failed', tokens: 100, attempts: 1}],
+        total}));
+    }});
+  });
+  page.node('usage-refresh').onclick();
+  await waitFor(() => shrunk.length >= 1);
+  assert.equal(shrunk[0].params.get('offset'), '50');
+  shrunk[0].finish(36);
+  await waitFor(() => shrunk.length >= 2 && shrunk[1].params.get('offset') === '25');
+  shrunk[1].finish(36);
+  await new Promise(setImmediate);
+  assert.equal(page.node('usage-page').textContent, '36 条记录 · 26–36');
+  assert.equal(textOf(page.node('usage-tasks')).includes('Clamped'), true, 'the clamped page must render its own rows');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled after clamping to the last page');
+  assert.equal(page.node('usage-prev').disabled, false);
+});
+
+test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
+  const details = [];
+  page.context.fetch = url => new Promise(resolve => {
+    details.push({finish: data => resolve(response(data))});
+  });
+  page.node('usage-tasks').children[0].children[2].handlers.click();
+  const detail = page.context.lastAction;
+  await waitFor(() => details.length >= 1);
+  details[0].finish({summary: {tokens: 3, tasks: 1}, daily: [], roles: [
+    {role: 'triage', provider: 'x', model: 'm', effort: 'high', tokens: 2},
+    {role: 'acceptance', provider: 'x', model: 'm', effort: 'high', tokens: 1}],
+    calls: [], call_total: 0, total: 0});
+  await detail;
+  const text = textOf(page.node('usage-detail-content'));
+  assert.ok(text.includes('价值初筛'), 'triage must use the usage role name');
+  assert.ok(text.includes('验收设计'), 'acceptance must use the usage role name');
+});
+
 for (const trigger of ['project', 'period', 'refresh', 'hide']) {
   test(`usage ${trigger} cancels pending search and discards late responses`, async () => {
     const page = usagePage();

@@ -881,6 +881,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  render();if(settingsBaseline){syncDelivery();window.RSIProduct?.renderEditor();window.RSIProduct?.dirtyStatus();}
  window.RSIModelCenter?.translate();
  window.RSIUsage?.translate();
+ window.RSIExperience?.translate?.();
  window.RSIDesktop?.translate?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));
