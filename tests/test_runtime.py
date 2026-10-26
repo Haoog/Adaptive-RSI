@@ -991,6 +991,37 @@ class ServerTest(unittest.TestCase):
     def headers(self):
         return {"Cookie": self.server.cookie + "=" + self.server.token}
 
+    def post(self, path, body):
+        request = urllib.request.Request(
+            self.server.origin + path, json.dumps(body).encode(),
+            {**self.headers(), "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+             "Content-Type": "application/json"})
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+
+    def test_project_api_reports_duplicate_path_and_normalizes_blank_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            repo = fixture(Path(temp) / "repo")
+            created = self.post("/api/projects", {"path": str(repo), "name": "  Named project  ", "enabled": False})
+            self.assertFalse(created["existing"])
+            self.assertEqual(created["name"], "Named project")
+            self.assertTrue(created["paused"])
+            duplicate = self.post("/api/projects", {"path": str(repo), "name": "Different", "enabled": True})
+            self.assertTrue(duplicate["existing"])
+            self.assertEqual(duplicate["id"], created["id"])
+            self.assertEqual(duplicate["name"], "Named project")
+            self.assertTrue(duplicate["paused"])
+            project = self.runtime.project(created["id"])
+            self.assertEqual((project["name"], project["paused"]), ("Named project", 1))
+            # 旧状态记录中的空白名称也回退到目录名，不显示空白选项。
+            self.runtime.store.execute("UPDATE projects SET name='   ' WHERE id=?", (created["id"],))
+            with urllib.request.urlopen(urllib.request.Request(
+                    self.server.origin + "/api/state", headers=self.headers())) as response:
+                state = json.load(response)
+            shown = next(item for item in state["projects"] if item["id"] == created["id"])
+            self.assertEqual(shown["name"], "repo")
+            self.assertEqual(shown["path"], str(repo.resolve()))
+
     def test_aborted_response_does_not_escape_as_server_error(self):
         class ClosedConnection:
             close_connection = False

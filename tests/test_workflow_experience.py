@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import pathlib
 import platform
 import sqlite3
 import tempfile
@@ -10,7 +11,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
@@ -1106,3 +1107,252 @@ class ExperienceTest(unittest.TestCase):
         self.assertEqual(connection_key(config, "opencode", self.project), evidence["failure"]["connection"])
         self.assertEqual(1, self.runtime.resume_provider_tasks("opencode", self.project))
         self.assertEqual("queued", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+
+
+class StorageApprovalOverviewTest(unittest.TestCase):
+    """Pending-approval storage counts must follow the current delivery intent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "state")
+        self.runtime = Runtime(self.store, FakeAgent())
+        self.project = self.runtime.add_project(fixture(self.root / "repo"))
+
+    def tearDown(self):
+        self.runtime.close()
+        self.tmp.cleanup()
+
+    def awaiting(self, text):
+        task = self.runtime.goal(self.project, text)
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass", "criteria": [], "checks": {}, "coverage": []},
+            "review": {"decision": "pass", "findings": []},
+        }, True)
+        return task, run["id"]
+
+    def test_approved_delivering_and_delivered_candidates_leave_pending_approval(self):
+        from adaptive_rsi.storage_tools import overview
+        _, pending = self.awaiting("Pending candidate")
+        _, approved = self.awaiting("Approved candidate")
+        cancelled_task, cancelled = self.awaiting("Cancelled candidate")
+        self.runtime.deliver(approved)
+        self.runtime.cancel_task(cancelled_task)
+
+        snapshot = overview(self.store)
+        pending_ids = [row["id"] for row in snapshot["expiring"]]
+        self.assertIn(pending, pending_ids)
+        self.assertNotIn(approved, pending_ids)
+        self.assertNotIn(cancelled, pending_ids)
+        self.assertEqual([row["id"] for row in snapshot["delivering"]], [approved])
+        self.assertEqual(snapshot["delivered"], [])
+
+        self.store.execute("UPDATE tasks SET state='completed' WHERE source='system_publish' AND body=?", (approved,))
+        snapshot = overview(self.store)
+        self.assertEqual(snapshot["delivering"], [])
+        self.assertEqual([row["id"] for row in snapshot["delivered"]], [approved])
+        self.assertNotIn(approved, [row["id"] for row in snapshot["expiring"]])
+        # Excluding an approved candidate from pending counts must not rewrite its history.
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (approved,))["state"], "awaiting_approval")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (cancelled,))["state"], "awaiting_approval")
+
+    def test_superseded_candidate_is_not_pending_approval(self):
+        from adaptive_rsi.storage_tools import overview
+        _, run = self.awaiting("Superseded candidate")
+        self.store.execute("UPDATE runs SET state='superseded' WHERE id=?", (run,))
+        self.assertNotIn(run, [row["id"] for row in overview(self.store)["expiring"]])
+
+
+class RestoreRetryTest(unittest.TestCase):
+    """A failed restore must clean only the directory it exclusively created."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "state")
+        self.addCleanup(self.store.close)
+        from adaptive_rsi.storage_tools import backup
+        saved = backup(self.store)
+        self.backup = self.store.root / "backups" / (saved["id"] + ".sqlite3")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_failed_restore_removes_new_destination_and_can_retry(self):
+        from adaptive_rsi.storage_tools import restore
+        destination = self.root / "new-parent" / "nested" / "restored"
+        with patch("adaptive_rsi.storage_tools.Store.recover", side_effect=RuntimeError("injected restore failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected restore failure"):
+                restore(self.backup, destination)
+        self.assertFalse(destination.exists())
+        restore(self.backup, destination)
+        self.assertTrue((destination / "state.sqlite3").is_file())
+
+    def test_failed_restore_never_removes_existing_parent_data(self):
+        from adaptive_rsi.storage_tools import restore
+        parent = self.root / "existing-parent"
+        parent.mkdir()
+        marker = parent / "user-data.txt"
+        marker.write_text("keep me")
+        destination = parent / "restored"
+        with patch("adaptive_rsi.storage_tools.Store.recover", side_effect=RuntimeError("injected restore failure")):
+            with self.assertRaises(RuntimeError):
+                restore(self.backup, destination)
+        self.assertFalse(destination.exists())
+        self.assertEqual(marker.read_text(), "keep me")
+        restore(self.backup, destination)
+        self.assertTrue((destination / "state.sqlite3").is_file())
+        self.assertEqual(marker.read_text(), "keep me")
+
+    def test_failed_restore_keeps_a_parent_created_by_a_concurrent_process(self):
+        from adaptive_rsi.storage_tools import restore
+        race = (self.root / "race").resolve()
+        concurrent = race / "parent"
+        destination = concurrent / "restored"
+        real_mkdir = os.mkdir
+
+        def mkdir(path, mode=0o777, *args, **kwargs):
+            # Simulate another process creating this empty parent between our scan and mkdir.
+            if Path(path) == concurrent and not concurrent.exists():
+                real_mkdir(path, mode)
+                raise FileExistsError(errno.EEXIST, "File exists", str(path))
+            return real_mkdir(path, mode)
+
+        # Python 3.9 routes Path.mkdir through _NormalAccessor; newer versions call os.mkdir.
+        targets = [patch("os.mkdir", side_effect=mkdir)]
+        if hasattr(pathlib, "_NormalAccessor"):
+            targets.append(patch("pathlib._NormalAccessor.mkdir", side_effect=mkdir))
+        with ExitStack() as stack:
+            for target in targets:
+                stack.enter_context(target)
+            stack.enter_context(patch("adaptive_rsi.storage_tools.Store.recover",
+                                      side_effect=RuntimeError("injected restore failure")))
+            with self.assertRaisesRegex(RuntimeError, "injected restore failure"):
+                restore(self.backup, destination)
+        self.assertTrue(concurrent.is_dir(), "a parent created by another process must not be removed")
+        self.assertFalse(destination.exists())
+        restore(self.backup, destination)
+        self.assertTrue((destination / "state.sqlite3").is_file())
+        self.assertTrue(concurrent.is_dir())
+
+    def inject_after_exists_check(self, destination, create):
+        from adaptive_rsi.storage_tools import restore
+        real_connect = sqlite3.connect
+        injected = []
+
+        def connect(path, *args, **kwargs):
+            connection = real_connect(path, *args, **kwargs)
+            if not injected and str(path).startswith("file:"):
+                injected.append(True)
+                create()  # Another process claims the destination after the exists check.
+            return connection
+
+        with patch("adaptive_rsi.storage_tools.sqlite3.connect", side_effect=connect):
+            with self.assertRaisesRegex(ValueError, "new state directory"):
+                restore(self.backup, destination)
+        self.assertEqual(injected, [True])
+
+    def assert_sentinel(self, path):
+        with closing(sqlite3.connect(str(path))) as db:
+            self.assertEqual(db.execute("SELECT value FROM sentinel").fetchone()[0], "keep")
+
+    def write_sentinel(self, path):
+        with closing(sqlite3.connect(str(path))) as db:
+            db.execute("CREATE TABLE sentinel(value TEXT)")
+            db.execute("INSERT INTO sentinel VALUES ('keep')")
+            db.commit()
+
+    def test_restore_rejects_destination_created_after_the_exists_check(self):
+        destination = self.root / "raced-state"
+
+        def create():
+            destination.mkdir()
+            self.write_sentinel(destination / "state.sqlite3")
+
+        self.inject_after_exists_check(destination, create)
+        self.assert_sentinel(destination / "state.sqlite3")
+        self.assertEqual([path.name for path in destination.iterdir()], ["state.sqlite3"])
+
+    def test_restore_rejects_destination_symlinked_after_the_exists_check(self):
+        target = (self.root / "existing-state").resolve()
+        target.mkdir()
+        sentinel = target / "state.sqlite3"
+        self.write_sentinel(sentinel)
+        destination = self.root / "raced-link"
+
+        self.inject_after_exists_check(
+            destination, lambda: destination.symlink_to(target, target_is_directory=True))
+
+        self.assertTrue(destination.is_symlink())
+        self.assert_sentinel(sentinel)
+        self.assertEqual([path.name for path in target.iterdir()], ["state.sqlite3"])
+
+    def test_symlinked_destination_is_rejected_without_touching_its_target(self):
+        from adaptive_rsi.storage_tools import restore
+        target = self.root / "existing-state"
+        target.mkdir()
+        marker = target / "user-data.txt"
+        marker.write_text("keep me")
+        link = self.root / "state-link"
+        link.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "new state directory"):
+            restore(self.backup, link)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(marker.read_text(), "keep me")
+
+
+class RestoreInvalidationTest(unittest.TestCase):
+    """Restored approvals must expose the restore reason instead of retention cleanup."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "state")
+        self.runtime = Runtime(self.store, FakeAgent())
+        self.project = self.runtime.add_project(fixture(self.root / "repo"))
+
+    def tearDown(self):
+        self.runtime.close()
+        self.tmp.cleanup()
+
+    def awaiting(self, text):
+        task = self.runtime.goal(self.project, text)
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass", "criteria": [], "checks": {}, "coverage": []},
+            "review": {"decision": "pass", "findings": []},
+        }, True)
+        return task, run["id"]
+
+    def test_restore_marks_candidate_invalidation_without_touching_older_history(self):
+        from adaptive_rsi.storage_tools import backup, restore
+        task, run = self.awaiting("Candidate invalidated by restore")
+        _, historical = self.awaiting("Previously expired candidate")
+        self.store.execute("UPDATE runs SET state='expired',result='{}' WHERE id=?", (historical,))
+        self.store.execute("UPDATE tasks SET state='expired' WHERE id=?", (self.store.one(
+            "SELECT task FROM runs WHERE id=?", (historical,))["task"],))
+        saved = backup(self.store)
+        destination = self.root / "restored-state"
+        restore(self.store.root / "backups" / (saved["id"] + ".sqlite3"), destination)
+        recovered = Store(destination)
+        try:
+            row = recovered.one("SELECT * FROM runs WHERE id=?", (run,))
+            self.assertEqual(row["state"], "expired")
+            self.assertEqual(json.loads(row["result"])["restore_invalidation"],
+                             {"reason": "candidate_not_in_backup"})
+            self.assertEqual(recovered.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "expired")
+            older = recovered.one("SELECT * FROM runs WHERE id=?", (historical,))
+            self.assertEqual(older["state"], "expired")
+            self.assertNotIn("restore_invalidation", json.loads(older["result"]))
+        finally:
+            recovered.close()
+
+    def test_restored_candidate_interface_uses_the_restore_reason(self):
+        javascript = (Path(__file__).resolve().parent.parent / "adaptive_rsi/web/experience.js").read_text()
+        translations = (Path(__file__).resolve().parent.parent / "adaptive_rsi/web/i18n.js").read_text()
+        self.assertIn("restore_invalidation", javascript)
+        self.assertIn("数据库备份不包含候选文件", javascript)
+        self.assertIn("数据库备份不包含候选文件", translations)

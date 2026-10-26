@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- The project selector shows both name and full path, blank names fall back to the directory name, and same-name local repositories remain distinguishable. A newly added project is persisted immediately and stays selected after reload.
+- Re-adding an existing path now reports the existing project name and paused state instead of silently ignoring the name or enabled option or claiming success.
+- Pending-approval counts in Data and diagnostics exclude approved, delivering and cancelled candidates. In-progress and delivered states are reported separately without rewriting history.
+- A failed restore removes only the new empty state directory it created and preserves the original error, so the same restore command can be retried.
+- Restore-invalidated candidates record the restore reason; the interface explains that candidate files are not in the database backup instead of reporting retention cleanup.
+- Open task details now update their title, body and evidence after Issue sync while preserving unsaved drafts; unchanged polls no longer rebuild the dialog.
+- When no GitHub repository is configured, the Issue sync entry point is disabled, and the service rejects the request with a localized message instead of reporting success. Manually scheduling checks remains available regardless of source toggles.
+- Incremental Issue sync counts only newly added tasks or actual body and evidence changes. Overlapping `since` scans are no longer recounted, and unfinished scans say so and continue next cycle.
+
 ## 0.5.116
 
 <!-- adaptive-rsi-release:0.5.116;base:e7787fc46becf2b9649bab47bfd51b075e41b350 -->

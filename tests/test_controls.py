@@ -72,6 +72,29 @@ class ValueAndIsolationTest(unittest.TestCase):
         self.assertEqual([role for role, _ in self.runtime.agent.roles], ["planning"])
         self.assertIn("disproportionate", json.loads(run["result"])["reason"])
 
+    def test_duplicate_project_path_reports_existing_without_changing_name_or_state(self):
+        original = self.runtime.project(self.project)
+        result = self.runtime.add_project(self.repo, "Renamed project", enabled=True, details=True)
+        self.assertEqual(result["id"], self.project)
+        self.assertTrue(result["existing"])
+        self.assertEqual(result["name"], original["name"])
+        self.assertEqual(result["paused"], bool(original["paused"]))
+        # 旧客户端仍可直接使用 id，且重复接入不会静默改名或启用项目。
+        self.assertEqual(self.runtime.add_project(self.repo), self.project)
+        current = self.runtime.project(self.project)
+        self.assertEqual(current["name"], original["name"])
+        self.assertEqual(current["paused"], original["paused"])
+
+    def test_project_names_strip_and_fall_back_to_directory_name(self):
+        spaced = fixture(self.root / "spaced")
+        result = self.runtime.add_project(spaced, "   ", details=True)
+        self.assertEqual(result["name"], "spaced")
+        self.assertTrue(result["paused"])
+        trimmed = fixture(self.root / "trimmed")
+        result = self.runtime.add_project(trimmed, "  Named project  ", details=True)
+        self.assertEqual(result["name"], "Named project")
+        self.assertEqual(result["path"], str(trimmed.resolve()))
+
     def test_empty_evidence_and_project_registration_during_active_run_are_blocked(self):
         _, run = self.process("ready", evidence=["  "])
         self.assertEqual(run["state"], "deferred")

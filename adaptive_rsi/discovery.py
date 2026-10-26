@@ -324,20 +324,23 @@ def sync(runtime, project, config, checked, cancel=None):
         progress = {"repository": repo, "policy": policy}
     if not progress.get("started"):
         progress.update(started=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), page=1)
-    consumed, complete = 0, False
+    changed, complete = 0, False
+    seen = set()
     pending = progress.get("pending", {})
 
     def apply(issue):
-        nonlocal consumed
+        nonlocal changed
         if "pull_request" in issue:
             return
         number = int(issue["number"])
+        seen.add(number)
         # Serialize the snapshot read and write with revise_task and run claims.
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             task_key, existing = _issue_task(db, project["id"], repo, number)
             if existing:
-                apply_existing(issue, existing, db)
+                if apply_existing(issue, existing, db):
+                    changed += 1
                 return
         labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
@@ -346,10 +349,9 @@ def sync(runtime, project, config, checked, cancel=None):
             evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
                          "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
             store.add_task(project["id"], "issue", task_key, issue["title"], issue["body"] or "", evidence, priority=60)
-            consumed += 1
+            changed += 1
 
     def apply_existing(issue, existing, db):
-        nonlocal consumed
         number = int(issue["number"])
         held = pending.pop(str(number), None)
         active = db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (existing["id"],)).fetchone()
@@ -371,21 +373,23 @@ def sync(runtime, project, config, checked, cancel=None):
                 excluded_evidence[0]["sync_exclusion"] = {"state": existing["state"], "at": excluded_at}
                 db.execute("UPDATE tasks SET state='obsolete',evidence=?,updated=? WHERE id=? AND state=?",
                               (encode(excluded_evidence), excluded_at, existing["id"], existing["state"]))
-            elif not active and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
+                return True
+            if not active and existing["state"] in ["merged", "completed", "pr_closed"] and revised:
                 # 记录关闭快照，让下一次重新打开可以被识别为「重开」。
                 closed_evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
                                     "state": issue["state"], "comments": int(issue.get("comments") or 0),
                                     "requirements": issue_requirements(db, existing)}]
                 db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
                               (encode(closed_evidence), time.time(), existing["id"]))
-            elif active or existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
+                return True
+            if active or existing["state"] not in ["pr_open", "merged", "completed", "obsolete", "pr_closed", "reverted", "superseded"]:
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
                 pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
                 if not held or held["updated_at"] != issue["updated_at"]:
                     db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
                                (project["id"], "issue_revision", "Issue closed or excluded during execution; recheck before delivery",
                                 encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
-            return
+            return False
         requirements = issue_requirements(db, existing)
         evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
                      "state": issue["state"], "comments": int(issue.get("comments") or 0),
@@ -400,11 +404,12 @@ def sync(runtime, project, config, checked, cancel=None):
                 body = issue_requirements_body(requirements)
                 db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
-                consumed += 1
-            elif revised:
+                return True
+            if revised:
                 db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
                               (encode(evidence), time.time(), existing["id"]))
-            return
+                return True
+            return False
         if existing:
             if (not active and existing["state"] == "obsolete" and not revised and isinstance(exclusion, dict) and
                     exclusion.get("at") == existing["updated"] and exclusion.get("state") in
@@ -414,13 +419,15 @@ def sync(runtime, project, config, checked, cancel=None):
                 restored_evidence[0].pop("sync_exclusion", None)
                 db.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
                               (exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
-            elif not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
+                return True
+            if not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
                 requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}
                 evidence[0]["requirements"] = requirements
                 body = issue_requirements_body(requirements)
                 db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
-            elif (not active and not revised and existing["state"] in
+                return True
+            if (not active and not revised and existing["state"] in
                   ["queued", "deferred", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and
                   requirements["local_supplements"] and
                   (not previous or not previous[0].get("requirements") or
@@ -443,7 +450,8 @@ def sync(runtime, project, config, checked, cancel=None):
                             db.execute("UPDATE task_decisions SET data=? WHERE task=?", (encode(prior), existing["id"]))
                 db.execute("UPDATE tasks SET body=?,evidence=? WHERE id=?",
                            (body, encoded_evidence, existing["id"]))
-            elif revised:
+                return body != existing["body"] or encoded_evidence != existing["evidence"]
+            if revised:
                 # Keep active runs' evidence immutable. The new revision remains visible for next sync.
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
                 pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
@@ -451,7 +459,7 @@ def sync(runtime, project, config, checked, cancel=None):
                     db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
                                (project["id"], "issue_revision", "Issue changed during execution; recheck before delivery",
                                 encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
-        consumed += 1
+        return False
 
     for issue in list(pending.values()):
         try:
@@ -493,8 +501,10 @@ def sync(runtime, project, config, checked, cancel=None):
         store.put_setting(key, progress)
         if complete:
             break
-    store.event("issues", str(consumed) + " Issue updates synchronized", project["id"],
-                data={"complete": complete, "next_page": progress["page"], "pages_read": pages_read})
+    store.event("issues", "Scanned %d Issues; %d updates synchronized%s" % (
+                    len(seen), changed, "" if complete else "; sync continues next cycle"), project["id"],
+                data={"complete": complete, "scanned": len(seen), "changed": changed,
+                      "next_page": progress["page"], "pages_read": pages_read})
 
 
 def problem_title(title):

@@ -85,6 +85,11 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get("RSI_BROWSER_PROJECT_IDENTITY"):
+                # 同名但不同路径的两个项目，以及一个尚未接入的新仓库，供项目标识回归使用。
+                runtime.add_project(fixture(root / "identity-a"), "同名仓库")
+                runtime.add_project(fixture(root / "identity-b"), "同名仓库")
+                fixture(root / "identity-new")
             for index in range(55):
                 runtime.store.add_task(project, "goal", str(index), "历史任务 " + str(index))
             runtime.store.add_task(other, "goal", "other", "另一个项目专属任务")
