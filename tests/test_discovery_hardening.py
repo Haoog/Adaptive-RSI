@@ -302,5 +302,334 @@ class DiscoveryHardeningTest(unittest.TestCase):
             opened[0].execute("SELECT 1")
 
 
+class IssueRequirementsTest(unittest.TestCase):
+    """Real SQLite/task/run fixtures; no credentials, network or model calls."""
+
+    def setUp(self):
+        from adaptive_rsi.runtime import Runtime
+        from tests.test_runtime import fixture
+        self.temp = tempfile.TemporaryDirectory(prefix="issue-requirements-")
+        self.root = Path(self.temp.name)
+        self.repo = fixture(self.root / "project")
+        self.store = Store(self.root / "state")
+        self.runtime = Runtime(self.store, SimpleNamespace())
+        self.project_id = self.runtime.add_project(self.repo)
+        self.runtime.configure({"github": {"repository": "owner/project"},
+                                "sources": {"inspection": False, "issues": False},
+                                "evolution": {"enabled": False}}, self.project_id)
+        self.project = self.runtime.project(self.project_id)
+        self.config = self.runtime.config(self.project_id)
+        self.issue = DiscoveryHardeningTest.issue()
+        self.synchronize()
+        self.task_id = self.store.one("SELECT id FROM tasks WHERE source='issue'")["id"]
+
+    def tearDown(self):
+        self.runtime.close()
+        self.temp.cleanup()
+
+    def synchronize(self, rows=None):
+        sync(self.runtime, self.project, self.config,
+             lambda *args, **kwargs: encode([self.issue] if rows is None else rows))
+
+    def task(self):
+        return self.store.one("SELECT * FROM tasks WHERE id=?", (self.task_id,))
+
+    def update(self, body):
+        self.issue.update(body=body, updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+
+    def test_remote_updates_and_revisions_reach_actual_planning_input(self):
+        from adaptive_rsi.gitops import git
+        self.runtime.revise_task(self.task_id, "Mandatory: reject negative inputs")
+        self.update("upstream v2")
+        self.runtime.revise_task(self.task_id, "Keep zero valid")
+        self.update("upstream v3")
+        expected = "upstream v3\n\nMandatory: reject negative inputs\n\nKeep zero valid"
+        self.assertEqual(self.task()["body"], expected)
+        before = self.task()
+        self.synchronize()
+        self.assertEqual(self.task(), before)
+        self.assertEqual(len(self.store.query("SELECT * FROM task_revisions")), 2)
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.assertEqual(run["task"], self.task_id)
+        prompts = []
+
+        def planning(role, prompt, *args, **kwargs):
+            self.assertEqual(role, "planning")
+            prompts.append(json.loads(prompt.split("\n")[-1]))
+            return {"decision": "deferred", "reason": "Fixture stops after planning", "scope": [],
+                    "acceptance": [], "risk": "low", "value": {
+                        "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Fixture",
+                        "cost": "Fixture", "inaction": "Fixture", "evidence": ["User requirements"]}}
+
+        # Execute the production process/pipeline through planning; replace only
+        # external/environment probes and the model boundary.
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), git(self.repo, "rev-parse", "HEAD"), "main")), \
+             patch.object(self.runtime, "issue_still_open", return_value=True), \
+             patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+             patch("adaptive_rsi.discovery.issue_comment_context", return_value={"status": "loaded", "comments": []}), \
+             patch.object(self.runtime, "invoke", side_effect=planning):
+            self.runtime.process(run)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0]["task"]["body"], expected)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "deferred")
+
+    def test_legacy_intact_and_lost_additions_migrate_once_on_unchanged_source(self):
+        # Legacy sync may have lost the first addition before another revise.
+        for lost in [False, True]:
+            with self.subTest(lost=lost):
+                self.store.execute("DELETE FROM task_revisions")
+                first_body = self.issue["body"]
+                second_body = "legacy newer upstream" if lost else first_body + "\n\nfirst"
+                current = second_body + "\n\nsecond"
+                self.store.execute("UPDATE tasks SET body=?,evidence=?,state='deferred',updated=123,available=456 WHERE id=?",
+                                   (current, encode([{"number": 7, "url": self.issue["html_url"],
+                                                      "updated": self.issue["updated_at"], "state": "open"}]), self.task_id))
+                with self.store.connect() as db:
+                    db.executemany("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                                   [(self.task_id, first_body, "first"), (self.task_id, second_body, "second")])
+                self.synchronize()
+                expected_upstream = second_body if lost else first_body
+                self.assertEqual(self.task()["body"], expected_upstream + "\n\nfirst\n\nsecond")
+                self.assertEqual((self.task()["state"], self.task()["updated"], self.task()["available"]), ("deferred", 123, 456))
+                self.store.execute("DELETE FROM task_revisions")
+                self.synchronize()
+                self.update("fresh upstream")
+                self.assertEqual(self.task()["body"], "fresh upstream\n\nfirst\n\nsecond")
+
+    def test_legacy_already_overwritten_body_recovers_and_revise_keeps_order(self):
+        original = self.task()["body"]
+        with self.store.connect() as db:
+            db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                       (self.task_id, original, "lost local"))
+        self.store.execute("UPDATE tasks SET body='remote after loss' WHERE id=?", (self.task_id,))
+        self.runtime.revise_task(self.task_id, "new local")
+        self.assertEqual(self.task()["body"], "remote after loss\n\nlost local\n\nnew local")
+        self.update("latest")
+        self.assertEqual(self.task()["body"], "latest\n\nlost local\n\nnew local")
+
+    def test_legacy_sync_lost_latest_revision_but_kept_earlier_addition(self):
+        original = self.task()["body"]
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                           [(self.task_id, original, "first"), (self.task_id, original + "\n\nfirst", "second")])
+        self.store.execute("UPDATE tasks SET body=? WHERE id=?", (original + "\n\nfirst", self.task_id))
+        self.synchronize()
+        self.assertEqual(self.task()["body"], original + "\n\nfirst\n\nsecond")
+        self.synchronize()
+        self.assertEqual(self.task()["body"], original + "\n\nfirst\n\nsecond")
+
+    def test_sync_and_local_revision_serialize_snapshot_updates(self):
+        import concurrent.futures
+        import threading
+        from adaptive_rsi.discovery import _issue_task
+        self.runtime.revise_task(self.task_id, "first")
+        started = threading.Event()
+        self.issue.update(body="concurrent upstream", updated_at="new revision")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            futures = []
+
+            def revise():
+                started.set()
+                self.runtime.revise_task(self.task_id, "second")
+
+            def lookup(db, *args):
+                result = _issue_task(db, *args)
+                futures.append(pool.submit(revise))
+                self.assertTrue(started.wait(5))
+                self.assertFalse(futures[0].done())
+                return result
+
+            with patch("adaptive_rsi.discovery._issue_task", side_effect=lookup):
+                self.synchronize()
+            futures[0].result(timeout=10)
+        self.assertEqual(self.task()["body"], "concurrent upstream\n\nfirst\n\nsecond")
+        self.update("following upstream")
+        self.assertEqual(self.task()["body"], "following upstream\n\nfirst\n\nsecond")
+
+    def test_upstream_matching_local_text_is_not_removed_or_deduplicated(self):
+        self.runtime.revise_task(self.task_id, "same text")
+        self.update("same text")
+        self.assertEqual(self.task()["body"], "same text\n\nsame text")
+        self.synchronize()
+        self.assertEqual(self.task()["body"], "same text\n\nsame text")
+        self.runtime.revise_task(self.task_id, "same text")
+        self.update("replacement")
+        self.assertEqual(self.task()["body"], "replacement\n\nsame text\n\nsame text")
+
+    def test_active_and_stopping_runs_keep_sealed_input_until_finished(self):
+        self.runtime.revise_task(self.task_id, "local")
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        before = self.task()
+        self.update("new upstream")
+        self.assertEqual(self.task(), before)
+        with self.assertRaisesRegex(ValueError, "active run"):
+            self.runtime.revise_task(self.task_id, "forbidden while active")
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (self.task_id,))
+        failed = self.task()
+        self.synchronize([])
+        self.assertEqual(self.task(), failed)
+        self.store.execute("UPDATE runs SET state='failed',ended=1 WHERE id=?", (run["id"],))
+        self.synchronize([])
+        self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "new upstream\n\nlocal"))
+        self.assertEqual(self.store.setting("issue-sync:" + self.project_id)["pending"], {})
+
+    def test_cancelled_run_waits_for_end_and_requires_explicit_revision(self):
+        self.runtime.revise_task(self.task_id, "local")
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.runtime.cancel_task(self.task_id)
+        before = self.task()
+        self.update("upstream while stopping")
+        self.assertEqual(self.task(), before)
+        with self.assertRaisesRegex(ValueError, "active run"):
+            self.runtime.revise_task(self.task_id, "new local")
+        self.store.execute("UPDATE runs SET state='cancelled',ended=1 WHERE id=?", (run["id"],))
+        self.synchronize([])
+        self.assertEqual(self.task(), before)
+        self.runtime.revise_task(self.task_id, "new local")
+        self.synchronize([])
+        self.assertEqual((self.task()["state"], self.task()["body"]),
+                         ("queued", "upstream while stopping\n\nlocal\n\nnew local"))
+
+    def test_cancelled_and_delivered_policy_preserves_local_additions(self):
+        self.runtime.revise_task(self.task_id, "local")
+        original = self.task()["body"]
+        for state in ["cancelled", "completed", "merged", "pr_closed", "pr_open", "reverted", "superseded", "expired"]:
+            with self.subTest(state=state):
+                self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, self.task_id))
+                self.update("edit for " + state)
+                self.assertEqual((self.task()["state"], self.task()["body"]), (state, original))
+        for state in ["completed", "merged", "pr_closed"]:
+            with self.subTest(reopen=state):
+                self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, self.task_id))
+                self.issue["state"] = "closed"
+                self.update("closed")
+                self.issue["state"] = "open"
+                self.update("reopened")
+                self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "reopened\n\nlocal"))
+
+    def test_label_policy_restores_decision_and_supplement(self):
+        self.runtime.revise_task(self.task_id, "local")
+        self.store.defer(self.task_id, {"reason": "held"})
+        self.config["github"]["labels"] = ["security"]
+        self.synchronize()
+        self.assertEqual(self.task()["state"], "obsolete")
+        self.config["github"]["labels"] = []
+        self.synchronize()
+        self.assertEqual((self.task()["state"], self.task()["body"]), ("deferred", self.issue["body"] + "\n\nlocal"))
+        before = self.task()
+        self.synchronize()
+        self.assertEqual(self.task(), before)
+        self.assertEqual(json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?", (self.task_id,))["data"]), {"reason": "held"})
+
+    def test_oversized_pending_keeps_snapshot_and_fetches_remote_recovery(self):
+        self.runtime.revise_task(self.task_id, "local")
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.update("x" * 30000)
+        key = "issue-sync:" + self.project_id
+        held = self.store.setting(key)["pending"]["7"]
+        self.store.transition(run["id"], "failed", {"reason": "fixture worker ended"}, True)
+        before = self.task()
+        unrelated = DiscoveryHardeningTest.issue(number=8)
+        fetched = []
+
+        def remote(*args, **kwargs):
+            fetched.append(args)
+            return encode([unrelated])
+
+        # Repeated pending failures must not prevent another Issue from syncing.
+        for _ in range(3):
+            sync(self.runtime, self.project, self.config, remote)
+            self.assertEqual(self.task(), before)
+            self.assertEqual(self.store.setting(key)["pending"]["7"], held)
+        self.assertEqual(len(fetched), 3)
+        self.assertIsNotNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='issue:owner/project:8'"))
+        self.issue.update(body="shortened remote", updated_at="remote corrected")
+        self.synchronize()
+        self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "shortened remote\n\nlocal"))
+        self.assertEqual(self.store.setting(key)["pending"], {})
+        self.synchronize()
+        self.assertEqual(self.task()["body"], "shortened remote\n\nlocal")
+
+    def test_legacy_migration_reassesses_only_actual_input_changes(self):
+        from adaptive_rsi.config import fingerprint
+        original = self.task()
+        for change in ["representation", "lost_supplement", "previous_input", "policy"]:
+            with self.subTest(change=change):
+                self.store.execute("DELETE FROM task_revisions")
+                body = original["body"] if change == "lost_supplement" else original["body"] + "\n\nlocal"
+                # Legacy metadata and additional evidence must survive migration.
+                evidence = encode([{**json.loads(original["evidence"])[0], "legacy_metadata": "retain"},
+                                   {"path": "calculator.py", "quote": "return a - b"}])
+                self.store.execute("UPDATE tasks SET body=?,evidence=? WHERE id=?", (body, evidence, self.task_id))
+                self.store.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                                   (self.task_id, original["body"], "local"))
+                decision = {"reason": "Explicit planner deferral", "base": "fixed-baseline", "extra": {"retain": True},
+                            "triage_input": fingerprint({"body": body, "evidence": evidence,
+                                                         "policy": self.config["triage"]["policy"]})}
+                self.store.defer(self.task_id, decision)
+                self.runtime.reassess_deferred(self.project_id, self.config, "fixed-baseline")
+                self.assertEqual(self.task()["state"], "deferred")
+                if change == "previous_input":
+                    decision["triage_input"] = "earlier-input"
+                    self.store.execute("UPDATE task_decisions SET data=? WHERE task=?", (encode(decision), self.task_id))
+                elif change == "policy":
+                    self.config["triage"]["policy"] += " updated"
+                before_decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+                self.synchronize()
+                migrated = self.task()
+                self.assertEqual(migrated["body"], original["body"] + "\n\nlocal")
+                migrated_evidence = json.loads(migrated["evidence"])
+                migrated_evidence[0].pop("requirements")
+                self.assertEqual(migrated_evidence, json.loads(evidence))
+                after_decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+                if change == "representation":
+                    expected = {**decision, "triage_input": fingerprint({"body": body, "evidence": migrated["evidence"],
+                                                                         "policy": self.config["triage"]["policy"]})}
+                    self.assertEqual(after_decision, {**before_decision, "data": encode(expected)})
+                else:
+                    self.assertEqual(after_decision, before_decision)
+                self.synchronize()
+                self.assertEqual(self.task(), migrated)
+                self.runtime.reassess_deferred(self.project_id, self.config, "fixed-baseline")
+                self.assertEqual(self.task()["state"], "deferred" if change == "representation" else "queued")
+
+    def test_legacy_decision_migration_rolls_back_with_task_write(self):
+        from adaptive_rsi.config import fingerprint
+        original = self.task()
+        body = original["body"] + "\n\nlocal"
+        self.store.execute("UPDATE tasks SET body=? WHERE id=?", (body, self.task_id))
+        self.store.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                           (self.task_id, original["body"], "local"))
+        self.store.defer(self.task_id, {"base": "fixed-baseline", "reason": "held", "triage_input": fingerprint({
+            "body": body, "evidence": original["evidence"], "policy": self.config["triage"]["policy"]})})
+        before = self.task()
+        decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+        self.store.execute("CREATE TRIGGER reject_migration BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected migration failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Injected migration failure"):
+                self.synchronize()
+        finally:
+            self.store.execute("DROP TRIGGER reject_migration")
+        self.assertEqual(self.task(), before)
+        self.assertEqual(self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,)), decision)
+
+    def test_oversized_remote_composition_rolls_back_without_losing_local(self):
+        self.runtime.revise_task(self.task_id, "local")
+        before = self.task()
+        progress = self.store.setting("issue-sync:" + self.project_id)
+        with self.assertRaisesRegex(ValueError, "30000"):
+            self.update("x" * 30000)
+        self.assertEqual(self.task(), before)
+        self.assertEqual(self.store.setting("issue-sync:" + self.project_id), progress)
+        self.update("shortened")
+        self.assertEqual(self.task()["body"], "shortened\n\nlocal")
+
+
 if __name__ == "__main__":
     unittest.main()

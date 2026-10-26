@@ -8,8 +8,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
-from adaptive_rsi.config import DEFAULTS
-from adaptive_rsi.delivery import StaleCandidate, publish
+from adaptive_rsi.config import DEFAULTS, fingerprint
+from adaptive_rsi.delivery import StaleCandidate, publish, tick
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.process import Cancelled
 from adaptive_rsi.runtime import Runtime
@@ -81,6 +81,8 @@ class DeliveryRecoveryTest(unittest.TestCase):
 
     def test_lost_receipt_recovers_open_or_merged_pr_after_baseline_advances(self):
         for state in ["OPEN", "MERGED"]:
+            self.store.execute("UPDATE runs SET state='awaiting_approval' WHERE id=?", (self.run["id"],))
+            self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (self.task["id"],))
             with self.subTest(state=state), \
                     patch("adaptive_rsi.delivery.baseline", return_value=("unused", "new-base", "main")), \
                     patch("adaptive_rsi.delivery.checked", return_value=encode([{"url": self.url}])) as command, \
@@ -92,7 +94,72 @@ class DeliveryRecoveryTest(unittest.TestCase):
                 self.assertEqual(command.call_args.args[0][1:3], ["pr", "list"])
                 self.assertEqual(self.store.setting("delivery:" + self.run["id"]),
                                  {"repository": "example/project", "branch": "main", "base": self.run["base"], "head": self.head})
-                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "awaiting_approval")
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "pr_open")
+                self.assertEqual(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (self.run["id"],))["result"])["pr"], self.url)
+
+    def recover_existing_pr_at_view_barrier(self, retry):
+        outcome = json.loads(self.run["result"])
+        outcome["patch_hash"] = fingerprint(git(self.workspace, "diff", self.run["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
+                           (str(self.workspace.parent), encode(outcome), self.run["id"]))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (self.approval,))
+        job = self.store.claim(self.project, self.runtime.config(self.project))
+        arrived, released = threading.Event(), threading.Event()
+        pr = {"state": "OPEN", "headRefOid": self.head, "baseRefName": "main"}
+        def view(*args):
+            arrived.set()
+            self.assertTrue(released.wait(10), "view barrier was not released")
+            return pr
+        def recover(*args):
+            url = publish(self.runtime, *args)
+            # Assert durability before runtime.process receives the successful return.
+            saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
+            self.assertEqual(json.loads(saved["result"])["pr"], self.url)
+            self.assertEqual(saved["state"], "superseded" if retry else "pr_open")
+            self.assertEqual(self.store.setting("delivery:" + self.run["id"]),
+                             {"repository": "example/project", "branch": "main", "base": self.run["base"], "head": self.head})
+            return url
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), "advanced-base", "main")), \
+                patch("adaptive_rsi.delivery.checked", return_value=encode([{"url": self.url}])) as command, \
+                patch("adaptive_rsi.delivery.pr_view", side_effect=view), \
+                patch("adaptive_rsi.delivery.github_git") as push, \
+                patch.object(self.runtime, "publish", side_effect=recover), ThreadPoolExecutor(max_workers=1) as pool:
+            worker = pool.submit(self.runtime.process, job)
+            try:
+                self.assertTrue(arrived.wait(10), "worker did not reach view barrier: " + str(
+                    self.store.one("SELECT state,result FROM runs WHERE id=?", (job["id"],))))
+                if retry:
+                    self.runtime.cancel_task(self.task["id"])
+                    self.runtime.retry(self.task["id"])
+            finally:
+                released.set()
+            worker.result(timeout=10)
+        push.assert_not_called()
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0][1:3], ["pr", "list"])
+        saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
+        self.assertEqual(saved["state"], "superseded" if retry else "pr_open")
+        self.assertEqual(json.loads(saved["result"])["pr"], self.url)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "completed")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"],
+                         "queued" if retry else "pr_open")
+        if retry:
+            self.assertTrue(json.loads(saved["result"])["close_pending"])
+            self.store = self.runtime.store = Store(self.store.root)
+            with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                    patch("adaptive_rsi.delivery.checked", return_value="") as close:
+                tick(self.runtime, project_id=self.project)
+            close.assert_called_once_with(["gh", "pr", "close", self.url, "--repo", "example/project"])
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "queued")
+            saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
+            self.assertEqual(saved["state"], "superseded")
+            self.assertFalse(json.loads(saved["result"])["close_pending"])
+
+    def test_existing_pr_receipt_survives_retry_at_view_return_barrier_and_recovers_close(self):
+        self.recover_existing_pr_at_view_barrier(retry=True)
+
+    def test_existing_pr_normal_recovery_persists_receipt_before_return_without_remote_writes(self):
+        self.recover_existing_pr_at_view_barrier(retry=False)
 
     def test_advanced_baseline_without_existing_pr_never_publishes(self):
         with patch("adaptive_rsi.delivery.baseline", return_value=("unused", "new-base", "main")), \
@@ -126,7 +193,7 @@ class DeliveryRecoveryTest(unittest.TestCase):
                 push.assert_not_called()
                 self.assertIsNone(self.store.setting("delivery:" + self.run["id"]))
 
-    def test_recovery_rechecks_pause_cancel_revocation_and_supersession(self):
+    def test_recovery_retains_verified_receipt_after_pause_cancel_revocation_or_supersession(self):
         for change in ["pause", "cancel", "revoke", "supersede"]:
             self.runtime.pause(self.project, False)
             self.runtime.configure({"delivery": {"mode": "pr"}}, self.project)
@@ -147,10 +214,16 @@ class DeliveryRecoveryTest(unittest.TestCase):
                     patch("adaptive_rsi.delivery.checked", return_value=encode([{"url": self.url}])), \
                     patch("adaptive_rsi.delivery.pr_view", side_effect=view), \
                     patch("adaptive_rsi.delivery.github_git") as push:
-                with self.assertRaises((RuntimeError, Cancelled)):
-                    self.publish()
+                self.assertEqual(self.publish(), self.url)
                 push.assert_not_called()
-                self.assertIsNone(self.store.setting("delivery:" + self.run["id"]))
+                self.assertIsNotNone(self.store.setting("delivery:" + self.run["id"]))
+                saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
+                self.assertEqual(json.loads(saved["result"])["pr"], self.url)
+                self.assertEqual(saved["state"], "superseded" if change == "supersede" else "pr_open")
+                if change == "supersede":
+                    self.assertTrue(json.loads(saved["result"])["close_pending"])
+                if change == "cancel":
+                    self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "cancelled")
 
 
 class ReleaseReconciliationRaceTest(unittest.TestCase):

@@ -157,7 +157,22 @@ def publish(runtime, project, task, run, workspace, config):
         existing_pr = pr_view(repo, url)
         if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName") != identity["branch"]:
             raise RuntimeError("Existing PR head or target differs from evaluated candidate")
-        authorize_write()
+        # Recover an observed remote fact before any later cancellation can discard it.
+        # This path performs no remote write, so fresh publishing authorization is unnecessary.
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            original = db.execute("SELECT state,result FROM runs WHERE id=?", (run["id"],)).fetchone()
+            receipt = json.loads(original["result"])
+            receipt["pr"] = url
+            state = "superseded" if original["state"] == "superseded" else "pr_open"
+            if state == "superseded":
+                receipt.update(replanned=True, close_pending=True)
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(
+                {"head": sha, "base": run["base"], "branch": base_branch, "repository": repo})))
+            db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (state, encode(receipt), run["id"]))
+            if state == "pr_open":
+                db.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=? AND state='awaiting_approval'",
+                           (time.time(), task["id"]))
     else:
         if current != run["base"]:
             raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")
@@ -186,6 +201,44 @@ def monitoring_due(outcome, config, now):
             config["delivery"]["feedback_minutes"] * 60)
 
 
+def _update_pr_task(store, run, state, now):
+    # Tracking may finish after the user requeued or revised this task.
+    store.execute("UPDATE tasks SET state=?,updated=? WHERE id=? AND state='pr_open' "
+                  "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                  "(started>? OR (started=? AND id>?)))",
+                  (state, now, run["task"], run["task"], run["started"], run["started"], run["id"]))
+
+
+def _supersede_pr(store, run, outcome, task_state, now):
+    """Detach tracking from the task and persist close intent before remote writes."""
+    outcome.update(replanned=True, close_pending=True)
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? AND state='pr_open'",
+                             (encode(outcome), run["id"])).rowcount
+        if changed:
+            db.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? AND state='pr_open' "
+                       "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
+                       "(started>? OR (started=? AND id>?)))",
+                       (task_state, now, run["task"], run["task"], run["started"], run["started"], run["id"]))
+    return bool(changed)
+
+
+def _close_superseded_pr(store, run, outcome, repo, pr, cancelled):
+    # A failed/lost response leaves the intent durable. Always observe remote state
+    # before retrying, including manual closes and merges while the worker was down.
+    if pr["state"] == "OPEN":
+        if cancelled():
+            return
+        checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
+        outcome["close_status"] = "close_submitted"
+    else:
+        outcome["close_status"] = pr["state"].lower()
+    outcome["close_pending"] = False
+    store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
+    store.remote_wait(run["id"], None, time.time())
+
+
 def schedule(runtime, now=None):
     now = now or time.time()
     store = runtime.store
@@ -195,9 +248,10 @@ def schedule(runtime, now=None):
     projects = set()
     from .release import pending
     for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
-                           "WHERE p.paused=0 AND r.state IN ('pr_open','merged')"):
+                           "WHERE p.paused=0 AND (r.state IN ('pr_open','merged') OR "
+                           "(r.state='superseded' AND json_extract(r.result,'$.close_pending')=1))"):
         with runtime.scheduler_scope("delivery_run", run["project"], run["id"]):
-            if (run["state"] == "pr_open" or pending(runtime, run) or
+            if (run["state"] in ["pr_open", "superseded"] or pending(runtime, run) or
                     monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now)):
                 projects.add(run["project"])
     for project_id in projects:
@@ -237,7 +291,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
-    for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') ORDER BY started"):
+    for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') OR "
+                           "(state='superseded' AND json_extract(result,'$.close_pending')=1) ORDER BY started"):
         if tracking_cancelled():
             return
         if project_id and run["project"] != project_id:
@@ -254,8 +309,20 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 continue
             identity = store.setting("run-baseline:" + run["id"])
             sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
+            pr = pr_view(repo, outcome["pr"]) if run["state"] in ["pr_open", "superseded"] else None
             if run["state"] == "pr_open":
-                pr = pr_view(repo, outcome["pr"])
+                task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
+                newer = store.one("SELECT 1 FROM runs WHERE task=? AND "
+                                  "(started>? OR (started=? AND id>?))",
+                                  (run["task"], run["started"], run["started"], run["id"]))
+                if not task or task["state"] != "pr_open" or newer:
+                    # Also recover older databases where a requeue preceded a failed close.
+                    if _supersede_pr(store, run, outcome, task["state"] if task else "blocked", now):
+                        run["state"] = "superseded"
+            if run["state"] == "superseded":
+                _close_superseded_pr(store, run, outcome, repo, pr, tracking_cancelled)
+                continue
+            if run["state"] == "pr_open":
                 gate = merge_gate(pr, policy["head"], policy["base"])
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
@@ -265,13 +332,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             pr.get("baseRefName", policy["branch"]) != policy["branch"]):
                         outcome["delivery_status"] = "unverified_merge"
                         store.execute("UPDATE runs SET state='unverified_merge',result=? WHERE id=?", (encode(outcome), run["id"]))
-                        store.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=?", (now, run["task"]))
+                        _update_pr_task(store, run, "blocked", now)
                     else:
                         outcome["merged_sha"] = pr["mergeCommit"]["oid"]
                         outcome["merged_at"] = now
                         outcome["delivery_status"] = "merged"
                         store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (encode(outcome), run["id"]))
-                        store.execute("UPDATE tasks SET state='merged',updated=? WHERE id=?", (now, run["task"]))
+                        _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
                         if task["source"] == "rollback":
                             original_id = json.loads(task["evidence"])[0]["run"]
@@ -285,7 +352,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 elif pr["state"] == "CLOSED":
                     outcome["delivery_status"] = "closed"
                     store.execute("UPDATE runs SET state='pr_closed' WHERE id=?", (run["id"],))
-                    store.execute("UPDATE tasks SET state='pr_closed',updated=? WHERE id=?", (now, run["task"]))
+                    _update_pr_task(store, run, "pr_closed", now)
                 else:
                     outcome["delivery_status"] = gate
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
@@ -307,13 +374,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     if not outcome.get("issue_stale_reason"):
                                         outcome["issue_stale_reason"] = "Issue is closed or no longer matches configured labels"
                                     outcome["delivery_status"] = "issue_changed"
-                                    outcome["replanned"] = True
-                                    store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
                                     # Issue sync will refresh evidence and requeue this task if it is still eligible.
-                                    store.execute("UPDATE tasks SET state='blocked',available=0,updated=? WHERE id=?", (now, run["task"]))
-                                    if tracking_cancelled():
-                                        return
-                                    checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
+                                    if _supersede_pr(store, run, outcome, "blocked", now):
+                                        _close_superseded_pr(store, run, outcome, repo,
+                                                             pr_view(repo, outcome["pr"]), tracking_cancelled)
                                     continue
                         # Fetch and Issue checks can outlive a settings change. Re-read the complete
                         # local authorization under the same lock used by configuration writes.
@@ -346,12 +410,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             return
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
                         state = "queued" if task["attempts"] <= config["limits"]["retries"] else "blocked"
-                        store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=?", (state, now, run["task"]))
-                        outcome["replanned"] = True
-                        if tracking_cancelled():
-                            return
-                        checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
-                        store.execute("UPDATE runs SET state='superseded' WHERE id=?", (run["id"],))
+                        if _supersede_pr(store, run, outcome, state, now):
+                            _close_superseded_pr(store, run, outcome, repo,
+                                                 pr_view(repo, outcome["pr"]), tracking_cancelled)
+                        continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
                 store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))

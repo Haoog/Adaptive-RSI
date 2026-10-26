@@ -485,6 +485,137 @@ print('BOUNDARIES_OK')
         self.assertEqual(command.call_count, 1)
         self.assertIn("close", command.call_args.args[0])
 
+    def test_stale_close_failure_survives_restart_without_overwriting_fresh_task(self):
+        run = self.tracked_pr()
+        self.runtime.configure({"limits": {"retries": 3}}, self.project)
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "new-base",
+              "baseRefName": "main", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        now = time.time()
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", side_effect=RuntimeError("close response lost")):
+            tick(self.runtime, now)
+        saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(saved["state"], "superseded")
+        self.assertTrue(json.loads(saved["result"])["close_pending"])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        # Pending close intent must retain the target metadata even past retention.
+        self.store.execute("UPDATE runs SET ended=? WHERE id=?", (now - 120 * 86400, run["id"]))
+        self.runtime.maintenance()
+        self.assertIsNotNone(self.store.setting("delivery:" + run["id"]))
+        self.assertIsNotNone(self.store.setting("run-baseline:" + run["id"]))
+        self.runtime.close()
+        self.store = Store(self.root / "state")
+        self.runtime = Runtime(self.store, FakeAgent())
+        self.runtime.revise_task(run["task"], "Keep new requirements")
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(fresh["task"], run["task"])
+        self.store.transition(fresh["id"], "failed", {"reason": "new verification fails"}, True)
+        pr["state"] = "CLOSED"
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr) as view, \
+                patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime, now + 61)
+            tick(self.runtime, now + 122)
+        remote.assert_not_called()
+        view.assert_called_once()
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "failed")
+        self.runtime.retry(run["task"])
+        self.assertEqual(self.store.claim(self.project, self.runtime.config(self.project))["task"], run["task"])
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertFalse(result["close_pending"])
+        self.assertEqual(result["close_status"], "closed")
+        self.assertEqual(result["pr"], "https://github.com/example/project/pull/1")
+
+    def test_close_intent_is_scheduled_and_retries_only_after_observing_open_pr(self):
+        from adaptive_rsi.delivery import schedule
+        run = self.tracked_pr()
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "new-base"}
+        now = time.time()
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked", side_effect=RuntimeError("close failed")):
+            tick(self.runtime, now)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "blocked")
+        schedule(self.runtime, now + 61)
+        tracking = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(self.store.one("SELECT source FROM tasks WHERE id=?", (tracking["task"],))["source"], "system_delivery")
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr) as view, \
+                patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, now + 61, project_id=self.project, active_run=tracking["id"])
+            view.assert_called_once()
+            remote.assert_called_once_with(["gh", "pr", "close", "https://github.com/example/project/pull/1",
+                                            "--repo", "example/project"])
+        self.store.transition(tracking["id"], "completed", {}, True)
+        with patch("adaptive_rsi.delivery.pr_view") as view, patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime, now + 122)
+        view.assert_not_called()
+        remote.assert_not_called()
+
+    def test_pending_close_does_not_repeat_write_when_remote_state_is_unknown_or_merged(self):
+        run = self.tracked_pr()
+        outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+        now = time.time()
+        with patch("adaptive_rsi.delivery.pr_view", side_effect=RuntimeError("remote unavailable")), \
+                patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime, now)
+        remote.assert_not_called()
+        self.assertTrue(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["close_pending"])
+        with patch("adaptive_rsi.delivery.pr_view", return_value={"state": "MERGED"}), \
+                patch("adaptive_rsi.delivery.checked") as remote, patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, now + 61)
+        remote.assert_not_called()
+        feedback.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(result["close_status"], "merged")
+        self.assertFalse(result["close_pending"])
+
+    def test_stale_supersession_and_requeue_roll_back_together(self):
+        run = self.tracked_pr()
+        self.store.execute("CREATE TRIGGER reject_replan BEFORE UPDATE OF state ON tasks "
+                           "WHEN NEW.id='" + run["task"] + "' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected replan failure'); END")
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "new-base"}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime)
+        remote.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
+        self.assertNotIn("close_pending", json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"]))
+
+    def test_legacy_tracking_cannot_overwrite_new_attempt_even_when_it_has_a_pr(self):
+        old = self.tracked_pr()
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (old["task"],))
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(fresh["id"], "pr_open", {"pr": "https://github.com/example/project/pull/2"}, True)
+        old_pr = {"state": "CLOSED", "headRefOid": "head", "baseRefOid": "base"}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=old_pr), patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime)
+        remote.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (old["task"],))["state"], "pr_open")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (old["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (fresh["id"],))["state"], "pr_open")
+
+    def test_tracking_terminal_write_rechecks_task_ownership(self):
+        run = self.tracked_pr()
+        def requeue_during_gate(*args):
+            self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+            self.runtime.revise_task(run["task"], "New verification requirements")
+            return "ready"
+        with patch("adaptive_rsi.delivery.pr_view", return_value={"state": "CLOSED"}), \
+                patch("adaptive_rsi.delivery.merge_gate", side_effect=requeue_during_gate):
+            tick(self.runtime)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_closed")
+
+    def test_closed_current_pr_still_updates_its_own_task(self):
+        run = self.tracked_pr()
+        with patch("adaptive_rsi.delivery.pr_view", return_value={"state": "CLOSED", "headRefOid": "head", "baseRefOid": "base"}), \
+                patch("adaptive_rsi.delivery.checked") as remote:
+            tick(self.runtime)
+        remote.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_closed")
+
     def test_merged_retargeted_pr_is_unverified_and_does_not_confirm_feedback(self):
         run = self.tracked_pr()
         pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "other", "mergeCommit": {"oid": "external"}}

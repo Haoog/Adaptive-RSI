@@ -443,6 +443,123 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "cancelled")
         self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='retry'"))
 
+    def test_retry_revokes_queued_approval_even_when_fresh_verification_fails(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        old = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(old["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        queued = self.runtime.deliver(old["id"])
+        self.runtime.cancel_task(task)
+        self.runtime.retry(task)
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(fresh["task"], task)
+        self.store.transition(fresh["id"], "failed", {"reason": "New verification fails"}, True)
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (old["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (queued,))["state"], "cancelled")
+        with self.assertRaisesRegex(ValueError, "awaiting approval"):
+            self.runtime.deliver(old["id"])
+
+    def test_retry_invalidation_is_atomic_and_preserves_delivered_history(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        old = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(old["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        queued = self.runtime.deliver(old["id"])
+        for state in ["pr_open", "merged"]:
+            self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) "
+                               "VALUES (?,?,?,?,?,1,2,?)",
+                               (state, task, self.project, state, old["config"], encode({"pr": state})))
+        self.runtime.cancel_task(task)
+        self.store.execute("CREATE TRIGGER reject_retry BEFORE UPDATE OF state ON tasks "
+                           "WHEN NEW.id='" + task + "' AND NEW.state='queued' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected retry write failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Injected retry write failure"):
+                self.runtime.retry(task)
+        finally:
+            self.store.execute("DROP TRIGGER reject_retry")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "cancelled")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (queued,))["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (old["id"],))["state"], "awaiting_approval")
+        self.runtime.retry(task)
+        for state in ["pr_open", "merged"]:
+            self.assertEqual(self.store.one("SELECT state,result FROM runs WHERE id=?", (state,)),
+                             {"state": state, "result": encode({"pr": state})})
+
+    def test_claimed_publish_exits_after_retry_before_loading_candidate(self):
+        _, task, original, _, job = self.candidate()
+        self.runtime.cancel_task(task["id"])
+        self.runtime.retry(task["id"])
+        with patch("adaptive_rsi.runtime.changes") as load, patch.object(self.runtime, "publish") as remote:
+            self.runtime.process(job)
+        load.assert_not_called()
+        remote.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (job["id"],))["state"], "interrupted")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"], "queued")
+
+    def test_retry_during_publish_rechecks_each_remote_write_and_keeps_pr_receipt(self):
+        _, task, original, workspace, job = self.candidate()
+        outcome = json.loads(original["result"])
+        outcome["patch_hash"] = fingerprint(git(workspace, "diff", original["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        for boundary in ["fetch", "push", "create", "unchanged"]:
+            with self.subTest(boundary=boundary):
+                # Each pass uses the same sealed candidate and a fresh publish worker directory.
+                self.store.execute("UPDATE runs SET state='awaiting_approval',path=?,result=? WHERE id=?",
+                                   (str(workspace.parent), encode(outcome), original["id"]))
+                self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (task["id"],))
+                self.store.execute("UPDATE tasks SET state=? WHERE id=?", ("planning" if boundary == "fetch" else "queued", job["task"]))
+                worker = self.store.claim(self.project, self.runtime.config(self.project)) if boundary != "fetch" else job
+                def retry():
+                    self.runtime.cancel_task(task["id"])
+                    self.runtime.retry(task["id"])
+                def fetch(*args):
+                    if boundary == "fetch":
+                        retry()
+                    return str(self.repo), original["base"], "main"
+                def push(*args):
+                    if boundary == "push":
+                        retry()
+                def gh(argv, **kwargs):
+                    if argv[:3] == ["gh", "pr", "list"]:
+                        return "[]"
+                    self.assertEqual(argv[:3], ["gh", "pr", "create"])
+                    if boundary == "create":
+                        retry()
+                    return "https://github.com/example/project/pull/1"
+                with patch("adaptive_rsi.delivery.baseline", side_effect=fetch), \
+                        patch("adaptive_rsi.delivery.github_git", side_effect=push) as pushed, \
+                        patch("adaptive_rsi.delivery.checked", side_effect=gh) as remote:
+                    self.runtime.process(worker)
+                saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (original["id"],))
+                self.assertEqual(saved["state"], "pr_open" if boundary == "unchanged" else "superseded")
+                self.assertEqual(pushed.call_count, 0 if boundary == "fetch" else 1)
+                creates = [c for c in remote.call_args_list if c.args[0][:3] == ["gh", "pr", "create"]]
+                self.assertEqual(len(creates), int(boundary in ["create", "unchanged"]))
+                if boundary in ["create", "unchanged"]:
+                    self.assertEqual(json.loads(saved["result"])["pr"], "https://github.com/example/project/pull/1")
+                if boundary == "create":
+                    self.assertTrue(json.loads(saved["result"])["close_pending"])
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"],
+                                 "pr_open" if boundary == "unchanged" else "queued")
+                self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=? AND state='queued'", (task["id"],))
+
+    def test_stale_publish_failure_after_retry_cannot_block_new_requirements(self):
+        _, task, original, workspace, job = self.candidate()
+        outcome = json.loads(original["result"])
+        outcome["patch_hash"] = fingerprint(git(workspace, "diff", original["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
+                           (str(workspace.parent), encode(outcome), original["id"]))
+        def stale_publish(*args):
+            self.runtime.cancel_task(task["id"])
+            self.runtime.retry(task["id"])
+            raise StaleCandidate("Target changed during publishing")
+        with patch.object(self.runtime, "publish", side_effect=stale_publish):
+            self.runtime.process(job)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"], "queued")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (original["id"],))["state"], "superseded")
+
     def test_revision_supersedes_pending_candidates_and_only_cancels_queued_publish_jobs(self):
         task = self.runtime.goal(self.project, "Original requirements")
         pending = self.store.claim(self.project, self.runtime.config(self.project))

@@ -363,8 +363,15 @@ class Runtime:
             scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
             if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
                 raise ValueError("This task cannot be retried")
+            # 重试要求全新验证；同事务撤销旧候选与尚未领取的批准任务，保留已交付回执。
+            now = time.time()
+            db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE project=? "
+                       "AND source='system_publish' AND state='queued' AND body IN "
+                       "(SELECT id FROM runs WHERE task=? AND state='awaiting_approval')",
+                       (now, row["project"], task))
+            db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
-            db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (time.time(), task))
+            db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=?", (now, task))
         self.store.event("manual_retry", "User requested fresh verification", row["project"], data={"task": task})
         self.wake.set()
 
@@ -378,7 +385,21 @@ class Runtime:
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
             if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
                 raise ValueError("Pause or finish active work before supplementing this task")
+            evidence = row["evidence"]
             body = row["body"] + "\n\n" + supplement.strip()
+            if row["source"] == "issue":
+                from .discovery import issue_requirements, issue_requirements_body
+                requirements = issue_requirements(db, row)
+                requirements = {**requirements, "local_supplements": [*requirements["local_supplements"], supplement.strip()]}
+                body = issue_requirements_body(requirements)
+                try:
+                    items = json.loads(evidence or "[]")
+                except (TypeError, ValueError):
+                    items = []
+                if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+                    items = [{}]
+                items[0]["requirements"] = requirements
+                evidence = encode(items)
             if len(body) > 30000:
                 raise ValueError("Combined requirements exceed 30000 characters")
             now = time.time()
@@ -390,7 +411,7 @@ class Runtime:
                        "(SELECT id FROM runs WHERE task=? AND state='awaiting_approval')",
                        (now, row["project"], task))
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
-            db.execute("UPDATE tasks SET body=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, now, task))
+            db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
         self.store.event("requirements_revised", "Requirements supplemented; fresh verification required", row["project"], data={"task": task})
         self.wake.set()
 
@@ -904,15 +925,29 @@ class Runtime:
                     url = self.publish(project, source_task, original, candidate, config)
                 except StaleCandidate as exc:
                     outcome["reason"] = str(exc)
-                    self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), original["id"]))
                     # Issue work must wait for synchronization to replace stale evidence.
                     state = "blocked" if source_task["source"] == "issue" else (
                         "queued" if source_task["attempts"] <= config["limits"]["retries"] else "blocked")
-                    self.store.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=?", (state, time.time(), original["task"]))
+                    with self.store.connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? "
+                                             "AND state='awaiting_approval'", (encode(outcome), original["id"])).rowcount
+                        if changed:
+                            db.execute("UPDATE tasks SET state=?,available=0,updated=? WHERE id=? "
+                                       "AND state='awaiting_approval'", (state, time.time(), original["task"]))
                     raise
                 outcome["pr"] = url
-                self.store.execute("UPDATE runs SET state='pr_open',result=? WHERE id=?", (encode(outcome), original["id"]))
-                self.store.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=?", (time.time(), original["task"]))
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current = db.execute("SELECT state FROM runs WHERE id=?", (original["id"],)).fetchone()
+                    # 已发 PR 的回执必须落盘，但不能把重试后的新任务改回 pr_open。
+                    state = "pr_open" if current["state"] in ["awaiting_approval", "pr_open"] else "superseded"
+                    if state == "superseded":
+                        outcome.update(replanned=True, close_pending=True)
+                    db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (state, encode(outcome), original["id"]))
+                    if state == "pr_open":
+                        db.execute("UPDATE tasks SET state='pr_open',updated=? WHERE id=? "
+                                   "AND state='awaiting_approval'", (time.time(), original["task"]))
                 self.store.transition(run["id"], "completed", {"reason": "Approved PR created", "pr": url}, True)
                 return
             from .delivery import baseline as remote_baseline
@@ -1431,7 +1466,8 @@ class Runtime:
             for prefix in prefixes)
         for run in self.store.query(
                 "SELECT r.id FROM runs r WHERE r.ended IS NOT NULL AND r.ended<? AND r.state NOT IN "
-                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') AND (" +
+                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
+                "AND NOT (r.state='superseded' AND coalesce(json_extract(r.result,'$.close_pending'),0)=1) AND (" +
                 remaining + ") LIMIT 200", (stale,)):
             for prefix in prefixes:
                 key = prefix + run["id"]
