@@ -1530,6 +1530,127 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
+function modelScopePage(savedDrafts = new Map()) {
+  const page=browser(),posts=[],globals={planning:{provider:'ollama',model:'scope-coder',effort:'medium',fallback:null}},overrides=new Map([['a',structuredClone(globals)],['b',{}]]);
+  let release,held=false,holdNext=false,probeFailure=false;
+  const effective=project=>({...structuredClone(globals),...structuredClone(overrides.get(project)||{})});
+  const modelSnapshot=project=>({project,models:effective(project),global_models:structuredClone(globals),overrides:structuredClone(overrides.get(project)||{}),providers:[{id:'ollama',name:'Ollama',protocol:'ollama',catalog:{models:[{id:'scope-coder',name:'Scope coder'}]}}]});
+  page.context.english={};page.context.window.addEventListener=()=>{};
+  const tab=page.node('model-tab');tab.dataset.mcTab='roles';tab.parentElement=page.node('model-tabs');
+  page.document.querySelectorAll=selector=>selector==='[data-mc-tab]'?[tab]:[];
+  for(const id of ['view-models','mc-provider-list','mc-model-list','mc-role-list','mc-extra-role-list'])page.node(id).removeAttribute=()=>{};
+  page.node('mc-probe-effort').querySelector=()=>page.node('mc-probe-effort').children[0];
+  page.context.window.RSIDraftStore={get:(_type,key)=>structuredClone(savedDrafts.get(key)),set:(_type,key,value)=>savedDrafts.set(key,structuredClone(value)),remove:(_type,key)=>savedDrafts.delete(key)};
+  page.context.api=async(path,body)=>{
+    if(body){posts.push({path,body:structuredClone(body)});if(holdNext){holdNext=false;held=true;await new Promise(resolve=>{release=resolve;});held=false;}}
+    if(path==='model-center/routes'){
+      overrides.set(body.project,Object.fromEntries(Object.entries(body.models).filter(([role,route])=>JSON.stringify(route)!==JSON.stringify(globals[role]))));
+      return {saved:true,models:effective(body.project)};
+    }
+    if(path==='model-center/probe'){if(probeFailure)throw Object.assign(new Error('Probe failed'),{code:'probe_failed'});return {calls:[{tokens:1}]};}
+    if(path.startsWith('model-center'))return modelSnapshot(path.includes('?')?decodeURIComponent(path.split('=')[1]):null);
+    throw new Error('Unexpected model request '+path);
+  };
+  page.context.refresh=async()=>{};
+  const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
+  // Keep production loading, saving, draft persistence and event handlers; omit unrelated catalog rendering.
+  const instrumented=modelSource.replace('  init();',`  render=renderRoles=()=>{updateDirty();persistRouteDraft();};
+  window.modelScopeTest={openProbe:()=>openProbe(data.providers[0],data.providers[0].catalog.models[0]),edit:effort=>{routes().planning.effort=effort;renderRoles();},draft:()=>structuredClone(routes())};
+  init();`);
+  vm.runInContext(instrumented,page.context);
+  return {...page,posts,globals,overrides,savedDrafts,
+    async show(project){page.context.window.RSIModelCenter.show(project,true);await page.context.lastAction;},
+    click(id){page.node(id).handlers.click();return page.context.lastAction;},
+    edit(effort){page.context.window.modelScopeTest.edit(effort);},
+    draft(){return page.context.window.modelScopeTest.draft();},
+    openProbe(){page.context.window.modelScopeTest.openProbe();},
+    hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
+  };
+}
+
+test('equal-valued project overrides can be reset, persisted across reload, and follow later defaults',async()=>{
+  const page=modelScopePage();await page.show('a');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  page.click('mc-reset-inheritance');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  const restored=modelScopePage(page.savedDrafts);await restored.show('a');
+  assert.equal(restored.node('mc-save-routes').disabled,false);
+  await restored.click('mc-save-routes');
+  assert.equal(restored.overrides.get('a').planning,undefined);
+  assert.equal(restored.node('mc-save-routes').disabled,true);
+  assert.equal(restored.savedDrafts.has('a'),false);
+  restored.globals.planning.effort='low';await restored.show('a');
+  assert.equal(restored.draft().planning.effort,'low');
+});
+
+for(const later of ['edit','reset','reset-then-edit'])test(`route acknowledgement retains later ${later} through a scope round trip`,async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  page.hold();const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  if(later.includes('reset'))page.click('mc-reset-inheritance');
+  if(later.includes('edit'))page.edit('high');
+  await page.show('b');await page.show('a');
+  page.release();await saving;
+  assert.equal(page.draft().planning.effort,later.includes('edit')?'high':'medium');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,later.includes('reset'));
+  await page.click('mc-save-routes');
+  assert.equal(page.node('mc-save-routes').disabled,true);
+  assert.equal(page.savedDrafts.has('a'),false);
+});
+
+test('a reset during an ordinary pending route save survives its acknowledgement',async()=>{
+  const page=modelScopePage();await page.show('a');page.edit('high');page.hold();
+  const saving=page.click('mc-save-routes');await new Promise(setImmediate);
+  page.click('mc-reset-inheritance');await page.show('b');page.release();await saving;await page.show('a');
+  assert.equal(page.draft().planning.effort,'medium');
+  assert.equal(page.node('mc-save-routes').disabled,false);
+  assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  await page.click('mc-save-routes');assert.equal(page.overrides.get('a').planning,undefined);
+});
+
+test('a failed route save preserves inheritance reset intent for retry',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');
+  const api=page.context.api;page.context.api=async(path,body)=>{if(path==='model-center/routes')throw new Error('Save failed');return api(path,body);};
+  await page.click('mc-save-routes');
+  assert.equal(page.node('mc-save-routes').disabled,false);assert.equal(page.savedDrafts.get('a').resetInheritance,true);
+  page.context.api=api;await page.click('mc-save-routes');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.overrides.get('a').planning,undefined);
+});
+
+test('undo clears equal-valued inheritance reset intent',async()=>{
+  const page=modelScopePage();await page.show('a');page.click('mc-reset-inheritance');page.click('mc-undo');
+  assert.equal(page.node('mc-save-routes').disabled,true);assert.equal(page.savedDrafts.has('a'),false);
+});
+
+for(const switchWith of ['show','scope-control'])test(`probe dialog invalidates on ${switchWith} scope change before start`,async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();
+  assert.equal(page.node('mc-probe-dialog').open,true);
+  if(switchWith==='show')await page.show('b');
+  else{page.node('mc-scope').value='global';page.node('mc-scope').handlers.change();await page.context.lastAction;}
+  assert.equal(page.node('mc-probe-dialog').open,false);
+  await page.click('mc-probe-start');
+  assert.equal(page.posts.filter(p=>p.path==='model-center/probe').length,0);
+});
+
+test('a current probe renders its result and retains the opening project',async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();await page.click('mc-probe-start');
+  assert.equal(page.posts[0].body.project,'a');assert.match(page.node('mc-probe-result').textContent,/基础能力测试通过/);
+  assert.equal(page.node('mc-probe-start').disabled,false);
+});
+
+for(const failure of [false,true])test(`delayed probe ${failure?'failure':'success'} cannot paint another project or a replacement dialog`,async()=>{
+  const page=modelScopePage();await page.show('a');page.openProbe();page.hold();if(failure)page.failProbe();
+  const probing=page.click('mc-probe-start');await new Promise(setImmediate);
+  assert.equal(page.posts[0].body.project,'a');
+  await page.show('b');assert.equal(page.node('mc-probe-result').textContent,'');
+  page.release();await probing;
+  assert.equal(page.node('mc-probe-result').textContent,'');assert.equal(page.node('mc-probe-dialog').open,false);
+  await page.show('a');page.openProbe();assert.equal(page.node('mc-probe-result').textContent,'');
+  page.node('mc-probe-dialog').close();
+  await page.click('mc-probe-start');assert.equal(page.posts.length,1);
+});
+
 for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
   const page=browser();let release,callback;
   const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
