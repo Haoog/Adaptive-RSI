@@ -59,8 +59,12 @@ window.RSIExperience = (() => {
     settingsBaseline = null;
     taskOffset = 0;
     showView("overview");
+    const ticket = detailSequence, navigation = navigationSequence;
+    const current = () => ticket === detailSequence && navigation === navigationSequence && projectId === task.project;
     await refresh();
-    await showTask(await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(task.project)));
+    if (!current()) return;
+    const metadata = await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(task.project));
+    if (current()) await showTask(metadata);
   }
   async function inbox() {
     const data = await api("attention"),
@@ -839,16 +843,7 @@ window.RSIExperience = (() => {
         task = params.get("task"),
         project = params.get("project");
       if (task && project && state.projects.some((p) => p.id === project))
-        safe(async () =>
-          openTask(
-            await api(
-              "task?id=" +
-                encodeURIComponent(task) +
-                "&project=" +
-                encodeURIComponent(project),
-            ),
-          ),
-        );
+        safe(() => openTask({id: task, project}));
     }
   }
   document.addEventListener("DOMContentLoaded", () => {

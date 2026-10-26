@@ -79,6 +79,127 @@ class RuntimeSafetyTest(unittest.TestCase):
                 self.assertEqual("Mandatory new criterion" in body, operation == "revise")
                 self.store.transition(fresh["id"], "completed", {}, True)
 
+    def test_system_requests_preserve_cancellation_until_worker_stops(self):
+        self.runtime.configure({"sources": {"inspection": True, "issues": False}}, self.project)
+        config = self.runtime.config(self.project)
+        for kind in ["light", "issues", "evolve", "reassess"]:
+            with self.subTest(kind=kind):
+                task = self.runtime.request(self.project, kind)
+                run = self.store.claim(self.project, config)
+                self.assertEqual(run["task"], task)
+                self.runtime.cancel_task(task)
+                before = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+                self.assertEqual(self.runtime.request(self.project, kind), task)
+                if kind == "light":
+                    self.runtime.schedule(self.project, config)
+                self.assertEqual(self.store.one("SELECT * FROM tasks WHERE id=?", (task,)), before)
+                self.assertTrue(self.runtime.is_cancelled(run))
+                self.assertIsNone(self.store.claim(self.project, config))
+                self.store.transition(run["id"], "interrupted", {}, True)
+                self.assertEqual(self.runtime.request(self.project, kind), task)
+                fresh = self.store.claim(self.project, config)
+                self.assertEqual(fresh["task"], task)
+                self.assertNotEqual(fresh["id"], run["id"])
+                self.store.transition(fresh["id"], "completed", {}, True)
+
+    def test_failure_retry_is_atomic_with_dependency_cleanup(self):
+        config = self.runtime.config(self.project)
+        config["limits"]["retries"] = 1
+        parent = self.runtime.goal(self.project, "Parent repair")
+        child = self.runtime.goal(self.project, "Wait for parent merge")
+        self.runtime.set_dependency(child, parent)
+        run = self.store.claim(self.project, config)
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (parent,))
+        transition = self.store.transition
+        observed = []
+
+        def cleanup_after_transition(*args, **kwargs):
+            changed = transition(*args, **kwargs)
+            self.runtime.release_dead_dependencies()
+            observed.append(self.store.one("SELECT state,available FROM tasks WHERE id=?", (parent,)))
+            return changed
+
+        with patch.object(self.store, "transition", side_effect=cleanup_after_transition):
+            self.runtime.finish_failure(run, task, {"decision": "fail", "reason": "Check failed"}, config)
+        self.assertEqual(observed[0]["state"], "queued")
+        self.assertGreater(observed[0]["available"], time.time())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "failed")
+        self.assertEqual(self.store.one("SELECT dependency FROM task_dependencies WHERE task=?", (child,))["dependency"], parent)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (child,))["state"], "queued")
+        self.assertIsNone(self.store.claim(self.project, config))
+        retry = self.store.one("SELECT project,run,message,data FROM events WHERE kind='retry'")
+        self.assertEqual(retry, {"project": self.project, "run": run["id"],
+                                 "message": "Fresh run scheduled with bounded backoff", "data": "{}"})
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (parent,))
+        self.assertEqual(self.store.claim(self.project, config)["task"], child)
+
+    def test_dependency_cleanup_rechecks_parent_retry_and_child_state(self):
+        for change in ["retry_parent", "cancel_child"]:
+            with self.subTest(change=change):
+                parent = self.runtime.goal(self.project, "Parent " + change)
+                child = self.runtime.goal(self.project, "Child " + change)
+                self.runtime.set_dependency(child, parent)
+                self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (parent,))
+                query = self.store.query
+
+                def change_after_query(sql, args=()):
+                    rows = query(sql, args)
+                    if "td.task AS task" in sql:
+                        if change == "retry_parent":
+                            self.runtime.retry(parent)
+                        else:
+                            self.runtime.cancel_task(child)
+                    return rows
+
+                with patch.object(self.store, "query", side_effect=change_after_query):
+                    self.runtime.release_dead_dependencies()
+                self.assertEqual(self.store.one("SELECT dependency FROM task_dependencies WHERE task=?", (child,))["dependency"], parent)
+                expected = "queued" if change == "retry_parent" else "cancelled"
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (child,))["state"], expected)
+                self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='dependency_released'"))
+
+    def test_cancel_rechecks_terminal_state_after_initial_read(self):
+        for state in ["pr_open", "merged", "completed"]:
+            with self.subTest(state=state):
+                task = self.runtime.goal(self.project, "Finishing " + state)
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertEqual(run["task"], task)
+                if state in ["pr_open", "merged"]:
+                    self.store.transition(run["id"], "awaiting_approval", {}, True)
+                one = self.store.one
+
+                def finish_after_read(sql, args=()):
+                    row = one(sql, args)
+                    if sql == "SELECT * FROM tasks WHERE id=?" and args == (task,):
+                        if state in ["pr_open", "merged"]:
+                            self.store.execute("UPDATE runs SET state=? WHERE id=?", (state, run["id"]))
+                            self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, task))
+                        else:
+                            self.store.transition(run["id"], state, {}, True)
+                    return row
+
+                with patch.object(self.store, "one", side_effect=finish_after_read):
+                    with self.assertRaisesRegex(ValueError, "finished"):
+                        self.runtime.cancel_task(task)
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], state)
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], state)
+                self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='cancelled'"))
+                with self.assertRaises(ValueError):
+                    self.runtime.retry(task)
+
+    def test_cancel_before_failure_retry_preserves_cancellation(self):
+        config = self.runtime.config(self.project)
+        config["limits"]["retries"] = 1
+        task = self.runtime.goal(self.project, "Cancelled repair")
+        run = self.store.claim(self.project, config)
+        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
+        self.runtime.cancel_task(task)
+        self.runtime.finish_failure(run, row, {"decision": "fail", "reason": "Check failed"}, config)
+        self.assertEqual(self.store.one("SELECT state,available FROM tasks WHERE id=?", (task,)),
+                         {"state": "cancelled", "available": 0})
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "cancelled")
+        self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='retry'"))
+
     def test_revision_supersedes_pending_candidates_and_only_cancels_queued_publish_jobs(self):
         task = self.runtime.goal(self.project, "Original requirements")
         pending = self.store.claim(self.project, self.runtime.config(self.project))

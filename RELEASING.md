@@ -51,7 +51,7 @@ GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并�
 
 ## 用户端稳定更新
 
-默认每日检查正式 GitHub Release 并提醒。`updates.mode` 可设为 `manual`、`notify`、`automatic`；自动模式还须选择 `updates.auto_policy`：`patch`（默认，仅同 major/minor）、`minor`（同 major）、`stable`（任何更高稳定版本）。草稿、预发布、同版本和降级均不安装。自动更新等待项目运行、模型测试和浏览器授权全部空闲；调用与 tokens 只记录，不设额度。
+检查期间显示「正在检查更新」，暂时禁用再次检查和安装操作，但不阻止普通项目工作。临时网络错误保留已明确确认且绑定原版本的空闲安装请求；发现目标版本变化后须重新确认。默认每日检查正式 GitHub Release 并提醒。`updates.mode` 可设为 `manual`、`notify`、`automatic`；自动模式还须选择 `updates.auto_policy`：`patch`（默认，仅同 major/minor）、`minor`（同 major）、`stable`（任何更高稳定版本）。草稿、预发布、同版本和降级均不安装。自动更新等待项目运行、模型测试和浏览器授权全部空闲；调用与 tokens 只记录，不设额度。
 
 更新源固定为 `Haoog/Adaptive-RSI`。每个正式版本必须有 `adaptive-rsi-X.Y.Z-plugin.zip` 和同名 `.zip.sha256`；ZIP 根目录为 `adaptive-rsi/`。目前没有独立发布签名，校验和仍由同一 GitHub Release 提供。`update.json` 只接受 `format: 1`、`python_min: [3, 9]`、`state_schema: 1`；不兼容的数据迁移会被拒绝，不能仅改版本号绕过协议。
 

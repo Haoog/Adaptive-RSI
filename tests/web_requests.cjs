@@ -114,6 +114,31 @@ test('settings edited during the acknowledgement refresh keep the saved baseline
   assert.equal(vm.runInContext('settingsBaseline.limits.daily_calls', page.context), 30);
 });
 
+test('update check acknowledgment replaces stale failure and disables only update controls', async () => {
+  const page=browser();
+  vm.runInContext('state.update={state:"error",reason:"old-check-error",busy:false};renderUpdateExtras=()=>{};renderUpdate()',page.context);
+  assert.match(page.node('update-status').textContent,/old-check-error/);
+  page.context.fetch=async()=>response({started:true,update:{state:'checking',busy:false}});
+  page.node('check-update').handlers.click();await page.context.lastAction;
+  assert.match(page.node('update-status').textContent,/正在检查更新/);
+  assert.doesNotMatch(page.node('update-status').textContent,/old-check-error/);
+  assert.equal(page.node('check-update').disabled,true);
+  assert.equal(page.node('apply-update').disabled,true);
+  assert.equal(vm.runInContext('state.update.busy',page.context),false);
+  vm.runInContext('state.update={state:"available",version:"9.0.0",busy:false};renderUpdate()',page.context);
+  assert.equal(page.node('check-update').disabled,false);
+  assert.equal(page.node('apply-update').disabled,false);
+});
+
+test('update check acknowledgment preserves a fast completed result', async () => {
+  const page=browser();vm.runInContext('renderUpdateExtras=()=>{}',page.context);
+  page.context.fetch=async()=>response({started:true,update:{state:'up_to_date',busy:false}});
+  page.node('check-update').handlers.click();await page.context.lastAction;
+  assert.match(page.node('update-status').textContent,/已是最新稳定版/);
+  assert.equal(page.node('check-update').disabled,false);
+  assert.equal(page.node('apply-update').disabled,true);
+});
+
 test('an explicit update rejection retries the original payload with fresh CSRF', async () => {
   const page = browser(), posts = [];
   page.context.fetch = async (url, options) => {
@@ -596,6 +621,45 @@ test('a successful goal save clears only its submitted draft and preserves newer
   assert.equal(vm.runInContext('window.RSIDraftStore.get("goal","a")',page.context),'New goal typed while saving');
 });
 
+for (const newerDraft of [null, 'New A draft', 'Submitted goal']) {
+  test(`goal acknowledgement away from its project clears only the submitted draft (${newerDraft === null ? 'unchanged' : newerDraft})`, async () => {
+    const page = browser(); let finish;
+    page.context.refresh = async () => {};
+    page.context.fetch = () => new Promise(resolve => { finish = () => resolve(response({id: 'created'})); });
+    const switchTo = project => { page.node('project-select').value = project; page.node('project-select').handlers.change(); };
+    const input = value => { page.node('goal-text').value = value; page.input('goal-text', 'goal-form'); };
+    input('Submitted goal');
+    const pending = page.submit('goal-form');
+    switchTo('b'); input('B draft');
+    if (newerDraft !== null) {
+      switchTo('a'); input('Intermediate A edit'); input(newerDraft); switchTo('b');
+    }
+    finish(); await pending;
+    assert.equal(page.node('goal-text').value, 'B draft');
+    assert.equal(vm.runInContext('draftStore.get("goal","b")', page.context), 'B draft');
+    assert.equal(vm.runInContext('goalDrafts.get("a")', page.context), newerDraft ?? undefined);
+    assert.equal(vm.runInContext('draftStore.get("goal","a")', page.context), newerDraft);
+    switchTo('a'); assert.equal(page.node('goal-text').value, newerDraft ?? '');
+    const reloaded = browser(page.sessionData);
+    reloaded.context.restoreGoalDraft();
+    assert.equal(reloaded.node('goal-text').value, newerDraft ?? '');
+  });
+}
+
+test('expired candidates returned by attention pagination remain visible with a retry action', () => {
+  const page = browser();
+  page.context.language = 'zh-CN';
+  page.node('task-filter').value = 'attention';
+  page.node('show-system-tasks').checked = false;
+  vm.runInContext('state={...initialState,selected_project:"a",tasks:[{id:"expired",project:"a",source:"goal",title:"Expired candidate",state:"expired",display_state:"expired",updated:1}],runs:[],pagination:{total:1,limit:50,offset:0,has_more:false}};renderTasks()', page.context);
+  const row = page.node('tasks-list').children[0];
+  assert.equal(row.children[0].children[0].textContent, 'Expired candidate');
+  assert.equal(row.children[2].children[0].textContent, '重试');
+  assert.equal(vm.runInContext('visibleTasks(state.tasks,"history").length', page.context), 0);
+  assert.equal(vm.runInContext('visibleTasks(state.tasks,"active").length', page.context), 0);
+  assert.equal(page.node('tasks-page').textContent, '1–1 / 1');
+});
+
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
   for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
     const page=browser();page.node('config-scope').value='project';
@@ -619,14 +683,23 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   assert.equal(definitions.length,new Set(definitions).size,'english 对象存在重复定义的 key');
 });
 
-function experiencePage() {
-  const page = browser();
+function experiencePage({navigation = false} = {}) {
+  const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
-    URL, history: {replaceState() {}},
+    URL, navigator: {}, history: {replaceState() {}},
     location: {origin: 'http://fixture.test', href: 'http://fixture.test/', pathname: '/', search: ''}
   });
+  page.context.window.addEventListener = (type, handler) => windowEvents.set(type, handler);
+  page.context.window.scrollTo = () => {};
+  const listen = page.document.addEventListener;
+  page.document.addEventListener = (type, handler) => {
+    if (type === 'DOMContentLoaded') ready.push(handler);
+    else listen(type, handler);
+  };
   // Load the real task-open/action wiring; all requests and timers stay in memory.
   vm.runInContext(experienceSource, page.context);
+  if (navigation) ready[0]();
+  page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
   const create = page.document.createElement;
   page.document.createElement = tag => {
     const node = create(tag);
@@ -651,6 +724,51 @@ async function openExperienceTask(page, task) {
   await page.context.showTask(task);
   await page.context.lastAction;
   return page.node('detail-body').children.find(node => node.className === 'task-controls');
+}
+
+for (const entry of ['notification', 'deep-link']) {
+  for (const stage of ['refresh', 'metadata']) {
+    for (const navigation of ['project', 'round-trip', 'other-task', 'view', 'new-notification', 'unchanged']) {
+      test(`${entry} loading during ${stage} preserves ${navigation} navigation`, async () => {
+        const page = experiencePage({navigation: true}), task = fixtureTask('old');
+        page.context.window.RSIDesktop = {};
+        let release, refreshCalls = 0, metadataCalls = 0;
+        const refreshGate = stage === 'refresh' ? new Promise(resolve => { release = resolve; }) : Promise.resolve();
+        page.context.refresh = () => ++refreshCalls <= 2 ? refreshGate : Promise.resolve();
+        page.context.fetch = async url => {
+          if (url.includes('/task-runs?')) return response([]);
+          if (url.includes('/task?id=old&') && ++metadataCalls === 1 && stage === 'metadata') {
+            return new Promise(resolve => { release = () => resolve(response(task)); });
+          }
+          return response(url.includes('id=other&') ? fixtureTask('other') : task);
+        };
+        if (entry === 'notification') page.notify({id: task.id, task: task.id, project: task.project});
+        else {
+          page.context.location.hash = '#project=a&task=old';
+          page.context.window.RSIExperience.refreshed();
+        }
+        const pending = page.context.lastAction;
+        await new Promise(setImmediate);
+        assert.equal(typeof release, 'function');
+        const switchTo = project => { page.node('project-select').value = project; page.node('project-select').handlers.change(); };
+        if (navigation === 'project' || navigation === 'round-trip') {
+          switchTo('b');
+          if (navigation === 'round-trip') switchTo('a');
+        } else if (navigation === 'other-task') await openExperienceTask(page, fixtureTask('other'));
+        else if (navigation === 'view') page.context.showView('settings');
+        else if (navigation === 'new-notification') {
+          page.notify({task: 'other', project: 'a'});
+          await page.context.lastAction;
+        }
+        release(); await pending; await new Promise(setImmediate);
+        const hasTask = ['other-task', 'new-notification', 'unchanged'].includes(navigation);
+        assert.equal(page.node('detail-dialog').open || false, hasTask);
+        if (hasTask) assert.equal(page.node('detail-title').textContent, navigation === 'unchanged' ? 'Task old' : 'Task other');
+        assert.equal(vm.runInContext('projectId', page.context), navigation === 'project' ? 'b' : 'a');
+        if (stage === 'refresh' && navigation !== 'unchanged') assert.equal(metadataCalls, 0, 'obsolete navigation must stop before requesting old metadata');
+      });
+    }
+  }
 }
 
 test('an urgency-only save preserves an off-page dependency; explicit removal still clears it', async () => {
