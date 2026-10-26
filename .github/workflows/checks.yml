@@ -123,6 +123,7 @@ jobs:
           python3 -m unittest -v \
             tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project \
             tests.test_model_center.ModelCenterTest.test_real_keychain_round_trip_and_no_plaintext_database_key \
+            tests.test_audit_boundaries.CodexExecutableTest.test_symlinked_codex_can_start_itself_inside_permissions \
             tests.test_runtime.RuntimeTest.test_green_tests_cannot_bypass_blocking_maintainability_review \
             tests.test_runtime.RuntimeTest.test_real_git_and_sandbox_end_to_end_without_user_tree_changes \
             tests.test_runtime.RuntimeTest.test_fake_agent_success_cannot_replace_original_tests \
