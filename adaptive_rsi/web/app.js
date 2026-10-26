@@ -319,7 +319,7 @@ function render(){
  const counts=state.selected_project&&state.selected_project!==projectId?null:state.task_counts;
  const running=runs.find(run=>!run.ended),queue=counts?.find(r=>r.state==='queued')?.count??tasks.filter(task=>task.state==='queued').length;
  $('queue-count').textContent=queue;$('queue-count').hidden=!queue;
- $('current-work').textContent=running?(tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
+ $('current-work').textContent=running?(running.task_title||tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
  $('current-work-detail').textContent=running?runningStage(running)+' · '+t('已运行')+' '+elapsedCopy(Date.now()/1000-running.started)+(running.last_stage_at?' · '+t('最近进展')+' '+stamp(running.last_stage_at):''):project?.paused?t('启动后会按计划检查项目，也可以随时添加目标。'):queue?t('已有')+' '+queue+' '+t('个任务等待，当前任务结束后按价值顺序开始。'):t('已到下一次检查时间时会自动开始，无需保持页面前台运行。');
  const usage=(state.usage||[]).find(u=>u.project===(projectId||'model-center'));$('usage-brief').textContent=loadedStateSections.analyticsProject===(projectId||null)?(usage?.tokens||0)+' tokens':t('统计加载中');$('runtime-evidence').hidden=!project&&!usage;
  const scheduleTime=row=>row.next_effective??row.due;

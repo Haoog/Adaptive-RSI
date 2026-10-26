@@ -9,6 +9,7 @@
 - After a download completes and the installer image opens, the button switches to a completed "Installer image is open. Drag to install." state that cannot be clicked into a full re-download; "Check for updates" remains the explicit way to re-check.
 - "Remove connection" no longer deletes on a single click: a confirmation now explains that the connection and credentials stored on this machine (keychain or private file) are deleted irreversibly, that re-adding creates a new connection without restoring enabled/favorite/verified/price records, and that the server rejects removal while a role or fallback model still references the connection. Cancelling sends no request.
 - Step 2 ("Account connection") of the model-center setup checklist no longer stays highlighted forever for key-based or local connections: it shows as done when no key is required or credentials are configured, and only stays current while credentials are missing. Codex/OpenCode official sign-in connections behave as before.
+- The workbench "current task" card now shows the task title instead of a status word when the running task is outside the current task-list page (deep queues) or excluded by the "Needs you" and "History" groups; the card falls back to waiting copy once the run ends, and switching projects no longer leaks another project's running title.
 
 ## 0.5.118
 

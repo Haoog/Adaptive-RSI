@@ -51,6 +51,16 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         runs = sorted({r["id"]: r for r in runs + latest}.values(), key=lambda r: r["started"], reverse=True)
     active = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs WHERE " + clause + " AND ended IS NULL", base_args)
     runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"], reverse=True)
+    # 运行中任务可能不在当前分页/分组的任务列表里，标题随运行行一起返回，
+    # 避免工作台「当前任务」退化成状态词。只标注未结束的运行，开销有界。
+    running_tasks = {row["task"] for row in runs if row["ended"] is None}
+    if running_tasks:
+        titles = {row["id"]: row["title"] for row in store.query(
+            "SELECT id,title FROM tasks WHERE id IN (" + ",".join("?" for _ in running_tasks) + ")",
+            tuple(running_tasks))}
+        for row in runs:
+            if row["ended"] is None:
+                row["task_title"] = titles.get(row["task"])
     if runs:
         stage_rows = store.query(
             "SELECT s.run,s.stage,s.created,json_extract(s.data,'$.decision') AS decision "

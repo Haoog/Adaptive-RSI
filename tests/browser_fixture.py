@@ -142,6 +142,18 @@ def main():
                 parent = runtime.store.add_task(project, "goal", "queue-old-parent", "旧失败前置任务")
                 runtime.store.execute("UPDATE tasks SET state='failed',updated=1 WHERE id=?", (parent,))
                 runtime.store.execute("UPDATE tasks SET urgency=1 WHERE id=?", (child,))
+            if os.environ.get("RSI_BROWSER_CURRENT_WORK"):
+                # 当前任务标题专项：60 条排队任务把运行中任务挤出第一页，
+                # 分组筛选与项目切换时标题不能退化成状态词。
+                now = time.time()
+                for index in range(60):
+                    runtime.store.add_task(project, "goal", "current-work-page-" + str(index), "当前任务分页目标 " + str(index))
+                running_task = runtime.store.add_task(project, "goal", "current-work-running", "修复登录页空指针")
+                runtime.store.execute("UPDATE tasks SET state='executing',updated=? WHERE id=?", (now, running_task))
+                runtime.store.execute(
+                    "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
+                    "VALUES ('browser-current-work',?,?,'executing','{}','basemain',NULL,2,900,?,?,'{}')",
+                    (running_task, project, now - 300, None))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -152,6 +164,11 @@ def main():
             for line in sys.stdin:
                 if not line.strip():
                     break
+                if line.strip() == "end-current-work-run":
+                    # 当前任务标题专项：关闭注入的运行，验证卡片回退到等待文案。
+                    runtime.store.execute("UPDATE runs SET ended=? WHERE id='browser-current-work'", (time.time(),))
+                    print(json.dumps({"ok": True}, ensure_ascii=False), flush=True)
+                    continue
                 texts = json.loads(line)["goal_evidence"]
                 placeholders = ",".join("?" for _ in texts)
                 print(json.dumps({
