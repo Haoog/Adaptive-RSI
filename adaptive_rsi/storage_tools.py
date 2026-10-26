@@ -1,6 +1,7 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 from contextlib import closing
@@ -54,13 +55,28 @@ def restore(source, destination):
     return {"restored": True, "paused": True, "artifacts_restored": False}
 
 
+def _file_info(paths, follow_symlinks=False):
+    for path in paths:
+        try:
+            info = path.stat() if follow_symlinks else path.lstat()
+        except FileNotFoundError:
+            continue  # SQLite sidecars can disappear during enumeration.
+        if stat.S_ISREG(info.st_mode):
+            yield path, info
+
+
 def overview(store):
     categories = {}
     for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups")]:
-        categories[label] = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file() and not p.is_symlink()) if directory.exists() else 0
-    categories["database"] = sum(p.stat().st_size for p in store.root.glob("state.sqlite3*") if p.is_file())
-    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": p.stat().st_size, "created": p.stat().st_mtime}
-            for p in sorted((store.root / "backups").glob("*.sqlite3"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]],
+        paths = directory.rglob("*")
+        if label == "backups":
+            paths = (p for p in paths if not p.name.startswith(".backup-"))
+        categories[label] = sum(info.st_size for _, info in _file_info(paths))
+    categories["database"] = sum(info.st_size for _, info in _file_info(store.root.glob("state.sqlite3*"), True))
+    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3"), True),
+                     key=lambda item: item[1].st_mtime, reverse=True)
+    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+            for p, info in backups[:20]],
             "expiring": store.query("SELECT r.id,r.task,r.project,r.ended FROM runs r WHERE r.state='awaiting_approval' ORDER BY r.ended")}
 
 

@@ -1,4 +1,5 @@
 import base64
+import errno
 import io
 import json
 import os
@@ -105,7 +106,9 @@ class BackupPublicationTest(unittest.TestCase):
                 self.assertEqual(staging[0].stat().st_mode & 0o777, 0o600)
                 self.assertTrue(all(path.name.startswith(staging[0].name)
                                     for path in self.folder.iterdir()))
-                self.assertEqual(overview(self.store)["backups"], [])
+                snapshot = overview(self.store)
+                self.assertEqual(snapshot["backups"], [])
+                self.assertEqual(snapshot["bytes"]["backups"], 0)
                 for params in ({}, {"format": ["json"], "offset": ["0"]}):
                     with self.assertRaisesRegex(RequestError, "Backup not found"):
                         self.handler().backup(final, params)
@@ -136,6 +139,91 @@ class BackupPublicationTest(unittest.TestCase):
                 "SELECT value FROM settings WHERE key='backup-probe'").fetchone()[0]), self.payload)
         self.assertFalse(Path(str(portable) + "-wal").exists())
         self.assertFalse(Path(str(portable) + "-shm").exists())
+
+    def test_overview_skips_files_disappearing_during_stat(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        for kind in ("runs", "backups", "database", "backup_listing"):
+            with self.subTest(kind=kind):
+                if kind == "database":
+                    transient = self.store.root / "state.sqlite3-journal"
+                elif kind == "runs":
+                    transient = self.store.root / "runs" / "run" / "temporary-journal"
+                else:
+                    saved = backup(self.store)
+                    transient = self.folder / (saved["id"] + ".sqlite3")
+                transient.parent.mkdir(parents=True, exist_ok=True)
+                if kind in ("runs", "database"):
+                    transient.write_bytes(b"temporary")
+                method = "stat" if kind in ("database", "backup_listing") else "lstat"
+                original = getattr(Path, method)
+                vanished = []
+
+                def disappear(path, *args, **kwargs):
+                    if path == transient and not vanished:
+                        vanished.append(path)
+                        path.unlink()
+                    return original(path, *args, **kwargs)
+
+                with patch.object(Path, method, disappear):
+                    snapshot = overview(self.store)
+                self.assertEqual(vanished, [transient])
+                self.assertEqual(snapshot["backups"], [])
+                self.assertEqual(snapshot["bytes"]["runs"], 0)
+                expected_database = sum(p.stat().st_size for p in self.store.root.glob("state.sqlite3*"))
+                self.assertEqual(snapshot["bytes"]["database"], expected_database)
+
+    def test_overview_propagates_permission_and_io_errors(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        saved = backup(self.store)
+        published = self.folder / (saved["id"] + ".sqlite3")
+        run_file = self.store.root / "runs" / "evidence"
+        run_file.parent.mkdir()
+        run_file.write_bytes(b"evidence")
+        for path, method in ((run_file, "lstat"), (published, "lstat"),
+                             (published, "stat"), (self.store.path, "stat")):
+            for error in (PermissionError(errno.EACCES, "Denied"), OSError(errno.EIO, "I/O failure")):
+                with self.subTest(path=path.name, method=method, error=error.errno):
+                    original = getattr(Path, method)
+
+                    def fail(candidate, *args, **kwargs):
+                        if candidate == path:
+                            raise error
+                        return original(candidate, *args, **kwargs)
+
+                    with patch.object(Path, method, fail):
+                        with self.assertRaises(type(error)) as raised:
+                            overview(self.store)
+                    self.assertIs(raised.exception, error)
+
+    def test_overview_during_concurrent_backup_publication(self):
+        from adaptive_rsi.storage_tools import backup, overview
+        ready, done = threading.Event(), threading.Event()
+
+        def publish():
+            if not ready.wait(10):
+                raise RuntimeError("Overview probe timed out")
+            try:
+                return [backup(self.store) for _ in range(12)]
+            finally:
+                done.set()
+
+        observations = 0
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(publish)
+            ready.set()
+            deadline = time.monotonic() + 10
+            while not done.is_set() or observations < 30:
+                self.assertLess(time.monotonic(), deadline)
+                snapshot = overview(self.store)
+                for saved in snapshot["backups"]:
+                    self.assertGreater(saved["bytes"], 0)
+                    self.assertTrue((self.folder / (saved["id"] + ".sqlite3")).is_file())
+                observations += 1
+            published = future.result(timeout=10)
+        snapshot = overview(self.store)
+        self.assertEqual(len(snapshot["backups"]), len(published))
+        self.assertEqual(snapshot["bytes"]["backups"], sum(saved["bytes"] for saved in published))
+        self.assertTrue(all(path.suffix == ".sqlite3" for path in self.folder.iterdir()))
 
     def test_copy_failure_cleans_staging_and_preserves_existing_backup(self):
         from adaptive_rsi.storage_tools import backup
