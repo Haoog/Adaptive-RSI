@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.118
+
+<!-- adaptive-rsi-release:0.5.118;base:947ad7b0cb1f3aa6c03c8a4e8de181adcae5a9ba -->
+
 - System notifications now share one deduplication record across browser tabs: a state change alerted by one tab is no longer alerted again by the others, while the existing restore-after-reload semantics are preserved.
 - A single failing system notification no longer swallows the rest of its batch: the failed item retries on the next poll with at most one hint per failure streak; when the constructor is unavailable (such as an iOS Home Screen app) the interface says so explicitly and resumes after recovery instead of failing silently forever.
 - Notification deduplication entries are touched on each observation before trimming, so active attention items are no longer evicted unchanged past the 5000-entry bound and re-alerted; storage stays bounded.
