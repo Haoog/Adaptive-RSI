@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.117
+
+<!-- adaptive-rsi-release:0.5.117;base:366d91099b42a38e8c3c8c89bfe0372bcaa267a1 -->
+
 - The project selector shows both name and full path, blank names fall back to the directory name, and same-name local repositories remain distinguishable. A newly added project is persisted immediately and stays selected after reload.
 - Re-adding an existing path now reports the existing project name and paused state instead of silently ignoring the name or enabled option or claiming success.
 - Pending-approval counts in Data and diagnostics exclude approved, delivering and cancelled candidates. In-progress and delivered states are reported separately without rewriting history.
