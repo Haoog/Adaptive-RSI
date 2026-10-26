@@ -164,6 +164,101 @@ function settingsSavePage(scope = 'project') {
   });
 }
 
+function productionSettingsPage(scope) {
+  const page = browser(), fields = [];
+  const html = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/index.html'), 'utf8').split('<form id="settings-form">')[1].split('</form>')[0];
+  for (const match of html.matchAll(/<(input|select|textarea)\b([^>]*)>/g)) {
+    const attrs = Object.fromEntries([...match[2].matchAll(/([\w-]+)="([^"]*)"/g)].map(item => [item[1], item[2]]));
+    const node = page.node(attrs.id || 'control-' + fields.length);
+    Object.assign(node, {id: attrs.id || '', type: attrs.type || match[1], tagName: match[1].toUpperCase(), checked: false, form: page.node('settings-form')});
+    for (const [key, value] of Object.entries(attrs)) if (key.startsWith('data-')) node.dataset[key.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = value;
+    node.hasAttribute = key => Object.hasOwn(attrs, key);
+    let value = ''; Object.defineProperty(node, 'value', {get: () => value, set: next => { value = String(next); }});
+    const content = html.slice(match.index + match[0].length).split('</' + match[1] + '>')[0];
+    node.options = match[1] === 'select' ? [...content.matchAll(/<option value="([^"]*)"/g)].map(item => ({value: item[1]})) : [];
+    fields.push(node);
+  }
+  const select = selector => {
+    if (selector === 'input,textarea,select') return fields;
+    if (selector === '[data-path]') return fields.filter(node => node.dataset.path);
+    if (selector === '[data-unit-for]') return fields.filter(node => node.dataset.unitFor);
+    if (selector === '[data-schedule-preset]') return fields.filter(node => node.dataset.schedulePreset);
+    if (selector === '[data-unit-for], [data-schedule-preset]') return fields.filter(node => node.dataset.unitFor || node.dataset.schedulePreset);
+    const exact = selector.match(/^\[data-(path|unit-for)="([^"]+)"\]$/);
+    if (exact) return fields.filter(node => node.dataset[exact[1] === 'path' ? 'path' : 'unitFor'] === exact[2]);
+    const prefix = selector.match(/^\[data-path\^="([^"]+)"\]$/);
+    return prefix ? fields.filter(node => node.dataset.path?.startsWith(prefix[1])) : [];
+  };
+  page.document.querySelectorAll = select; page.document.querySelector = selector => select(selector)[0] || null;
+  page.node('settings-form').querySelectorAll = select;
+  const prior = page.node('settings-form').querySelector.bind(page.node('settings-form'));
+  page.node('settings-form').querySelector = selector => select(selector)[0] || prior(selector);
+  const config = JSON.parse(require('node:child_process').execFileSync(process.env.PYTHON || 'python3', ['-B', '-c', 'import json; from adaptive_rsi.config import DEFAULTS; print(json.dumps(DEFAULTS))'], {cwd: path.join(__dirname, '..'), encoding: 'utf8'}));
+  page.context.initialState.config = structuredClone(config);
+  page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); project.overrides = {}; });
+  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}}, language: 'zh-CN'});
+  page.context.window.addEventListener = () => {}; page.context.window.scrollTo = () => {};
+  vm.runInContext(experienceSource, page.context);
+  // Keep production renderSettings, refresh, draft restoration and dirty status.
+  // Isolate only unrelated panels and their background requests.
+  vm.runInContext(`view='settings';renderCapabilities=async()=>{};loadReleaseWorkflows=async()=>{};
+    renderUpdateExtras=()=>{};renderNavigation=()=>{};window.RSIExperience.refreshed=()=>{};
+    render=()=>{if(!settingsBaseline)renderSettings();};`, page.context);
+  page.node('config-scope').value = scope; page.context.renderSettings();
+  const server = structuredClone(page.context.initialState), posts = [];
+  let acknowledge;
+  page.context.fetch = async (url, options) => {
+    if (url.includes('/state?')) return response({...structuredClone(server), selected_project: new URLSearchParams(url.split('?')[1]).get('project')});
+    const post = JSON.parse(options.body); posts.push(post);
+    const target = post.project === null ? server : server.projects.find(project => project.id === post.project);
+    page.context.deepMerge(target.config, post.values);
+    if (post.project !== null) page.context.deepMerge(target.overrides, post.values);
+    const saved = structuredClone(target.config);
+    return new Promise(resolve => { acknowledge = () => resolve(response({saved: true, config: saved})); });
+  };
+  const weight = select('[data-path="schedule.weight"]')[0];
+  return Object.assign(page, {server, posts, weight,
+    edit(selector, value) {
+      const node = select(selector)[0]; node.value = value;
+      page.input(node.id || 'control-' + fields.indexOf(node), 'settings-form');
+      page.node('settings-form').handlers.input(); page.context.window.RSIProduct.dirtyStatus();
+    },
+    async navigate(back) {
+      if (scope === 'project') { page.node('project-select').value = back ? 'a' : 'b'; page.node('project-select').handlers.change(); }
+      else page.context.changeSettingsScope(back ? 'global' : 'project');
+      await page.context.refresh();
+    },
+    finish() { acknowledge(); }
+  });
+}
+
+for (const scope of ['project', 'global']) {
+  for (const external of ['none', 'unrelated-field', 'same-field']) {
+    test(`production settings restore after GET sees pending ${scope} save with ${external} conflict`, async () => {
+      const page = productionSettingsPage(scope), key = scope === 'project' ? 'a' : 'global';
+      const target = scope === 'project' ? page.server.projects[0] : page.server;
+      page.edit('[data-path="schedule.weight"]', '2'); const pending = page.submit('settings-form');
+      page.edit('[data-path="schedule.weight"]', '1');
+      if (external === 'unrelated-field') page.edit('[data-path="limits.retries"]', '7');
+      if (external === 'same-field') target.config.schedule.weight = 6;
+      if (external === 'unrelated-field') target.config.limits.retries = 8;
+      assert.equal(target.config.schedule.weight, external === 'same-field' ? 6 : 2, 'server commits before POST acknowledgement');
+      await page.navigate(false); await page.navigate(true);
+      assert.equal(vm.runInContext('settingsBaseline.schedule.weight', page.context), external === 'same-field' ? 6 : 2, 'navigation GET observes the committed baseline');
+      assert.equal(page.weight.value, external === 'same-field' ? '6' : '1', 'only a baseline change belonging to this save preserves the newer draft');
+      if (external === 'unrelated-field') assert.equal(page.document.querySelector('[data-path="limits.retries"]').value, '8', 'unrelated external conflicts retain server values');
+      if (external !== 'none') assert.match(page.node('toast').textContent, /冲突字段/);
+      page.finish(); await pending;
+      if (external === 'same-field') return;
+      assert.equal(page.weight.value, '1');
+      assert.equal(page.node('save-note').dataset.state, 'dirty');
+      const stored = vm.runInContext(`draftStore.get('settings',${JSON.stringify(key)})`, page.context);
+      assert.equal(stored.values.find(entry => entry.path === 'schedule.weight').baselineValue, 2);
+      assert.equal(stored.values.find(entry => entry.path === 'schedule.weight').value, '1');
+    });
+  }
+}
+
 for (const scope of ['project', 'global']) {
   for (const navigation of ['same', 'project-away', 'project-round-trip', 'scope-away', 'scope-round-trip']) {
     for (const newer of [1, 2, 3]) {
