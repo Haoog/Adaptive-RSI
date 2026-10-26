@@ -75,6 +75,7 @@ async function addLocalProject(page, repoPath, name, enabled) {
     assert.equal(duplicate.name, '同名仓库');
     await page.locator('#toast').filter({hasText: '该路径已接入'}).waitFor();
     const duplicateMessage = await page.locator('#toast').innerText();
+    assert.match(duplicateMessage, /该路径已接入：/);
     assert.match(duplicateMessage, /未修改名称或启用状态/);
     assert.equal(await page.locator('#project-select').inputValue(), sameName[0].id);
     assert.equal(await page.evaluate(() => localStorage.getItem('rsi-project')), sameName[0].id);
@@ -104,6 +105,7 @@ async function addLocalProject(page, repoPath, name, enabled) {
     const duplicateEnglish = await addLocalProject(page, sameName[0].path, 'Renamed attempt', true);
     assert.equal(duplicateEnglish.existing, true);
     await page.locator('#toast').filter({hasText: 'This path is already registered'}).waitFor();
+    assert.match(await page.locator('#toast').innerText(), /already registered: /);
     assert.match(await page.locator('#toast').innerText(), /Name and enabled state were not changed/);
 
     assert.deepEqual(errors, []);

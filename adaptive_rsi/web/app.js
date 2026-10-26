@@ -654,7 +654,7 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
   }
   if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;localStorage.setItem('rsi-project',projectId);settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
   await refresh();
-  if(existingProject)toast(t('该路径已接入')+'：'+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'));
+  if(existingProject)toast(t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'));
   else toast(t('项目已接入'));
  }finally{$('project-submit').disabled=false;}
 },event.target);});
