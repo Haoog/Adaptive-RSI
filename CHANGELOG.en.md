@@ -8,7 +8,7 @@
 - Manually re-adding a model missing from the catalog makes it selectable again, preserves existing preferences, and keeps it available after later catalog refreshes.
 - Auto-merge rechecks the current repository, branch and sealed target after fetching the baseline, preventing merges to an old target after authorization changes.
 - Workflow authorization acknowledgments update the saved baseline while preserving newer disable choices and authorization field edits made while waiting.
-- Saving login credentials immediately invalidates account-status caches. Cancelled or replaced sessions ignore late poll results and errors while keeping the new session visible and polled.
+- Saving login credentials immediately invalidates account-status caches. Cancelled or replaced sessions ignore late poll results and errors while keeping the new session visible and polled. Temporary post-login status/catalog failures retry their unfinished stage without repeating authorization or overwriting feedback for a newly selected provider.
 
 ## 0.5.109
 

@@ -1017,6 +1017,97 @@ test('an active run stopping error explains when retry and supplement become ava
   await assert.rejects(page.context.api('retry', {task: 'child'}), /任务仍在停止中，请等当前运行结束后再重试或补充需求。/);
 });
 
+for(const fails of [false,true])test(`catalog callback ${fails?'failure':'success'} preserves feedback after provider switch`,async()=>{
+  const page=browser();let release,callback;
+  const modelSource=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/model-center.js'),'utf8');
+  // Expose the production closure with only rendering/load stubbed for this focused ownership test.
+  const instrumented=modelSource.replace('  init();','').replace('  return {show:(requested=null,reload=false)=>{',
+    '  return {testSetup(){renderProvider=()=>{};load=async()=>{};active="openai";scope="a";return ()=>fetchProvider("openai","a",true);},testSwitch(){active="opencode";setStatus("Provider B feedback");},show:(requested=null,reload=false)=>{');
+  page.context.english={};vm.runInContext(instrumented,page.context);
+  page.context.fetch=async()=>new Promise(resolve=>{release=()=>resolve(response({},fails?503:200));});
+  callback=page.context.window.RSIModelCenter.testSetup();
+  const result=callback();page.context.window.RSIModelCenter.testSwitch();release();
+  if(fails)await assert.rejects(result);else await result;
+  assert.equal(page.node('mc-feedback').textContent,'Provider B feedback');
+});
+
+async function authCompletionPage({failure='',direct=false,hold=''}={}) {
+  const page=browser(),calls={status:0,session:0,catalog:0,start:0,complete:0},walk=node=>[node,...(node.children||[]).flatMap(walk)];
+  const tick=()=>new Promise(setImmediate),session={id:'completion-A',backend:'codex',provider:null,state:'awaiting_authorization',method:direct?'code':'auto'};
+  let release,held=false;
+  const waitHeld=async stage=>{if(hold===stage&&!held){held=true;await new Promise(resolve=>{release=resolve;});}};
+  page.context.fetch=async(url,options={})=>{
+    if(url.endsWith('/api/auth/status')){
+      calls.status++;if(calls.status>1){await waitHeld('status');if(calls.status===2&&failure==='status')return response({},503);if(failure==='session_required')return response({},401);}
+      return response({sessions:calls.status===1?[session]:[],codex:{available:true,state:calls.status===1?'signed_out':'authenticated'}});
+    }
+    if(url.includes('/api/auth/session?id=')){calls.session++;if(url.includes('completion-B'))return response({...session,id:'completion-B',state:'starting'});return response({...session,state:calls.session===1?'awaiting_authorization':'completed'});}
+    if(url.endsWith('/api/auth/complete')){calls.complete++;return response({...session,state:'completed'});}
+    if(url.endsWith('/api/auth/cancel'))return response({...session,state:'cancelled'});
+    if(url.endsWith('/api/auth/start')){calls.start++;return response({...session,id:'completion-B',state:'starting'});}
+    if(url.endsWith('/api/auth/logout'))return response({ok:true});
+    throw new Error('Unexpected request '+url);
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('openai',async()=>{
+    calls.catalog++;await waitHeld('catalog');
+    if(calls.catalog===1&&failure==='catalog')throw Object.assign(new Error('Catalog unavailable'),{status:503});
+  });
+  await tick();await tick();
+  return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
+    async finish(){
+      if(direct){const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='TEST-CODE';form.handlers.submit({preventDefault(){}});}
+      else page.fireTimer(1500);
+      await tick();await tick();
+    }};
+}
+
+for(const direct of [false,true])for(const failure of ['status','catalog']){
+  test(`completed auth retries ${failure} refresh after ${direct?'code submission':'poll'} without repeating OAuth`,async()=>{
+    const run=await authCompletionPage({failure,direct});await run.finish();
+    assert.match(run.text(),/更新失败，正在重试/);
+    assert.equal(run.calls.catalog,failure==='status'?0:1);
+    run.page.fireTimer(1500);await run.tick();await run.tick();
+    assert.doesNotMatch(run.text(),/更新失败/);
+    assert.equal(run.calls.status,failure==='status'?3:2);
+    assert.equal(run.calls.catalog,failure==='status'?1:2);
+    assert.equal(run.calls.session,direct?1:2);
+    assert.equal(run.calls.complete,direct?1:0);
+    assert.equal(run.calls.start,0);
+    assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+  });
+}
+
+test('completed auth console expiry stays actionable and stops refresh retries',async()=>{
+  const run=await authCompletionPage({failure:'session_required'});await run.finish();
+  assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
+  assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+for(const hold of ['status','catalog'])for(const restart of [false,true]){
+  test(`completion ${hold} pending cannot revive auth after ${restart?'restart':'cancel or logout'}`,async()=>{
+    const run=await authCompletionPage({hold,failure:hold==='status'?'session_required':'catalog'});await run.finish();
+    const button=run.walk(run.page.node('mc-auth')).find(node=>node.textContent===(hold==='status'?'取消登录':'退出账号'));
+    assert.ok(button);button.handlers.click();await run.page.context.lastAction;
+    if(restart){
+      run.walk(run.page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});await run.page.context.lastAction;
+    }
+    run.release();await run.tick();await run.tick();
+    assert.equal(run.calls.catalog,hold==='status'?0:1);
+    assert.doesNotMatch(run.text(),/更新失败/);
+    if(restart)assert.match(run.text(),/正在准备官方登录/);
+    else assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+  });
+}
+
+test('pending completion catalog refresh cannot invoke duplicate callbacks',async()=>{
+  const run=await authCompletionPage({hold:'catalog'});await run.finish();
+  run.page.fireTimer(1500);await run.tick();assert.equal(run.calls.catalog,1);
+  run.release();await run.tick();await run.tick();
+  assert.equal(run.calls.catalog,1);
+  assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
 test('the live run stage marks an in-progress review before its stage row exists', () => {
   const page = browser();
   assert.equal(vm.runInContext('runningStage({state:"evaluating",stage:"review"})', page.context), '正在评审改动');

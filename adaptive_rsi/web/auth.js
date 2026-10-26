@@ -40,12 +40,30 @@ window.RSIAuth = (() => {
   async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
     selectPreferredProvider();render();}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;render();}}
-  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state))){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
+  function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
+  async function refreshCompleted(id,session){
+    if(session.refreshing||sessions.get(id)!==session)return;session.refreshing=true;
+    try{
+      if(session.refreshStage==='status'){
+        readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
+        session.refreshStage='catalog';
+      }
+      await session.refresh();if(sessions.get(id)!==session)return;
+      session.refreshStage='';session.pollMessage='';
+    }catch(error){
+      if(sessions.get(id)!==session)return;
+      if(error.code==='session_required'){pollingStopped=true;session.pollMessage='控制台登录已失效，请重新打开控制台后继续授权。';}
+      else session.pollMessage='登录已完成，账号状态或模型目录更新失败，正在重试。';
+    }finally{session.refreshing=false;}
+  }
   async function poll(){
     if(polling||pollingStopped)return;polling=true;
-    try{for(const [id,session] of sessions){if(terminal.has(session.state))continue;
-      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(sessions.get(id)!==session)continue;sessions.set(id,{...next,refresh:session.refresh,pollMessage:''});
-        if(next.state==='completed'){snapshot=null;readinessCache.clear();await status(true);await session.refresh();}
+    try{for(const [id,session] of sessions){
+      if(session.refreshStage){await refreshCompleted(id,session);continue;}
+      if(terminal.has(session.state))continue;
+      try{const next=await api('auth/session?id='+encodeURIComponent(session.id));if(sessions.get(id)!==session)continue;
+        const updated={...next,refresh:session.refresh,pollMessage:'',refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
+        if(updated.refreshStage)await refreshCompleted(id,updated);
       }catch(error){
         if(sessions.get(id)!==session)continue;
         if(error.code==='session_required'){pollingStopped=true;sessions.set(id,{...session,pollMessage:'控制台登录已失效，请重新打开控制台后继续授权。'});continue;}
@@ -57,8 +75,9 @@ window.RSIAuth = (() => {
     }}finally{polling=false;render();schedule();}
   }
   async function completeSession(id,session,code){
-    const next=await mutate('complete',{id:session.id,code});sessions.set(id,{...next,refresh:session.refresh});
-    if(next.state==='completed'){readinessCache.clear();await status(true);await session.refresh();}render();schedule();
+    const next=await mutate('complete',{id:session.id,code});if(sessions.get(id)!==session)return;
+    const updated={...next,refresh:session.refresh,refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
+    if(updated.refreshStage)await refreshCompleted(id,updated);render();schedule();
   }
   async function start(method,inputs={}){
     if(pending||!context)return;const current={...context},existing=sessions.get(current.backend+':'+(current.provider||''));if(existing&&!terminal.has(existing.state))return;
