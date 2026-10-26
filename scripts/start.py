@@ -34,6 +34,25 @@ def live_session():
 
 session = live_session()
 if not session:
+    # 两个启动入口同时探测会各自 spawn 一个服务；用非阻塞文件锁串行化启动。
+    import fcntl
+    launch_lock = (state / "launcher.lock").open("a+")
+    try:
+        fcntl.flock(launch_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        # 另一个启动器正在拉起服务：等它写出会话即可，不再重复 spawn。
+        launch_lock.close()
+        for attempt in range(200):
+            time.sleep(0.2)
+            session = live_session()
+            if session:
+                break
+        if not session:
+            raise SystemExit("Another launcher is starting the runtime; it did not become ready. See " + str(state / "server.log"))
+        print(session["url"])
+        if "--no-open" not in sys.argv:
+            webbrowser.open(session["url"])
+        raise SystemExit(0)
     log_path = state / "server.log"
     with log_path.open("ab") as log:
         log_path.chmod(0o600)
@@ -45,6 +64,7 @@ if not session:
         session = live_session()
         if session:
             break
+    launch_lock.close()
     if not session:
         raise SystemExit("Runtime did not start. See " + str(log_path))
 print(session["url"])

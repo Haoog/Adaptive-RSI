@@ -42,8 +42,8 @@ def pr_body(task, run, outcome):
     return "\n".join(lines) + "\n"
 
 
-def github_git(root, *args):
-    return git(root, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args)
+def github_git(root, *args, timeout=60):
+    return git(root, "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args, timeout=timeout)
 
 
 def baseline(runtime, project, config):
@@ -60,7 +60,7 @@ def baseline(runtime, project, config):
         if not cache.exists():
             checked(["git", "init", "--bare", "--quiet", str(cache)])
         github_git(cache, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
-            "+refs/heads/" + branch + ":refs/heads/rsi-baseline")
+            "+refs/heads/" + branch + ":refs/heads/rsi-baseline", timeout=180)
         sha = git(cache, "rev-parse", "refs/heads/rsi-baseline")
         runtime.store.put_setting("baseline:" + project["id"], {"sha": sha, "branch": branch})
         return str(cache), sha, branch

@@ -157,3 +157,6 @@
 @media(max-width:700px){.mc-setup-steps{grid-template-columns:1fr;gap:5px;margin-top:14px}.mc-setup-steps li{padding:8px 10px}}
 @media(max-width:700px){.mc-auth-code strong{font-size:20px}.mc-auth input,.mc-auth select{font-size:16px}#release-settings .task-actions{align-items:stretch;flex-direction:column}.release-status-row{overflow-wrap:anywhere}}
 .mc-route-picker{position:relative;display:grid;gap:5px;text-align:left;padding:12px 36px 12px 14px;background:#fff;border:1px solid #d8dfd5;border-radius:10px;cursor:pointer}.mc-route-picker:hover,.mc-route-picker:focus-visible{border-color:#235e48;outline:2px solid #e2eee7}.mc-route-picker strong,.mc-route-picker small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mc-route-picker small{color:#74816f;font-size:12px}.mc-picker-arrow{position:absolute;right:14px;top:18px}.mc-route-proof{margin-top:10px}
+
+/* 订阅与路由的入门引导 */
+.mc-route-guide{margin:0 0 18px;padding:12px 16px;border-left:3px solid var(--green);background:var(--mc-soft);border-radius:6px;color:var(--mc-muted);font-size:13px;line-height:1.7}

@@ -570,6 +570,7 @@ def prepare_home(home, model=None, read_only=True, container=False, capabilities
 
 def parse_events(text, strict=True):
     final, usage, seen, errors = [], [], set(), []
+    token_shapes = set()
     for line in text.splitlines():
         try:
             event = json.loads(line)
@@ -582,24 +583,34 @@ def parse_events(text, strict=True):
             errors.append("OpenCode reported an execution error")
         if event.get("type") == "text" and isinstance(part.get("text"), str):
             final.append(part["text"])
-        if event.get("type") == "step_finish" and part.get("id") not in seen:
-            if part.get("id"):
-                seen.add(part["id"])
-            if isinstance(part.get("tokens"), dict):
-                usage.append(part["tokens"])
+        if event.get("type") == "step_finish" and isinstance(part.get("tokens"), dict):
+            part_id = part.get("id")
+            if part_id:
+                if part_id in seen:
+                    continue
+                seen.add(part_id)
+            else:
+                # 缺少 id 的事件按 tokens 内容判重，同一步骤的重复事件不重复累计用量。
+                shape = json.dumps(part["tokens"], sort_keys=True)
+                if shape in token_shapes:
+                    continue
+                token_shapes.add(shape)
+            usage.append(part["tokens"])
     if errors:
         if strict:
             raise RuntimeError(errors[-1])
         return None, usage
-    for text in reversed(final):
-        text = text.strip()
+    # 契约要求最终消息就是 JSON：只解析最后一段文本，
+    # 避免把中间步骤恰好合法的 JSON 当作最终结果采纳。
+    if final:
+        text = final[-1].strip()
         if text.startswith("```"):
             # 语言标签大小写不敏感，避免 ```JSON 围栏导致解析失败。
             text = re.sub(r"^```(?i:json)?\s*|\s*```$", "", text)
         try:
             return json.loads(text), usage
         except ValueError:
-            continue
+            pass
     if strict:
         raise RuntimeError("OpenCode did not return valid structured output")
     return None, usage
@@ -619,6 +630,11 @@ def check_provider_errors(text):
             continue
         data = error.get("data", {})
         status = data.get("statusCode") if isinstance(data, dict) else None
+        # 网关可能把状态码序列化为字符串；统一转成整数再比较。
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
         if status in [404, 429, 502, 503, 504]:
             raise ProviderUnavailable("OpenCode model API HTTP " + str(status))
         if status in [401, 403] or error.get("name") == "ProviderAuthError":
@@ -761,7 +777,12 @@ class OpenCodeAgent:
                     for secret in secrets:
                         if secret:
                             summary = summary.replace(secret, "[REDACTED]")
-                    raise RuntimeError("OpenCode call failed" + (": " + summary if summary else "; see the redacted execution record"))
+                    error = RuntimeError("OpenCode call failed" + (": " + summary if summary else "; see the redacted execution record"))
+                    if any(word in summary.lower() for word in
+                           ["timed out", "timeout", "rate limit", "429", "503", "connection"]):
+                        # CLI 自身的瞬时故障在 raise 侧已知成因，携带结构化码优先于文本分类。
+                        error.failure_code = "provider"
+                    raise error
                 if data is None:
                     raise RuntimeError("OpenCode did not return valid structured output; see the redacted execution record")
                 validate_output(data, SCHEMAS[role])

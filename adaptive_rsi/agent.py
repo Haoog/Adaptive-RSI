@@ -124,7 +124,11 @@ def workspace_signature(workspace, max_bytes):
             digest.update(b"missing\0")
             continue
         resolved = path.resolve()
-        resolved.relative_to(root)
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            # 父目录符号链接指向快照之外：按可比较性错误处理，不让未分类 ValueError 替换原始异常。
+            raise RuntimeError("Workspace contains a symlink escaping the snapshot: " + name) from None
         if not resolved.is_file():
             continue
         digest.update(str(resolved.stat().st_mode & 0o777).encode())

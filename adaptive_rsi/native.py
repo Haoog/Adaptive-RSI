@@ -249,7 +249,7 @@ class Conversation:
         self.history.append(content)  # Preserve opaque thoughtSignature fields verbatim.
         calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"],
                   parse_arguments(x["functionCall"]["name"], x["functionCall"].get("args", {})))
-                 for x in content["parts"] if "functionCall" in x]
+                 for i, x in enumerate(content["parts"]) if "functionCall" in x]
         return calls, int(response.get("usageMetadata", {}).get("totalTokenCount") or 0)
 
     def results(self, results):
@@ -282,7 +282,8 @@ class NativeAgent:
         began = time.monotonic()
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
         # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
-        timeout = 30 if role == "probe" else 300
+        # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
+        timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
         for turn in range(200):
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")

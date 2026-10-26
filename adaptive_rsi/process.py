@@ -120,6 +120,11 @@ def quote_sb(path):
     return json.dumps(str(Path(path).resolve()))
 
 
+def docker_mount_path(path):
+    """docker --mount 的选项以逗号分隔；路径中的逗号必须转义，否则挂载直接解析失败。"""
+    return str(path).replace(",", "\\,")
+
+
 def scrub_tree(root):
     """Never follow project symlinks into host files or evaluator data."""
     root = Path(root).resolve()
@@ -224,7 +229,7 @@ class Sandbox:
                     "--security-opt=no-new-privileges", "--pids-limit=" + str(limits["pids"]),
                     "--memory=" + str(limits["memory_mb"]) + "m", "--cpus=" + str(limits["cpus"]),
                     "--user=" + str(os.getuid()) + ":" + str(os.getgid()),
-                    "--mount", "type=bind,src=" + str(workspace) + ",dst=/workspace",
+                    "--mount", "type=bind,src=" + docker_mount_path(workspace) + ",dst=/workspace",
                     "--tmpfs", "/tmp:rw,nosuid,size=256m", "--env", "HOME=/tmp",
                     "-w", "/workspace/" + cwd]
             import uuid
@@ -232,7 +237,7 @@ class Sandbox:
             for item in protected:
                 item = Path(item).resolve()
                 relative = item.relative_to(workspace).as_posix()
-                command += ["--mount", "type=bind,src=" + str(item) + ",dst=/workspace/" + relative + ",readonly"]
+                command += ["--mount", "type=bind,src=" + docker_mount_path(item) + ",dst=/workspace/" + docker_mount_path(relative) + ",readonly"]
             return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",

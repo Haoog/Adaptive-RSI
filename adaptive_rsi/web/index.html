@@ -38,6 +38,7 @@
  <section id="view-settings" class="view" hidden><div class="page-heading"><div><h1>运行设置</h1><p>调整工作频率、模型角色和交付方式。保存后生效。</p></div></div><select id="config-scope" hidden><option value="project">当前项目</option><option value="global">通用默认</option></select>
   <section id="view-models" class="model-center">
     <div class="page-heading"><div><h2>模型服务与分工</h2><p>连接你的模型，再安排它们的工作。</p></div><div class="mc-top-tools"><label hidden>应用范围<select id="mc-scope" aria-label="模型配置作用范围"><option value="global">全局默认</option><option value="project">此项目单独设置</option></select></label><button id="mc-add-provider" class="button primary" type="button">＋ 添加模型服务</button></div></div>
+    <p class="mc-route-guide">不知道从哪开始？订阅了 ChatGPT → 选 Codex 登录；订阅了 OpenCode → 选 OpenCode 并登录你的账号；只有 API 密钥或中转站 → 添加模型服务填地址和密钥；只想用本机模型 → 选 Ollama。订阅和 API 密钥是两套账本，互不通用。</p>
     <div class="mc-tabs" role="tablist" aria-label="模型中心页面"><button id="mc-providers-tab" type="button" role="tab" class="mc-tab" aria-controls="mc-providers-panel" aria-selected="false" data-mc-tab="providers">连接与模型</button><button id="mc-roles-tab" type="button" role="tab" class="mc-tab" aria-controls="mc-roles-panel" aria-selected="true" data-mc-tab="roles">工作分工</button></div>
     <p id="mc-scope-note" class="mc-scope-note"></p>
     <section hidden id="mc-providers-panel" role="tabpanel" aria-labelledby="mc-providers-tab"><div class="mc-layout"><div id="mc-provider-list" class="mc-provider-list" aria-label="模型服务列表"></div><div class="mc-provider-detail">

@@ -5,11 +5,11 @@ from pathlib import Path
 from .process import checked, scrub_tree
 
 
-def git(root, *args):
+def git(root, *args, timeout=60):
     environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                    "GIT_TERMINAL_PROMPT": "0"}
     return checked(["git", "-c", "core.hooksPath=" + os.devnull, "-c", "core.fsmonitor=false",
-                    "-C", str(root)] + list(args), env=environment)
+                    "-C", str(root)] + list(args), env=environment, timeout=timeout)
 
 
 def repository(path):

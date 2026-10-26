@@ -18,11 +18,20 @@ QUOTA_EXHAUSTED = ("budget exhausted", "budget insufficient", "insufficient budg
                    "credit balance", "resource_exhausted")
 
 
+# 结构化故障码对应的处理动作；raise 侧已知故障成因时优先携带，不再依赖消息文本猜测。
+FAILURE_ACTIONS = {"provider": "retry_later", "budget": "wait_or_adjust_budget",
+                   "credentials": "check_model_settings", "environment": "check_environment",
+                   "baseline": "retry_new_baseline", "execution": "inspect_details"}
+
+
 def failure(exc):
     text = str(exc)
     lower = text.lower()
-    if isinstance(exc, BudgetExhausted) or any(s in lower for s in QUOTA_EXHAUSTED):
+    structured = getattr(exc, "failure_code", None)
+    if isinstance(exc, BudgetExhausted) or structured == "budget" or any(s in lower for s in QUOTA_EXHAUSTED):
         code, action = "budget", "wait_or_adjust_budget"
+    elif structured in FAILURE_ACTIONS:
+        code, action = structured, FAILURE_ACTIONS[structured]
     elif any(s in lower for s in ["credential", "api key", "environment variable", "unauthorized", "401"]):
         code, action = "credentials", "check_model_settings"
     elif "opencode_incompatible" in lower or "opencode command compatibility" in lower:

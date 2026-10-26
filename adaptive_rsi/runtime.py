@@ -479,7 +479,9 @@ class Runtime:
                 self.store.execute("UPDATE projects SET paused=1")
             self.updates.restore_startup()
             self.store.recover()
-            self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE source='system_publish' AND state='interrupted'")
+            # 重启恢复把未结束 run 置为 interrupted；这些任务是被进程中断而非自身失败，
+            # 重新排队等待执行（尝试计数保留，poison 任务仍受重试上限约束）。
+            self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE state='interrupted'", (time.time(),))
             self.thread = threading.Thread(target=self.loop, name="rsi-scheduler", daemon=True)
             self.thread.start()
         except BaseException:
@@ -497,6 +499,8 @@ class Runtime:
         self.pool.shutdown(wait=True)
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
             self.maintenance_thread.join(timeout=10)
+        # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
+        self.store.close()
         if self.lockfile:
             self.lockfile.close()
 
@@ -670,8 +674,10 @@ class Runtime:
                         config = self.config(project["id"])
                         hour = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).hour
                         start, end = config["schedule"]["working_hours"]
+                        # 额度退避到期即恢复排队：是否执行由工作时段统一决定，
+                        # 不能让退避结束的任务再等到下一个时段窗口才回到队列。
+                        self.resume_budget(project["id"], config)
                         if start <= hour < end:
-                            self.resume_budget(project["id"], config)
                             self.schedule(project["id"], config)
                             eligible.append((project, config))
                 self.dispatch(eligible)

@@ -55,6 +55,8 @@ def download(url, limit, progress=None):
         length = headers.get("Content-Length") if headers else None
         total = int(length) if length and length.isdigit() and int(length) <= limit else None
         data = bytearray()
+        # 慢速滴注的发布服务器不能无限占用更新线程；总预算 15 分钟。
+        deadline = time.monotonic() + 900
         while True:
             chunk = response.read(65536)
             if not chunk:
@@ -62,6 +64,8 @@ def download(url, limit, progress=None):
             data.extend(chunk)
             if len(data) > limit:
                 raise ValueError("Release asset exceeds size limit")
+            if time.monotonic() > deadline:
+                raise ValueError("Release download exceeded the total time budget")
             if progress and total:
                 progress(len(data), total)
     if progress and total:
@@ -617,6 +621,9 @@ def _supervise_restart(state):
             for suffix in ["-wal", "-shm"]:
                 Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
             os.replace(restore, state / "state.sqlite3")
+        # 先落回滚状态再启动旧服务：服务启动时会读取该状态决定是否允许工作，
+        # 若仍读到 restarting 会进入更新忙态拒绝写请求。
+        Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
         atomic_json(state / "restart-session.json", session)
         previous_child = subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(state), "serve", "--port", str(port), "--restart-session"],
                          cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
@@ -638,7 +645,6 @@ def _supervise_restart(state):
         if not previous_healthy:
             recovery_required(state, "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually")
             return
-        Store(state).put_setting("update-status", {"state": "rolled_back", "current": __version__, "checked": time.time(), "reason": "Startup failed before work was admitted; previous code and guarded database snapshot restored"})
         (state / "update-ready").write_text("ready")
     finally:
         if Store(state).setting("update-status", {}).get("state") in ["installed", "rolled_back"]:

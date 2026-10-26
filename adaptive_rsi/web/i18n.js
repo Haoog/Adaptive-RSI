@@ -1274,7 +1274,8 @@ const english = {
   "前置任务无法合并；等待已解除，任务需要人工复核后重试": "The dependency will not merge; the wait was released and the task needs manual review before retrying",
   "候选已超过保留期被清理，请重新生成后再发布。": "The candidate was cleaned up after the retention window; regenerate it before publishing.",
   "检查更新失败，请稍后重试。": "Update check failed; try again later.",
-  "操作未完成，请稍后重试。": "The request did not complete; try again later."
+  "操作未完成，请稍后重试。": "The request did not complete; try again later.",
+  "不知道从哪开始？订阅了 ChatGPT → 选 Codex 登录；订阅了 OpenCode → 选 OpenCode 并登录你的账号；只有 API 密钥或中转站 → 添加模型服务填地址和密钥；只想用本机模型 → 选 Ollama。订阅和 API 密钥是两套账本，互不通用。": "Not sure where to start? A ChatGPT subscription means signing in with Codex; an OpenCode subscription means choosing OpenCode and signing in; an API key or relay means adding a model service with its address and key; local-only means choosing Ollama. Subscriptions and API keys are separate accounts and cannot be used interchangeably."
 };
 let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }

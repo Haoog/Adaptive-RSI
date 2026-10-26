@@ -5,8 +5,15 @@
 ## Unreleased
 
 - Tasks judged obsolete by planning are no longer requeued by inspections (avoiding repeated paid planning every scan cycle); manual retry and requirement supplements remain available for obsolete tasks.
+- Tasks interrupted by a crash or restart are requeued automatically on startup (attempt counters are preserved, poison tasks still respect retry limits); budget-backoff tasks return to the queue as soon as their wait expires instead of waiting for the next working-hours window.
+- Failure classification now prefers structured codes raised at the failure site: OpenCode CLI's own transient failures carry a code instead of relying on message text, so "timeout/connection" words in tested project output no longer misclassify as provider faults.
+- OpenCode parsing only accepts the final message's structured output, so a valid JSON in an intermediate step is no longer adopted; step events without ids are deduplicated by content so usage is not double-counted; string status codes from gateways now trigger the circuit breaker.
+- Post-crash/update startup health checks are relaxed to 60 seconds; a rollback writes its state before starting the previous version and only reports ready after that service passes its health check (fixing the restored service refusing writes).
+- Update downloads have a 15-minute total budget; the launcher serializes double-starts with a file lock; delivery baseline fetches get a 180-second timeout.
+- Auth containers receive environment variables explicitly as KEY=VALUE; shutdown flows wait at most 10 seconds for stuck processes; docker mount paths containing commas are escaped (check and auth containers).
+- Native API implementation/review timeouts are relaxed to 900/600 seconds; model probe failures are no longer masked by catalog update errors; workspace comparison reports a diagnosable error for escaping symlinks; the runtime releases data-layer connections on close.
+- The model center gained a subscription-to-route onboarding note (ChatGPT/OpenCode subscription, API key, or local model).
 - A failed desktop update check no longer displays "up to date"; check errors are now distinct from "no update".
-- After an automatic-update rollback, the previous version must pass its startup health check before the system reports ready; startup waits for the new candidate and the rollback are unified at 60 seconds so large state directories are no longer misjudged.
 - The English anti-flash bootstrap now has a 3-second safety net, so a broken translation script can no longer leave the page blank forever.
 - Sandbox snapshots exclude `.rsi-tmp`, so setup leftovers no longer pollute candidate patches; publishing retries use `checkout -B` so an existing branch no longer fails.
 - Authentication token comparison treats non-ASCII input as a mismatch instead of raising and resetting the connection; CSP now includes `form-action 'self'`.

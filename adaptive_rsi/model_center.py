@@ -300,20 +300,24 @@ class ModelCenter:
             return {"verified": model["verified"], "calls": self.store.query("SELECT state,tokens,seconds FROM calls WHERE run=?", (run,))}
         except Exception as exc:
             code = "default_effort_required" if "requires effort=default" in str(exc) else error_code(exc)
-            with self.runtime.dispatch_lock, self.lock:
-                if self.signature(self.provider(provider_id, project)) == signature:
-                    self.edit_model(provider_id, {"id": model_id}, project)
-                    directory = self.directory(provider, project)
-                    model = next(m for m in directory["models"] if m["id"] == model_id)
-                    proof = {"at": time.time(), "effort": effort, "state": "fail", "code": code}
-                    if code in ["budget_exhausted", "provider_paused", "missing_key", "keychain_locked", "keychain_unavailable", "keychain_failed", "default_effort_required"]:
-                        model["last_attempt"] = proof
-                    else:
-                        model.pop("last_attempt", None)
-                        model.setdefault("probes", {})[effort] = proof
-                        if model.get("verified", {}).get("effort") == effort:
-                            model.pop("verified", None)
-                    self.store.put_setting(self.key(provider, project), directory)
+            try:
+                with self.runtime.dispatch_lock, self.lock:
+                    if self.signature(self.provider(provider_id, project)) == signature:
+                        self.edit_model(provider_id, {"id": model_id}, project)
+                        directory = self.directory(provider, project)
+                        model = next(m for m in directory["models"] if m["id"] == model_id)
+                        proof = {"at": time.time(), "effort": effort, "state": "fail", "code": code}
+                        if code in ["budget_exhausted", "provider_paused", "missing_key", "keychain_locked", "keychain_unavailable", "keychain_failed", "default_effort_required"]:
+                            model["last_attempt"] = proof
+                        else:
+                            model.pop("last_attempt", None)
+                            model.setdefault("probes", {})[effort] = proof
+                            if model.get("verified", {}).get("effort") == effort:
+                                model.pop("verified", None)
+                        self.store.put_setting(self.key(provider, project), directory)
+            except Exception:
+                # 失败记录写入不成功时，绝不用目录更新错误掩盖原始探测错误。
+                pass
             raise CenterError(code) from None
         finally:
             with self.runtime.dispatch_lock:
