@@ -38,6 +38,8 @@ Task details load the latest run first and fetch historical runs on expansion. C
 
 The **Attention inbox** covers every project. System notifications require opt-in and fire on new states or reasons. Unchanged polling stays quiet. Denied notification permission does not remove inbox items, and viewing a notification does not resolve work. Browser notifications navigate to tasks. When the desktop notification service reports a click, the window opens the corresponding task. Notifications from a previously connected runtime cannot navigate into another runtime. Web Push while the page or desktop client is closed is not provided.
 
+Usage list searches update after typing stops. Earlier responses cannot cancel new searches or replace later results; switching projects or leaving the page invalidates old requests.
+
 **Records and usage → Workflow quality and timing** reports logical tasks created in the last 30 days: first pass, acceptance, merges, infrastructure failures, repeated failures, revisions and reused stages. Accumulated phase durations include parallel runs and are not total elapsed time. Unknown usage remains explicit rather than becoming zero. These metrics do not establish model capability improvements.
 
 Metrics also report average time to PR and merge with sample counts, repeated failure signatures, user interventions, tokens per accepted/delivered task, invalidation reasons and recorded CI/review waits. Missing historical wait durations are not fabricated. Preparation, model calls, checks and review are recorded separately.
