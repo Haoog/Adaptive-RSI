@@ -32,9 +32,9 @@ def backup(store):
 
 
 def _create_directories(destination):
-    """Create missing directories one level at a time and own only the ones this process created."""
+    """Create ancestors incrementally, then atomically claim the destination itself."""
     missing = []
-    current = destination
+    current = destination.parent
     while not current.exists():
         missing.append(current)
         if current.parent == current:
@@ -44,14 +44,18 @@ def _create_directories(destination):
     try:
         for path in reversed(missing):
             try:
-                path.mkdir(mode=0o700 if path == destination else 0o777)
+                path.mkdir(mode=0o777)
             except FileExistsError:
-                if path == destination:
-                    raise ValueError(
-                        "Restore requires a new state directory; existing state is never overwritten") from None
                 # Another process won the race for an ancestor; reuse it but never claim ownership.
                 continue
             created.append(path)
+        try:
+            # exist_ok=False rejects a concurrently created directory or symlink without following it.
+            destination.mkdir(mode=0o700)
+        except FileExistsError:
+            raise ValueError(
+                "Restore requires a new state directory; existing state is never overwritten") from None
+        created.append(destination)
     except BaseException:
         _discard_incomplete_restore(destination, list(reversed(created)))
         raise
@@ -80,15 +84,19 @@ def _discard_incomplete_restore(destination, created):
 
 def restore(source, destination):
     source = Path(source).expanduser().resolve()
-    destination = Path(destination).expanduser().resolve()
-    if destination.exists():
+    destination = Path(destination).expanduser()
+    if destination.is_symlink() or destination.exists():
         raise ValueError("Restore requires a new state directory; existing state is never overwritten")
+    # Normalize existing ancestors only; the final component must be claimed without following links.
+    destination = destination.parent.resolve() / destination.name
     with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         for table in ["projects", "tasks", "runs", "settings"]:
             db.execute("SELECT * FROM " + table + " LIMIT 0")
         created = _create_directories(destination)
+        if destination not in created:  # Never write into a directory this process did not exclusively create.
+            raise ValueError("Restore requires a new state directory; existing state is never overwritten")
         try:
             target = destination / "state.sqlite3"
             with sqlite3.connect(str(target)) as out:

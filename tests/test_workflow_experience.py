@@ -1237,6 +1237,58 @@ class RestoreRetryTest(unittest.TestCase):
         self.assertTrue((destination / "state.sqlite3").is_file())
         self.assertTrue(concurrent.is_dir())
 
+    def inject_after_exists_check(self, destination, create):
+        from adaptive_rsi.storage_tools import restore
+        real_connect = sqlite3.connect
+        injected = []
+
+        def connect(path, *args, **kwargs):
+            connection = real_connect(path, *args, **kwargs)
+            if not injected and str(path).startswith("file:"):
+                injected.append(True)
+                create()  # Another process claims the destination after the exists check.
+            return connection
+
+        with patch("adaptive_rsi.storage_tools.sqlite3.connect", side_effect=connect):
+            with self.assertRaisesRegex(ValueError, "new state directory"):
+                restore(self.backup, destination)
+        self.assertEqual(injected, [True])
+
+    def assert_sentinel(self, path):
+        with closing(sqlite3.connect(str(path))) as db:
+            self.assertEqual(db.execute("SELECT value FROM sentinel").fetchone()[0], "keep")
+
+    def write_sentinel(self, path):
+        with closing(sqlite3.connect(str(path))) as db:
+            db.execute("CREATE TABLE sentinel(value TEXT)")
+            db.execute("INSERT INTO sentinel VALUES ('keep')")
+            db.commit()
+
+    def test_restore_rejects_destination_created_after_the_exists_check(self):
+        destination = self.root / "raced-state"
+
+        def create():
+            destination.mkdir()
+            self.write_sentinel(destination / "state.sqlite3")
+
+        self.inject_after_exists_check(destination, create)
+        self.assert_sentinel(destination / "state.sqlite3")
+        self.assertEqual([path.name for path in destination.iterdir()], ["state.sqlite3"])
+
+    def test_restore_rejects_destination_symlinked_after_the_exists_check(self):
+        target = (self.root / "existing-state").resolve()
+        target.mkdir()
+        sentinel = target / "state.sqlite3"
+        self.write_sentinel(sentinel)
+        destination = self.root / "raced-link"
+
+        self.inject_after_exists_check(
+            destination, lambda: destination.symlink_to(target, target_is_directory=True))
+
+        self.assertTrue(destination.is_symlink())
+        self.assert_sentinel(sentinel)
+        self.assertEqual([path.name for path in target.iterdir()], ["state.sqlite3"])
+
     def test_symlinked_destination_is_rejected_without_touching_its_target(self):
         from adaptive_rsi.storage_tools import restore
         target = self.root / "existing-state"
