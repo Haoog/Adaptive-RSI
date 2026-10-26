@@ -8,6 +8,10 @@
 - Stale PR replanning persists supersession and close intent before remote cleanup, allowing failed closes to reconcile. Old tracking cannot mark tasks closed after a new round begins.
 - Issue source text and local requirement supplements are stored separately and recomposed for task input on synchronization, preserving repeated supplements and recoverable legacy revisions so saved requirements reach planning.
 
+## 0.5.113
+
+<!-- adaptive-rsi-release:0.5.113;base:87ebf190302c60b062f7db308a3f1f4a4bd0e9b1 -->
+
 - Restoring a database disconnects source-state artifact paths and local verification caches while preserving history and remote delivery receipts. Artifact downloads and post-merge verification stay inside the current state directory, and missing required artifacts produce insufficient evidence.
 - Each project retains the original text, digest and request ID for up to 32 unconfirmed goals in the browser session. The form can restore their text for explicit retries, preventing duplicate tasks after text changes or reloads. Success clears only its matching record and frees capacity; invalid records block sending with a dedicated error.
 - Queue settings block overlapping saves so older requests cannot overwrite newer dependency or urgency choices, while retaining edits made after submission.
