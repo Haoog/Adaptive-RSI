@@ -525,6 +525,100 @@ class IssueRequirementsTest(unittest.TestCase):
         self.assertEqual(self.task(), before)
         self.assertEqual(json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?", (self.task_id,))["data"]), {"reason": "held"})
 
+    def test_oversized_pending_keeps_snapshot_and_fetches_remote_recovery(self):
+        self.runtime.revise_task(self.task_id, "local")
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.update("x" * 30000)
+        key = "issue-sync:" + self.project_id
+        held = self.store.setting(key)["pending"]["7"]
+        self.store.transition(run["id"], "failed", {"reason": "fixture worker ended"}, True)
+        before = self.task()
+        unrelated = DiscoveryHardeningTest.issue(number=8)
+        fetched = []
+
+        def remote(*args, **kwargs):
+            fetched.append(args)
+            return encode([unrelated])
+
+        # Repeated pending failures must not prevent another Issue from syncing.
+        for _ in range(3):
+            sync(self.runtime, self.project, self.config, remote)
+            self.assertEqual(self.task(), before)
+            self.assertEqual(self.store.setting(key)["pending"]["7"], held)
+        self.assertEqual(len(fetched), 3)
+        self.assertIsNotNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='issue:owner/project:8'"))
+        self.issue.update(body="shortened remote", updated_at="remote corrected")
+        self.synchronize()
+        self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "shortened remote\n\nlocal"))
+        self.assertEqual(self.store.setting(key)["pending"], {})
+        self.synchronize()
+        self.assertEqual(self.task()["body"], "shortened remote\n\nlocal")
+
+    def test_legacy_migration_reassesses_only_actual_input_changes(self):
+        from adaptive_rsi.config import fingerprint
+        original = self.task()
+        for change in ["representation", "lost_supplement", "previous_input", "policy"]:
+            with self.subTest(change=change):
+                self.store.execute("DELETE FROM task_revisions")
+                body = original["body"] if change == "lost_supplement" else original["body"] + "\n\nlocal"
+                # Legacy metadata and additional evidence must survive migration.
+                evidence = encode([{**json.loads(original["evidence"])[0], "legacy_metadata": "retain"},
+                                   {"path": "calculator.py", "quote": "return a - b"}])
+                self.store.execute("UPDATE tasks SET body=?,evidence=? WHERE id=?", (body, evidence, self.task_id))
+                self.store.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                                   (self.task_id, original["body"], "local"))
+                decision = {"reason": "Explicit planner deferral", "base": "fixed-baseline", "extra": {"retain": True},
+                            "triage_input": fingerprint({"body": body, "evidence": evidence,
+                                                         "policy": self.config["triage"]["policy"]})}
+                self.store.defer(self.task_id, decision)
+                self.runtime.reassess_deferred(self.project_id, self.config, "fixed-baseline")
+                self.assertEqual(self.task()["state"], "deferred")
+                if change == "previous_input":
+                    decision["triage_input"] = "earlier-input"
+                    self.store.execute("UPDATE task_decisions SET data=? WHERE task=?", (encode(decision), self.task_id))
+                elif change == "policy":
+                    self.config["triage"]["policy"] += " updated"
+                before_decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+                self.synchronize()
+                migrated = self.task()
+                self.assertEqual(migrated["body"], original["body"] + "\n\nlocal")
+                migrated_evidence = json.loads(migrated["evidence"])
+                migrated_evidence[0].pop("requirements")
+                self.assertEqual(migrated_evidence, json.loads(evidence))
+                after_decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+                if change == "representation":
+                    expected = {**decision, "triage_input": fingerprint({"body": body, "evidence": migrated["evidence"],
+                                                                         "policy": self.config["triage"]["policy"]})}
+                    self.assertEqual(after_decision, {**before_decision, "data": encode(expected)})
+                else:
+                    self.assertEqual(after_decision, before_decision)
+                self.synchronize()
+                self.assertEqual(self.task(), migrated)
+                self.runtime.reassess_deferred(self.project_id, self.config, "fixed-baseline")
+                self.assertEqual(self.task()["state"], "deferred" if change == "representation" else "queued")
+
+    def test_legacy_decision_migration_rolls_back_with_task_write(self):
+        from adaptive_rsi.config import fingerprint
+        original = self.task()
+        body = original["body"] + "\n\nlocal"
+        self.store.execute("UPDATE tasks SET body=? WHERE id=?", (body, self.task_id))
+        self.store.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,0)",
+                           (self.task_id, original["body"], "local"))
+        self.store.defer(self.task_id, {"base": "fixed-baseline", "reason": "held", "triage_input": fingerprint({
+            "body": body, "evidence": original["evidence"], "policy": self.config["triage"]["policy"]})})
+        before = self.task()
+        decision = self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,))
+        self.store.execute("CREATE TRIGGER reject_migration BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected migration failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Injected migration failure"):
+                self.synchronize()
+        finally:
+            self.store.execute("DROP TRIGGER reject_migration")
+        self.assertEqual(self.task(), before)
+        self.assertEqual(self.store.one("SELECT * FROM task_decisions WHERE task=?", (self.task_id,)), decision)
+
     def test_oversized_remote_composition_rolls_back_without_losing_local(self):
         self.runtime.revise_task(self.task_id, "local")
         before = self.task()

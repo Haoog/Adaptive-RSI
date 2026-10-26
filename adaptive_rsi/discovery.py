@@ -274,12 +274,16 @@ def issue_requirements(db, task):
     return {"upstream_body": upstream, "local_supplements": [row["supplement"] for row in revisions]}
 
 
+class IssueRequirementsTooLong(ValueError):
+    """A snapshot cannot be composed without dropping requirements."""
+
+
 def issue_requirements_body(requirements):
     body = "\n\n".join([requirements["upstream_body"], *requirements["local_supplements"]])
     if len(body) > 30000:
-        # Leave the previous snapshot and sync cursor intact rather than truncate
-        # either upstream requirements or user additions.
-        raise ValueError("Combined requirements exceed 30000 characters")
+        # Leave the previous task snapshot intact rather than truncate either
+        # upstream requirements or user additions.
+        raise IssueRequirementsTooLong("Combined requirements exceed 30000 characters")
     return body
 
 
@@ -421,10 +425,24 @@ def sync(runtime, project, config, checked, cancel=None):
                   requirements["local_supplements"] and
                   (not previous or not previous[0].get("requirements") or
                    issue_requirements_body(requirements) != existing["body"])):
-                # Repair an already lost legacy supplement without waking a held
-                # task or pretending that the source Issue changed.
+                # Preserve source metadata during this representation migration.
+                # A repaired body remains a real input change for reassessment.
+                body = issue_requirements_body(requirements)
+                evidence = [dict(previous[0]), *previous[1:]]
+                evidence[0]["requirements"] = requirements
+                encoded_evidence = encode(evidence)
+                if body == existing["body"]:
+                    decision = db.execute("SELECT data FROM task_decisions WHERE task=?", (existing["id"],)).fetchone()
+                    if decision:
+                        prior = json.loads(decision["data"])
+                        old_signature = fingerprint({"body": body, "evidence": existing["evidence"],
+                                                     "policy": config["triage"]["policy"]})
+                        if prior.get("triage_input") == old_signature:
+                            prior["triage_input"] = fingerprint({"body": body, "evidence": encoded_evidence,
+                                                                 "policy": config["triage"]["policy"]})
+                            db.execute("UPDATE task_decisions SET data=? WHERE task=?", (encode(prior), existing["id"]))
                 db.execute("UPDATE tasks SET body=?,evidence=? WHERE id=?",
-                           (issue_requirements_body(requirements), encode(evidence), existing["id"]))
+                           (body, encoded_evidence, existing["id"]))
             elif revised:
                 # Keep active runs' evidence immutable. The new revision remains visible for next sync.
                 pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
@@ -436,7 +454,12 @@ def sync(runtime, project, config, checked, cancel=None):
         consumed += 1
 
     for issue in list(pending.values()):
-        apply(issue)
+        try:
+            apply(issue)
+        except IssueRequirementsTooLong:
+            # Keep the sealed task and pending snapshot, but still fetch remote
+            # updates: a newer, shorter revision can replace this held snapshot.
+            pending[str(int(issue["number"]))] = issue
     # API 按页读取并持久化游标，不限制可同步的 Issue 总数。
     size = 100
     started = time.monotonic()
