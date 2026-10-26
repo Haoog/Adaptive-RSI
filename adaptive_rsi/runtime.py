@@ -273,7 +273,15 @@ class Runtime:
             self.project(project)
             if not paused:
                 self.config(project)
-            self.store.execute("UPDATE projects SET paused=? WHERE id=?", (bool(paused), project))
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE projects SET paused=? WHERE id=?", (bool(paused), project))
+                if paused:
+                    # 停止信号属于本次运行；恢复项目不能撤销，重启后也必须保留。
+                    # 不改任务状态，让 worker 仍按 interrupted 收尾，显式取消另行处理。
+                    db.execute("INSERT OR IGNORE INTO settings(key,value) "
+                               "SELECT 'run-stop:' || id,'true' FROM runs WHERE project=? AND ended IS NULL",
+                               (project,))
         self.store.event("paused" if paused else "resumed", "Project paused" if paused else "Project enabled", project)
         self.wake.set()
 
@@ -503,6 +511,8 @@ class Runtime:
                 self.store.execute("UPDATE projects SET paused=1")
             self.updates.restore_startup()
             self.store.recover()
+            self.store.execute("DELETE FROM settings WHERE key IN "
+                               "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
             # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
             self.store.execute("UPDATE tasks SET state='queued',available=0,updated=? "
                                "WHERE source='system_publish' AND state='interrupted'", (time.time(),))
@@ -716,8 +726,26 @@ class Runtime:
             self.wake.clear()
 
     def dispatch(self, eligible):
+        # 配置刷新、资格复核、选择与领取共用保存/暂停的锁，避免成功保存后仍封存旧配置。
+        with self.dispatch_lock:
+            if self.import_in_progress or self.updates.is_busy():
+                return
+            refreshed = []
+            for project, _ in eligible:
+                with self.scheduler_scope("dispatch_project", project["id"]):
+                    current = self.project(project["id"])
+                    if current["paused"]:
+                        continue
+                    config = self.config(current["id"])
+                    hour = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).hour
+                    start, end = config["schedule"]["working_hours"]
+                    if start <= hour < end:
+                        refreshed.append((current, config))
+            self._dispatch(refreshed)
+
+    def _dispatch(self, eligible):
         # 持久化虚拟服务量：权重越高增长越慢，等待项目可持续获得执行机会。
-        # 并发上限在本次 dispatch 内固定读取一次，避免每轮循环都重读配置（数据库查询+全量校验）。
+        # 调用方持有 dispatch_lock；全局并发与项目权重在本轮内保持一致。
         concurrency = self.config()["limits"]["concurrency"]
         while len(self.futures) < concurrency:
             ready = []
@@ -769,9 +797,11 @@ class Runtime:
         return result
 
     def is_cancelled(self, run):
-        row = self.store.one("SELECT t.state,p.paused FROM runs r JOIN tasks t ON r.task=t.id "
+        row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
+                             "WHERE s.key='run-stop:' || r.id) AS stop_requested "
+                             "FROM runs r JOIN tasks t ON r.task=t.id "
                              "JOIN projects p ON p.id=r.project WHERE r.id=?", (run["id"],))
-        return self.stop.is_set() or not row or row["paused"] or row["state"] == "cancelled"
+        return self.stop.is_set() or not row or row["paused"] or row["stop_requested"] or row["state"] == "cancelled"
 
     def active_strategies(self, project, config=None):
         # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
@@ -993,6 +1023,10 @@ class Runtime:
             self.store.transition(run["id"], state, {"reason": str(exc), "failure": problem}, True,
                                   task_fields=task_fields or None)
         finally:
+            # 只清理已收尾的停止请求；异常或进程退出留下的未完成请求由恢复流程处理。
+            self.store.execute("DELETE FROM settings WHERE key=? AND EXISTS "
+                               "(SELECT 1 FROM runs WHERE id=? AND ended IS NOT NULL)",
+                               ("run-stop:" + run["id"], run["id"]))
             self.wake.set()
 
     def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False):

@@ -52,6 +52,102 @@ class RuntimeSafetyTest(unittest.TestCase):
         return (self.runtime.project(self.project), self.store.one("SELECT * FROM tasks WHERE id=?", (task,)),
                 self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],)), workspace, job)
 
+    def test_pause_resume_interrupts_inflight_invoke_and_preserves_cancel_retry(self):
+        provider = {"id": "fixture_api", "name": "Fixture", "base_url": "https://example.invalid/v1",
+                    "protocol": "chat_completions", "env_key": "", "credential": "none"}
+        self.runtime.agent = CodexAgent(self.store)
+        self.runtime.configure({"providers": [provider], "models": {"implementation": {
+            "provider": "fixture_api", "model": "fixture-model", "effort": "default"}}}, self.project)
+        response = {"choices": [{"message": {"tool_calls": [{"id": "finish-1", "type": "function",
+                    "function": {"name": "finish", "arguments": json.dumps({"summary": "fixture"})}}]}}]}
+        for explicit_cancel in [False, True]:
+            with self.subTest(explicit_cancel=explicit_cancel):
+                task = self.runtime.goal(self.project, "Pause active worker " + str(explicit_cancel))
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertEqual(run["task"], task)
+
+                def pause_before_response(*args, **kwargs):
+                    self.runtime.pause(self.project, True)
+                    self.runtime.pause(self.project, False)
+                    self.assertTrue(self.runtime.is_cancelled(run))
+                    self.assertIsNone(self.store.one("SELECT ended FROM runs WHERE id=?", (run["id"],))["ended"])
+                    self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "planning")
+                    if explicit_cancel:
+                        self.runtime.cancel_task(task)
+                    for operation in [lambda: self.runtime.retry(task),
+                                      lambda: self.runtime.revise_task(task, "New criterion")]:
+                        with self.assertRaisesRegex(ValueError, "Wait for the active run to finish stopping"):
+                            operation()
+                    self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+                    return response
+
+                def invoke_candidate(run, project, task, source, base, directory, workspace, strategies):
+                    self.runtime.invoke("implementation", "fixture", workspace, run)
+                    self.fail("Paused worker accepted the in-flight response")
+
+                base = git(self.repo, "rev-parse", "HEAD")
+                with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                        patch.object(self.runtime, "execute_candidate", side_effect=invoke_candidate), \
+                        patch("adaptive_rsi.native.post_json", side_effect=pause_before_response) as post:
+                    self.runtime.process(run)
+                self.assertEqual(post.call_count, 1)
+                expected = "cancelled" if explicit_cancel else "interrupted"
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], expected)
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], expected)
+                self.assertIsNotNone(self.store.one("SELECT ended FROM runs WHERE id=?", (run["id"],))["ended"])
+                self.assertEqual(self.store.one("SELECT state FROM calls WHERE run=?", (run["id"],))["state"], "failed")
+                self.assertIsNone(self.store.setting("run-stop:" + run["id"]))
+                self.runtime.retry(task)
+                fresh = self.store.claim(self.project, self.runtime.config(self.project))
+                self.assertNotEqual(fresh["id"], run["id"])
+                self.assertFalse(self.runtime.is_cancelled(fresh))
+                with patch("adaptive_rsi.native.post_json", return_value=response):
+                    self.assertEqual(self.runtime.invoke("implementation", "fixture", self.repo, fresh), {"summary": "fixture"})
+                self.store.transition(fresh["id"], "completed", {}, True)
+
+    def test_pause_stop_request_survives_runtime_reopen_and_recovery(self):
+        task = self.runtime.goal(self.project, "Durable pause")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.pause(self.project, True)
+        reopened = Runtime(Store(self.store.root), object())
+        try:
+            reopened.pause(self.project, False)
+            self.assertTrue(reopened.is_cancelled(run))
+            self.assertTrue(self.runtime.is_cancelled(run))
+            with patch.object(reopened.updates, "restore_startup"), \
+                    patch.object(reopened, "loop", side_effect=reopened.stop.set):
+                reopened.start()
+                reopened.thread.join(5)
+            self.assertFalse(reopened.thread.is_alive())
+            self.assertEqual(reopened.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "interrupted")
+            self.assertIsNone(reopened.store.setting("run-stop:" + run["id"]))
+            reopened.stop.clear()
+            reopened.retry(task)
+            fresh = reopened.store.claim(self.project, reopened.config(self.project))
+            self.assertFalse(reopened.is_cancelled(fresh))
+            self.assertNotEqual(fresh["id"], run["id"])
+        finally:
+            reopened.close()
+
+    def test_pause_marks_only_unfinished_runs_in_its_project(self):
+        task = self.runtime.goal(self.project, "Completed history")
+        ended = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(ended["id"], "completed", {}, True)
+        active_task = self.runtime.goal(self.project, "Active work")
+        active = self.store.claim(self.project, self.runtime.config(self.project))
+        other = "other-project"
+        self.store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                           (other, other, str(self.root / "other"), "{}", 0, time.time()))
+        self.runtime.goal(other, "Other work")
+        other_run = self.store.claim(other, self.runtime.config(other))
+        self.runtime.pause(self.project, True)
+        self.runtime.pause(self.project, False)
+        self.assertTrue(self.runtime.is_cancelled(active))
+        self.assertFalse(self.runtime.is_cancelled(other_run))
+        self.assertIsNone(self.store.setting("run-stop:" + ended["id"]))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "completed")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (active_task,))["state"], "planning")
+
     def test_cancelled_unfinished_run_blocks_retry_and_revision_until_it_stops(self):
         for operation in ["retry", "revise"]:
             with self.subTest(operation=operation):

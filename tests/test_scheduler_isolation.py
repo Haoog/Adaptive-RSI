@@ -1,4 +1,5 @@
 import concurrent.futures
+import datetime
 import json
 import tempfile
 import threading
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.delivery import schedule as schedule_delivery
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
@@ -42,13 +44,14 @@ class SchedulerIsolationTest(unittest.TestCase):
                            (str(directory), old, old, run["id"]))
         return self.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
 
-    def iteration(self, join_maintenance=True):
+    def iteration(self, join_maintenance=True, complete_runs=True):
         test = self
 
         class Pool:
             def submit(self, fn, run):
                 test.dispatched.append(run)
-                test.store.transition(run["id"], "completed", {}, True)
+                if complete_runs:
+                    test.store.transition(run["id"], "completed", {}, True)
                 future = concurrent.futures.Future()
                 future.set_result(None)
                 return future
@@ -80,6 +83,92 @@ class SchedulerIsolationTest(unittest.TestCase):
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "queued")
         self.assertEqual(self.store.one("SELECT paused FROM projects WHERE id='paused'")["paused"], 1)
         self.assertEqual(self.errors("project")[0]["project"], "broken")
+
+    def test_save_between_eligibility_and_claim_refreshes_snapshot_and_invoke(self):
+        self.runtime.agent = CodexAgent(self.store)
+        provider = {"id": "fixture_api", "name": "Fixture", "base_url": "https://example.invalid/v1",
+                    "protocol": "chat_completions", "env_key": "", "credential": "none"}
+        active_task = self.task("broken")
+        active = self.store.claim("broken", self.runtime.config("broken"))
+        healthy = self.task("healthy")
+        dispatch = self.runtime.dispatch
+
+        def save_then_dispatch(eligible):
+            self.assertIn("healthy", [p["id"] for p, _ in eligible])
+            self.runtime.configure({"providers": [provider],
+                                    "models": {"implementation": {"provider": "fixture_api", "model": "new-planner",
+                                                                    "effort": "default"}},
+                                    "limits": {"command_seconds": 7200}})
+            self.runtime.configure({"limits": {"max_output_mb": 3}}, "healthy")
+            self.assertFalse(self.store.one("SELECT 1 FROM runs WHERE project='healthy'"))
+            dispatch(eligible)
+
+        with patch.object(self.runtime, "dispatch", side_effect=save_then_dispatch):
+            self.iteration(complete_runs=False)
+
+        run = next(r for r in self.dispatched if r["task"] == healthy)
+        config = json.loads(run["config"])
+        self.assertEqual(config["models"]["implementation"]["model"], "new-planner")
+        self.assertEqual(config["limits"]["command_seconds"], 7200)
+        self.assertEqual(config["limits"]["max_output_mb"], 3)
+        self.assertEqual(self.store.one("SELECT config FROM runs WHERE id=?", (active["id"],))["config"], active["config"])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (active_task,))["state"], "planning")
+        # 真实 invoke 路由与调用记录，只替代远端响应，不执行模型或网络。
+        self.runtime.stop.clear()
+        response = {"choices": [{"message": {"tool_calls": [{"id": "finish-1", "type": "function",
+                    "function": {"name": "finish", "arguments": json.dumps({"summary": "fixture"})}}]}}]}
+        with patch("adaptive_rsi.native.post_json", return_value=response) as post:
+            self.assertEqual(self.runtime.invoke("implementation", "fixture", self.root, run), {"summary": "fixture"})
+        self.assertEqual(post.call_args.args[1]["model"], "new-planner")
+        self.assertEqual(self.store.one("SELECT model FROM calls WHERE run=?", (run["id"],))["model"], "new-planner")
+
+    def test_dispatch_rechecks_hours_timezone_pause_weight_and_concurrency(self):
+        # 两个时区的固定时刻：UTC 在新窗口内，上海在新窗口外。
+        instant = datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc)
+        for change in ["hours", "timezone", "pause", "weight", "concurrency"]:
+            with self.subTest(change=change):
+                self.runtime.futures.clear()
+                self.dispatched.clear()
+                for project in ["broken", "healthy"]:
+                    self.runtime.pause(project, False)
+                    self.runtime.configure({"schedule": {"timezone": "UTC", "working_hours": [0, 24], "weight": 1}}, project)
+                self.runtime.configure({"limits": {"concurrency": 2}})
+                self.task("broken")
+                self.task("healthy")
+                dispatch = self.runtime.dispatch
+
+                def save_then_dispatch(eligible):
+                    if change == "hours":
+                        self.runtime.configure({"schedule": {"working_hours": [0, 1]}}, "broken")
+                    elif change == "timezone":
+                        self.runtime.configure({"schedule": {"timezone": "Asia/Shanghai", "working_hours": [12, 13]}}, "broken")
+                    elif change == "pause":
+                        self.runtime.pause("broken", True)
+                    elif change == "weight":
+                        self.runtime.configure({"schedule": {"weight": 4}}, "broken")
+                    else:
+                        self.runtime.configure({"limits": {"concurrency": 1}})
+                    dispatch(eligible)
+
+                self.store.put_setting("fair-service", {})
+                self.store.put_setting("fair-waiting", {})
+                self.store.put_setting("fair-clock", 0)
+                with patch("adaptive_rsi.runtime.datetime.datetime") as clock, \
+                        patch.object(self.runtime, "dispatch", side_effect=save_then_dispatch):
+                    clock.now.side_effect = lambda zone: instant.astimezone(zone)
+                    self.iteration()
+                projects = [r["project"] for r in self.dispatched]
+                if change in ["hours", "timezone", "pause"]:
+                    self.assertEqual(projects, ["healthy"])
+                    self.assertFalse(self.store.one("SELECT 1 FROM runs WHERE project='broken'"))
+                elif change == "concurrency":
+                    self.assertEqual(len(projects), 1)
+                else:
+                    self.assertEqual(set(projects), {"broken", "healthy"})
+                    self.assertEqual(self.store.setting("fair-service")["broken"], 0.25)
+                self.store.execute("DELETE FROM phase_times")
+                self.store.execute("DELETE FROM runs")
+                self.store.execute("DELETE FROM tasks")
 
     def test_project_schedule_failure_does_not_block_healthy_project(self):
         self.store.put_setting("maintenance-last", time.time())
