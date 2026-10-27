@@ -418,7 +418,8 @@ function showView(name){
 }
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
- if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs)]))return;
+ const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.available>Date.now()/1000).map(task=>task.id);
+ if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
  list.replaceChildren();
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);

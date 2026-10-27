@@ -15,7 +15,7 @@ window.RSIExperience = (() => {
     inboxBusy = false,
     inboxAt = 0;
   const queueSaves = new Map();
-  let queueEditor;
+  let queueEditor, backoffRetry;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
@@ -407,19 +407,18 @@ window.RSIExperience = (() => {
           "button",
         ),
       );
-    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)
-      // 只有带退避/等待时间的排队任务才允许提前重试；普通排队任务保持无按钮。
-      controls.append(
-        action(
-          t("立即重试"),
-          async () => {
-            if (!current()) return;
-            await api("retry", { task: task.id });
-            await refreshTaskDetail();
-          },
-          "button",
-        ),
+    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000) {
+      backoffRetry = action(
+        t("立即重试"),
+        async () => {
+          if (!current()) return;
+          await api("retry", { task: task.id });
+          await refreshTaskDetail();
+        },
+        "button",
       );
+      controls.append(backoffRetry);
+    }
     if (
       [
         "queued",
@@ -640,6 +639,7 @@ window.RSIExperience = (() => {
     queueEditor.submit = null;
     clearTimeout(liveTimer);
     lastDetail = "";
+    backoffRetry = null;
     const url = new URL(location.href);
     url.hash = new URLSearchParams({
       project: task.project,
@@ -679,7 +679,11 @@ window.RSIExperience = (() => {
       if (!current()) return;
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
-      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated]);
+      if (backoffRetry && !(metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)) {
+        backoffRetry.remove();
+        backoffRetry = null;
+      }
+      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated, task.available]);
       if (snapshot(metadata) !== snapshot(task)) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
         const queueDraft = readQueueDraft();

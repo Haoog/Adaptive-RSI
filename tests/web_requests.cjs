@@ -1593,6 +1593,34 @@ test('queued backoff tasks expose an immediate retry entry while ordinary queued
   assert.deepEqual(labels('Plain queue task'), ['查看详情']);
 });
 
+test('queued retry entry expires when the clock advances with unchanged task data', () => {
+  const page=browser();page.context.language='zh-CN';page.node('task-filter').value='active';
+  vm.runInContext(`Date.now=()=>1700000000000;state={...initialState,selected_project:'a',tasks:[
+    {id:'backoff',project:'a',source:'goal',title:'Backoff task',state:'queued',available:1700000001,updated:1}
+  ],runs:[]};renderTasks()`,page.context);
+  const labels=()=>page.node('tasks-list').children[0].children[2].children.map(node=>node.textContent);
+  assert.ok(labels().includes('立即重试'));
+  vm.runInContext('Date.now=()=>1700000001000;renderTasks()',page.context);
+  assert.ok(!labels().includes('立即重试'));
+});
+
+test('live detail removes expired backoff retry without rebuilding supplement drafts', async () => {
+  const task={...fixtureTask('child','queued'),available:1700000001};
+  const page=revisionMetadataPage(task,{...task,dependency:null,revisions:[]});
+  vm.runInContext('Date.now=()=>1700000000000',page.context);
+  const controls=await openExperienceTask(page,task);
+  const retry=()=>controls.children.find(node=>node.textContent==='立即重试');
+  assert.ok(retry());
+  retry().remove=()=>{controls.children=controls.children.filter(node=>node.textContent!=='立即重试');};
+  const form=controls.children.find(node=>node.tagName==='FORM'),textarea=form.children[0].children[0];
+  textarea.value='尚未保存的补充草稿';
+  vm.runInContext('Date.now=()=>1700000001000',page.context);
+  page.fireTimer(5000);await new Promise(setImmediate);await page.context.lastAction;
+  assert.ok(!retry());
+  assert.equal(textarea.value,'尚未保存的补充草稿');
+  assert.ok(page.node('detail-body').children.includes(controls),'expiry keeps the controls and draft DOM');
+});
+
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
   for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
     const page=browser();page.node('config-scope').value='project';
