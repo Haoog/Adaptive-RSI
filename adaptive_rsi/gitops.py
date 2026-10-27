@@ -52,7 +52,7 @@ def changes(workspace):
 def copy_source(source, destination):
     scrub_tree(source)
     shutil.copytree(source, destination, symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__", "node_modules", ".venv", "dist", "build"))
+                    ignore=shutil.ignore_patterns(".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"))
     return Path(destination)
 
 
