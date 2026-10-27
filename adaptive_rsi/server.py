@@ -123,6 +123,7 @@ This task has finished and can no longer be cancelled
 Submission ID was already used with different content
 Candidate not found
 Only a verified ready candidate can be promoted
+Candidate evidence is incompatible with current configuration
 Candidate content is incomplete
 Unknown candidate kind
 """.strip().splitlines())

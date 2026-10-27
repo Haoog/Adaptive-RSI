@@ -646,6 +646,20 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
         status, payload = post("/api/evolution/promote", {"candidate": "missing-candidate"})
         self.assertEqual((status, payload["error"], payload["error_code"]),
                          (400, "Candidate not found", "validation_error"))
+        runtime.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                              "VALUES ('incompatible-ready',?,'strategy','ready',?,?,?)",
+                              (project, json.dumps({"guidance": "Check arithmetic boundaries first",
+                                                    "triggers": ["add"]}),
+                               json.dumps({"compatibility": "obsolete-fingerprint"}), time.time()))
+        before = {table: runtime.store.query("SELECT * FROM " + table)
+                  for table in ("candidates", "skills", "events")}
+        status, payload = post("/api/evolution/promote", {"candidate": "incompatible-ready"})
+        self.assertEqual((status, payload),
+                         (400, {"error": "Candidate evidence is incompatible with current configuration",
+                                "error_code": "validation_error"}))
+        for table, rows in before.items():
+            self.assertEqual(runtime.store.query("SELECT * FROM " + table), rows, table)
+        self.assertEqual([item["id"] for item in runtime.active_strategies(project)], ["manual-ready"])
 
     def test_revision_validation_errors_reach_the_console_verbatim(self):
         from adaptive_rsi import server as server_module

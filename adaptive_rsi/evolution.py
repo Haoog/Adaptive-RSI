@@ -224,6 +224,10 @@ class Evolution:
             if (not isinstance(content, dict) or not isinstance(content.get("guidance"), str)
                     or not content["guidance"].strip() or not isinstance(content.get("triggers"), list)):
                 raise ValueError("Candidate content is incomplete")
+            # 与 active_strategies 相同：旧证据无兼容指纹时仍可用，有指纹则必须匹配。
+            expected = json.loads(row["evidence"]).get("compatibility")
+            if expected and expected != compatibility(config):
+                raise ValueError("Candidate evidence is incompatible with current configuration")
             # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
             self.activate(db, candidate, now)
             db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",

@@ -698,6 +698,57 @@ Path(%r).write_text('allowed output')
         self.assertEqual(len(self.store.query("SELECT * FROM skills")), 1)
         self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='promotion'")), 1)
 
+    def test_manual_promotion_rejects_incompatible_evidence_without_side_effects(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        previous = self.runtime.config(self.project)
+        self.runtime.configure({"review": {"block_on": "high"}}, self.project)
+        current = self.runtime.config(self.project)
+        self.assertNotEqual(compatibility(previous), compatibility(current))
+        for kind in ("strategy", "meta_strategy", "adapter"):
+            for suffix, status, config in [("old", "stable", current), ("ready", "ready", previous)]:
+                candidate = kind + "-" + suffix
+                self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                                   "VALUES (?,?,?,?,?,?,?)",
+                                   (candidate, self.project, kind, status, encode(content),
+                                    encode({"compatibility": compatibility(config)}), time.time()))
+            self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                               Evolution.skill_values(self.project, kind + "-old", content, current, time.time()))
+        before = {table: self.store.query("SELECT * FROM " + table) for table in ("candidates", "skills", "events")}
+        active = self.runtime.active_strategies(self.project)
+        memories = self.runtime.memories(self.project, "add")
+        self.assertEqual(len(active), 3)
+        self.assertTrue(memories)
+        for kind in ("strategy", "meta_strategy", "adapter"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "^Candidate evidence is incompatible with current configuration$"):
+                    self.runtime.promote_strategy(kind + "-ready")
+                for table, rows in before.items():
+                    self.assertEqual(self.store.query("SELECT * FROM " + table), rows, table)
+                self.assertEqual(self.runtime.active_strategies(self.project), active)
+                self.assertEqual(self.runtime.memories(self.project, "add"), memories)
+
+    def test_manual_promotion_uses_active_strategy_compatibility_rules(self):
+        previous = self.runtime.config(self.project)
+        self.runtime.configure({"schedule": {"light_minutes": 600}}, self.project)
+        current = self.runtime.config(self.project)
+        self.assertNotEqual(fingerprint(previous), fingerprint(current))
+        self.assertEqual(compatibility(previous), compatibility(current))
+        for candidate, evidence in [("matching", {"compatibility": compatibility(previous)}),
+                                    ("legacy", {}), ("null", {"compatibility": None}),
+                                    ("empty", {"compatibility": ""})]:
+            with self.subTest(candidate=candidate):
+                evidence["config_hash"] = fingerprint(previous)
+                self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                                   "VALUES (?,?,?,?,?,?,?)",
+                                   (candidate, self.project, "strategy", "ready",
+                                    encode({"guidance": "Check arithmetic boundaries", "triggers": ["add"]}),
+                                    encode(evidence), time.time()))
+                self.assertEqual(self.runtime.promote_strategy(candidate),
+                                 {"candidate": candidate, "status": "stable"})
+                self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], [candidate])
+                self.assertEqual(json.loads(self.store.one("SELECT evidence FROM candidates WHERE id=?",
+                                                          (candidate,))["evidence"]), evidence)
+
     def test_auto_activation_rebinds_parent_and_persists_evidence(self):
         content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
         for candidate, status, created in [("a", "stable", 1), ("auto", "evaluating", 2)]:

@@ -111,6 +111,7 @@ const apiErrors={
  "An inherited setting cannot also have an override": "跟随通用的扫描项不能同时填写 JSON 覆盖，请先选择单独设置。",
  "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。",
  "No GitHub repository configured": "请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。",
+ "Candidate evidence is incompatible with current configuration": "候选的评估证据与当前配置不兼容，请重新评估后再启用；当前稳定策略已保留。",
  "Supplement must contain 1..10000 characters": "补充需求不能为空，且不能超过 10000 个字符。请缩短后重试。",
  "Pause or finish active work before supplementing this task": "该任务正在运行或属于系统自动任务，暂不能补充需求。请等待当前运行结束后再试。",
  "Combined requirements exceed 30000 characters": "合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。"
@@ -418,7 +419,7 @@ function showView(name){
 }
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
- const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.available>Date.now()/1000).map(task=>task.id);
+ const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
  if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
  list.replaceChildren();
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
@@ -442,7 +443,7 @@ function renderTasks(){
 
   if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
-  else if(task.state==='queued'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
  }

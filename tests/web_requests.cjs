@@ -1583,14 +1583,16 @@ test('queued backoff tasks expose an immediate retry entry while ordinary queued
   const available = Math.floor(Date.now() / 1000) + 3600;
   vm.runInContext(`state={...initialState,selected_project:"a",tasks:[
     {id:"backoff",project:"a",source:"goal",title:"Backoff task",state:"queued",display_state:"queued",available:${available},updated:1},
-    {id:"plain",project:"a",source:"goal",title:"Plain queue task",state:"queued",display_state:"queued",available:0,updated:1}
-  ],runs:[],pagination:{total:2,limit:50,offset:0,has_more:false}};renderTasks()`, page.context);
+    {id:"plain",project:"a",source:"goal",title:"Plain queue task",state:"queued",display_state:"queued",available:0,updated:1},
+    {id:"hours",project:"a",source:"goal",title:"Working hours task",state:"queued",display_state:"queued",wait_reason:"working_hours",available:${available},updated:1}
+  ],runs:[],pagination:{total:3,limit:50,offset:0,has_more:false}};renderTasks()`, page.context);
   const rows = page.node('tasks-list').children;
   const labels = title => rows
     .find(row => row.children[0].children[0].textContent === title)
     .children[2].children.map(child => child.textContent);
   assert.deepEqual(labels('Backoff task'), ['立即重试', '查看详情']);
   assert.deepEqual(labels('Plain queue task'), ['查看详情']);
+  assert.deepEqual(labels('Working hours task'), ['查看详情']);
 });
 
 test('queued retry entry expires when the clock advances with unchanged task data', () => {
@@ -1660,6 +1662,10 @@ test('revision and backoff messages are mapped and localized for both console la
     '合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。'])
     assert.equal(typeof english[key],'string','english dictionary misses: '+key);
   assert.equal(english['立即重试'],'Retry now');
+  const compatibilityError='Candidate evidence is incompatible with current configuration';
+  const mapped=vm.runInContext(`apiErrors[${JSON.stringify(compatibilityError)}]`,browser().context);
+  assert.match(mapped,/重新评估/);
+  assert.match(english[mapped],/Reevaluate/);
 });
 
 function experiencePage({navigation = false} = {}) {
