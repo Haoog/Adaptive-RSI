@@ -165,7 +165,8 @@ def publish(runtime, project, task, run, workspace, config):
     if identity != expected:
         raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
-    branch = prefix + "/rsi-" + run["id"]
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]", "-", run["id"])
+    branch = prefix + "/rsi-" + safe_id
     if git(workspace, "branch", "--show-current") != branch:
         # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
         existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
@@ -175,9 +176,10 @@ def publish(runtime, project, task, run, workspace, config):
             git(workspace, "checkout", branch)
         else:
             git(workspace, "checkout", "-b", branch)
+    title = re.sub(r"[\r\n\0]+", " ", task["title"]).strip()
     if git(workspace, "diff", "--cached", "--name-only"):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
-            "commit", "-m", "完成任务：" + task["title"])
+            "commit", "-m", "完成任务：" + title)
     sha = git(workspace, "rev-parse", "HEAD")
     existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
                                    "--limit", "1", "--json", "url"]))

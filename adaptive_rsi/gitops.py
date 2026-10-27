@@ -34,7 +34,9 @@ def snapshot(source, destination, sha=None):
              "-C", str(destination), "fetch", "--quiet", "--depth=1", "--no-tags", "origin", commit], timeout=180)
     git(destination, "checkout", "--quiet", "--detach", "FETCH_HEAD")
     scrub_tree(destination)
-    with (destination / ".git" / "info" / "exclude").open("a") as stream:
+    exclude_file = destination / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True, exist_ok=True)
+    with exclude_file.open("a") as stream:
         stream.write("\n.rsi-agent/\n.rsi-home/\n.rsi-build/\n.rsi-tmp/\n")
     return destination
 
@@ -50,7 +52,7 @@ def changes(workspace):
 def copy_source(source, destination):
     scrub_tree(source)
     shutil.copytree(source, destination, symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__"))
+                    ignore=shutil.ignore_patterns(".git", ".rsi-agent", ".rsi-home", ".rsi-build", "__pycache__", "node_modules", ".venv", "dist", "build"))
     return Path(destination)
 
 

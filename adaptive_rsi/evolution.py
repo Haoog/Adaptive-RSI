@@ -81,7 +81,15 @@ class Evolution:
         failures = self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
                                     "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
                                     "ORDER BY r.started DESC LIMIT 5", (project["id"],))
-        failures = [{"state": r["state"], "reason": json.loads(r["result"]).get("reason", "")[:1000]} for r in failures]
+        failures = []
+        for r in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
+                                  "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
+                                  "ORDER BY r.started DESC LIMIT 5", (project["id"],)):
+            try:
+                res = json.loads(r["result"]) if r["result"] else {}
+            except (ValueError, TypeError):
+                res = {}
+            failures.append({"state": r["state"], "reason": res.get("reason", "")[:1000]})
         development = [json.loads(row["spec"])["task"] for row in self.store.query(
             "SELECT spec FROM cases WHERE project=? AND split='development' LIMIT 10", (project["id"],))]
         current = self.runtime.active_strategies(project["id"])
@@ -95,6 +103,8 @@ class Evolution:
                                        encode({"observations": observations, "failures": failures,
                                                "development_tasks": development, "current": current,
                                                "candidate_archive": archive}), workspace, run)
+        if not isinstance(proposal, dict) or "kind" not in proposal:
+            raise RuntimeError("Model proposal must be an object with kind and content")
         candidate = uid()
         previous = self.store.one("SELECT id FROM candidates WHERE project=? AND kind=? AND status='stable' ORDER BY promoted DESC LIMIT 1",
                                   (project["id"], proposal["kind"]))

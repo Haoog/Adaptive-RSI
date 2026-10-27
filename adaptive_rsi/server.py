@@ -143,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
     def respond(self, data, code=200, content_type="application/json; charset=utf-8", headers=None):
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
@@ -207,7 +207,10 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Backup exceeds download size limit")
                 if params.get("format", [""])[0] == "json":
                     import base64
-                    offset = int(params.get("offset", [0])[0])
+                    try:
+                        offset = int(params.get("offset", [0])[0])
+                    except (ValueError, TypeError):
+                        raise RequestError("Invalid backup offset")
                     if not 0 <= offset <= size:
                         raise RequestError("Invalid backup offset")
                     stream.seek(offset)

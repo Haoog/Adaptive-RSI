@@ -184,18 +184,27 @@ def docker_mount(source, destination, read_only=False):
     return stream.getvalue()[:-2]  # 仅移除 writer 添加的 CRLF，保留路径中的换行。
 
 
-def scrub_tree(root):
+def scrub_tree(root, state=None):
     """Never follow project symlinks into host files or evaluator data."""
     root = Path(root).resolve()
+    sensitive = [Path.home() / ".ssh", Path.home() / ".aws"]
+    if state:
+        sensitive.append(Path(state).resolve())
     for parent, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = [x for x in dirs if x != ".git"]
         for name in dirs + files:
             item = Path(parent) / name
             if item.is_symlink():
                 try:
-                    item.resolve().relative_to(root)
+                    resolved = item.resolve()
+                    resolved.relative_to(root)
                 except ValueError:
-                    raise RuntimeError("External symlink cannot enter an execution snapshot: " + str(item.relative_to(root)))
+                    for target in sensitive:
+                        try:
+                            resolved.relative_to(target)
+                            raise RuntimeError("External symlink cannot enter protected host state: " + str(item.relative_to(root)))
+                        except ValueError:
+                            pass
 
 
 class Sandbox:
@@ -341,8 +350,14 @@ class Sandbox:
                "TMPDIR": str(Path(workspace) / ".rsi-tmp"), "CI": "1", "PYTHONDONTWRITEBYTECODE": "1",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                "GOPROXY": "off", "GOTOOLCHAIN": "local", "NO_COLOR": "1"}
-        Path(env["HOME"]).mkdir(exist_ok=True)
-        Path(env["TMPDIR"]).mkdir(exist_ok=True)
+        try:
+            Path(env["HOME"]).mkdir(exist_ok=True)
+            Path(env["TMPDIR"]).mkdir(exist_ok=True)
+        except OSError:
+            env["HOME"] = str(Path(tempfile.gettempdir()) / "rsi-home")
+            env["TMPDIR"] = str(Path(tempfile.gettempdir()) / "rsi-tmp")
+            Path(env["HOME"]).mkdir(mode=0o700, exist_ok=True)
+            Path(env["TMPDIR"]).mkdir(mode=0o700, exist_ok=True)
         cleanup = argv[0] == "docker"
         try:
             result = run_process(argv, cwd, self.config["limits"]["command_seconds"], cancel,

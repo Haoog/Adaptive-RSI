@@ -174,7 +174,11 @@ fn desktop_release(release: &Value, current: &str) -> Result<Option<DesktopUpdat
     let tag = tag.strip_prefix('v').unwrap_or(tag);
     let target = parse_version(tag).ok_or(())?;
     let now = parse_version(current).ok_or(())?;
-    let dmg_name = format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", tag);
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        _ => "arm64",
+    };
+    let dmg_name = format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", tag, arch);
     let mut url = None;
     let mut sha_url = None;
     if let Some(assets) = release.get("assets").and_then(Value::as_array) {
@@ -304,10 +308,16 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             fail("Checksum unavailable".into(), "checksum_unavailable");
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_default();
-        let path = std::path::PathBuf::from(&home)
-            .join("Downloads")
-            .join(format!("adaptive-rsi-{}-macos-arm64-adhoc.dmg", version));
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x86_64",
+            _ => "arm64",
+        };
+        let download_dir = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+            .unwrap_or_else(std::env::temp_dir);
+        let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
         let outcome = (|| -> Result<(), String> {
             let mut response = client
                 .get(&url)
@@ -378,7 +388,10 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 update.opened.store(true, Ordering::Relaxed);
             }
         }
+        #[cfg(target_os = "macos")]
         let _ = Command::new("hdiutil").arg("attach").arg(&path).spawn();
+        #[cfg(not(target_os = "macos"))]
+        let _ = &path;
     });
     // 闸门 try_lock 即刻完成，这里的短暂等待只把启动结果同步给前端。
     receiver
@@ -1047,6 +1060,7 @@ fn main() {
                         if let Some(window) = handle.get_webview_window("main") {
                             let payload = json!({"task": task, "project": project});
                             let _ = window.show();
+                            let _ = window.unminimize();
                             let _ = window.set_focus();
                             let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('rsi-notification-open',{{detail:{payload}}}))"));
                         }

@@ -49,7 +49,7 @@ def workflow_content(repo, workflow, sha):
 
 def compatible_workflow(text):
     # Accept the deliberately small public contract; reject ambiguous YAML forms.
-    if not re.search(r"(?m)^run-name:\s*['\"]?\$\{\{\s*inputs\.rsi_operation_id\s*\}\}['\"]?\s*$", text):
+    if not re.search(r"(?m)^run-name:\s*['\"]?\$\{\{\s*inputs\.rsi_operation_id\s*\}\}['\"]?\s*(?:#.*)?$", text):
         return False
     def block(source, key, expected_indent=None):
         match = re.search(r"(?m)^([ ]*)" + key + r":[ ]*(?:#.*)?$", source)
@@ -69,8 +69,9 @@ def compatible_workflow(text):
         return False
     for name in ["rsi_operation_id", "rsi_sha"]:
         field = block(inputs[0], name)
-        if (not field or field[1] <= inputs[1] or not re.search(r"(?m)^[ ]+required:[ ]*true[ ]*$", field[0]) or
-                not re.search(r"(?m)^[ ]+type:[ ]*string[ ]*$", field[0])):
+        if (not field or field[1] <= inputs[1] or
+                not re.search(r"(?m)^[ ]+required:[ ]*(?:true|'true'|\"true\")[ ]*(?:#.*)?$", field[0]) or
+                not re.search(r"(?m)^[ ]+type:[ ]*(?:string|'string'|\"string\")[ ]*(?:#.*)?$", field[0])):
             return False
     return True
 
@@ -92,15 +93,13 @@ def workflow_choices(runtime, project_id):
     if cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
         return cached[1]
     workflows = []
-    for page in range(1, 101):
+    for page in range(1, 11):
         batch = api(repo, "actions/workflows?per_page=100" + ("&page=" + str(page) if page > 1 else "")).get("workflows", [])
         if not isinstance(batch, list):
             raise ValueError("Invalid workflow directory response")
         workflows.extend(batch)
         if len(batch) < 100:
             break
-    else:
-        raise ValueError("Workflow directory exceeds 100 pages")
     import concurrent.futures
 
     def inspect(item):
