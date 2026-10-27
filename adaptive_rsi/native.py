@@ -63,7 +63,9 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
         if result["error_kind"] == "timeout":
             raise ProviderUnavailable("Model API connection timed out", "timeout")
         if result["error"] or result["exit_code"]:
-            raise RuntimeError("Model transport failed")
+            detail = (result.get("stderr") or result.get("stdout") or result.get("error") or "").strip()
+            msg = "Model transport failed" + (f": {detail[:500]}" if detail else "")
+            raise RuntimeError(msg)
         envelope = json.loads(result["stdout"])
         if not envelope["ok"]:
             problem = (ProviderUnavailable(envelope["error"], envelope["code"]) if envelope["unavailable"] else
@@ -300,7 +302,8 @@ class Conversation:
                 body["stream"] = False
             return ("/api/chat" if p == "ollama" else "/chat/completions"), body
         if p == "anthropic":
-            return "/messages", {"model": self.model, "messages": self.history, "max_tokens": 8192,
+            max_tokens = 4096 if "opus" in self.model.lower() or "claude-2" in self.model.lower() else 8192
+            return "/messages", {"model": self.model, "messages": self.history, "max_tokens": max_tokens,
                 "tools": [{"name": n, "description": d, "input_schema": s} for n, d, s in self.tools]}
         if p == "gemini":
             def schema(s):
@@ -311,6 +314,26 @@ class Conversation:
                 "contents": self.history, "tools": [{"functionDeclarations": [{"name": n, "description": d,
                     **({"parameters": schema(s)} if s["properties"] else {})} for n, d, s in self.tools]}]}
         raise ValueError("Unknown native protocol")
+
+    def trim_history(self, max_bytes):
+        """Bound oldest verbose tool outputs when approaching context capacity."""
+        if len(self.history) <= 6:
+            return
+        try:
+            encoded = len(json.dumps(self.history, ensure_ascii=False).encode("utf-8"))
+        except (ValueError, TypeError):
+            return
+        if encoded < max_bytes * 0.7:
+            return
+        for item in self.history[1:-4]:
+            if isinstance(item, dict):
+                content = item.get("content")
+                if isinstance(content, str) and len(content) > 1000:
+                    item["content"] = content[:500] + "\n...[output trimmed for context capacity]...\n" + content[-200:]
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and "content" in part and len(str(part.get("content", ""))) > 1000:
+                            part["content"] = str(part["content"])[:500] + "...[trimmed]"
 
     def receive(self, response):
         if not isinstance(response, dict):
@@ -363,7 +386,7 @@ class Conversation:
         elif self.protocol == "anthropic":
             self.history.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": call, "content": json.dumps(value, ensure_ascii=False)} for call, _, value in results]})
         else:
-            self.history.append({"role": "user", "parts": [{"functionResponse": {"name": name, "response": {"result": value}, **({"id": call} if not call.isdigit() else {})}}
+            self.history.append({"role": "user", "parts": [{"functionResponse": {"name": name, "response": {"result": value}, **({"id": call} if call else {})}}
                                                              for call, name, value in results]})
 
 
@@ -399,6 +422,7 @@ class NativeAgent:
                 raise ProviderUnavailable("Native conversation timed out", "timeout")
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
+            conversation.trim_history(max_bytes)
             suffix, payload = conversation.request()
             if len(json.dumps(payload).encode()) > max_bytes:
                 raise RuntimeError("Native model context exceeds output limit")
@@ -423,7 +447,9 @@ class NativeAgent:
                 final = [x for x in calls if x[1] == "finish"]
                 if final:
                     if len(calls) != 1:
-                        raise RuntimeError("finish must be the only tool call")
+                        conversation.results([(call_id, name, {"error": "finish must be called alone without other concurrent tool calls; please execute your other tool calls first and then call finish."}) for call_id, name, _ in calls])
+                        self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
+                        continue
                     call_id, name, args = final[0]
                     error = str(args) if isinstance(args, ArgumentsError) else None
                     if error is None:

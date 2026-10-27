@@ -65,7 +65,8 @@ def empty_test_run(text):
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
                          r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b|"
-                         r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b", text, re.I)
+                         r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
+                         r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
     return bool(empty and not positive)
 
 
@@ -115,6 +116,12 @@ def freeze_harness(baseline, target, checks=()):
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.is_dir():
                 shutil.rmtree(dst)
+            if src.is_symlink():
+                try:
+                    if not src.resolve().exists():
+                        continue
+                except OSError:
+                    continue
             shutil.copy2(src, dst)
             baseline_harness.add(relative)
             parts = relative.parts

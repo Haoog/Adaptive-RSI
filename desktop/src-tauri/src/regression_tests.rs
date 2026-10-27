@@ -1,10 +1,14 @@
 use super::*;
 
 fn release() -> Value {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        _ => "arm64",
+    };
     json!({
         "tag_name": "v1.2.3", "body": "notes", "assets": [
-            {"name": "adaptive-rsi-1.2.3-macos-arm64-adhoc.dmg", "browser_download_url": "https://example.test/update.dmg"},
-            {"name": "adaptive-rsi-1.2.3-macos-arm64-adhoc.dmg.sha256", "browser_download_url": "https://example.test/update.sha256"}
+            {"name": format!("adaptive-rsi-1.2.3-macos-{}-adhoc.dmg", arch), "browser_download_url": "https://example.test/update.dmg"},
+            {"name": format!("adaptive-rsi-1.2.3-macos-{}-adhoc.dmg.sha256", arch), "browser_download_url": "https://example.test/update.sha256"}
         ]
     })
 }

@@ -138,6 +138,10 @@ class Store:
                 CREATE TABLE IF NOT EXISTS task_completions (
                     task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
                 CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
+                CREATE INDEX IF NOT EXISTS event_kind_created ON events(kind, created);
+                CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
+                CREATE INDEX IF NOT EXISTS remote_waits_run ON remote_waits(run);
+                CREATE INDEX IF NOT EXISTS task_revisions_task ON task_revisions(task);
             """)
             db.execute("BEGIN IMMEDIATE")
             for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),

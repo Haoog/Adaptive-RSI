@@ -61,8 +61,7 @@ def _archive(store, max_mb):
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
                 "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
     finally:
-        if staging is not None:
-            staging.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         source.unlink(missing_ok=True)
 
 

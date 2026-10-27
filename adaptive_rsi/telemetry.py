@@ -70,7 +70,8 @@ def workflow_metrics(store, project=None):
         "SELECT DISTINCT task FROM task_revisions WHERE task IN (" + scope + ")", scope_args)}
     interventions = {row["task"]: row["n"] for row in store.query(
         "SELECT json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END,'$.task') AS task,count(*) AS n FROM events WHERE "
-        "kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') GROUP BY 1")}
+        "created>? AND kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved')" +
+        (" AND project=?" if project else "") + " GROUP BY 1", (cutoff, project) if project else (cutoff,))}
     phase_rows = store.query(
         "SELECT run,phase,coalesce(duration,max(0,ended-started)) AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
     wait_rows = store.query(

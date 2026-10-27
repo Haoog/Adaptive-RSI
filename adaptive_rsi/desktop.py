@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 
@@ -41,7 +42,20 @@ def run(root):
     session = existing_session(root)
     if session:
         print(json.dumps({**session, "owned": False}), flush=True)
-        sys.stdin.read()
+        def watch_stdin():
+            sys.stdin.read()
+        t = threading.Thread(target=watch_stdin, daemon=True)
+        t.start()
+        marker = root / "server.json"
+        while t.is_alive():
+            time.sleep(2)
+            try:
+                current = json.loads(marker.read_text())
+                if current.get("token") != session.get("token"):
+                    session = current
+                    print(json.dumps({**session, "owned": False, "rotated": True}), flush=True)
+            except (OSError, ValueError):
+                pass
         return
     runtime = Runtime(Store(root))
     runtime.updates.desktop_managed = True

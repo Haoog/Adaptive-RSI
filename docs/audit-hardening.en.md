@@ -32,6 +32,14 @@ Authorization, dispatch intent and receipts are durable separately. Slow GitHub 
 
 Activity history uses cursor pagination, and historical timestamps include year and timezone. Pages remain usable when browser storage is denied, with an explicit warning when drafts cannot persist. Confirmation dialogs manage focus, and partial model saves show the remaining state. Desktop backups stream through Rust to private temporary files with progress and cancellation. The service worker caches only public icons without query parameters; executable assets and navigation always use the network. The console does not provide offline operation.
 
+## Round 3 deep defect and cross-platform hardening
+
+- **Indexes and batched purging**: Added covering indexes on `events(kind, created)`, `phase_times(run)`, `remote_waits(run)`, and `task_revisions(task)`. Batched cascading deletes for `phase_times`, `remote_waits`, `task_revisions`, and `submissions` with a limit of 500 rows per transaction to prevent long WAL locks. Replaced unindexed subquery in `events` purge with a single indexed seek via `LIMIT 1 OFFSET 1000`.
+- **Sandbox isolation and environment resilience**: `scrub_tree` allows benign external symlinks (e.g. package manager caches or system compilers) while strictly blocking symlinks into controller state or credential paths. The sandbox falls back to the system temporary directory when the project workspace is read-only. Test evaluators support Unicode checkmarks and Vitest duration formats; baseline freezing skips dangling symlinks without crashing.
+- **Model conversations and context trimming**: Native model conversations automatically trim bloated tool output payloads when approaching context token limits while preserving diagnostics. The Gemini transport preserves `tool_call_id`. Claude 2 / Opus `max_tokens` is bounded to 4096. Concurrent finish and tool calls convert into feedback guidance.
+- **Release and desktop multi-architecture**: Release workflow parsing handles inline comments and quoted YAML values. Desktop update downloads detect `x86_64` vs `arm64` dynamically and fallback to system temp if `HOME` is unset. The PR delivery button is protected against double-click reentrancy, and CSP specifies `object-src 'none'`.
+
+
 ## Remaining limitations
 
 - Ordinary process-group cleanup under macOS Seatbelt cannot guarantee termination of descendants that actively detach with `setsid()` and quickly reparent. Docker checks use container cleanup. These changes do not provide complete macOS process-tree supervision.

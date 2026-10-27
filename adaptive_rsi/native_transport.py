@@ -10,7 +10,7 @@ def main():
     try:
         response = post_json(*json.load(sys.stdin))
         result = {"ok": True, "response": response}
-    except (ModelFailure, RuntimeError) as exc:
+    except Exception as exc:
         result = {"ok": False, "error": str(exc), "code": getattr(exc, "code", "execution"),
                   "unavailable": isinstance(exc, ProviderUnavailable),
                   "retry_after": getattr(exc, "retry_after", 0)}

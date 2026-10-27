@@ -197,7 +197,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             raise RuntimeError("Original run missing")
         prior_result = json.loads(prior["result"])
         patch_path = Path(prior["path"]) / "candidate.patch"
-        git(workspace, "apply", "--reverse", "--check", str(patch_path))
+        try:
+            git(workspace, "apply", "--reverse", "--check", str(patch_path))
+        except RuntimeError as exc:
+            raise RuntimeError(f"Cannot cleanly reverse candidate patch: {exc}") from exc
         plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
                 "scope": prior_result["files"], "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
     else:
@@ -213,7 +216,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                        "Check related_work against this baseline and open PRs. Related paths are hints, not proof of the same defect: "
                        "do not duplicate an existing fix, and do not discard a distinct problem merely because it shares a file. "
                        "If ready, scope must contain ONLY literal relative file/directory paths (e.g. calculator.py, tests), without annotations or descriptions. Define observable acceptance criteria separately. "
-                           "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes. "
+                       "High risk includes credentials, deployment, database migrations, permissions, dependency or public API changes. "
                        "Return change_kind explicitly: behavior, performance, refactor, documentation, configuration or ui. "
                        "Use measurable thresholds for performance; refactor requires behavior preservation and concrete maintainability evidence. "
                        "For performance_threshold return metric, unit, numeric target, nonnegative tolerance and direction lower/higher. "
@@ -246,7 +249,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     plan["scope"] = [str(PurePosixPath(relative_path(path))) for path in plan["scope"]]
     for path in plan["scope"]:
         relative_path(path)
-        if path == "." or any(char in path for char in [":", "：", "\n", "*", "?", "["]):
+        if path == "." or any(char in path for char in [":", "：", "\n", "\r", "\0", "*", "?", "[", "\\"]):
             raise RuntimeError("Plan must name narrower scope than the entire repository")
     original_scope = list(plan["scope"])
     change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
