@@ -600,6 +600,11 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
         with self.assertRaises(ValueError) as cancel_missing:
             runtime.cancel_task("missing-task")
         self.assertEqual(str(cancel_missing.exception), "Task not found")
+        runtime.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                              "VALUES ('manual-ready',?,'strategy','ready',?,?,?)",
+                              (project, json.dumps({"guidance": "Check arithmetic boundaries first",
+                                                    "triggers": ["add"]}),
+                               json.dumps({"reason": "verified"}), time.time()))
 
         server = Server(runtime)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -633,6 +638,83 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
         status, payload = post("/api/cancel", {"task": "missing-task"})
         self.assertEqual((status, payload["error"], payload["error_code"]),
                          (400, "Task not found", "validation_error"))
+        status, payload = post("/api/evolution/promote", {"candidate": "manual-ready"})
+        self.assertEqual((status, payload), (200, {"candidate": "manual-ready", "status": "stable"}))
+        status, payload = post("/api/evolution/promote", {"candidate": "manual-ready"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "Only a verified ready candidate can be promoted", "validation_error"))
+        status, payload = post("/api/evolution/promote", {"candidate": "missing-candidate"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "Candidate not found", "validation_error"))
+        runtime.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                              "VALUES ('incompatible-ready',?,'strategy','ready',?,?,?)",
+                              (project, json.dumps({"guidance": "Check arithmetic boundaries first",
+                                                    "triggers": ["add"]}),
+                               json.dumps({"compatibility": "obsolete-fingerprint"}), time.time()))
+        before = {table: runtime.store.query("SELECT * FROM " + table)
+                  for table in ("candidates", "skills", "events")}
+        status, payload = post("/api/evolution/promote", {"candidate": "incompatible-ready"})
+        self.assertEqual((status, payload),
+                         (400, {"error": "Candidate evidence is incompatible with current configuration",
+                                "error_code": "validation_error"}))
+        for table, rows in before.items():
+            self.assertEqual(runtime.store.query("SELECT * FROM " + table), rows, table)
+        self.assertEqual([item["id"] for item in runtime.active_strategies(project)], ["manual-ready"])
+
+    def test_revision_validation_errors_reach_the_console_verbatim(self):
+        from adaptive_rsi import server as server_module
+        messages = [
+            "Supplement must contain 1..10000 characters",
+            "Pause or finish active work before supplementing this task",
+            "Combined requirements exceed 30000 characters",
+        ]
+        for message in messages:
+            self.assertIn(message, server_module.SAFE_VALIDATION_MESSAGES)
+
+        runtime = Runtime(Store(self.root / "state"), object())
+        self.addCleanup(runtime.close)
+        project = runtime.add_project(fixture(self.root / "project"))
+        too_long = runtime.goal(project, "First requirement")
+        inactive = runtime.goal(project, "Second requirement")
+        oversized = runtime.goal(project, "Third requirement")
+        # 已完成任务不能补充；超长正文用于触发合并后的需求上限。
+        runtime.store.execute("UPDATE tasks SET state='completed' WHERE id=?", (inactive,))
+        runtime.store.execute("UPDATE tasks SET body=? WHERE id=?", ("x" * 30000, oversized))
+
+        server = Server(runtime)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server_thread.join, 3)
+
+        import http.client
+
+        def post(payload):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+            try:
+                body = json.dumps(payload).encode()
+                connection.request("POST", "/api/task/revise", body=body, headers={
+                    "Content-Type": "application/json", "Content-Length": str(len(body)),
+                    "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                    "Cookie": server.cookie + "=" + server.token})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        cases = [
+            ({"task": too_long, "supplement": "x" * 10001},
+             "Supplement must contain 1..10000 characters"),
+            ({"task": inactive, "supplement": "A valid supplement"},
+             "Pause or finish active work before supplementing this task"),
+            ({"task": oversized, "supplement": "y"},
+             "Combined requirements exceed 30000 characters"),
+        ]
+        for payload, message in cases:
+            status, body = post(payload)
+            self.assertEqual((status, body["error"], body["error_code"]),
+                             (400, message, "validation_error"))
 
     def test_cli_api_surfaces_fixed_server_messages(self):
         import io

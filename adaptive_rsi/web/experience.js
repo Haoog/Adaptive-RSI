@@ -15,7 +15,7 @@ window.RSIExperience = (() => {
     inboxBusy = false,
     inboxAt = 0;
   const queueSaves = new Map();
-  let queueEditor;
+  let queueEditor, backoffRetry;
   let usageButton;
   const queueKey = task => JSON.stringify([task.project, task.id]);
   function queueEditorCurrent(editor) {
@@ -407,6 +407,18 @@ window.RSIExperience = (() => {
           "button",
         ),
       );
+    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000) {
+      backoffRetry = action(
+        t("立即重试"),
+        async () => {
+          if (!current()) return;
+          await api("retry", { task: task.id });
+          await refreshTaskDetail();
+        },
+        "button",
+      );
+      controls.append(backoffRetry);
+    }
     if (
       [
         "queued",
@@ -427,7 +439,8 @@ window.RSIExperience = (() => {
         input = el("textarea");
       input.rows = 3;
       input.maxLength = 10000;
-      input.required = true;
+      // 空白补充由下面的显式校验拦下；HTML required 会放过纯空白并产生未本地化的原生提示。
+      input.setAttribute("aria-required", "true");
         input.value = draftStore.get('task-supplement', task.id) || '';
         input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
@@ -438,9 +451,10 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
+          const value = input.value;
+          if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
-            const value = input.value;
             await api("task/revise", {
               task: task.id,
               supplement: value,
@@ -450,7 +464,7 @@ window.RSIExperience = (() => {
           } finally {
             submit.disabled = false;
           }
-        });
+        }, form);
       };
       controls.append(form);
     }
@@ -625,6 +639,7 @@ window.RSIExperience = (() => {
     queueEditor.submit = null;
     clearTimeout(liveTimer);
     lastDetail = "";
+    backoffRetry = null;
     const url = new URL(location.href);
     url.hash = new URLSearchParams({
       project: task.project,
@@ -664,7 +679,11 @@ window.RSIExperience = (() => {
       if (!current()) return;
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
-      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated]);
+      if (backoffRetry && !(metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)) {
+        backoffRetry.remove();
+        backoffRetry = null;
+      }
+      const snapshot = task => JSON.stringify([task.state, task.title, task.body, task.evidence, task.updated, task.available]);
       if (snapshot(metadata) !== snapshot(task)) {
         const scroll = $("detail-dialog").scrollTop, restore = detailsSnapshot($("detail-body"));
         const queueDraft = readQueueDraft();

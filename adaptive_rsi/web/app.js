@@ -11,7 +11,7 @@ const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new M
 let navigationSequence=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
-let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='';
+let refreshSequence=0,refreshPromise=null,refreshController=null,refreshProject=null,refreshKey=null,refreshQueued=false,refreshForce=false,refreshWaiters=[],refreshPollTimer=null,lastUpdateToast='';
 let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
 let readinessSequence=0;
@@ -110,7 +110,11 @@ const apiErrors={
  "Only project scan settings can inherit global defaults": "只能让项目扫描设置跟随通用设置。",
  "An inherited setting cannot also have an override": "跟随通用的扫描项不能同时填写 JSON 覆盖，请先选择单独设置。",
  "Invalid origin or CSRF token": "页面安全校验已过期。输入已保留，请重新打开控制台后重试。",
- "No GitHub repository configured": "请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。"
+ "No GitHub repository configured": "请先在项目设置中填写 GitHub 仓库，再安排 Issue 同步。",
+ "Candidate evidence is incompatible with current configuration": "候选的评估证据与当前配置不兼容，请重新评估后再启用；当前稳定策略已保留。",
+ "Supplement must contain 1..10000 characters": "补充需求不能为空，且不能超过 10000 个字符。请缩短后重试。",
+ "Pause or finish active work before supplementing this task": "该任务正在运行或属于系统自动任务，暂不能补充需求。请等待当前运行结束后再试。",
+ "Combined requirements exceed 30000 characters": "合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
 for(const type of ['input','change','reset'])document.addEventListener(type,event=>{
@@ -262,16 +266,17 @@ async function safe(fn,form){
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
 function scheduleRefreshPoll(delay=refreshDelay()){clearTimeout(refreshPollTimer);refreshPollTimer=setTimeout(()=>{refreshPollTimer=null;refresh().catch(error=>{$('connection').textContent=t(error.code==='session_required'?'需要重新登录':'连接中断');});},delay);}
-function requestedStateSections(){
+function requestedStateSections(force=false){
  const sections=['core'],project=projectId||null,stale=Date.now()-30000;
- if(view==='evolution'&&(loadedStateSections.candidatesProject!==project||loadedStateSections.candidatesAt<stale))sections.push('candidates');
- if(['overview','evolution'].includes(view)&&(loadedStateSections.analyticsProject!==project||loadedStateSections.analyticsAt<stale))sections.push('analytics');
+ // 用户刚完成回滚、导入或晋升时，旧数组仍在 TTL 内也不能沿用；其他轮询继续使用 TTL。
+ if(force||view==='evolution'&&(loadedStateSections.candidatesProject!==project||loadedStateSections.candidatesAt<stale))sections.push('candidates');
+ if(force||['overview','evolution'].includes(view)&&(loadedStateSections.analyticsProject!==project||loadedStateSections.analyticsAt<stale))sections.push('analytics');
  return sections;
 }
-async function refresh(){
- const requestedProject=projectId,requestedView=view,sections=requestedStateSections(),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
+async function refresh(options={}){
+ const force=!!options.force,requestedProject=projectId,requestedView=view,sections=requestedStateSections(force),taskView=['overview','tasks'].includes(view),filter=taskView?$('task-filter').value:'all',system=taskView?String($('show-system-tasks').checked):'true',offset=taskView?taskOffset:0;
  const key=JSON.stringify([requestedProject,view,offset,filter,system,sections]);
- if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
+ if(refreshPromise){if(refreshKey===key)return refreshPromise;refreshQueued=true;refreshForce=refreshForce||force;refreshSequence++;refreshController?.abort();return new Promise((resolve,reject)=>refreshWaiters.push({resolve,reject}));}
  const ticket=++refreshSequence;clearTimeout(refreshPollTimer);
  const controller=new AbortController(),query=new URLSearchParams({project:requestedProject,limit:'50',offset:String(offset),filter,system,sections:sections.join(',')});
  refreshController=controller;refreshProject=requestedProject;refreshKey=key;let timedOut=false;const timeout=setTimeout(()=>{timedOut=true;controller.abort();},15000);
@@ -303,7 +308,7 @@ async function refresh(){
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
  })();refreshPromise=operation;
- try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0);let next;try{next=refresh();}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
+ try{return await operation;}finally{if(refreshPromise===operation){refreshPromise=null;refreshController=null;refreshProject=null;refreshKey=null;}if(refreshQueued){refreshQueued=false;const waiters=refreshWaiters.splice(0),forceNext=refreshForce;refreshForce=false;let next;try{next=refresh({force:forceNext});}catch(error){for(const waiter of waiters)waiter.reject(error);scheduleRefreshPoll();}if(next)Promise.resolve(next).then(value=>waiters.forEach(waiter=>waiter.resolve(value)),error=>waiters.forEach(waiter=>waiter.reject(error)));}else scheduleRefreshPoll();}
 }
 function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
@@ -414,7 +419,8 @@ function showView(name){
 }
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
- if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs)]))return;
+ const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
+ if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
  list.replaceChildren();
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
@@ -436,6 +442,8 @@ function renderTasks(){
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
   if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
+  else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
  }
@@ -505,11 +513,25 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
  restoreView?.(body);
  if(!$('detail-dialog').open)$('detail-dialog').showModal();}
-function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null))for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const count=(state.cases||[]).filter(c=>c.project===projectId).find(c=>c.split===split)?.count||0,card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',description));summary.append(card);}else summary.append(el('p',t('验证统计加载中。'),'muted'));
+const evolutionReasons={
+ "Need independent validation/holdout cases before proposing":"需要先导入独立的验证集和最终评估集任务，才能提出改进方案。",
+ "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses":"验证集或最终评估集的曝光次数已达上限；请导入新的评估任务，或在项目配置中调高 evolution.max_holdout_uses。",
+ "Too few independent, repeated improvements for promotion":"独立用例的重复改进证据不足，暂不能晋升。",
+ "Incomplete paired trials":"配对试验不完整。",
+ "No demonstrated improvement on each evaluated split":"每个评估集合都没有显示出改进。",
+ "Both validation and holdout are required":"需要同时覆盖验证集和最终评估集。",
+ "Candidate regressed on previously passing cases":"候选在原本通过的用例上出现退步。",
+ "Repeated paired improvement on both splits without observed regressions":"验证集和最终评估集均重复显示改进，且未观察到退步。",
+ "Paired quality improved without observed regressions; usage recorded separately":"配对质量有所提升且未观察到退步；用量单独记录。"
+};
+function evolutionReason(reason){return evolutionReasons[reason]?t(evolutionReasons[reason]):reason;}
+function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null)){const limit=Number(currentProject()?.config?.evolution?.max_holdout_uses??state.config?.evolution?.max_holdout_uses);for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const row=(state.cases||[]).find(c=>c.project===projectId&&c.split===split),count=row?.count||0,uses=row?.uses||0,usage=split!=='development'&&count>0&&Number.isFinite(limit)&&limit>0?t('已用 ')+uses+'/'+(count*limit)+' · ':'',card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',usage+description));summary.append(card);}}else summary.append(el('p',t('验证统计加载中。'),'muted'));
  $('experiment-readiness').textContent=t('改进方案需通过独立样本的前后对照验证；调用与 tokens 只记录用量。');
  const list=$('candidates');list.replaceChildren();if(loadedStateSections.candidatesProject!==(projectId||null)){list.append(el('p',t('正在加载改进方案…'),'empty-copy'));return;}const candidates=scoped(state.candidates||[]);if(!candidates.length)list.append(el('p',t('还没有改进方案。积累运行记录后会自动提出，也可以手动发起。'),'empty-copy'));
- for(const c of candidates){const card=el('article',undefined,'panel candidate-card'),top=el('div',undefined,'panel-title');top.append(el('h2',{strategy:t('执行策略'),meta_strategy:t('规划方法'),adapter:t('项目执行说明')}[c.kind]||c.kind),badge(c.status));card.append(top,el('div',(c.parent?c.parent.slice(0,8):'BASELINE')+' → '+c.id.slice(0,8),'lineage'),el('p',c.content.guidance),el('p',c.reason,'muted'),el('small',c.trial_count+t(' 组配对任务 · ')+stamp(c.created),'muted'));
-  if(c.status==='stable')card.append(action(t('恢复到上一个已验证版本'),async()=>{await api('rollback',{candidate:c.id});toast(t('策略已恢复旧版本'));await refresh();}));list.append(card);}}
+ for(const c of candidates){const card=el('article',undefined,'panel candidate-card'),top=el('div',undefined,'panel-title'),independent=c.independent_cases??c.trial_count??0,trials=c.trial_count??independent;top.append(el('h2',{strategy:t('执行策略'),meta_strategy:t('规划方法'),adapter:t('项目执行说明')}[c.kind]||c.kind),badge(c.status));card.append(top,el('div',(c.parent?c.parent.slice(0,8):'BASELINE')+' → '+c.id.slice(0,8),'lineage'),el('p',c.content.guidance),el('p',evolutionReason(c.reason),'muted'),el('small',independent+t(' 个独立用例 · 共 ')+trials+t(' 次配对运行 · ')+stamp(c.created),'muted'));
+  if(c.status==='stable')card.append(action(t('恢复到上一个已验证版本'),async()=>{await api('rollback',{candidate:c.id});toast(t('策略已恢复旧版本'));await refresh({force:true});}));
+  if(c.status==='ready')card.append(action(t('启用这个策略'),async()=>{if(!(await uiConfirm(t('启用后会替换当前稳定策略，并开始有限监控；出现回归时可以回滚。确认启用？'))))return;await api('evolution/promote',{candidate:c.id});toast(t('策略已启用'));await refresh({force:true});}));
+  list.append(card);}}
 function getPath(obj,path){return path.split('.').reduce((v,k)=>v?.[k],obj);}
 function setPath(obj,path,value){const keys=path.split('.');let node=obj;keys.slice(0,-1).forEach(k=>node=node[k]??={});node[keys.at(-1)]=value;}
 function deepMerge(a,b){for(const [key,value]of Object.entries(b)){if(value&&typeof value==='object'&&!Array.isArray(value))a[key]=deepMerge(a[key]||{},value);else a[key]=value;}return a;}
@@ -754,7 +776,7 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  if(settingsBaseline&&(settingsBaseline===baseline||settingsContext===key)&&settingsKey()===key){settingsBaseline=acknowledged;stashSettings();}
  readinessCache.clear();await refresh();if(settingsBaseline===acknowledged&&unchanged()&&$('config-scope').value===scope&&view==='settings'&&sameValue(settingsValues(),submittedValues)){settingsDrafts.delete(key);renderSettings();}
  window.RSIProduct?.savingStatus(false,true,saveKey);toast(t(unchanged()?'已保存，无需重启；新任务使用新配置':'已保存提交的配置，后续修改仍未保存。'));}finally{finishPendingSettingsSave(saveKey);button.disabled=false;window.RSIProduct?.savingStatus(false,false,saveKey);}},event.target);});
-$('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh();toast(t('评估任务已导入'));},event.target);});
+$('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh({force:true});toast(t('评估任务已导入'));},event.target);});
 const updateNames={checking:'正在检查更新',recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
 const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
 let releaseWorkflowSequence=0;

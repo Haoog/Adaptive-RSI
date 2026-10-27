@@ -59,11 +59,18 @@ class Evolution:
 
     def propose_and_evaluate(self, project, workspace, directory, run):
         config = json.loads(run["config"])
-        cases = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
-                                 "AND uses<? ORDER BY created,id", (project["id"], config["evolution"]["max_holdout_uses"]))
+        limit = config["evolution"]["max_holdout_uses"]
+        available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
+                                     "ORDER BY created,id", (project["id"],))
+        cases = [case for case in available if case["uses"] < limit]
         minimum = config["evolution"]["min_cases_per_split"]
         if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
-            reason = "Need independent validation/holdout cases before proposing"
+            # 曝光耗尽的样本仍在案例表中；若只报“样本不足”，界面会同时显示样本数量，
+            # 让人误以为导入没有生效。区分两种情况并给出可操作说明。
+            exhausted = any(case["uses"] >= limit for case in available)
+            reason = ("Validation or holdout exposure limit reached; import new cases or raise "
+                      "evolution.max_holdout_uses") if exhausted else \
+                     "Need independent validation/holdout cases before proposing"
             candidate = uid()
             self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
                 (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
@@ -148,15 +155,14 @@ class Evolution:
             if state == "pass" and config["evolution"]["auto_promote"]:
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled before promotion")
+                promoted = time.time()
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute("UPDATE candidates SET status='superseded' WHERE project=? AND kind=? AND status='stable'",
-                               (project["id"], proposal["kind"]))
-                    db.execute("UPDATE candidates SET status='stable',promoted=?,evidence=? WHERE id=?",
-                               (time.time(), encode(evidence), candidate))
-                self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)", (
-                    uid(), project["id"], None, "verified", encode(proposal["triggers"]), proposal["guidance"],
-                    encode({"candidate": candidate, "config_hash": fingerprint(config)}), time.time() + 30 * 86400, time.time()))
+                    # 晋升时重新绑定紧接着的稳定版，而不是沿用建候选时的快照；
+                    # 这样回滚始终回到刚被替换的一版（含手动/自动交替晋升）。
+                    self.activate(db, candidate, promoted, evidence)
+                self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                                   self.skill_values(project["id"], candidate, proposal, config, promoted))
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
                 state = "stable"
@@ -167,6 +173,68 @@ class Evolution:
             evidence.update(decision="insufficient_evidence", reason=str(exc))
             self.save(candidate, "interrupted" if isinstance(exc, Cancelled) else "insufficient_evidence", evidence)
             raise
+
+    @staticmethod
+    def activate(db, candidate, now, evidence=None):
+        """在调用方事务内启用候选，并把 parent 重绑到刚被替换的稳定版。"""
+        row = db.execute("SELECT project,kind FROM candidates WHERE id=?", (candidate,)).fetchone()
+        previous = db.execute(
+            "SELECT id FROM candidates WHERE project=? AND kind=? AND status='stable' "
+            "ORDER BY coalesce(promoted,created) DESC, created DESC LIMIT 1",
+            (row["project"], row["kind"])).fetchone()
+        parent = previous["id"] if previous else None
+        db.execute("UPDATE candidates SET status='superseded' WHERE project=? AND kind=? AND status='stable'",
+                   (row["project"], row["kind"]))
+        if evidence is None:
+            db.execute("UPDATE candidates SET status='stable',promoted=?,parent=? WHERE id=?",
+                       (now, parent, candidate))
+        else:
+            db.execute("UPDATE candidates SET status='stable',promoted=?,parent=?,evidence=? WHERE id=?",
+                       (now, parent, encode(evidence), candidate))
+        return parent
+
+    @staticmethod
+    def skill_values(project, candidate, content, config, now):
+        """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。"""
+        return (uid(), project, None, "verified", encode(content["triggers"]), content["guidance"],
+                encode({"candidate": candidate, "config_hash": fingerprint(config)}),
+                now + 30 * 86400, now)
+
+    def promote(self, candidate):
+        """启用一个已通过配对验证但等待人工确认的候选。"""
+        row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate,))
+        if not row:
+            raise ValueError("Candidate not found")
+        if not self.store.one("SELECT id FROM projects WHERE id=?", (row["project"],)):
+            raise ValueError("Project not found")
+        config = self.runtime.config(row["project"])
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
+            if not row:
+                raise ValueError("Candidate not found")
+            if row["status"] != "ready":
+                raise ValueError("Only a verified ready candidate can be promoted")
+            if not db.execute("SELECT id FROM projects WHERE id=?", (row["project"],)).fetchone():
+                raise ValueError("Project not found")
+            if row["kind"] not in ("strategy", "meta_strategy", "adapter"):
+                raise ValueError("Unknown candidate kind")
+            content = json.loads(row["content"] or "{}")
+            if (not isinstance(content, dict) or not isinstance(content.get("guidance"), str)
+                    or not content["guidance"].strip() or not isinstance(content.get("triggers"), list)):
+                raise ValueError("Candidate content is incomplete")
+            # 与 active_strategies 相同：旧证据无兼容指纹时仍可用，有指纹则必须匹配。
+            expected = json.loads(row["evidence"]).get("compatibility")
+            if expected and expected != compatibility(config):
+                raise ValueError("Candidate evidence is incompatible with current configuration")
+            # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
+            self.activate(db, candidate, now)
+            db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                       self.skill_values(row["project"], candidate, content, config, now))
+        self.store.event("promotion", "Ready candidate manually promoted; limited operational monitoring started",
+                         row["project"], data={"candidate": candidate})
+        return {"candidate": candidate, "status": "stable"}
 
     @staticmethod
     def split_decision(trials, config):

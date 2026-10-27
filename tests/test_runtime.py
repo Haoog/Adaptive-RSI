@@ -419,6 +419,10 @@ class RuntimeTest(unittest.TestCase):
         self.store.execute("UPDATE tasks SET state='blocked',infra_retries=3 WHERE id=?", (task,))
         self.runtime.retry(task)
         self.assertEqual(self.store.one("SELECT infra_retries FROM tasks WHERE id=?", (task,))["infra_retries"], 0)
+        # 普通排队任务（没有未来 available）不能提前重试，避免界面出现无操作入口。
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (task,))
+        with self.assertRaisesRegex(ValueError, "This task cannot be retried"):
+            self.runtime.retry(task)
 
     def test_cancel_cannot_rewrite_terminal_states(self):
         task = self.runtime.goal(self.project, "Fix addition")
@@ -615,6 +619,23 @@ Path(%r).write_text('allowed output')
         self.assertEqual(candidates[0]["status"], "insufficient_evidence")
         self.assertEqual(self.runtime.active_strategies(self.project), [])
 
+    def test_exhausted_holdout_exposure_gets_an_actionable_reason(self):
+        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 3,
+                                              "max_holdout_uses": 3}}, self.project)
+        now = time.time()
+        for index, split in enumerate(["validation"] * 3 + ["holdout"] * 3):
+            self.store.execute("INSERT INTO cases(id,project,family,split,spec,uses,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               ("case-" + str(index), self.project, "family-" + str(index), split, "{}", 3, now))
+        project = self.runtime.project(self.project)
+        result = Evolution(self.runtime).propose_and_evaluate(
+            project, self.root / "workspace", self.root / "experiments",
+            {"id": "exhausted-run", "config": encode(self.runtime.config(self.project))})
+        reason = "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses"
+        self.assertEqual(result["reason"], reason)
+        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertEqual(json.loads(self.store.one("SELECT evidence FROM candidates")["evidence"])["reason"], reason)
+
     def test_case_families_cannot_leak_between_splits(self):
         manifest = {"family": "addition", "split": "validation", "repository": str(self.repo), "base": "HEAD",
                     "task": "Correct add", "checks": CHECKS, "source": "synthetic"}
@@ -634,6 +655,187 @@ Path(%r).write_text('allowed output')
         self.runtime.rollback_strategy("b")
         self.assertEqual(self.runtime.active_strategies(self.project)[0]["id"], "a")
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
+
+    def test_manual_promotion_requires_ready_and_writes_verified_skill(self):
+        content = {"guidance": "Reproduce arithmetic boundary cases before editing", "triggers": ["add"]}
+        evidence = {"reason": "Repeated paired improvement", "trials": [{"case": "case-a"}]}
+        for candidate, parent, status in [("old", None, "stable"), ("ready", "old", "ready"),
+                                          ("evaluating", None, "evaluating")]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", parent, status, encode(content),
+                                encode(evidence), time.time()))
+        result = self.runtime.promote_strategy("ready")
+        self.assertEqual(result, {"candidate": "ready", "status": "stable"})
+        promoted = self.store.one("SELECT * FROM candidates WHERE id='ready'")
+        self.assertEqual(promoted["status"], "stable")
+        self.assertIsNotNone(promoted["promoted"])
+        self.assertEqual(json.loads(promoted["evidence"]), evidence, "manual promotion preserves evaluation evidence")
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='old'")["status"], "superseded")
+        skill = self.store.one("SELECT * FROM skills")
+        config = self.runtime.config(self.project)
+        # 自动晋升与手动晋升使用同一种技能行（verified、30 天过期、含候选与配置指纹）。
+        expected = Evolution.skill_values(self.project, "ready", content, config, skill["created"])
+        self.assertEqual((skill["project"], skill["task"], skill["status"], skill["triggers"],
+                          skill["content"], skill["evidence"], skill["expires"], skill["created"]),
+                         expected[1:])
+        self.assertAlmostEqual(skill["expires"] - skill["created"], 30 * 86400)
+        self.assertEqual(json.loads(skill["evidence"]),
+                         {"candidate": "ready", "config_hash": fingerprint(config)})
+        self.assertEqual(promoted["parent"], "old", "promotion rebinds to the stable it replaced")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["ready"])
+        event = self.store.one("SELECT * FROM events WHERE kind='promotion' ORDER BY seq DESC")
+        self.assertEqual(json.loads(event["data"]), {"candidate": "ready"})
+        with self.assertRaisesRegex(ValueError, "Only a verified ready candidate can be promoted"):
+            self.runtime.promote_strategy("ready")
+        with self.assertRaisesRegex(ValueError, "Only a verified ready candidate can be promoted"):
+            self.runtime.promote_strategy("evaluating")
+        with self.assertRaisesRegex(ValueError, "Candidate not found"):
+            self.runtime.promote_strategy("missing")
+        self.runtime.rollback_strategy("ready")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["old"])
+        self.assertEqual(self.store.one("SELECT status FROM skills")["status"], "invalidated")
+        self.assertEqual(len(self.store.query("SELECT * FROM skills")), 1)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='promotion'")), 1)
+
+    def test_manual_promotion_rejects_incompatible_evidence_without_side_effects(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        previous = self.runtime.config(self.project)
+        self.runtime.configure({"review": {"block_on": "high"}}, self.project)
+        current = self.runtime.config(self.project)
+        self.assertNotEqual(compatibility(previous), compatibility(current))
+        for kind in ("strategy", "meta_strategy", "adapter"):
+            for suffix, status, config in [("old", "stable", current), ("ready", "ready", previous)]:
+                candidate = kind + "-" + suffix
+                self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                                   "VALUES (?,?,?,?,?,?,?)",
+                                   (candidate, self.project, kind, status, encode(content),
+                                    encode({"compatibility": compatibility(config)}), time.time()))
+            self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                               Evolution.skill_values(self.project, kind + "-old", content, current, time.time()))
+        before = {table: self.store.query("SELECT * FROM " + table) for table in ("candidates", "skills", "events")}
+        active = self.runtime.active_strategies(self.project)
+        memories = self.runtime.memories(self.project, "add")
+        self.assertEqual(len(active), 3)
+        self.assertTrue(memories)
+        for kind in ("strategy", "meta_strategy", "adapter"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "^Candidate evidence is incompatible with current configuration$"):
+                    self.runtime.promote_strategy(kind + "-ready")
+                for table, rows in before.items():
+                    self.assertEqual(self.store.query("SELECT * FROM " + table), rows, table)
+                self.assertEqual(self.runtime.active_strategies(self.project), active)
+                self.assertEqual(self.runtime.memories(self.project, "add"), memories)
+
+    def test_manual_promotion_uses_active_strategy_compatibility_rules(self):
+        previous = self.runtime.config(self.project)
+        self.runtime.configure({"schedule": {"light_minutes": 600}}, self.project)
+        current = self.runtime.config(self.project)
+        self.assertNotEqual(fingerprint(previous), fingerprint(current))
+        self.assertEqual(compatibility(previous), compatibility(current))
+        for candidate, evidence in [("matching", {"compatibility": compatibility(previous)}),
+                                    ("legacy", {}), ("null", {"compatibility": None}),
+                                    ("empty", {"compatibility": ""})]:
+            with self.subTest(candidate=candidate):
+                evidence["config_hash"] = fingerprint(previous)
+                self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                                   "VALUES (?,?,?,?,?,?,?)",
+                                   (candidate, self.project, "strategy", "ready",
+                                    encode({"guidance": "Check arithmetic boundaries", "triggers": ["add"]}),
+                                    encode(evidence), time.time()))
+                self.assertEqual(self.runtime.promote_strategy(candidate),
+                                 {"candidate": candidate, "status": "stable"})
+                self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], [candidate])
+                self.assertEqual(json.loads(self.store.one("SELECT evidence FROM candidates WHERE id=?",
+                                                          (candidate,))["evidence"]), evidence)
+
+    def test_auto_activation_rebinds_parent_and_persists_evidence(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, status, created in [("a", "stable", 1), ("auto", "evaluating", 2)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", status, encode(content), "{}", created))
+        evidence = {"decision": "pass", "trials": [{"case": "case-a"}]}
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            parent = Evolution.activate(db, "auto", now, evidence)
+        self.assertEqual(parent, "a")
+        row = self.store.one("SELECT * FROM candidates WHERE id='auto'")
+        self.assertEqual((row["status"], row["parent"], row["promoted"]), ("stable", "a", now))
+        self.assertEqual(json.loads(row["evidence"]), evidence)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='a'")["status"], "superseded")
+
+    def test_consecutive_manual_promotions_roll_back_through_previous_stables(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, status, created in [("a", "stable", 1), ("r1", "ready", 2), ("r2", "ready", 3)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", status, encode(content), "{}", created))
+        self.runtime.promote_strategy("r1")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r1'")["parent"], "a")
+        self.runtime.promote_strategy("r2")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r2'")["parent"], "r1")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r2"])
+        self.runtime.rollback_strategy("r2")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r1"])
+        self.runtime.rollback_strategy("r1")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["a"])
+
+    def test_two_manual_promotions_without_prior_stable_roll_back_to_the_first(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, created in [("r1", 1), ("r2", 2)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", "ready", encode(content), "{}", created))
+        self.runtime.promote_strategy("r1")
+        self.assertIsNone(self.store.one("SELECT parent FROM candidates WHERE id='r1'")["parent"])
+        self.runtime.promote_strategy("r2")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r2'")["parent"], "r1")
+        self.runtime.rollback_strategy("r2")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r1"])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='r1'")["status"], "stable")
+
+    def test_manual_promotion_rejects_invalid_project_kind_and_content(self):
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                           "VALUES ('missing-project','absent','strategy','ready',?,?,?)",
+                           (encode({"guidance": "g", "triggers": []}), '{}', time.time()))
+        with self.assertRaisesRegex(ValueError, "Project not found"):
+            self.runtime.promote_strategy("missing-project")
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                           "VALUES ('bad-kind',?,'other','ready',?,?,?)",
+                           (self.project, encode({"guidance": "g", "triggers": []}), '{}', time.time()))
+        with self.assertRaisesRegex(ValueError, "Unknown candidate kind"):
+            self.runtime.promote_strategy("bad-kind")
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                           "VALUES ('bad-content',?,'strategy','ready',?,?,?)",
+                           (self.project, encode({"guidance": " ", "triggers": []}), '{}', time.time()))
+        with self.assertRaisesRegex(ValueError, "Candidate content is incomplete"):
+            self.runtime.promote_strategy("bad-content")
+        self.assertEqual(self.store.query("SELECT * FROM skills"), [])
+        self.assertEqual(self.store.query("SELECT * FROM events WHERE kind='promotion'"), [])
+
+    def test_manual_promotion_is_idempotent_under_concurrent_clicks(self):
+        content = {"guidance": "Reproduce arithmetic boundary cases before editing", "triggers": ["add"]}
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                           "VALUES ('race',?,'strategy','ready',?,?,?)",
+                           (self.project, encode(content), encode({"reason": "verified"}), time.time()))
+        barrier = threading.Barrier(4)
+        def click():
+            barrier.wait()
+            try:
+                return self.runtime.promote_strategy("race")
+            except ValueError as exc:
+                return str(exc)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: click(), range(4)))
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 1, results)
+        self.assertEqual([result for result in results if isinstance(result, str)],
+                         ["Only a verified ready candidate can be promoted"] * 3)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='race'")["status"], "stable")
+        self.assertIsNone(self.store.one("SELECT parent FROM candidates WHERE id='race'")["parent"])
+        self.assertEqual(len(self.store.query("SELECT * FROM skills")), 1)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='promotion'")), 1)
 
     def test_github_sync_uses_incremental_cursor_dedupes_and_closes(self):
         config = merge(self.runtime.config(self.project), {"github": {"repository": "owner/repo"}})

@@ -102,6 +102,31 @@ def main():
                 for name in ["过时任务重试入口", "过时任务补充入口"]:
                     obsolete = runtime.store.add_task(project, "goal", name, name)
                     runtime.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete,))
+            if os.environ.get("RSI_BROWSER_REVISION_FLOW"):
+                # 修订与退避体验专项：长文本溢出、退避立即重试、普通排队无重试入口。
+                # 历史任务占满第一页会把退避任务挤出列表，仅保留少量排队任务。
+                runtime.store.execute(
+                    "UPDATE tasks SET state='merged' WHERE id IN "
+                    "(SELECT id FROM tasks WHERE project=? AND title LIKE '历史任务 %' LIMIT 50)", (project,))
+                now = time.time()
+                backoff = runtime.store.add_task(project, "goal", "revision-backoff", "自动退避中的任务",
+                                                 priority=130)
+                runtime.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=?",
+                                      (now + 3600, backoff))
+                plain = runtime.store.add_task(project, "goal", "revision-plain", "普通排队任务", priority=130)
+                runtime.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (plain,))
+                long_body = "来源正文 " + "Z" * 600 + " https://example.test/" + "a" * 300
+                revised = runtime.store.add_task(project, "goal", "revision-long", "修订长文本任务", long_body,
+                                                 priority=100)
+                runtime.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (revised,))
+                for index, supplement in enumerate([
+                    "无空格长串 " + "X" * 700,
+                    "长链接 https://example.test/" + "b" * 320,
+                ]):
+                    runtime.store.execute(
+                        "INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
+                        (revised, long_body if index == 0 else long_body + "\n\n" + "X" * 700,
+                         supplement, now + index))
             if os.environ.get("RSI_BROWSER_TASK_DETAIL"):
                 # 任务详情专项：多运行历史懒加载、待交付取消、等待额度/过时任务详情内重试。
                 now = time.time()
@@ -205,6 +230,37 @@ def main():
                     current = runtime.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"]
                     assert current == state, (task, current, state)
                     assert runtime.store.one("SELECT data FROM task_decisions WHERE task=?", (task,)), task
+            if os.environ.get("RSI_BROWSER_EVOLUTION"):
+                # 自动改进可用性专项：稳定/待启用/曝光耗尽候选与各集合曝光量，
+                # 全部直接落库，不调用模型，也不改变自动晋升配置。
+                now = time.time()
+                guidance = "Reproduce arithmetic boundary cases before editing"
+                stable_evidence = json.dumps({
+                    "reason": "Repeated paired improvement on both splits without observed regressions",
+                    "trials": [{"case": "browser-case-" + str(index % 3), "split": "validation",
+                                "repetition": index // 3} for index in range(12)]})
+                ready_evidence = json.dumps({
+                    "reason": "Paired quality improved without observed regressions; usage recorded separately",
+                    "trials": [{"case": "browser-case-" + str(index % 3), "split": "holdout",
+                                "repetition": index // 3} for index in range(12)]})
+                exhausted_evidence = json.dumps({
+                    "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
+                    "trials": []})
+                content = json.dumps({"guidance": guidance, "triggers": ["add"]})
+                for candidate, parent, status, evidence, created in [
+                        ("browser-stable", None, "stable", stable_evidence, now - 3000),
+                        ("browser-ready", "browser-stable", "ready", ready_evidence, now - 2000),
+                        ("browser-exhausted", "browser-stable", "insufficient_evidence", exhausted_evidence, now - 1000)]:
+                    runtime.store.execute(
+                        "INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (candidate, project, "strategy", parent, status, content, evidence, created))
+                for split, count, uses in [("development", 4, 0), ("validation", 3, 2), ("holdout", 3, 3)]:
+                    for index in range(count):
+                        runtime.store.execute(
+                            "INSERT INTO cases(id,project,family,split,spec,uses,created) VALUES (?,?,?,?,?,?,?)",
+                            ("browser-" + split + "-" + str(index), project,
+                             "browser-" + split + "-" + str(index), split, "{}", uses, now))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -1138,6 +1138,73 @@ test('core-only state keeps loaded analytics, then evolution requests missing se
   assert.equal(vm.runInContext('state.candidates[0].id',page.context),'c1');
 });
 
+function textOf(node){return [node.textContent||'',...(node.children||[]).map(textOf)].filter(Boolean).join(' ');}
+function buttonWith(node,label){return (node.children||[]).map(child=>child.textContent===label?child:buttonWith(child,label)).find(Boolean);}
+
+test('evolution suites show exposure, independent cases and translated controller reasons', () => {
+  const page = browser();
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';state={...initialState,selected_project:'a',config:{evolution:{max_holdout_uses:3}},projects:[{id:'a',name:'A',paused:true,config:{evolution:{max_holdout_uses:3}}}],cases:[{project:'a',split:'development',count:4,uses:0},{project:'a',split:'validation',count:3,uses:6},{project:'a',split:'holdout',count:3,uses:9}],candidates:[{id:'ready-1',project:'a',kind:'strategy',status:'ready',content:{guidance:'Guide'},reason:'Paired quality improved without observed regressions; usage recorded separately',independent_cases:3,trial_count:12,created:100},{id:'exhausted-1',project:'a',kind:'strategy',status:'insufficient_evidence',content:{guidance:'Guide'},reason:'Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses',independent_cases:0,trial_count:0,created:100}]};loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();renderEvolution()`, page.context);
+  const suites = page.node('suite-summary').children.map(textOf);
+  assert.equal(suites.length, 3);
+  assert.match(suites[1], /已用 6\/9/);
+  assert.match(suites[1], /配对比较 · 受限复用/);
+  assert.match(suites[2], /已用 9\/9/);
+  assert.doesNotMatch(suites[0], /已用/);
+  const cards = page.node('candidates').children;
+  assert.equal(cards.length, 2);
+  const ready = textOf(cards[0]);
+  assert.match(ready, /3 个独立用例 · 共 12 次配对运行/);
+  assert.match(ready, /配对质量有所提升且未观察到退步；用量单独记录。/);
+  assert.ok(buttonWith(cards[0], '启用这个策略'), 'ready candidate exposes manual promotion');
+  assert.equal(buttonWith(cards[0], '恢复到上一个已验证版本'), undefined);
+  const exhausted = textOf(cards[1]);
+  assert.match(exhausted, /曝光次数已达上限/);
+  assert.match(exhausted, /evolution\.max_holdout_uses/);
+  assert.doesNotMatch(exhausted, /Validation or holdout exposure limit reached/);
+});
+
+test('rollback forces candidates and analytics refresh despite the TTL', async () => {
+  const page = browser(), requests = [];
+  page.context.fetch = async (url, options = {}) => {
+    if (url === '/api/rollback') return response({saved: true});
+    const sections = new URLSearchParams(url.split('?')[1]).get('sections');
+    requests.push(sections);
+    return response({...snapshot('next'), selected_project: 'a', sections: sections.split(','),
+      candidates: [{id: 'c1', project: 'a', kind: 'strategy', status: 'rolled_back',
+        content: {guidance: 'g'}, reason: 'Repeated paired improvement on both splits without observed regressions',
+        independent_cases: 1, trial_count: 2, created: 100}],
+      cases: [{project: 'a', split: 'development', count: 5, uses: 0}], quality: [], usage: [], model_usage: []});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'c1',project:'a',kind:'strategy',status:'stable',content:{guidance:'g'},reason:'Repeated paired improvement on both splits without observed regressions',trial_count:2,created:100}]};renderEvolution()`, page.context);
+  const card = page.node('candidates').children[0];
+  buttonWith(card, '恢复到上一个已验证版本').handlers.click();
+  await page.context.lastAction;
+  assert.deepEqual(requests, ['core,candidates,analytics']);
+  assert.equal(vm.runInContext('state.cases[0].count', page.context), 5);
+  vm.runInContext('renderEvolution()', page.context);
+  assert.match(textOf(page.node('candidates').children[0]), /已恢复旧版本/);
+});
+
+test('importing an evaluation case forces the suite counts to refresh immediately', async () => {
+  const page = browser(), requests = [], posts = [];
+  page.node('case-form').reset = () => {};
+  page.node('case-json').value = JSON.stringify({family: 'f', split: 'holdout'});
+  page.context.fetch = async (url, options = {}) => {
+    if (url === '/api/cases') { posts.push(JSON.parse(options.body)); return response({id: 'new-case'}); }
+    const sections = new URLSearchParams(url.split('?')[1]).get('sections');
+    requests.push(sections);
+    return response({...snapshot('next'), selected_project: 'a', sections: sections.split(','),
+      candidates: [], cases: [{project: 'a', split: 'development', count: 4, uses: 0},
+        {project: 'a', split: 'holdout', count: 4, uses: 9}], quality: [], usage: [], model_usage: []});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0},{project:'a',split:'holdout',count:3,uses:9}],candidates:[]};renderEvolution()`, page.context);
+  await page.submit('case-form');
+  assert.deepEqual(requests, ['core,candidates,analytics']);
+  assert.equal(vm.runInContext('state.cases.find(c=>c.split==="holdout").count', page.context), 4);
+  vm.runInContext('renderEvolution()', page.context);
+  assert.match(textOf(page.node('suite-summary').children[2]), /4 最终评估集/);
+});
+
 for(const staleFails of [false,true]){
 test(`an outdated readiness ${staleFails?'failure':'success'} cannot erase the newer result`,async()=>{
   const page=browser(),pending=[];
@@ -1508,6 +1575,54 @@ test('expired candidates returned by attention pagination remain visible with a 
   assert.equal(page.node('tasks-page').textContent, '1–1 / 1');
 });
 
+test('queued backoff tasks expose an immediate retry entry while ordinary queued tasks do not', () => {
+  const page = browser();
+  page.context.language = 'zh-CN';
+  page.node('task-filter').value = 'active';
+  page.node('show-system-tasks').checked = false;
+  const available = Math.floor(Date.now() / 1000) + 3600;
+  vm.runInContext(`state={...initialState,selected_project:"a",tasks:[
+    {id:"backoff",project:"a",source:"goal",title:"Backoff task",state:"queued",display_state:"queued",available:${available},updated:1},
+    {id:"plain",project:"a",source:"goal",title:"Plain queue task",state:"queued",display_state:"queued",available:0,updated:1},
+    {id:"hours",project:"a",source:"goal",title:"Working hours task",state:"queued",display_state:"queued",wait_reason:"working_hours",available:${available},updated:1}
+  ],runs:[],pagination:{total:3,limit:50,offset:0,has_more:false}};renderTasks()`, page.context);
+  const rows = page.node('tasks-list').children;
+  const labels = title => rows
+    .find(row => row.children[0].children[0].textContent === title)
+    .children[2].children.map(child => child.textContent);
+  assert.deepEqual(labels('Backoff task'), ['立即重试', '查看详情']);
+  assert.deepEqual(labels('Plain queue task'), ['查看详情']);
+  assert.deepEqual(labels('Working hours task'), ['查看详情']);
+});
+
+test('queued retry entry expires when the clock advances with unchanged task data', () => {
+  const page=browser();page.context.language='zh-CN';page.node('task-filter').value='active';
+  vm.runInContext(`Date.now=()=>1700000000000;state={...initialState,selected_project:'a',tasks:[
+    {id:'backoff',project:'a',source:'goal',title:'Backoff task',state:'queued',available:1700000001,updated:1}
+  ],runs:[]};renderTasks()`,page.context);
+  const labels=()=>page.node('tasks-list').children[0].children[2].children.map(node=>node.textContent);
+  assert.ok(labels().includes('立即重试'));
+  vm.runInContext('Date.now=()=>1700000001000;renderTasks()',page.context);
+  assert.ok(!labels().includes('立即重试'));
+});
+
+test('live detail removes expired backoff retry without rebuilding supplement drafts', async () => {
+  const task={...fixtureTask('child','queued'),available:1700000001};
+  const page=revisionMetadataPage(task,{...task,dependency:null,revisions:[]});
+  vm.runInContext('Date.now=()=>1700000000000',page.context);
+  const controls=await openExperienceTask(page,task);
+  const retry=()=>controls.children.find(node=>node.textContent==='立即重试');
+  assert.ok(retry());
+  retry().remove=()=>{controls.children=controls.children.filter(node=>node.textContent!=='立即重试');};
+  const form=controls.children.find(node=>node.tagName==='FORM'),textarea=form.children[0].children[0];
+  textarea.value='尚未保存的补充草稿';
+  vm.runInContext('Date.now=()=>1700000001000',page.context);
+  page.fireTimer(5000);await new Promise(setImmediate);await page.context.lastAction;
+  assert.ok(!retry());
+  assert.equal(textarea.value,'尚未保存的补充草稿');
+  assert.ok(page.node('detail-body').children.includes(controls),'expiry keeps the controls and draft DOM');
+});
+
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
   for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
     const page=browser();page.node('config-scope').value='project';
@@ -1529,6 +1644,28 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   assert.equal(english['通用'],'General');
   const definitions=[...i18n.matchAll(/^  "((?:[^"\\]|\\.)*)":/gm)].map(match=>match[1]);
   assert.equal(definitions.length,new Set(definitions).size,'english 对象存在重复定义的 key');
+});
+
+test('revision and backoff messages are mapped and localized for both console languages', () => {
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  const apiBlock=source.slice(source.indexOf('const apiErrors={'),source.indexOf('function reviseForm'));
+  const apiErrors=JSON.parse('{'+apiBlock.slice(apiBlock.indexOf('{')+1,apiBlock.lastIndexOf('}'))+'}');
+  for(const message of ['Supplement must contain 1..10000 characters',
+    'Pause or finish active work before supplementing this task',
+    'Combined requirements exceed 30000 characters'])
+    assert.ok(Object.hasOwn(apiErrors,message),'server validation message must be mapped: '+message);
+  for(const key of ['立即重试',
+    '补充需求不能为空，请输入需要保留或补充的要求。',
+    '补充需求不能为空，且不能超过 10000 个字符。请缩短后重试。',
+    '该任务正在运行或属于系统自动任务，暂不能补充需求。请等待当前运行结束后再试。',
+    '合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。'])
+    assert.equal(typeof english[key],'string','english dictionary misses: '+key);
+  assert.equal(english['立即重试'],'Retry now');
+  const compatibilityError='Candidate evidence is incompatible with current configuration';
+  const mapped=vm.runInContext(`apiErrors[${JSON.stringify(compatibilityError)}]`,browser().context);
+  assert.match(mapped,/重新评估/);
+  assert.match(english[mapped],/Reevaluate/);
 });
 
 function experiencePage({navigation = false} = {}) {
@@ -1573,6 +1710,72 @@ async function openExperienceTask(page, task) {
   await page.context.lastAction;
   return page.node('detail-body').children.find(node => node.className === 'task-controls');
 }
+
+function revisionMetadataPage(task, metadata) {
+  const page = experiencePage();
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') return response({saved: true});
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response(metadata);
+    if (url.includes('/state?')) return response({tasks: []});
+    return response(metadata);
+  };
+  return page;
+}
+
+test('detail retry is offered only for a queued task waiting on backoff', async () => {
+  for (const [offset, expected] of [[3600, true], [0, false]]) {
+    const task = fixtureTask('child', 'queued');
+    const available = Math.floor(Date.now() / 1000) + offset;
+    const page = revisionMetadataPage(task, {...task, available, dependency: null, revisions: []});
+    const controls = await openExperienceTask(page, task);
+    const labels = controls.children.filter(node => node.tagName === 'BUTTON').map(node => node.textContent);
+    assert.equal(labels.includes('立即重试'), expected, `available offset ${offset}`);
+  }
+});
+
+test('a whitespace-only supplement is rejected inside the form without a request', async () => {
+  const task = fixtureTask('child', 'failed'), posts = [];
+  const page = revisionMetadataPage(task, {...task, available: 0, dependency: null, revisions: []});
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') { posts.push(JSON.parse(options.body)); return response({saved: true}); }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response({...task, available: 0, dependency: null, revisions: []});
+    return response({tasks: []});
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.find(node => node.tagName === 'FORM');
+  const textarea = form.children[0].children[0];
+  textarea.value = '   \n\t ';
+  form.onsubmit({preventDefault() {}});
+  await page.context.lastAction;
+  assert.deepEqual(posts, [], 'blank input must not reach the server');
+  const error = form.children.find(node => node.className === 'form-error');
+  assert.match(error.textContent, /补充需求不能为空/);
+  assert.equal(textarea.value, '   \n\t ', 'the draft stays editable');
+});
+
+test('an oversized Issue composition explains the 30000-character limit in the form', async () => {
+  const task = fixtureTask('issue-task', 'queued');
+  const page = revisionMetadataPage(task, {...task, source: 'issue', available: 0, dependency: null, revisions: []});
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') return response(
+      {error: 'Combined requirements exceed 30000 characters', error_code: 'validation_error'}, 400);
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response({...task, source: 'issue', available: 0, dependency: null, revisions: []});
+    return response({tasks: []});
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.find(node => node.tagName === 'FORM');
+  form.children[0].children[0].value = '0123456789';
+  form.onsubmit({preventDefault() {}});
+  await page.context.lastAction;
+  const error = form.children.find(node => node.className === 'form-error');
+  assert.match(error.textContent, /合并后的需求超过 30000 个字符/);
+  assert.match(error.textContent, /缩短补充内容/);
+});
 
 function queueForm(page) {
   return page.node('detail-body').children.find(node => node.className === 'task-controls')

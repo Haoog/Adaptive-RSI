@@ -491,6 +491,20 @@ main {
 .detail-section>summary {
   font-size:13px;
 }
+/* 任务详情的来源、证据和修订正文可能包含无空格长串或长链接，必须在容器内换行。 */
+#detail-body p,
+#detail-body li,
+#detail-body dd,
+#detail-body summary,
+#detail-body h3,
+#detail-body h4,
+.experience-dialog p,
+.experience-dialog li,
+.experience-dialog dd,
+.experience-dialog summary {
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
 .stage-progress {
   margin:16px 0;
 }
