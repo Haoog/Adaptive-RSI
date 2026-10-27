@@ -64,3 +64,5 @@ The updater uses separate version directories and active pointers, rereads the o
 The legacy 0.3.0 supervisor has no phase journal or supervisor lock. Allow its original supervisor 90 seconds to finish; absence of the new lock never triggers takeover or candidate shutdown. If completion remains unconfirmed, preserve the current database and require manual recovery. The actual installed 0.3.0 supervisor has been tested upgrading to the current candidate code in temporary state while polling status continuously, verifying normal handoff and database preservation. This does not replace validation of official release assets.
 
 Already loaded Codex plugin metadata still requires a marketplace refresh and Codex restart. After a managed upgrade, `STATE/installations/current` is a stable entry point. Wheel users update with pip or switch to the bundled launcher.
+
+Optional `updates.require_provenance=true` additionally verifies GitHub attestations before installation; it defaults to off. See [batch hardening and configuration](docs/audit-hardening.en.md). The desktop Developer ID and notarization path needs real Apple credentials; builds without them remain ad-hoc.

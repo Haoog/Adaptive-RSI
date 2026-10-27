@@ -71,8 +71,11 @@ def detect(root):
         if "package.json" in names:
             try:
                 package = json.loads((folder / "package.json").read_text())
+                if not isinstance(package, dict) or not isinstance(package.get("scripts", {}), dict):
+                    raise ValueError("package.json scripts must be an object")
                 tool = "pnpm" if "pnpm-lock.yaml" in names else "yarn" if "yarn.lock" in names else "npm"
                 checks = [[tool, "run", s] for s in ["test", "typecheck", "lint"] if s in package.get("scripts", {})
+                          and isinstance(package["scripts"][s], str)
                           and "no test specified" not in package["scripts"][s].lower()]
                 modules.append(module("JavaScript / TypeScript", "package.json", cwd, tool, checks))
             except (ValueError, OSError, TypeError):

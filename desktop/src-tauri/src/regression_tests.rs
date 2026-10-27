@@ -183,16 +183,14 @@ fn a_second_download_is_refused_even_if_the_flag_was_cleared() {
             "9.9.9"
         )
     );
-    assert!(
-        state
-            .update
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .downloading
-            .load(Ordering::Relaxed)
-    );
+    assert!(state
+        .update
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .downloading
+        .load(Ordering::Relaxed));
     // 模拟下载推进与并发状态替换：进度已更新、downloading 标志被清零。
     {
         let update = state.update.lock().unwrap();
@@ -229,7 +227,14 @@ fn download_refused_without_update_state_or_while_flagged_downloading() {
     *state.update.lock().unwrap() = Some(update_state(true, 1200));
     assert!(begin_desktop_download(&state, &gate).is_err());
     assert_eq!(
-        state.update.lock().unwrap().as_ref().unwrap().percent.load(Ordering::Relaxed),
+        state
+            .update
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .percent
+            .load(Ordering::Relaxed),
         1200,
         "refused download must not reset progress"
     );

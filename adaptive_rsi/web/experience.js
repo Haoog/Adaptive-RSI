@@ -67,7 +67,7 @@ window.RSIExperience = (() => {
     stashGoalDraft();
     closeTaskDetail();
     projectId = task.project;
-    localStorage.setItem("rsi-project", projectId);
+    localWrite("rsi-project", projectId);
     restoreGoalDraft();
     settingsBaseline = null;
     taskOffset = 0;
@@ -85,7 +85,7 @@ window.RSIExperience = (() => {
     box.append(el("p", t("查看通知不会替你处理任务。"), "muted"));
     const notify = action(t("启用系统通知"), async () => {
       if (window.RSIDesktop) {
-        localStorage.setItem(notificationKey, "true");
+        localWrite(notificationKey, "true");
         toast(t("通知已启用"));
         return;
       }
@@ -94,7 +94,7 @@ window.RSIExperience = (() => {
         return;
       }
       const result = await Notification.requestPermission();
-      localStorage.setItem(
+      localWrite(
         notificationKey,
         JSON.stringify(result === "granted"),
       );
@@ -111,7 +111,7 @@ window.RSIExperience = (() => {
       action(
         t("关闭系统通知"),
         () => {
-          localStorage.setItem(notificationKey, "false");
+          localWrite(notificationKey, "false");
           toast(t("系统通知已关闭"));
         },
         "text-button",
@@ -144,8 +144,8 @@ window.RSIExperience = (() => {
     try {
       const data = await api("attention");
       if (seenInstance !== data.instance) {
-        if (seenInstance) localStorage.removeItem(notificationKey + ':seen:' + seenInstance);
-        localStorage.removeItem(notificationKey + ':seen');
+        if (seenInstance) localRemove(notificationKey + ':seen:' + seenInstance);
+        localRemove(notificationKey + ':seen');
         seenInstance = data.instance;
         seen = readSaved(notificationKey + ':seen:' + seenInstance, {});
       } else {
@@ -201,7 +201,7 @@ window.RSIExperience = (() => {
               (data.projects.find((p) => p.id === task.project)?.name || "");
           try {
             if (window.RSIDesktop)
-              window.RSIDesktop.invoke("notify", { title, body, task: task.id, project: task.project }).catch(() => {});
+              await window.RSIDesktop.invoke("notify", { title, body, task: task.id, project: task.project });
             else if (
               "Notification" in window &&
               Notification.permission === "granted"
@@ -245,7 +245,7 @@ window.RSIExperience = (() => {
         merged[id] = signature;
       }
       seen = Object.fromEntries(Object.entries(merged).slice(-5000));
-      localStorage.setItem(notificationKey + ':seen:' + seenInstance, JSON.stringify(seen));
+      localWrite(notificationKey + ':seen:' + seenInstance, JSON.stringify(seen));
     } catch {
     } finally {
       inboxBusy = false;
@@ -935,22 +935,20 @@ window.RSIExperience = (() => {
     link.onclick = (event) => {
       event.preventDefault();
       safe(async () => {
-        const parts = [];
-        let offset = 0, size;
-        do {
-          const chunk = await api("backup?id=" + id + "&format=json&offset=" + offset);
-          const data = Uint8Array.from(atob(chunk.data), c => c.charCodeAt(0));
-          parts.push(data);
-          offset += data.length;
-          size = chunk.size;
-          if (!data.length && offset < size) throw Error(t("备份读取未完成"));
-        } while (offset < size);
-        const url = URL.createObjectURL(new Blob(parts, { type: "application/vnd.sqlite3" }));
-        const download = el("a");
-        download.href = url;
-        download.download = link.download;
-        download.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        const box = dialog("下载备份"), progress = el("progress"), status = el("p");
+        const cancel = action(t("取消下载"), () => window.RSIDesktop.invoke("backup_download_status", {cancel: true}));
+        box.append(progress, status, cancel);
+        const timer = setInterval(async () => {
+          try {
+            const data = await window.RSIDesktop.invoke("backup_download_status", {cancel: false});
+            progress.max = data.total || 1; progress.value = data.bytes;
+            status.textContent = (data.bytes / 1048576).toFixed(1) + " / " + (data.total / 1048576).toFixed(1) + " MB";
+          } catch {}
+        }, 500);
+        box.addEventListener("close", () => window.RSIDesktop.invoke("backup_download_status", {cancel: true}).catch(() => {}));
+        try {
+          await window.RSIDesktop.invoke("download_backup", {id});
+        } finally {clearInterval(timer); box.close();}
       });
     };
   }

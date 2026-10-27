@@ -126,7 +126,7 @@ flowchart TD
 
 仅服务/模型不可用、限流等错误触发备用路由；原生实现工具已经修改工作区后，不再切换实现以免混入半成品。检查或代码评审失败不会靠换模型绕过。调用记录包含服务、模型、强度、用量；修改模型、服务地址或评审规则会使旧策略验证证据失配。
 
-**用量只记录，不设额度**：Codex 和 OpenCode 按 CLI 会话统计，原生接口按 HTTP 请求统计。记录输入、输出及可获得的缓存 tokens，缺少用量时标为未知；费用仅作估算。旧配置中的每日/每轮调用、任务总时长、命令时长、改动文件数及实验调用额度不再生效。暂停、取消、连接超时和异常恢复继续有效。
+**用量只记录，不设额度**：Codex 和 OpenCode 按 CLI 会话统计，原生接口按 HTTP 请求统计。记录输入、输出及可获得的缓存 tokens，缺少用量时标为未知；费用仅作估算。旧配置中的每日/每轮调用、任务总时长、改动文件数及实验调用额度不再生效。`limits.command_seconds` 仍是安全超时（60–86400 秒）。暂停、取消、连接超时和异常恢复继续有效。
 
 协议参考：[Responses 工具调用](https://developers.openai.com/api/docs/guides/function-calling)、[Anthropic 工具调用](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview)、[Gemini 函数调用](https://ai.google.dev/gemini-api/docs/function-calling)。本地协议替身测试通过，真实厂商调用尚待验证。
 

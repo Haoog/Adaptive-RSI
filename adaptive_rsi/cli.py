@@ -114,6 +114,10 @@ def api(root, path, data=None):
 
 
 def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["internal-native-transport"]:
+        from .native_transport import main as transport_main
+        return transport_main()
     parser = argparse.ArgumentParser(prog="adaptive-rsi", description="Adaptive RSI local autonomous improvement runtime")
     parser.add_argument("--state-dir", type=Path, default=default_state())
     parser.add_argument("--version", action="version", version=__version__)
@@ -145,6 +149,8 @@ def main(argv=None):
     goal.add_argument("--request-id", help="Reuse only when retrying the same submission")
     restore_parser = sub.add_parser("restore", help="Restore a backup into a NEW state directory, paused")
     restore_parser.add_argument("file", type=Path)
+    archive_parser = sub.add_parser("archive", help="Export a private compressed database snapshot")
+    archive_parser.add_argument("--max-mb", type=int, default=1024)
     for command in ["pause", "resume", "inspect", "issues", "evolve"]:
         p = sub.add_parser(command)
         p.add_argument("project")
@@ -172,6 +178,14 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "archive":
+            from .storage_tools import archive
+            store = Store(root)
+            try:
+                print(json.dumps(archive(store, args.max_mb)))
+            finally:
+                store.close()
+            return
         if args.command == "restore":
             from .storage_tools import restore
             print(json.dumps(restore(args.file, root)))

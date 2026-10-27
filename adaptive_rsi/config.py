@@ -24,8 +24,9 @@ DEFAULTS = {
         "evolution": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
     },
     "review": {"block_on": "medium"},
+    "recovery": {"provider_retry_minutes": 0},
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
-    "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch"},
+    "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch", "require_provenance": False},
     "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
                "command_seconds": 3600, "concurrency": 1, "retries": 1,
                "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30},
@@ -36,7 +37,8 @@ DEFAULTS = {
                "max_issues": 100},
     "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440,
                  "release": {"enabled": False, "workflow": "", "ref": "", "sha": ""},
-                 "deploy": {"enabled": False, "workflow": "", "ref": "", "sha": "", "health_url": "", "automatic_rollback": False}},
+                 "deploy": {"enabled": False, "workflow": "", "ref": "", "sha": "", "health_url": "", "automatic_rollback": False,
+                            "health_attempts": 1, "health_interval_seconds": 10, "health_warmup_seconds": 0}},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -57,6 +59,11 @@ def merge(*layers):
     return result
 
 
+def within_hours(hour, hours):
+    start, end = hours
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
 def validate(config):
     def shape(values, template, path=""):
         for key, value in values.items():
@@ -72,6 +79,8 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
+    if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
+        raise ValueError("provider_retry_minutes must be 0..1440")
     # 旧额度字段仅用于读取历史配置，不再阻断运行；command_seconds 是安全超时而非额度，单独保留。
     for key in ["daily_calls", "run_calls", "run_seconds", "max_changed_files"]:
         config["limits"][key] = 0
@@ -144,8 +153,9 @@ def validate(config):
         if not 5 <= config["schedule"][name] <= 525600:
             raise ValueError(name + " must be between 5 and 525600")
     hours = config["schedule"]["working_hours"]
-    if len(hours) != 2 or not all(type(x) is int for x in hours) or not 0 <= hours[0] < hours[1] <= 24:
-        raise ValueError("working_hours must be [start, end], 0 <= start < end <= 24")
+    if (len(hours) != 2 or not all(type(x) is int for x in hours) or
+            not 0 <= hours[0] < 24 or not 0 <= hours[1] <= 24 or hours[0] == hours[1]):
+        raise ValueError("working_hours requires different start/end hours in 0..24; start must be below 24")
     from zoneinfo import ZoneInfo
     ZoneInfo(config["schedule"]["timezone"])
     for key, value in config["limits"].items():
@@ -191,6 +201,10 @@ def validate(config):
         raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
+    if (not 1 <= delivery["deploy"]["health_attempts"] <= 10 or
+            not 1 <= delivery["deploy"]["health_interval_seconds"] <= 300 or
+            not 0 <= delivery["deploy"]["health_warmup_seconds"] <= 900):
+        raise ValueError("Invalid deployment health retry policy")
     if not 5 <= delivery["feedback_minutes"] <= 525600:
         raise ValueError("Feedback interval must be at least 5 minutes")
     if delivery["base_branch"] and (delivery["base_branch"].startswith("-") or
@@ -205,7 +219,7 @@ def validate(config):
     for check in config["checks"] + config["environment"]["setup"]:
         if not isinstance(check, dict) or set(check) - {"name", "cwd", "argv"}:
             raise ValueError("Check must contain name, cwd, argv")
-        if not check.get("name") or not isinstance(check.get("argv"), list) or not check["argv"]:
+        if not isinstance(check.get("name"), str) or not check["name"].strip() or not isinstance(check.get("argv"), list) or not check["argv"]:
             raise ValueError("Check requires a name and argv array")
         if not all(isinstance(x, str) and "\0" not in x and len(x) < 2000 for x in check["argv"]):
             raise ValueError("Invalid check arguments")

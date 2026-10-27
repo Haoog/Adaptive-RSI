@@ -2,6 +2,7 @@
 import json
 import time
 from .config import fingerprint
+from .store import decode_object, decode_evidence
 
 
 def quality_summary(store, project=None):
@@ -18,7 +19,7 @@ def quality_summary(store, project=None):
         if run["state"] in ["failed", "blocked", "insufficient_evidence"]:
             key = (run["project"], run["task"])
             failures[key] = failures.get(key, 0) + 1
-        result = json.loads(run["result"])
+        result = decode_evidence(run["result"])
         feedback = result.get("feedback", {}).get("state")
         if feedback in ["verified", "regressed"]:
             item["postmerge_" + feedback] += 1
@@ -68,12 +69,12 @@ def workflow_metrics(store, project=None):
     revised = {row["task"] for row in store.query(
         "SELECT DISTINCT task FROM task_revisions WHERE task IN (" + scope + ")", scope_args)}
     interventions = {row["task"]: row["n"] for row in store.query(
-        "SELECT json_extract(data,'$.task') AS task,count(*) AS n FROM events WHERE "
+        "SELECT json_extract(CASE WHEN json_valid(data) THEN data ELSE '{}' END,'$.task') AS task,count(*) AS n FROM events WHERE "
         "kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') GROUP BY 1")}
     phase_rows = store.query(
-        "SELECT run,phase,ended-started AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
+        "SELECT run,phase,coalesce(duration,max(0,ended-started)) AS seconds FROM phase_times WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
     wait_rows = store.query(
-        "SELECT run,reason,ended-started AS seconds FROM remote_waits WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
+        "SELECT run,reason,coalesce(duration,max(0,ended-started)) AS seconds FROM remote_waits WHERE ended IS NOT NULL AND run IN (" + run_scope + ")", scope_args)
     for task in tasks:
         runs = runs_by_task.get(task["id"], [])
         code_attempts = []
@@ -82,7 +83,7 @@ def workflow_metrics(store, project=None):
         merged_at = []
         pr_created = []
         for run in runs:
-            evidence = json.loads(run["result"])
+            evidence = decode_evidence(run["result"])
             infrastructure = evidence.get("failure", {}).get("code") in ["provider", "credentials", "environment"]
             result["infrastructure_failures"] += infrastructure
             if not infrastructure and (run["id"] in implemented or evidence.get("evaluation")):

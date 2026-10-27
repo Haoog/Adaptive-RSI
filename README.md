@@ -12,7 +12,7 @@ Adaptive RSI 会把项目巡检、用户目标和 GitHub Issues 转成经过价�
 
 [下载桌面版](https://github.com/Haoog/Adaptive-RSI/releases/latest) · [快速开始](#快速开始) · [详细文档](#文档) · [运行边界](#安全与边界)
 
-[手机安装与流程指南](EXPERIENCE.md)
+[手机安装与流程指南](EXPERIENCE.md) · [本批加固与配置说明](docs/audit-hardening.md)
 
 ## 它解决什么
 

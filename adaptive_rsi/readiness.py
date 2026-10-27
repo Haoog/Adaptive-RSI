@@ -102,8 +102,11 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
             except Exception as exc:
                 return False, detail + " is missing usable credentials (" + str(exc) + ").", "models", "credentials_missing", {**route_fields, "probe": {"state": "unavailable"}}
         from .provider_health import ProviderHealth
-        if ProviderHealth(runtime.store).status(config, provider_id, project["id"])["paused"]:
+        health = ProviderHealth(runtime.store).admission(config, provider_id, project["id"])
+        if not health["ready"]:
             return False, detail + " is paused after repeated provider failures.", "models", "provider_paused", {**route_fields, "probe": {"state": "unavailable"}}
+        if health["half_open"]:
+            detail += " A single half-open recovery attempt is eligible."
         opencode = opencode_status() if provider.get("protocol") == "opencode" else None
         if opencode and opencode[0] == "failed":
             exc = opencode[1]
@@ -183,6 +186,10 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
     except (RuntimeError, OSError, ValueError):
         # 仓库缺失或损坏时 readiness 仍应给出可操作的结果，而不是整体报错。
         verified = False
-    return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks,
+    protection = None
+    if config["delivery"]["auto_merge"] and config["github"]["repository"]:
+        from .delivery import merge_protection
+        protection = merge_protection(config)
+    return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks, "merge_protection": protection,
             "execution_verified": verified, "model_evidence": model_evidence,
             "checked_at": time.time(), "budget": usage}

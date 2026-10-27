@@ -71,6 +71,10 @@ const UPDATE_REPO: &str = "Haoog/Adaptive-RSI";
 // 进程级下载闸门：由下载线程持有直到结束。双下载防护因此不依赖
 // DesktopUpdate.downloading 这个可被并发状态替换清零的标志。
 static DOWNLOAD_GATE: Mutex<()> = Mutex::new(());
+static BACKUP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BACKUP_CANCEL: AtomicBool = AtomicBool::new(false);
+static BACKUP_BYTES: AtomicU64 = AtomicU64::new(0);
+static BACKUP_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn update_client() -> Result<Client, String> {
     // 资产下载会经过 GitHub 的 https 重定向；只跟随 https，且限制跳数。
@@ -116,8 +120,7 @@ fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
 // 的状态保留给轮询，直到显式强制刷新。
 fn should_preserve_update(current: &DesktopUpdate, force: bool) -> bool {
     current.downloading.load(Ordering::Relaxed)
-        || (!force
-            && (current.opened.load(Ordering::Relaxed) || !current.error.is_empty()))
+        || (!force && (current.opened.load(Ordering::Relaxed) || !current.error.is_empty()))
 }
 
 fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<Value> {
@@ -714,6 +717,126 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
+fn backup_download_status(cancel: bool) -> Value {
+    if cancel {
+        BACKUP_CANCEL.store(true, Ordering::Relaxed);
+    }
+    json!({"active": BACKUP_ACTIVE.load(Ordering::Relaxed),
+           "bytes": BACKUP_BYTES.load(Ordering::Relaxed), "total": BACKUP_TOTAL.load(Ordering::Relaxed)})
+}
+
+#[tauri::command]
+async fn download_backup(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    if id.len() != 16
+        || !id
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err("Invalid backup ID".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        if BACKUP_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("Backup download is already active".into());
+        }
+        BACKUP_CANCEL.store(false, Ordering::Relaxed);
+        BACKUP_BYTES.store(0, Ordering::Relaxed);
+        BACKUP_TOTAL.store(0, Ordering::Relaxed);
+        let result = (|| {
+            let selected = app
+                .dialog()
+                .file()
+                .set_file_name(format!("adaptive-rsi-{id}.sqlite3"))
+                .blocking_save_file();
+            let Some(selected) = selected else {
+                return Ok(false);
+            };
+            let destination = selected
+                .into_path()
+                .map_err(|_| "Invalid backup destination")?;
+            if destination.exists() {
+                return Err("Choose a new backup filename".to_string());
+            }
+            let state = app.state::<RuntimeState>();
+            let connection = state
+                .target
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or("Runtime is unavailable")?;
+            let mut request = connection
+                .client
+                .get(format!("{}/api/backup?id={id}", connection.origin))
+                .timeout(Duration::from_secs(120));
+            if let Some(cookie) = connection.cookie {
+                request = request.header("Cookie", cookie);
+            }
+            let mut response = request.send().map_err(|_| "Cannot download backup")?;
+            if !response.status().is_success() {
+                return Err("Backup request failed".into());
+            }
+            let length = response
+                .content_length()
+                .filter(|n| *n <= 1024 * 1024 * 1024)
+                .ok_or("Invalid backup size")?;
+            BACKUP_TOTAL.store(length, Ordering::Relaxed);
+            let staging =
+                destination.with_extension(format!("sqlite3.{}.partial", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&staging)
+                .map_err(|_| "Cannot create backup destination")?;
+            let saved = (|| {
+                let mut buffer = [0_u8; 65536];
+                loop {
+                    if BACKUP_CANCEL.load(Ordering::Relaxed) {
+                        return Err("Backup download cancelled".to_string());
+                    }
+                    let count = response
+                        .read(&mut buffer)
+                        .map_err(|_| "Cannot read backup")?;
+                    if count == 0 {
+                        break;
+                    }
+                    let done =
+                        BACKUP_BYTES.fetch_add(count as u64, Ordering::Relaxed) + count as u64;
+                    if done > length {
+                        return Err("Backup exceeded expected size".into());
+                    }
+                    file.write_all(&buffer[..count])
+                        .map_err(|_| "Cannot write backup")?;
+                }
+                if BACKUP_BYTES.load(Ordering::Relaxed) != length {
+                    return Err("Backup download was incomplete".into());
+                }
+                file.sync_all().map_err(|_| "Cannot flush backup")?;
+                drop(file);
+                if BACKUP_CANCEL.load(Ordering::Relaxed) {
+                    return Err("Backup download cancelled".to_string());
+                }
+                std::fs::hard_link(&staging, &destination)
+                    .map_err(|_| "Cannot publish backup; choose a new filename")?;
+                Ok(true)
+            })();
+            let _ = std::fs::remove_file(staging);
+            saved
+        })();
+        BACKUP_ACTIVE.store(false, Ordering::SeqCst);
+        result
+    })
+    .await
+    .map_err(|_| "Backup download interrupted".to_string())?
+}
+
+#[tauri::command]
 async fn request(
     app: tauri::AppHandle,
     path: String,
@@ -903,6 +1026,8 @@ fn main() {
             notify,
             check_desktop_update,
             download_desktop_update
+            ,download_backup
+            ,backup_download_status
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

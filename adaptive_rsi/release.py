@@ -6,7 +6,7 @@ import time
 import urllib.request
 from urllib.parse import quote, urlsplit
 
-from .config import fingerprint
+from .config import DEFAULTS, fingerprint, merge
 from .gitops import origin_repository
 from .process import Cancelled, checked
 from .store import encode
@@ -91,16 +91,29 @@ def workflow_choices(runtime, project_id):
     now = time.time()
     if cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
         return cached[1]
-    workflows = api(repo, "actions/workflows?per_page=100").get("workflows", [])
+    workflows = []
+    for page in range(1, 101):
+        batch = api(repo, "actions/workflows?per_page=100" + ("&page=" + str(page) if page > 1 else "")).get("workflows", [])
+        if not isinstance(batch, list):
+            raise ValueError("Invalid workflow directory response")
+        workflows.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ValueError("Workflow directory exceeds 100 pages")
     import concurrent.futures
 
     def inspect(item):
         path = item.get("path", "")
         if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path):
             return None
-        compatible = item.get("state") == "active" and compatible_workflow(workflow_content(repo, path, sha))
+        try:
+            compatible = item.get("state") == "active" and compatible_workflow(workflow_content(repo, path, sha))
+        except (RuntimeError, ValueError, OSError):
+            return {"workflow": path, "name": item.get("name", path), "compatible": False,
+                    "reason": "Unable to inspect this workflow; refresh before authorizing"}
         return {"workflow": path, "name": item.get("name", path), "compatible": compatible,
-                "reason": "" if compatible else "Requires workflow_dispatch inputs rsi_operation_id/rsi_sha and run-name: ${{ inputs.rsi_operation_id }}"}
+                "reason": "" if compatible else "Requires explicit block-style YAML: workflow_dispatch inputs rsi_operation_id/rsi_sha (required string), and top-level run-name: ${{ inputs.rsi_operation_id }}; anchors, aliases and flow mappings require manual inspection"}
     # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         choices = [row for row in pool.map(inspect, workflows) if row]
@@ -115,20 +128,26 @@ def workflow_choices(runtime, project_id):
 def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
+    initial = runtime.config(project_id)
+    choices = workflow_choices(runtime, project_id)
+    if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
+        raise ValueError("Select a compatible existing workflow from this project")
+    repo, sha = choices["repository"], choices["sha"]
+    tag = "rsi-workflow/" + sha
+    # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.
+    refs = api(repo, "git/matching-refs/tags/" + tag)
+    exact = [item for item in refs if item.get("ref") == "refs/tags/" + tag]
+    if exact:
+        if exact[0]["object"].get("type") != "commit" or exact[0]["object"].get("sha") != sha:
+            raise ValueError("Trusted workflow tag points to a different commit")
+    else:
+        api(repo, "git/refs", "POST", {"ref": "refs/tags/" + tag, "sha": sha})
     with runtime.dispatch_lock:
-        choices = workflow_choices(runtime, project_id)
-        if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
-            raise ValueError("Select a compatible existing workflow from this project")
-        repo, sha = choices["repository"], choices["sha"]
-        tag = "rsi-workflow/" + sha
-        # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.
-        refs = api(repo, "git/matching-refs/tags/" + tag)
-        exact = [item for item in refs if item.get("ref") == "refs/tags/" + tag]
-        if exact:
-            if exact[0]["object"].get("type") != "commit" or exact[0]["object"].get("sha") != sha:
-                raise ValueError("Trusted workflow tag points to a different commit")
-        else:
-            api(repo, "git/refs", "POST", {"ref": "refs/tags/" + tag, "sha": sha})
+        current = runtime.config(project_id)
+        if current["github"]["repository"] != repo:
+            raise ValueError("Workflow repository must match the selected project's origin")
+        if current["delivery"][kind] != initial["delivery"][kind]:
+            raise ValueError("Workflow authorization changed during inspection; refresh before authorizing")
         runtime.configure({"delivery": {kind: {"enabled": True, "workflow": workflow, "ref": tag, "sha": sha}}}, project_id)
         runtime.store.event("workflow_authorized", "Existing workflow explicitly authorized", project_id,
                             data={"kind": kind, "workflow": workflow, "ref": tag, "sha": sha})
@@ -137,6 +156,10 @@ def authorize_workflow(runtime, project_id, kind, workflow):
 
 def key(run_id, kind):
     return "automation:" + run_id + ":" + kind
+
+
+def normalized_policy(kind, policy):
+    return merge(DEFAULTS["delivery"][kind], policy)
 
 
 def pending(runtime, run):
@@ -148,7 +171,7 @@ def pending(runtime, run):
         if not delivery.get(kind, {}).get("enabled"):
             continue
         data = runtime.store.setting(key(run["id"], kind), {})
-        if (live["delivery"][kind] != delivery[kind] or live["delivery"]["mode"] != "pr" or
+        if (normalized_policy(kind, live["delivery"][kind]) != normalized_policy(kind, delivery[kind]) or live["delivery"]["mode"] != "pr" or
                 live["github"]["repository"] != saved["github"]["repository"]):
             if data.get("state") in active or data.get("state") == "rolling_back" and data.get("rollback", {}).get("state") in active:
                 return True
@@ -202,8 +225,10 @@ def authorized(runtime, project, run, kind, policy, cancel=None):
         raise Cancelled("Release/deploy paused or cancelled")
     identity = runtime.store.setting("delivery:" + run["id"], {})
     repo = live["github"]["repository"]
+    effective = normalized_policy(kind, policy)
     if (live["delivery"]["mode"] != "pr" or not policy.get("enabled") or
-            live["delivery"][kind] != policy or saved["delivery"].get(kind) != policy or
+            normalized_policy(kind, live["delivery"][kind]) != effective or
+            normalized_policy(kind, saved["delivery"].get(kind, {})) != effective or
             repo != saved["github"]["repository"] or repo != identity.get("repository", repo) or
             repo.lower() != origin_repository(project["path"]).lower()):
         raise ValueError("Release/deploy authorization revoked or target changed")
@@ -309,6 +334,11 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
         data.update(state="superseded", error="A newer deployment owns this target; no stale rollback will be issued")
         return data
     if data["state"] == "workflow_succeeded":
+        now = time.time()
+        first = data.setdefault("health_started_at", now)
+        if now < first + policy.get("health_warmup_seconds", 0) or now < data.get("health_retry_at", 0):
+            persist(runtime, run, "deploy", data)
+            return data
         authorized(runtime, project, run, "deploy", policy, cancel)
         report = health_check(policy["health_url"], data["sha"])
         with runtime.dispatch_lock:
@@ -316,6 +346,11 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             current_owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; old health evidence was discarded")
+                return data
+            data["health_attempts"] = data.get("health_attempts", 0) + 1
+            if not report["healthy"] and data["health_attempts"] < policy.get("health_attempts", 1):
+                data.update(health=report, health_retry_at=now + policy.get("health_interval_seconds", 10))
+                persist(runtime, run, "deploy", data)
                 return data
             data.update(health=report, state="healthy" if report["healthy"] else "health_failed")
             if not report["healthy"]:
@@ -329,9 +364,9 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
         if not previous or previous["sha"] == data["sha"]:
             data["rollback_unavailable"] = True
             return data
+        repo = authorized(runtime, project, run, "deploy", policy, cancel)
+        validate_pin(repo, policy)
         with runtime.dispatch_lock:
-            repo = authorized(runtime, project, run, "deploy", policy, cancel)
-            validate_pin(repo, policy)
             authorized(runtime, project, run, "deploy", policy, cancel)
             current_owner = runtime.store.setting(owner_key(project["id"], repo, policy))
             if current_owner and current_owner["run"] != run["id"]:
@@ -341,20 +376,20 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                         "sha": previous["sha"], "operation_id": data["operation_id"] + "-rollback", "state": "dispatching"}
             data.update(state="rolling_back", rollback=rollback)
             persist(runtime, run, "deploy", data)
-            try:
-                api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
-                    {"ref": policy["ref"], "inputs[rsi_operation_id]": rollback["operation_id"], "inputs[rsi_sha]": rollback["sha"]})
-                rollback.update(state="submitted", dispatch_receipt="accepted")
-            except ApiRejected as exc:
-                rollback.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
-                                dispatch_http_status=exc.status)
-                data.update(state="rollback_failed", error=rollback["error"])
-                persist(runtime, run, "deploy", data)
-                raise
-            except Exception as exc:
-                rollback.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
-                persist(runtime, run, "deploy", data)
-                raise
+        try:
+            api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
+                {"ref": policy["ref"], "inputs[rsi_operation_id]": rollback["operation_id"], "inputs[rsi_sha]": rollback["sha"]})
+            rollback.update(state="submitted", dispatch_receipt="accepted")
+        except ApiRejected as exc:
+            rollback.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                            dispatch_http_status=exc.status)
+            data.update(state="rollback_failed", error=rollback["error"])
+            persist(runtime, run, "deploy", data)
+            raise
+        except Exception as exc:
+            rollback.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
+            persist(runtime, run, "deploy", data)
+            raise
     if data["state"] == "rolling_back":
         rollback = reconcile(runtime, run, "deploy", data["rollback"], persist=False)
         data["rollback"] = rollback
@@ -408,22 +443,22 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data = {**(data or {}), "state": "waiting_release", "error": ""}
                     result[kind] = persist(runtime, run, kind, data)
                     continue
+            repo = authorized(runtime, project, run, kind, policy, cancel)
+            expected_owner = None
+            if kind == "deploy":
+                owner = runtime.store.setting(owner_key(project["id"], repo, policy))
+                expected_owner = owner
+                if owner and owner["run"] != run["id"]:
+                    previous = runtime.store.setting(key(owner["run"], "deploy"), {})
+                    if not deployment_terminal(previous, policy):
+                        result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
+                        continue
+                    comparison = api(repo, "compare/" + owner["sha"] + "..." + outcome["merged_sha"])
+                    if comparison.get("status") != "ahead":
+                        result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
+                        continue
+            validate_pin(repo, policy)
             with runtime.dispatch_lock:
-                repo = authorized(runtime, project, run, kind, policy, cancel)
-                expected_owner = None
-                if kind == "deploy":
-                    owner = runtime.store.setting(owner_key(project["id"], repo, policy))
-                    expected_owner = owner
-                    if owner and owner["run"] != run["id"]:
-                        previous = runtime.store.setting(key(owner["run"], "deploy"), {})
-                        if not deployment_terminal(previous, policy):
-                            result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
-                            continue
-                        comparison = api(repo, "compare/" + owner["sha"] + "..." + outcome["merged_sha"])
-                        if comparison.get("status") != "ahead":
-                            result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
-                            continue
-                validate_pin(repo, policy)
                 authorized(runtime, project, run, kind, policy, cancel)
                 if kind == "deploy" and runtime.store.setting(owner_key(project["id"], repo, policy)) != expected_owner:
                     result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Deployment ownership changed during validation"})
@@ -439,19 +474,19 @@ def advance(runtime, project, run, outcome, cancel=None):
                 persist(runtime, run, kind, data)
                 if kind == "deploy":
                     runtime.store.put_setting(owner_key(project["id"], repo, policy), {"run": run["id"], "sha": data["sha"]})
-                try:
-                    api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
-                        {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
-                except ApiRejected as exc:
-                    data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
-                                dispatch_http_status=exc.status)
-                    raise
-                except Exception as exc:
-                    data.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
-                    raise
-                data.update(state="submitted", dispatch_receipt="accepted")
-                persist(runtime, run, kind, data)
-                runtime.store.event("automation_dispatched", "Authorized " + kind + " workflow submitted", project["id"], run["id"], data)
+            try:
+                api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
+                    {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
+            except ApiRejected as exc:
+                data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                            dispatch_http_status=exc.status)
+                raise
+            except Exception as exc:
+                data.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
+                raise
+            data.update(state="submitted", dispatch_receipt="accepted")
+            persist(runtime, run, kind, data)
+            runtime.store.event("automation_dispatched", "Authorized " + kind + " workflow submitted", project["id"], run["id"], data)
         except _AutomationChanged:
             result[kind] = runtime.store.setting(key(run["id"], kind), {})
             continue
@@ -477,7 +512,7 @@ def advance(runtime, project, run, outcome, cancel=None):
 def retry(runtime, project_id, run_id, kind):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
-    with runtime.dispatch_lock:
+    with runtime.automation_lock_for(project_id, kind):
         run = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=? AND state='merged'", (run_id, project_id))
         if not run:
             raise ValueError("Only a verified merged run in this project can be retried")
@@ -496,10 +531,29 @@ def retry(runtime, project_id, run_id, kind):
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
         if kind == "deploy" and data.get("state") == "health_failed":
-            data.update(state="workflow_succeeded", error="")
-            save(runtime, run, kind, data)
+            expected_health = encode(data)
+            data.update(state="workflow_succeeded", error="", health_attempts=0)
+            for field in ("health_started_at", "health_retry_at"):
+                data.pop(field, None)
+            with runtime.dispatch_lock:
+                authorized(runtime, project, run, kind, policy)
+                save(runtime, run, kind, data, expected=expected_health)
             runtime.wake.set()
             return data
+        expected = encode(data)
+
+        def persist_retry(require_authorization=False):
+            nonlocal expected
+            with runtime.dispatch_lock:
+                if require_authorization:
+                    authorized(runtime, project, run, kind, policy)
+                if require_authorization and kind == "deploy":
+                    owner = runtime.store.setting(owner_key(project_id, repo, policy))
+                    if owner and owner["run"] != run_id:
+                        raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
+                save(runtime, run, kind, data, expected=expected)
+                expected = encode(data)
+
         target = data
         rollback = data.get("rollback", {})
         if kind == "deploy" and (data.get("state") == "rollback_failed" or
@@ -508,7 +562,7 @@ def retry(runtime, project_id, run_id, kind):
             target = rollback
             if target.get("state") == "workflow_succeeded":
                 data.update(state="rolling_back", error="")
-                save(runtime, run, kind, data)
+                persist_retry()
                 runtime.wake.set()
                 return data
         if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
@@ -518,7 +572,7 @@ def retry(runtime, project_id, run_id, kind):
             target.update(state="dispatching", error="", dispatch_receipt="pending")
             if target is not data:
                 data.update(state="rolling_back", rollback=target, error="")
-            save(runtime, run, kind, data)
+            persist_retry(require_authorization=True)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": target["operation_id"], "inputs[rsi_sha]": target["sha"]})
@@ -527,19 +581,19 @@ def retry(runtime, project_id, run_id, kind):
                               dispatch_http_status=exc.status)
                 if target is not data:
                     data.update(state="rollback_failed", error=target["error"])
-                save(runtime, run, kind, data)
+                persist_retry()
                 raise
             except Exception as exc:
                 target.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
                 if target is not data:
                     data.update(state="rolling_back", error=target["error"])
-                save(runtime, run, kind, data)
+                persist_retry()
                 runtime.wake.set()
                 raise
             target.update(state="submitted", error="", dispatch_receipt="accepted")
             if target is not data:
                 data.update(state="rolling_back", error="")
-            save(runtime, run, kind, data)
+            persist_retry()
             runtime.wake.set()
             return data
         unconfirmed_rerun = target.get("rerun_pending") or target.get("state") in {"rerunning", "rerun_unknown"}
@@ -547,7 +601,7 @@ def retry(runtime, project_id, run_id, kind):
         if unconfirmed_rerun:
             if target is not data:
                 data.update(state="rollback_failed" if target["state"] in {"failed", "rerun_unknown"} else "rolling_back", rollback=target, error=target.get("error", ""))
-            save(runtime, run, kind, data)
+            persist_retry()
             runtime.wake.set()
             return data
         if target.get("state") != "failed" or not target.get("workflow_run_id"):
@@ -558,21 +612,21 @@ def retry(runtime, project_id, run_id, kind):
                       rerun_pending=True, rerun_receipt="pending", rerun_requested_at=time.time())
         if target is not data:
             data.update(state="rolling_back", rollback=target)
-        save(runtime, run, kind, data)
+        persist_retry(require_authorization=True)
         try:
             api(repo, "actions/runs/" + str(target["workflow_run_id"]) + "/rerun", "POST")
         except ApiRejected as exc:
             target.update(state="failed", error=str(exc)[:500], rerun_pending=False, rerun_receipt="rejected", rerun_http_status=exc.status)
             if target is not data:
                 data.update(state="rollback_failed", error=target["error"], rollback=target)
-            save(runtime, run, kind, data)
+            persist_retry()
             raise
         except Exception as exc:
             target.update(error=str(exc)[:500], rerun_receipt="unknown")
-            save(runtime, run, kind, data)
+            persist_retry()
             runtime.wake.set()
             raise
         target["rerun_receipt"] = "accepted"
-        save(runtime, run, kind, data)
+        persist_retry()
         runtime.wake.set()
         return data

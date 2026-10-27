@@ -12,7 +12,7 @@ Adaptive RSI turns project inspections, user goals, and GitHub Issues into maint
 
 [Download desktop](https://github.com/Haoog/Adaptive-RSI/releases/latest) · [Quick start](#quick-start) · [Documentation](#documentation) · [Boundaries](#safety-and-boundaries)
 
-[Mobile installation and workflow guide](EXPERIENCE.en.md)
+[Mobile installation and workflow guide](EXPERIENCE.en.md) · [Batch hardening and configuration](docs/audit-hardening.en.md)
 
 ## Why Adaptive RSI
 

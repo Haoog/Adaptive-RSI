@@ -77,6 +77,29 @@ def report(store, params):
         # 显式关闭生成器，连接立即归还连接池而不是等 GC。
         rows.close()
     daily = []
+    if buckets:
+        first = datetime.datetime.fromtimestamp(start, zone).date() if start else min(buckets)
+        last = datetime.datetime.fromtimestamp(end - 0.001, zone).date()
+        if (last - first).days <= 93:
+            day = first
+            while day <= last:
+                buckets.setdefault(day, {"calls": 0, "tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                                        "cache_read_tokens": 0, "cache_write_tokens": 0, "model_seconds": 0,
+                                        "unknown_calls": 0, "failed_calls": 0, "estimated_usd": None})
+                day += datetime.timedelta(days=1)
+        else:
+            monthly = {}
+            for day, values in buckets.items():
+                month = day.replace(day=1)
+                target = monthly.setdefault(month, {key: None if key == "estimated_usd" else 0 for key in values})
+                for key, amount in values.items():
+                    if amount is not None:
+                        target[key] = (target[key] or 0) + amount
+            day = first.replace(day=1)
+            while day <= last:
+                monthly.setdefault(day, {key: None if key == "estimated_usd" else 0 for key in next(iter(buckets.values()))})
+                day = (day.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+            buckets = monthly
     for day, bucket in sorted(buckets.items()):
         midnight = datetime.datetime.combine(day, datetime.time.min, tzinfo=zone)
         daily.append({"day": midnight.timestamp(), "date": day.isoformat(), **bucket})

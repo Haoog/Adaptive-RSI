@@ -1,6 +1,24 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "检查期间工作流授权已变更，请刷新后重新授权。": "Workflow authorization changed during inspection. Refresh before authorizing again.",
+ "已观察到严格状态检查；GitHub 分支保护仍决定是否允许合并。":"Strict status checks were observed; GitHub branch protection still decides whether merging is allowed.",
+ "请在 GitHub 确认严格状态检查或合并队列；当前权限可能无法读取全部保护规则。":"Confirm strict status checks or a merge queue in GitHub; current permissions may not expose every protection rule.",
+
+  "取消下载": "Cancel download",
+  "加载更早活动": "Load earlier activity",
+  "活动历史": "Activity history",
+  "显示时区": "Display timezone",
+  "查看活动历史": "View activity history",
+  "浏览器未能保存草稿；当前页面仍保留输入，关闭页面前请另行保存。": "Your browser could not save the draft. The current page retains your input; preserve it before closing the page.",
+  "此连接正在刷新模型目录，请稍候。": "This connection is refreshing its model catalog. Please wait.",
+  "同时测试的模型已达上限，请稍候重试。": "The model test concurrency limit has been reached. Try again shortly.",
+  "凭据清理登记损坏，请保留状态并检查诊断。": "The credential cleanup registry is invalid. Preserve the state and inspect diagnostics.",
+  "待清理凭据过多，请先完成凭据清理。": "Too many credentials await cleanup. Complete credential cleanup first.",
+  "仅适用于当时的连接与运行环境": "Applies to the connection and runtime environment at the time of testing",
+  "连接已保存；部分后续操作未完成。尚未添加的模型：": "The connection was saved; some subsequent operations did not finish. Models still to add:",
+  "此开关只控制模型选择列表；已有角色配置和正在运行的任务继续使用原来的模型。": "This switch controls the model picker. Existing role routes and running tasks continue using their configured model.",
+  "工作时段的开始和结束需不同；开始为 0 至 23 时，结束为 0 至 24 时，可跨午夜。": "Working hours need different start and end times: start 0–23, end 0–24. Overnight windows are supported.",
   "Android：浏览器菜单安装应用。iPhone：Safari 分享，再添加到主屏幕。": "Android: install from the browser menu. iPhone: Safari, Share, Add to Home Screen.",
   "数据库": "Database",
   "运行文件": "Run artifacts",
@@ -1455,7 +1473,7 @@ const english = {
   "运行记录加载失败。":"Failed to load run records.",
   "取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？":"Cancelling revokes the pending candidate. A fresh verification is required before it can be delivered again; existing PRs are not affected. Cancel this task?"
 };
-let language = localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';
+let language = (()=>{try{return localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';}catch{return 'zh-CN';}})();
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }
 const staticText = [], staticAttributes = [];
 const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_TEXT);

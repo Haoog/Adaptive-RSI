@@ -18,7 +18,7 @@ def _regression_test_scope(workspace, scope, allow_colocated=False):
     test_dirs = {"test", "tests", "spec", "specs", "__tests__"}
     candidates = set()
     root_tests = False
-    for path in git(workspace, "ls-files").splitlines():
+    for path in filter(None, git(workspace, "ls-files", "-z").split("\0")):
         parts = Path(path).parts
         in_test_directory = False
         for index, part in enumerate(parts[:-1]):
@@ -37,8 +37,12 @@ def _regression_test_scope(workspace, scope, allow_colocated=False):
     scope_parts = [Path(path).parts for path in scope]
     def rank(candidate):
         parts = Path(candidate).parts
-        common = max((sum(1 for left, right in zip(parts, item) if left == right)
-                      for item in scope_parts), default=0)
+        def prefix_length(item):
+            for index, (left, right) in enumerate(zip(parts, item)):
+                if left != right:
+                    return index
+            return min(len(parts), len(item))
+        common = max((prefix_length(item) for item in scope_parts), default=0)
         return (-common, len(parts), candidate)
     return min(candidates, key=rank)
 
@@ -112,10 +116,15 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
     if not check["ready"]:
-        from .provider_health import ProviderHealth
-        for item in check.get("items", []):
-            if item.get("reason") == "provider_paused":
-                ProviderHealth(runtime.store).require(config, item["provider"], project["id"])
+        paused = next((item for item in check.get("items", [])
+                       if item.get("reason") == "provider_paused"), None)
+        if paused:
+            # Preserve provider failure classification without consuming a
+            # half-open lease before the actual model invocation.
+            from .provider_health import ProviderPaused
+            error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
+            error.provider_id = paused["provider"]
+            raise error
         transition("insufficient_evidence", {"reason": "Project readiness checks need attention", "readiness": check,
                    "failure": {"code": "environment",
                                "action": "check_readiness"}}, True)
@@ -254,6 +263,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             regression_test_scope = test_scope
         elif not covered:
             plan["scope"].append(test_scope)
+    tool_scope = list(plan["scope"]) + ([regression_test_scope] if regression_test_scope else [])
+    (directory / "tool-scope.json").write_text(encode(tool_scope), encoding="utf-8")
     (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     if not experiment:
         save(runtime, run, "planning", plan, plan_key)
@@ -312,7 +323,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     acceptance_executor = None
     acceptance_future = None
     acceptance_cancel = threading.Event()
-    if saved_candidate is None and task["source"] != "rollback" and acceptance:
+    if (saved_candidate is None and task["source"] != "rollback" and acceptance and
+            acceptance.get("change_kind") != "performance"):
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         try:
@@ -344,8 +356,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             result = {"summary": "Reversed only the saved patch from run " + prior["id"]}
         else:
             if test_first:
-                test_instruction = ("Add exactly one new regression test file within the provided regression_test_scope. "
-                                    "It must fail on the unchanged baseline and pass with the fix. Do not edit existing tests, "
+                test_instruction = ("Add 1..8 new regression test files within the provided regression_test_scope. "
+                                    "At least one must fail on the unchanged baseline; all must pass with the fix. Do not edit existing tests, "
                                     "test configuration, manifests, or check entrypoints. No other files are allowed in that test scope. ")
                 implementation_context = {**context, "regression_test_scope": regression_test_scope}
             elif change_type == "documentation":
@@ -364,8 +376,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             return None
         added_test_files = {path for path in git(workspace, "diff", "--cached", "--diff-filter=A", "--name-only", "-z").split("\0")
                             if path and test_path(path)}
-        if test_first and len(added_test_files) != 1:
-            raise RuntimeError("Test-first changes require exactly one new regression test file")
+        if test_first and not 1 <= len(added_test_files) <= 8:
+            raise RuntimeError("Test-first changes require 1..8 new regression test files")
         for path in files:
             relative_path(path)
             if test_first and test_path(path):

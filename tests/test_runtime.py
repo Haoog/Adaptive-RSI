@@ -31,7 +31,7 @@ CHECKS = [{"name": "real unittest regression", "cwd": ".", "argv": ["python3", "
 
 
 def fixture(root):
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     checked(["git", "init", "--quiet", str(root)])
     (root / "calculator.py").write_text("def add(a, b):\n    return a - b\n")
     (root / "tests").mkdir()

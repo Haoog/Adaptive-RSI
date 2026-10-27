@@ -1,5 +1,6 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
 import json
+import gzip
 import os
 import sqlite3
 import stat
@@ -9,6 +10,60 @@ from contextlib import closing
 from pathlib import Path
 
 from .store import Store, uid
+
+
+def archive(store, max_mb=1024):
+    """Export a private compressed consistent snapshot within an archive capacity budget."""
+    if type(max_mb) is not int or not 1 <= max_mb <= 102400:
+        raise ValueError("Archive capacity must be 1..102400 MiB")
+    import fcntl
+    fd = os.open(store.root / "archive.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "wb") as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise ValueError("Invalid archive lock")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Another archive is in progress") from None
+        return _archive(store, max_mb)
+
+
+def _archive(store, max_mb):
+    folder = store.root / "archives"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    capacity = max_mb * 1024 * 1024
+    used = sum(info.st_size for _, info in _file_info(folder.iterdir()))
+    if used >= capacity:
+        raise ValueError("Archive capacity reached; move existing archives before retrying")
+    snapshot = backup(store)
+    source = store.root / "backups" / (snapshot["id"] + ".sqlite3")
+    staging = None
+    try:
+        fd, name = tempfile.mkstemp(prefix=".archive-", dir=folder)
+        staging = Path(name)
+        with os.fdopen(fd, "wb") as output:
+            with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+                with source.open("rb") as raw:
+                    while True:
+                        block = raw.read(65536)
+                        if not block:
+                            break
+                        compressed.write(block)
+                        compressed.flush()
+                        if output.tell() + used > capacity:
+                            raise ValueError("Archive capacity reached; move existing archives before retrying")
+            if output.tell() + used > capacity:
+                raise ValueError("Archive capacity reached; move existing archives before retrying")
+            output.flush()
+            os.fsync(output.fileno())
+        target = folder / (snapshot["id"] + ".sqlite3.gz")
+        os.link(staging, target)
+        return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
+                "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
+    finally:
+        if staging is not None:
+            staging.unlink(missing_ok=True)
+        source.unlink(missing_ok=True)
 
 
 def backup(store):
@@ -94,6 +149,11 @@ def restore(source, destination):
             raise ValueError("Backup integrity check failed")
         for table in ["projects", "tasks", "runs", "settings"]:
             db.execute("SELECT * FROM " + table + " LIMIT 0")
+        if db.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("Backup contains invalid relationships")
+        if db.execute("SELECT 1 FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                      "WHERE r.task IS NOT NULL AND (t.id IS NULL OR r.project<>t.project) LIMIT 1").fetchone():
+            raise ValueError("Backup contains invalid run ownership")
         created = _create_directories(destination)
         if destination not in created:  # Never write into a directory this process did not exclusively create.
             raise ValueError("Restore requires a new state directory; existing state is never overwritten")

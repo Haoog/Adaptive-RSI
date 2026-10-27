@@ -1,4 +1,6 @@
 import csv
+import contextlib
+import contextvars
 import io
 import json
 import os
@@ -18,6 +20,16 @@ _PROBE_LOCK = threading.Lock()
 _PROBE_CACHE = {}
 # 每个探测键保留一个进行中标记：并发线程等待首个结果，而不是各自排队重复探测。
 _PROBE_INFLIGHT = {}
+_OPERATION_CANCEL = contextvars.ContextVar("rsi_operation_cancel", default=None)
+
+
+@contextlib.contextmanager
+def operation_cancellation(cancel):
+    token = _OPERATION_CANCEL.set(cancel)
+    try:
+        yield
+    finally:
+        _OPERATION_CANCEL.reset(token)
 
 
 class _ProbeFlight:
@@ -98,10 +110,13 @@ def process_error_kind(result):
     }.get(result.get("error"), "exit")
 
 
-def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None):
+def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None, input_data=None):
     started = time.monotonic()
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen([str(x) for x in argv], cwd=cwd, stdin=subprocess.DEVNULL,
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr, tempfile.TemporaryFile() as stdin:
+        if input_data is not None:
+            stdin.write(input_data)
+            stdin.seek(0)
+        process = subprocess.Popen([str(x) for x in argv], cwd=cwd, stdin=subprocess.DEVNULL if input_data is None else stdin,
                                    stdout=stdout, stderr=stderr, env=env, start_new_session=True)
         reason = None
         while process.poll() is None:
@@ -125,7 +140,10 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                 break
             time.sleep(0.08)
         process.wait()
-        # Kill detached descendants still in this process group before touching artifacts.
+        if reason is None and (os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size >
+                               output_mb * 1024 * 1024):
+            reason = "Command output limit exceeded"
+        # Kill descendants still in this process group before touching artifacts.
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -144,8 +162,9 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
         return result
 
 
-def checked(argv, cwd=None, timeout=60, env=None):
-    result = run_process(argv, cwd, timeout, env=env)
+def checked(argv, cwd=None, timeout=60, env=None, cancel=None):
+    cancel = cancel if cancel is not None else _OPERATION_CANCEL.get()
+    result = run_process(argv, cwd, timeout, env=env, cancel=cancel)
     if result["exit_code"] or result["error"]:
         raise ProcessError(result)
     return result["stdout"].rstrip("\n")
@@ -252,10 +271,16 @@ class Sandbox:
                 "-c", 'shell_environment_policy.inherit="all"',
                 "-c", 'shell_environment_policy.include_only=["PATH","LANG","LC_ALL","TMPDIR"]']
 
-    def command(self, argv, workspace, cwd=".", protected=(), hidden=()):
+    def command(self, argv, workspace, cwd=".", protected=(), hidden=(), writable=None):
         workspace = Path(workspace).resolve()
         location = (workspace / cwd).resolve()
         location.relative_to(workspace)
+        writes = None if writable is None else [Path(item).resolve() for item in writable]
+        if writes is not None:
+            for item in writes:
+                item.relative_to(workspace)
+        if writes is not None and workspace in writes:
+            writes = None
         backend = self.backend()
         if backend == "docker":
             limits = self.config["sandbox"]
@@ -269,11 +294,15 @@ class Sandbox:
                     "--security-opt=no-new-privileges", "--pids-limit=" + str(limits["pids"]),
                     "--memory=" + str(limits["memory_mb"]) + "m", "--cpus=" + str(limits["cpus"]),
                     "--user=" + str(os.getuid()) + ":" + str(os.getgid()),
-                    "--mount", docker_mount(workspace, "/workspace"),
+                    "--mount", docker_mount(workspace, "/workspace", read_only=writes is not None),
                     "--tmpfs", "/tmp:rw,nosuid,size=256m", "--env", "HOME=/tmp",
                     "-w", "/workspace/" + cwd]
             import uuid
             command += ["--name", "adaptive-rsi-check-" + uuid.uuid4().hex[:16]]
+            if writes is not None:
+                for item in writes:
+                    if item.exists():
+                        command += ["--mount", docker_mount(item, "/workspace/" + item.relative_to(workspace).as_posix())]
             for item in protected:
                 item = Path(item).resolve()
                 relative = item.relative_to(workspace).as_posix()
@@ -288,6 +317,11 @@ class Sandbox:
         profile += '(allow file-read* file-write* (subpath %s))' % quote_sb(workspace)
         profile += '(deny file-read* file-write* (subpath %s))' % quote_sb(self.state)
         profile += '(allow file-read* file-write* (subpath %s))' % quote_sb(workspace)
+        if writes is not None:
+            # The later scoped grant follows the workspace-wide deny. Protected paths remain denied.
+            profile += '(deny file-write* (subpath %s))' % quote_sb(workspace)
+            for item in writes:
+                profile += '(allow file-write* (subpath %s))' % quote_sb(item)
         for item in protected:
             profile += '(deny file-write* (subpath %s))' % quote_sb(item)
         for item in hidden:
@@ -295,9 +329,14 @@ class Sandbox:
         profile += '(deny network*)'
         return ["sandbox-exec", "-p", profile] + list(argv), location
 
-    def check(self, check, workspace, cancel=None, protected=(), hidden=()):
+    def check(self, check, workspace, cancel=None, protected=(), hidden=(), writable=None):
+        from .resources import execution_resources
+        with execution_resources.acquire(cancel=cancel):
+            return self._check(check, workspace, cancel, protected, hidden, writable)
+
+    def _check(self, check, workspace, cancel=None, protected=(), hidden=(), writable=None):
         scrub_tree(workspace)
-        argv, cwd = self.command(check["argv"], workspace, check.get("cwd", "."), protected, hidden)
+        argv, cwd = self.command(check["argv"], workspace, check.get("cwd", "."), protected, hidden, writable)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path(workspace) / ".rsi-home"),
                "TMPDIR": str(Path(workspace) / ".rsi-tmp"), "CI": "1", "PYTHONDONTWRITEBYTECODE": "1",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,

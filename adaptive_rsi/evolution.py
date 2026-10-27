@@ -103,6 +103,10 @@ class Evolution:
                            (candidate, project["id"], proposal["kind"], parent, "evaluating", encode(proposal), time.time()))
         evidence = {"run": run["id"], "config_hash": fingerprint(config), "compatibility": compatibility(config),
                     "trials": [], "monitor": {"passed": 0, "failed": 0}}
+        evidence["selection_attempts"] = self.store.one(
+            "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
+            "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
+            (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
         try:
             for split in ["validation", "holdout"]:
                 selected = [c for c in cases if c["split"] == split][:minimum]
@@ -151,17 +155,24 @@ class Evolution:
                         self.save(candidate, validation["decision"], evidence)
                         return {"reason": evidence["reason"], "candidate": candidate, "status": evidence["decision"]}
             evidence.update(self.decide(evidence["trials"], config))
+            if "sign_test_p" in evidence:
+                evidence["selection_adjusted_p"] = min(1, evidence["sign_test_p"] * evidence["selection_attempts"])
+                evidence["selection_warning"] = "Adaptive reuse and candidate selection limit generalization; adjusted p is a conservative attempt-count diagnostic, not independent replication"
             state = evidence["decision"]
             if state == "pass" and config["evolution"]["auto_promote"]:
-                if self.runtime.is_cancelled(run):
-                    raise Cancelled("Evolution cancelled before promotion")
-                promoted = time.time()
-                with self.store.connect() as db:
-                    db.execute("BEGIN IMMEDIATE")
-                    # 晋升时重新绑定紧接着的稳定版，而不是沿用建候选时的快照；
-                    # 这样回滚始终回到刚被替换的一版（含手动/自动交替晋升）。
-                    self.activate(db, candidate, promoted, evidence)
-                self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                with self.runtime.dispatch_lock:
+                    if self.runtime.is_cancelled(run):
+                        raise Cancelled("Evolution cancelled before promotion")
+                    live = self.runtime.config(project["id"])
+                    if not live["evolution"]["auto_promote"] or compatibility(live) != evidence["compatibility"]:
+                        evidence["reason"] = "Configuration changed; candidate retained for explicit revalidation"
+                        self.save(candidate, "ready", evidence)
+                        return {"reason": evidence["reason"], "candidate": candidate, "status": "ready"}
+                    promoted = time.time()
+                    with self.store.connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        self.activate(db, candidate, promoted, evidence)
+                        db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                                    self.skill_values(project["id"], candidate, proposal, config, promoted))
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
