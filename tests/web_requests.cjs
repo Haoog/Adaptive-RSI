@@ -3130,6 +3130,24 @@ function desktopPage() {
   return page;
 }
 
+test('global config repair can obtain CSRF before initial state loads', async () => {
+  const page = browser();
+  vm.runInContext('state=undefined', page.context);
+  let csrfHeader = '', posted = false;
+  page.context.fetch = async (url, options = {}) => {
+    if (url === '/api/contract') return {ok:true, async json(){return {csrf:'bootstrap-csrf'};}};
+    if (url === '/api/config/repair-global') {
+      csrfHeader = options.headers['X-RSI-CSRF'];
+      posted = true;
+      return {ok:true, async json(){return {repaired:true};}};
+    }
+    throw Error('unexpected request ' + url);
+  };
+  await vm.runInContext("sendApi('config/repair-global',{confirmation:'reset-invalid-global-config'})", page.context);
+  assert.equal(csrfHeader, 'bootstrap-csrf');
+  assert.equal(posted, true);
+});
+
 test('reloading during a desktop download resumes polling until the completion toast', async () => {
   const page = desktopPage();
   page.desktop.states = [

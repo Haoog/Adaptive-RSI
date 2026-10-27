@@ -104,11 +104,13 @@ def verify_backup(path):
     with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version > 2:
+            raise ValueError("Backup schema is newer than this runtime")
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Backup contains invalid relationships")
         for table in ("projects", "tasks", "runs", "settings"):
             db.execute("SELECT * FROM " + table + " LIMIT 0")
-        version = db.execute("PRAGMA user_version").fetchone()[0]
     return {"valid": True, "schema_version": version, "bytes": path.stat().st_size}
 
 
@@ -193,9 +195,14 @@ def restore(source, destination):
     with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
-        for table in ["projects", "tasks", "runs", "settings", "task_decisions", "task_revisions",
-                      "task_dependencies", "submissions", "phase_times", "remote_waits",
-                      "task_completions", "schema_migrations"]:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        tables = ["projects", "tasks", "runs", "settings"]
+        # Parent schema version 1 databases did not have these additive tables;
+        # Store performs the supported migration after the snapshot is copied.
+        if version >= 2:
+            tables += ["task_decisions", "task_revisions", "task_dependencies", "submissions",
+                       "phase_times", "remote_waits", "task_completions", "schema_migrations"]
+        for table in tables:
             db.execute("SELECT * FROM " + table + " LIMIT 0")
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Backup contains invalid relationships")

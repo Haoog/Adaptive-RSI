@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,7 +19,7 @@ from adaptive_rsi.storage_tools import _archive, diagnostics
 from adaptive_rsi.store import Store, uid
 from adaptive_rsi.lifecycle import readiness
 from adaptive_rsi.batching import execute as batch, preserve_acceptance
-from adaptive_rsi.storage_tools import verify_backup, retain_backups
+from adaptive_rsi.storage_tools import verify_backup, retain_backups, restore
 from scripts.package_desktop import package_updater
 from scripts.release import release_assets
 
@@ -304,6 +305,25 @@ class AuditRound5Test(unittest.TestCase):
         self.assertEqual(result["kept"], 2)
         self.assertEqual(len(result["removed"]), 2)
 
+    def test_restore_accepts_legacy_v1_backup_without_migration_ledger(self):
+        source = self.root / "legacy-v1.sqlite3"
+        with sqlite3.connect(source) as db:
+            db.executescript("""
+                CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT,path TEXT,config TEXT,paused INTEGER,created REAL);
+                CREATE TABLE tasks(id TEXT PRIMARY KEY,project TEXT,source TEXT,fingerprint TEXT,title TEXT,body TEXT,
+                    evidence TEXT,acceptance TEXT,state TEXT,priority INTEGER,attempts INTEGER,overrides TEXT,
+                    available REAL,created REAL,updated REAL,urgency INTEGER,infra_retries INTEGER,budget_waits INTEGER);
+                CREATE TABLE runs(id TEXT PRIMARY KEY,task TEXT,project TEXT,state TEXT,config TEXT,strategy TEXT,
+                    base TEXT,path TEXT,calls INTEGER,tokens INTEGER,started REAL,ended REAL,result TEXT);
+                CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
+                PRAGMA user_version=1;
+            """)
+        restored = restore(source, self.root / "restored")
+        self.assertTrue(restored["restored"])
+        checked = Store(self.root / "restored")
+        self.addCleanup(checked.close)
+        self.assertEqual(checked.one("SELECT count(*) AS n FROM schema_migrations")["n"], 2)
+
     def test_snapshot_and_config_revision_prevent_cross_tab_overwrite(self):
         with self.store.snapshot():
             first = self.store.one("SELECT count(*) AS n FROM schema_migrations")["n"]
@@ -313,6 +333,23 @@ class AuditRound5Test(unittest.TestCase):
         self.assertEqual(self.store.bump_config_revision(expected=0), 1)
         with self.assertRaisesRegex(ValueError, "changed in another window"):
             self.store.bump_config_revision(expected=0)
+
+    def test_agent_contract_reports_bootstrap_csrf_before_state(self):
+        from adaptive_rsi.server import Server
+        fake = SimpleNamespace(store=self.store, assets={}, model_center=SimpleNamespace(busy=0),
+                               auth_sessions=SimpleNamespace(busy=0), import_in_progress=False)
+        server = Server(fake)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        request = urllib.request.Request(server.origin + "/api/contract",
+                                         headers={"Cookie": server.cookie + "=" + server.token})
+        with urllib.request.urlopen(request, timeout=3) as response:
+            body = json.load(response)
+        self.assertEqual(body["csrf"], server.csrf)
+        self.assertEqual(body["descriptor"]["api_version"], 2)
 
     def test_project_archive_retains_rows_and_rejects_invalid_confirmation(self):
         runtime = Runtime(self.store)

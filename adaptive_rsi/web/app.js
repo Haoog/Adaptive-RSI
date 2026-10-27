@@ -147,12 +147,20 @@ function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevis
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
 function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
 async function sendApi(path,body,signal,{text=false}={}){
- if(body!==undefined&&!state)throw Error(t('正在连接本地服务，请稍候再提交。'));
+ const bootstrapRepair=body!==undefined&&!state&&path==='config/repair-global';
+ if(body!==undefined&&!state&&!bootstrapRepair)throw Error(t('正在连接本地服务，请稍候再提交。'));
  const controller=new AbortController();
  // Refresh already owns a shared deadline and cancellation across pagination.
  const timeout=signal?null:setTimeout(()=>controller.abort(),path==='model-center/probe'?960000:path==='projects/import'?210000:60000);
  try{
- const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-RSI-CSRF':state.csrf},body:JSON.stringify(body)};options.signal=signal||controller.signal;
+ const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-RSI-CSRF':state?.csrf||''},body:JSON.stringify(body)};options.signal=signal||controller.signal;
+ if(bootstrapRepair){
+  try{
+   const contract=await fetch('/api/contract');
+   if(!contract.ok)throw new Error('contract unavailable');
+   options.headers['X-RSI-CSRF']=(await contract.json()).csrf;
+  }catch{throw new TypeError(t('正在连接本地服务，请稍候再提交。'));}
+ }
  let response;
  try{response=await fetch('/api/'+path,options);}catch(error){throw new TypeError(t('无法连接本地服务。输入已保留，请确认服务仍在运行后重试。'));}
  if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;throw error;}
@@ -165,7 +173,8 @@ async function sendApi(path,body,signal,{text=false}={}){
   const message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
   if(!known&&data.error)console.warn('[adaptive-rsi]',data.error);
   if(data.error_code==='invalid_global_configuration')queueMicrotask(()=>offerGlobalConfigRepair(data.raw));
-  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.evidence={status:response.status,code:error.code,error:data.error};throw error;}
+  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.evidence={status:response.status,code:error.code,error:data.error};throw error;
+ }
  if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
  }finally{if(timeout!==null)clearTimeout(timeout);}

@@ -353,10 +353,14 @@ class Handler(BaseHTTPRequestHandler):
                                                                     "400": {"description": "Revision conflict or validation error"}}}},
                             "/api/operations": {"post": {"responses": {"200": {"description": "Background job receipt"}}}},
                         },
+                        "security": [{"sessionCookie": []}],
+                        "components": {"securitySchemes": {"sessionCookie": {
+                            "type": "apiKey", "in": "cookie", "name": self.server.cookie}}},
                     })
                     return
                 self.respond({
                     "descriptor": descriptor(),
+                    "csrf": self.server.csrf,
                     "state_schema": json.loads((Path(__file__).parent / "schemas/api-state-v2.schema.json").read_text())
                 })
             elif parsed.path == "/api/usage":
