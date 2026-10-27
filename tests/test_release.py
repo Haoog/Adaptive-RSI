@@ -362,6 +362,18 @@ class ReleaseAutomationTest(unittest.TestCase):
                 self.assertEqual(result["release"]["state"], expected)
                 api.assert_not_called()
 
+    def test_waiting_release_does_not_inherit_stale_verification_error(self):
+        # 检查通过后部署转入等待发布；此前等待检查时的提示已过期，不得继续展示。
+        self.runtime.configure({"delivery": {"deploy": self.policy}}, self.project)
+        self.run["config"] = encode(self.runtime.config(self.project))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            stale = advance(self.runtime, self.runtime.project(self.project), self.run, {"merged_sha": MERGED, "feedback": {}})
+            self.assertEqual(stale["deploy"]["state"], "waiting_verification")
+            self.assertEqual(stale["deploy"]["error"], "Post-merge verification must pass before release/deploy")
+            waiting = self.tick()
+            self.assertEqual(waiting["deploy"]["state"], "waiting_release")
+            self.assertEqual(waiting["deploy"]["error"], "")
+
     def test_owner_change_during_health_check_prevents_stale_rollback(self):
         from adaptive_rsi.release import owner_key, stable_key
         policy = self.setup_deployment(rollback=True)

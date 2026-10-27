@@ -657,6 +657,42 @@ async function checkQueueEditor(page, evidence) {
       window.dispatchEvent(new CustomEvent('rsi-notification-open',{detail:{task,project}}));
     }, [ids[0],ids[2]]);
     await page.locator('#detail-dialog[open] #detail-title').filter({hasText:'手机测试目标'}).waitFor();
+    // 流程质量与耗时：按钮文案与阶段名跟随界面语言往返切换。
+    const qualityRoute = async route => route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify({
+      tasks: 2, accepted: 1, delivered: 1, first_pass: 1, infrastructure_failures: 0, repeated_failures: 0,
+      requirements_revised: 0, stage_reused: 0, interventions: 0, stale_rework: 0, queue_seconds: 10,
+      phase_seconds: {preparation: 5, triage: 600, evolution: 300}, model_seconds: 30,
+      remote_wait_seconds: {}, invalidations: {}, events: {}, elapsed_samples: 1, elapsed_seconds: 600,
+      accepted_tokens: 100, accepted_unknown_calls: 0, delivered_tokens: 100, delivered_unknown_calls: 0,
+      to_pr_samples: 1, to_pr_seconds: 60, to_merge_samples: 1, to_merge_seconds: 120})});
+    await page.route('**/api/workflow-metrics*', qualityRoute);
+    try {
+      await page.locator('#detail-dialog .close-dialog').click();
+      await page.locator('[data-view="usage"]').click();
+      await page.locator('#usage-totals strong').first().waitFor();
+      await page.locator('#language-select').selectOption('zh-CN');
+      await page.getByRole('button', {name: '流程质量与耗时', exact: true}).waitFor();
+      await page.getByRole('button', {name: '流程质量与耗时', exact: true}).click();
+      const qualityDialog = page.locator('dialog[open].experience-dialog');
+      await qualityDialog.getByText('价值初筛 · 600 秒').waitFor();
+      await qualityDialog.getByText('策略改进 · 300 秒').waitFor();
+      assert.equal(await qualityDialog.innerText().then(text => /triage ·|evolution ·/.test(text)), false,
+        'phase names must not fall back to raw identifiers');
+      await qualityDialog.getByRole('button', {name: '关闭', exact: true}).click();
+      await page.locator('#language-select').selectOption('en');
+      await page.getByRole('button', {name: 'Workflow quality and timing', exact: true}).waitFor();
+      await page.getByRole('button', {name: 'Workflow quality and timing', exact: true}).click();
+      const englishDialog = page.locator('dialog[open].experience-dialog');
+      await englishDialog.getByText('Value screening · 600 seconds').waitFor();
+      await englishDialog.getByText('Strategy improvement · 300 seconds').waitFor();
+      assert.equal(await englishDialog.innerText().then(text => /triage ·|evolution ·/.test(text)), false,
+        'phase names must not fall back to raw identifiers');
+      await englishDialog.getByRole('button', {name: 'Close', exact: true}).click();
+      await page.locator('#language-select').selectOption('zh-CN');
+      await page.getByRole('button', {name: '流程质量与耗时', exact: true}).waitFor();
+    } finally {
+      await page.unroute('**/api/workflow-metrics*', qualityRoute);
+    }
     assert.deepEqual(errors, []);
     console.log(
       "Mobile fresh navigation, install assets, idempotency, revisions, lazy history, evidence, diff and backup passed.",
