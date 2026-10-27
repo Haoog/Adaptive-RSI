@@ -597,7 +597,10 @@ class Runtime(Maintenance):
         self.auth_sessions.close()
         if self.thread:
             self.thread.join(timeout=10)
-        self.pool.shutdown(wait=True)
+        try:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+        except TypeError:
+            self.pool.shutdown(wait=True)
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
             self.maintenance_thread.join(timeout=10)
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
@@ -657,7 +660,9 @@ class Runtime(Maintenance):
                 # 小时之间也可能切换偏移（例如 Lord Howe 的半小时跳时）。
                 # 在时间戳轴上找到切换的首秒，避免跨过真正的窗口起点。
                 low, high = int(candidate // 1), int(boundary)
-                while high - low > 1:
+                steps = 0
+                while high - low > 1 and steps < 64:
+                    steps += 1
                     middle = (low + high) // 2
                     if datetime.datetime.fromtimestamp(middle, zone).utcoffset() == local.utcoffset():
                         low = middle
@@ -687,8 +692,9 @@ class Runtime(Maintenance):
                                               "reason": prior.get("reason") or "Legacy deferral retained until inputs change"})
                 continue
             baseline_changed = head != prior.get("base")
-            # Implementation scope and issue locations do not prove a complete dependency set.
             paths = prior.get("related_paths", []) if prior.get("dependency_scope_complete") is True else []
+            if not isinstance(paths, list):
+                paths = []
             if baseline_changed and paths and prior.get("base"):
                 try:
                     for path in paths:
@@ -714,7 +720,8 @@ class Runtime(Maintenance):
 
     def release_dead_dependencies(self):
         # 依赖到达「永远不会合并」的终态时，等待它的任务会永久卡在
-        # 「等待前置任务合并」；解除等待并转 blocked，由用户复核后手动重试。
+        if not DEAD_DEPENDENCY_STATES:
+            return
         placeholders = ",".join("?" * len(DEAD_DEPENDENCY_STATES))
         rows = self.store.query(
             "SELECT td.task AS task, td.dependency AS dependency, t.project AS project, d.state AS dep_state "
@@ -779,7 +786,10 @@ class Runtime(Maintenance):
                     if future.done():
                         self.futures.remove(future)
                         with self.scheduler_scope("worker_future"):
-                            future.result()
+                            try:
+                                future.result()
+                            except Cancelled:
+                                pass
                 from .delivery import schedule as schedule_delivery
                 with self.scheduler_scope("delivery"):
                     schedule_delivery(self)
@@ -853,7 +863,7 @@ class Runtime(Maintenance):
                 run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
                 if not run:
                     return
-                services[project["id"]] += 1 / config["schedule"]["weight"]
+                services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
                 self.store.put_setting("fair-service", services)
                 self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
                 waiting[project["id"]] = now
@@ -943,7 +953,7 @@ class Runtime(Maintenance):
             task = self.store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
             config = json.loads(run["config"])
             directory = self.store.root / "runs" / run["id"]
-            directory.mkdir(parents=True)
+            directory.mkdir(parents=True, exist_ok=True)
             self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(directory), run["id"]))
             if self.is_cancelled(run):
                 raise Cancelled("Project paused or run cancelled")

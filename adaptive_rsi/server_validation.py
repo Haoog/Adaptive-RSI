@@ -108,6 +108,20 @@ Only a verified ready candidate can be promoted
 Candidate evidence is incompatible with current configuration
 Candidate content is incomplete
 Unknown candidate kind
+Task dependency cycle
+Dependency must be another task in the same project
+Urgency must be 0 or 1
+Only waiting tasks can be scheduled
+Automatic delivery must be explicitly enabled per project
+Parallel project limit is a global setting; select global defaults
+Software updates are a global setting
+Only a verified candidate awaiting approval can be delivered
+Independent gates have not passed
+No verified code candidate to revert
+Explicit confirmation is required to reset invalid project settings
+Project configuration is valid; reset is unavailable
+Project configuration must be a JSON object
+Configuration must be an object
 """.strip().splitlines())
 
 

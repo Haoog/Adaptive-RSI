@@ -113,12 +113,15 @@ class Credentials:
             elif mode == "session":
                 self._sessions[(self.service, reference)] = value
             elif mode == "file":
-                self.directory.mkdir(mode=0o700, exist_ok=True)
+                self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
                 self.directory.chmod(0o700)
                 path = self.directory / reference
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "w") as stream:
+                import tempfile
+                with tempfile.NamedTemporaryFile("w", dir=self.directory, prefix=".cred-", delete=False) as stream:
+                    os.fchmod(stream.fileno(), 0o600)
                     stream.write(value)
+                    tmp_name = stream.name
+                os.replace(tmp_name, path)
             else:
                 raise CredentialError("invalid_mode")
 

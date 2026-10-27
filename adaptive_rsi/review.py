@@ -62,10 +62,16 @@ def enforce_review(review, config):
     ranks = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     for finding in review["findings"]:
         relative_path(finding["path"])
-        if finding["path"] in ["", "."] or finding["line"] < 1 or \
-                any(not finding[key].strip() for key in ["title", "reason", "suggestion"]):
+        try:
+            line_val = int(finding.get("line", 0))
+        except (ValueError, TypeError):
+            line_val = 0
+        if finding["path"] in ["", "."] or line_val < 1 or \
+                any(not str(finding.get(key, "")).strip() for key in ["title", "reason", "suggestion"]):
             raise RuntimeError("Review finding requires a file, line, evidence and suggestion")
-    blocked = any(ranks[f["severity"]] <= ranks[config["review"]["block_on"]] for f in review["findings"])
+    block_threshold = config.get("review", {}).get("block_on", "high")
+    threshold_rank = ranks.get(block_threshold, 1)
+    blocked = any(ranks.get(f.get("severity"), 3) <= threshold_rank for f in review["findings"])
     decision = review["decision"]
     if blocked or any(a["decision"] == "fail" for a in assessments):
         decision = "fail"
@@ -74,4 +80,4 @@ def enforce_review(review, config):
     reason = review["reason"] if decision == review["decision"] else \
         "Review gate: " + decision + "; blocking findings or incomplete/failed assessments override the reported pass. " + review["reason"]
     return {**review, "decision": decision, "reason": reason, "reported_decision": review["decision"],
-            "blocking_threshold": config["review"]["block_on"]}
+            "blocking_threshold": block_threshold}

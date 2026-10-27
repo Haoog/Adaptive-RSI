@@ -23,15 +23,21 @@ def report(store, params):
         return params.get(key, [default])[0]
 
     now = time.time()
-    start, end = float(value("start", now - 7 * 86400)), float(value("end", now))
-    if not all(math.isfinite(x) for x in [start, end]) or start < 0 or end <= start:
+    try:
+        start, end = float(value("start", now - 7 * 86400)), float(value("end", now))
+    except (ValueError, TypeError):
+        raise ValueError("Invalid usage time range") from None
+    if not all(math.isfinite(x) for x in [start, end]) or start < 0 or end <= start or end > 4102444800:
         raise ValueError("Invalid usage time range")
     timezone = value("timezone", "UTC")
     try:
         zone = ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError):
         raise ValueError("Invalid usage timezone") from None
-    limit, offset = int(value("limit", 25)), int(value("offset", 0))
+    try:
+        limit, offset = int(value("limit", 25)), int(value("offset", 0))
+    except (ValueError, TypeError):
+        raise ValueError("Invalid usage pagination") from None
     if not 1 <= limit <= 100 or not 0 <= offset <= 2**63 - 1:
         raise ValueError("Invalid usage pagination")
     project, task = value("project"), value("task")

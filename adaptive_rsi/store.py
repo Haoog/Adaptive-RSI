@@ -47,7 +47,8 @@ def decode_evidence(value):
     if not isinstance(checks, dict) or any(not isinstance(rows, list) or
             any(not isinstance(row, dict) for row in rows) for rows in checks.values()):
         return {"evidence_error": "invalid_evidence_shape:checks"}
-    if "merged_at" in result and not isinstance(result["merged_at"], (int, float)):
+    if "merged_at" in result and (not isinstance(result["merged_at"], (int, float)) or
+            not (0 <= result["merged_at"] < 2**63 - 1)):
         return {"evidence_error": "invalid_evidence_shape:merged_at"}
     return result
 
@@ -142,6 +143,8 @@ class Store:
                 CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
                 CREATE INDEX IF NOT EXISTS remote_waits_run ON remote_waits(run);
                 CREATE INDEX IF NOT EXISTS task_revisions_task ON task_revisions(task);
+                CREATE INDEX IF NOT EXISTS task_dependencies_dependency ON task_dependencies(dependency);
+                CREATE INDEX IF NOT EXISTS runs_task_state ON runs(task, state);
             """)
             db.execute("BEGIN IMMEDIATE")
             for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
@@ -255,9 +258,13 @@ class Store:
             self._pool_generation += 1
             while True:
                 try:
-                    self._pool.get_nowait().close()
+                    conn = self._pool.get_nowait()
                 except queue.Empty:
                     return
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def query(self, sql, args=()):
         with self.connect() as db:
@@ -344,6 +351,8 @@ class Store:
                 self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
 
     def _end_spans(self, db, table, run, now):
+        if table not in ("phase_times", "remote_waits"):
+            raise ValueError("Invalid span table")
         for row in db.execute("SELECT id,started FROM " + table + " WHERE run=? AND ended IS NULL", (run,)).fetchall():
             began = self._clock_samples.pop((table, row["id"]), None)
             elapsed = max(0, time.monotonic() - began if began is not None else now - row["started"])
@@ -465,8 +474,11 @@ class Store:
             extra = ""
             values = []
             if task_fields and task and task["state"] != "cancelled":
-                extra = "," + ",".join(field + "=?" for field in task_fields)
-                values = [task_fields[field] for field in task_fields]
+                allowed_fields = {"state", "available", "infra_retries", "attempts", "budget_waits"}
+                safe_fields = {k: v for k, v in task_fields.items() if k in allowed_fields}
+                if safe_fields:
+                    extra = "," + ",".join(field + "=?" for field in safe_fields)
+                    values = [safe_fields[field] for field in safe_fields]
             db.execute("UPDATE tasks SET state=?,updated=?" + extra + " WHERE id=?",
                        (state, now, *values, row["task"]))
             if state == "deferred":

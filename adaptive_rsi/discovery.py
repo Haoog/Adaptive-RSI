@@ -109,7 +109,7 @@ def issue_comment_context(runtime, project, task, config, checked=None, cancel=N
                        "body": row["body"][:ISSUE_COMMENT_BODY_LIMIT], "truncated": truncated,
                        "created_at": row.get("created_at", ""), "updated_at": row.get("updated_at", ""),
                        "url": row.get("html_url", "")}
-            max_comment_id = max(max_comment_id, int(comment["id"]))
+            max_comment_id = max(max_comment_id, int(comment["id"]) if str(comment["id"]).isdigit() else 0)
             fetched_comments[str(comment["id"])] = comment
 
     try:
@@ -192,7 +192,7 @@ def issue_comment_context(runtime, project, task, config, checked=None, cancel=N
         comments.update(fetched_comments)
         sort_field = "updated_at" if cursor else "created_at"
         comments = dict(sorted(comments.items(), key=lambda pair: (
-            pair[1].get(sort_field, ""), int(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
+            pair[1].get(sort_field, ""), int(pair[0]) if str(pair[0]).isdigit() else 0, str(pair[0])), reverse=True)[:ISSUE_COMMENT_LIMIT])
         retained = list(comments.values())
         authoritative = issue_evidence.get("comments")
         if isinstance(authoritative, int) and authoritative >= 0:

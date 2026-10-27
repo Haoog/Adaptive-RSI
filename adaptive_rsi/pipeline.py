@@ -246,7 +246,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if not plan["scope"] or not plan["acceptance"]:
         raise RuntimeError("Plan lacks scope or acceptance criteria")
     from pathlib import PurePosixPath
-    plan["scope"] = [str(PurePosixPath(relative_path(path))) for path in plan["scope"]]
+    plan["scope"] = list(dict.fromkeys(str(PurePosixPath(relative_path(path))) for path in plan["scope"]))
     for path in plan["scope"]:
         relative_path(path)
         if path == "." or any(char in path for char in [":", "：", "\n", "\r", "\0", "*", "?", "[", "\\"]):

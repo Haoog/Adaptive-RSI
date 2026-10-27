@@ -64,7 +64,7 @@ def empty_test_run(text):
     # 行首锚点用 (?:^|\n) 而不是内联 (?m)：Python 3.11 起禁用位于模式中段的内联旗标。
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
-                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b|"
+                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
                          r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
                          r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
     return bool(empty and not positive)
@@ -74,6 +74,8 @@ def configured_check_files(baseline, checks):
     root = Path(baseline).resolve()
     files = set()
     for check in checks:
+        if not isinstance(check, dict) or not isinstance(check.get("argv"), list):
+            continue
         cwd = (root / check.get("cwd", ".")).resolve()
         try:
             cwd.relative_to(root)

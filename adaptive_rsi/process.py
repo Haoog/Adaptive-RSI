@@ -109,8 +109,9 @@ def process_error_kind(result):
         "Command timed out": "timeout", "Command output limit exceeded": "output_limit",
     }.get(result.get("error"), "exit")
 
-
 def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None, input_data=None):
+    output_mb = max(1, int(output_mb or 12))
+    limit_bytes = output_mb * 1024 * 1024
     started = time.monotonic()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr, tempfile.TemporaryFile() as stdin:
         if input_data is not None:
@@ -130,7 +131,7 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                     reason = "Cancelled"
                 elif timeout and time.monotonic() - started > timeout:
                     reason = "Command timed out"
-                elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > output_mb * 1024 * 1024:
+                elif os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > limit_bytes:
                     reason = "Command output limit exceeded"
             if reason:
                 try:
@@ -139,9 +140,12 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                     pass
                 break
             time.sleep(0.08)
-        process.wait()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
         if reason is None and (os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size >
-                               output_mb * 1024 * 1024):
+                               limit_bytes):
             reason = "Command output limit exceeded"
         # Kill descendants still in this process group before touching artifacts.
         try:
@@ -198,7 +202,11 @@ def scrub_tree(root, state=None):
                 try:
                     resolved = item.resolve()
                     resolved.relative_to(root)
-                except ValueError:
+                except (ValueError, RuntimeError):
+                    try:
+                        resolved = item.resolve()
+                    except RuntimeError:
+                        continue
                     for target in sensitive:
                         try:
                             resolved.relative_to(target)
@@ -366,8 +374,9 @@ class Sandbox:
             cleanup = cleanup and bool(result["error"])
         finally:
             if cleanup:
-                name = argv[argv.index("--name") + 1]
-                run_process(["docker", "rm", "--force", name], timeout=15)
+                name = argv[argv.index("--name") + 1] if "--name" in argv and argv.index("--name") + 1 < len(argv) else None
+                if name:
+                    run_process(["docker", "rm", "--force", name], timeout=15)
         result["argv"] = check["argv"]
         result["name"] = check["name"]
         return result
