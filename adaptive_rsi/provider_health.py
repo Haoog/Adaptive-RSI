@@ -132,6 +132,25 @@ class ProviderHealth:
     def status(self, config, provider, project):
         return self.store.setting(connection_key(config, provider, project), {"failures": 0, "paused": False})
 
+    @staticmethod
+    def _half_open_ready(config, state, now):
+        minutes = config.get("recovery", {}).get("provider_retry_minutes", 0)
+        return bool(
+            state.get("paused")
+            and minutes
+            and state.get("code") in ("rate_limit", "timeout", "connection")
+            and now >= state.get("at", now) + minutes * 60
+            and now >= state.get("half_open_until", 0)
+            and now >= state.get("retry_at", 0)
+        )
+
+    def admission(self, config, provider, project):
+        """Report readiness without consuming the single half-open attempt."""
+        now = time.time()
+        state = self.status(config, provider, project)
+        half_open = self._half_open_ready(config, state, now)
+        return {"ready": not state.get("paused") or half_open, "half_open": half_open}
+
     def require(self, config, provider, project):
         key = connection_key(config, provider, project)
         now = time.time()
@@ -144,9 +163,7 @@ class ProviderHealth:
                 error.retry_after = state["retry_at"] - now
                 error.provider_id = provider
                 raise error
-            minutes = config.get("recovery", {}).get("provider_retry_minutes", 0)
-            if (state.get("paused") and minutes and state.get("code") in ("rate_limit", "timeout", "connection") and
-                    now >= state.get("at", now) + minutes * 60 and now >= state.get("half_open_until", 0)):
+            if self._half_open_ready(config, state, now):
                 state["half_open_until"] = now + config["limits"]["command_seconds"] + 30
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(state), key))
                 return

@@ -102,8 +102,11 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
             except Exception as exc:
                 return False, detail + " is missing usable credentials (" + str(exc) + ").", "models", "credentials_missing", {**route_fields, "probe": {"state": "unavailable"}}
         from .provider_health import ProviderHealth
-        if ProviderHealth(runtime.store).status(config, provider_id, project["id"])["paused"]:
+        health = ProviderHealth(runtime.store).admission(config, provider_id, project["id"])
+        if not health["ready"]:
             return False, detail + " is paused after repeated provider failures.", "models", "provider_paused", {**route_fields, "probe": {"state": "unavailable"}}
+        if health["half_open"]:
+            detail += " A single half-open recovery attempt is eligible."
         opencode = opencode_status() if provider.get("protocol") == "opencode" else None
         if opencode and opencode[0] == "failed":
             exc = opencode[1]

@@ -1839,7 +1839,7 @@
     "retained_freshness_gate": 1
   },
   "verification": {
-    "python_discovered_tests": 733,
+    "python_discovered_tests": 734,
     "python": "Full grouped execution followed by clean reruns of the corrected 184-test group, 10 delivery endpoint tests, 55 release/reconciliation tests and 22 audit tests. Initial failures exposed test fixtures requiring valid references and the new operation-lock interface; both were fixed. Required CI must run on the final PR SHA.",
     "javascript_tests_passed": 326,
     "rust_tests_passed": 10,
@@ -1860,6 +1860,7 @@
     "review": {
       "standards": "No remaining blockers after credential cleanup, nested evidence and fixture corrections.",
       "spec": "No remaining blockers in final bounded review after policy normalization, transactional candidate retention and authorization-independent factual receipts.",
+      "pull_request": "The repository's automated review identified premature half-open lease consumption; readiness admission is now read-only, the actual model invocation reserves the lease, and a shared-provider end-to-end regression passes.",
       "independent_human_review": false
     },
     "real_model_capability_claim": false

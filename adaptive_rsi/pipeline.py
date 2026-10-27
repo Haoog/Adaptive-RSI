@@ -116,10 +116,15 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
     if not check["ready"]:
-        from .provider_health import ProviderHealth
-        for item in check.get("items", []):
-            if item.get("reason") == "provider_paused":
-                ProviderHealth(runtime.store).require(config, item["provider"], project["id"])
+        paused = next((item for item in check.get("items", [])
+                       if item.get("reason") == "provider_paused"), None)
+        if paused:
+            # Preserve provider failure classification without consuming a
+            # half-open lease before the actual model invocation.
+            from .provider_health import ProviderPaused
+            error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
+            error.provider_id = paused["provider"]
+            raise error
         transition("insufficient_evidence", {"reason": "Project readiness checks need attention", "readiness": check,
                    "failure": {"code": "environment",
                                "action": "check_readiness"}}, True)

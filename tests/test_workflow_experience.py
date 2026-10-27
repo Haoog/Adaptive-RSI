@@ -1108,6 +1108,43 @@ class ExperienceTest(unittest.TestCase):
         self.assertEqual(1, self.runtime.resume_provider_tasks("opencode", self.project))
         self.assertEqual("queued", self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
 
+    def test_shared_provider_half_open_recovery_reaches_real_invocations(self):
+        from adaptive_rsi.provider_health import ProviderHealth
+
+        class HealthAwareAgent(FakeAgent):
+            def invoke(agent, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                health.require(config, "openai", project)
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                health.record(config, "openai", project)
+                return result
+
+        self.runtime.configure({
+            "checks": CHECKS,
+            "sources": {"inspection": False, "issues": False},
+            "recovery": {"provider_retry_minutes": 1},
+            "evolution": {"enabled": False},
+        }, self.project)
+        task = self.runtime.goal(self.project, "Fix addition")
+        self.runtime.pause(self.project, False)
+        config = self.runtime.config(self.project)
+        run = self.store.claim(self.project, config)
+        health = ProviderHealth(self.store)
+        with patch("adaptive_rsi.provider_health.time.time", return_value=time.time() - 61):
+            for _ in range(3):
+                health.record(config, "openai", self.project, RuntimeError("HTTP 503"))
+        self.assertTrue(health.status(config, "openai", self.project)["paused"])
+        agent = HealthAwareAgent()
+        self.runtime.agent = agent
+
+        self.runtime.process(run)
+
+        self.assertIn("planning", [role for role, _ in agent.roles])
+        self.assertIn("implementation", [role for role, _ in agent.roles])
+        self.assertIn("review", [role for role, _ in agent.roles])
+        self.assertFalse(health.status(config, "openai", self.project)["paused"])
+        self.assertIn(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"],
+                      {"awaiting_approval", "completed"})
+
 
 class StorageApprovalOverviewTest(unittest.TestCase):
     """Pending-approval storage counts must follow the current delivery intent."""
