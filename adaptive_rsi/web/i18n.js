@@ -1334,6 +1334,7 @@ const english = {
   "控制台登录已失效，请重新打开控制台后继续授权。": "The console session expired. Reopen the console to continue authorization.",
   "暂时无法连接，授权状态已保留，正在重试。": "Connection is unavailable. Authorization status is retained; retrying.",
   "登录已完成，账号状态或模型目录更新失败，正在重试。": "Signed in. Account status or model catalog refresh failed; retrying.",
+  "登录已完成，但模型目录刷新失败。可稍后在模型列表手动刷新目录，或重新登录。": "Signed in, but the model catalog refresh failed. Refresh the catalog manually in the model list later, or sign in again.",
   "项目时区": "Project timezone",
   "等待模型服务恢复用量": "Waiting for provider usage to recover",
   "这个版本更新了什么": "What is new in this version",

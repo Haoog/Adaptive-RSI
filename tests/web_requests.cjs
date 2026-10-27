@@ -2525,10 +2525,13 @@ async function authCompletionPage({failure='',direct=false,hold=''}={}) {
   vm.runInContext(authSource,page.context);
   page.context.window.RSIAuth.show('openai',async()=>{
     calls.catalog++;await waitHeld('catalog');
-    if(calls.catalog===1&&failure==='catalog')throw Object.assign(new Error('Catalog unavailable'),{status:503});
+    if(failure==='catalog'&&calls.catalog===1)throw Object.assign(new Error('Catalog unavailable'),{status:503});
+    if(failure==='catalog503')throw Object.assign(new Error('Catalog unavailable'),{status:503});
+    if(failure==='catalog400')throw Object.assign(new Error('Catalog rejected'),{status:400});
   });
   await tick();await tick();
   return {page,calls,tick,walk,release:()=>release(),text:()=>walk(page.node('mc-auth')).map(node=>node.textContent||'').join(' '),
+    activeTimers:()=>page.timers.filter(timer=>timer.active&&timer.delay===1500).length,
     async finish(){
       if(direct){const form=walk(page.node('mc-auth')).find(node=>node.tagName==='FORM');form.children[0].children[0].value='TEST-CODE';form.handlers.submit({preventDefault(){}});}
       else page.fireTimer(1500);
@@ -2556,6 +2559,22 @@ test('completed auth console expiry stays actionable and stops refresh retries',
   const run=await authCompletionPage({failure:'session_required'});await run.finish();
   assert.match(run.text(),/控制台登录已失效/);assert.equal(run.calls.catalog,0);
   assert.equal(run.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
+});
+
+test('completed auth stops catalog retries on a non-retryable rejection',async()=>{
+  const run=await authCompletionPage({failure:'catalog400'});await run.finish();
+  assert.equal(run.calls.catalog,1);
+  assert.match(run.text(),/模型目录刷新失败/);
+  assert.equal(run.activeTimers(),0,'a 4xx catalog rejection must not keep retrying');
+  assert.equal(run.calls.catalog,1,'no further catalog attempts after a permanent rejection');
+});
+
+test('completed auth bounds catalog retries for a persistent transient failure',async()=>{
+  const run=await authCompletionPage({failure:'catalog503'});await run.finish();
+  for(let attempt=0;attempt<8;attempt++){if(!run.activeTimers())break;run.page.fireTimer(1500);await run.tick();await run.tick();}
+  assert.equal(run.calls.catalog,5,'catalog retries stop after four automatic retries');
+  assert.match(run.text(),/模型目录刷新失败/);
+  assert.equal(run.activeTimers(),0);
 });
 
 for(const hold of ['status','catalog'])for(const restart of [false,true]){
