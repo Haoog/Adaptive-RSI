@@ -441,14 +441,7 @@ class NativeAgent:
                 if cancel and cancel():
                     raise Cancelled("Cancelled after model response")
                 if not calls:
-                    retries = getattr(conversation, "_text_only_retries", 0) + 1
-                    conversation._text_only_retries = retries
-                    if retries > 2:
-                        raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
-                    conversation.results([("retry", "prompt", {"error": "Please call a tool to inspect or execute changes; plain text thoughts alone cannot execute the task."})])
-                    self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
-                    continue
-                conversation._text_only_retries = 0
+                    raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
                 if len(calls) > 64:
                     raise RuntimeError("Model response exceeds 64 tool calls per turn")
                 final = [x for x in calls if x[1] == "finish"]
