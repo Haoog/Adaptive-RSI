@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.119
+
+<!-- adaptive-rsi-release:0.5.119;base:0d722d9a6bdbae28ee8a9e44c8ac6c4523733206 -->
+
 - Deferred/rejected decisions from batch triage are recorded in the task decision store when the finding lands: tasks without any run now show the concrete reason in the task list and detail instead of a bare state badge, consistent with deferrals produced by full planning. Decision records persist with the task and are no longer affected by the 90-day derived-data cleanup; legacy internal triage-state keys from earlier upgrades are still migrated at the next deferred reassessment, and wake-up, deduplication and manual reconsideration behave unchanged.
 - The task detail block "Deferral decision and wake conditions" renders structured content instead of raw JSON: the reason, the baseline (short SHA with the full commit on hover) and the wake condition (machine enums get Chinese/English copy; unknown enums are shown verbatim), while the raw decision record stays expandable. For rejected tasks the block title and guidance become "Rejection reason" instead of the deferral wording.
 - Software update failure reasons are no longer shown as raw English in the Chinese interface: every fixed reason from interrupted checks, an unverifiable release feed, installation verification failures, rollback completion and recovery mode now comes with actionable Chinese guidance; `GitHub HTTP <code>` reasons render as a structured sentence, and unrecognized reasons keep the original text behind a "reason (verbatim)" prefix. The English interface still shows the original reason.
