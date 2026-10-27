@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.120
+
+<!-- adaptive-rsi-release:0.5.120;base:1adb167bd200e942256e7ea197c928986256eaa4 -->
+
 - A failed model catalog refresh after sign-in no longer retries every 1.5 seconds forever: input rejections stop immediately with an actionable message, transient failures stop after four automatic retries, and the catalog can be refreshed manually or the account signed in again.
 - Reloading the interface or switching the runtime machine while the desktop app is downloading a new installer image now resumes progress polling until completion or failure; the completion and failure notices match the non-reloaded flow instead of freezing at a percentage.
 - Desktop update checks (including an explicit "Check for updates") keep an in-flight download's progress instead of clearing its downloading state, so the button cannot be clicked into a duplicate download; downloads are guarded by a process-wide gate, and no path can run two download threads writing the same installer image.
@@ -11,6 +15,7 @@
 - "Remove connection" no longer deletes on a single click: a confirmation now explains that the connection and credentials stored on this machine (keychain or private file) are deleted irreversibly, that re-adding creates a new connection without restoring enabled/favorite/verified/price records, and that the server rejects removal while a role or fallback model still references the connection. Cancelling sends no request.
 - Step 2 ("Account connection") of the model-center setup checklist no longer stays highlighted forever for key-based or local connections: it shows as done when no key is required or credentials are configured, and only stays current while credentials are missing. Codex/OpenCode official sign-in connections behave as before.
 - The workbench "current task" card now shows the task title instead of a status word when the running task is outside the current task-list page (deep queues) or excluded by the "Needs you" and "History" groups; the card falls back to waiting copy once the run ends, and switching projects no longer leaks another project's running title.
+
 ## 0.5.119
 
 <!-- adaptive-rsi-release:0.5.119;base:0d722d9a6bdbae28ee8a9e44c8ac6c4523733206 -->
