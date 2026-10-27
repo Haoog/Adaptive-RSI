@@ -360,7 +360,7 @@ function render(){
  const counts=state.selected_project&&state.selected_project!==projectId?null:state.task_counts;
  const running=runs.find(run=>!run.ended),queue=counts?.find(r=>r.state==='queued')?.count??tasks.filter(task=>task.state==='queued').length;
  $('queue-count').textContent=queue;$('queue-count').hidden=!queue;
- $('current-work').textContent=running?(tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
+ $('current-work').textContent=running?(running.task_title||tasks.find(task=>task.id===running.task)?.title||t(statusNames[running.state]||'执行中')):t(project?.paused?'暂停期间不会调用模型或修改代码':queue?'准备处理任务':'等待下一次检查');
  $('current-work-detail').textContent=running?runningStage(running)+' · '+t('已运行')+' '+elapsedCopy(Date.now()/1000-running.started)+(running.last_stage_at?' · '+t('最近进展')+' '+stamp(running.last_stage_at):''):project?.paused?t('启动后会按计划检查项目，也可以随时添加目标。'):queue?t('已有')+' '+queue+' '+t('个任务等待，当前任务结束后按价值顺序开始。'):t('已到下一次检查时间时会自动开始，无需保持页面前台运行。');
  const usage=(state.usage||[]).find(u=>u.project===(projectId||'model-center'));$('usage-brief').textContent=loadedStateSections.analyticsProject===(projectId||null)?(usage?.tokens||0)+' tokens':t('统计加载中');$('runtime-evidence').hidden=!project&&!usage;
  const scheduleTime=row=>row.next_effective??row.due;
@@ -825,24 +825,32 @@ for(const kind of ['release','deploy'])document.querySelector('[data-path="deliv
 
 const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升级）',managed:'内置自更新'};
 let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
+function stopDesktopUpdatePolling(){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
 async function checkDesktopUpdate(force=false){
  if(!window.RSIDesktop?.invoke)return;
  try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
+ // 下载可能先于本次页面会话开始（刷新界面或切换运行机器后加载）：恢复轮询直到完成或失败。
+ if(desktopUpdate?.downloading&&!desktopUpdateTimer)pollDesktopUpdate();
  renderUpdate();
+}
+function pollDesktopUpdate(){
+ if(desktopUpdateTimer||!window.RSIDesktop?.invoke)return;
+ desktopUpdateTimer=setInterval(async()=>{
+   try{const info=await window.RSIDesktop.invoke('check_desktop_update');
+     if(!info||!info.version){desktopUpdate=null;stopDesktopUpdatePolling();}
+     else if(info.error){desktopUpdate=null;stopDesktopUpdatePolling();toast(t('新版本下载失败：')+(info.error_code==='checksum'?t('校验未通过，已删除下载文件。'):info.error),true);}
+     else{desktopUpdate=info;if(!info.downloading&&info.percent>=100){stopDesktopUpdatePolling();toast(t('下载已完成，安装镜像已打开；请拖拽安装后重启应用。'));}}
+   }catch{stopDesktopUpdatePolling();}
+   renderUpdate();
+ },1000);
 }
 async function startDesktopUpdate(){
  if(!desktopUpdate||desktopUpdateTimer)return;
+ if(desktopUpdate.opened&&!desktopUpdate.downloading)return;
  if(!(await uiConfirm(t('将下载新版桌面安装镜像并自动打开，下载完成后请拖拽安装。确认继续？'))))return;
  desktopUpdate.downloading=true;desktopUpdate.percent=0;renderUpdate();
  try{await window.RSIDesktop.invoke('download_desktop_update');}catch(error){desktopUpdate=null;toast(t('新版本下载失败：')+error,true);renderUpdate();return;}
- desktopUpdateTimer=setInterval(async()=>{
-   try{const info=await window.RSIDesktop.invoke('check_desktop_update');
-     if(!info||!info.version){desktopUpdate=null;clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
-     else if(info.error){desktopUpdate=null;clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;toast(t('新版本下载失败：')+(info.error_code==='checksum'?t('校验未通过，已删除下载文件。'):info.error),true);}
-     else{desktopUpdate=info;if(!info.downloading&&info.percent>=100){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;toast(t('下载已完成，安装镜像已打开；请拖拽安装后重启应用。'));}}
-   }catch{clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
-   renderUpdate();
- },1000);
+ pollDesktopUpdate();
 }
 function renderUpdateExtras(update){
  let notes=$('update-notes');
@@ -850,7 +858,9 @@ function renderUpdateExtras(update){
  else if(notes)notes.remove();
  let button=$('desktop-update');
  const candidate=window.RSIDesktop&&desktopUpdate;
- if(candidate){if(!button){button=el('button',undefined,'button');button.id='desktop-update';button.type='button';button.addEventListener('click',()=>safe(startDesktopUpdate));$('apply-update').after(button);}button.replaceChildren((candidate.downloading?t('正在下载新版本…'):t('下载并安装新版本'))+' · '+candidate.version+(candidate.downloading&&Number.isFinite(candidate.percent)?' · '+Math.max(0,Math.min(100,Math.round(candidate.percent)))+'%':''));button.disabled=!!candidate.downloading;}
+ if(candidate){if(!button){button=el('button',undefined,'button');button.id='desktop-update';button.type='button';button.addEventListener('click',()=>safe(startDesktopUpdate));$('apply-update').after(button);}
+  const done=!candidate.downloading&&candidate.opened;
+  button.replaceChildren((candidate.downloading?t('正在下载新版本…'):done?t('安装镜像已打开，请拖拽安装'):t('下载并安装新版本'))+' · '+candidate.version+(candidate.downloading&&Number.isFinite(candidate.percent)?' · '+Math.max(0,Math.min(100,Math.round(candidate.percent)))+'%':''));button.disabled=!!candidate.downloading||done;}
  else if(button)button.remove();
 }
 function renderUpdate(){if(!state)return;const update=state.update||{state:'unchecked'};

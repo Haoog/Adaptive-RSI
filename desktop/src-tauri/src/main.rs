@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::{Mutex, RwLock},
+    sync::{Mutex, MutexGuard, RwLock},
     time::Duration,
 };
 use tauri::{
@@ -68,6 +68,10 @@ impl DesktopUpdate {
 
 const UPDATE_REPO: &str = "Haoog/Adaptive-RSI";
 
+// 进程级下载闸门：由下载线程持有直到结束。双下载防护因此不依赖
+// DesktopUpdate.downloading 这个可被并发状态替换清零的标志。
+static DOWNLOAD_GATE: Mutex<()> = Mutex::new(());
+
 fn update_client() -> Result<Client, String> {
     // 资产下载会经过 GitHub 的 https 重定向；只跟随 https，且限制跳数。
     Client::builder()
@@ -107,17 +111,21 @@ fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+// 下载中的状态任何情况下都必须保留：force 重查若替换状态，会把 downloading 清零、
+// 让前端误判可重新下载，并绕过下载闸门留下的状态一致性。已结束（成功打开/失败）
+// 的状态保留给轮询，直到显式强制刷新。
+fn should_preserve_update(current: &DesktopUpdate, force: bool) -> bool {
+    current.downloading.load(Ordering::Relaxed)
+        || (!force
+            && (current.opened.load(Ordering::Relaxed) || !current.error.is_empty()))
+}
+
 fn check_desktop_update_blocking(app: &tauri::AppHandle, force: bool) -> Option<Value> {
     {
         let state = app.state::<RuntimeState>();
         let guard = state.update.lock().unwrap();
         if let Some(current) = guard.as_ref() {
-            // 下载中与已结束（成功打开/失败）的状态保留给轮询，直到显式强制刷新。
-            if !force
-                && (current.downloading.load(Ordering::Relaxed)
-                    || current.opened.load(Ordering::Relaxed)
-                    || !current.error.is_empty())
-            {
+            if should_preserve_update(current, force) {
                 return Some(current.json());
             }
         }
@@ -213,27 +221,51 @@ fn desktop_release(release: &Value, current: &str) -> Result<Option<DesktopUpdat
     }))
 }
 
-fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
-    // 检查与置位放在同一个锁作用域内，双击不会启动两个下载线程写同一个文件。
-    let (url, sha_url, version) = {
-        let state = app.state::<RuntimeState>();
-        let mut guard = state.update.lock().unwrap();
-        match guard.as_mut() {
-            Some(update) if !update.downloading.load(Ordering::Relaxed) => {
-                update.downloading.store(true, Ordering::Relaxed);
-                update.percent.store(0, Ordering::Relaxed);
-                update.error.clear();
-                update.error_code.clear();
-                (
-                    update.url.clone(),
-                    update.sha_url.clone(),
-                    update.version.clone(),
-                )
-            }
-            _ => return Err("No desktop update available".into()),
+// 先占住下载闸门，再进更新锁检查并置位 downloading；返回的闸门由下载线程
+// 持有直到结束，任何路径都不可能有两个写线程并发写同一个安装镜像。
+fn begin_desktop_download<'a>(
+    state: &RuntimeState,
+    gate: &'a Mutex<()>,
+) -> Result<(String, String, String, MutexGuard<'a, ()>), String> {
+    let gate = gate
+        .try_lock()
+        .map_err(|_| "Desktop update is already downloading".to_string())?;
+    let mut guard = state.update.lock().unwrap();
+    match guard.as_mut() {
+        Some(update) if !update.downloading.load(Ordering::Relaxed) => {
+            update.downloading.store(true, Ordering::Relaxed);
+            update.percent.store(0, Ordering::Relaxed);
+            update.error.clear();
+            update.error_code.clear();
+            Ok((
+                update.url.clone(),
+                update.sha_url.clone(),
+                update.version.clone(),
+                gate,
+            ))
         }
-    };
+        _ => Err("No desktop update available".into()),
+    }
+}
+
+fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // 先占住进程级下载闸门再进更新锁置位 downloading；闸门由本线程持有
+        // 直到下载结束，双下载防护因此不依赖可被并发状态替换清零的标志。
+        // MutexGuard 不能跨线程移动，闸门获取结果经 channel 同步回报给调用方。
+        let state = app.state::<RuntimeState>();
+        // 闸门 guard 以 _gate 绑定持有到线程结束（下划线绑定不会提前释放）。
+        let (url, sha_url, version, _gate) = match begin_desktop_download(&state, &DOWNLOAD_GATE) {
+            Ok(started) => {
+                let _ = sender.send(Ok(()));
+                started
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error));
+                return;
+            }
+        };
         let fail = |message: String, code: &str| {
             let state = app.state::<RuntimeState>();
             let mut guard = state.update.lock().unwrap();
@@ -345,7 +377,10 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
         }
         let _ = Command::new("hdiutil").arg("attach").arg(&path).spawn();
     });
-    Ok(())
+    // 闸门 try_lock 即刻完成，这里的短暂等待只把启动结果同步给前端。
+    receiver
+        .recv()
+        .unwrap_or_else(|_| Err("Download did not start".into()))
 }
 
 struct PendingChild(Option<Child>);

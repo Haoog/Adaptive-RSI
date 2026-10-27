@@ -136,6 +136,8 @@ Select the built-in **OpenCode** connection under **Connections and models**, ch
 
 The built-in **Codex login** connection starts official device authorization in the dashboard: open the official page, enter the one-time code and finish authorization. The connection and model directory then refresh. Device authorization must be enabled for your account or workspace; API connections remain available otherwise. Cancel, sign out or reconnect in the same panel. Credentials stay on the runtime machine and survive restart; unfinished authorization is marked interrupted and must be started again. Login refreshes the directory without automatically running paid model tests. See [Account connections](accounts.en.md).
 
+OAuth refreshes during a run write back only the fields of that connection and leave other connections untouched. Execution logs are redacted, and the temporary HOME directory is removed when the task call ends. CLI tool usage counts only what the output events actually report; unreported auxiliary calls cannot be inferred.
+
 ## Quick start
 
 On macOS, double-click `启动 Adaptive RSI.command`, or run from this directory:

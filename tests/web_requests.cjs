@@ -2883,3 +2883,75 @@ for (const restart of [false, true]) {
     });
   }
 }
+
+function desktopPage() {
+  const page = browser();
+  const desktop = {checks: 0, downloads: [], states: [], invoke: async (command, args) => {
+    if (command === 'check_desktop_update') { desktop.checks++; return desktop.states[Math.min(desktop.checks - 1, desktop.states.length - 1)]; }
+    if (command === 'download_desktop_update') { desktop.downloads.push(args || null); return; }
+    throw new Error('unexpected desktop command ' + command);
+  }};
+  let poll = null, intervalId = 0;
+  page.context.setInterval = (callback, delay) => { poll = callback; return ++intervalId; };
+  page.context.clearInterval = id => { if (id === intervalId) poll = null; };
+  page.context.uiConfirm = async () => true;
+  page.context.window.RSIDesktop = desktop;
+  for (const id of ['update-status', 'update-notes', 'apply-update', 'desktop-update'])
+    Object.assign(page.node(id), {after(...children) { this.children.push(...children); }, remove() { this.removed = true; }});
+  page.desktop = desktop;
+  page.tick = async () => {
+    assert.ok(poll, 'desktop update poller is active');
+    const callback = poll;
+    await callback();
+    await new Promise(setImmediate);
+  };
+  return page;
+}
+
+test('reloading during a desktop download resumes polling until the completion toast', async () => {
+  const page = desktopPage();
+  page.desktop.states = [
+    {version: '9.9.9', notes: 'n', downloading: true, percent: 30, opened: false, error: '', error_code: ''},
+    {version: '9.9.9', notes: 'n', downloading: true, percent: 80, opened: false, error: '', error_code: ''},
+    {version: '9.9.9', notes: 'n', downloading: false, percent: 100, opened: true, error: '', error_code: ''}
+  ];
+  await vm.runInContext('checkDesktopUpdate()', page.context);
+  assert.ok(vm.runInContext('desktopUpdateTimer', page.context), 'a page reload must resume polling for the in-flight download');
+  assert.equal(page.node('desktop-update').disabled, true);
+  assert.match(String(page.node('desktop-update').children[0]), /正在下载新版本/);
+  assert.match(String(page.node('desktop-update').children[0]), /30%/);
+  await page.tick();
+  assert.match(String(page.node('desktop-update').children[0]), /80%/);
+  await page.tick();
+  assert.equal(vm.runInContext('desktopUpdateTimer', page.context), null, 'polling stops once the download completed');
+  assert.match(page.node('toast').textContent, /下载已完成/);
+  assert.equal(page.node('desktop-update').disabled, true, 'the completed download cannot be started again');
+  assert.match(String(page.node('desktop-update').children[0]), /安装镜像已打开/);
+  await vm.runInContext('startDesktopUpdate()', page.context);
+  assert.equal(page.desktop.downloads.length, 0, 'the completed state never re-downloads the image');
+});
+
+test('repeated update checks during a download keep one poller and the reported progress', async () => {
+  const page = desktopPage();
+  page.desktop.states = [{version: '9.9.9', notes: 'n', downloading: true, percent: 40, opened: false, error: '', error_code: ''}];
+  await vm.runInContext('checkDesktopUpdate()', page.context);
+  const first = vm.runInContext('desktopUpdateTimer', page.context);
+  assert.ok(first, 'polling resumes for an in-flight download');
+  await vm.runInContext('checkDesktopUpdate(true)', page.context);
+  assert.equal(vm.runInContext('desktopUpdateTimer', page.context), first, 'a repeated check never starts a second poller');
+  assert.equal(vm.runInContext('desktopUpdate.percent', page.context), 40, 'a repeated check keeps the reported progress');
+  assert.equal(page.desktop.checks, 2);
+  assert.match(String(page.node('desktop-update').children[0]), /40%/);
+});
+
+test('an available desktop update starts polling only after its download begins', async () => {
+  const page = desktopPage();
+  page.desktop.states = [{version: '9.9.9', notes: 'n', downloading: false, percent: 0, opened: false, error: '', error_code: ''}];
+  await vm.runInContext('checkDesktopUpdate()', page.context);
+  assert.equal(vm.runInContext('desktopUpdateTimer', page.context), null, 'an available update does not poll');
+  assert.equal(page.node('desktop-update').disabled, false);
+  await vm.runInContext('startDesktopUpdate()', page.context);
+  assert.equal(page.desktop.downloads.length, 1, 'the download is requested once');
+  assert.ok(vm.runInContext('desktopUpdateTimer', page.context), 'polling starts once the download begins');
+  assert.equal(page.node('desktop-update').disabled, true);
+});
