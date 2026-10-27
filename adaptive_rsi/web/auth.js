@@ -49,11 +49,20 @@ window.RSIAuth = (() => {
         session.refreshStage='catalog';
       }
       await session.refresh();if(sessions.get(id)!==session)return;
-      session.refreshStage='';session.pollMessage='';
+      session.refreshStage='';session.refreshAttempts=0;session.pollMessage='';
     }catch(error){
       if(sessions.get(id)!==session)return;
       if(error.code==='session_required'){pollingStopped=true;session.pollMessage='控制台登录已失效，请重新打开控制台后继续授权。';}
-      else session.pollMessage='登录已完成，账号状态或模型目录更新失败，正在重试。';
+      else{
+        // 固定输入类错误重试不会成功；瞬时故障最多自动重试 4 次，避免无限轮询。
+        const transient=error instanceof TypeError||error.name==='AbortError'||error.status>=500;
+        session.refreshAttempts=(session.refreshAttempts||0)+1;
+        if(transient&&session.refreshAttempts<5)session.pollMessage='登录已完成，账号状态或模型目录更新失败，正在重试。';
+        else{
+          session.refreshStage='';session.refreshAttempts=0;
+          session.pollMessage='登录已完成，但模型目录刷新失败。可稍后在模型列表手动刷新目录，或重新登录。';
+        }
+      }
     }finally{session.refreshing=false;}
   }
   async function poll(){

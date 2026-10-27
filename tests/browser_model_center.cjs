@@ -55,10 +55,23 @@ async function main() {
     assert.equal(await step('mc-step-models').getAttribute('data-state'), 'current');
 
     // OAuth 登录完成后第 2 步仍正确显示为完成。
+    // CI 高负载下首次登录请求偶尔未生效，页面停留在登录表单；重试点击直到授权码出现。
     await pick('Codex 登录');
-    await page.getByRole('button', {name: '前往 Codex 官方登录', exact: true}).click();
-    await page.locator('.mc-auth-code').filter({hasText: 'PROBE-CODE-01'}).waitFor();
-    await page.waitForFunction(() => document.getElementById('mc-step-account').dataset.state === 'done', null, {timeout: 15000});
+    const authCode = page.locator('.mc-auth-code').filter({hasText: 'PROBE-CODE-01'});
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await page.getByRole('button', {name: '前往 Codex 官方登录', exact: true}).click();
+      try {
+        await authCode.waitFor({timeout: 15000});
+        break;
+      } catch (error) {
+        if (attempt === 2) {
+          const panel = await page.locator('#mc-auth').innerText().catch(() => '<unreadable>');
+          throw Error('auth code missing after retries; panel=' + panel.slice(0, 400));
+        }
+        await page.waitForTimeout(1000);
+      }
+    }
+    await page.waitForFunction(() => document.getElementById('mc-step-account').dataset.state === 'done', null, {timeout: 20000});
 
     // 移除连接必须先确认；取消时不发出任何请求。
     await pick('本地目录服务');

@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- A failed model catalog refresh after sign-in no longer retries every 1.5 seconds forever: input rejections stop immediately with an actionable message, transient failures stop after four automatic retries, and the catalog can be refreshed manually or the account signed in again.
 - Reloading the interface or switching the runtime machine while the desktop app is downloading a new installer image now resumes progress polling until completion or failure; the completion and failure notices match the non-reloaded flow instead of freezing at a percentage.
 - Desktop update checks (including an explicit "Check for updates") keep an in-flight download's progress instead of clearing its downloading state, so the button cannot be clicked into a duplicate download; downloads are guarded by a process-wide gate, and no path can run two download threads writing the same installer image.
 - After a download completes and the installer image opens, the button switches to a completed "Installer image is open. Drag to install." state that cannot be clicked into a full re-download; "Check for updates" remains the explicit way to re-check.

@@ -36,8 +36,8 @@ class MockAuthWorker:
                 "method": "auto", "instructions": "浏览器专项假登录流程"}
 
     def wait(self, stop, deadline):
-        # 模拟用户 1.5 秒后在官方页面完成授权。
-        return not stop.wait(1.5) and time.time() < deadline
+        # 模拟用户在官方页面完成授权；留出足够窗口让界面渲染设备码（轮询间隔 1.5 秒）。
+        return not stop.wait(4.5) and time.time() < deadline
 
     def providers(self):
         return []
