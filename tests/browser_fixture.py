@@ -102,6 +102,31 @@ def main():
                 for name in ["过时任务重试入口", "过时任务补充入口"]:
                     obsolete = runtime.store.add_task(project, "goal", name, name)
                     runtime.store.execute("UPDATE tasks SET state='obsolete' WHERE id=?", (obsolete,))
+            if os.environ.get("RSI_BROWSER_REVISION_FLOW"):
+                # 修订与退避体验专项：长文本溢出、退避立即重试、普通排队无重试入口。
+                # 历史任务占满第一页会把退避任务挤出列表，仅保留少量排队任务。
+                runtime.store.execute(
+                    "UPDATE tasks SET state='merged' WHERE id IN "
+                    "(SELECT id FROM tasks WHERE project=? AND title LIKE '历史任务 %' LIMIT 50)", (project,))
+                now = time.time()
+                backoff = runtime.store.add_task(project, "goal", "revision-backoff", "自动退避中的任务",
+                                                 priority=130)
+                runtime.store.execute("UPDATE tasks SET state='queued',available=? WHERE id=?",
+                                      (now + 3600, backoff))
+                plain = runtime.store.add_task(project, "goal", "revision-plain", "普通排队任务", priority=130)
+                runtime.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (plain,))
+                long_body = "来源正文 " + "Z" * 600 + " https://example.test/" + "a" * 300
+                revised = runtime.store.add_task(project, "goal", "revision-long", "修订长文本任务", long_body,
+                                                 priority=100)
+                runtime.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (revised,))
+                for index, supplement in enumerate([
+                    "无空格长串 " + "X" * 700,
+                    "长链接 https://example.test/" + "b" * 320,
+                ]):
+                    runtime.store.execute(
+                        "INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
+                        (revised, long_body if index == 0 else long_body + "\n\n" + "X" * 700,
+                         supplement, now + index))
             if os.environ.get("RSI_BROWSER_TASK_DETAIL"):
                 # 任务详情专项：多运行历史懒加载、待交付取消、等待额度/过时任务详情内重试。
                 now = time.time()

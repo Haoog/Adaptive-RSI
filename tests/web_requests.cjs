@@ -1575,6 +1575,24 @@ test('expired candidates returned by attention pagination remain visible with a 
   assert.equal(page.node('tasks-page').textContent, '1–1 / 1');
 });
 
+test('queued backoff tasks expose an immediate retry entry while ordinary queued tasks do not', () => {
+  const page = browser();
+  page.context.language = 'zh-CN';
+  page.node('task-filter').value = 'active';
+  page.node('show-system-tasks').checked = false;
+  const available = Math.floor(Date.now() / 1000) + 3600;
+  vm.runInContext(`state={...initialState,selected_project:"a",tasks:[
+    {id:"backoff",project:"a",source:"goal",title:"Backoff task",state:"queued",display_state:"queued",available:${available},updated:1},
+    {id:"plain",project:"a",source:"goal",title:"Plain queue task",state:"queued",display_state:"queued",available:0,updated:1}
+  ],runs:[],pagination:{total:2,limit:50,offset:0,has_more:false}};renderTasks()`, page.context);
+  const rows = page.node('tasks-list').children;
+  const labels = title => rows
+    .find(row => row.children[0].children[0].textContent === title)
+    .children[2].children.map(child => child.textContent);
+  assert.deepEqual(labels('Backoff task'), ['立即重试', '查看详情']);
+  assert.deepEqual(labels('Plain queue task'), ['查看详情']);
+});
+
 test('a late settings error cannot mark a different project or a rerendered scope as invalid', async () => {
   for(const change of ['projectId="b"','settingsGeneration++','$("config-scope").value="global"']){
     const page=browser();page.node('config-scope').value='project';
@@ -1596,6 +1614,24 @@ test('English UI copy has no accidentally translated Chinese fragments and prese
   assert.equal(english['通用'],'General');
   const definitions=[...i18n.matchAll(/^  "((?:[^"\\]|\\.)*)":/gm)].map(match=>match[1]);
   assert.equal(definitions.length,new Set(definitions).size,'english 对象存在重复定义的 key');
+});
+
+test('revision and backoff messages are mapped and localized for both console languages', () => {
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  const apiBlock=source.slice(source.indexOf('const apiErrors={'),source.indexOf('function reviseForm'));
+  const apiErrors=JSON.parse('{'+apiBlock.slice(apiBlock.indexOf('{')+1,apiBlock.lastIndexOf('}'))+'}');
+  for(const message of ['Supplement must contain 1..10000 characters',
+    'Pause or finish active work before supplementing this task',
+    'Combined requirements exceed 30000 characters'])
+    assert.ok(Object.hasOwn(apiErrors,message),'server validation message must be mapped: '+message);
+  for(const key of ['立即重试',
+    '补充需求不能为空，请输入需要保留或补充的要求。',
+    '补充需求不能为空，且不能超过 10000 个字符。请缩短后重试。',
+    '该任务正在运行或属于系统自动任务，暂不能补充需求。请等待当前运行结束后再试。',
+    '合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。'])
+    assert.equal(typeof english[key],'string','english dictionary misses: '+key);
+  assert.equal(english['立即重试'],'Retry now');
 });
 
 function experiencePage({navigation = false} = {}) {
@@ -1640,6 +1676,72 @@ async function openExperienceTask(page, task) {
   await page.context.lastAction;
   return page.node('detail-body').children.find(node => node.className === 'task-controls');
 }
+
+function revisionMetadataPage(task, metadata) {
+  const page = experiencePage();
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') return response({saved: true});
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response(metadata);
+    if (url.includes('/state?')) return response({tasks: []});
+    return response(metadata);
+  };
+  return page;
+}
+
+test('detail retry is offered only for a queued task waiting on backoff', async () => {
+  for (const [offset, expected] of [[3600, true], [0, false]]) {
+    const task = fixtureTask('child', 'queued');
+    const available = Math.floor(Date.now() / 1000) + offset;
+    const page = revisionMetadataPage(task, {...task, available, dependency: null, revisions: []});
+    const controls = await openExperienceTask(page, task);
+    const labels = controls.children.filter(node => node.tagName === 'BUTTON').map(node => node.textContent);
+    assert.equal(labels.includes('立即重试'), expected, `available offset ${offset}`);
+  }
+});
+
+test('a whitespace-only supplement is rejected inside the form without a request', async () => {
+  const task = fixtureTask('child', 'failed'), posts = [];
+  const page = revisionMetadataPage(task, {...task, available: 0, dependency: null, revisions: []});
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') { posts.push(JSON.parse(options.body)); return response({saved: true}); }
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response({...task, available: 0, dependency: null, revisions: []});
+    return response({tasks: []});
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.find(node => node.tagName === 'FORM');
+  const textarea = form.children[0].children[0];
+  textarea.value = '   \n\t ';
+  form.onsubmit({preventDefault() {}});
+  await page.context.lastAction;
+  assert.deepEqual(posts, [], 'blank input must not reach the server');
+  const error = form.children.find(node => node.className === 'form-error');
+  assert.match(error.textContent, /补充需求不能为空/);
+  assert.equal(textarea.value, '   \n\t ', 'the draft stays editable');
+});
+
+test('an oversized Issue composition explains the 30000-character limit in the form', async () => {
+  const task = fixtureTask('issue-task', 'queued');
+  const page = revisionMetadataPage(task, {...task, source: 'issue', available: 0, dependency: null, revisions: []});
+  vm.runInContext('safe=(fn,form)=>{lastAction=originalSafe(fn,form);return lastAction;}', page.context);
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') return response(
+      {error: 'Combined requirements exceed 30000 characters', error_code: 'validation_error'}, 400);
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/task?')) return response({...task, source: 'issue', available: 0, dependency: null, revisions: []});
+    return response({tasks: []});
+  };
+  const controls = await openExperienceTask(page, task);
+  const form = controls.children.find(node => node.tagName === 'FORM');
+  form.children[0].children[0].value = '0123456789';
+  form.onsubmit({preventDefault() {}});
+  await page.context.lastAction;
+  const error = form.children.find(node => node.className === 'form-error');
+  assert.match(error.textContent, /合并后的需求超过 30000 个字符/);
+  assert.match(error.textContent, /缩短补充内容/);
+});
 
 function queueForm(page) {
   return page.node('detail-body').children.find(node => node.className === 'task-controls')

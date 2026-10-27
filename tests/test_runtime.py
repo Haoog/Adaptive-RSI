@@ -419,6 +419,10 @@ class RuntimeTest(unittest.TestCase):
         self.store.execute("UPDATE tasks SET state='blocked',infra_retries=3 WHERE id=?", (task,))
         self.runtime.retry(task)
         self.assertEqual(self.store.one("SELECT infra_retries FROM tasks WHERE id=?", (task,))["infra_retries"], 0)
+        # 普通排队任务（没有未来 available）不能提前重试，避免界面出现无操作入口。
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (task,))
+        with self.assertRaisesRegex(ValueError, "This task cannot be retried"):
+            self.runtime.retry(task)
 
     def test_cancel_cannot_rewrite_terminal_states(self):
         task = self.runtime.goal(self.project, "Fix addition")

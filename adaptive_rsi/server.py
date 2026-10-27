@@ -115,6 +115,9 @@ Task overrides cannot grant delivery permissions
 Invalid submission ID
 Unknown inspection type
 This task cannot be retried
+Supplement must contain 1..10000 characters
+Pause or finish active work before supplementing this task
+Combined requirements exceed 30000 characters
 Task not found
 This task has finished and can no longer be cancelled
 Submission ID was already used with different content

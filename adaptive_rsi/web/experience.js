@@ -407,6 +407,19 @@ window.RSIExperience = (() => {
           "button",
         ),
       );
+    else if (metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)
+      // 只有带退避/等待时间的排队任务才允许提前重试；普通排队任务保持无按钮。
+      controls.append(
+        action(
+          t("立即重试"),
+          async () => {
+            if (!current()) return;
+            await api("retry", { task: task.id });
+            await refreshTaskDetail();
+          },
+          "button",
+        ),
+      );
     if (
       [
         "queued",
@@ -427,7 +440,8 @@ window.RSIExperience = (() => {
         input = el("textarea");
       input.rows = 3;
       input.maxLength = 10000;
-      input.required = true;
+      // 空白补充由下面的显式校验拦下；HTML required 会放过纯空白并产生未本地化的原生提示。
+      input.setAttribute("aria-required", "true");
         input.value = draftStore.get('task-supplement', task.id) || '';
         input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
@@ -438,9 +452,10 @@ window.RSIExperience = (() => {
         event.preventDefault();
         safe(async () => {
           if (!current()) return;
+          const value = input.value;
+          if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
-            const value = input.value;
             await api("task/revise", {
               task: task.id,
               supplement: value,
@@ -450,7 +465,7 @@ window.RSIExperience = (() => {
           } finally {
             submit.disabled = false;
           }
-        });
+        }, form);
       };
       controls.append(form);
     }

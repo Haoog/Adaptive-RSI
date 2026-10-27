@@ -7,6 +7,9 @@
 - The self-improvement page refreshes candidates and statistics immediately after a rollback, evaluation-case import or manual promotion instead of reusing the 30-second cache; other polling keeps its cache interval.
 - When automatic promotion is off, a verified candidate can be enabled explicitly from the interface. The server accepts only `ready` candidates, validates the project and kind in a transaction, supersedes the prior stable strategy of the same project and kind, and rebinds the candidate parent to the stable it just replaced so rollbacks walk back through the immediately preceding version. It writes the same verified skill as automatic promotion (preserving paired evidence, 30-day expiry). Repeated or concurrent clicks succeed only once; automatic promotion and evaluation algorithms are unchanged.
 - The self-improvement page shows used/limit exposure per split and separate independent-case and paired-run counts for candidates. Exhausted exposure explains how to import new cases or raise `evolution.max_holdout_uses`, fixed controller reasons are mapped in Chinese and English, and the English subtitle is corrected.
+- Supplement validation failures no longer degrade to a generic error: empty or whitespace-only input, more than 10,000 characters, and an Issue requirement combination over 30,000 characters show actionable messages inside the form in both languages; whitespace-only input is blocked in the browser without a request.
+- A queued task waiting on automatic backoff shows “Retry now” in the task list and detail, runs early and clears its infrastructure retry count; ordinary queued tasks do not show this entry.
+- Long unbroken text and long URLs in task sources, evidence and revision history wrap inside the detail at 390px mobile and desktop widths instead of scrolling horizontally.
 
 ## 0.5.120
 
