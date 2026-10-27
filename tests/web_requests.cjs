@@ -387,8 +387,77 @@ test('primary rate limit shows retry time in both languages and enables checking
     assert.equal(page.node('check-update').disabled,false);
     assert.match(page.node('update-status').textContent,locale==='en'?/ready to retry/:/已到，可重试/);
     vm.runInContext('state.update={state:"error",reason:"GitHub HTTP 403",busy:false};renderUpdate();',page.context);
-    assert.match(page.node('update-status').textContent,/GitHub HTTP 403/);
+    // 无额度标记的 GitHub HTTP 码走结构化说明分支，两种语言都不再直出原文片段。
+    assert.match(page.node('update-status').textContent,
+      locale==='en'?/GitHub HTTP 403: could not reach the official release feed/:/无法访问 GitHub 发布接口（HTTP 403）/);
     assert.equal(page.node('check-update').disabled,false);
+  }
+});
+
+test('every fixed updater reason emitted by updates.py is localized for both console languages', () => {
+  const py = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/updates.py'), 'utf8');
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  const apiBlock = source.slice(source.indexOf('const apiErrors={'), source.indexOf('function reviseForm'));
+  const apiErrors = JSON.parse('{' + apiBlock.slice(apiBlock.indexOf('{') + 1, apiBlock.lastIndexOf('}')) + '}');
+  const englishBlock = i18n.slice(i18n.indexOf('const english = {'), i18n.indexOf('let language ='));
+  const english = JSON.parse(englishBlock.slice(englishBlock.indexOf('{'), englishBlock.lastIndexOf('}') + 1));
+  const emitted = new Set();
+  // 原因只从这些写入点进入 update-status：恢复模式、检查失败、内联 reason 字面量。
+  for (const pattern of [/recovery_required\([^,\n]+,\s*"((?:[^"\\]|\\.)*)"\)/g,
+                         /check_failure\([^,\n]+,\s*"((?:[^"\\]|\\.)*)"\)/g,
+                         /"reason":\s*"((?:[^"\\]|\\.)*)"/g])
+    for (const match of py.matchAll(pattern)) emitted.add(match[1]);
+  // apply 的 except 会把 download/release_info/extract_bundle/version/apply 内
+  // 抛出的 ValueError 文本原样写入 reason，这些固定文案同样必须可映射。
+  const span = (signature, terminator) => {
+    const start = py.indexOf(signature);
+    assert.ok(start >= 0, 'updates.py contains ' + signature);
+    const end = py.slice(start + 1).search(terminator);
+    return py.slice(start, end < 0 ? undefined : start + 1 + end);
+  };
+  for (const name of ['def version(', 'def download(', 'def release_info(', 'def extract_bundle('])
+    for (const match of span(name, /\ndef /).matchAll(/ValueError\(\s*"((?:[^"\\]|\\.)*)"/g)) emitted.add(match[1]);
+  for (const match of span('    def apply(self, status):', /\n    def |\ndef /).matchAll(/ValueError\(\s*"((?:[^"\\]|\\.)*)"/g)) emitted.add(match[1]);
+  assert.ok(emitted.size >= 36, 'reason extraction should cover every updater literal, found ' + emitted.size);
+  // "GitHub HTTP <码>" 含动态内容，由 renderUpdate 的结构化分支渲染，不进映射键。
+  const structured = reason => /^GitHub HTTP \d+$/.test(reason);
+  const unmapped = [...emitted].filter(reason => !structured(reason) && !Object.hasOwn(apiErrors, reason));
+  assert.deepEqual(unmapped, [], 'updates.py emits update reasons the console cannot localize');
+  // 既有条目的英文值沿用改写风格；其余更新器原因英文界面必须显示原文。
+  const restated = new Set(['Restart plan is missing; inspect installations before admitting work']);
+  for (const [reason, localized] of Object.entries(apiErrors)) {
+    if (!emitted.has(reason)) continue;
+    assert.ok(Object.hasOwn(english, localized), 'english dictionary misses the updater reason: ' + reason);
+    if (!restated.has(reason)) assert.equal(english[localized], reason, 'English UI must show the original updater reason: ' + reason);
+  }
+  assert.ok(Object.hasOwn(english, '无法访问 GitHub 发布接口（HTTP {code}），请稍后重试。'),
+    'english dictionary misses the structured GitHub HTTP template');
+  assert.ok(Object.hasOwn(english, '更新失败原因（原文）：'),
+    'english dictionary misses the verbatim-reason prefix');
+});
+
+test('update reasons show Chinese guidance in Chinese and the original text in English', () => {
+  const i18n = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  const cases = [
+    [{state: 'error', reason: 'Unable to verify the official release feed'}, '无法访问 GitHub 官方发布源'],
+    [{state: 'rolled_back', reason: 'Previous code and database restored and health verified'}, '已恢复旧版本：代码和数据库均已还原'],
+    [{state: 'recovery_required', reason: 'Recovery backup is missing or corrupt; refusing an unsafe database rollback'}, '已拒绝回滚数据库'],
+    [{state: 'no_release', reason: 'GitHub HTTP 404'}, '无法访问 GitHub 发布接口（HTTP 404）'],
+    [{state: 'restarting', reason: 'Verifying restored service'}, '正在验证恢复后的服务'],
+    [{state: 'error', reason: '<urlopen error request timed out>'}, '更新失败原因（原文）：'],
+  ];
+  for (const locale of ['zh-CN', 'en']) for (const [update, zhHint] of cases) {
+    const page = browser();
+    vm.runInContext(i18n.slice(0, i18n.indexOf('const staticText =')), page.context);
+    vm.runInContext(`language=${JSON.stringify(locale)};state.update=${JSON.stringify({...update, busy: false})};renderUpdateExtras=()=>{};renderUpdate();`, page.context);
+    const text = page.node('update-status').textContent;
+    if (locale === 'zh-CN') {
+      assert.ok(text.includes(zhHint), 'Chinese UI should guide on: ' + update.reason + ' — got: ' + text);
+      if (update.reason !== '<urlopen error request timed out>' && !/^GitHub HTTP/.test(update.reason))
+        assert.ok(!text.includes(update.reason), 'Chinese UI should not show the raw reason: ' + update.reason);
+    } else {
+      assert.ok(text.includes(update.reason), 'English UI should keep the original reason: ' + update.reason);
+    }
   }
 });
 
@@ -2600,6 +2669,95 @@ test('usage coalesces repeated input, resets pagination and refreshes the latest
   assert.equal(page.requests[3].params.get('q'), 'latest');
   page.requests[3].finish('Refreshed'); await refresh;
   assert.equal(page.active(30000), 1);
+});
+
+test('usage pagination stays disabled during a load and re-enables at the boundaries', async () => {
+  const page = usagePage(), initial = page.show();
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must be disabled while a page loads');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled while a page loads');
+  page.requests[0].finish('Initial'); await initial;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 1–25');
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must stay disabled on the first page');
+  assert.equal(page.node('usage-next').disabled, false);
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  assert.equal(page.node('usage-prev').disabled, true, 'prev must be disabled while a page loads');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled while a page loads');
+  page.requests[1].finish('Page two'); await second;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Page three'); await third;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 51–60');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled on the last page');
+  assert.equal(page.node('usage-prev').disabled, false);
+  page.node('usage-prev').onclick(); const previous = page.context.lastAction;
+  page.requests[3].finish('Page two again'); await previous;
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+});
+
+test('usage pagination restores the rendered page when a request fails', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two', 500); await second.catch(() => {});
+  assert.equal(page.title(), 'Initial', 'a failed page load must keep the previous rows');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 1–25', 'the page label must match the rendered rows after a failure');
+  assert.equal(page.node('usage-refresh').disabled, false);
+  page.node('usage-next').onclick(); const retry = page.context.lastAction;
+  assert.equal(page.requests[2].params.get('offset'), '25', 'the retry must request the failed page again instead of skipping it');
+  page.requests[2].finish('Page two retried'); await retry;
+  assert.equal(page.title(), 'Page two retried');
+  assert.equal(page.node('usage-page').textContent, '60 条记录 · 26–50');
+});
+
+test('usage clamps an offset beyond the total and reloads the clamped page', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  page.node('usage-next').onclick(); const second = page.context.lastAction;
+  page.requests[1].finish('Page two'); await second;
+  page.node('usage-next').onclick(); const third = page.context.lastAction;
+  page.requests[2].finish('Page three'); await third;
+  const shrunk = [];
+  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
+  page.context.fetch = url => new Promise(resolve => {
+    const params = new URLSearchParams(url.split('?')[1]);
+    shrunk.push({params, finish(total) {
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
+        tasks: [{task: 'Clamped', title: 'Clamped', project: 'a', state: 'failed', tokens: 100, attempts: 1}],
+        total}));
+    }});
+  });
+  page.node('usage-refresh').onclick();
+  await waitFor(() => shrunk.length >= 1);
+  assert.equal(shrunk[0].params.get('offset'), '50');
+  shrunk[0].finish(36);
+  await waitFor(() => shrunk.length >= 2 && shrunk[1].params.get('offset') === '25');
+  shrunk[1].finish(36);
+  await new Promise(setImmediate);
+  assert.equal(page.node('usage-page').textContent, '36 条记录 · 26–36');
+  assert.equal(textOf(page.node('usage-tasks')).includes('Clamped'), true, 'the clamped page must render its own rows');
+  assert.equal(page.node('usage-next').disabled, true, 'next must be disabled after clamping to the last page');
+  assert.equal(page.node('usage-prev').disabled, false);
+});
+
+test('usage detail roles fall back to the usage role names for triage and acceptance', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  const textOf = node => [node.textContent, ...(node.children || []).map(textOf)].filter(Boolean).join(' ');
+  const details = [];
+  page.context.fetch = url => new Promise(resolve => {
+    details.push({finish: data => resolve(response(data))});
+  });
+  page.node('usage-tasks').children[0].children[2].handlers.click();
+  const detail = page.context.lastAction;
+  await waitFor(() => details.length >= 1);
+  details[0].finish({summary: {tokens: 3, tasks: 1}, daily: [], roles: [
+    {role: 'triage', provider: 'x', model: 'm', effort: 'high', tokens: 2},
+    {role: 'acceptance', provider: 'x', model: 'm', effort: 'high', tokens: 1}],
+    calls: [], call_total: 0, total: 0});
+  await detail;
+  const text = textOf(page.node('usage-detail-content'));
+  assert.ok(text.includes('价值初筛'), 'triage must use the usage role name');
+  assert.ok(text.includes('验收设计'), 'acceptance must use the usage role name');
 });
 
 for (const trigger of ['project', 'period', 'refresh', 'hide']) {

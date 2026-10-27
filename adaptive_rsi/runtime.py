@@ -1297,15 +1297,19 @@ class Runtime:
                 project["id"], "inspection", candidate["key"], item["title"], item["body"],
                 [candidate["evidence"]], item["acceptance"], max(1, min(70, item["priority"])))
             if decision in ["deferred", "rejected"]:
-                self.store.execute("UPDATE tasks SET state=?,updated=? WHERE id=? AND state='queued'",
-                                   (decision, time.time(), task_id))
-                self.store.put_setting("triage-state:" + task_id, {
+                # 决定与理由在初筛落库时即写入 task_decisions：/api/task、任务列表与
+                # 暂缓复核共用这一份记录，没有运行记录的任务也能看到理由。
+                # 存量 triage-state 键仍由 reassess_deferred 迁移，保留其读取回退。
+                record = {
                     "base": head,
                     "triage_input": fingerprint({"body": item["body"], "evidence": encode([candidate["evidence"]]),
                                                  "policy": json.loads(run["config"])["triage"]["policy"]}),
                     "reason": decisions.get(candidate["index"], {}).get("reason", ""),
                     "decision": decision,
-                })
+                }
+                if decision == "deferred":
+                    record["wake_condition"] = "inputs_policy_or_relevant_baseline_change"
+                self.store.decide(task_id, decision, record)
             added += 1
             queued += decision == "ready"
             deferred += decision == "deferred"
@@ -1492,6 +1496,8 @@ class Runtime:
                 key = prefix + run["id"]
                 self.store.execute("DELETE FROM settings WHERE key=? OR (key>=? AND key<?)",
                                    (key, key + ":", key + ";"))
+        # 批量初筛决定已直接写入 task_decisions 并随任务持久；这里只清理
+        # 升级前遗留的 triage-state 键（存量暂缓任务会在 reassess 中迁移）。
         for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? LIMIT 200", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", ("triage-state:" + task["id"],))
         # 过滤在 LIMIT 之前完成：新鲜条目占满一批时，过期条目仍能在本轮被删除。

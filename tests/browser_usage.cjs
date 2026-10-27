@@ -94,6 +94,70 @@ const {chromium}=require('playwright');
    assert.equal(dst.timezone,'America/New_York');
    assert.equal(Number(dst.end)-Number(dst.start),25*3600,'fall-back day must end at the next local midnight');
   }finally{await dstPage.close();await dstContext.close();}
+  // —— 分页：在途禁用、越界回夹、边界状态；明细角色回退（价值初筛/验收设计）中英文一致。
+  let shrinkTotal=0;
+  const usageRows=(offset,total)=>Array.from({length:Math.max(0,Math.min(25,total-offset))},(_,i)=>({
+   task:'page-'+(offset+i),title:'分页任务 '+(offset+i+1),project:'fixture',tokens:10,unknown_calls:0,
+   model_seconds:1,attempts:1,state:'completed'}));
+  const usageRoute=async route=>{
+   const params=new URL(route.request().url()).searchParams;
+   if(params.has('task')){
+    const roles=[['triage',6],['acceptance',4],['evolution',2]].map(([role,tokens])=>({role,provider:'fixture',model:'fixture',effort:'high',tokens}));
+    const calls=roles.map((item,index)=>({role:item.role,model:'fixture',provider:'fixture',effort:'high',state:'done',created:100+index,usage_known:true,tokens:3,input_tokens:1,output_tokens:1,cache_read_tokens:0,cache_write_tokens:0,seconds:1,unit:'http_request'}));
+    return route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({summary:{tokens:12,unknown_calls:0,tasks:1,model_seconds:3,cache_read_tokens:0,estimated_usd:null,unpriced_calls:0},daily:[],roles,tasks:[],total:0,call_total:calls.length,calls})});
+   }
+   await new Promise(resolve=>setTimeout(resolve,200));
+   const offset=Number(params.get('offset')||0),total=shrinkTotal||60;
+   await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({summary:{tokens:600,unknown_calls:0,tasks:1,model_seconds:6,cache_read_tokens:0,estimated_usd:null,unpriced_calls:0},daily:[],roles:[],tasks:usageRows(offset,total),total})});
+  };
+  await page.route('**/api/usage?*',usageRoute);
+  try{
+   await page.locator('#usage-refresh').click();
+   await page.waitForFunction(()=>!document.getElementById('usage-refresh').disabled);
+   assert.equal(await page.locator('#usage-page').textContent(),'60 条记录 · 1–25');
+   assert.equal(await page.locator('#usage-prev').isDisabled(),true);
+   assert.equal(await page.locator('#usage-next').isDisabled(),false);
+   assert.equal(await page.locator('#usage-tasks article').count(),25);
+   await page.locator('#usage-next').click();
+   assert.equal(await page.locator('#usage-next').isDisabled(),true,'next must be disabled while a page loads');
+   assert.equal(await page.locator('#usage-prev').isDisabled(),true,'prev must be disabled while a page loads');
+   await page.waitForFunction(()=>!document.getElementById('usage-next').disabled);
+   assert.equal(await page.locator('#usage-page').textContent(),'60 条记录 · 26–50');
+   await page.locator('#usage-next').click();
+   await page.waitForFunction(()=>document.getElementById('usage-page').textContent==='60 条记录 · 51–60');
+   assert.equal(await page.locator('#usage-next').isDisabled(),true,'next must be disabled on the last page');
+   assert.equal(await page.locator('#usage-prev').isDisabled(),false);
+   // 记录总数回落到当前页之前时，offset 必须回夹并重取当前页，而不是显示“51–36”和空列表。
+   shrinkTotal=36;
+   await page.locator('#usage-refresh').click();
+   await page.waitForFunction(()=>document.getElementById('usage-page').textContent==='36 条记录 · 26–36');
+   assert.equal(await page.locator('#usage-tasks article').count(),11);
+   assert.equal(await page.locator('#usage-next').isDisabled(),true);
+   assert.equal(await page.locator('#usage-prev').isDisabled(),false);
+   // 搜索仍然把分页重置回第一页。
+   await page.locator('#usage-search').fill('分页任务');
+   await page.waitForFunction(()=>document.getElementById('usage-page').textContent==='36 条记录 · 1–25');
+   assert.equal(await page.locator('#usage-prev').isDisabled(),true);
+   // 明细角色：triage/acceptance/evolution 显示“价值初筛/验收设计/策略改进”。
+   const detailContent=page.locator('#usage-detail-content');
+   await page.getByRole('button',{name:'查看用量明细',exact:true}).first().click();
+   await detailContent.locator('span').filter({hasText:'价值初筛'}).first().waitFor();
+   assert.ok(await detailContent.locator('span').filter({hasText:'验收设计'}).first().isVisible());
+   assert.ok(await detailContent.locator('strong').filter({hasText:'策略改进'}).first().isVisible());
+   assert.equal(await detailContent.innerText().then(text=>/triage|acceptance|evolution/.test(text)),false);
+   await page.locator('#usage-detail .close-dialog').click();
+   await page.locator('#language-select').selectOption('en');
+   await page.getByRole('button',{name:'View usage details',exact:true}).first().click();
+   await detailContent.locator('span').filter({hasText:'Value screening'}).first().waitFor();
+   assert.ok(await detailContent.locator('span').filter({hasText:'Acceptance design'}).first().isVisible());
+   assert.ok(await detailContent.locator('strong').filter({hasText:'Strategy improvement'}).first().isVisible());
+   assert.equal(await detailContent.innerText().then(text=>/triage|acceptance|evolution/.test(text)),false);
+   await page.locator('#usage-detail .close-dialog').click();
+   await page.locator('#language-select').selectOption('zh-CN');
+   await page.getByRole('button',{name:'查看用量明细',exact:true}).first().click();
+   await detailContent.locator('span').filter({hasText:'价值初筛'}).first().waitFor();
+   await page.locator('#usage-detail .close-dialog').click();
+  }finally{await page.unroute('**/api/usage?*',usageRoute);}
   console.log('Usage page: real API, empty/filter state, English, mobile and no JS errors passed.');
  }finally{if(browser)await browser.close();server.stdin.end('\n');await new Promise(resolve=>server.once('exit',resolve));}
 })().catch(e=>{console.error(e);process.exitCode=1;});

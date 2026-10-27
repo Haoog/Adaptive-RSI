@@ -30,9 +30,50 @@ window.RSIDraftStore=draftStore;
 const apiErrors={
  "Wait for the active run to finish stopping before retrying or supplementing this task":"任务仍在停止中，请等当前运行结束后再重试或补充需求。",
  "Restart plan is missing; inspect installations before admitting work":"缺少重启计划，请检查安装记录，确认当前版本后重新启动服务。",
+ "Update check interrupted; retry is safe":"上次检查更新被中断，未更改任何内容，可直接重新检查。",
+ "Installation interrupted before restart; retry is safe":"上次安装在重启前被中断，未更改现有版本，可直接重新安装。",
+ "Unable to verify the official release feed":"无法访问 GitHub 官方发布源，未能确认是否有新版本。请检查网络后重试。",
+ "Release changed; check again before installing":"发布内容已变化，为避免装错版本，请重新检查更新后再安装。",
+ "Automatic update authorization changed":"自动更新授权已变化，本次不再自动安装；如需更新请手动确认。",
+ "Managed installation directory cannot be a symlink":"内置自更新目录不能是符号链接，已停止安装。请检查 installations 安装记录。",
+ "Previously staged installation differs from the verified bundle":"已暂存的安装目录与本次校验通过的安装包不一致，已停止安装。请重新检查更新后重试。",
+ "Updates must come from official GitHub release URLs":"更新包只允许来自官方 GitHub 发布地址，已拒绝本次下载。",
+ "Untrusted update redirect":"下载被重定向到非官方地址，已拒绝继续下载。",
+ "Release download exceeded the total time budget":"下载新版本超时，已停止下载。请检查网络后重试。",
+ "Release asset exceeds size limit":"更新包超过大小限制，已停止下载。",
+ "Only stable major.minor.patch releases are supported":"仅支持 x.y.z 形式的正式稳定版本，无法识别该发布的版本号。",
+ "Release is missing its plugin ZIP or SHA-256 file":"该发布缺少插件 ZIP 或 SHA-256 校验文件，无法安装。",
+ "Release assets belong to another repository":"发布附件不属于官方仓库，已拒绝安装。",
+ "Release SHA-256 verification failed":"更新包 SHA-256 校验未通过，已停止安装。",
+ "Unsafe release archive path":"更新包内包含不安全的文件路径，已停止安装。",
+ "Unpacked release exceeds size limit":"更新包解压后超过大小限制，已停止安装。",
+ "Unsupported update manifest or state migration":"更新包的清单或状态迁移格式不受支持，已停止安装。",
+ "Plugin manifest does not match release version":"插件清单中的版本与发布版本不一致，已停止安装。",
+ "Incomplete release bundle":"更新包内容不完整，缺少必要文件，已停止安装。",
+ "Restart plan disappeared before completion; preserve current state and inspect installations":"重启计划在完成前丢失。当前状态已保留，请检查 installations 安装记录后重新启动服务。",
+ "Legacy supervisor did not confirm installation within 90 seconds; preserve current database and inspect installations":"旧版监督进程 90 秒内未确认安装。数据库已保留，请检查 installations 安装记录后重新启动服务。",
+ "Unsupported state migration; refusing automatic rollback":"状态迁移格式不受支持，已拒绝自动回滚。请检查 installations 安装记录后重新启动服务。",
+ "Restored service did not acknowledge the health-verified rollback":"恢复后的服务未确认回滚完成。请检查服务日志和 installations 安装记录后重新启动服务。",
+ "Rolled-back service cannot be verified; preserve the database and restart plan":"无法确认回滚后的服务正常。数据库和重启计划已保留，请检查后重新启动服务。",
+ "Committed candidate cannot be verified; preserve current database and inspect the retained restart plan":"已提交的新版本未能通过健康检查。当前数据库已保留，请检查保留的重启计划后重新启动服务。",
+ "An unverified candidate is still running; preserve database and inspect the retained restart plan":"未通过验证的新版本仍在运行。数据库已保留，请检查保留的重启计划后重新启动服务。",
+ "Unknown restart phase; refusing to overwrite state":"重启计划包含未知阶段，已拒绝覆盖当前状态。请检查 installations 安装记录后重新启动服务。",
+ "A service still owns runtime.lock; inspect the retained restart plan before recovery":"仍有服务占用 runtime.lock。重启计划已保留，请处理后重新启动服务。",
+ "Recovery backup is missing or corrupt; refusing an unsafe database rollback":"恢复备份缺失或损坏，为保护数据已拒绝回滚数据库。请检查 installations 安装记录后重新启动服务。",
+ "Installation commit was interrupted; preserve current database and restart plan":"安装提交被中断。当前数据库和重启计划已保留，请检查后重新启动服务。",
+ "Another runtime owns the database; recovery plan and database were preserved":"数据库正被其他运行实例占用。恢复计划和数据库均已保留，请关闭多余实例后重新启动服务。",
+ "Recovery backup is corrupt; current database was preserved":"恢复备份损坏，当前数据库已原样保留。请检查 installations 安装记录后重新启动服务。",
+ "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually":"回滚后的服务未通过启动健康检查。数据库已恢复，请查看 server.log 并手动重启服务。",
+ "Previous code and database restored and health verified":"已恢复旧版本：代码和数据库均已还原，健康检查通过。",
+ "Verifying restored service":"正在验证恢复后的服务",
  "A newer deployment owns this target; no stale rollback will be issued":"已有更新版本接管此服务，本次不会恢复旧版本。",
  "A newer deployment owns this target; rollback was cancelled":"已有更新版本接管此服务，本次恢复已取消。",
+ "A newer deployment owns this target; old health evidence was discarded":"已有更新版本接管此服务，本次部署的健康检查结果已作废。",
  "Another deployment is still active on this target":"同一服务的上次部署还未结束，将在结束后继续。",
+ "Post-merge verification must pass before release/deploy":"合并后检查尚未通过，发布与部署会在检查通过后自动继续。",
+ "Deployment target already has this or a newer commit; refusing a stale or diverged deployment":"部署目标已包含本次或更新的提交，继续部署会回退服务，已拒绝这次过期部署。",
+ "Deployment ownership changed during validation":"校验期间同一服务的部署归属发生了变化，本次部署会等最新部署结束后继续。",
+ "Workflow run identity differs from the authorized operation":"工作流执行记录与授权的部署操作不一致，请到 GitHub 核对本次部署对应的工作流记录。",
  "Select a compatible existing workflow from this project": "请先为项目添加支持自动交付的工作流，再刷新列表。",
  "Trusted workflow tag points to a different commit": "工作流标签已指向其他版本，请重新授权。",
  "Trusted workflow tag changed; authorize the workflow again": "工作流标签已改变，请重新授权。",
@@ -385,7 +426,10 @@ function renderTasks(){
   const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');
   title.append(action(task.title,()=>showTask(task),'task-title'),el('span',t(sourceNames[task.source]||task.source)+' · '+stamp(task.updated),'task-meta'));
   if(task.wait_reason)title.append(el('p',window.RSIExperience?.queueCopy(task)||'','task-meta'));
-  const latest=scoped(state.runs).find(run=>run.task===task.id),reason=latest?.reason||latest?.plan_reason;
+  // 暂缓/不采纳的任务可能没有运行记录：理由回退到 task_decisions 的决定记录（批量初筛或规划）。
+  const latest=scoped(state.runs).find(run=>run.task===task.id),
+        decisionReason=['deferred','rejected'].includes(task.state)&&task.decision_reason?task.decision_reason:'',
+        reason=latest?.reason||latest?.plan_reason||decisionReason;
   if(reason)title.append(el('p',latest?.failure?failureCopy(latest.failure):reason,'task-reason'));
   if(latest?.summary&&latest.summary!==reason)title.append(el('p',latest.summary,'task-result-summary'));
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
@@ -758,7 +802,9 @@ async function renderReleaseOutcome(node,run,project){
  const section=el('section',undefined,'release-outcome');section.append(el('h4',t('发布与上线')));
  for(const [kind,title]of [['release','发布'],['deploy','部署']]){const operation=automation[kind];if(!operation)continue;const row=el('div',undefined,'release-status-row');row.append(el('strong',t(title)+' · '),el('span',t(releaseStates[operation.state]||operation.state)));
   const rerunUnknown=operation.state==='rerun_unknown'||operation.rollback?.state==='rerun_unknown',dispatchRejected=operation.state==='failed'&&operation.dispatch_receipt==='rejected'&&!operation.workflow_run_id;
-  if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),'form-error'));
+  // 等待中的状态（合并后检查、同服务前次部署、等待发布成功）属进行中，提示用中性样式；其余错误保持红色。
+  const waitingNotice=['waiting_verification','waiting_target','waiting_release'].includes(operation.state);
+  if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),waitingNotice?'muted':'form-error'));
   if(dispatchRejected)row.append(el('p',t('提交未被接受。修复授权或工作流配置后，可以安全重试。'),'muted'));
   if(kind==='deploy'&&operation.state==='workflow_succeeded')row.append(el('p',t('部署工作流已完成，服务健康状态尚未验证。'),'muted'));
   if(operation.rollback_unavailable)row.append(el('p',t('没有已验证的历史版本可恢复，请人工检查服务。'),'form-error'));
@@ -823,7 +869,12 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  const limited=!update.desktop_managed&&update.reason_code==='github_primary_rate_limit'&&Number.isFinite(update.rate_limit_until);
  const cooling=limited&&Date.now()<update.rate_limit_until*1000;
  const retryTime=limited?new Date(update.rate_limit_until*1000).toLocaleString(typeof language==='undefined'?'zh-CN':language):'';
- const reason=limited?t('GitHub 匿名 API 额度已用尽。')+' '+t('可重试时间：')+retryTime+(cooling?' '+t('此时间前暂停更新请求。'):t('（已到，可重试）')):update.reason?t(apiErrors[update.reason]||update.reason):'';
+ // 已知原因给中文指引；GitHub HTTP 码含动态内容走结构化说明；
+ // 未识别的原因保留原文（原始运行证据），加中文前缀说明来源。
+ const githubHttp=update.reason&&/^GitHub HTTP (\d+)$/.exec(update.reason);
+ const reason=limited?t('GitHub 匿名 API 额度已用尽。')+' '+t('可重试时间：')+retryTime+(cooling?' '+t('此时间前暂停更新请求。'):t('（已到，可重试）')):
+  githubHttp?t('无法访问 GitHub 发布接口（HTTP {code}），请稍后重试。').replace('{code}',githubHttp[1]):
+  update.reason?(apiErrors[update.reason]?t(apiErrors[update.reason]):t('更新失败原因（原文）：')+update.reason):'';
  let status=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(reason?' · '+reason:'')+progress;
  if(update.desktop_managed)status=t('桌面版请安装新版软件，项目和记录会保留。')+channel;
  else status=t('后台服务')+' · '+status+channel;
@@ -847,6 +898,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  render();if(settingsBaseline){syncDelivery();window.RSIProduct?.renderEditor();window.RSIProduct?.dirtyStatus();}
  window.RSIModelCenter?.translate();
  window.RSIUsage?.translate();
+ window.RSIExperience?.translate?.();
  window.RSIDesktop?.translate?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));

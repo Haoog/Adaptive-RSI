@@ -404,7 +404,8 @@ def advance(runtime, project, run, outcome, cancel=None):
                 continue
             if kind == "deploy" and saved["delivery"].get("release", {}).get("enabled"):
                 if result.get("release", {}).get("state") != "workflow_succeeded":
-                    data = {**(data or {}), "state": "waiting_release"}
+                    # 到达这里说明合并后检查已通过；继承的等待提示已过期，进入等待发布时一并清除。
+                    data = {**(data or {}), "state": "waiting_release", "error": ""}
                     result[kind] = persist(runtime, run, kind, data)
                     continue
             with runtime.dispatch_lock:

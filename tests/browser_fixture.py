@@ -154,6 +154,57 @@ def main():
                     "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
                     "VALUES ('browser-current-work',?,?,'executing','{}','basemain',NULL,2,900,?,?,'{}')",
                     (running_task, project, now - 300, None))
+            if os.environ.get("RSI_BROWSER_TRIAGE_VISIBILITY"):
+                # 批量初筛决定可见性：新决定直接落库 task_decisions；
+                # 存量 triage-state 键经 reassess 迁移后同样可见。全程无模型调用。
+                from adaptive_rsi.config import fingerprint
+                from adaptive_rsi.gitops import git
+                from adaptive_rsi.store import encode as dump
+                triage_config = runtime.config(project)
+                head = git(Path(runtime.project(project)["path"]), "rev-parse", "HEAD").strip()
+
+                def triage_signature(body, evidence):
+                    return fingerprint({"body": body, "evidence": dump(evidence),
+                                        "policy": triage_config["triage"]["policy"]})
+                rejected_body = "把注释从 // 风格改为文档字符串，属于外观层面的修改。"
+                deferred_body = "加法实现的证据较弱，引用行与描述不完全一致。"
+                legacy_body = "与现有任务可能重叠，等待基线变化后重评。"
+                rejected = runtime.store.add_task(
+                    project, "inspection", "browser-triage-rejected", "初筛不采纳任务", rejected_body,
+                    [{"path": "calculator.py", "quote": "def add(a, b):", "base": head, "source": "inspection"}], 40)
+                deferred = runtime.store.add_task(
+                    project, "inspection", "browser-triage-deferred", "初筛暂缓任务", deferred_body,
+                    [{"path": "tests/test_calculator.py", "quote": "class Regression", "base": head,
+                      "source": "inspection"}], 40)
+                legacy = runtime.store.add_task(
+                    project, "inspection", "browser-triage-legacy", "存量暂缓任务", legacy_body,
+                    [{"path": "calculator.py", "quote": "return a - b", "base": head, "source": "inspection"}], 40)
+                rejected_evidence = [{"path": "calculator.py", "quote": "def add(a, b):", "base": head,
+                                      "source": "inspection"}]
+                deferred_evidence = [{"path": "tests/test_calculator.py", "quote": "class Regression", "base": head,
+                                      "source": "inspection"}]
+                legacy_evidence = [{"path": "calculator.py", "quote": "return a - b", "base": head,
+                                    "source": "inspection"}]
+                runtime.store.decide(rejected, "rejected", {
+                    "base": head, "triage_input": triage_signature(rejected_body, rejected_evidence),
+                    "reason": "Cosmetic churn: comment style change with disproportionate cost.",
+                    "decision": "rejected"})
+                runtime.store.decide(deferred, "deferred", {
+                    "base": head, "triage_input": triage_signature(deferred_body, deferred_evidence),
+                    "reason": "Evidence is weak: the quoted line does not fully match the report.",
+                    "wake_condition": "inputs_policy_or_relevant_baseline_change", "decision": "deferred"})
+                # 存量键：只有 settings 里的 triage-state，没有决定记录。
+                runtime.store.execute("UPDATE tasks SET state='deferred' WHERE id=?", (legacy,))
+                runtime.store.put_setting("triage-state:" + legacy, {
+                    "base": head, "triage_input": triage_signature(legacy_body, legacy_evidence),
+                    "reason": "Weak evidence: overlaps an existing queued finding.",
+                    "decision": "deferred"})
+                # 与正式 reassess 同一条迁移路径：存量键生成决定记录，新决定保持不变。
+                runtime.reassess_deferred(project, triage_config, head)
+                for task, state in [(rejected, "rejected"), (deferred, "deferred"), (legacy, "deferred")]:
+                    current = runtime.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"]
+                    assert current == state, (task, current, state)
+                    assert runtime.store.one("SELECT data FROM task_decisions WHERE task=?", (task,)), task
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()
