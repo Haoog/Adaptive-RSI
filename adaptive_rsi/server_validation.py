@@ -24,6 +24,7 @@ authorization_failed device_auth_unavailable auth_container_unavailable auth_wor
 
 # 精确匹配固定业务校验文案；不使用前缀匹配，也不携带用户提交的字段或值。
 SAFE_VALIDATION_MESSAGES = frozenset("""
+Configuration changed in another window; reload before saving
 Invalid command timeout: command_seconds must be 60..86400
 provider_retry_minutes must be 0..1440
 Invalid deployment health retry policy

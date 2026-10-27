@@ -258,6 +258,9 @@ class UpdateManager:
 
     def is_busy(self):
         with self.runtime.dispatch_lock:
+            from .lifecycle import barrier
+            if barrier(self.runtime):
+                return True
             status = self.status()
             # Completion can precede journal deletion or race an earlier recovery decision.
             if self.completed(status):
@@ -351,6 +354,7 @@ class UpdateManager:
 
     def work_busy(self):
         return (getattr(self.runtime, "import_in_progress", False) or
+                (getattr(self.runtime, "operations", None) and self.runtime.operations.busy()) or
                 self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or
                 getattr(getattr(self.runtime, "model_center", None), "busy", 0) or
                 getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))

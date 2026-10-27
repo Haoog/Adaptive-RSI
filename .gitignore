@@ -19,3 +19,4 @@ desktop/src-tauri/icons/
 !.env.example
 
 desktop/src-tauri/gen/
+.ci/

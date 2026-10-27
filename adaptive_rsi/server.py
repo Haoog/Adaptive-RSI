@@ -23,7 +23,8 @@ from .catalog import CatalogError, list_models
 from .credentials import CredentialError
 from .model_center import CenterError
 from .telemetry import quality_summary
-from .config import compatibility
+from .config import BUILTIN_PROVIDERS, compatibility
+from .contracts import API_VERSION, descriptor
 from .gitops import git
 from .evolution import Evolution
 from .updates import UpdateInProgress, atomic_json
@@ -146,6 +147,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
     def respond(self, data, code=200, content_type="application/json; charset=utf-8", headers=None):
+        self._response_status = code
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
         if isinstance(payload, str):
             payload = payload.encode()
@@ -154,6 +156,8 @@ class Handler(BaseHTTPRequestHandler):
             self.headers_common()
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
+            if getattr(self, "_request_id", None):
+                self.send_header("X-RSI-Request-ID", self._request_id)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -205,6 +209,23 @@ class Handler(BaseHTTPRequestHandler):
                 size = info.st_size
                 if size > 1024 * 1024 * 1024:
                     raise RequestError("Backup exceeds download size limit")
+                if params.get("format", [""])[0] == "manifest":
+                    from .storage_tools import verify_backup
+                    import hashlib
+                    try:
+                        verification = verify_backup(path)
+                    except (ValueError, OSError, sqlite3.Error):
+                        raise RequestError("Backup verification failed") from None
+                    self.respond({
+                        "format": 1,
+                        "backup": {"id": path.stem, "bytes": verification["bytes"],
+                                   "schema_version": verification["schema_version"],
+                                   "sha256": hashlib.sha256(stream.read()).hexdigest()},
+                        "restore": {"artifacts_restored": False, "projects_paused": True,
+                                    "credentials_require_reconnect": True},
+                        "instructions": "adaptive-rsi --state-dir /NEW/STATE restore /PATH/" + path.name,
+                    })
+                    return
                 if params.get("format", [""])[0] == "json":
                     import base64
                     try:
@@ -278,6 +299,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        request_id = secrets.token_hex(8)
+        self._request_id = request_id
+        started = time.time()
+        error_code = ""
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         if parsed.path == "/login.css" and self.headers.get("Host") in self.server.allowed_hosts:
@@ -311,7 +336,29 @@ class Handler(BaseHTTPRequestHandler):
             runtime = self.server.runtime
             store = runtime.store
             if parsed.path == "/api/health":
-                self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid(), "api_version": 1})
+                self.respond({"version": __version__, "build": BUILD_ID, "pid": os.getpid(),
+                              **descriptor()})
+            elif parsed.path == "/api/operation":
+                self.respond(runtime.operations.get(params.get("id", [""])[0]))
+            elif parsed.path == "/api/contract":
+                if params.get("format", [""])[0] == "openapi":
+                    self.respond({
+                        "openapi": "3.1.0",
+                        "info": {"title": "Adaptive RSI local API", "version": str(API_VERSION)},
+                        "servers": [{"url": self.server.origin}],
+                        "paths": {
+                            "/api/health": {"get": {"responses": {"200": {"description": "Health and capabilities"}}}},
+                            "/api/state": {"get": {"responses": {"200": {"description": "Project-scoped state"}}}},
+                            "/api/config": {"post": {"responses": {"200": {"description": "Save settings"},
+                                                                    "400": {"description": "Revision conflict or validation error"}}}},
+                            "/api/operations": {"post": {"responses": {"200": {"description": "Background job receipt"}}}},
+                        },
+                    })
+                    return
+                self.respond({
+                    "descriptor": descriptor(),
+                    "state_schema": json.loads((Path(__file__).parent / "schemas/api-state-v2.schema.json").read_text())
+                })
             elif parsed.path == "/api/usage":
                 from .usage_report import report
                 self.respond(report(store, params))
@@ -358,7 +405,7 @@ class Handler(BaseHTTPRequestHandler):
                 task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not task:
                     raise RequestError("Task not found")
-                task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id", (task["id"],))
+                task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id DESC LIMIT 100", (task["id"],))
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
                 task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
                 self.respond(task)
@@ -374,8 +421,14 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     global_config = runtime.config()
                 except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-                    raise RequestError("Global configuration is invalid") from None
-                projects = store.query("SELECT * FROM projects ORDER BY created")
+                    self.respond({"error": "Global configuration is invalid",
+                                  "error_code": "invalid_global_configuration",
+                                  "raw": store.setting("config", {})}, 400)
+                    return
+                archived = {row["key"].split(":", 1)[1] for row in store.query(
+                    "SELECT key FROM settings WHERE key LIKE 'project-archived:%'")}
+                projects = [row for row in store.query("SELECT * FROM projects ORDER BY created")
+                            if row["id"] not in archived]
                 raw_project_configs = {}
                 for project in projects:
                     project["name"] = project_display_name(project["name"], project["path"])
@@ -398,8 +451,9 @@ class Handler(BaseHTTPRequestHandler):
                 selected = params.get("project", [None])[0] or (projects[0]["id"] if projects else None)
                 if selected not in {p["id"] for p in projects}:
                     selected = projects[0]["id"] if projects else None
-                rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
-                               params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
+                with store.snapshot():
+                    rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
+                                   params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
                 capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
                 opening = None
                 for task in rows["tasks"]:
@@ -434,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
                         schedule["next_effective"] = None
                 data = {"version": __version__, "build": BUILD_ID, "selected_project": selected,
                         "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
+                        "config_revision": store.config_revision(selected if selected else None),
+                        "global_config_revision": store.config_revision(),
                         "update": runtime.updates.snapshot(), "schedules": schedules}
                 include_candidates = legacy or "candidates" in requested
                 include_analytics = legacy or "analytics" in requested
@@ -480,7 +536,29 @@ class Handler(BaseHTTPRequestHandler):
                 task = store.one("SELECT project FROM tasks WHERE id=?", (params.get("task", [""])[0],))
                 if not task or task["project"] != params.get("project", [""])[0]:
                     raise RequestError("Task not found")
-                self.respond(store.query("SELECT id,project,task,state,started,ended FROM runs WHERE task=? ORDER BY started DESC LIMIT 100", (params["task"][0],)))
+                try:
+                    before = params.get("before", [None])[0]
+                    limit = int(params.get("limit", ["50"])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid run pagination") from None
+                if not 1 <= limit <= 100:
+                    raise RequestError("Invalid run pagination")
+                query = ("SELECT id,project,task,state,started,ended FROM runs WHERE task=?" +
+                         (" AND (started<? OR (started=? AND id<?))" if before else "") +
+                         " ORDER BY started DESC,id DESC LIMIT ?")
+                if before:
+                    timestamp, separator, identifier = before.partition(":")
+                    try:
+                        timestamp = float(timestamp)
+                    except ValueError:
+                        raise RequestError("Invalid run pagination") from None
+                    if not separator or not identifier:
+                        raise RequestError("Invalid run pagination")
+                    args = (params["task"][0], timestamp, timestamp, identifier, limit + 1)
+                else:
+                    args = (params["task"][0], limit + 1)
+                rows = store.query(query, args)
+                self.respond(rows[:limit])
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
                 data = detect(project["path"])
@@ -493,18 +571,27 @@ class Handler(BaseHTTPRequestHandler):
                             module["verified_at"] = proof["at"]
                 self.respond(data)
             elif parsed.path == "/api/model-center":
-                self.respond(runtime.model_center.snapshot(params.get("project", [None])[0] or None))
+                project = params.get("project", [None])[0] or None
+                snapshot = runtime.model_center.snapshot(project)
+                from .agent import model_capabilities
+                config = runtime.config(project)
+                snapshot["capabilities"] = {
+                    role: model_capabilities(route["model"], next(
+                        (p.get("protocol", "codex") for p in BUILTIN_PROVIDERS + config["providers"]
+                         if p["id"] == route.get("provider", "openai")), "codex"))
+                    for role, route in config["models"].items()
+                }
+                self.respond(snapshot)
             elif parsed.path == "/api/run":
                 run = store.one("SELECT * FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
                 run["result"] = decode_evidence(run["result"])
                 run["config"] = decode_object(run["config"])
-                run["stages"] = store.query("SELECT stage,created FROM stages WHERE run=? ORDER BY created", (run["id"],))
+                run["stages"] = store.query("SELECT stage,created,data FROM stages WHERE run=? ORDER BY created", (run["id"],))
                 run["phases"] = store.query("SELECT phase,started,ended FROM phase_times WHERE run=? ORDER BY id", (run["id"],))
                 for stage in run["stages"]:
-                    saved = store.one("SELECT data FROM stages WHERE run=? AND stage=?", (run["id"], stage["stage"]))
-                    stage["decision"] = decode_object(saved["data"]).get("decision")
+                    stage["decision"] = decode_object(stage.pop("data")).get("decision")
                 self.respond(run)
             elif parsed.path == "/api/patch":
                 from .storage_tools import run_artifact_path
@@ -516,10 +603,32 @@ class Handler(BaseHTTPRequestHandler):
                     if not path.is_file():
                         raise ValueError("Missing patch")
                     payload = path.read_bytes()
+                    if len(payload) > 2 * 1024 * 1024:
+                        raise ValueError("Candidate patch exceeds the UI size limit; download it from the run directory")
                 except (ValueError, OSError, RuntimeError):
                     raise RequestError("Run has no artifacts in this state directory") from None
                 self.respond(payload, content_type="text/plain; charset=utf-8")
-            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path == "/api/diff-files":
+                from .storage_tools import run_artifact_path
+                run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
+                if not run:
+                    raise RequestError("Run not found")
+                path = run_artifact_path(store, run, "candidate.patch")
+                if not path.is_file() or path.is_symlink():
+                    raise RequestError("Run has no artifacts in this state directory")
+                files, current = [], None
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("diff --git "):
+                        current = {"path": None, "additions": 0, "deletions": 0}
+                        files.append(current)
+                    if current and line.startswith("+++ b/"):
+                        current["path"] = line[6:]
+                    elif current and line.startswith("+") and not line.startswith("+++"):
+                        current["additions"] += 1
+                    elif current and line.startswith("-") and not line.startswith("---"):
+                        current["deletions"] += 1
+                self.respond([{**item, "path": item["path"] or "unknown"} for item in files])
+            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/native-update.js", "/batch.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]
@@ -529,9 +638,24 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.respond({"error": "Not found"}, 404)
         except Exception as exc:
+            error_code = getattr(exc, "code", "") or "internal_error"
+            if not isinstance(error_code, str):
+                error_code = "internal_error"
             self.api_error(exc)
+        finally:
+            # Record only the route shape, never query values, bodies, headers or errors.
+            if urlparse(self.path).path.startswith("/api/"):
+                try:
+                    self.server.runtime.store.execute(
+                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
+                        (request_id, "GET", urlparse(self.path).path[:300],
+                         getattr(self, "_response_status", 500), started, time.time(), error_code[:100]))
+                except Exception:
+                    pass
 
     def do_POST(self):
+        self._request_id = secrets.token_hex(8)
+        started = time.time()
         if not self.authenticated():
             return
         if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
@@ -549,9 +673,20 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("Expected an object")
             runtime = self.server.runtime
             path = urlparse(self.path).path
+            if path == "/api/operations":
+                self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {})))
+                return
+            if path == "/api/operations/cancel":
+                self.respond(runtime.operations.cancel(body.get("id")))
+                return
+            if path == "/api/desktop-update":
+                from .lifecycle import readiness
+                self.respond(readiness(runtime, body.get("action", "status"), body.get("version"), body.get("lease")))
+                return
             if path.startswith("/api/auth/"):
                 with runtime.dispatch_lock:
-                    runtime.updates.require_ready()
+                    if path != "/api/auth/cancel":
+                        runtime.updates.require_ready()
                     auth = runtime.auth_sessions
                     if path == "/api/auth/start":
                         result = auth.start(body.get("backend"), body.get("provider"), body.get("method", 0), body.get("inputs"))
@@ -575,6 +710,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = center.fetch(body.get("provider"), project)
                 elif path == "/api/model-center/probe":
                     result = center.probe(body.get("provider"), body.get("model"), body.get("effort", "default"), project)
+                elif path == "/api/model-center/diagnose":
+                    result = center.diagnose(body.get("provider"), body.get("model"), project)
                 else:
                     with runtime.dispatch_lock:
                         runtime.updates.require_ready()
@@ -585,6 +722,9 @@ class Handler(BaseHTTPRequestHandler):
                         elif path == "/api/model-center/model":
                             result = center.edit_model(body.get("provider"), body.get("model"), project)
                         elif path == "/api/model-center/routes":
+                            expected = body.get("revision")
+                            if expected is not None and int(expected) != runtime.store.config_revision(body.get("project")):
+                                raise RequestError("Configuration changed in another window; reload before saving")
                             result = center.save_routes(body.get("models"), project,
                                                         **({"inherit": body["inherit"]} if "inherit" in body else {}))
                         elif path == "/api/model-center/resume":
@@ -606,8 +746,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with runtime.dispatch_lock:
                 path = urlparse(self.path).path
-                runtime.updates.require_ready()
-                if path == "/api/projects":
+                if path != "/api/cancel":
+                    runtime.updates.require_ready()
+                if path == "/api/project/archive":
+                    result = runtime.archive_project(body["project"], body.get("confirmation"))
+                elif path == "/api/projects":
                     # id 保持兼容旧客户端；新客户端读取 existing/name/paused 准确提示重复路径。
                     result = runtime.add_project(body["path"], body.get("name"), body.get("enabled", False), details=True)
                 elif path == "/api/updates/check":
@@ -619,10 +762,13 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.updates.apply_async()
                     result = {"started": True}
                 elif path == "/api/config":
-                    runtime.configure(body["values"], body.get("project"), body.get("inherit"))
-                    result = {"saved": True, "config": runtime.config(body.get("project"))}
+                    configured = runtime.configure(body["values"], body.get("project"), body.get("inherit"),
+                                                   body.get("revision"))
+                    result = {**configured, "config": runtime.config(body.get("project"))}
                 elif path == "/api/config/repair":
                     result = runtime.repair_project_config(body["project"], body.get("confirmation"))
+                elif path == "/api/config/repair-global":
+                    result = runtime.repair_global_config(body.get("confirmation"))
                 elif path == "/api/release-retry":
                     result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
                 elif path == "/api/release-authorize":
@@ -632,6 +778,11 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/task/revise":
                     runtime.revise_task(body["task"], body["supplement"])
                     result = {"saved": True}
+                elif path == "/api/tasks/batch":
+                    from .batching import execute
+                    result = execute(runtime, body.get("project"), body.get("tasks"), body.get("action"),
+                                     body.get("request_id"), preview=body.get("preview", True) is not False,
+                                     expected=body.get("revision"))
                 elif path == "/api/task/schedule":
                     runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0))
                     result = {"saved": True}
@@ -672,3 +823,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(result)
         except Exception as exc:
             self.api_error(exc)
+        finally:
+            if urlparse(self.path).path.startswith("/api/"):
+                try:
+                    status = getattr(self, "_response_status", 500)
+                    self.server.runtime.store.execute(
+                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
+                        (self._request_id, "POST", urlparse(self.path).path[:300], status,
+                         started, time.time(), ""))
+                except Exception:
+                    pass

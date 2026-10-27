@@ -22,7 +22,8 @@ files = [root / name for name in ["plugin.json", "update.json", "pyproject.toml"
 files += [root / name for name in ["SERVER.md", "SERVER.en.md", "DESKTOP.md", "DESKTOP.en.md", "EXPERIENCE.md", "EXPERIENCE.en.md"]]
 files += [root / "desktop" / name for name in ["package.json", "package-lock.json", "app-icon.svg", "engine_entry.py",
           "scripts/build.mjs", "scripts/engine.py", "src-tauri/Cargo.toml", "src-tauri/Cargo.lock", "src-tauri/build.rs",
-          "src-tauri/tauri.conf.json", "src-tauri/capabilities/default.json", "src-tauri/src/main.rs"]]
+          "src-tauri/tauri.conf.json", "src-tauri/capabilities/default.json", "src-tauri/src/main.rs",
+          "src-tauri/src/native_update.rs", "src-tauri/src/bin/verify_updater.rs"]]
 for folder in ["adaptive_rsi", "scripts", "skills", "tests", "docs", "deploy"]:
     files += [path for path in (root / folder).rglob("*") if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"]
 with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:

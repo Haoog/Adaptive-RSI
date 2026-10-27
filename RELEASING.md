@@ -57,7 +57,9 @@ GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并�
 
 更新源固定为 `Haoog/Adaptive-RSI`。每个正式版本必须有 `adaptive-rsi-X.Y.Z-plugin.zip` 和同名 `.zip.sha256`；ZIP 根目录为 `adaptive-rsi/`。目前没有独立发布签名，校验和仍由同一 GitHub Release 提供。`update.json` 只接受 `format: 1`、`python_min: [3, 9]`、`state_schema: 1`；不兼容的数据迁移会被拒绝，不能仅改版本号绕过协议。
 
-桌面版同批随正式版本提供 `adaptive-rsi-X.Y.Z-macos-arm64-adhoc.dmg` 和 `.dmg.sha256`。桌面包从同一经过验证的版本提交构建，并检查 Rust 桥接测试、引擎版本、应用签名完整性及 DMG 校验；目前只有 macOS ARM64 构建。临时 ad-hoc 签名不是 Apple Developer ID 签名或公证，macOS 可能显示安全警告，不能宣称为已公证安装包。桌面 app 需用户手动下载替换；服务器自动更新不替换桌面应用。
+桌面版同批提供 `adaptive-rsi-X.Y.Z-macos-arm64-adhoc.dmg` 和 `.dmg.sha256`，目前只有 macOS ARM64。正式发布还须生成签名应用归档和 `desktop-latest.json`；清单与产物随同源树校验，客户端安装前验证签名和签名版本。发布构建需要设置仓库变量 `RSI_UPDATER_PUBLIC_KEY` 和 secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，公钥必须与私钥匹配并保持稳定。缺少公钥或私钥时正式发布检查失败；未配置公钥的本地构建提供手动安装入口。不能提交私钥。
+
+桌面更新在任务排空后替换应用和捆绑引擎，独立或远程服务不由桌面更新器替换。临时 ad-hoc 签名不是 Apple Developer ID 签名或公证；这与更新包签名及 provenance 是不同保障。首次从旧桌面版本迁移仍需手动安装支持更新的新版本；自动回滚、正式签名和公证必须按真实环境另行验证。
 
 更新器使用独立版本目录和活动指针，重新读取官方 feed、校验 SHA-256 并检查归档路径。已经暂存且内容相同的版本可恢复继续；内容不同则停止。下载中断后可重试；自动失败采用退避并限制三次，后续可再次检查或手动重试。监督进程使用独占锁、持久化阶段和原始数据库备份；重启发现监督进程中断时，在禁止新任务及写入的状态下恢复计划。启动健康通过后才允许工作，启动失败仅在没有运行器占用数据库时恢复受保护的启动前快照。缺失备份、状态协议不兼容或磁盘损坏须人工处理；不能保证任意迁移、断电或已发生外部写入都能安全倒退。
 

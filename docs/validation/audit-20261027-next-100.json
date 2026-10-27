@@ -1,0 +1,525 @@
+{
+  "scope": "Second 100-point audit and desktop updater; local implementation complete, exact-tree release verification pending",
+  "base": "6e0cded96b4b55980b3720c983c5002491434c04",
+  "items": [
+    {
+      "id": 1,
+      "title": "会话时限覆盖工具批次",
+      "status": "implemented"
+    },
+    {
+      "id": 2,
+      "title": "Responses/Gemini 历史裁剪",
+      "status": "implemented"
+    },
+    {
+      "id": 3,
+      "title": "保留 Retry-After",
+      "status": "implemented"
+    },
+    {
+      "id": 4,
+      "title": "策略监控防止复活回滚",
+      "status": "implemented"
+    },
+    {
+      "id": 5,
+      "title": "调度错误独立日志兜底",
+      "status": "implemented"
+    },
+    {
+      "id": 6,
+      "title": "终态后处理失败留痕",
+      "status": "implemented"
+    },
+    {
+      "id": 7,
+      "title": "遗留数据清理推进",
+      "status": "implemented"
+    },
+    {
+      "id": 8,
+      "title": "诊断隔离损坏 JSON",
+      "status": "implemented"
+    },
+    {
+      "id": 9,
+      "title": "归档失败清理",
+      "status": "implemented"
+    },
+    {
+      "id": 10,
+      "title": "运行热路径隔离坏历史",
+      "status": "implemented"
+    },
+    {
+      "id": 11,
+      "title": "搜索截断标记",
+      "status": "implemented"
+    },
+    {
+      "id": 12,
+      "title": "安装器避免覆盖同名文件",
+      "status": "implemented"
+    },
+    {
+      "id": 13,
+      "title": "安装器实际打开状态",
+      "status": "implemented"
+    },
+    {
+      "id": 14,
+      "title": "校验文件大小限制",
+      "status": "implemented"
+    },
+    {
+      "id": 15,
+      "title": "安装包下载体积与磁盘限制",
+      "status": "implemented"
+    },
+    {
+      "id": 16,
+      "title": "差异请求统一超时",
+      "status": "implemented"
+    },
+    {
+      "id": 17,
+      "title": "桌面请求超时统一",
+      "status": "implemented"
+    },
+    {
+      "id": 18,
+      "title": "回滚健康检查重试",
+      "status": "implemented"
+    },
+    {
+      "id": 19,
+      "title": "维护线程安全关闭",
+      "status": "implemented"
+    },
+    {
+      "id": 20,
+      "title": "贡献指南命令块",
+      "status": "implemented"
+    },
+    {
+      "id": 21,
+      "title": "按任务分组交付",
+      "status": "implemented"
+    },
+    {
+      "id": 22,
+      "title": "分组冲突预览",
+      "status": "implemented"
+    },
+    {
+      "id": 23,
+      "title": "合并队列",
+      "status": "implemented"
+    },
+    {
+      "id": 24,
+      "title": "快速与完整测试分层",
+      "status": "implemented"
+    },
+    {
+      "id": 25,
+      "title": "历史耗时分配测试",
+      "status": "implemented"
+    },
+    {
+      "id": 26,
+      "title": "测试进度输出",
+      "status": "implemented"
+    },
+    {
+      "id": 27,
+      "title": "测试进程超时",
+      "status": "implemented"
+    },
+    {
+      "id": 28,
+      "title": "CI 测试发现覆盖校验",
+      "status": "implemented"
+    },
+    {
+      "id": 29,
+      "title": "版本验证并行",
+      "status": "implemented"
+    },
+    {
+      "id": 30,
+      "title": "CI 耗时指标",
+      "status": "implemented"
+    },
+    {
+      "id": 31,
+      "title": "执行成本公平调度",
+      "status": "implemented"
+    },
+    {
+      "id": 32,
+      "title": "Future 完成唤醒",
+      "status": "implemented"
+    },
+    {
+      "id": 33,
+      "title": "按到期调度",
+      "status": "implemented"
+    },
+    {
+      "id": 34,
+      "title": "提交失败补偿",
+      "status": "implemented"
+    },
+    {
+      "id": 35,
+      "title": "批量项目资格查询",
+      "status": "implemented"
+    },
+    {
+      "id": 36,
+      "title": "统一执行取消上下文",
+      "status": "implemented"
+    },
+    {
+      "id": 37,
+      "title": "手动操作与审计原子性",
+      "status": "implemented"
+    },
+    {
+      "id": 38,
+      "title": "全局配置修复",
+      "status": "implemented"
+    },
+    {
+      "id": 39,
+      "title": "资源压力准入",
+      "status": "implemented"
+    },
+    {
+      "id": 40,
+      "title": "依赖关键路径",
+      "status": "implemented"
+    },
+    {
+      "id": 41,
+      "title": "连接总量上限",
+      "status": "implemented"
+    },
+    {
+      "id": 42,
+      "title": "状态接口一致快照",
+      "status": "implemented"
+    },
+    {
+      "id": 43,
+      "title": "统计增量汇总",
+      "status": "implemented"
+    },
+    {
+      "id": 44,
+      "title": "差异分页流式读取",
+      "status": "implemented"
+    },
+    {
+      "id": 45,
+      "title": "运行阶段批量读取",
+      "status": "implemented"
+    },
+    {
+      "id": 46,
+      "title": "长历史游标分页",
+      "status": "implemented"
+    },
+    {
+      "id": 47,
+      "title": "配置版本冲突检查",
+      "status": "implemented"
+    },
+    {
+      "id": 48,
+      "title": "API 字段契约",
+      "status": "implemented"
+    },
+    {
+      "id": 49,
+      "title": "空间统计缓存",
+      "status": "implemented"
+    },
+    {
+      "id": 50,
+      "title": "空间统计覆盖目录",
+      "status": "implemented"
+    },
+    {
+      "id": 51,
+      "title": "备份进度与取消",
+      "status": "implemented"
+    },
+    {
+      "id": 52,
+      "title": "备份保留策略",
+      "status": "implemented"
+    },
+    {
+      "id": 53,
+      "title": "可迁移备份包",
+      "status": "implemented"
+    },
+    {
+      "id": 54,
+      "title": "恢复点验证",
+      "status": "implemented"
+    },
+    {
+      "id": 55,
+      "title": "数据库迁移台账",
+      "status": "implemented"
+    },
+    {
+      "id": 56,
+      "title": "关系一致性审计",
+      "status": "implemented"
+    },
+    {
+      "id": 57,
+      "title": "SQLite 运行指标",
+      "status": "implemented"
+    },
+    {
+      "id": 58,
+      "title": "请求与运行日志关联",
+      "status": "implemented"
+    },
+    {
+      "id": 59,
+      "title": "HTTP 绝对读取截止",
+      "status": "implemented"
+    },
+    {
+      "id": 60,
+      "title": "后台操作 ID",
+      "status": "implemented"
+    },
+    {
+      "id": 61,
+      "title": "模型上下文容量",
+      "status": "implemented"
+    },
+    {
+      "id": 62,
+      "title": "模型能力元数据",
+      "status": "implemented"
+    },
+    {
+      "id": 63,
+      "title": "只读工具并行",
+      "status": "implemented"
+    },
+    {
+      "id": 64,
+      "title": "工具调用 ID 幂等",
+      "status": "implemented"
+    },
+    {
+      "id": 65,
+      "title": "模型流式进度",
+      "status": "implemented"
+    },
+    {
+      "id": 66,
+      "title": "模型停止原因",
+      "status": "implemented"
+    },
+    {
+      "id": 67,
+      "title": "跨项目账号限流",
+      "status": "implemented"
+    },
+    {
+      "id": 68,
+      "title": "健康旧结果保护",
+      "status": "implemented"
+    },
+    {
+      "id": 69,
+      "title": "环境凭据世代",
+      "status": "implemented"
+    },
+    {
+      "id": 70,
+      "title": "多维价格模型",
+      "status": "implemented"
+    },
+    {
+      "id": 71,
+      "title": "评估案例分层抽样",
+      "status": "implemented"
+    },
+    {
+      "id": 72,
+      "title": "评估集版本清单",
+      "status": "implemented"
+    },
+    {
+      "id": 73,
+      "title": "效应大小与不确定性",
+      "status": "implemented"
+    },
+    {
+      "id": 74,
+      "title": "新鲜留出集晋升",
+      "status": "implemented"
+    },
+    {
+      "id": 75,
+      "title": "长期漂移检测",
+      "status": "implemented"
+    },
+    {
+      "id": 76,
+      "title": "质量耗时费用对照",
+      "status": "implemented"
+    },
+    {
+      "id": 77,
+      "title": "评估准备环境缓存",
+      "status": "implemented"
+    },
+    {
+      "id": 78,
+      "title": "结构化测试产物",
+      "status": "implemented"
+    },
+    {
+      "id": 79,
+      "title": "验收要求证据映射",
+      "status": "implemented"
+    },
+    {
+      "id": 80,
+      "title": "大差异分块评审",
+      "status": "implemented"
+    },
+    {
+      "id": 81,
+      "title": "批量任务操作",
+      "status": "implemented"
+    },
+    {
+      "id": 82,
+      "title": "项目生命周期管理",
+      "status": "implemented"
+    },
+    {
+      "id": 83,
+      "title": "深链接与导航",
+      "status": "implemented"
+    },
+    {
+      "id": 84,
+      "title": "可保存任务视图",
+      "status": "implemented"
+    },
+    {
+      "id": 85,
+      "title": "需求修订对比",
+      "status": "implemented"
+    },
+    {
+      "id": 86,
+      "title": "长日志按需渲染",
+      "status": "implemented"
+    },
+    {
+      "id": 87,
+      "title": "差异文件目录",
+      "status": "implemented"
+    },
+    {
+      "id": 88,
+      "title": "冲突草稿保留",
+      "status": "implemented"
+    },
+    {
+      "id": 89,
+      "title": "扩展无障碍验证",
+      "status": "implemented"
+    },
+    {
+      "id": 90,
+      "title": "最后成功更新时间",
+      "status": "implemented"
+    },
+    {
+      "id": 91,
+      "title": "桌面请求底层取消",
+      "status": "implemented"
+    },
+    {
+      "id": 92,
+      "title": "安装包下载恢复",
+      "status": "implemented"
+    },
+    {
+      "id": 93,
+      "title": "运行器更新流式下载",
+      "status": "implemented"
+    },
+    {
+      "id": 94,
+      "title": "连续发布健康检测",
+      "status": "implemented"
+    },
+    {
+      "id": 95,
+      "title": "健康检查总截止",
+      "status": "implemented"
+    },
+    {
+      "id": 96,
+      "title": "固定构建工具链",
+      "status": "implemented"
+    },
+    {
+      "id": 97,
+      "title": "SBOM 与许可证清单",
+      "status": "implemented"
+    },
+    {
+      "id": 98,
+      "title": "运行时长期压力测试",
+      "status": "implemented"
+    },
+    {
+      "id": 99,
+      "title": "故障注入矩阵",
+      "status": "implemented"
+    },
+    {
+      "id": 100,
+      "title": "跨版本能力协商",
+      "status": "implemented"
+    }
+  ],
+  "updater_status": "implemented; permanent signing configuration and real signed cross-version upgrade remain release-environment checks",
+  "external_settings": [
+    {
+      "id": 23,
+      "area": "GitHub merge queue",
+      "status": "repository configuration required"
+    },
+    {
+      "id": 92,
+      "area": "real cross-version installation",
+      "status": "release-environment acceptance required"
+    }
+  ],
+  "verification": {
+    "python": "final grouped run completed with one stale workflow selector assertion, which was updated; rerun required",
+    "browser": "full Chromium suite passed before the latest UI state fix; rerun required",
+    "desktop": "temporary-key build, signature verification, bundled engine startup passed",
+    "release_boundary": "no push, merge, release, or permanent signing credentials were used"
+  }
+}

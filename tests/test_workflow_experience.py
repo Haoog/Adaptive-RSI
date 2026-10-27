@@ -1110,12 +1110,14 @@ class ExperienceTest(unittest.TestCase):
 
     def test_shared_provider_half_open_recovery_reaches_real_invocations(self):
         from adaptive_rsi.provider_health import ProviderHealth
+        health = ProviderHealth(self.store)
 
         class HealthAwareAgent(FakeAgent):
             def invoke(agent, role, prompt, workspace, project, run, config, cancel=None, protected=()):
-                health.require(config, "openai", project)
+                model = config["models"][role]["model"]
+                health.require(config, "openai", project, model)
                 result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
-                health.record(config, "openai", project)
+                health.record(config, "openai", project, model=model)
                 return result
 
         self.runtime.configure({
@@ -1128,7 +1130,6 @@ class ExperienceTest(unittest.TestCase):
         self.runtime.pause(self.project, False)
         config = self.runtime.config(self.project)
         run = self.store.claim(self.project, config)
-        health = ProviderHealth(self.store)
         with patch("adaptive_rsi.provider_health.time.time", return_value=time.time() - 61):
             for _ in range(3):
                 health.record(config, "openai", self.project, RuntimeError("HTTP 503"))

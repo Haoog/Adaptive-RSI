@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .agent import CodexAgent
+from .agent import CodexAgent, model_capabilities
 from .catalog import CatalogError, list_models
 from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
@@ -87,7 +87,12 @@ class ModelCenter:
                 if proof:
                     task_proofs[role] = proof
         override = self.store.one("SELECT config FROM projects WHERE id=?", (project,)) if project else None
-        return {"providers": items, "models": config["models"], "task_proofs": task_proofs, "overrides": json.loads(override["config"]).get("models", {}) if override else {},
+        try:
+            overrides = json.loads(override["config"]).get("models", {}) if override and isinstance(
+                json.loads(override["config"]), dict) else {}
+        except (TypeError, ValueError):
+            overrides = {}
+        return {"providers": items, "models": config["models"], "task_proofs": task_proofs, "overrides": overrides,
                 "keychain": platform.system() == "Darwin", "project": project,
                 "global_models": self.runtime.config()["models"]}
 
@@ -380,6 +385,26 @@ class ModelCenter:
         self.store.event("provider_resumed", "Provider resumed by user", project, data={"provider": provider_id})
         return {"saved": True, "resumed_tasks": self.runtime.resume_provider_tasks(provider_id, project)}
 
+    def diagnose(self, provider_id, model_id, project=None):
+        """Read-only route diagnostics; no paid model call or network probe is made."""
+        config = self.runtime.config(project)
+        provider = self.provider(provider_id, project)
+        capabilities = model_capabilities(model_id, provider.get("protocol", "codex"))
+        health = ProviderHealth(self.store).diagnostics(
+            config, provider_id, project or "model-center", model_id)
+        directory = self.directory(provider, project)
+        entry = next((item for item in directory.get("models", []) if item.get("id") == model_id), None)
+        credential = self.credentials.status(provider) if provider.get("credential") else "not_required"
+        return {"provider": provider_id, "model": model_id,
+                "capabilities": capabilities, "health": health,
+                "credential_status": credential, "catalog": {
+                    "fetched": bool(directory.get("fetched")),
+                    "present": entry is not None,
+                    "missing": bool(entry and entry.get("missing")),
+                    "truncated": bool(directory.get("truncated")),
+                },
+                "paid_probe": False}
+
     def save_routes(self, routes, project=None, inherit=_UNSET_INHERIT):
         with self.runtime.dispatch_lock:
             return self._save_routes(routes, project, inherit)
@@ -404,8 +429,16 @@ class ModelCenter:
             if differences:
                 override["models"] = differences
             validate(merge(self.runtime.config(), override))
-            self.store.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), project))
-            self.store.event("config", "Model routes updated", project, data={"models": differences})
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE projects SET config=? WHERE id=?", (encode(override), project))
+                key = "config-revision:" + project
+                row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                revision = int(row["value"]) if row and str(row["value"]).isdigit() else 0
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(revision + 1)))
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) "
+                           "VALUES (?,NULL,'config','Model routes updated',?,?)",
+                           (project, encode({"models": differences}), time.time()))
             self.runtime.wake.set()
         else:
             self.runtime.configure({"models": routes})

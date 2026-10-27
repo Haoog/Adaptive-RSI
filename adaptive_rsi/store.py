@@ -2,6 +2,7 @@ import contextlib
 import json
 import queue
 import sqlite3
+import statistics
 import threading
 import time
 import uuid
@@ -12,6 +13,7 @@ from zoneinfo import ZoneInfoNotFoundError
 # /api/state 单次请求会执行十几条查询；8 个复用连接足以覆盖线程池的并发峰值，
 # 池满时新借出的连接用完直接关闭，不阻塞调用方。
 POOL_SIZE = 8
+MAX_CONNECTIONS = 32
 
 
 def uid():
@@ -70,10 +72,17 @@ class Store:
         self._pool_lock = threading.Lock()
         self._pool_generation = 0
         self._clock_samples = {}
+        self._connection_capacity = threading.BoundedSemaphore(MAX_CONNECTIONS + POOL_SIZE)
+        self._metrics_lock = threading.Lock()
+        self._metrics = {"opened": 0, "borrowed": 0, "waiting": 0, "peak": 0}
+        self._read_snapshot = threading.local()
+        self._task_samples = threading.local()
         with self.connect() as db:
-            if db.execute("PRAGMA user_version").fetchone()[0] > 1:
+            if db.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("Database schema is newer than this runtime")
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied REAL NOT NULL);
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS projects (
@@ -138,6 +147,12 @@ class Store:
                     started REAL, ended REAL);
                 CREATE TABLE IF NOT EXISTS task_completions (
                     task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
+                CREATE TABLE IF NOT EXISTS request_log (
+                    id TEXT PRIMARY KEY, method TEXT, path TEXT, status INTEGER, started REAL,
+                    ended REAL, error_code TEXT);
+                CREATE TABLE IF NOT EXISTS relationship_quarantine (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT, row_id TEXT, data TEXT, created REAL);
+                CREATE INDEX IF NOT EXISTS request_log_started ON request_log(started DESC);
                 CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
                 CREATE INDEX IF NOT EXISTS event_kind_created ON events(kind, created);
                 CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
@@ -184,7 +199,24 @@ class Store:
             db.execute("UPDATE tasks SET state='obsolete' WHERE source='system_deep' AND state IN ('queued','waiting_budget')")
             db.execute("INSERT OR IGNORE INTO task_completions SELECT id,project,updated FROM tasks "
                        "WHERE source NOT LIKE 'system_%' AND state IN ('awaiting_approval','pr_open','merged','completed')")
-            db.execute("PRAGMA user_version=1")
+            checksum = self._migration_checksum(1)
+            migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=1").fetchone()
+            if migration and migration["checksum"] != checksum:
+                raise RuntimeError("Database migration checksum mismatch")
+            db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (1,?,?)", (checksum, time.time()))
+            # Version 2 adds read-only observability tables and indexes.
+            db.execute("CREATE INDEX IF NOT EXISTS request_log_created ON request_log(started DESC)")
+            checksum = self._migration_checksum(2)
+            migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=2").fetchone()
+            if migration and migration["checksum"] != checksum:
+                raise RuntimeError("Database migration checksum mismatch")
+            db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (2,?,?)", (checksum, time.time()))
+            db.execute("PRAGMA user_version=2")
+
+    @staticmethod
+    def _migration_checksum(version):
+        import hashlib
+        return hashlib.sha256(("adaptive-rsi-schema-v" + str(version)).encode()).hexdigest()
 
     def _file_identity(self):
         try:
@@ -210,6 +242,16 @@ class Store:
 
     @contextlib.contextmanager
     def connect(self):
+        with self._metrics_lock:
+            self._metrics["waiting"] += 1
+        if not self._connection_capacity.acquire(timeout=15):
+            with self._metrics_lock:
+                self._metrics["waiting"] -= 1
+            raise sqlite3.OperationalError("Database connection capacity exhausted")
+        with self._metrics_lock:
+            self._metrics["waiting"] -= 1
+            self._metrics["borrowed"] += 1
+            self._metrics["peak"] = max(self._metrics["peak"], self._metrics["borrowed"])
         with self._pool_lock:
             generation = self._pool_generation
             try:
@@ -223,6 +265,8 @@ class Store:
             db = None
         if db is None:
             db = self._new_connection()
+            with self._metrics_lock:
+                self._metrics["opened"] += 1
         try:
             self._prepare(db)
         except sqlite3.Error:
@@ -231,26 +275,31 @@ class Store:
             db = self._new_connection()
             self._prepare(db)
         try:
-            yield db
-            db.commit()
-        except BaseException:
-            # 异常退出（包括 stream 被中途放弃）的连接可能持有坏状态：
-            # 回滚后直接关闭，绝不归还回池。
             try:
-                db.rollback()
-            except sqlite3.Error:
-                pass
-            db.close()
-            raise
-        else:
-            with self._pool_lock:
-                if generation != self._pool_generation:
-                    db.close()
-                else:
-                    try:
-                        self._pool.put_nowait(db)
-                    except queue.Full:
+                yield db
+                db.commit()
+            except BaseException:
+                # 异常退出（包括 stream 被中途放弃）的连接可能持有坏状态：
+                # 回滚后直接关闭，绝不归还回池。
+                try:
+                    db.rollback()
+                except sqlite3.Error:
+                    pass
+                db.close()
+                raise
+            else:
+                with self._pool_lock:
+                    if generation != self._pool_generation:
                         db.close()
+                    else:
+                        try:
+                            self._pool.put_nowait(db)
+                        except queue.Full:
+                            db.close()
+        finally:
+            with self._metrics_lock:
+                self._metrics["borrowed"] -= 1
+            self._connection_capacity.release()
 
     def close(self):
         """关闭池中空闲连接；已借出的连接由各自的 with 块负责关闭。"""
@@ -267,11 +316,24 @@ class Store:
                     pass
 
     def query(self, sql, args=()):
+        active = getattr(self._read_snapshot, "connection", None)
+        if active is not None:
+            return [dict(row) for row in active.execute(sql, args).fetchall()]
         with self.connect() as db:
-            return [dict(row) for row in db.execute(sql, args).fetchall()]
+            started = time.monotonic()
+            result = [dict(row) for row in db.execute(sql, args).fetchall()]
+            if "FROM tasks" in sql:
+                self._task_samples.history = [*getattr(self._task_samples, "history", [])[-127:],
+                                              time.monotonic() - started]
+            return result
 
     def stream(self, sql, args=()):
         """Yield rows without materializing an unbounded result set."""
+        active = getattr(self._read_snapshot, "connection", None)
+        if active is not None:
+            for row in active.execute(sql, args):
+                yield dict(row)
+            return
         with self.connect() as db:
             for row in db.execute(sql, args):
                 yield dict(row)
@@ -281,8 +343,91 @@ class Store:
         return rows[0] if rows else None
 
     def execute(self, sql, args=()):
+        active = getattr(self._read_snapshot, "connection", None)
+        if active is not None:
+            active.execute(sql, args)
+            return
         with self.connect() as db:
             db.execute(sql, args)
+
+    @contextlib.contextmanager
+    def snapshot(self):
+        """Serve related reads from one SQLite transaction on this thread."""
+        if getattr(self._read_snapshot, "connection", None) is not None:
+            yield
+            return
+        with self.connect() as db:
+            db.execute("BEGIN")
+            self._read_snapshot.connection = db
+            try:
+                yield
+            finally:
+                self._read_snapshot.connection = None
+
+    def metrics(self):
+        with self._metrics_lock:
+            borrowed = self._metrics["borrowed"]
+            values = dict(self._metrics)
+        with self.connect() as db:
+            values.update({
+                "database_bytes": self.path.stat().st_size if self.path.exists() else 0,
+                "wal_bytes": Path(str(self.path) + "-wal").stat().st_size
+                if Path(str(self.path) + "-wal").exists() else 0,
+                "page_count": db.execute("PRAGMA page_count").fetchone()[0],
+                "page_size": db.execute("PRAGMA page_size").fetchone()[0],
+                "busy_timeout_ms": db.execute("PRAGMA busy_timeout").fetchone()[0],
+                "foreign_key_violations": len(db.execute("PRAGMA foreign_key_check").fetchall()),
+            })
+        values.update(idle=self._pool.qsize(), borrowed=borrowed, limit=MAX_CONNECTIONS + POOL_SIZE)
+        return values
+
+    def task_duration_model(self):
+        samples = getattr(self._task_samples, "history", [])
+        return {"samples": len(samples), "median_seconds": statistics.median(samples) if samples else 0.0}
+
+    def schema_migrations(self):
+        return self.query("SELECT version,checksum,applied FROM schema_migrations ORDER BY version")
+
+    def relationship_audit(self, limit=100):
+        checks = {
+            "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project<>t.project",
+        }
+        result = {}
+        for name, sql in checks.items():
+            result[name] = [row[next(iter(row))] for row in self.query(sql + " LIMIT ?", (limit,))]
+        return result
+
+    def quarantine_orphans(self):
+        """Move provable orphan rows into an audit table without deleting evidence."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            specs = [
+                ("stages", "stages_without_run", "SELECT s.run,s.data FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL"),
+            ]
+            quarantined = {}
+            for table, label, select in specs:
+                rows = db.execute(select).fetchall()
+                quarantined[label] = len(rows)
+                for row in rows:
+                    db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES (?,?,?,?)",
+                               (table, row[0], json.dumps(dict(row), ensure_ascii=False), time.time()))
+                db.execute("DELETE FROM stages WHERE run IN (" + select.replace("SELECT s.run,s.data", "SELECT s.run") + ")")
+            return quarantined
+
+    def config_revision(self, project=None):
+        row = self.one("SELECT value FROM settings WHERE key=?", ("config-revision:" + (project or "global"),))
+        return int(row["value"]) if row and str(row["value"]).isdigit() else 0
+
+    def bump_config_revision(self, project=None, expected=None):
+        key = "config-revision:" + (project or "global")
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            current = int(row["value"]) if row and str(row["value"]).isdigit() else 0
+            if expected is not None and int(expected) != current:
+                raise ValueError("Configuration changed in another window; reload before saving")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(current + 1)))
+            return current + 1
 
     def setting(self, key, default=None):
         row = self.one("SELECT value FROM settings WHERE key=?", (key,))

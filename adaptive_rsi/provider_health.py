@@ -114,10 +114,11 @@ def cli_failure(backend, result):
     return None
 
 
-def connection_key(config, provider_id, project):
+def connection_key(config, provider_id, project, model=None):
     provider = next((p for p in config["providers"] if p["id"] == provider_id), {"id": provider_id})
     signature = fingerprint({k: v for k, v in provider.items() if k != "name"})
-    return "provider-health:" + str(project or "global") + ":" + provider_id + ":" + signature
+    key = "provider-health:" + str(project or "global") + ":" + provider_id + ":" + signature
+    return key + ":" + fingerprint({"model": model}) if model else key
 
 
 class ProviderPaused(RuntimeError):
@@ -129,8 +130,9 @@ class ProviderHealth:
     def __init__(self, store):
         self.store = store
 
-    def status(self, config, provider, project):
-        return self.store.setting(connection_key(config, provider, project), {"failures": 0, "paused": False})
+    def status(self, config, provider, project, model=None):
+        key = connection_key(config, provider, project)
+        return self.store.setting(key, {"failures": 0, "paused": False})
 
     @staticmethod
     def _half_open_ready(config, state, now):
@@ -144,14 +146,14 @@ class ProviderHealth:
             and now >= state.get("retry_at", 0)
         )
 
-    def admission(self, config, provider, project):
+    def admission(self, config, provider, project, model=None):
         """Report readiness without consuming the single half-open attempt."""
         now = time.time()
-        state = self.status(config, provider, project)
+        state = self.status(config, provider, project, model)
         half_open = self._half_open_ready(config, state, now)
         return {"ready": not state.get("paused") or half_open, "half_open": half_open}
 
-    def require(self, config, provider, project):
+    def require(self, config, provider, project, model=None):
         key = connection_key(config, provider, project)
         now = time.time()
         with self.store.connect() as db:
@@ -162,17 +164,25 @@ class ProviderHealth:
                 error = ModelFailure("Provider Retry-After cooldown is pending", "rate_limit")
                 error.retry_after = state["retry_at"] - now
                 error.provider_id = provider
+                error.model = model
                 raise error
             if self._half_open_ready(config, state, now):
-                state["half_open_until"] = now + config["limits"]["command_seconds"] + 30
+                # Lease the recovered connection for the current bounded role, not
+                # the entire command budget, so later stages can continue.
+                state["half_open_until"] = now + min(config["limits"]["command_seconds"], 30)
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(state), key))
+                return
+            if (state.get("paused") and state.get("half_open_until", 0) > now and
+                    state["half_open_until"] - now <= min(config["limits"]["command_seconds"], 30)):
+                # The role that acquired the lease can perform its one recovery call.
                 return
         if state.get("paused"):
             error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
             error.provider_id = provider
+            error.model = model
             raise error
 
-    def record(self, config, provider, project, error=None):
+    def record(self, config, provider, project, error=None, model=None):
         code = error_code(error) if error else None
         if error and code not in ["auth", "rate_limit", "timeout", "connection"]:
             return
@@ -183,12 +193,29 @@ class ProviderHealth:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             old = json.loads(row[0]) if row else {}
-            failures = old.get("failures", 0) + 1 if error else 0
-            value = {"failures": failures, "paused": (old.get("paused", False) and not (not error and old.get("half_open_until"))) or failures >= 3,
-                     "code": code, "at": time.time()}
-            if error and getattr(error, "retry_after", 0):
+            if not error:
+                # A late success from an older attempt cannot clear a newer failure.
+                if old.get("paused") and not old.get("half_open_until"):
+                    value = None
+                else:
+                    value = {"failures": 0, "paused": False, "code": None, "at": time.time()}
+            else:
+                failures = old.get("failures", 0) + 1
+                value = {"failures": failures,
+                         "paused": old.get("paused", False) or failures >= 3,
+                         "code": code, "at": time.time()}
+            if value is not None and error and getattr(error, "retry_after", 0):
                 value["retry_at"] = time.time() + error.retry_after
-            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+            if value is not None:
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+        if model and value is not None:
+            detail_key = connection_key(config, provider, project, model)
+            detail = self.store.setting(detail_key, {})
+            detail.update(value)
+            detail["model"] = model
+            # Detail writes are diagnostic only; the connection row above is the
+            # sole admission control and must not be overwritten after commit.
+            self.store.put_setting(detail_key, detail)
 
-    def reset(self, config, provider, project):
+    def reset(self, config, provider, project, model=None):
         self.store.put_setting(connection_key(config, provider, project), {"failures": 0, "paused": False})

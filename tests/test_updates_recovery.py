@@ -87,7 +87,7 @@ class UpdateJournalRecoveryTest(unittest.TestCase):
     def test_unverified_living_child_is_not_killed_or_overwritten(self):
         self.write_plan("health_check")
         # 假时钟跨过 RESTART_HEALTH_SECONDS（60s）预算即退出等待循环。
-        with patch("adaptive_rsi.updates.process_present", return_value=True), patch("adaptive_rsi.updates.candidate_health", return_value=False), patch("adaptive_rsi.updates.time.monotonic", side_effect=[0, 61]), patch("adaptive_rsi.updates.subprocess.Popen") as spawn:
+        with patch("adaptive_rsi.updates.process_present", return_value=True), patch("adaptive_rsi.updates.candidate_health", return_value=False), patch("adaptive_rsi.updates.time.monotonic", side_effect=[0, 0, 61, 61]), patch("adaptive_rsi.updates.subprocess.Popen") as spawn:
             supervise_restart(self.store.root)
         spawn.assert_not_called()
         self.assertEqual(self.store.setting("update-status")["state"], "recovery_required")

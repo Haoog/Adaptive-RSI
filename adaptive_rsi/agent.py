@@ -71,6 +71,27 @@ def validate_output(value, schema):
             validate_output(item, schema["items"])
 
 
+def model_capabilities(model, protocol=""):
+    """Return conservative routing metadata; unknown models never inherit premium limits."""
+    value = str(model or "").lower()
+    result = {"id": model, "context_tokens": 128000, "max_output_tokens": 16384,
+              "efforts": ["default"], "tools": True, "streaming": protocol in ("responses", "anthropic", "chat_completions", "gemini"),
+              "source": "conservative_default"}
+    if "claude" in value:
+        result.update(context_tokens=200000, max_output_tokens=32000,
+                      efforts=["low", "medium", "high", "max"], source="known_family")
+    elif "gemini" in value:
+        result.update(context_tokens=1000000, max_output_tokens=65536,
+                      efforts=["default"], source="known_family")
+    elif any(item in value for item in ("gpt-", "o1", "o3", "o4")):
+        result.update(context_tokens=200000, max_output_tokens=32768,
+                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family")
+    if "luna" in value:
+        result.update(max_output_tokens=min(result["max_output_tokens"], 32768),
+                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family")
+    return result
+
+
 def provider_arguments(route, config, environment=None):
     provider_id = route.get("provider", "openai")
     if provider_id == "openai":
@@ -165,7 +186,7 @@ class CodexAgent:
         for index, route in enumerate(routes):
             provider_id = route.get("provider", "openai")
             try:
-                health.require(config, provider_id, project)
+                health.require(config, provider_id, project, route["model"])
                 effective = {**config, "models": {**config["models"], role: {**route, "fallback": None}}}
                 result = self._invoke(role, prompt, workspace, project, run, effective, cancel, protected)
             except Exception as exc:
@@ -173,7 +194,7 @@ class CodexAgent:
                 exc.role = role
                 if isinstance(exc, Cancelled):
                     raise
-                health.record(config, provider_id, project, exc)
+                health.record(config, provider_id, project, exc, route["model"])
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
                 # 仅旧适配器无代码的 CLI 自身诊断允许文本兼容；明确的 execution
                 # 或认证/额度故障绝不被消息中的 timeout 等关键词覆盖。
@@ -194,7 +215,7 @@ class CodexAgent:
                     self.store.event("fallback", "Primary provider unavailable; using configured fallback", project, run)
                     continue
                 raise
-            health.record(config, provider_id, project)
+            health.record(config, provider_id, project, model=route["model"])
             return result
 
     def _invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):

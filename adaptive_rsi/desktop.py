@@ -61,7 +61,8 @@ def run(root):
     runtime.updates.desktop_managed = True
     server = None
     try:
-        runtime.start(paused=True)
+        from .lifecycle import barrier
+        runtime.start(paused=not bool(barrier(runtime)))
         server = Server(runtime)
         session = {"origin": server.origin, "local_origin": server.local_origin,
                    "cookie": server.cookie, "token": server.token, "csrf": server.csrf,

@@ -188,9 +188,12 @@ class ParallelReleaseTest(unittest.TestCase):
                 setup = next(step for step in config["steps"] if step.get("uses", "").startswith("actions/setup-python@"))
                 self.assertEqual(setup["with"]["python-version"], "3.12")
                 commands = [step.get("run", "") for step in config["steps"]]
-                self.assertEqual(commands.count("python3 scripts/test_parallel.py"), 1)
+                gates = [command for command in commands
+                         if command.startswith("python3 scripts/test_parallel.py")]
+                self.assertEqual(len(gates), 1)
                 self.assertNotIn("python3 -m unittest discover -v", commands)
-                gate = next(step for step in config["steps"] if step.get("run") == "python3 scripts/test_parallel.py")
+                gate = next(step for step in config["steps"]
+                            if step.get("run", "").startswith("python3 scripts/test_parallel.py"))
                 self.assertFalse(gate.get("continue-on-error", False))
                 self.assertNotIn("if", gate)
                 self.assertTrue(any("scripts/release_smoke.py" in command for command in commands))

@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .agent import SCHEMAS, TEXT, object_schema, validate_output
+from .agent import SCHEMAS, TEXT, model_capabilities, object_schema, validate_output
 from .config import relative_path
 from .credentials import Credentials
 from .provider_health import ModelFailure, error_code, http_failure, provider_text_code
@@ -29,6 +29,8 @@ class ProviderInterrupted(ModelFailure):
     def __init__(self, cause):
         super().__init__("Provider became unavailable after workspace tools; fallback refused to avoid mixing implementations",
                          error_code(cause))
+        self.retry_after = getattr(cause, "retry_after", 0)
+        self.provider_id = getattr(cause, "provider_id", None)
 
 
 class ArgumentsError(ValueError):
@@ -57,7 +59,7 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
         argv = ([sys.executable, "internal-native-transport"] if getattr(sys, "frozen", False) else
                 [sys.executable, "-m", "adaptive_rsi.native_transport"])
         result = run_process(argv,
-                             cwd=Path(__file__).resolve().parents[1], timeout=timeout + 5,
+                             cwd=Path(__file__).resolve().parents[1], timeout=timeout,
                              cancel=cancel, output_mb=max(1, max_bytes // (1024 * 1024) * 2),
                              input_data=json.dumps([url, payload, headers, timeout, max_bytes]).encode())
         if result["error_kind"] == "timeout":
@@ -145,6 +147,15 @@ class WorkspaceTools:
         self._text_cache_bytes = 0
         self.files_truncated = False
         self.scope = None
+        self.deadline = None
+
+    def remaining(self):
+        if self.deadline is None:
+            return self.config["limits"]["command_seconds"]
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderUnavailable("Native conversation timed out", "timeout")
+        return remaining
 
     @staticmethod
     def read_source(path, maximum):
@@ -186,6 +197,7 @@ class WorkspaceTools:
         return result
 
     def execute(self, name, args):
+        self.remaining()
         if self.cancel and self.cancel():
             raise Cancelled("Cancelled before model tool execution")
         schema = next((schema for tool, _, schema in tools_for(self.role) if tool == name and tool != "finish"), None)
@@ -233,8 +245,9 @@ class WorkspaceTools:
                     if args["text"] in line:
                         result.append({"path": file, "line": i, "text": line[:1000]})
                         if len(result) >= 100:
-                            return result
-            return result
+                            return {"matches": result, "truncated": True, "reason": "match limit", "limit": 100}
+            return {"matches": result, "truncated": self.files_truncated,
+                    "reason": "file limit" if self.files_truncated else None, "limit": 100}
         if name in ["write_file", "replace_text"]:
             path = self.path(args["path"])
             relative = path.relative_to(self.workspace).as_posix()
@@ -267,7 +280,8 @@ class WorkspaceTools:
             self._file_cache = None
             self._text_cache.clear()
             self._text_cache_bytes = 0
-            sandbox = Sandbox(self.state, self.config)
+            config = {**self.config, "limits": {**self.config["limits"], "command_seconds": self.remaining()}}
+            sandbox = Sandbox(self.state, config)
             writable = None
             if self.scope is not None:
                 writable = [self.path(scope) for scope in self.scope]
@@ -333,6 +347,12 @@ class Conversation:
             return
         for item in self.history[1:-4]:
             if isinstance(item, dict):
+                if item.get("type") == "function_call_output" and len(str(item.get("output", ""))) > 1000:
+                    item["output"] = json.dumps({"truncated": True, "excerpt": str(item["output"])[:500]})
+                for part in item.get("parts", []):
+                    response = part.get("functionResponse") if isinstance(part, dict) else None
+                    if response and len(json.dumps(response.get("response", {}))) > 1000:
+                        response["response"] = {"truncated": True, "excerpt": json.dumps(response["response"])[:500]}
                 content = item.get("content")
                 if isinstance(content, str) and len(content) > 1000:
                     item["content"] = content[:500] + "\n...[output trimmed for context capacity]...\n" + content[-200:]
@@ -418,10 +438,13 @@ class NativeAgent:
                 tools.scope = [relative_path(value) for value in scope]
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
         began = time.monotonic()
-        max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
+        tools.deadline = began + config["limits"]["command_seconds"]
+        max_bytes = min(config["limits"]["max_output_mb"] * 1024 * 1024,
+                        model_capabilities(route["model"], protocol)["max_output_tokens"] * 4)
         # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
         # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
         timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
+        seen_calls = set()
         for turn in range(200):
             remaining = config["limits"]["command_seconds"] - (time.monotonic() - began)
             if remaining <= 0:
@@ -446,10 +469,36 @@ class NativeAgent:
                     raise ValueError("Invalid token usage")
                 if cancel and cancel():
                     raise Cancelled("Cancelled after model response")
+                tools.remaining()
                 if not calls:
-                    raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
+                    stop_reason = (response.get("stop_reason") or response.get("finishReason") or
+                                   (response.get("choices") or [{}])[0].get("finish_reason") or
+                                   (response.get("candidates") or [{}])[0].get("finishReason"))
+                    reason = "text_only" if not stop_reason else str(stop_reason)[:80]
+                    error = RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
+                    error.code = "tool_format"
+                    error.stop_reason = reason
+                    raise error
                 if len(calls) > 64:
                     raise RuntimeError("Model response exceeds 64 tool calls per turn")
+                # Reject ambiguous batches before executing any potentially mutating
+                # operation. Replaying one ID twice must never perform two writes.
+                if len({call_id for call_id, _, _ in calls}) != len(calls):
+                    raise RuntimeError("Model response contains duplicate tool call IDs")
+                # Some gateways omit IDs; their positional fallbacks are only
+                # meaningful within this turn, so track only explicit IDs.
+                if protocol in ("responses", "anthropic"):
+                    explicit_ids = {call_id for call_id, _, _ in calls}
+                elif protocol in ("chat_completions", "ollama"):
+                    message = response["message"] if protocol == "ollama" else response["choices"][0]["message"]
+                    explicit_ids = {item["id"] for item in message.get("tool_calls", []) if item.get("id")}
+                else:
+                    parts = response["candidates"][0]["content"]["parts"]
+                    explicit_ids = {part["functionCall"]["id"] for part in parts
+                                    if part.get("functionCall", {}).get("id")}
+                if explicit_ids & seen_calls:
+                    raise RuntimeError("Model response reused an earlier tool call ID")
+                seen_calls.update(explicit_ids)
                 final = [x for x in calls if x[1] == "finish"]
                 if final:
                     if len(calls) != 1:
@@ -471,6 +520,7 @@ class NativeAgent:
                     continue
                 results = []
                 for call_id, name, args in calls:
+                    tools.remaining()
                     if isinstance(args, ArgumentsError):
                         results.append((call_id, name, {"error": str(args)}))
                         continue
@@ -485,6 +535,7 @@ class NativeAgent:
                     except (ValueError, OSError, UnicodeError) as exc:
                         value = {"error": str(exc)}
                     results.append((call_id, name, value))
+                    tools.remaining()
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             except ProviderUnavailable as exc:

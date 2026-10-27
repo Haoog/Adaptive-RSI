@@ -146,7 +146,7 @@ document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')rev
 function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&(!projectSensitive||projectId===project);}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
 function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
-async function sendApi(path,body,signal){
+async function sendApi(path,body,signal,{text=false}={}){
  if(body!==undefined&&!state)throw Error(t('正在连接本地服务，请稍候再提交。'));
  const controller=new AbortController();
  // Refresh already owns a shared deadline and cancellation across pagination.
@@ -156,6 +156,7 @@ async function sendApi(path,body,signal){
  let response;
  try{response=await fetch('/api/'+path,options);}catch(error){throw new TypeError(t('无法连接本地服务。输入已保留，请确认服务仍在运行后重试。'));}
  if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;throw error;}
+ if(text&&response.ok)return await response.text();
  let data;
  try{data=await response.json();}catch(error){const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;throw invalid;}
  if(!response.ok){
@@ -163,6 +164,7 @@ async function sendApi(path,body,signal){
   const known=apiErrors[data.error];
   const message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
   if(!known&&data.error)console.warn('[adaptive-rsi]',data.error);
+  if(data.error_code==='invalid_global_configuration')queueMicrotask(()=>offerGlobalConfigRepair(data.raw));
   const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.evidence={status:response.status,code:error.code,error:data.error};throw error;}
  if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
@@ -351,9 +353,11 @@ function renderNavigation(){
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
  const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
+ document.querySelectorAll('.nav').forEach(node=>{const selected=node.dataset.view===parent;if(selected)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
+ document.querySelector('#tasks-list')?.setAttribute('aria-live','polite');
  $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
  $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录',usage:'记录与用量'}[parent]);
- $('project-settings').hidden=parent==='settings'||!projectId;$('back-workspace').hidden=parent==='overview';
+ $('project-settings').hidden=!projectId;$('back-workspace').hidden=parent==='overview';
  $('global-settings').classList.toggle('active',parent==='settings'&&configScope==='global');
  $('settings-context-title').textContent=configScope==='global'?t('通用默认设置'):(project?projectName(project):t('当前项目'))+' · '+t('项目设置');
  $('settings-context-note').textContent=t(configScope==='global'?'未单独设置的项目会沿用这里的配置。':'仅修改当前项目，其他项目不受影响。');
@@ -392,6 +396,9 @@ function render(){
  }));$('project-config-error').append(repair);}
  $('workspace-title').textContent=project?projectName(project):t('从一个项目开始');
  $('workspace-path').textContent=project?projectPath(project):'';
+ let archive=$('archive-project');
+ if(!archive){archive=el('button',t('归档当前项目'),'text-button');archive.id='archive-project';archive.type='button';$('workspace-path').after(archive);}
+ archive.hidden=!project;
  $('workspace-path').hidden=!project;
  $('workspace-path').title=project?projectPath(project):'';
  $('goal-project-target').textContent=project?projectName(project):t('尚未接入项目');
@@ -449,17 +456,35 @@ function showView(name){
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':models?'settings':name;
  navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections();document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
+ if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',models?'models':name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');history.replaceState(null,'',location.pathname+location.search+'#'+navigation);}
  render();if(['overview','evolution'].includes(name))safe(refresh);if(name==='settings')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
  if(name==='usage')window.RSIUsage?.show();
  if(models)$('view-models').scrollIntoView({block:'start'});
 }
+(function initialNavigation(){
+ const route=new URLSearchParams(location.href?String(location.hash||'').replace(/^#/,''):''),requestedView=route.get('view'),requestedProject=route.get('project');
+ if(requestedProject){projectId=requestedProject;}
+ if(requestedView&&['overview','tasks','evolution','settings','models','usage'].includes(requestedView)){
+  view=requestedView==='tasks'?'overview':requestedView==='models'?'settings':requestedView;
+ }
+})();
+typeof window.addEventListener==='function'&&window.addEventListener('hashchange',()=>{
+ if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project');
+ if(project&&state.projects.some(item=>item.id===project)&&project!==projectId){projectId=project;localWrite('rsi-project',projectId);}
+ if(requested&&['overview','tasks','evolution','settings','models','usage'].includes(requested))showView(requested);
+});
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
  const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
  if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
  list.replaceChildren();
+ if(state.tasks.length>120){
+  const pages=Math.ceil(state.pagination?.total/50);
+  list.append(el('p',t('本次只渲染当前页，长历史通过分页加载。')+' · '+(Math.floor(taskOffset/50)+1)+'/'+Math.max(1,pages),'muted'));
+ }
  document.querySelectorAll('[data-task-filter]').forEach(button=>{button.classList.toggle('active',button.dataset.taskFilter===filter);button.setAttribute('aria-pressed',String(button.dataset.taskFilter===filter));});
  const tasks=visibleTasks(scoped(state.tasks),filter,$('show-system-tasks').checked);
+ window.RSIBatch?.toolbar();
  const candidate=state.selected_project&&state.selected_project!==projectId?null:state.pagination;
  const page=candidate&&candidate.offset===taskOffset&&(candidate.total===0?candidate.offset===0:candidate.offset<candidate.total)?candidate:null;
  $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
@@ -481,6 +506,7 @@ function renderTasks(){
   // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
   else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
+  if(!task.source.startsWith('system_')&&window.RSIBatch)row.append(window.RSIBatch.row(task));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
  }
 }
@@ -504,7 +530,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task,queueDraft);
  const evidence=el('details',undefined,'detail-section');let evidenceText=task.evidence||'';try{evidenceText=JSON.stringify(JSON.parse(task.evidence),null,2);}catch{}evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',evidenceText));body.append(evidence);
- const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));if(ticket!==detailSequence||projectId!==project)return;
+ const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
  async function loadRun(run,index,section){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
   section.replaceChildren();
   if(index===0){const outcome=taskOutcome(data);outcome.id='live-task-outcome';body.insertBefore(outcome,evidence);window.RSIExperience?.enhanceOutcome(outcome,data);await renderReleaseOutcome(outcome,run,project);if(ticket!==detailSequence||projectId!==project)return;}
@@ -766,6 +792,14 @@ document.querySelectorAll('[data-unit-for]').forEach(unit=>unit.addEventListener
 $('delivery-choice').addEventListener('change',()=>{if($('delivery-choice').value==='custom')return;document.querySelector('[data-path="delivery.mode"]').value=$('delivery-choice').value==='local'?'local':'pr';document.querySelector('[data-path="delivery.auto_merge"]').checked=$('delivery-choice').value==='auto';syncDelivery();});
 $('goal-text').addEventListener('input',()=>{goalDraftRevisions.set(projectId,(goalDraftRevisions.get(projectId)||0)+1);stashGoalDraft();});
 $('project-select').addEventListener('change',()=>{stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;render();safe(refresh);});
+var offerGlobalConfigRepair=function(raw){
+ const dialog=el('dialog','','confirm-dialog');dialog.setAttribute('aria-labelledby','global-config-repair-title');
+ const title=el('h2',t('通用配置损坏'));title.id='global-config-repair-title';
+ const text=el('p',t('通用设置无法解析。重置会清除全局覆盖并暂停所有项目；原始内容保存在本地审计记录中。')+' '+JSON.stringify(raw||{}).slice(0,1000));
+ const actions=el('div','','task-actions'),cancel=el('button',t('稍后处理'),'text-button'),repair=el('button',t('重置通用配置'),'button');
+ cancel.type=repair.type='button';actions.append(cancel,repair);dialog.append(title,text,actions);document.body.append(dialog);dialog.showModal();
+ cancel.onclick=()=>dialog.close();repair.onclick=()=>safe(async()=>{repair.disabled=true;try{await api('config/repair-global',{confirmation:'reset-invalid-global-config'});dialog.close();await refresh({force:true});toast(t('通用配置已重置，所有项目保持暂停。'));}finally{repair.disabled=false;}});
+};
 for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>$('project-dialog').showModal());
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
 document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d)d.close();}));
@@ -794,6 +828,11 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
  }finally{$('project-submit').disabled=false;}
 },event.target);});
 $('pause-button').addEventListener('click',()=>safe(async()=>{const project=currentProject();await api('pause',{project:project.id,paused:!project.paused});await refresh();toast(project.paused?t('项目已启用'):t('已暂停，正在中断当前工作'));}));
+document.querySelector('#project-workspace')?.addEventListener('click',event=>{if(event.target.id!=='archive-project')return;safe(async()=>{const project=currentProject();if(!project)return;
+ if(!(await uiConfirm(t('归档会停止调度并隐藏此项目，但保留任务、运行记录和审计历史。确认归档？'))))return;
+ await api('project/archive',{project:project.id,confirmation:'archive-project'});
+ projectId='';localWrite('rsi-project','');settingsBaseline=null;closeTaskDetail();await refresh({force:true});toast(t('项目已归档；历史记录仍保留。'));
+})});
 $('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const project=projectId,text=$('goal-text').value,draftRevision=goalDraftRevisions.get(project)||0;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const submission=await pendingGoalSubmission(project,text);await api('goal',{project,text,request_id:submission.id});saveGoalSubmissions(project,(await goalSubmissions(project)).filter(entry=>entry.id!==submission.id));await renderGoalRecovery();if((goalDraftRevisions.get(project)||0)===draftRevision){if(goalDrafts.get(project)===text)goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);if(projectId===project&&$('goal-text').value===text)$('goal-text').value='';}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
@@ -806,7 +845,7 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
  const inherit=scope==='project'&&$('schedule-mode').value==='inherit'?schedulePaths:[];
  const scheduleMode=$('schedule-mode').value;
  if(scope==='project'&&scheduleMode==='custom'&&settingsModes.get(baseline)==='inherit')for(const path of schedulePaths){const node=document.querySelector('[data-path="'+path+'"]');setPath(patch,path,fieldValue(node));}
- patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const submittedValues=settingsValues(),pendingConfig=deepMerge(structuredClone(baseline),structuredClone(patch));for(const path of inherit)setPath(pendingConfig,path,getPath(state.config,path));settingsModes.set(pendingConfig,scheduleMode);pendingSettingsSaves.set(key,{config:pendingConfig,mode:scheduleMode});window.RSIProduct?.savingStatus(true,false,key);const saved=await api('config',{project:scope==='project'?project:null,values:patch,...(inherit.length?{inherit}:{})}),acknowledged=deepMerge(structuredClone(baseline),saved.config||patch);
+ patch=deepMerge(patch,JSON.parse($('advanced-json').value||'{}'));const submittedValues=settingsValues(),pendingConfig=deepMerge(structuredClone(baseline),structuredClone(patch));for(const path of inherit)setPath(pendingConfig,path,getPath(state.config,path));settingsModes.set(pendingConfig,scheduleMode);pendingSettingsSaves.set(key,{config:pendingConfig,mode:scheduleMode});window.RSIProduct?.savingStatus(true,false,key);const saved=await api('config',{project:scope==='project'?project:null,values:patch,revision:scope==='global'?state.global_config_revision:state.config_revision,...(inherit.length?{inherit}:{})}),acknowledged=deepMerge(structuredClone(baseline),saved.config||patch);
  settingsModes.set(acknowledged,scheduleMode);
  settingsClean.set(key,JSON.stringify(acknowledgedSettingsValues(submittedValues,acknowledged,scheduleMode)));
  const draft=settingsDrafts.get(key);if(draft){draft.baseline=structuredClone(acknowledged);draft.baselineValues=Object.fromEntries(draft.values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,acknowledged,scheduleMode)]));writePersistentSettingsDraft(key,draft.values.filter(persistableDraftEntry),acknowledged,scheduleMode);}
@@ -887,6 +926,7 @@ const updateChannels={desktop:'桌面应用',pip:'Python 包（建议用 pip 升
 let desktopUpdate=null,desktopUpdateTimer=null,desktopCheckError=false;
 function stopDesktopUpdatePolling(){clearInterval(desktopUpdateTimer);desktopUpdateTimer=null;}
 async function checkDesktopUpdate(force=false){
+ if(window.RSINativeUpdate){await window.RSINativeUpdate.run('check');desktopCheckError=false;return;}
  if(!window.RSIDesktop?.invoke)return;
  try{const info=await window.RSIDesktop.invoke('check_desktop_update',{force});desktopUpdate=info&&info.version?info:null;desktopCheckError=!!(info&&info.check_error);}catch{desktopUpdate=null;desktopCheckError=true;}
  // 下载可能先于本次页面会话开始（刷新界面或切换运行机器后加载）：恢复轮询直到完成或失败。
@@ -913,6 +953,7 @@ async function startDesktopUpdate(){
  pollDesktopUpdate();
 }
 function renderUpdateExtras(update){
+ if(window.RSINativeUpdate&&window.RSIDesktop){window.RSINativeUpdate.render();return;}
  let notes=$('update-notes');
  if(update.notes&&update.version){if(!notes){notes=el('details');notes.id='update-notes';$('update-status').after(notes);}notes.replaceChildren(el('summary',t('这个版本更新了什么')+' · '+update.version),el('pre',update.notes));}
  else if(notes)notes.remove();
@@ -936,13 +977,14 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
   githubHttp?t('无法访问 GitHub 发布接口（HTTP {code}），请稍后重试。').replace('{code}',githubHttp[1]):
   update.reason?(apiErrors[update.reason]?t(apiErrors[update.reason]):t('更新失败原因（原文）：')+update.reason):'';
  let status=t(updateNames[update.state]||update.state)+(update.version?' · '+update.version:'')+(reason?' · '+reason:'')+progress;
- if(update.desktop_managed)status=t('桌面版请安装新版软件，项目和记录会保留。')+channel;
+ if(update.desktop_managed)status=t('桌面应用')+channel;
  else status=t('后台服务')+' · '+status+channel;
  $('update-status').textContent=status;
  $('apply-update').disabled=!!update.desktop_managed||cooling||!['available','waiting_idle'].includes(update.state);
+ $('apply-update').hidden=!!update.desktop_managed&&!!window.RSINativeUpdate;
  $('check-update').disabled=cooling||update.state==='checking'||(update.busy??['downloading','restarting'].includes(update.state));
  renderUpdateExtras(update);}
-$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
+$('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
 safe(refresh);
 if(window.RSIDesktop)safe(checkDesktopUpdate);
@@ -960,6 +1002,7 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  window.RSIUsage?.translate();
  window.RSIExperience?.translate?.();
  window.RSIDesktop?.translate?.();
+ window.RSINativeUpdate?.render?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));
 typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{

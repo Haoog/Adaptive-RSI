@@ -32,8 +32,10 @@ npm run --prefix desktop dev
 
 The build downloads Python 3.12, installs PyInstaller and packages a standalone engine. The app version comes from the Python package rather than a second release-version source. Bundles are under `desktop/src-tauri/target/release/bundle/`.
 
-Builds use local ad-hoc signatures only. Apple Developer ID signing and notarization are not configured; macOS may show a security warning, and the package is not notarized. To update, download the new asset from GitHub Releases, quit, then replace the app manually. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
+Builds use local ad-hoc signatures unless Apple Developer ID signing and notarization credentials are configured; macOS may show a security warning for ad-hoc builds. Server source hot-updates are disabled for an app-owned engine to prevent UI/engine version mismatch. Replacing the app preserves its data directory.
 
 ## Software updates
 
-Opening "General settings → Software updates" makes the desktop app check GitHub for the latest official release. When a new version is available it can be downloaded in place: progress is shown as a percentage, the download is verified against its SHA-256 checksum, and the installer image opens automatically—drag to replace the app. Projects and records live in the data directory and survive the replacement. You can also download and replace manually from GitHub Releases. The bundled server runtime updates together with the desktop app; no separate step is needed.
+Desktop builds configured with an updater public key can check and download signed updates in the app. Choose “Restart and update” or enable automatic installation when tasks are idle. An owned runtime stops admitting new tasks and drains active work; the new app checks its bundled engine version before resuming. Download, wait, and installation errors are displayed alongside a manual installer link.
+
+Publishers must configure the updater signing key and publish matching manifests and artifacts. Builds without a public key provide the manual download link. Existing desktop versions require one manual installation of an updater-enabled build. App replacement preserves the data directory; independent and remote runtimes are not replaced by the desktop updater. Real signing, notarization, and cross-version upgrades still require release-environment acceptance.

@@ -640,12 +640,14 @@ window.RSIExperience = (() => {
     clearTimeout(liveTimer);
     lastDetail = "";
     backoffRetry = null;
-    const url = new URL(location.href);
-    url.hash = new URLSearchParams({
-      project: task.project,
-      task: task.id,
-    }).toString();
-    history.replaceState(null, "", url);
+    if (location.href && typeof URL === "function") {
+      const route = new URLSearchParams({project: task.project, task: task.id});
+      try {
+        const url = new URL(location.href);
+        url.hash = route.toString();
+        history.replaceState(null, "", url);
+      } catch {}
+    }
     const ticket = detailSequence;
     safe(() => taskControls(task, $("detail-body"), ticket, queueDraft, queueEditor));
     liveTimer = setTimeout(liveDetail, 5000);
@@ -695,7 +697,7 @@ window.RSIExperience = (() => {
         return;
       }
       const history = await api(
-        "task-runs?task=" + task.id + "&project=" + task.project,
+        "task-runs?task=" + task.id + "&project=" + task.project + "&limit=50",
       );
       if (!current()) return;
       const latest = history[0];
@@ -735,10 +737,17 @@ window.RSIExperience = (() => {
     }
   }
   async function showDiff(run) {
-    const response = await fetch("/api/patch?id=" + encodeURIComponent(run));
-    if (!response.ok) throw Error(t("代码差异不可用"));
-    const patch = await response.text(),
-      box = dialog("阅读代码差异");
+    const [patch, fileRows] = await Promise.all([
+      sendApi("patch?id=" + encodeURIComponent(run), undefined, undefined, {text: true}),
+      api("diff-files?id=" + encodeURIComponent(run)),
+    ]);
+    const files = Array.isArray(fileRows) ? fileRows : [], box = dialog("阅读代码差异");
+    if (files.length) {
+      const summary = el("p", t("差异文件") + " · " + files.map(file =>
+        file.path + " (+" + file.additions + " / -" + file.deletions + ")").join(" · "), "muted");
+      summary.className += " diff-files";
+      box.append(summary);
+    }
     if (patch.split("\n").length > 2000) {
       box.append(
         el("p", t("差异超过 2000 行，已折叠为纯文本。"), "muted"),
@@ -793,7 +802,7 @@ window.RSIExperience = (() => {
           Object.entries(data.bytes)
             .map(
               ([key, value]) =>
-                t(({database:'数据库',runs:'运行文件',backups:'备份'})[key] || key) + ": " + (value / 1048576).toFixed(1) + " MB",
+                t(({database:'数据库',runs:'运行文件',backups:'备份',suites:'评估集',archives:'归档',installations:'安装版本'})[key] || key) + ": " + (value / 1048576).toFixed(1) + " MB",
             )
             .join(" / "),
       ),
@@ -807,14 +816,34 @@ window.RSIExperience = (() => {
     );
     const backupButton = action(t("创建一致性备份"), async () => {
       backupButton.disabled = true;
+      let timer, cancelButton;
       try {
-        const saved = await api("backup", {}),
+        const operation = await api("operations", {kind:"backup", parameters:{}}),
+          status = el("p", t("正在创建备份"), "muted");
+        cancelButton = action(t("取消备份"), () => api("operations/cancel", {id:operation.id}), "text-button");
+        box.append(status, cancelButton);
+        let current;
+        do {
+          await new Promise(resolve => { timer = setTimeout(resolve, 500); });
+          current = await api("operation?id=" + encodeURIComponent(operation.id));
+          if (current.result?.pages_total) status.textContent = t("正在创建备份") + " · " +
+            Math.round(current.result.pages_done * 100 / current.result.pages_total) + "%";
+        } while (!current.ended);
+        cancelButton.remove();
+        if (current.state !== "completed") {
+          status.textContent = t(current.state === "cancelled" ? "备份已取消" : "备份未完成，请重试。");
+          return;
+        }
+        status.textContent = t("备份已完成");
+        const saved = current.result,
           link = el("a", t("下载备份") + " · " + saved.id, "button");
         link.href = "/api/backup?id=" + saved.id;
         link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
         desktopDownload(link, saved.id);
         box.append(link);
       } finally {
+        clearTimeout(timer);
+        cancelButton?.remove();
         backupButton.disabled = false;
       }
     });
@@ -865,6 +894,26 @@ window.RSIExperience = (() => {
       link.download = "adaptive-rsi-" + saved.id + ".sqlite3";
       desktopDownload(link, saved.id);
       box.append(link);
+      box.append(action(t("验证恢复点"), async () => {
+        const operation = await api("operations", {kind:"restore-check", parameters:{id:saved.id}});
+        let current;
+        do {
+          await new Promise(resolve => setTimeout(resolve, 300));
+          current = await api("operation?id=" + encodeURIComponent(operation.id));
+        } while (!current.ended);
+        toast(t(current.state === "completed" ? "恢复点验证通过。" : "恢复点验证未通过。"),
+              current.state !== "completed");
+      }, "text-button"));
+      box.append(action(t("验证备份并生成清单"), async () => {
+        const response = await fetch("/api/backup?id=" + encodeURIComponent(saved.id) + "&format=manifest");
+        if (!response.ok) throw Error(t("备份清单生成失败"));
+        const bundle = await response.blob();
+        const link = el("a", t("下载备份清单"), "button");
+        link.href = URL.createObjectURL(bundle);
+        link.download = "adaptive-rsi-" + saved.id + "-backup-pack.json";
+        link.addEventListener("click", () => setTimeout(() => URL.revokeObjectURL(link.href), 1000));
+        box.append(link);
+      }, "text-button"));
     }
     box.append(
       el("h3", t("恢复命令")),

@@ -50,6 +50,8 @@ flowchart LR
 
 Models, tasks, memory, usage, and delivery authorization remain separate per project. Pausing a project or revoking authorization blocks subsequent operations that have not yet been issued.
 
+The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
+
 ## Quick Start
 
 ### Desktop app (recommended)
@@ -60,6 +62,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 4. Click **Start** for the project.
 
 Custom model IDs allow up to 256 characters. Display names are optional and default to the full ID. Custom display names allow up to 160 characters and survive catalog refreshes; names supplied by the service continue to follow catalog updates.
+
+Desktop builds configured with update signing can check and download updates in the background, then install manually or when local work is idle. Updates are signature-verified and wait for local work to finish. Without signing configuration, download from the official releases page. See the [desktop guide](DESKTOP.en.md).
 
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.
 

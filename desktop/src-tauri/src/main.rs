@@ -19,6 +19,8 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
+mod native_update;
+
 #[derive(Clone)]
 struct Connection {
     client: Client,
@@ -294,9 +296,12 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .header("User-Agent", "Adaptive-RSI-updater")
             .send()
         {
-            Ok(mut response) if response.status().is_success() => {
+            Ok(response) if response.status().is_success() => {
                 let mut text = String::new();
-                let _ = response.read_to_string(&mut text);
+                if response.take(4097).read_to_string(&mut text).is_err() || text.len() > 4096 {
+                    fail("Checksum download failed".into(), "checksum_unavailable");
+                    return;
+                }
                 text.split_whitespace().next().unwrap_or("").to_lowercase()
             }
             _ => {
@@ -304,7 +309,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 return;
             }
         };
-        if expected.len() != 64 {
+        if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
             fail("Checksum unavailable".into(), "checksum_unavailable");
             return;
         }
@@ -318,6 +323,10 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .map(|h| std::path::PathBuf::from(h).join("Downloads"))
             .unwrap_or_else(std::env::temp_dir);
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
+        let mut staged = match tempfile::Builder::new().prefix(".adaptive-rsi-").tempfile_in(&download_dir) {
+            Ok(file) => file,
+            Err(_) => { fail("Cannot write download".into(), ""); return; }
+        };
         let outcome = (|| -> Result<(), String> {
             let mut response = client
                 .get(&url)
@@ -328,8 +337,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 return Err("Download failed".into());
             }
             let total = response.content_length().unwrap_or(0);
-            let mut file =
-                std::fs::File::create(&path).map_err(|_| "Cannot write download".to_string())?;
+            if total > 512 * 1024 * 1024 { return Err("Download exceeds size limit".into()); }
             let mut downloaded: u64 = 0;
             let mut buffer = [0u8; 65536];
             loop {
@@ -339,7 +347,10 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 if read == 0 {
                     break;
                 }
-                file.write_all(&buffer[..read])
+                if downloaded.saturating_add(read as u64) > 512 * 1024 * 1024 {
+                    return Err("Download exceeds size limit".into());
+                }
+                staged.write_all(&buffer[..read])
                     .map_err(|_| "Cannot write download".to_string())?;
                 downloaded += read as u64;
                 if total > 0 {
@@ -355,14 +366,13 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             Ok(())
         })();
         if let Err(message) = outcome {
-            let _ = std::fs::remove_file(&path);
             fail(message, "");
             return;
         }
         let digest = Command::new("/usr/bin/shasum")
             .arg("-a")
             .arg("256")
-            .arg(&path)
+            .arg(staged.path())
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -376,9 +386,24 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
         if digest.is_empty() || digest != expected {
-            let _ = std::fs::remove_file(&path);
             fail("Checksum verification failed".into(), "checksum");
             return;
+        }
+        if staged.persist_noclobber(&path).is_err() {
+            fail("A download with this name already exists".into(), "");
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut child = match Command::new("hdiutil").arg("attach").arg(&path).spawn() {
+                Ok(child) => child,
+                Err(_) => { fail("Cannot open installer".into(), ""); return; }
+            };
+            if !wait_for_child(&mut child, Duration::from_secs(60)) ||
+                !child.try_wait().ok().flatten().is_some_and(|status| status.success()) {
+                fail("Cannot open installer".into(), "");
+                return;
+            }
         }
         {
             let state = app.state::<RuntimeState>();
@@ -388,8 +413,6 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                 update.opened.store(true, Ordering::Relaxed);
             }
         }
-        #[cfg(target_os = "macos")]
-        let _ = Command::new("hdiutil").arg("attach").arg(&path).spawn();
         #[cfg(not(target_os = "macos"))]
         let _ = &path;
     });
@@ -572,7 +595,12 @@ fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Resul
         .unwrap()
         .clone()
         .ok_or_else(|| state.error.lock().unwrap().clone())?;
-    let (reply, credentials) = call_with_session(&connection, path, body, None)?;
+    let timeout = match path.split('?').next().unwrap_or("") {
+        "model-center/probe" => 960,
+        "projects/import" => 210,
+        _ => 60,
+    };
+    let (reply, credentials) = call_with_session(&connection, path, body, Some(Duration::from_secs(timeout)))?;
     if let Some((cookie, csrf)) = credentials {
         for slot in [&state.target, &state.local] {
             if let Some(current) = slot.lock().unwrap().as_mut() {
@@ -704,7 +732,24 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
             None,
             Some(remaining.min(Duration::from_secs(2))),
         ) {
-            Ok((health, _)) if health.status == 200 => break,
+            Ok((health, _)) if health.status == 200 => {
+                let health: Value = serde_json::from_str(&health.body).map_err(|_| "Invalid runtime health")?;
+                if connection.owned && (health["version"].as_str() != Some(app.package_info().version.to_string().as_str())
+                    || health["api_version"].as_u64().unwrap_or(0) < 2) {
+                    return Err("Bundled runtime version or API is incompatible".into());
+                }
+                if connection.owned {
+                    let status = call(&connection, "desktop-update", Some(json!({"action":"status"})))?;
+                    if status.status != 200 { return Err("Cannot inspect update admission".into()); }
+                    let status: Value = serde_json::from_str(&status.body).map_err(|_| "Invalid update admission")?;
+                    if status["barrier"].is_object() {
+                        let action = if status["barrier"]["version"] == health["version"] { "complete" } else { "cancel" };
+                        let complete = call(&connection, "desktop-update", Some(json!({"action":action,"lease":status["barrier"]["lease"]})))?;
+                        if complete.status != 200 { return Err("Cannot complete desktop update".into()); }
+                    }
+                }
+                break;
+            },
             Ok((health, _)) if health.status == 401 || health.status == 403 => {
                 return Err("Runtime authentication failed".into());
             }
@@ -968,6 +1013,21 @@ async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|_| "Request interrupted".to_string())?
 }
 #[tauri::command]
+async fn native_update(app: tauri::AppHandle, action: String) -> Result<Value, String> {
+    match action.as_str() {
+        "status" => Ok(native_update::snapshot(&app)),
+        "check" => native_update::check(app, false).await,
+        "download" => native_update::check(app, true).await,
+        "cancel" => { native_update::cancel(&app); Ok(native_update::snapshot(&app)) },
+        "install" => {
+            tauri::async_runtime::spawn_blocking(move || native_update::install(app))
+                .await.map_err(|_| "update_worker_failed".to_string())??;
+            Ok(json!({"state":"restarting"}))
+        },
+        _ => Err("invalid_update_action".into()),
+    }
+}
+#[tauri::command]
 fn choose_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
     app.dialog()
         .file()
@@ -1020,6 +1080,8 @@ fn notify(
 fn main() {
     let app = tauri::Builder::default()
         .manage(RuntimeState::default())
+        .manage(native_update::NativeUpdater::default())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
@@ -1039,6 +1101,7 @@ fn main() {
             notify,
             check_desktop_update,
             download_desktop_update
+            ,native_update
             ,download_backup
             ,backup_download_status
         ])
