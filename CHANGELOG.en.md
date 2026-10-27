@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.122
+
+<!-- adaptive-rsi-release:0.5.122;base:426ee9d1cc644baab17b6ece23851a22df5c4d7e -->
+
 - Harden import cleanup ownership, dependency fingerprints, fast-command output limits, call recovery and usage corrections to preserve user directories and consistent historical totals.
 - Native requests gain cancellation of genuinely blocked HTTP, conversation deadlines, Retry-After support, plan-scoped file/command writes and bounded search caching. Frozen desktop engines use a dedicated transport entry point.
 - Scheduling supports overnight windows, fair claims, monotonic completion counts and transactional audit events. Slow delivery requests leave the global lock while preserving dispatch intent, factual receipts, legacy deployment compatibility and authorization race checks.
