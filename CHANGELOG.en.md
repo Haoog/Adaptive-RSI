@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.121
+
+<!-- adaptive-rsi-release:0.5.121;base:481d0238943045910ee4592fd2c6912529ad6e94 -->
+
 - The self-improvement page refreshes candidates and statistics immediately after a rollback, evaluation-case import or manual promotion instead of reusing the 30-second cache; other polling keeps its cache interval.
 - When automatic promotion is off, a verified candidate can be enabled explicitly from the interface. The server accepts only `ready` candidates, validates the project and kind in a transaction, supersedes the prior stable strategy of the same project and kind, and rebinds the candidate parent to the stable it just replaced so rollbacks walk back through the immediately preceding version. It writes the same verified skill as automatic promotion (preserving paired evidence, 30-day expiry). Repeated or concurrent clicks succeed only once; automatic promotion and evaluation algorithms are unchanged.
 - Manual promotion checks evidence compatibility against the current configuration and retains the stable strategy with reevaluation guidance when incompatible; working-hours waits no longer show an invalid “Retry now” action.
