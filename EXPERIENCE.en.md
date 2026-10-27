@@ -36,6 +36,8 @@ Retry feedback retains specific review locations, consequences and suggestions, 
 
 Performance tasks freeze a metric, unit, target, tolerance and direction before implementation. Independent checks report measurements for each version. The host verifies the target and an improvement exceeding tolerance; missing thresholds or matching measurements yield insufficient evidence. Preservation contracts require an explicitly behavior-preserving request. Other types demonstrate the requested before/after change and still require fixed regressions and independent review.
 
+With automatic promotion off, verified candidates remain in a ready state and can be enabled manually after confirmation. Only ready candidates are accepted; enabling replaces the stable strategy of the same project and kind, starts limited monitoring, preserves the paired evidence and remains rollback-able to the previous verified strategy. The page shows used/limit exposure per split and separates independent-case counts from total paired runs. Exhausted exposure explains how to import new cases or raise `evolution.max_holdout_uses` instead of only reporting insufficient samples. Rollbacks, imports and promotions refresh candidates and statistics immediately; other polling keeps its cache interval.
+
 ## Results and attention
 
 Task details load the latest run first and fetch historical runs on expansion. Current state updates periodically; task URLs support direct navigation. Saved checkpoints are distinguished from actual execution. No fabricated percentages or completion estimates are shown. Results include independent before/after acceptance, review findings and readable diffs; original evidence is preserved.

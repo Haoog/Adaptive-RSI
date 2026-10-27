@@ -1410,6 +1410,10 @@ class Runtime:
         from .evolution import Evolution
         return Evolution(self).rollback(candidate)
 
+    def promote_strategy(self, candidate):
+        from .evolution import Evolution
+        return Evolution(self).promote(candidate)
+
     def maintenance_async(self):
         # maintenance 里的批量删除可能耗时数秒，放到后台线程执行，避免阻塞调度循环；
         # 同一时刻只允许一个清理线程，重入直接跳过，未完成的清理由下一轮调度继续。

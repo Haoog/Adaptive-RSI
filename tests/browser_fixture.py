@@ -205,6 +205,37 @@ def main():
                     current = runtime.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"]
                     assert current == state, (task, current, state)
                     assert runtime.store.one("SELECT data FROM task_decisions WHERE task=?", (task,)), task
+            if os.environ.get("RSI_BROWSER_EVOLUTION"):
+                # 自动改进可用性专项：稳定/待启用/曝光耗尽候选与各集合曝光量，
+                # 全部直接落库，不调用模型，也不改变自动晋升配置。
+                now = time.time()
+                guidance = "Reproduce arithmetic boundary cases before editing"
+                stable_evidence = json.dumps({
+                    "reason": "Repeated paired improvement on both splits without observed regressions",
+                    "trials": [{"case": "browser-case-" + str(index % 3), "split": "validation",
+                                "repetition": index // 3} for index in range(12)]})
+                ready_evidence = json.dumps({
+                    "reason": "Paired quality improved without observed regressions; usage recorded separately",
+                    "trials": [{"case": "browser-case-" + str(index % 3), "split": "holdout",
+                                "repetition": index // 3} for index in range(12)]})
+                exhausted_evidence = json.dumps({
+                    "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
+                    "trials": []})
+                content = json.dumps({"guidance": guidance, "triggers": ["add"]})
+                for candidate, parent, status, evidence, created in [
+                        ("browser-stable", None, "stable", stable_evidence, now - 3000),
+                        ("browser-ready", "browser-stable", "ready", ready_evidence, now - 2000),
+                        ("browser-exhausted", "browser-stable", "insufficient_evidence", exhausted_evidence, now - 1000)]:
+                    runtime.store.execute(
+                        "INSERT INTO candidates(id,project,kind,parent,status,content,evidence,created) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (candidate, project, "strategy", parent, status, content, evidence, created))
+                for split, count, uses in [("development", 4, 0), ("validation", 3, 2), ("holdout", 3, 3)]:
+                    for index in range(count):
+                        runtime.store.execute(
+                            "INSERT INTO cases(id,project,family,split,spec,uses,created) VALUES (?,?,?,?,?,?,?)",
+                            ("browser-" + split + "-" + str(index), project,
+                             "browser-" + split + "-" + str(index), split, "{}", uses, now))
             runtime.store.event("issue_revision", "Issue closed or excluded during execution; recheck before delivery", project)
             server = Server(runtime)
             threading.Thread(target=server.serve_forever, daemon=True).start()

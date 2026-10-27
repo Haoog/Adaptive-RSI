@@ -1138,6 +1138,73 @@ test('core-only state keeps loaded analytics, then evolution requests missing se
   assert.equal(vm.runInContext('state.candidates[0].id',page.context),'c1');
 });
 
+function textOf(node){return [node.textContent||'',...(node.children||[]).map(textOf)].filter(Boolean).join(' ');}
+function buttonWith(node,label){return (node.children||[]).map(child=>child.textContent===label?child:buttonWith(child,label)).find(Boolean);}
+
+test('evolution suites show exposure, independent cases and translated controller reasons', () => {
+  const page = browser();
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';state={...initialState,selected_project:'a',config:{evolution:{max_holdout_uses:3}},projects:[{id:'a',name:'A',paused:true,config:{evolution:{max_holdout_uses:3}}}],cases:[{project:'a',split:'development',count:4,uses:0},{project:'a',split:'validation',count:3,uses:6},{project:'a',split:'holdout',count:3,uses:9}],candidates:[{id:'ready-1',project:'a',kind:'strategy',status:'ready',content:{guidance:'Guide'},reason:'Paired quality improved without observed regressions; usage recorded separately',independent_cases:3,trial_count:12,created:100},{id:'exhausted-1',project:'a',kind:'strategy',status:'insufficient_evidence',content:{guidance:'Guide'},reason:'Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses',independent_cases:0,trial_count:0,created:100}]};loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();renderEvolution()`, page.context);
+  const suites = page.node('suite-summary').children.map(textOf);
+  assert.equal(suites.length, 3);
+  assert.match(suites[1], /已用 6\/9/);
+  assert.match(suites[1], /配对比较 · 受限复用/);
+  assert.match(suites[2], /已用 9\/9/);
+  assert.doesNotMatch(suites[0], /已用/);
+  const cards = page.node('candidates').children;
+  assert.equal(cards.length, 2);
+  const ready = textOf(cards[0]);
+  assert.match(ready, /3 个独立用例 · 共 12 次配对运行/);
+  assert.match(ready, /配对质量有所提升且未观察到退步；用量单独记录。/);
+  assert.ok(buttonWith(cards[0], '启用这个策略'), 'ready candidate exposes manual promotion');
+  assert.equal(buttonWith(cards[0], '恢复到上一个已验证版本'), undefined);
+  const exhausted = textOf(cards[1]);
+  assert.match(exhausted, /曝光次数已达上限/);
+  assert.match(exhausted, /evolution\.max_holdout_uses/);
+  assert.doesNotMatch(exhausted, /Validation or holdout exposure limit reached/);
+});
+
+test('rollback forces candidates and analytics refresh despite the TTL', async () => {
+  const page = browser(), requests = [];
+  page.context.fetch = async (url, options = {}) => {
+    if (url === '/api/rollback') return response({saved: true});
+    const sections = new URLSearchParams(url.split('?')[1]).get('sections');
+    requests.push(sections);
+    return response({...snapshot('next'), selected_project: 'a', sections: sections.split(','),
+      candidates: [{id: 'c1', project: 'a', kind: 'strategy', status: 'rolled_back',
+        content: {guidance: 'g'}, reason: 'Repeated paired improvement on both splits without observed regressions',
+        independent_cases: 1, trial_count: 2, created: 100}],
+      cases: [{project: 'a', split: 'development', count: 5, uses: 0}], quality: [], usage: [], model_usage: []});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'c1',project:'a',kind:'strategy',status:'stable',content:{guidance:'g'},reason:'Repeated paired improvement on both splits without observed regressions',trial_count:2,created:100}]};renderEvolution()`, page.context);
+  const card = page.node('candidates').children[0];
+  buttonWith(card, '恢复到上一个已验证版本').handlers.click();
+  await page.context.lastAction;
+  assert.deepEqual(requests, ['core,candidates,analytics']);
+  assert.equal(vm.runInContext('state.cases[0].count', page.context), 5);
+  vm.runInContext('renderEvolution()', page.context);
+  assert.match(textOf(page.node('candidates').children[0]), /已恢复旧版本/);
+});
+
+test('importing an evaluation case forces the suite counts to refresh immediately', async () => {
+  const page = browser(), requests = [], posts = [];
+  page.node('case-form').reset = () => {};
+  page.node('case-json').value = JSON.stringify({family: 'f', split: 'holdout'});
+  page.context.fetch = async (url, options = {}) => {
+    if (url === '/api/cases') { posts.push(JSON.parse(options.body)); return response({id: 'new-case'}); }
+    const sections = new URLSearchParams(url.split('?')[1]).get('sections');
+    requests.push(sections);
+    return response({...snapshot('next'), selected_project: 'a', sections: sections.split(','),
+      candidates: [], cases: [{project: 'a', split: 'development', count: 4, uses: 0},
+        {project: 'a', split: 'holdout', count: 4, uses: 9}], quality: [], usage: [], model_usage: []});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0},{project:'a',split:'holdout',count:3,uses:9}],candidates:[]};renderEvolution()`, page.context);
+  await page.submit('case-form');
+  assert.deepEqual(requests, ['core,candidates,analytics']);
+  assert.equal(vm.runInContext('state.cases.find(c=>c.split==="holdout").count', page.context), 4);
+  vm.runInContext('renderEvolution()', page.context);
+  assert.match(textOf(page.node('suite-summary').children[2]), /4 最终评估集/);
+});
+
 for(const staleFails of [false,true]){
 test(`an outdated readiness ${staleFails?'failure':'success'} cannot erase the newer result`,async()=>{
   const page=browser(),pending=[];

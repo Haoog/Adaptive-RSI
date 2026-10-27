@@ -118,6 +118,10 @@ This task cannot be retried
 Task not found
 This task has finished and can no longer be cancelled
 Submission ID was already used with different content
+Candidate not found
+Only a verified ready candidate can be promoted
+Candidate content is incomplete
+Unknown candidate kind
 """.strip().splitlines())
 
 
@@ -542,7 +546,13 @@ class Handler(BaseHTTPRequestHandler):
                         evidence = json.loads(candidate.pop("evidence"))
                         candidate["content"] = json.loads(candidate["content"])
                         candidate["reason"] = evidence.get("reason", "")
-                        candidate["trial_count"] = len(evidence.get("trials", []))
+                        trials = evidence.get("trials", [])
+                        # trial_count 是配对运行次数（用例 × 重复）；独立样本按用例去重，
+                        # 与文档“重复运行不作为独立样本”的晋升语义一致。
+                        candidate["trial_count"] = len(trials)
+                        # 没有 case 标识的旧证据无法证明独立性，只统计明确去重后的用例。
+                        candidate["independent_cases"] = len({trial.get("case") for trial in trials
+                                                              if trial.get("case")})
                         candidate["monitor"] = evidence.get("monitor", {})
                     data["candidates"] = candidates
                 if include_analytics:
@@ -745,6 +755,8 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/rollback":
                     runtime.rollback_strategy(body["candidate"])
                     result = {"saved": True}
+                elif path == "/api/evolution/promote":
+                    result = runtime.promote_strategy(body["candidate"])
                 elif path == "/api/revert-code":
                     result = {"id": runtime.revert_code(body["run"])}
                 elif path == "/api/cases":

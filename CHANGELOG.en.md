@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- The self-improvement page refreshes candidates and statistics immediately after a rollback, evaluation-case import or manual promotion instead of reusing the 30-second cache; other polling keeps its cache interval.
+- When automatic promotion is off, a verified candidate can be enabled explicitly from the interface. The server accepts only `ready` candidates, validates the project and kind in a transaction, supersedes the prior stable strategy of the same project and kind, and writes the same verified skill as automatic promotion (preserving paired evidence, 30-day expiry). Repeated or concurrent clicks succeed only once; automatic promotion and evaluation algorithms are unchanged.
+- The self-improvement page shows used/limit exposure per split and separate independent-case and paired-run counts for candidates. Exhausted exposure explains how to import new cases or raise `evolution.max_holdout_uses`, fixed controller reasons are mapped in Chinese and English, and the English subtitle is corrected.
+
 ## 0.5.120
 
 <!-- adaptive-rsi-release:0.5.120;base:1adb167bd200e942256e7ea197c928986256eaa4 -->

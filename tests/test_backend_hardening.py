@@ -600,6 +600,11 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
         with self.assertRaises(ValueError) as cancel_missing:
             runtime.cancel_task("missing-task")
         self.assertEqual(str(cancel_missing.exception), "Task not found")
+        runtime.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                              "VALUES ('manual-ready',?,'strategy','ready',?,?,?)",
+                              (project, json.dumps({"guidance": "Check arithmetic boundaries first",
+                                                    "triggers": ["add"]}),
+                               json.dumps({"reason": "verified"}), time.time()))
 
         server = Server(runtime)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -633,6 +638,14 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
         status, payload = post("/api/cancel", {"task": "missing-task"})
         self.assertEqual((status, payload["error"], payload["error_code"]),
                          (400, "Task not found", "validation_error"))
+        status, payload = post("/api/evolution/promote", {"candidate": "manual-ready"})
+        self.assertEqual((status, payload), (200, {"candidate": "manual-ready", "status": "stable"}))
+        status, payload = post("/api/evolution/promote", {"candidate": "manual-ready"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "Only a verified ready candidate can be promoted", "validation_error"))
+        status, payload = post("/api/evolution/promote", {"candidate": "missing-candidate"})
+        self.assertEqual((status, payload["error"], payload["error_code"]),
+                         (400, "Candidate not found", "validation_error"))
 
     def test_cli_api_surfaces_fixed_server_messages(self):
         import io
