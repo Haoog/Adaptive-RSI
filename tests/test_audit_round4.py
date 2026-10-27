@@ -39,16 +39,15 @@ class AuditRound4Test(unittest.TestCase):
         scrub_tree(project)
 
     def test_sandbox_check_handles_empty_or_malformed_argv(self):
-        import platform
-        config = {
-            "limits": {"command_seconds": 5, "max_output_mb": 1},
-            "sandbox": {"backend": "seatbelt" if platform.system() == "Darwin" else "docker"}
-        }
+        config = {"limits": {"command_seconds": 5, "max_output_mb": 1}}
         box = Sandbox(self.root / "state", config)
-        check = {"name": "test-check", "argv": ["python3", "-c", "import sys; sys.exit(1)"]}
-        # When --name is not present, cleanup block should not crash
-        result = box._check(check, self.root)
-        self.assertEqual(result["exit_code"], 1)
+        check = {"name": "test-check", "argv": ["python3", "-c", "pass"]}
+        # When argv starts with docker and ends with --name without a trailing name, cleanup must not raise IndexError
+        with patch.object(box, "command", return_value=(["docker", "run", "--name"], ".")):
+            with patch("adaptive_rsi.process.run_process") as mock_run:
+                mock_run.return_value = {"exit_code": 1, "error": "Command timed out", "stdout": "", "stderr": ""}
+                result = box._check(check, self.root)
+                self.assertEqual(result["error"], "Command timed out")
 
     def test_store_decode_evidence_bounds_merged_at(self):
         valid = json.dumps({"merged_at": 1700000000})
