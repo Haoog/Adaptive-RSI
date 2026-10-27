@@ -36,7 +36,7 @@ class DesktopRuntimeTest(unittest.TestCase):
             first,session=launch()
             self.assertTrue(session['owned'])
             self.assertEqual(store.one('SELECT paused FROM projects')['paused'],1)
-            self.assertEqual(health(session)['api_version'],1)
+            self.assertGreaterEqual(health(session)['api_version'],2)
             store.execute('UPDATE projects SET paused=0')
             second,attached=launch()
             self.assertFalse(attached['owned'])

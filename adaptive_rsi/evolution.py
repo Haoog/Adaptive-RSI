@@ -1,4 +1,5 @@
 import json
+import math
 import shutil
 import time
 from pathlib import Path
@@ -76,11 +77,15 @@ class Evolution:
                 (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
                  encode({"reason": reason}), time.time()))
             return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence"}
+        manifest = []
+        for case in cases:
+            spec = json.loads(case["spec"])
+            manifest.append({"case": case["id"], "split": case["split"], "source": spec["source"],
+                             "signature": spec["signature"],
+                             "tree": fingerprint({"task": spec["task"], "base": spec["base"]}),
+                             "checks": fingerprint(spec["checks"])})
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
                                         "ORDER BY created DESC LIMIT 10", (project["id"],))
-        failures = self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
-                                    "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
-                                    "ORDER BY r.started DESC LIMIT 5", (project["id"],))
         failures = []
         for r in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
                                   "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
@@ -112,6 +117,8 @@ class Evolution:
         self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,created) VALUES (?,?,?,?,?,?,?)",
                            (candidate, project["id"], proposal["kind"], parent, "evaluating", encode(proposal), time.time()))
         evidence = {"run": run["id"], "config_hash": fingerprint(config), "compatibility": compatibility(config),
+                    "dataset": {"version": 1, "manifest": sorted(manifest, key=lambda item: item["case"]),
+                                "holdout_hash": fingerprint([item for item in manifest if item["split"] == "holdout"])},
                     "trials": [], "monitor": {"passed": 0, "failed": 0}}
         evidence["selection_attempts"] = self.store.one(
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
@@ -119,7 +126,13 @@ class Evolution:
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
         try:
             for split in ["validation", "holdout"]:
-                selected = [c for c in cases if c["split"] == split][:minimum]
+                candidates = [c for c in cases if c["split"] == split]
+                # Deterministically rotate balanced strata before taking the minimum;
+                # a stable tail of the case list must not be the only samples exposed.
+                candidates.sort(key=lambda item: (
+                    fingerprint({"split": split, "source": json.loads(item["spec"])["source"],
+                                 "family": item["family"], "run": run["id"]}), item["id"]))
+                selected = candidates[:minimum]
                 for case in selected:
                     # Exposure is charged just before first use; untouched holdouts stay protected.
                     self.store.execute("UPDATE cases SET uses=uses+1 WHERE id=?", (case["id"],))
@@ -168,6 +181,18 @@ class Evolution:
             if "sign_test_p" in evidence:
                 evidence["selection_adjusted_p"] = min(1, evidence["sign_test_p"] * evidence["selection_attempts"])
                 evidence["selection_warning"] = "Adaptive reuse and candidate selection limit generalization; adjusted p is a conservative attempt-count diagnostic, not independent replication"
+            wins = evidence.get("consistent_family_wins", 0)
+            losses = sum(1 for trial in evidence["trials"]
+                         if trial["stable"]["pass"] and not trial["candidate"]["pass"])
+            # Wilson score interval for each paired outcome; it is diagnostic, not a
+            # replacement for fresh independent holdout evidence.
+            n = wins + losses
+            if n:
+                center = (wins + 1.96 ** 2 / 2) / (n + 1.96 ** 2)
+                margin = 1.96 * math.sqrt((center * (1 - center)) / (n + 1.96 ** 2))
+                evidence["win_rate"] = {"wins": wins, "losses": losses,
+                                        "estimate": wins / n,
+                                        "wilson_95": [max(0, center - margin), min(1, center + margin)]}
             state = evidence["decision"]
             if state == "pass" and config["evolution"]["auto_promote"]:
                 with self.runtime.dispatch_lock:
@@ -292,6 +317,16 @@ class Evolution:
         if probability > 0.05 or not repeated:
             return {"decision": "insufficient_evidence", "reason": "Too few independent, repeated improvements for promotion",
                     "consistent_family_wins": wins, "sign_test_p": probability}
+        stable_tokens = sum(trial["stable"].get("tokens", 0) for trial in trials)
+        candidate_tokens = sum(trial["candidate"].get("tokens", 0) for trial in trials)
+        stable_seconds = sum(trial["stable"].get("seconds", 0) for trial in trials)
+        candidate_seconds = sum(trial["candidate"].get("seconds", 0) for trial in trials)
+        cost_ratio = candidate_tokens / stable_tokens if stable_tokens else None
+        latency_ratio = candidate_seconds / stable_seconds if stable_seconds else None
+        if cost_ratio is not None and cost_ratio > config["evolution"]["max_cost_ratio"]:
+            return {"decision": "insufficient_evidence", "reason": "Candidate exceeds the configured token cost ratio",
+                    "cost_ratio": cost_ratio, "latency_ratio": latency_ratio}
+        result = {**result, "cost_ratio": cost_ratio, "latency_ratio": latency_ratio}
         return {**result, "consistent_family_wins": wins, "sign_test_p": probability,
                 "reason": "Repeated paired improvement on both splits without observed regressions"}
 
@@ -313,18 +348,27 @@ class Evolution:
         for row in self.store.query("SELECT * FROM candidates WHERE project=? AND status='stable'", (project,)):
             if row["id"] not in active:
                 continue
-            evidence = json.loads(row["evidence"])
-            if evidence.get("compatibility") and evidence["compatibility"] != compatibility(json.loads(recorded["config"])):
-                continue
-            monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
-            seen = monitor.setdefault("runs", [])
-            if run["id"] in seen:
-                continue
-            if monitor["passed"] >= config["evolution"]["monitor_tasks"]:
-                continue
-            seen.append(run["id"])
-            monitor["passed" if passed else "failed"] += 1
-            self.save(row["id"], "stable", evidence)
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
+                if not current:
+                    continue
+                evidence = json.loads(current["evidence"])
+                if evidence.get("compatibility") and evidence["compatibility"] != compatibility(json.loads(recorded["config"])):
+                    continue
+                monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
+                seen = monitor.setdefault("runs", [])
+                if run["id"] in seen or monitor["passed"] >= config["evolution"]["monitor_tasks"]:
+                    continue
+                seen.append(run["id"])
+                monitor["passed" if passed else "failed"] += 1
+                monitor["last_run"] = run["id"]
+                monitor["last_checked"] = time.time()
+                total = monitor["passed"] + monitor["failed"]
+                if total and monitor["passed"] / total < 0.8:
+                    evidence["drift"] = {"state": "watch",
+                                         "passed": monitor["passed"], "failed": monitor["failed"]}
+                db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
             if not passed:
                 self.rollback(row["id"])
 

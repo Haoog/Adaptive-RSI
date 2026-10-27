@@ -36,6 +36,14 @@ def main():
                         raise RuntimeError("Soak lost queue ownership")
                     store.transition(run["id"], "completed", {}, True)
                     list(pool.map(lambda _: store.query("SELECT count(*) AS n FROM runs"), range(8)))
+                    if index % 17 == 0:
+                        # Exercise restart and replacement detection without trusting a live pool.
+                        store.close()
+                    if index % 29 == 0:
+                        # Simulate a process dying while a call remains reserved; recovery must
+                        # make it observable and leave the next claim runnable.
+                        reserved = store.reserve_call("p", run["id"], "review", config["models"]["review"], config)
+                        store.execute("UPDATE calls SET state='interrupted' WHERE id=?", (reserved,))
                     if index % 100 == 0:
                         store.close()
                     if args.seconds and time.monotonic() - began >= args.seconds:
@@ -44,10 +52,12 @@ def main():
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise RuntimeError("Soak database integrity failed")
             current, peak = tracemalloc.get_traced_memory()
+            metrics = store.metrics()
             print(json.dumps({"iterations": index + 1, "seconds": time.monotonic() - began,
                               "python_bytes": current, "peak_python_bytes": peak,
                               "max_rss": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                              "pool_connections": store._pool.qsize(), "integrity": "ok"}))
+                              "pool_connections": store._pool.qsize(), "metrics": metrics,
+                              "relationship_audit": store.relationship_audit(), "integrity": "ok"}))
         finally:
             store.close()
             tracemalloc.stop()

@@ -5,6 +5,13 @@
   "build": {
     "frontendDist": "../../adaptive_rsi/web"
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [],
+      "requireSignedVersion": true
+    }
+  },
   "app": {
     "withGlobalTauri": false,
     "windows": [

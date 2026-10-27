@@ -464,7 +464,7 @@ class AuditFailureBoundariesTest(unittest.TestCase):
                             with self.assertRaises(ModelFailure):
                                 agent.invoke("probe", "test", directory, code, code, config)
                             invoke.assert_called_once()
-                    circuit = health.status(config, "openai", code)
+                    circuit = health.status(config, "openai", code, "primary")
                     self.assertEqual(circuit["failures"], int(code in {"auth", "connection", "timeout"}))
 
     def test_known_structured_failure_overrides_conflicting_text(self):

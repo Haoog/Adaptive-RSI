@@ -97,7 +97,7 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_release tests.test_release_parallel tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4
+            modules: tests.test_release tests.test_release_parallel tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery
@@ -114,7 +114,29 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python || '3.12' }}
+      - run: python3 scripts/check_test_matrix.py
       - run: python3 -m unittest -v ${{ matrix.modules }}
+
+  quick_python:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    outputs:
+      test_count: ${{ steps.summary.outputs.test_count }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: python3 scripts/check_api_contract.py
+      - run: python3 scripts/check_i18n.py
+      - name: 快速测试与数量指标
+        id: summary
+        run: |
+          python3 -m unittest tests.test_store tests.test_audit_round5 -q 2> /tmp/quick-tests.log
+          count="$(sed -n 's/^Ran \\([0-9][0-9]*\\) tests.*/\\1/p' /tmp/quick-tests.log | tail -1)"
+          echo "test_count=${count:-0}" >> "$GITHUB_OUTPUT"
 
   macos_sandbox_core:
     needs: changes
@@ -182,15 +204,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
       - run: node --check adaptive_rsi/web/app.js
       - run: node --check adaptive_rsi/web/i18n.js
       - run: node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
       - run: node --check adaptive_rsi/web/experience.js
+      - run: node --check adaptive_rsi/web/native-update.js
+      - run: node --check adaptive_rsi/web/batch.js
       - run: node --check adaptive_rsi/web/install.js
       - run: node --check adaptive_rsi/web/sw.js
       - run: python3 scripts/check_i18n.py
+      - run: python3 scripts/check_api_contract.py
       - run: node --test tests/web_requests.cjs tests/web_service_worker.cjs
 
   browser:
@@ -205,7 +230,7 @@ jobs:
           python-version: '3.12'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci --ignore-scripts
@@ -268,7 +293,7 @@ jobs:
 
   verify:
     if: always()
-    needs: [changes, docs, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
+    needs: [changes, docs, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -278,6 +303,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           PYTHON_RESULT: ${{ needs.python.result }}
+          QUICK_PYTHON_RESULT: ${{ needs.quick_python.result }}
           MACOS_SANDBOX_CORE_RESULT: ${{ needs.macos_sandbox_core.result }}
           MACOS_SANDBOX_FLOWS_RESULT: ${{ needs.macos_sandbox_flows.result }}
           JAVASCRIPT_RESULT: ${{ needs.javascript.result }}
@@ -297,10 +323,28 @@ jobs:
             echo "Documentation checks passed"
             exit 0
           fi
-          for result in "$PYTHON_RESULT" "$MACOS_SANDBOX_CORE_RESULT" "$MACOS_SANDBOX_FLOWS_RESULT" "$JAVASCRIPT_RESULT" "$BROWSER_RESULT" "$PACKAGE_RESULT" "$LINUX_RESULT"; do
+          for result in "$QUICK_PYTHON_RESULT" "$PYTHON_RESULT" "$MACOS_SANDBOX_CORE_RESULT" "$MACOS_SANDBOX_FLOWS_RESULT" "$JAVASCRIPT_RESULT" "$BROWSER_RESULT" "$PACKAGE_RESULT" "$LINUX_RESULT"; do
             if [ "$result" != success ]; then
               echo "One or more required jobs failed: $result"
               exit 1
             fi
           done
           echo "All required checks passed"
+
+  ci_metrics:
+    if: always() && needs.changes.outputs.docs_only != 'true'
+    needs: [changes, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Record bounded CI outcome and quick-test count
+        run: |
+          {
+            echo "## CI metrics"
+            echo "- exact SHA: \`$GITHUB_SHA\`"
+            echo "- quick tests: ${{ needs.quick_python.outputs.test_count }}"
+            echo "- python: ${{ needs.python.result }}"
+            echo "- browser: ${{ needs.browser.result }}"
+            echo "- desktop packaging: ${{ needs.package.result }}"
+            echo "- linux isolation: ${{ needs.linux.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"

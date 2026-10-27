@@ -231,6 +231,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                 value["impact"] == "low" and value["effort"] == "high"):
             plan["decision"] = "deferred"
             plan["reason"] = "Value gate held: insufficient evidence or disproportionate effort. " + plan["reason"]
+    if not experiment:
+        from .batching import preserve_acceptance
+        preserve_acceptance(task, plan)
     if plan.get("value") and not experiment:
         from .discovery import value_priority
         rank = value_priority(plan["value"], plan["risk"])

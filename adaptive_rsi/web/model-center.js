@@ -158,6 +158,15 @@ window.RSIModelCenter = (() => {
     $('mc-health').hidden=!provider.health.paused&&!provider.health.failures;
     $('mc-health-status').textContent=provider.health.paused?t('连续失败已暂停')+' · '+t(errors[provider.health.code]||''):t('连续故障次数')+' '+provider.health.failures+' / 3';
     $('mc-resume').hidden=!provider.health.paused;$('mc-resume').disabled=false;
+    let diagnostics=$('mc-diagnostics');
+    if(!diagnostics){diagnostics=el('button',t('只读诊断'),'mc-text-button');diagnostics.id='mc-diagnostics';diagnostics.type='button';$('mc-health').after(diagnostics);}
+    diagnostics.onclick=()=>safe(async()=>{
+      const model=provider.catalog.models.find(item=>item.enabled)?.id||provider.catalog.models[0]?.id;
+      if(!model)return;
+      const result=await api('model-center/diagnose',{provider:provider.id,model,project:scope==='project'?scope:null});
+      const box=dialog(t('模型路由诊断')),body=el('pre',JSON.stringify(result,null,2));
+      box.append(el('p',t('本次只读取本地状态，不发送模型请求，也不产生费用。'),'muted'),body);
+    });
     const authProvider=provider.id,authScope=scope;window.RSIAuth?.show(authProvider,()=>fetchProvider(authProvider,authScope,true));
     renderModels();
   }
@@ -393,7 +402,7 @@ window.RSIModelCenter = (() => {
       const models=structuredClone(routes()),submittedReset=inheritanceResets.get(key);savingRoutes.add(key);updateDirty();setStatus(t('正在保存模型分工…'));
       try{
         const inherit=inheritedRoles(models,submittedReset);
-        const result=await api('model-center/routes',{project,models,...(submittedReset?{inherit}:{})}),saved=result.models||models,current=drafts.get(key);
+        const result=await api('model-center/routes',{project,models,revision:project?state?.config_revision:state?.global_config_revision,...(submittedReset?{inherit}:{})}),saved=result.models||models,current=drafts.get(key);
         const sameReset=inheritanceResets.get(key)===submittedReset;
         if(current&&sameReset)for(const role of Object.keys(saved))if(JSON.stringify(safeRoute(current[role]))===JSON.stringify(safeRoute(models[role])))current[role]=structuredClone(saved[role]);
         if(sameReset)inheritanceResets.delete(key);

@@ -12,7 +12,9 @@ This batch covers process execution, isolation, storage, scheduling, providers, 
 - `updates.require_provenance` defaults to `false` for clients without `gh`. Enabling it additionally runs `gh attestation verify` before installation, requiring the official repository, allowed release workflows, main-branch source and a non-self-hosted build. Missing verification evidence blocks installation. SHA-256 checks remain. This option does not imply that every historical release has attestations.
 - Legacy quota keys `limits.daily_calls/run_calls/run_seconds/max_changed_files` and `evolution.max_calls` are accepted for compatibility and normalized to zero; they do not limit execution. `limits.command_seconds` is a safety timeout of `60..86400` seconds, shared across a native multi-turn conversation. Tokens and estimated costs are recorded only.
 
-The database explicitly uses `PRAGMA user_version=1` and rejects future versions. Added tables, indexes and duration columns are compatible migrations. Restore checks SQLite integrity, foreign keys and run/task project ownership. Old duration records retain wall-clock fallback; new records prefer monotonic elapsed durations.
+The database now uses `PRAGMA user_version=2` with a checksummed migration ledger and still rejects newer versions. Added tables, indexes and duration columns are compatible migrations. Restore checks SQLite integrity, foreign keys and run/task project ownership. Old duration records retain wall-clock fallback; new records prefer monotonic elapsed durations.
+
+Settings saves use revision checks so two windows cannot silently overwrite each other; `/api/state` reads related data from one database snapshot. Invalid global or project configuration can be reset while retaining its raw audit copy, and projects remain paused. Diagnostics include read-only database metrics, relationship checks, the migration ledger and a backup manifest without credentials or task bodies.
 
 ## Retention and capacity
 

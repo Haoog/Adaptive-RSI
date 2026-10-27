@@ -292,10 +292,18 @@ def health_check(url, sha):
                 raise ValueError("Deployment health redirect changed the authorized origin")
             return super().redirect_request(request, fp, code, msg, headers, newurl)
     result = {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False}
+    deadline = time.monotonic() + 15
     try:
         request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Adaptive-RSI-health"})
         with urllib.request.build_opener(SameOrigin()).open(request, timeout=10) as response:
-            body = response.read(65537)
+            body = bytearray()
+            while len(body) <= 65536:
+                if time.monotonic() >= deadline:
+                    raise ValueError("Deployment health check exceeded the total deadline")
+                chunk = response.read1(min(8192, 65537 - len(body))) if hasattr(response, "read1") else response.read(8192)
+                if not chunk:
+                    break
+                body.extend(chunk)
             if len(body) > 65536:
                 raise ValueError("Deployment health response exceeds size limit")
             data = json.loads(body)
@@ -397,8 +405,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             if rollback["state"] == "rerun_unknown":
                 data["error"] = rollback["error"]
         elif rollback["state"] == "workflow_succeeded":
+            now = time.time()
+            first = rollback.setdefault("health_started_at", now)
+            if now < first + policy.get("health_warmup_seconds", 0) or now < rollback.get("health_retry_at", 0):
+                return data
             authorized(runtime, project, run, "deploy", policy, cancel)
             rollback["health"] = health_check(policy["health_url"], rollback["sha"])
+            rollback["health_attempts"] = rollback.get("health_attempts", 0) + 1
+            if not rollback["health"]["healthy"] and rollback["health_attempts"] < policy.get("health_attempts", 1):
+                rollback["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+                return data
             data["state"] = "rolled_back" if rollback["health"]["healthy"] else "rollback_failed"
     return data
 

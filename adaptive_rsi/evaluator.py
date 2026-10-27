@@ -14,6 +14,7 @@ from .build import BUILD_ID
 from .config import fingerprint
 from .gitops import copy_source, git
 from .process import Sandbox, run_process
+from .store import encode
 from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
                        unittest_discovery_options, pytest_options)
 
@@ -50,6 +51,39 @@ def structured_test_summary(text):
             detected = True
             count += bool(event.get("Test") and event["Action"] in ("pass", "fail"))
     return {"format": "go_test_json", "executed": count} if detected else None
+
+
+def junit_test_summary(text):
+    """Read bounded JUnit XML from stdout without trusting it for gate decisions."""
+    from xml.etree import ElementTree
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith(("<testsuite", "<?xml")):
+            continue
+        try:
+            root = ElementTree.fromstring(line)
+        except ElementTree.ParseError:
+            continue
+        tests = root if root.tag == "testsuite" else root.find("testsuite")
+        if tests is None:
+            continue
+        try:
+            values = {name: int(tests.attrib.get(name, 0)) for name in ("tests", "failures", "errors", "skipped")}
+        except ValueError:
+            continue
+        return {"format": "junit", "executed": values["tests"], **values}
+    return None
+
+
+def clarity_test_summary(text):
+    """Recognize bounded pytest CLI summaries without parsing arbitrary output."""
+    match = re.search(r"(?m)^=+ ([1-9]\d*) passed(?:, (\d+) failed)?(?:, (\d+) skipped)? in ",
+                      text)
+    if not match:
+        return None
+    passed, failed, skipped = (int(value or 0) for value in match.groups())
+    return {"format": "pytest_cli", "executed": passed + failed + skipped,
+            "passed": passed, "failed": failed, "skipped": skipped}
 
 
 def empty_test_run(text):
@@ -266,8 +300,10 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
                     command = argv[:runner + 1] + [relative]
                     break
         if command:
+            timeout = check.get("timeout_seconds", 300)
             return {"name": "isolated regression: " + check.get("name", "test check"),
-                    "argv": command, "cwd": command_cwd}
+                    "argv": command, "cwd": command_cwd,
+                    "timeout_seconds": timeout}
     return None
 
 
@@ -354,8 +390,11 @@ class Evaluator:
     def _cache_get(self, scope, key):
         if not key:
             return None
-        entries = self.store.setting("evaluation-baseline:" + scope, {})
-        entry = entries.get(key) if isinstance(entries, dict) else None
+        entry = self.store.setting("evaluation-baseline-entry:" + scope + ":" + key)
+        if not entry:
+            # One-time compatibility for caches written before per-key entries.
+            entries = self.store.setting("evaluation-baseline:" + scope, {})
+            entry = entries.get(key) if isinstance(entries, dict) else None
         return copy.deepcopy(entry["rows"]) if entry and isinstance(entry.get("rows"), list) else None
 
     def _cache_put(self, scope, key, rows):
@@ -363,10 +402,6 @@ class Evaluator:
             return
         if any(row.get("error") or UNAVAILABLE_OUTPUT.search(row.get("stderr") or "") for row in rows):
             return
-        cache_key = "evaluation-baseline:" + scope
-        entries = self.store.setting(cache_key, {})
-        if not isinstance(entries, dict):
-            entries = {}
         compact = []
         for row in rows:
             item = {field: value for field, value in row.items() if field != "stdout"}
@@ -375,9 +410,25 @@ class Evaluator:
                 item["stderr"] = item["stderr"][-CACHE_STDERR_LIMIT:]
             item["cached"] = True
             compact.append(item)
-        entries[key] = {"rows": compact, "at": time.time()}
-        entries = dict(sorted(entries.items(), key=lambda pair: pair[1].get("at", 0), reverse=True)[:BASELINE_CACHE_LIMIT])
-        self.store.put_setting(cache_key, entries)
+        # A CAS upsert per key prevents concurrent project checks from
+        # dropping each other's independently computed cache entries.
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM settings WHERE key=?",
+                             ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
+            previous = json.loads(row["value"]) if row else None
+            if previous and previous.get("at", 0) > time.time() - 60:
+                return
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                       ("evaluation-baseline-entry:" + scope + ":" + key,
+                        encode({"rows": compact, "at": time.time()})))
+        entries = self.store.query(
+            "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
+            ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
+        if len(entries) > BASELINE_CACHE_LIMIT:
+            stale = sorted(entries, key=lambda item: json.loads(item["value"]).get("at", 0))
+            for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
+                self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
 
     @staticmethod
     def _seed_target(target, seeds, config, clear=False):
@@ -439,7 +490,8 @@ class Evaluator:
             empty = empty_test_run(text)
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty
             result["empty_tests"] = empty
-            result["test_summary"] = structured_test_summary(text)
+            result["test_summary"] = (structured_test_summary(text) or junit_test_summary(text) or
+                                      clarity_test_summary(text))
             rows.append(result)
         outcome = {"rows": rows}
         if test_first_check is not None and label in {"baseline", "candidate"}:

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import platform
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +25,7 @@ FULL_BUILD_FILES = {
     "pyproject.toml",
     "scripts/package.py",
     "scripts/package_desktop.py",
+    "scripts/test_updater_signing.py",
 }
 
 
@@ -123,11 +126,68 @@ def package_desktop(bundle_dir=BUNDLE_DIR, output_dir=OUTPUT_DIR, version=None,
         raise ValueError("Expected exactly one regular macOS desktop disk image")
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    for name in (f"adaptive-rsi-{version}-macos-arm64-adhoc.dmg",
+                 f"adaptive-rsi-{version}-macos-arm64-adhoc.dmg.sha256"):
+        if (output / name).exists() or (output / name).is_symlink():
+            raise ValueError("Desktop release asset already exists: " + name)
     destination = output / f"adaptive-rsi-{version}-macos-arm64-adhoc.dmg"
-    shutil.copy2(images[0], destination)
-    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-    (output / (destination.name + ".sha256")).write_text(digest + "  " + destination.name + "\n")
+    staging = output / (".desktop-" + next(tempfile._get_candidate_names()))
+    try:
+        staging.mkdir(mode=0o700)
+        staged_image = staging / destination.name
+        staged_checksum = staging / (destination.name + ".sha256")
+        shutil.copy2(images[0], staged_image)
+        digest = hashlib.sha256(staged_image.read_bytes()).hexdigest()
+        staged_checksum.write_text(digest + "  " + destination.name + "\n")
+        os.link(staged_image, destination)
+        try:
+            os.link(staged_checksum, output / staged_checksum.name)
+        except FileExistsError:
+            destination.unlink(missing_ok=True)
+            raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return destination
+
+
+def package_updater(bundle_dir, output_dir, version):
+    """Publish a manifest only when the complete signed updater artifact exists."""
+    bundle_dir, output = Path(bundle_dir), Path(output_dir)
+    bundles = [p for p in bundle_dir.glob("*.app.tar.gz") if p.is_file() and not p.is_symlink()]
+    if len(bundles) != 1:
+        raise ValueError("Expected exactly one signed desktop updater bundle")
+    signature = Path(str(bundles[0]) + ".sig")
+    if not signature.is_file() or signature.is_symlink() or not 1 <= signature.stat().st_size <= 8192:
+        raise ValueError("Missing desktop updater signature")
+    signed = signature.read_text(encoding="ascii").strip()
+    name = "adaptive-rsi-" + version + "-macos-arm64.app.tar.gz"
+    output.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(bundles[0], output / name)
+    (output / (name + ".sig")).write_text(signed + "\n", encoding="ascii")
+    subprocess.run(["cargo", "run", "--quiet", "--locked", "--manifest-path",
+                    str(ROOT / "desktop/src-tauri/Cargo.toml"), "--bin", "verify_updater", "--",
+                    str(output / name), str(output / (name + ".sig")), version], check=True, timeout=120)
+    feed = {"version": version, "notes": "", "platforms": {"darwin-aarch64": {
+        "signature": signed,
+        "url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + version + "/" + name}}}
+    (output / "desktop-latest.json").write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")
+    # Build a minimal, machine-readable release inventory. It contains only
+    # public build inputs and proof hashes, never user state or credentials.
+    sbom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "component": {"type": "application", "name": "adaptive-rsi", "version": version}},
+        "components": [
+            {"type": "application", "name": "adaptive-rsi-desktop", "version": version},
+            {"type": "application", "name": "adaptive-rsi-engine", "version": version},
+            {"type": "library", "name": "Tauri", "version": "2", "scope": "required"},
+            {"type": "library", "name": "Python", "version": ">=3.9", "scope": "required"},
+        ],
+    }
+    (output / "sbom.cdx.json").write_text(json.dumps(sbom, indent=2) + "\n", encoding="utf-8")
+    return feed
 
 
 def main():
@@ -151,6 +211,10 @@ def main():
             print(json.dumps(verify_macos_dmg(args.image, Path(directory) / "mount"), ensure_ascii=False))
     else:
         image = package_desktop()
+        if os.environ.get("RSI_UPDATER_PUBLIC_KEY"):
+            source = (ROOT / "adaptive_rsi/__init__.py").read_text()
+            version = re.search(r'(?m)^__version__ = "(\d+\.\d+\.\d+)"$', source).group(1)
+            package_updater(BUNDLE_DIR.parent / "macos", OUTPUT_DIR, version)
         print(json.dumps({"asset": image.name, "sha256": image.with_name(image.name + ".sha256").name,
                           "bytes": image.stat().st_size}, ensure_ascii=False))
 

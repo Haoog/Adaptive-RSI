@@ -37,10 +37,14 @@ class Maintenance:
         with self.scheduler_scope("credential_cleanup"):
             self.model_center.cleanup_credentials()
         for project in self.store.query("SELECT * FROM projects"):
+            if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
+                return
             with self.scheduler_scope("maintenance_project", project["id"]):
                 config = self.config(project["id"])
                 cutoff = now - config["limits"]["retention_days"] * 86400
                 for run in self.store.query("SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL", (project["id"], cutoff)):
+                    if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
+                        return
                     with self.scheduler_scope("maintenance_run", project["id"], run["id"]):
                         with self.dispatch_lock:
                             run = self.store.one("SELECT id,path,state,task,result FROM runs WHERE id=? AND ended<?",
@@ -87,6 +91,7 @@ class Maintenance:
         # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
         stale = now - 90 * 86400
         self.store.execute("DELETE FROM skills WHERE expires<?", (now - 30 * 86400,))
+        self.store.execute("DELETE FROM request_log WHERE started<?", (now - 7 * 86400,))
         self.store.execute("DELETE FROM phase_times WHERE id IN (SELECT id FROM phase_times WHERE ended IS NOT NULL AND ended<? AND run IN "
                            "(SELECT id FROM runs WHERE ended IS NOT NULL AND ended<?) LIMIT 500)", (stale, stale))
         self.store.execute("DELETE FROM remote_waits WHERE id IN (SELECT id FROM remote_waits WHERE ended IS NOT NULL AND ended<? AND run IN "
@@ -109,7 +114,8 @@ class Maintenance:
         for run in self.store.query(
                 "SELECT r.id FROM runs r WHERE r.ended IS NOT NULL AND r.ended<? AND r.state NOT IN "
                 "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
-                "AND NOT (r.state='superseded' AND coalesce(json_extract(r.result,'$.close_pending'),0)=1) AND (" +
+                "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
+                "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1) AND (" +
                 remaining + ") LIMIT 200", (stale,)):
             for prefix in prefixes:
                 key = prefix + run["id"]
@@ -117,22 +123,23 @@ class Maintenance:
                                    (key, key + ":", key + ";"))
         # 批量初筛决定已直接写入 task_decisions 并随任务持久；这里只清理
         # 升级前遗留的 triage-state 键（存量暂缓任务会在 reassess 中迁移）。
-        for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? LIMIT 200", (stale,)):
+        for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? AND EXISTS "
+                                     "(SELECT 1 FROM settings WHERE key='triage-state:'||tasks.id) LIMIT 200", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", ("triage-state:" + task["id"],))
         # 过滤在 LIMIT 之前完成：新鲜条目占满一批时，过期条目仍能在本轮被删除。
         for row in self.store.query(
                 "SELECT key FROM settings WHERE key LIKE 'task-proof:%' AND "
-                "(json_extract(value,'$.at') IS NULL OR json_extract(value,'$.at')<?) LIMIT 400", (stale,)):
+                "CASE WHEN json_valid(value) THEN (json_extract(value,'$.at') IS NULL OR json_extract(value,'$.at')<?) ELSE 0 END LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         for row in self.store.query(
                 "SELECT key FROM settings WHERE key LIKE 'provider-health:%' AND "
-                "(json_extract(value,'$.at') IS NULL OR (json_extract(value,'$.paused')=0 AND json_extract(value,'$.at')<?)) LIMIT 400", (stale,)):
+                "CASE WHEN json_valid(value) THEN (json_extract(value,'$.at') IS NULL OR (json_extract(value,'$.paused')=0 AND json_extract(value,'$.at')<?)) ELSE 0 END LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         # Issue 评论缓存按 issue 数量累积（每个键含最多 20 条评论正文）；
         # 超过保留期未刷新的键不会再被命中（处理时总会刷新），直接删除。
         for row in self.store.query(
                 "SELECT key FROM settings WHERE key LIKE 'issue-comments:%' AND "
-                "(json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) LIMIT 400", (stale,)):
+                "CASE WHEN json_valid(value) THEN (json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) ELSE 0 END LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         # Retire stale connection-signature directories after proving they are unused.
         with self.dispatch_lock:
@@ -149,7 +156,10 @@ class Maintenance:
             # Frozen runs can still refer to a retired connection signature.
             active = self.store.one("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1")
             if configs_valid and not active:
-                for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' LIMIT 4000"):
+                for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' "
+                                            "AND json_valid(value) AND json_extract(value,'$.fetched')<? "
+                                            "AND key NOT IN (SELECT value FROM json_each(?)) LIMIT 4000",
+                                            (stale, json.dumps(sorted(keys)))):
                     try:
                         fetched = json.loads(row["value"]).get("fetched")
                     except (ValueError, TypeError, AttributeError):

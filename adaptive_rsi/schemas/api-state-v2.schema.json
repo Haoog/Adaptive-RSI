@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Adaptive RSI state response",
+  "type": "object",
+  "required": [
+    "version", "build", "selected_project", "csrf", "projects", "tasks", "runs",
+    "pagination", "config_revision", "global_config_revision", "schedules"
+  ],
+  "properties": {
+    "version": {"type": "string"},
+    "build": {"type": "string"},
+    "selected_project": {"type": ["string", "null"]},
+    "csrf": {"type": "string"},
+    "projects": {"type": "array", "items": {"type": "object"}},
+    "tasks": {"type": "array", "items": {"type": "object"}},
+    "runs": {"type": "array", "items": {"type": "object"}},
+    "events": {"type": "array", "items": {"type": "object"}},
+    "pagination": {
+      "type": "object",
+      "required": ["total", "limit", "offset", "has_more"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1},
+        "offset": {"type": "integer", "minimum": 0},
+        "has_more": {"type": "boolean"}
+      }
+    },
+    "config": {"type": "object"},
+    "config_revision": {"type": "integer", "minimum": 0},
+    "global_config_revision": {"type": "integer", "minimum": 0},
+    "schedules": {"type": "array", "items": {"type": "object"}}
+  }
+}

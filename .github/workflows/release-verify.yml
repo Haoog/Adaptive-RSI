@@ -52,7 +52,7 @@ jobs:
           python-version: '3.12'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: package-lock.json
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
@@ -73,13 +73,21 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
-      - run: python3 scripts/test_parallel.py
+      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js && node --check adaptive_rsi/web/auth.js && node --check adaptive_rsi/web/experience.js && node --check adaptive_rsi/web/install.js && node --check adaptive_rsi/web/sw.js
+      - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
       - run: node --test tests/web_requests.cjs tests/web_service_worker.cjs
       - run: python3 scripts/check_i18n.py
+      - run: python3 scripts/check_api_contract.py
       - run: npm ci --ignore-scripts
       - run: npx playwright install chromium
       - run: npm run test:browser
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.attest.outcome == 'success'
+        with:
+          name: timing-${{ github.run_id }}
+          path: .ci/test-durations.json
+          if-no-files-found: ignore
       - run: python3 scripts/package.py
       - run: python3 -m pip install --disable-pip-version-check build
       - run: python3 -m build --wheel
@@ -90,12 +98,22 @@ jobs:
           rustup default stable
           npm ci --prefix desktop
       - name: 构建、验证并收集桌面安装包
+        env:
+          RSI_UPDATER_PUBLIC_KEY: ${{ vars.RSI_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
+          if [ -z "$RSI_UPDATER_PUBLIC_KEY" ] || [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo 'Desktop updater signing configuration is required for a formal release.' >&2
+            exit 1
+          fi
           npm run --prefix desktop build
           cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml
+          python3 scripts/test_updater_signing.py
           codesign --verify --deep --strict "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app"
           "desktop/src-tauri/target/release/bundle/macos/Adaptive RSI.app/Contents/MacOS/adaptive-rsi-engine" --version
           python3 scripts/package_desktop.py
+          test -s dist/desktop-latest.json
           VERSION=$(python3 -c 'from adaptive_rsi import __version__; print(__version__)')
           DMG="dist/adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg"
           (cd dist && shasum -a 256 -c "adaptive-rsi-${VERSION}-macos-arm64-adhoc.dmg.sha256")
@@ -115,7 +133,7 @@ jobs:
         with:
           subject-path: dist/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: steps.attest.outcome == 'success'
+        if: always() && steps.attest.outcome == 'success'
         continue-on-error: true
         with:
           name: release-verified-${{ steps.source.outputs.tree }}

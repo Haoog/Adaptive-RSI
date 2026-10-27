@@ -103,6 +103,25 @@ def release_assets(directory, target):
                 "adaptive-rsi-" + target + "-macos-arm64-adhoc.dmg.sha256"]
     if len(wheels) != 1 or any(name not in files for name in expected):
         raise ValueError("Expected plugin ZIP, checksums, one wheel and one macOS ARM64 desktop DMG")
+    updater = ["adaptive-rsi-" + target + "-macos-arm64.app.tar.gz",
+               "adaptive-rsi-" + target + "-macos-arm64.app.tar.gz.sig", "desktop-latest.json"]
+    if any(name in files for name in updater):
+        if not all(name in files for name in updater):
+            raise ValueError("Incomplete desktop updater assets")
+        try:
+            feed = json.loads(files[updater[2]].read_text())
+            platform = feed["platforms"]["darwin-aarch64"]
+            signature = files[updater[1]].read_text().strip()
+            expected_url = "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + target + "/" + updater[0]
+            if feed["version"] != target or platform["url"] != expected_url or not signature or platform["signature"] != signature:
+                raise ValueError("Desktop updater manifest does not match release assets")
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid desktop updater manifest") from exc
+        expected += updater
+    if "desktop-latest.json" in files and "sbom.cdx.json" not in files:
+        raise ValueError("Signed desktop update is missing its SBOM")
+    if "sbom.cdx.json" in files:
+        expected.append("sbom.cdx.json")
     return sorted([files[name] for name in expected] + wheels)
 
 

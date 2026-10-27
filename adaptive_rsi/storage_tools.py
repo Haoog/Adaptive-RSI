@@ -1,6 +1,7 @@
 """Consistent private backups and deliberately minimal shareable diagnostics."""
 import json
 import gzip
+import hashlib
 import os
 import sqlite3
 import stat
@@ -61,11 +62,12 @@ def _archive(store, max_mb):
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
                 "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
     finally:
-        staging.unlink(missing_ok=True)
+        if staging is not None:
+            staging.unlink(missing_ok=True)
         source.unlink(missing_ok=True)
 
 
-def backup(store):
+def backup(store, cancel=None, progress=None):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
     path = folder / (uid() + ".sqlite3")
@@ -74,7 +76,16 @@ def backup(store):
     try:
         os.close(fd)
         with store.connect() as source, closing(sqlite3.connect(str(staging))) as target:
-            source.backup(target)
+            def advance(status, remaining, total):
+                if cancel and cancel():
+                    from .process import Cancelled
+                    raise Cancelled("Backup cancelled")
+                if progress:
+                    progress(total - remaining, total)
+            if cancel or progress:
+                source.backup(target, pages=128, progress=advance)
+            else:
+                source.backup(target)
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
         # Publish only the closed snapshot; a name collision must preserve the old backup.
@@ -83,6 +94,44 @@ def backup(store):
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
             Path(str(staging) + suffix).unlink(missing_ok=True)
+
+
+def verify_backup(path):
+    """Open a backup in read-only mode and prove it is a usable state snapshot."""
+    path = Path(path).expanduser().resolve()
+    if not path.is_file() or path.is_symlink():
+        raise ValueError("Backup must be a regular file")
+    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise ValueError("Backup integrity check failed")
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version > 2:
+            raise ValueError("Backup schema is newer than this runtime")
+        if db.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("Backup contains invalid relationships")
+        for table in ("projects", "tasks", "runs", "settings"):
+            db.execute("SELECT * FROM " + table + " LIMIT 0")
+    return {"valid": True, "schema_version": version, "bytes": path.stat().st_size}
+
+
+def retain_backups(store, max_count=20, max_age_days=90, now=None):
+    """Remove only older, successful backup snapshots after proving the newest remains."""
+    if type(max_count) is not int or not 1 <= max_count <= 1000:
+        raise ValueError("Backup count must be 1..1000")
+    if type(max_age_days) is not int or not 1 <= max_age_days <= 3650:
+        raise ValueError("Backup age must be 1..3650 days")
+    now = time.time() if now is None else now
+    folder = store.root / "backups"
+    paths = sorted((path for path in folder.glob("*.sqlite3")
+                    if path.is_file() and not path.is_symlink()),
+                   key=lambda path: path.stat().st_mtime, reverse=True)
+    removed = []
+    for index, path in enumerate(paths):
+        if index < max_count and now - path.stat().st_mtime <= max_age_days * 86400:
+            continue
+        path.unlink()
+        removed.append(path.name)
+    return {"kept": len(paths) - len(removed), "removed": removed}
 
 
 def _create_directories(destination):
@@ -146,7 +195,14 @@ def restore(source, destination):
     with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
-        for table in ["projects", "tasks", "runs", "settings"]:
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        tables = ["projects", "tasks", "runs", "settings"]
+        # Parent schema version 1 databases did not have these additive tables;
+        # Store performs the supported migration after the snapshot is copied.
+        if version >= 2:
+            tables += ["task_decisions", "task_revisions", "task_dependencies", "submissions",
+                       "phase_times", "remote_waits", "task_completions", "schema_migrations"]
+        for table in tables:
             db.execute("SELECT * FROM " + table + " LIMIT 0")
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Backup contains invalid relationships")
@@ -191,7 +247,7 @@ def restore(source, destination):
                     db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), row["id"]))
                 # Local verification caches describe artifacts/environments absent from this restore.
                 # Keep sealed remote identities, PR receipts and automation reconciliation state.
-                for prefix in ("evaluation-baseline:", "verified-checks:", "task-proof:", "task-proof-current:"):
+                for prefix in ("evaluation-baseline:", "evaluation-baseline-entry:", "verified-checks:", "task-proof:", "task-proof-current:"):
                     db.execute("DELETE FROM settings WHERE substr(key,1,?)=?", (len(prefix), prefix))
                 # Machine paths and external credentials need reconnecting; pending side effects need reconciliation.
                 db.execute("UPDATE tasks SET state='blocked' WHERE source IN ('system_publish','system_delivery') AND state='queued'")
@@ -290,7 +346,9 @@ def _approval_candidates(store):
 
 def overview(store):
     categories = {}
-    for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups")]:
+    for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups"),
+                             ("suites", store.root / "suites"), ("archives", store.root / "archives"),
+                             ("installations", store.root / "installations")]:
         paths = directory.rglob("*")
         if label == "backups":
             paths = (p for p in paths if not p.name.startswith(".backup-"))
@@ -299,8 +357,11 @@ def overview(store):
     backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3"), True),
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
+    manifest = [{"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
+                 "modified": info.st_mtime, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                for p, info in backups[:20]]
     return {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
-            for p, info in backups[:20]],
+            for p, info in backups[:20]], "backup_manifest": manifest,
             "expiring": expiring, "delivering": delivering, "delivered": delivered}
 
 
@@ -310,5 +371,12 @@ def diagnostics(store):
             "included": ["version", "state_counts", "failure_codes", "storage_bytes"],
             "tasks": store.query("SELECT state,count(*) AS count FROM tasks GROUP BY state"),
             "runs": store.query("SELECT state,count(*) AS count FROM runs GROUP BY state"),
-            "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
+            "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
+            "invalid_evidence": store.one("SELECT count(*) AS count FROM runs WHERE NOT json_valid(result)")["count"],
+            "database": store.metrics(),
+            "schema_migrations": store.schema_migrations(),
+            "relationship_audit": store.relationship_audit(),
+            "quarantined_orphans": store.one("SELECT count(*) AS count FROM relationship_quarantine")
+            if store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relationship_quarantine'")
+            else {"count": 0},
             "storage_bytes": overview(store)["bytes"]}
