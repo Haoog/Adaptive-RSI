@@ -635,7 +635,11 @@ async function checkQueueEditor(page, evidence) {
     await page.locator('#save-note[data-state="dirty"]').waitFor();
     assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'Project A unsaved');
     await page.emulateMedia({colorScheme:'dark'});
-    assert.notEqual(await page.locator('.mc-route-picker').first().evaluate(node=>getComputedStyle(node).backgroundColor),'rgb(255, 255, 255)');
+    await page.waitForFunction(()=>{
+      const picker=document.querySelector('.mc-route-picker');
+      const surface=getComputedStyle(document.documentElement).getPropertyValue('--surface').trim();
+      return picker&&surface==='#1e2620'&&getComputedStyle(picker).backgroundColor==='rgb(30, 38, 32)';
+    });
     await page.locator('#mc-add-provider').click();
     await page.locator('#mc-provider-preset').selectOption('opencode_go');
     assert.equal(await page.locator('#mc-input-name').inputValue(),'OpenCode Go');
