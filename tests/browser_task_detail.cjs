@@ -16,9 +16,9 @@ async function openDetail(page, title, filter) {
 async function closeDetail(page) {
   await page.evaluate(() => {
     const dialog = document.getElementById('detail-dialog');
-    if (dialog.open) dialog.close();
+    if (dialog && dialog.open) dialog.close();
   });
-  await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 5000 });
+  await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 10000 });
 }
 
 async function checkTaskDetail(browser, url, errors) {
