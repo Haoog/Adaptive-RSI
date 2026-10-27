@@ -4,12 +4,17 @@
 
 ## Unreleased
 
+## 0.5.120
+
+<!-- adaptive-rsi-release:0.5.120;base:1a1ab7794b91999c38c8d1993c5f7ee56c007259 -->
+
 - Reloading the interface or switching the runtime machine while the desktop app is downloading a new installer image now resumes progress polling until completion or failure; the completion and failure notices match the non-reloaded flow instead of freezing at a percentage.
 - Desktop update checks (including an explicit "Check for updates") keep an in-flight download's progress instead of clearing its downloading state, so the button cannot be clicked into a duplicate download; downloads are guarded by a process-wide gate, and no path can run two download threads writing the same installer image.
 - After a download completes and the installer image opens, the button switches to a completed "Installer image is open. Drag to install." state that cannot be clicked into a full re-download; "Check for updates" remains the explicit way to re-check.
 - "Remove connection" no longer deletes on a single click: a confirmation now explains that the connection and credentials stored on this machine (keychain or private file) are deleted irreversibly, that re-adding creates a new connection without restoring enabled/favorite/verified/price records, and that the server rejects removal while a role or fallback model still references the connection. Cancelling sends no request.
 - Step 2 ("Account connection") of the model-center setup checklist no longer stays highlighted forever for key-based or local connections: it shows as done when no key is required or credentials are configured, and only stays current while credentials are missing. Codex/OpenCode official sign-in connections behave as before.
 - The workbench "current task" card now shows the task title instead of a status word when the running task is outside the current task-list page (deep queues) or excluded by the "Needs you" and "History" groups; the card falls back to waiting copy once the run ends, and switching projects no longer leaks another project's running title.
+
 ## 0.5.119
 
 <!-- adaptive-rsi-release:0.5.119;base:0d722d9a6bdbae28ee8a9e44c8ac6c4523733206 -->
