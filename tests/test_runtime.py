@@ -678,6 +678,7 @@ Path(%r).write_text('allowed output')
         self.assertAlmostEqual(skill["expires"] - skill["created"], 30 * 86400)
         self.assertEqual(json.loads(skill["evidence"]),
                          {"candidate": "ready", "config_hash": fingerprint(config)})
+        self.assertEqual(promoted["parent"], "old", "promotion rebinds to the stable it replaced")
         self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["ready"])
         event = self.store.one("SELECT * FROM events WHERE kind='promotion' ORDER BY seq DESC")
         self.assertEqual(json.loads(event["data"]), {"candidate": "ready"})
@@ -687,8 +688,58 @@ Path(%r).write_text('allowed output')
             self.runtime.promote_strategy("evaluating")
         with self.assertRaisesRegex(ValueError, "Candidate not found"):
             self.runtime.promote_strategy("missing")
+        self.runtime.rollback_strategy("ready")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["old"])
+        self.assertEqual(self.store.one("SELECT status FROM skills")["status"], "invalidated")
         self.assertEqual(len(self.store.query("SELECT * FROM skills")), 1)
         self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='promotion'")), 1)
+
+    def test_auto_activation_rebinds_parent_and_persists_evidence(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, status, created in [("a", "stable", 1), ("auto", "evaluating", 2)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", status, encode(content), "{}", created))
+        evidence = {"decision": "pass", "trials": [{"case": "case-a"}]}
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            parent = Evolution.activate(db, "auto", now, evidence)
+        self.assertEqual(parent, "a")
+        row = self.store.one("SELECT * FROM candidates WHERE id='auto'")
+        self.assertEqual((row["status"], row["parent"], row["promoted"]), ("stable", "a", now))
+        self.assertEqual(json.loads(row["evidence"]), evidence)
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='a'")["status"], "superseded")
+
+    def test_consecutive_manual_promotions_roll_back_through_previous_stables(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, status, created in [("a", "stable", 1), ("r1", "ready", 2), ("r2", "ready", 3)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", status, encode(content), "{}", created))
+        self.runtime.promote_strategy("r1")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r1'")["parent"], "a")
+        self.runtime.promote_strategy("r2")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r2'")["parent"], "r1")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r2"])
+        self.runtime.rollback_strategy("r2")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r1"])
+        self.runtime.rollback_strategy("r1")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["a"])
+
+    def test_two_manual_promotions_without_prior_stable_roll_back_to_the_first(self):
+        content = {"guidance": "Check arithmetic boundaries", "triggers": ["add"]}
+        for candidate, created in [("r1", 1), ("r2", 2)]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, self.project, "strategy", "ready", encode(content), "{}", created))
+        self.runtime.promote_strategy("r1")
+        self.assertIsNone(self.store.one("SELECT parent FROM candidates WHERE id='r1'")["parent"])
+        self.runtime.promote_strategy("r2")
+        self.assertEqual(self.store.one("SELECT parent FROM candidates WHERE id='r2'")["parent"], "r1")
+        self.runtime.rollback_strategy("r2")
+        self.assertEqual([item["id"] for item in self.runtime.active_strategies(self.project)], ["r1"])
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='r1'")["status"], "stable")
 
     def test_manual_promotion_rejects_invalid_project_kind_and_content(self):
         self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
@@ -727,6 +778,7 @@ Path(%r).write_text('allowed output')
         self.assertEqual([result for result in results if isinstance(result, str)],
                          ["Only a verified ready candidate can be promoted"] * 3)
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='race'")["status"], "stable")
+        self.assertIsNone(self.store.one("SELECT parent FROM candidates WHERE id='race'")["parent"])
         self.assertEqual(len(self.store.query("SELECT * FROM skills")), 1)
         self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='promotion'")), 1)
 

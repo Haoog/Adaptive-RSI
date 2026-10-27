@@ -155,14 +155,14 @@ class Evolution:
             if state == "pass" and config["evolution"]["auto_promote"]:
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled before promotion")
+                promoted = time.time()
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute("UPDATE candidates SET status='superseded' WHERE project=? AND kind=? AND status='stable'",
-                               (project["id"], proposal["kind"]))
-                    db.execute("UPDATE candidates SET status='stable',promoted=?,evidence=? WHERE id=?",
-                               (time.time(), encode(evidence), candidate))
+                    # 晋升时重新绑定紧接着的稳定版，而不是沿用建候选时的快照；
+                    # 这样回滚始终回到刚被替换的一版（含手动/自动交替晋升）。
+                    self.activate(db, candidate, promoted, evidence)
                 self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                                   self.skill_values(project["id"], candidate, proposal, config, time.time()))
+                                   self.skill_values(project["id"], candidate, proposal, config, promoted))
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
                 state = "stable"
@@ -173,6 +173,25 @@ class Evolution:
             evidence.update(decision="insufficient_evidence", reason=str(exc))
             self.save(candidate, "interrupted" if isinstance(exc, Cancelled) else "insufficient_evidence", evidence)
             raise
+
+    @staticmethod
+    def activate(db, candidate, now, evidence=None):
+        """在调用方事务内启用候选，并把 parent 重绑到刚被替换的稳定版。"""
+        row = db.execute("SELECT project,kind FROM candidates WHERE id=?", (candidate,)).fetchone()
+        previous = db.execute(
+            "SELECT id FROM candidates WHERE project=? AND kind=? AND status='stable' "
+            "ORDER BY coalesce(promoted,created) DESC, created DESC LIMIT 1",
+            (row["project"], row["kind"])).fetchone()
+        parent = previous["id"] if previous else None
+        db.execute("UPDATE candidates SET status='superseded' WHERE project=? AND kind=? AND status='stable'",
+                   (row["project"], row["kind"]))
+        if evidence is None:
+            db.execute("UPDATE candidates SET status='stable',promoted=?,parent=? WHERE id=?",
+                       (now, parent, candidate))
+        else:
+            db.execute("UPDATE candidates SET status='stable',promoted=?,parent=?,evidence=? WHERE id=?",
+                       (now, parent, encode(evidence), candidate))
+        return parent
 
     @staticmethod
     def skill_values(project, candidate, content, config, now):
@@ -206,9 +225,7 @@ class Evolution:
                     or not content["guidance"].strip() or not isinstance(content.get("triggers"), list)):
                 raise ValueError("Candidate content is incomplete")
             # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
-            db.execute("UPDATE candidates SET status='superseded' WHERE project=? AND kind=? AND status='stable'",
-                       (row["project"], row["kind"]))
-            db.execute("UPDATE candidates SET status='stable',promoted=? WHERE id=?", (now, candidate))
+            self.activate(db, candidate, now)
             db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                        self.skill_values(row["project"], candidate, content, config, now))
         self.store.event("promotion", "Ready candidate manually promoted; limited operational monitoring started",
