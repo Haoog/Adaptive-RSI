@@ -39,21 +39,6 @@ class AuditRound3Test(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "External symlink cannot enter protected host state"):
             scrub_tree(project, state=state)
 
-    def test_storage_tools_fallback_when_os_link_fails(self):
-        store = Store(self.root / "store")
-        self.addCleanup(store.close)
-        store.event("test", "hello")
-
-        original_link = os.link
-
-        def failing_link(src, dst):
-            raise OSError(1, "Operation not permitted")
-
-        with patch("os.link", side_effect=failing_link):
-            snapshot = backup(store)
-            self.assertTrue(Path(store.root / "backups" / (snapshot["id"] + ".sqlite3")).is_file())
-            arch = archive(store, 100)
-            self.assertTrue(Path(arch["path"]).is_file())
 
     def test_empty_test_run_recognizes_unicode_and_vitest_output(self):
         vitest_output = """

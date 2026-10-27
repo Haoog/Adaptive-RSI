@@ -57,16 +57,11 @@ def _archive(store, max_mb):
             output.flush()
             os.fsync(output.fileno())
         target = folder / (snapshot["id"] + ".sqlite3.gz")
-        try:
-            os.link(staging, target)
-        except OSError:
-            os.replace(staging, target)
-            staging = None
+        os.link(staging, target)
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
                 "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
     finally:
-        if staging is not None:
-            staging.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
         source.unlink(missing_ok=True)
 
 
@@ -83,11 +78,7 @@ def backup(store):
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
         # Publish only the closed snapshot; a name collision must preserve the old backup.
-        try:
-            os.link(staging, path)
-        except OSError:
-            os.replace(staging, path)
-            staging = None
+        os.link(staging, path)
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
