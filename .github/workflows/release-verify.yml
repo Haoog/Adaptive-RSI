@@ -19,7 +19,7 @@ jobs:
     outputs:
       sha: ${{ steps.gate.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -39,7 +39,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.gate.outputs.sha }}
           fetch-depth: 0
@@ -47,35 +47,36 @@ jobs:
       - name: 记录精确源树
         id: source
         run: echo "tree=$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: package-lock.json
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
           cache-dependency-glob: pyproject.toml
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: desktop/src-tauri -> target
           key: ${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/Library/Caches/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
           restore-keys: playwright-${{ runner.os }}-
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
       - run: python3 scripts/test_parallel.py
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js && node --check adaptive_rsi/web/auth.js && node --check adaptive_rsi/web/experience.js && node --check adaptive_rsi/web/install.js && node --check adaptive_rsi/web/sw.js
-      - run: node --test tests/web_requests.cjs
+      - run: node --test tests/web_requests.cjs tests/web_service_worker.cjs
+      - run: python3 scripts/check_i18n.py
       - run: npm ci --ignore-scripts
       - run: npx playwright install chromium
       - run: npm run test:browser
@@ -110,10 +111,10 @@ jobs:
       - name: 为精确构建产物签发 GitHub provenance
         id: attest
         continue-on-error: true
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.attest.outcome == 'success'
         continue-on-error: true
         with:
@@ -150,7 +151,7 @@ jobs:
       pull-requests: write
       actions: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           persist-credentials: false

@@ -24,6 +24,20 @@ REPOSITORY = "Haoog/Adaptive-RSI"
 RELEASE_API = "https://api.github.com/repos/" + REPOSITORY + "/releases/latest"
 
 
+def verify_provenance(path):
+    """Verify the asset digest against GitHub's signed hosted-workflow identity."""
+    from .process import run_process
+    if not shutil.which("gh"):
+        raise RuntimeError("Provenance verification requires GitHub CLI")
+    for workflow in ("release.yml", "release-verify.yml"):
+        result = run_process(["gh", "attestation", "verify", str(path), "--repo", REPOSITORY,
+                              "--signer-workflow", REPOSITORY + "/.github/workflows/" + workflow,
+                              "--source-ref", "refs/heads/main", "--deny-self-hosted-runners"], timeout=60)
+        if result["exit_code"] == 0 and not result["error"]:
+            return
+    raise RuntimeError("Release provenance verification failed")
+
+
 def primary_rate_limit_reset(exc):
     """Recognize only the official API's bounded primary quota reset."""
     if not isinstance(exc, urllib.error.HTTPError) or exc.code != 403 or exc.url != RELEASE_API:
@@ -425,17 +439,21 @@ class UpdateManager:
             raise RuntimeError("Updates require a running service with restart supervision")
         if not self.lock.acquire(False):
             raise ValueError("An update check or installation is already in progress")
-        status = self.status()
-        if self.cooling_down(status):
+        try:
+            status = self.status()
+            if self.cooling_down(status):
+                raise ValueError("GitHub API rate limit reset is pending")
+            if status.get("state") not in ["available", "waiting_idle", "error"] or not status.get("version"):
+                raise ValueError("Check for an available release first")
+            status = {**status, "requested": requested}
+            with self.runtime.dispatch_lock:
+                self.installing = True
+            threading.Thread(target=self.apply, args=(status,), daemon=True, name="rsi-update-install").start()
+        except BaseException:
+            with self.runtime.dispatch_lock:
+                self.installing = False
             self.lock.release()
-            raise ValueError("GitHub API rate limit reset is pending")
-        if status.get("state") not in ["available", "waiting_idle", "error"] or not status.get("version"):
-            self.lock.release()
-            raise ValueError("Check for an available release first")
-        status = {**status, "requested": requested}
-        with self.runtime.dispatch_lock:
-            self.installing = True
-        threading.Thread(target=self.apply, args=(status,), daemon=True, name="rsi-update-install").start()
+            raise
 
     def apply(self, status):
         staging = None
@@ -474,6 +492,11 @@ class UpdateManager:
             installs.mkdir(exist_ok=True)
             import tempfile
             staging = Path(tempfile.mkdtemp(prefix="staging-", dir=installs))
+            if policy.get("require_provenance"):
+                artifact = staging / "release.zip"
+                artifact.write_bytes(data)
+                verify_provenance(artifact)
+                artifact.unlink()
             candidate = extract_bundle(data, checksum, staging, fresh["version"])
             final = installs / (fresh["version"] + "-" + checksum[:12])
             if final.exists():

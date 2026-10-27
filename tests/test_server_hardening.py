@@ -272,7 +272,7 @@ class ServerHardeningTest(unittest.TestCase):
         from adaptive_rsi.config import validate
         self.runtime.configure = lambda values, *_: validate(values)
         invalid = [
-            ({"schedule": {"working_hours": [20, 8]}}, "working_hours must be [start, end], 0 <= start < end <= 24"),
+            ({"schedule": {"working_hours": [20, 20]}}, "working_hours requires different start/end hours in 0..24; start must be below 24"),
             ({"github": {"repository": "invalid"}}, "Repository must be owner/name"),
             ({"limits": {"concurrency": 5}}, "Maximum concurrency is 4"),
         ]

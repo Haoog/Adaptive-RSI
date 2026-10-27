@@ -1,0 +1,1867 @@
+{
+  "scope": "100-item whole-project audit; bundled implementation with explicit platform, archival and signing limits",
+  "base": "f5349e0",
+  "status": "implementation_with_explicit_limits_locally_checked",
+  "items": [
+    {
+      "id": 1,
+      "title": "导入目录清理所有权",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/updates.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_backend_hardening",
+        "tests.test_updates_recovery"
+      ]
+    },
+    {
+      "id": 2,
+      "title": "脱离进程组的子进程清理",
+      "status": "platform_limit",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/updates.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_backend_hardening",
+        "tests.test_updates_recovery"
+      ],
+      "note": "进程组清理无法保证终止 macOS 下主动 setsid 后快速重新挂接的后代；Docker 检查继续使用容器清理。未宣称完整进程树监管。"
+    },
+    {
+      "id": 3,
+      "title": "依赖指纹字段边界",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/updates.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_backend_hardening",
+        "tests.test_updates_recovery"
+      ]
+    },
+    {
+      "id": 4,
+      "title": "升级启动异常释放锁",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/updates.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_backend_hardening",
+        "tests.test_updates_recovery"
+      ]
+    },
+    {
+      "id": 5,
+      "title": "快速退出命令的输出上限",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/updates.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_backend_hardening",
+        "tests.test_updates_recovery"
+      ]
+    },
+    {
+      "id": 6,
+      "title": "含凭据 URL 的缓存边界",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/sw.js"
+      ],
+      "validation": [
+        "tests/web_service_worker.cjs"
+      ]
+    },
+    {
+      "id": 7,
+      "title": "仅清理本应用缓存",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/sw.js"
+      ],
+      "validation": [
+        "tests/web_service_worker.cjs"
+      ]
+    },
+    {
+      "id": 8,
+      "title": "升级时静态资源一致性",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/sw.js"
+      ],
+      "validation": [
+        "tests/web_service_worker.cjs"
+      ]
+    },
+    {
+      "id": 9,
+      "title": "依赖快照模式与链接指纹",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/adapters.py",
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_protocols",
+        "tests.test_runtime"
+      ]
+    },
+    {
+      "id": 10,
+      "title": "畸形 package.json 检测",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/adapters.py",
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_protocols",
+        "tests.test_runtime"
+      ]
+    },
+    {
+      "id": 11,
+      "title": "工具 schema 错误可恢复",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/adapters.py",
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_protocols",
+        "tests.test_runtime"
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Git Unicode 与特殊文件名",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/adapters.py",
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_protocols",
+        "tests.test_runtime"
+      ]
+    },
+    {
+      "id": 13,
+      "title": "恢复悬挂调用记录",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 14,
+      "title": "关闭借出的数据库连接",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 15,
+      "title": "用量更正与汇总一致",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 16,
+      "title": "隔离既有损坏项目配置",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 17,
+      "title": "索引未跟踪源码",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 18,
+      "title": "检查名称类型",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 19,
+      "title": "桌面通知异步失败重试",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/context.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "tests.test_store",
+        "tests.test_comprehensive_audit",
+        "tests/browser_notifications.cjs"
+      ]
+    },
+    {
+      "id": 20,
+      "title": "安全超时文档准确性",
+      "status": "implemented",
+      "files": [
+        "docs/advanced.md",
+        "docs/advanced.en.md",
+        "docs/audit-hardening.md",
+        "docs/audit-hardening.en.md"
+      ],
+      "validation": [
+        "scripts/check_docs.py"
+      ]
+    },
+    {
+      "id": 21,
+      "title": "原生 HTTP 调用即时取消",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 22,
+      "title": "原生对话总时限",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Provider Retry-After",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 24,
+      "title": "分层响应结构校验",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 25,
+      "title": "每轮工具数量上限",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 26,
+      "title": "拒绝特殊源文件",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 27,
+      "title": "会话内源码检索缓存",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 28,
+      "title": "文件列表截断提示",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 29,
+      "title": "工具写入时的计划范围",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ],
+      "note": "文件工具和命令均限制写入范围；Docker 新路径需先由文件工具创建，单文件挂载可能拒绝原子替换。"
+    },
+    {
+      "id": 30,
+      "title": "截断保留命令诊断",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/pipeline.py"
+      ],
+      "validation": [
+        "tests.test_protocols",
+        "tests.test_comprehensive_audit",
+        "frozen-engine-local-http"
+      ]
+    },
+    {
+      "id": 31,
+      "title": "全局调度锁中的远端操作",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 32,
+      "title": "后台 Future 异常可见性",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 33,
+      "title": "交付任务与普通任务公平性",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 34,
+      "title": "领取前复核扫描开关",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 35,
+      "title": "手动重试重置计数",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 36,
+      "title": "不可达前置任务早期校验",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 37,
+      "title": "跨午夜工作时段",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 38,
+      "title": "活动历史游标分页",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 39,
+      "title": "单调完成计数触发进化",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 40,
+      "title": "严格布尔请求类型",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 41,
+      "title": "状态与审计同事务",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 42,
+      "title": "时钟变化下的耗时统计",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_schedule_consistency",
+        "tests.test_scheduler_isolation",
+        "tests.test_store"
+      ]
+    },
+    {
+      "id": 43,
+      "title": "历史数据归档与容量策略",
+      "status": "partial",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ],
+      "note": "新增带跨进程锁及容量上限的私有 gzip 一致数据库归档，反馈及派生数据保留期已清理；在线原始历史不自动删除，尚无完整自动分层/全状态硬容量上限。"
+    },
+    {
+      "id": 44,
+      "title": "反馈目录保留期清理",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 45,
+      "title": "发布中的候选保留",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 46,
+      "title": "完整回滚祖先链保留",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 47,
+      "title": "退役模型目录清理",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 48,
+      "title": "损坏 JSON 行的读取隔离",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 49,
+      "title": "明确数据库版本迁移",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 50,
+      "title": "恢复时关系一致性",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/telemetry.py"
+      ],
+      "validation": [
+        "tests.test_comprehensive_audit",
+        "tests.test_data_hardening",
+        "tests.test_scheduler_isolation",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 51,
+      "title": "目录使用已配置执行镜像",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 52,
+      "title": "并发目录刷新覆盖",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 53,
+      "title": "模型目录增长边界",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 54,
+      "title": "模型开关语义提示",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 55,
+      "title": "服务端模型测试并发上限",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 56,
+      "title": "同一 fd 安全读取凭据",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 57,
+      "title": "凭据状态与可用性一致",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 58,
+      "title": "批量清理凭据查询",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 59,
+      "title": "可选半开 Provider 恢复",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 60,
+      "title": "验证证据时间与适用范围",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/catalog.py",
+        "adaptive_rsi/credentials.py",
+        "adaptive_rsi/provider_health.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "tests.test_model_center",
+        "tests.test_catalog",
+        "tests.test_comprehensive_audit",
+        "tests/browser_model_center.cjs"
+      ]
+    },
+    {
+      "id": 61,
+      "title": "GitHub 工作流目录分页",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 62,
+      "title": "YAML 兼容检查诊断",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 63,
+      "title": "工作流局部读取失败隔离",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 64,
+      "title": "合并保护规则准备度",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 65,
+      "title": "远端操作取消传播",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 66,
+      "title": "PR 特殊文件名转义",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 67,
+      "title": "减少重复远端基线读取",
+      "status": "retained_freshness_gate",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ],
+      "note": "保留执行开始、验收后、发布前的远端 fetch；未用缓存替代关键新鲜度检查，避免交付陈旧候选。"
+    },
+    {
+      "id": 68,
+      "title": "交付查询按项目过滤",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 69,
+      "title": "缺失验证资产检查退避",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 70,
+      "title": "部署健康检查重试阈值",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/delivery.py",
+        "adaptive_rsi/readiness.py",
+        "adaptive_rsi/process.py",
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "tests.test_release_parallel",
+        "tests.test_delivery_loop",
+        "tests.test_backend_hardening"
+      ]
+    },
+    {
+      "id": 71,
+      "title": "回归目录真实公共前缀",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 72,
+      "title": "评估并发资源预算",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 73,
+      "title": "评估兄弟阶段停止",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 74,
+      "title": "保留隔离测试运行参数",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 75,
+      "title": "多文件回归测试证据",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 76,
+      "title": "结构化测试执行摘要",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ],
+      "note": "当前结构化执行摘要支持 Go test JSON；其他运行器保留既有输出判定。"
+    },
+    {
+      "id": 77,
+      "title": "性能对照避免并发干扰",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 78,
+      "title": "多候选统计风险报告",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 79,
+      "title": "晋升前复核当前配置",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "tests.test_runtime",
+        "tests.test_reliability",
+        "tests.test_workflow_experience",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 80,
+      "title": "废弃配置字段准确说明",
+      "status": "implemented",
+      "files": [
+        "docs/advanced.md",
+        "docs/advanced.en.md",
+        "docs/audit-hardening.md",
+        "docs/audit-hardening.en.md"
+      ],
+      "validation": [
+        "scripts/check_docs.py"
+      ]
+    },
+    {
+      "id": 81,
+      "title": "统一 API 请求时限",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 82,
+      "title": "禁止存储时的页面可用性",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 83,
+      "title": "草稿存储失败显式提示",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 84,
+      "title": "待提交记录按机器隔离",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 85,
+      "title": "连接与模型部分保存提示",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 86,
+      "title": "桌面大备份流式下载",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 87,
+      "title": "历史时间显示年份",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 88,
+      "title": "时间显示时区标签",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 89,
+      "title": "确认框焦点管理",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 90,
+      "title": "用量图零值与长周期",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/usage.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/usage_report.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "tests/web_requests.cjs",
+        "npm run test:browser",
+        "cargo test",
+        "tests.test_usage_report",
+        "tests.test_comprehensive_audit"
+      ]
+    },
+    {
+      "id": 91,
+      "title": "最低与新 Python 版本 CI",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ]
+    },
+    {
+      "id": 92,
+      "title": "状态机性质测试",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ]
+    },
+    {
+      "id": 93,
+      "title": "资源增长压力测试",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ],
+      "note": "本次实际执行1000轮隔离Store压力测试；不是多日生产稳定性保证。"
+    },
+    {
+      "id": 94,
+      "title": "i18n 完整性自动校验",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ]
+    },
+    {
+      "id": 95,
+      "title": "无障碍自动校验",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ],
+      "note": "覆盖桌面/手机、中英文 accessible names、labels 和 ARIA 引用；不是完整无障碍认证。"
+    },
+    {
+      "id": 96,
+      "title": "GitHub Actions 固定 SHA",
+      "status": "implemented",
+      "files": [
+        ".github/workflows/checks.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/desktop.yml",
+        "scripts/check_i18n.py",
+        "scripts/soak.py",
+        "tests/browser_accessibility.cjs",
+        "tests/test_comprehensive_audit.py"
+      ],
+      "validation": [
+        "tests.test_release",
+        "scripts/check_i18n.py",
+        "scripts/soak.py --iterations 1000",
+        "tests/browser_accessibility.cjs"
+      ]
+    },
+    {
+      "id": 97,
+      "title": "发布签名与来源验证",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/updates.py",
+        "desktop/scripts/build.mjs",
+        ".github/workflows/release.yml",
+        "docs/audit-hardening.md",
+        "docs/audit-hardening.en.md"
+      ],
+      "validation": [
+        "tests.test_update_safety",
+        "tests.test_desktop_release",
+        "tests.test_release"
+      ],
+      "note": "客户端严格来源验证为显式 opt-in；工作流生成 provenance，本次功能通过本地边界测试，正式资产证据由发布流程提供。"
+    },
+    {
+      "id": 98,
+      "title": "桌面签名与公证通路",
+      "status": "external_verification_required",
+      "files": [
+        "adaptive_rsi/updates.py",
+        "desktop/scripts/build.mjs",
+        ".github/workflows/release.yml",
+        "docs/audit-hardening.md",
+        "docs/audit-hardening.en.md"
+      ],
+      "validation": [
+        "tests.test_update_safety",
+        "tests.test_desktop_release",
+        "tests.test_release"
+      ],
+      "note": "已接入 Developer ID、hardened runtime、公证凭据配置检查；尚无本次真实 Apple 凭据签名、公证和 Gatekeeper 端到端证据。"
+    },
+    {
+      "id": 99,
+      "title": "凭据登记错误码安全透传",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/server_validation.py",
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/model_center.py"
+      ],
+      "validation": [
+        "tests.test_server_hardening",
+        "tests.test_model_center",
+        "tests.test_scheduler_isolation"
+      ]
+    },
+    {
+      "id": 100,
+      "title": "运行时与服务职责拆分",
+      "status": "implemented",
+      "files": [
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/server_validation.py",
+        "adaptive_rsi/maintenance.py",
+        "adaptive_rsi/model_center.py"
+      ],
+      "validation": [
+        "tests.test_server_hardening",
+        "tests.test_model_center",
+        "tests.test_scheduler_isolation"
+      ]
+    }
+  ],
+  "counts": {
+    "external_verification_required": 1,
+    "implemented": 96,
+    "partial": 1,
+    "platform_limit": 1,
+    "retained_freshness_gate": 1
+  },
+  "verification": {
+    "python_discovered_tests": 733,
+    "python": "Full grouped execution followed by clean reruns of the corrected 184-test group, 10 delivery endpoint tests, 55 release/reconciliation tests and 22 audit tests. Initial failures exposed test fixtures requiring valid references and the new operation-lock interface; both were fixed. Required CI must run on the final PR SHA.",
+    "javascript_tests_passed": 326,
+    "rust_tests_passed": 10,
+    "browser": "Complete npm run test:browser passed, including bilingual desktop/mobile accessibility checks.",
+    "packaging": [
+      "plugin ZIP",
+      "Python wheel",
+      "frozen engine local HTTP transport"
+    ],
+    "soak": {
+      "iterations": 1000,
+      "pool_connections": 4,
+      "integrity": "ok",
+      "peak_python_bytes": 297773
+    },
+    "documentation": "29 tracked Markdown files; bilingual pairing/local links passed",
+    "i18n": "literal UI/message-dictionary translation check passed",
+    "review": {
+      "standards": "No remaining blockers after credential cleanup, nested evidence and fixture corrections.",
+      "spec": "No remaining blockers in final bounded review after policy normalization, transactional candidate retention and authorization-independent factual receipts.",
+      "independent_human_review": false
+    },
+    "real_model_capability_claim": false
+  }
+}

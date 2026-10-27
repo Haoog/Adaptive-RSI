@@ -183,6 +183,10 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
     except (RuntimeError, OSError, ValueError):
         # 仓库缺失或损坏时 readiness 仍应给出可操作的结果，而不是整体报错。
         verified = False
-    return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks,
+    protection = None
+    if config["delivery"]["auto_merge"] and config["github"]["repository"]:
+        from .delivery import merge_protection
+        protection = merge_protection(config)
+    return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks, "merge_protection": protection,
             "execution_verified": verified, "model_evidence": model_evidence,
             "checked_at": time.time(), "budget": usage}

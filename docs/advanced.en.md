@@ -126,7 +126,7 @@ Explicit cross-provider fallback is available through advanced configuration:
 
 Only availability/rate-limit errors trigger fallback. Native execution cannot fall back after mutating tools, avoiding mixed partial implementations. Check/review failures cannot be bypassed by switching models. Calls record actual provider, model, effort and usage. Model, endpoint or review changes invalidate previous strategy compatibility evidence.
 
-**Usage is recorded without quotas:** Codex and OpenCode count CLI sessions; native APIs count HTTP requests. Input, output and available cache tokens are recorded, with missing usage marked unknown. Cost is only an estimate. Legacy call, duration, changed-file and experiment allowances no longer apply. Pause, cancellation, connection timeouts and recovery remain available.
+**Usage is recorded without quotas:** Codex and OpenCode count CLI sessions; native APIs count HTTP requests. Input, output and available cache tokens are recorded, with missing usage marked unknown. Cost is only an estimate. Legacy call, total-task-duration, changed-file and experiment allowances no longer apply. `limits.command_seconds` remains a safety timeout (60–86400 seconds). Pause, cancellation, connection timeouts and recovery remain available.
 
 Protocol references: [Responses tools](https://developers.openai.com/api/docs/guides/function-calling), [Anthropic tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview), [Gemini function calling](https://ai.google.dev/gemini-api/docs/function-calling). Local protocol fixtures pass; live vendor invocations remain unverified.
 

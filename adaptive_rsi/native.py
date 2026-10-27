@@ -1,6 +1,8 @@
 """Native API adapters with a host-controlled, workspace-only tool loop."""
 import json
 import os
+import stat
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -49,7 +51,26 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def post_json(url, payload, headers, timeout, max_bytes):
+def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
+    if cancel is not None:
+        from .process import run_process
+        argv = ([sys.executable, "internal-native-transport"] if getattr(sys, "frozen", False) else
+                [sys.executable, "-m", "adaptive_rsi.native_transport"])
+        result = run_process(argv,
+                             cwd=Path(__file__).resolve().parents[1], timeout=timeout + 5,
+                             cancel=cancel, output_mb=max(1, max_bytes // (1024 * 1024) * 2),
+                             input_data=json.dumps([url, payload, headers, timeout, max_bytes]).encode())
+        if result["error_kind"] == "timeout":
+            raise ProviderUnavailable("Model API connection timed out", "timeout")
+        if result["error"] or result["exit_code"]:
+            raise RuntimeError("Model transport failed")
+        envelope = json.loads(result["stdout"])
+        if not envelope["ok"]:
+            problem = (ProviderUnavailable(envelope["error"], envelope["code"]) if envelope["unavailable"] else
+                       ModelFailure(envelope["error"], envelope["code"]))
+            problem.retry_after = envelope.get("retry_after", 0)
+            raise problem
+        return envelope["response"]
     request = urllib.request.Request(url, json.dumps(payload).encode(),
                                      {"Content-Type": "application/json", **headers})
     try:
@@ -63,7 +84,18 @@ def post_json(url, payload, headers, timeout, max_bytes):
         error = "Model API HTTP " + str(exc.code)
         problem = http_failure(error + "; check endpoint, credentials and model capabilities", exc.code)
         if exc.code in [404, 429, 502, 503, 504]:
-            raise ProviderUnavailable(error, problem.code) from None
+            problem = ProviderUnavailable(error, problem.code)
+        from email.utils import parsedate_to_datetime
+        retry = exc.headers.get("Retry-After", "") if exc.headers else ""
+        try:
+            problem.retry_after = min(86400, max(0, float(retry) if retry.isdigit() else
+                                                parsedate_to_datetime(retry).timestamp() - time.time()))
+        except (ValueError, TypeError, OverflowError):
+            problem.retry_after = 0
+        try:
+            exc.close()
+        except (AttributeError, KeyError):
+            pass
         raise problem from None
     except (TimeoutError, ):
         raise ProviderUnavailable("Model API connection timed out", "timeout") from None
@@ -100,6 +132,22 @@ class WorkspaceTools:
         self.role, self.state, self.config = role, state, config
         self.cancel, self.protected = cancel, protected
         self.changed = False
+        self._file_cache = None
+        self._text_cache = {}
+        self._text_cache_bytes = 0
+        self.files_truncated = False
+        self.scope = None
+
+    @staticmethod
+    def read_source(path, maximum):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError("Source must be a regular file")
+            data = stream.read(maximum + 1)
+            if len(data) > maximum:
+                raise ValueError("Source file is too large")
+            return data.decode("utf-8")
 
     def path(self, value):
         relative_path(value)
@@ -112,16 +160,21 @@ class WorkspaceTools:
         return path
 
     def files(self):
+        if self._file_cache is not None:
+            return self._file_cache
         result = []
         for root, dirs, files in os.walk(self.workspace, followlinks=False):
             dirs[:] = sorted(d for d in dirs if d != ".git" and not d.startswith(".rsi-")
                              and d not in ["node_modules", "__pycache__", ".venv"] and not (Path(root) / d).is_symlink())
             for name in sorted(files):
                 path = Path(root) / name
-                if not path.is_symlink() and not name.startswith(".rsi-"):
-                    result.append(path.relative_to(self.workspace).as_posix())
+                if path.is_file() and not path.is_symlink() and not name.startswith(".rsi-"):
                     if len(result) >= 4000:
+                        self.files_truncated = True
+                        self._file_cache = result
                         return result
+                    result.append(path.relative_to(self.workspace).as_posix())
+        self._file_cache = result
         return result
 
     def execute(self, name, args):
@@ -130,9 +183,13 @@ class WorkspaceTools:
         schema = next((schema for tool, _, schema in tools_for(self.role) if tool == name and tool != "finish"), None)
         if schema is None:
             raise ValueError("Tool not available for this role")
-        validate_output(args, schema)
+        try:
+            validate_output(args, schema)
+        except RuntimeError as exc:
+            raise ArgumentsError("Tool arguments failed schema validation: " + str(exc)) from None
         if name == "list_files":
-            return self.files()
+            files = self.files()
+            return {"files": files, "truncated": self.files_truncated, "limit": 4000}
         if name == "read_file":
             start, end = args["start_line"], args["end_line"]
             if not 1 <= start <= end <= start + 499:
@@ -140,18 +197,29 @@ class WorkspaceTools:
             path = self.path(args["path"])
             if path.stat().st_size > 2 * 1024 * 1024:
                 raise ValueError("Source file is too large")
-            return "\n".join(f"{i}: {line}" for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if start <= i <= end)
+            return "\n".join(f"{i}: {line}" for i, line in enumerate(self.read_source(path, 2 * 1024 * 1024).splitlines(), 1) if start <= i <= end)
         if name == "search":
             if not args["text"] or len(args["text"]) > 1000:
                 raise ValueError("Search requires 1..1000 characters")
             result = []
+            remaining = 12 * 1024 * 1024
             for file in self.files():
                 path = self.path(file)
                 if path.stat().st_size > 1024 * 1024:
                     continue
                 try:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                except UnicodeError:
+                    if remaining < path.stat().st_size:
+                        return {"matches": result, "truncated": True, "reason": "search byte limit"}
+                    text = self._text_cache.get(file)
+                    if text is None:
+                        text = self.read_source(path, 1024 * 1024)
+                        size = len(text.encode("utf-8"))
+                        if self._text_cache_bytes + size <= 4 * 1024 * 1024:
+                            self._text_cache[file] = text
+                            self._text_cache_bytes += size
+                    remaining -= len(text.encode("utf-8"))
+                    lines = text.splitlines()
+                except (UnicodeError, ValueError, OSError):
                     continue
                 for i, line in enumerate(lines, 1):
                     if args["text"] in line:
@@ -161,10 +229,14 @@ class WorkspaceTools:
             return result
         if name in ["write_file", "replace_text"]:
             path = self.path(args["path"])
+            relative = path.relative_to(self.workspace).as_posix()
+            if self.scope is not None and not any(scope == "." or relative == scope or
+                    relative.startswith(scope.rstrip("/") + "/") for scope in self.scope):
+                raise ValueError("Source write is outside the approved plan scope")
             if name == "replace_text":
                 if path.stat().st_size > 1024 * 1024:
                     raise ValueError("Source file is too large")
-                text = path.read_text(encoding="utf-8")
+                text = self.read_source(path, 1024 * 1024)
                 if not args["old"] or text.count(args["old"]) != 1:
                     raise ValueError("Replacement requires one unique match")
                 text = text.replace(args["old"], args["new"], 1)
@@ -175,15 +247,27 @@ class WorkspaceTools:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")
             self.changed = True
+            self._file_cache = None
+            self._text_cache.clear()
+            self._text_cache_bytes = 0
             return {"written": args["path"]}
         if name == "run_command":
             relative_path(args["cwd"])
             if not args["argv"] or any("\0" in x or len(x) > 4000 for x in args["argv"]):
                 raise ValueError("Invalid command arguments")
             self.changed = True
+            self._file_cache = None
+            self._text_cache.clear()
+            self._text_cache_bytes = 0
             sandbox = Sandbox(self.state, self.config)
+            writable = None
+            if self.scope is not None:
+                writable = [self.path(scope) for scope in self.scope]
+                writable += [self.workspace / ".rsi-home", self.workspace / ".rsi-tmp"]
+                for item in writable[-2:]:
+                    item.mkdir(exist_ok=True)
             result = sandbox.check({"name": "model tool", **args}, self.workspace, self.cancel,
-                                   protected=[self.workspace / ".git"], hidden=self.protected)
+                                   protected=[self.workspace / ".git"], hidden=self.protected, writable=writable)
             scrub_tree(self.workspace)
             return {k: result[k] for k in ["exit_code", "stdout", "stderr", "error"]}
         raise ValueError("Unknown tool")
@@ -229,6 +313,14 @@ class Conversation:
         raise ValueError("Unknown native protocol")
 
     def receive(self, response):
+        if not isinstance(response, dict):
+            raise RuntimeError("Model API response must be an object")
+        try:
+            return self._receive(response)
+        except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+            raise RuntimeError("Model API returned an invalid tool response structure") from None
+
+    def _receive(self, response):
         p = self.protocol
         if p == "responses":
             output = response.get("output", [])
@@ -288,6 +380,13 @@ class NativeAgent:
         if protocol == "anthropic":
             headers["anthropic-version"] = "2023-06-01"
         tools = WorkspaceTools(workspace, role, self.store.root, config, cancel, protected)
+        if role == "implementation":
+            plan_path = Path(workspace).resolve().parent / "tool-scope.json"
+            if plan_path.is_file():
+                scope = json.loads(plan_path.read_text(encoding="utf-8"))
+                if not isinstance(scope, list) or not scope:
+                    raise RuntimeError("Approved native tool scope is invalid")
+                tools.scope = [relative_path(value) for value in scope]
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
         began = time.monotonic()
         max_bytes = config["limits"]["max_output_mb"] * 1024 * 1024
@@ -295,6 +394,9 @@ class NativeAgent:
         # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
         timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
         for turn in range(200):
+            remaining = config["limits"]["command_seconds"] - (time.monotonic() - began)
+            if remaining <= 0:
+                raise ProviderUnavailable("Native conversation timed out", "timeout")
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
             suffix, payload = conversation.request()
@@ -304,7 +406,8 @@ class NativeAgent:
             started = time.monotonic()
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
             try:
-                response = post_json(provider["base_url"].rstrip("/") + suffix, payload, headers, timeout, max_bytes)
+                request_args = (provider["base_url"].rstrip("/") + suffix, payload, headers, min(timeout, remaining), max_bytes)
+                response = post_json(*request_args, **({"cancel": cancel} if cancel is not None else {}))
                 # A malformed/blocked response can still contain billable usage.
                 from .usage import native_usage
                 self.store.record_usage(call, run, native_usage(protocol, response), time.monotonic() - started)
@@ -315,6 +418,8 @@ class NativeAgent:
                     raise Cancelled("Cancelled after model response")
                 if not calls:
                     raise RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
+                if len(calls) > 64:
+                    raise RuntimeError("Model response exceeds 64 tool calls per turn")
                 final = [x for x in calls if x[1] == "finish"]
                 if final:
                     if len(calls) != 1:
@@ -340,7 +445,11 @@ class NativeAgent:
                     try:
                         value = tools.execute(name, args)
                         if len(json.dumps(value).encode()) > 128000:
-                            value = {"error": "Tool output exceeds limit; narrow the request"}
+                            if isinstance(value, dict) and "exit_code" in value:
+                                value = {**value, "stdout": value.get("stdout", "")[-24000:],
+                                         "stderr": value.get("stderr", "")[-24000:], "truncated": True}
+                            else:
+                                value = {"error": "Tool output exceeds limit; narrow the request"}
                     except (ValueError, OSError, UnicodeError) as exc:
                         value = {"error": str(exc)}
                     results.append((call_id, name, value))

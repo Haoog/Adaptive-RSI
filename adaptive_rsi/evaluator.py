@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import time
+import threading
+import contextlib
 from pathlib import Path
 
 from .adapters import detect, test_path
@@ -13,7 +15,7 @@ from .config import fingerprint
 from .gitops import copy_source, git
 from .process import Sandbox, run_process
 from .workflow import (_go_test_options, environment_failure, node_test_options, npm_test_runner,
-                       unittest_discovery_options)
+                       unittest_discovery_options, pytest_options)
 
 MANIFESTS = {"package.json", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini", "conftest.py",
              "pom.xml", "build.gradle", "build.gradle.kts", "Makefile", "CMakeLists.txt", "Cargo.toml",
@@ -34,7 +36,26 @@ UNAVAILABLE_OUTPUT = re.compile(
 DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 
+def structured_test_summary(text):
+    count = 0
+    detected = False
+    for line in text.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("Action") in ("pass", "fail", "skip") and "Package" in event:
+            detected = True
+            count += bool(event.get("Test") and event["Action"] in ("pass", "fail"))
+    return {"format": "go_test_json", "executed": count} if detected else None
+
+
 def empty_test_run(text):
+    structured = structured_test_summary(text)
+    if structured is not None:
+        return structured["executed"] == 0
     empty = re.search(r"Ran 0 tests|no tests ran|No tests found|No tests were found|no test files|running 0 tests|"
                       r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|"
                       r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|no tests to run|"
@@ -191,10 +212,12 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
         if command is None and python_test and "-m" in lower:
             module_index = lower.index("-m")
             if module_index + 1 < len(lower) and lower[module_index + 1] == "pytest":
-                command = argv[:module_index + 2] + [relative]
+                options = pytest_options(argv[module_index + 2:])
+                command = argv[:module_index + 2] + options + [relative] if options is not None else None
         if command is None and python_test and any(Path(item).name == "pytest" for item in lower):
             runner = next(index for index, item in enumerate(lower) if Path(item).name == "pytest")
-            command = argv[:runner + 1] + [relative]
+            options = pytest_options(argv[runner + 1:])
+            command = argv[:runner + 1] + options + [relative] if options is not None else None
         if command is None and suffix == ".go" and any(Path(item).name == "go" for item in lower):
             flags = _go_test_options(argv)
             if names and flags is not None:
@@ -407,14 +430,17 @@ class Evaluator:
             empty = empty_test_run(text)
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty
             result["empty_tests"] = empty
+            result["test_summary"] = structured_test_summary(text)
             rows.append(result)
         outcome = {"rows": rows}
         if test_first_check is not None and label in {"baseline", "candidate"}:
-            focused = sandbox.check(test_first_check, target, cancel, protected, hidden)
-            focused_text = focused["stdout"] + focused["stderr"]
-            focused["empty_tests"] = empty_test_run(focused_text)
-            focused["passed"] = focused["exit_code"] == 0 and not focused["error"] and not focused["empty_tests"]
-            outcome["test_first_row"] = focused
+            outcome["test_first_rows"] = []
+            for check in test_first_check if isinstance(test_first_check, list) else [test_first_check]:
+                focused = sandbox.check(check, target, cancel, protected, hidden)
+                focused_text = focused["stdout"] + focused["stderr"]
+                focused["empty_tests"] = empty_test_run(focused_text)
+                focused["passed"] = focused["exit_code"] == 0 and not focused["error"] and not focused["empty_tests"]
+                outcome["test_first_rows"].append(focused)
         return outcome
 
     def _acceptance_stage(self, label, source, baseline, acceptance, directory, config, cancel, seeds, hidden):
@@ -443,7 +469,7 @@ class Evaluator:
         return {"rows": rows}
 
     @staticmethod
-    def _run_stages(stages, limit):
+    def _run_stages(stages, limit, stop=None):
         if not stages:
             return {}
         workers = min(3, max(1, limit), len(stages))
@@ -457,6 +483,8 @@ class Evaluator:
                 for future in concurrent.futures.as_completed(futures):
                     results[futures[future]] = future.result()
             except Exception:
+                if stop:
+                    stop.set()
                 for future in futures:
                     future.cancel()
                 raise
@@ -488,6 +516,19 @@ class Evaluator:
     def evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
                  acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+        from .resources import execution_resources
+        exclusive = acceptance and acceptance.get("change_kind") == "performance"
+        with execution_resources.acquire(exclusive=True, cancel=cancel) if exclusive else contextlib.nullcontext():
+            return self._evaluate(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
+                                  acceptance, acceptance_baseline, cache_scope, cache_base,
+                                  environment_digest, test_first, test_first_kind, changed_files)
+
+    def _evaluate(self, baseline, candidate, checks, directory, config, cancel=None, overlay=None, seeds=None,
+                  acceptance=None, acceptance_baseline=None, cache_scope=None, cache_base=None,
+                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
+        stage_stop = threading.Event()
+        original_cancel = cancel
+        cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
             return {"decision": "insufficient_evidence", "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": []}
         results = {}
@@ -497,7 +538,7 @@ class Evaluator:
         if changed_files is None:
             changed_files = _changed_files(candidate)
         added_tests = _added_test_files(candidate) if test_first else []
-        existing_test_files = ([path for path in git(baseline, "ls-files").splitlines() if test_path(path)]
+        existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
         existing_test_symbols = ({symbol for path in existing_test_files
                                   for symbol in _test_symbols(baseline, path)} if test_first else set())
@@ -514,11 +555,11 @@ class Evaluator:
                     "reason": "Test-first proof cannot modify the existing test harness", "checks": []}
         test_first_check = None
         if test_first:
-            if len(added_tests) != 1:
+            if not 1 <= len(added_tests) <= 8:
                 return {"decision": "insufficient_evidence",
-                        "reason": "Test-first proof requires exactly one new regression test file", "checks": []}
-            test_first_check = _isolated_test_check(checks, baseline, added_tests[0], regression_test_symbols)
-            if test_first_check is None:
+                        "reason": "Test-first proof requires 1..8 new regression test files", "checks": []}
+            test_first_check = [_isolated_test_check(checks, baseline, filename, regression_test_symbols) for filename in added_tests]
+            if any(check is None for check in test_first_check):
                 return {"decision": "insufficient_evidence",
                         "reason": "Configured test runner cannot execute the new regression test in isolation",
                         "checks": []}
@@ -580,7 +621,10 @@ class Evaluator:
             stages["acceptance_candidate"] = lambda: self._acceptance_stage(
                 "acceptance_candidate", candidate, baseline, acceptance, directory, execution_config, cancel,
                 seeds, hidden)
-        outcomes = self._run_stages(stages, int(config.get("limits", {}).get("concurrency", 1)))
+        # Benchmarks have exclusive process-wide access; ordinary checks share
+        # the global execution capacity while retaining stage concurrency.
+        outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
+                                    else int(config.get("limits", {}).get("concurrency", 1)), stop=stage_stop)
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
                 continue
@@ -595,8 +639,8 @@ class Evaluator:
                 (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
                 return data
             results[label] = outcome["rows"]
-            if "test_first_row" in outcome:
-                results["test_first_" + label] = [outcome["test_first_row"]]
+            if "test_first_rows" in outcome:
+                results["test_first_" + label] = outcome["test_first_rows"]
         if reuse_full:
             results["candidate_full"] = list(results.get("candidate", []))
         if cached_baseline is None and "baseline" in results:

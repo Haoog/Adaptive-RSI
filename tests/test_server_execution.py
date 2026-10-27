@@ -167,6 +167,7 @@ class ServerExecutionTest(unittest.TestCase):
         self.assertNotIn("server-test-secret", encode(self.runtime.model_center.snapshot()))
 
     def test_public_origin_is_explicit_and_health_remains_local(self):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         for address in ["http://example.com", "https://example.com/path", "https://user:pass@example.com"]:
             with self.assertRaises(ValueError):
                 Server(self.runtime, public_url=address)
@@ -184,11 +185,11 @@ class ServerExecutionTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "process changed"):
                 live_session(self.store.root)
             headers = {"Host": "rsi.example.com", "Cookie": server.cookie + "=" + server.token}
-            with urllib.request.urlopen(urllib.request.Request(server.local_origin + "/api/state", headers=headers)) as response:
+            with opener.open(urllib.request.Request(server.local_origin + "/api/state", headers=headers)) as response:
                 self.assertEqual(response.status, 200)
             headers["Host"] = "untrusted.example"
             with self.assertRaises(urllib.error.HTTPError) as rejected:
-                urllib.request.urlopen(urllib.request.Request(server.local_origin + "/api/state", headers=headers))
+                opener.open(urllib.request.Request(server.local_origin + "/api/state", headers=headers))
             self.assertEqual(rejected.exception.code, 403)
         finally:
             server.shutdown()

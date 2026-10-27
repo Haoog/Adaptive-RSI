@@ -4,6 +4,7 @@ import hashlib
 import os
 import platform
 import re
+import stat
 import threading
 from pathlib import Path
 
@@ -151,11 +152,21 @@ class Credentials:
         with self._lock:
             if mode == "file":
                 path = self.directory / reference
-                if not path.exists():
-                    raise CredentialError("missing_key")
-                if path.is_symlink() or path.stat().st_mode & 0o077:
-                    raise CredentialError("credential_file_unavailable")
-                value = path.read_text()
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or
+                                info.st_size > 8192 or info.st_uid != os.getuid()):
+                            raise CredentialError("credential_file_unavailable")
+                        raw = stream.read(8193)
+                        if len(raw) > 8192:
+                            raise CredentialError("credential_file_unavailable")
+                        value = raw.decode("utf-8")
+                except FileNotFoundError:
+                    raise CredentialError("missing_key") from None
+                except (OSError, UnicodeError):
+                    raise CredentialError("credential_file_unavailable") from None
             else:
                 value = self._sessions.get((self.service, reference), "") if mode == "session" else MacKeychain().request(self.service, reference, "get")
         if not value:
@@ -171,6 +182,10 @@ class Credentials:
         if mode == "session":
             return "configured" if (self.service, provider.get("secret_ref")) in self._sessions else "missing"
         if mode == "file":
-            return "file" if (self.directory / provider.get("secret_ref", "missing")).is_file() else "missing"
+            try:
+                self.get(provider)
+                return "file"
+            except CredentialError:
+                return "missing"
         # 页面轮询只返回保存状态，不反复打开系统钥匙串。
         return "stored" if provider.get("secret_ref") else "missing"

@@ -2,6 +2,7 @@ import contextlib
 import json
 import queue
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +22,36 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def decode_object(value):
+    """Isolate malformed historical read-model evidence without rewriting it."""
+    try:
+        result = json.loads(value)
+    except (TypeError, ValueError):
+        result = None
+    return result if isinstance(result, dict) else {"evidence_error": "invalid_json_object"}
+
+
+def decode_evidence(value):
+    """Validate containers consumed by historical dashboards, preserving raw database evidence."""
+    result = decode_object(value)
+    for field in ("review", "evaluation", "feedback", "failure", "automation", "value", "monitor"):
+        if field in result and not isinstance(result[field], dict):
+            return {"evidence_error": "invalid_evidence_shape:" + field}
+    review, evaluation = result.get("review", {}), result.get("evaluation", {})
+    findings, trials, checks = review.get("findings", []), result.get("trials", []), evaluation.get("checks", {})
+    for name, rows in (("findings", findings), ("trials", trials)):
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return {"evidence_error": "invalid_evidence_shape:" + name}
+    if any("case" in row and not isinstance(row["case"], (str, type(None))) for row in trials):
+        return {"evidence_error": "invalid_evidence_shape:case"}
+    if not isinstance(checks, dict) or any(not isinstance(rows, list) or
+            any(not isinstance(row, dict) for row in rows) for rows in checks.values()):
+        return {"evidence_error": "invalid_evidence_shape:checks"}
+    if "merged_at" in result and not isinstance(result["merged_at"], (int, float)):
+        return {"evidence_error": "invalid_evidence_shape:merged_at"}
+    return result
+
+
 class PooledConnection(sqlite3.Connection):
     """携带创建时数据库文件标识的连接，用于识别被整体替换的数据库。"""
 
@@ -35,7 +66,12 @@ class Store:
         self.path = self.root / "state.sqlite3"
         # 有界连接池；__init__ 的 DDL 迁移同样经由 connect() 走借出-归还路径。
         self._pool = queue.LifoQueue(maxsize=POOL_SIZE)
+        self._pool_lock = threading.Lock()
+        self._pool_generation = 0
+        self._clock_samples = {}
         with self.connect() as db:
+            if db.execute("PRAGMA user_version").fetchone()[0] > 1:
+                raise RuntimeError("Database schema is newer than this runtime")
             db.executescript("""
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -99,6 +135,9 @@ class Store:
                 CREATE TABLE IF NOT EXISTS remote_waits (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), reason TEXT,
                     started REAL, ended REAL);
+                CREATE TABLE IF NOT EXISTS task_completions (
+                    task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
+                CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
             """)
             db.execute("BEGIN IMMEDIATE")
             for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
@@ -116,6 +155,9 @@ class Store:
                     db.execute("ALTER TABLE calls ADD COLUMN " + field + " INTEGER DEFAULT 0")
             db.execute("CREATE INDEX IF NOT EXISTS run_calls ON calls(run,created)")
             db.execute("CREATE INDEX IF NOT EXISTS created_calls ON calls(created)")
+            for table in ("phase_times", "remote_waits"):
+                if "duration" not in {row["name"] for row in db.execute("PRAGMA table_info(" + table + ")")}:
+                    db.execute("ALTER TABLE " + table + " ADD COLUMN duration REAL")
             # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
             migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
             if not migration:
@@ -133,6 +175,9 @@ class Store:
                 db.execute("INSERT INTO settings VALUES ('delivery-policy-v2','true')")
             db.execute("DELETE FROM schedules WHERE kind='deep'")
             db.execute("UPDATE tasks SET state='obsolete' WHERE source='system_deep' AND state IN ('queued','waiting_budget')")
+            db.execute("INSERT OR IGNORE INTO task_completions SELECT id,project,updated FROM tasks "
+                       "WHERE source NOT LIKE 'system_%' AND state IN ('awaiting_approval','pr_open','merged','completed')")
+            db.execute("PRAGMA user_version=1")
 
     def _file_identity(self):
         try:
@@ -158,10 +203,12 @@ class Store:
 
     @contextlib.contextmanager
     def connect(self):
-        try:
-            db = self._pool.get_nowait()
-        except queue.Empty:
-            db = None
+        with self._pool_lock:
+            generation = self._pool_generation
+            try:
+                db = self._pool.get_nowait()
+            except queue.Empty:
+                db = None
         if db is not None and db.identity != self._file_identity():
             # 升级回滚会整体替换 state.sqlite3（连同 -wal/-shm）；指向旧文件的
             # 池连接必须弃用，否则轻则 I/O 错误，重则读到替换前的数据。
@@ -189,18 +236,24 @@ class Store:
             db.close()
             raise
         else:
-            try:
-                self._pool.put_nowait(db)
-            except queue.Full:
-                db.close()
+            with self._pool_lock:
+                if generation != self._pool_generation:
+                    db.close()
+                else:
+                    try:
+                        self._pool.put_nowait(db)
+                    except queue.Full:
+                        db.close()
 
     def close(self):
         """关闭池中空闲连接；已借出的连接由各自的 with 块负责关闭。"""
-        while True:
-            try:
-                self._pool.get_nowait().close()
-            except queue.Empty:
-                return
+        with self._pool_lock:
+            self._pool_generation += 1
+            while True:
+                try:
+                    self._pool.get_nowait().close()
+                except queue.Empty:
+                    return
 
     def query(self, sql, args=()):
         with self.connect() as db:
@@ -282,8 +335,15 @@ class Store:
                 return
             active = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if not active or active["phase"] != name:
-                db.execute("UPDATE phase_times SET ended=? WHERE run=? AND ended IS NULL", (now, run))
-                db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, name, now))
+                self._end_spans(db, "phase_times", run, now)
+                cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, name, now))
+                self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
+
+    def _end_spans(self, db, table, run, now):
+        for row in db.execute("SELECT id,started FROM " + table + " WHERE run=? AND ended IS NULL", (run,)).fetchall():
+            began = self._clock_samples.pop((table, row["id"]), None)
+            elapsed = max(0, time.monotonic() - began if began is not None else now - row["started"])
+            db.execute("UPDATE " + table + " SET ended=?,duration=? WHERE id=?", (now, elapsed, row["id"]))
 
     def remote_wait(self, run, reason, now):
         with self.connect() as db:
@@ -291,9 +351,10 @@ class Store:
             active = db.execute("SELECT reason FROM remote_waits WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if active and active["reason"] == reason:
                 return
-            db.execute("UPDATE remote_waits SET ended=? WHERE run=? AND ended IS NULL", (now, run))
+            self._end_spans(db, "remote_waits", run, now)
             if reason:
-                db.execute("INSERT INTO remote_waits(run,reason,started) VALUES (?,?,?)", (run, reason, now))
+                cursor = db.execute("INSERT INTO remote_waits(run,reason,started) VALUES (?,?,?)", (run, reason, now))
+                self._clock_samples[("remote_waits", cursor.lastrowid)] = time.monotonic()
 
     @staticmethod
     def queue_order(display=False):
@@ -322,12 +383,22 @@ class Store:
             from .config import merge, validate
             task = None
             effective = None
+            recent = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                                "WHERE r.project=? ORDER BY r.started DESC,r.id DESC LIMIT 3", (project,)).fetchall()
+            fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
+                          len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
             while True:
                 candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() + " "
-                                       "ORDER BY " + self.queue_order() + " LIMIT 1",
+                                       "ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
                                        (project, now, now)).fetchone()
                 if not candidate:
                     return None
+                source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
+                if (source_key and not config["sources"][source_key] and
+                        any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
+                            for item in json.loads(candidate["evidence"] or "[]"))):
+                    db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (now, candidate["id"]))
+                    continue
                 try:
                     overrides = json.loads(candidate["overrides"])
                     if not isinstance(overrides, dict):
@@ -351,7 +422,8 @@ class Store:
             db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
             db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
                        (run, task["id"], project, "planning", encode(effective), now))
-            db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
+            cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
+            self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
     def transition(self, run, state, result=None, terminal=False, task_fields=None):
@@ -375,9 +447,12 @@ class Store:
             phase = (result or {}).get("stage", state)
             active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if not active_phase or active_phase["phase"] != phase or terminal:
-                db.execute("UPDATE phase_times SET ended=? WHERE run=? AND ended IS NULL", (now, run))
+                self._end_spans(db, "phase_times", run, now)
+                if terminal:
+                    self._end_spans(db, "remote_waits", run, now)
                 if not terminal:
-                    db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, phase, now))
+                    cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, phase, now))
+                    self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
             result = {**{key: previous[key] for key in ["value", "scope", "plan_reason", "plan_decision", "failure", "stage"] if key in previous}, **(result or {})}
             db.execute("UPDATE runs SET state=?,result=?,ended=? WHERE id=?",
                        (state, encode(result or {}), now if terminal else None, run))
@@ -392,13 +467,18 @@ class Store:
                        (state, now, *values, row["task"]))
             if state == "deferred":
                 db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (row["task"], encode(result), now))
-        self.event(state, (result or {}).get("reason", state), row["project"], run, result)
+            if terminal and state in ("awaiting_approval", "pr_open", "merged", "completed"):
+                db.execute("INSERT OR IGNORE INTO task_completions SELECT id,project,? FROM tasks "
+                           "WHERE id=? AND source NOT LIKE 'system_%'", (now, row["task"]))
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                       (row["project"], run, state, (result or {}).get("reason", state), encode(result or {}), now))
         return True
 
     def recover(self):
         rows = self.query("SELECT id FROM runs WHERE ended IS NULL")
         for row in rows:
             self.transition(row["id"], "interrupted", {"reason": "Runtime restarted; artifacts retained. Retry creates a fresh isolated run."}, True)
+        self.execute("UPDATE calls SET state='interrupted' WHERE state='reserved'")
         self.execute("UPDATE candidates SET status='interrupted' WHERE status IN ('proposing','evaluating')")
         return len(rows)
 
@@ -430,9 +510,10 @@ class Store:
         fields = ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute("SELECT tokens FROM calls WHERE id=?", (call,)).fetchone()
+            previous = db.execute("SELECT tokens,run FROM calls WHERE id=?", (call,)).fetchone()
+            if previous is None or previous["run"] != run:
+                raise ValueError("Usage call does not belong to run")
             db.execute("UPDATE calls SET " + ",".join(field + "=?" for field in fields) + ",seconds=? WHERE id=?",
                        (*[values[field] for field in fields], seconds, call))
-            # 重试或重复记录时新值可能小于旧值；runs 只增不减，重复记录保持幂等。
-            db.execute("UPDATE runs SET tokens=tokens+? WHERE id=?",
-                       (max(0, values["tokens"] - previous["tokens"]), run))
+            db.execute("UPDATE runs SET tokens=max(0,tokens+?) WHERE id=?",
+                       (values["tokens"] - previous["tokens"], run))

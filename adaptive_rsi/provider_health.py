@@ -133,7 +133,24 @@ class ProviderHealth:
         return self.store.setting(connection_key(config, provider, project), {"failures": 0, "paused": False})
 
     def require(self, config, provider, project):
-        if self.status(config, provider, project)["paused"]:
+        key = connection_key(config, provider, project)
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            state = json.loads(row[0]) if row else {"paused": False}
+            if state.get("retry_at", 0) > now:
+                error = ModelFailure("Provider Retry-After cooldown is pending", "rate_limit")
+                error.retry_after = state["retry_at"] - now
+                error.provider_id = provider
+                raise error
+            minutes = config.get("recovery", {}).get("provider_retry_minutes", 0)
+            if (state.get("paused") and minutes and state.get("code") in ("rate_limit", "timeout", "connection") and
+                    now >= state.get("at", now) + minutes * 60 and now >= state.get("half_open_until", 0)):
+                state["half_open_until"] = now + config["limits"]["command_seconds"] + 30
+                db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(state), key))
+                return
+        if state.get("paused"):
             error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
             error.provider_id = provider
             raise error
@@ -150,8 +167,10 @@ class ProviderHealth:
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             old = json.loads(row[0]) if row else {}
             failures = old.get("failures", 0) + 1 if error else 0
-            value = {"failures": failures, "paused": old.get("paused", False) or failures >= 3,
+            value = {"failures": failures, "paused": (old.get("paused", False) and not (not error and old.get("half_open_until"))) or failures >= 3,
                      "code": code, "at": time.time()}
+            if error and getattr(error, "retry_after", 0):
+                value["retry_at"] = time.time() + error.retry_after
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
 
     def reset(self, config, provider, project):

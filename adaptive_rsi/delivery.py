@@ -1,4 +1,5 @@
 import json
+import html
 import time
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def pr_body(task, run, outcome):
         lines += ["## 预期效果", "", _public_text(value["benefit"]), ""]
     lines += ["## 改动", "", _public_text(outcome.get("summary")) or "完成经过验证的改进。", ""]
     if files:
-        lines += ["修改文件：", "", *["- `" + path + "`" for path in files], ""]
+        lines += ["修改文件：", "", *["- <code>" + html.escape(path).replace("`", "&#96;").replace("\n", "&#10;").replace("\r", "&#13;") + "</code>" for path in files], ""]
     lines += ["## 验证", "",
               "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
               "- 独立验收：" + ("通过" if (evaluation.get("improvement") or {}).get("decision") == "pass" else "见运行记录"),
@@ -69,6 +70,34 @@ def baseline(runtime, project, config):
 def pr_view(repo, url):
     return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json",
         "url,state,headRefOid,baseRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft"]))
+
+
+_PROTECTION_CACHE = {}
+
+
+def merge_protection(config):
+    """A bounded advisory read; GitHub still enforces the actual merge policy."""
+    repo = config["github"]["repository"]
+    branch = config["delivery"]["base_branch"]
+    key = (repo, branch)
+    cached = _PROTECTION_CACHE.get(key)
+    if cached and time.monotonic() - cached[0] < 300:
+        return cached[1]
+    result = {"state": "unknown", "strict_checks": None, "branch": branch}
+    try:
+        from urllib.parse import quote
+        if not branch:
+            branch = json.loads(checked(["gh", "api", "repos/" + repo], timeout=10))["default_branch"]
+        policy = json.loads(checked(["gh", "api", "repos/" + repo + "/branches/" + quote(branch, safe="") +
+                                     "/protection"], timeout=10))
+        strict = bool((policy.get("required_status_checks") or {}).get("strict"))
+        result = {"state": "strict" if strict else "review_rules", "strict_checks": strict, "branch": branch}
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+        pass
+    if len(_PROTECTION_CACHE) >= 64:
+        _PROTECTION_CACHE.clear()
+    _PROTECTION_CACHE[key] = (time.monotonic(), result)
+    return result
 
 
 def merge_gate(pr, head, base):
@@ -291,12 +320,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
-    for run in store.query("SELECT * FROM runs WHERE state IN ('pr_open','merged') OR "
-                           "(state='superseded' AND json_extract(result,'$.close_pending')=1) ORDER BY started"):
+    for run in store.query("SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR "
+                           "(state='superseded' AND json_extract(result,'$.close_pending')=1))" +
+                           (" AND project=?" if project_id else "") + " ORDER BY started",
+                           (project_id,) if project_id else ()):
         if tracking_cancelled():
             return
-        if project_id and run["project"] != project_id:
-            continue
         project = runtime.project(run["project"])
         if project["paused"] or store.one("SELECT 1 FROM runs WHERE project=? AND ended IS NULL AND id<>?", (project["id"], active_run or "")):
             continue
@@ -381,6 +410,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     continue
                         # Fetch and Issue checks can outlive a settings change. Re-read the complete
                         # local authorization under the same lock used by configuration writes.
+                        merge_admitted = False
                         with runtime.dispatch_lock:
                             live_project = runtime.project(project["id"])
                             live_config = runtime.config(project["id"])
@@ -402,9 +432,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     live_policy == policy and live_identity == identity and
                                     live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
                                     not live_project["paused"] and not tracking_cancelled()):
-                                checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
-                                         "--match-head-commit", policy["head"]])
-                                outcome["delivery_status"] = "merge_submitted"
+                                merge_admitted = True
+                                store.put_setting("merge-intent:" + run["id"], {"head": policy["head"], "at": now})
+                        if merge_admitted:
+                            checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
+                                     "--match-head-commit", policy["head"]])
+                            outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
                         if tracking_cancelled():
                             return
@@ -443,14 +476,19 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
+    if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
+        return
     saved = json.loads(run["config"])
 
     def missing_artifacts():
         previous = outcome.get("feedback", {})
+        outcome["feedback_polled_at"] = now
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
             runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
             runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
+        else:
+            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
 
     try:
         output_name = "feedback/" + str(time.time_ns()) + "-" + uid()

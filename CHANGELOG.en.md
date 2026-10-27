@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Harden import cleanup ownership, dependency fingerprints, fast-command output limits, call recovery and usage corrections to preserve user directories and consistent historical totals.
+- Native requests gain cancellation of genuinely blocked HTTP, conversation deadlines, Retry-After support, plan-scoped file/command writes and bounded search caching. Frozen desktop engines use a dedicated transport entry point.
+- Scheduling supports overnight windows, fair claims, monotonic completion counts and transactional audit events. Slow delivery requests leave the global lock while preserving dispatch intent, factual receipts, legacy deployment compatibility and authorization race checks.
+- Strengthen retention protections, malformed historical evidence isolation and restore relationship checks; add private compressed archives with a capacity limit. Raw online audit and usage history is retained rather than automatically deleted.
+- Managed evaluation shares global execution capacity; performance comparisons hold exclusive capacity and run serially. Support multi-file regressions, safe pytest options and Go JSON summaries, with explicit candidate-selection statistical limitations.
+- Add paginated activity history and timezone labels, explicit browser-storage failure messages, confirmation focus management and streamed desktop backups with progress/cancellation. Service workers cache public icons only, excluding pages and executable assets.
+- Add Python-version, translation, basic accessibility, state-transition, resource-soak and service-worker checks; pin Actions SHAs. Provide optional update-provenance verification and an Apple signing/notarization configuration path. See [batch hardening notes](docs/audit-hardening.en.md) for detached macOS descendants, automatic history tiering and real signing verification limits.
+
 ## 0.5.121
 
 <!-- adaptive-rsi-release:0.5.121;base:dec49fee66fe760a5639a913c9e30c4b576b6015 -->

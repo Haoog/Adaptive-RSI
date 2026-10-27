@@ -169,14 +169,13 @@ class RecordUsageTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 100)
         self.assertEqual(self.store.one("SELECT seconds FROM calls WHERE id='call'")["seconds"], 1.5)
 
-    def test_smaller_retry_values_never_decrease_run_tokens(self):
+    def test_usage_corrections_keep_run_and_call_totals_consistent(self):
         self.store.record_usage("call", "run", self.usage(100), 1.0)
         self.store.record_usage("call", "run", self.usage(40), 2.0)
-        # calls 行仍按最新值覆盖；runs 汇总只增不减，负增量被钳制为 0。
         self.assertEqual(self.store.one("SELECT tokens FROM calls WHERE id='call'")["tokens"], 40)
-        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 100)
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 40)
         self.store.record_usage("call", "run", self.usage(150), 3.0)
-        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 210)
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 150)
 
 
 if __name__ == "__main__":

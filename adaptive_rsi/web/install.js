@@ -12,7 +12,7 @@ function installCopy() {
 }
 document.getElementById("language-select").onchange = (event) => {
   language = event.target.value;
-  localStorage.setItem("rsi-language", language);
+  try { localStorage.setItem("rsi-language", language); } catch {}
   translateStatic();
   installCopy();
 };

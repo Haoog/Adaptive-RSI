@@ -242,10 +242,10 @@ def codex_models():
                 process.stdout.close()
 
 
-def list_models(provider, key=None):
+def list_models(provider, key=None, config=None):
     if isinstance(provider, str):
         if provider == "opencode":
-            return opencode_models()
+            return opencode_models(config)
         if provider == "openai":
             models, truncated = codex_models()
             return {"models": models, "truncated": truncated}
@@ -262,9 +262,10 @@ def list_models(provider, key=None):
     return {"models": models, "truncated": truncated}
 
 
-def opencode_models():
+def opencode_models(config=None):
     from .cli_worker import cli_home, clean_environment, run_cli
     from .config import DEFAULTS
+    config = config or DEFAULTS
     from .opencode import (OpenCodeCompatibilityError, detect_opencode, prepare_home)
     from .process import run_process
     with tempfile.TemporaryDirectory(prefix="rsi-opencode-models-") as directory:
@@ -280,7 +281,7 @@ def opencode_models():
                                     "XDG_DATA_HOME": str(home / ".local/share"), "XDG_CACHE_HOME": str(home / ".cache"),
                                     "XDG_STATE_HOME": str(home / ".local/state")})
             elif shutil.which("docker"):
-                image = DEFAULTS["sandbox"]["worker_image"]
+                image = config["sandbox"]["worker_image"]
                 try:
                     capabilities = detect_opencode(
                         "opencode", argv=["docker", "run", "--rm", image, "opencode", "--version"],
@@ -294,7 +295,7 @@ def opencode_models():
                 if binary:
                     return run_process([binary, *argv[1:]], directory, timeout=TIMEOUT,
                                        env={**clean_environment(), **environment})
-                return run_cli(argv, directory, home, DEFAULTS, environment=environment,
+                return run_cli(argv, directory, home, config, environment=environment,
                                read_only=True, timeout=TIMEOUT)
             if capabilities.modern:
                 result = execute(["opencode", "api", "GET", "/api/model", "--standalone"])

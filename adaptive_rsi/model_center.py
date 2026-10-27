@@ -15,6 +15,8 @@ from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
 from .store import encode, uid
 from .provider_health import ProviderHealth, error_code
+from . import __version__
+from .config import compatibility
 
 
 NON_AGENT = {"embedding", "embeddings", "image", "audio", "rerank"}
@@ -35,6 +37,7 @@ class ModelCenter:
         self.credentials = Credentials(self.store.root)
         self.lock = threading.RLock()
         self.busy = 0
+        self.catalog_inflight = set()
 
     def provider(self, provider_id, project=None):
         config = self.runtime.config(project)
@@ -90,24 +93,28 @@ class ModelCenter:
 
     def _credential_in_use(self, reference, mode):
         """当前配置和未结束运行的封存配置都可能继续使用旧凭据。"""
+        references = self._credential_references()
+        return references is None or (reference, mode) in references
+
+    def _credential_references(self):
         configs = [self.runtime.config()]
         for row in self.store.query("SELECT id FROM projects"):
-            configs.append(self.runtime.config(row["id"]))
+            try:
+                configs.append(self.runtime.config(row["id"]))
+            except (ValueError, KeyError, TypeError):
+                return None
         for row in self.store.query("SELECT config FROM runs WHERE ended IS NULL"):
             try:
                 config = json.loads(row["config"])
             except (ValueError, TypeError):
-                return True
+                return None
             if (not isinstance(config, dict) or not isinstance(config.get("providers"), list)
                     or any(not isinstance(provider, dict) for provider in config["providers"])):
                 # 无法证明旧快照不再引用凭据时，保守保留，待快照修复或运行结束后重试。
-                return True
+                return None
             configs.append(config)
-        for config in configs:
-            for provider in [*BUILTINS, *config["providers"]]:
-                if provider.get("secret_ref") == reference and provider.get("credential") == mode:
-                    return True
-        return False
+        return {(provider["secret_ref"], provider.get("credential")) for config in configs
+                for provider in config["providers"] if provider.get("secret_ref")}
 
     def _pending_credentials(self):
         try:
@@ -157,10 +164,17 @@ class ModelCenter:
             if self.runtime.updates.is_busy():
                 return
             pending = self._pending_credentials()
+            references = self._credential_references()
+            if references is None:
+                return
+            attempts = 0
             for reference, modes in list(pending.items()):
                 for mode in list(modes):
-                    if self._credential_in_use(reference, mode):
+                    if (reference, mode) in references:
                         continue
+                    if attempts >= 32:
+                        break
+                    attempts += 1
                     try:
                         self.credentials.delete(reference, mode)
                     except (CredentialError, OSError):
@@ -170,6 +184,8 @@ class ModelCenter:
                         modes.remove(mode)
                 if not modes:
                     del pending[reference]
+                if attempts >= 32:
+                    break
             self.store.put_setting("credential-cleanup-pending", pending)
 
     def save_provider(self, data, authentication, project=None):
@@ -269,6 +285,18 @@ class ModelCenter:
                                                and model["name"] != model["id"]))
 
     def fetch(self, provider_id, project=None):
+        key = (project, provider_id)
+        with self.lock:
+            if key in self.catalog_inflight:
+                raise CenterError("catalog_busy")
+            self.catalog_inflight.add(key)
+        try:
+            return self._fetch(provider_id, project)
+        finally:
+            with self.lock:
+                self.catalog_inflight.discard(key)
+
+    def _fetch(self, provider_id, project=None):
         with self.runtime.dispatch_lock:
             if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
@@ -277,10 +305,13 @@ class ModelCenter:
         key = self.key(provider, project)
         try:
             secret = None if provider["id"] in {p["id"] for p in BUILTINS} else self.credentials.get(provider)
-            result = list_models(provider_id if provider["id"] in {p["id"] for p in BUILTINS} else provider, secret)
+            if provider_id == "opencode":
+                result = list_models(provider_id, secret, config=self.runtime.config(project))
+            else:
+                result = list_models(provider_id if provider["id"] in {p["id"] for p in BUILTINS} else provider, secret)
         except (CatalogError, CredentialError) as exc:
             with self.runtime.dispatch_lock, self.lock:
-                if not self.runtime.updates.is_busy():
+                if not self.runtime.updates.is_busy() and self.signature(self.provider(provider_id, project)) == signature:
                     previous = self.directory(provider, project)
                     previous.update(error=exc.code, attempted=time.time())
                     self.store.put_setting(key, previous)
@@ -300,8 +331,14 @@ class ModelCenter:
                                "manual": old.get("manual", False), "missing": False, "name_override": custom_name,
                                **({"name": old["name"]} if custom_name else {}),
                                **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price"] if k in old}})
-            models.extend({**model, "missing": not model.get("manual", False)} for model in before.values())
-            directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"]}
+            retained = sorted(before.values(), key=lambda model: not (model.get("manual") or model.get("favorite") or
+                              model.get("name_override") or model.get("unit_price") is not None))
+            omitted = len(models) + len(retained) > 2000
+            if omitted and any(m.get("manual") or m.get("favorite") or m.get("name_override") or m.get("unit_price") is not None
+                               for m in retained[max(0, 2000 - len(models)):]):
+                raise CenterError("too_many_models")
+            models.extend({**model, "missing": not model.get("manual", False)} for model in retained[:max(0, 2000 - len(models))])
+            directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"] or omitted}
             self.store.put_setting(key, directory)
         return directory
 
@@ -386,6 +423,8 @@ class ModelCenter:
         with self.runtime.dispatch_lock:
             if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
+            if self.busy >= 4:
+                raise CenterError("probe_busy")
             self.busy += 1
         try:
             with tempfile.TemporaryDirectory(prefix="rsi-model-test-") as workspace:
@@ -405,7 +444,8 @@ class ModelCenter:
                 self.edit_model(provider_id, {"id": model_id}, project)
                 directory = self.directory(provider, project)
                 model = next(m for m in directory["models"] if m["id"] == model_id)
-                model["verified"] = {"at": time.time(), "effort": effort, "kind": "structured_tool"}
+                model["verified"] = {"at": time.time(), "effort": effort, "kind": "structured_tool",
+                                     "version": __version__, "compatibility": compatibility(config)}
                 model.pop("last_attempt", None)
                 model.setdefault("probes", {})[effort] = {**model["verified"], "state": "pass"}
                 self.store.put_setting(self.key(provider, project), directory)

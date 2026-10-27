@@ -64,6 +64,32 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.commands = []
         self.remote = None
 
+    def test_legacy_deploy_snapshot_keeps_pending_health_tracking(self):
+        deploy = {**self.policy, "health_url": "https://service.example/health", "automatic_rollback": False}
+        self.runtime.configure({"delivery": {"deploy": deploy}}, self.project)
+        saved = self.runtime.config(self.project)
+        for field in ("health_attempts", "health_interval_seconds", "health_warmup_seconds"):
+            saved["delivery"]["deploy"].pop(field)
+        run = {**self.run, "config": encode(saved)}
+        self.runtime.store.put_setting(key(run["id"], "deploy"), {"state": "workflow_succeeded"})
+        self.assertTrue(pending(self.runtime, run))
+
+    def test_rejected_retry_receipt_survives_concurrent_authorization_revocation(self):
+        from adaptive_rsi.release import save
+        data = {"state": "failed", "operation_id": "rsi-release-test", "sha": MERGED,
+                "dispatch_receipt": "rejected"}
+        save(self.runtime, self.run, "release", data)
+        def remote(repo, endpoint, method="GET", fields=None):
+            if endpoint.endswith("/dispatches"):
+                self.runtime.configure({"delivery": {"release": {"enabled": False}}}, self.project)
+                raise ApiRejected("explicit rejection", 422)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=remote), self.assertRaises(ApiRejected):
+            retry(self.runtime, self.project, self.run["id"], "release")
+        receipt = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual((receipt["state"], receipt["dispatch_receipt"], receipt["dispatch_http_status"]),
+                         ("failed", "rejected", 422))
+
     def tearDown(self):
         self.runtime.close()
         self.temp.cleanup()
@@ -732,7 +758,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact"))
         self.assertIn("steps.attest.outcome", upload["if"])
         text = (self.ROOT / ".github/workflows/release-verify.yml").read_text()
-        self.assertIn("actions/attest-build-provenance@v4", text)
+        self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
         self.assertIn("release-verified-${{ steps.source.outputs.tree }}", text)
         self.assertIn("RSI_SOURCE_TREE", text)
         self.assertIn("RSI_WORKFLOW_SOURCE_SHA", text)
@@ -746,7 +772,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertEqual(jobs["build"]["needs"], ["prepare", "reuse"])
         self.assertIn("needs.reuse.result != 'success'", jobs["build"]["if"])
         text = (self.ROOT / ".github/workflows/release.yml").read_text()
-        for command in ["actions/download-artifact@v4", "scripts/release.py validate-verified",
+        for command in ["actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093", "scripts/release.py validate-verified",
                         "gh attestation verify", "--signer-workflow", "--source-ref refs/heads/main", "--source-digest",
                         "scripts/release_smoke.py", "scripts/package_desktop.py verify-dmg"]:
             self.assertIn(command, text)

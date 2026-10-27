@@ -79,7 +79,7 @@ def _workspace_fingerprint(workspace):
 def _code_index(root, fingerprint):
     """Cache the bounded text index for one exact workspace content state."""
     workspace = Path(root)
-    paths = git(workspace, "ls-files").splitlines()
+    paths = sorted(set(filter(None, git(workspace, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0"))))
     rows = []
     content_budget = 12 * 1024 * 1024
     text_suffixes = {

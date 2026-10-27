@@ -250,7 +250,9 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                               (run["id"], run["project"], run["state"], run["config"], run["result"]))
                 store.put_setting(release.key("run", kind), operation)
                 from types import SimpleNamespace
+                operation_lock = threading.RLock()
                 runtime = SimpleNamespace(store=store, dispatch_lock=threading.RLock(), stop=threading.Event(),
+                                          automation_lock_for=lambda project, kind: operation_lock,
                                           wake=threading.Event(), config=lambda p: config,
                                           project=lambda p: {"id": "project", "path": "unused", "paused": False})
                 target = operation["rollback"] if rollback else operation

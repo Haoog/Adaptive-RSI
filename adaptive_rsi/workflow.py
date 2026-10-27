@@ -22,6 +22,33 @@ NODE_TEST_VALUE_FLAGS = {"-r", "--require", "--import", "--loader", "--experimen
 NODE_TEST_BOOL_FLAGS = {"--test", "--experimental-strip-types"}
 
 
+def pytest_options(args):
+    """Preserve supported pytest configuration while replacing collection paths."""
+    values = {"-c", "--rootdir", "--confcutdir", "--import-mode", "-o", "--override-ini", "-p",
+              "--basetemp", "--tb", "--maxfail", "--color", "--capture", "--assert", "--junitxml"}
+    booleans = {"-q", "-qq", "-v", "-vv", "-vvv", "-s", "-x", "--disable-warnings", "--strict-markers",
+                "--strict-config", "--continue-on-collection-errors", "--noconftest", "--showlocals"}
+    result = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        key, separator, value = item.partition("=")
+        if key in values:
+            result.append(item)
+            if not separator:
+                index += 1
+                if index >= len(args):
+                    return None
+                result.append(args[index])
+        elif item in booleans:
+            result.append(item)
+        elif item.startswith("-"):
+            # Filters (-k/-m), collect-only and plugin flags can hide the new test.
+            return None
+        index += 1
+    return result
+
+
 def unittest_discovery_options(argv):
     """Parse the unittest options we can safely retain while targeting one file."""
     module_index = next((index for index, item in enumerate(argv[:-1])
@@ -228,19 +255,23 @@ def improvement(results, acceptance):
         before = results.get("test_first_baseline", [])
         after = results.get("test_first_candidate", [])
         test_files = acceptance.get("regression_test_files", [])
-        if len(test_files) != 1 or not before or len(before) != len(after):
+        if not 1 <= len(test_files) <= 8 or not before or len(before) != len(after):
             return {"decision": "insufficient_evidence", "kind": acceptance["change_kind"]}
-        old, new = before[0], after[0]
-        same_isolated_check = (str(old.get("name", "")).startswith("isolated regression:") and
-                               old.get("name") == new.get("name") and old.get("argv") == new.get("argv") and
-                               old.get("cwd", ".") == new.get("cwd", "."))
-        failed_on_baseline = (old.get("exit_code") not in (None, 0) and not old.get("error") and
-                              not old.get("empty_tests") and not environment_failure(old))
-        passed_on_candidate = (new.get("passed") is True and new.get("exit_code") == 0 and
-                               not new.get("error") and not new.get("empty_tests"))
-        proven = same_isolated_check and failed_on_baseline and passed_on_candidate
+        improved = []
+        proven = len(before) == len(test_files)
+        for index, (old, new) in enumerate(zip(before, after)):
+            same = (str(old.get("name", "")).startswith("isolated regression:") and
+                    old.get("name") == new.get("name") and old.get("argv") == new.get("argv") and
+                    old.get("cwd", ".") == new.get("cwd", "."))
+            valid_before = (old.get("exit_code") is not None and not old.get("error") and
+                            not old.get("empty_tests") and not environment_failure(old))
+            passed = new.get("passed") is True and new.get("exit_code") == 0 and not new.get("error") and not new.get("empty_tests")
+            proven = proven and same and valid_before and passed
+            if old.get("exit_code") not in (None, 0):
+                improved.append(index)
+        proven = proven and bool(improved)
         return {"decision": "pass" if proven else "insufficient_evidence",
-                "kind": acceptance["change_kind"], "improved_checks": [0] if proven else [],
+                "kind": acceptance["change_kind"], "improved_checks": improved if proven else [],
                 "regression_test_files": test_files,
                 "basis": "isolated_new_test_fails_baseline_and_passes_candidate"}
     before = results.get("acceptance_baseline", [])

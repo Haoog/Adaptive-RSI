@@ -64,3 +64,5 @@ GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并�
 旧 0.3.0 监督协议没有阶段日志或监督锁，因此先给予原监督器 90 秒完成窗口，不因缺少新协议的锁接管或终止候选；届时仍无法确认则保留当前数据库并转为人工恢复。已使用实际已安装的 0.3.0 监督代码，在临时状态目录向当前候选代码执行升级并连续轮询状态，验证正常交接和数据库保留；这不替代正式发布资产的验证。
 
 Codex 已加载的插件元数据仍需刷新 marketplace 并重启 Codex。成功托管升级后，`STATE/installations/current` 是稳定目录入口；wheel 用户使用 pip 更新，或改用随插件提供的启动器。
+
+可选 `updates.require_provenance=true` 会在安装前额外核对 GitHub attestation；默认关闭，详见 [本批加固与配置说明](docs/audit-hardening.md)。桌面 Developer ID 和公证通路需要真实 Apple 凭据；缺少凭据时仍为 ad-hoc 产物。
