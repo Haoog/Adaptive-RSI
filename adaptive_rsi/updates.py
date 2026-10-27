@@ -282,7 +282,7 @@ class UpdateManager:
                             return False
                         if latest.get("state") == "restarting":
                             recovery_required(self.store.root, "Legacy supervisor did not confirm installation within 90 seconds; preserve current database and inspect installations")
-                elif time.time() - status.get("checked", time.time()) > 5 and not supervisor_active(self.store.root):
+                elif time.time() - float(status.get("checked") or 0) > 5 and not supervisor_active(self.store.root):
                     self.recovering = True
             if self.recovering and self.shutdown is not None:
                 plan = self.restart_plan()
@@ -295,9 +295,12 @@ class UpdateManager:
                 # A replacement supervisor waits for this guarded service to release its lock.
                 plan["pid"] = os.getpid()
                 atomic_json(self.store.root / "installations/restart.json", plan)
+                worker_cwd = plan.get("previous")
+                if not worker_cwd or not Path(worker_cwd).is_dir():
+                    worker_cwd = str(self.store.root)
                 with (self.store.root / "update.log").open("ab") as log:
                     subprocess.Popen([sys.executable, "-m", "adaptive_rsi", "--state-dir", str(self.store.root), "update-worker"],
-                                     cwd=plan["previous"], stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+                                     cwd=worker_cwd, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
                 service_pid = plan.get("rollback_pid") if plan.get("phase") in ["rollback_health_check", "rollback_ack"] else plan.get("candidate_pid")
                 if service_pid != os.getpid():
                     self.shutdown()

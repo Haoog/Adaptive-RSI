@@ -66,10 +66,16 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
             detail = (result.get("stderr") or result.get("stdout") or result.get("error") or "").strip()
             msg = "Model transport failed" + (f": {detail[:500]}" if detail else "")
             raise RuntimeError(msg)
-        envelope = json.loads(result["stdout"])
-        if not envelope["ok"]:
-            problem = (ProviderUnavailable(envelope["error"], envelope["code"]) if envelope["unavailable"] else
-                       ModelFailure(envelope["error"], envelope["code"]))
+        try:
+            envelope = json.loads(result["stdout"].strip())
+            if not isinstance(envelope, dict):
+                raise ValueError("Envelope must be an object")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("Model transport returned invalid JSON: " + str(exc)) from None
+        if not envelope.get("ok"):
+            problem = (ProviderUnavailable(envelope.get("error", "Model unavailable"), envelope.get("code"))
+                       if envelope.get("unavailable") else
+                       ModelFailure(envelope.get("error", "Model failure"), envelope.get("code")))
             problem.retry_after = envelope.get("retry_after", 0)
             raise problem
         return envelope["response"]

@@ -8,7 +8,10 @@ from .provider_health import ModelFailure
 
 def main():
     try:
-        response = post_json(*json.load(sys.stdin))
+        raw = sys.stdin.read()
+        if not raw.strip():
+            raise ValueError("Empty transport payload")
+        response = post_json(*json.loads(raw))
         result = {"ok": True, "response": response}
     except Exception as exc:
         result = {"ok": False, "error": str(exc), "code": getattr(exc, "code", "execution"),

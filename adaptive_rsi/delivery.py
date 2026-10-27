@@ -15,7 +15,7 @@ class StaleCandidate(RuntimeError):
 
 
 def _public_text(value, limit=4000):
-    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(value or "")).replace("\r", " ").replace("\n", " ").strip()
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("@", "＠")
     return text[:limit]
 
@@ -31,7 +31,11 @@ def pr_body(task, run, outcome):
         lines += ["## 预期效果", "", _public_text(value["benefit"]), ""]
     lines += ["## 改动", "", _public_text(outcome.get("summary")) or "完成经过验证的改进。", ""]
     if files:
-        lines += ["修改文件：", "", *["- <code>" + html.escape(path).replace("`", "&#96;").replace("\n", "&#10;").replace("\r", "&#13;") + "</code>" for path in files], ""]
+        visible = files[:50]
+        file_lines = ["- <code>" + html.escape(path).replace("`", "&#96;").replace("\n", "&#10;").replace("\r", "&#13;") + "</code>" for path in visible]
+        if len(files) > 50:
+            file_lines.append(f"- <code>... 还有 {len(files) - 50} 个文件 ...</code>")
+        lines += ["修改文件：", "", *file_lines, ""]
     lines += ["## 验证", "",
               "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
               "- 独立验收：" + ("通过" if (evaluation.get("improvement") or {}).get("decision") == "pass" else "见运行记录"),
@@ -61,6 +65,11 @@ def baseline(runtime, project, config):
         cache = runtime.store.root / "remotes" / project["id"]
         if not cache.exists():
             checked(["git", "init", "--bare", "--quiet", str(cache)])
+        for lock in cache.glob("*.lock"):
+            try:
+                lock.unlink()
+            except OSError:
+                pass
         github_git(cache, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
             "+refs/heads/" + branch + ":refs/heads/rsi-baseline", timeout=180)
         sha = git(cache, "rev-parse", "refs/heads/rsi-baseline")

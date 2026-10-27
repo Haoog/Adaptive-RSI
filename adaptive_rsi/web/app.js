@@ -120,7 +120,22 @@ const apiErrors={
  "Candidate evidence is incompatible with current configuration": "候选的评估证据与当前配置不兼容，请重新评估后再启用；当前稳定策略已保留。",
  "Supplement must contain 1..10000 characters": "补充需求不能为空，且不能超过 10000 个字符。请缩短后重试。",
  "Pause or finish active work before supplementing this task": "该任务正在运行或属于系统自动任务，暂不能补充需求。请等待当前运行结束后再试。",
- "Combined requirements exceed 30000 characters": "合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。"
+ "Combined requirements exceed 30000 characters": "合并后的需求超过 30000 个字符。请缩短补充内容；原始需求不会被截断。",
+ "Task dependency cycle": "任务依赖形成环路，无法设置该前置依赖。",
+ "Dependency must be another task in the same project": "前置依赖必须是同一项目下的其他任务。",
+ "Urgency must be 0 or 1": "紧急程度只能为 0 或 1。",
+ "Only waiting tasks can be scheduled": "只有处于排队或暂缓的任务才能设置前置依赖。",
+ "Automatic delivery must be explicitly enabled per project": "自动交付必须在具体项目设置中显式启用，不能在全局开启。",
+ "Parallel project limit is a global setting; select global defaults": "并发项目限制是全局设置，请在全局通用设置中调整。",
+ "Software updates are a global setting": "软件更新是全局通用设置，不能在项目级别单独覆盖。",
+ "Only a verified candidate awaiting approval can be delivered": "只有通过验证且待批准的候选才能交付。",
+ "Independent gates have not passed": "独立验证与审查门禁未全部通过，无法交付。",
+ "No verified code candidate to revert": "没有可回滚的代码候选。",
+ "Explicit confirmation is required to reset invalid project settings": "需要明确确认才能重置无效的项目配置。",
+ "Project configuration is valid; reset is unavailable": "当前项目配置有效，无需重置。",
+ "Project configuration must be a JSON object": "项目配置必须是有效的 JSON 对象。",
+ "Configuration must be an object": "配置必须是对象格式。",
+ "Invalid event pagination": "事件分页参数无效。"
 };
 function reviseForm(form){if(form)formRevisions.set(form,(formRevisions.get(form)||0)+1);}
 for(const type of ['input','change','reset'])document.addEventListener(type,event=>{
@@ -753,6 +768,7 @@ $('goal-text').addEventListener('input',()=>{goalDraftRevisions.set(projectId,(g
 $('project-select').addEventListener('change',()=>{stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;render();safe(refresh);});
 for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>$('project-dialog').showModal());
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
+document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d)d.close();}));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});
 $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
  const unchanged=unchangedForm(event.target,{projectSensitive:false});

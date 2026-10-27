@@ -316,11 +316,14 @@ class Handler(BaseHTTPRequestHandler):
                 from .usage_report import report
                 self.respond(report(store, params))
             elif parsed.path == "/api/events":
-                before = int(params.get("before", [str(2**63 - 1)])[0])
-                limit = int(params.get("limit", ["100"])[0])
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                    limit = int(params.get("limit", ["100"])[0])
+                except (ValueError, TypeError):
+                    raise RequestError("Invalid event pagination") from None
                 project = params.get("project", [""])[0]
                 if not 0 < before <= 2**63 - 1 or not 1 <= limit <= 200:
-                    raise ValueError("Invalid event pagination")
+                    raise RequestError("Invalid event pagination")
                 rows = store.query("SELECT * FROM events WHERE seq<?" +
                                    (" AND (project=? OR project IS NULL)" if project else "") +
                                    " ORDER BY seq DESC LIMIT ?", (before, project, limit + 1) if project else (before, limit + 1))
