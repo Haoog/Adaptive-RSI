@@ -536,6 +536,9 @@ function taskOutcome(data){
  if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}outcome.append(stageProgress(data));return outcome;
 }
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
+ // A request can finish after the user closed the previous detail view.
+ // Only show the dialog after checking that this exact request is still current.
+ const stillCurrent=()=>ticket===detailSequence&&projectId===project&&detailTask?.id===task.id;
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task,queueDraft);
  const evidence=el('details',undefined,'detail-section');let evidenceText=task.evidence||'';try{evidenceText=JSON.stringify(JSON.parse(task.evidence),null,2);}catch{}evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',evidenceText));body.append(evidence);
@@ -583,7 +586,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(task.state==='awaiting_approval'&&!(await uiConfirm(t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？'))))return;
   await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
  restoreView?.(body);
- if(!$('detail-dialog').open)$('detail-dialog').showModal();}
+ if(stillCurrent()&&!$('detail-dialog').open)$('detail-dialog').showModal();}
 const evolutionReasons={
  "Need independent validation/holdout cases before proposing":"需要先导入独立的验证集和最终评估集任务，才能提出改进方案。",
  "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses":"验证集或最终评估集的曝光次数已达上限；请导入新的评估任务，或在项目配置中调高 evolution.max_holdout_uses。",
