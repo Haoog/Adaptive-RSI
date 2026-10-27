@@ -4,6 +4,7 @@ const { createInterface } = require("node:readline");
 const { chromium } = require("playwright");
 
 async function openDetail(page, title, filter) {
+  await closeDetail(page);
   await page.locator('[data-task-filter="' + filter + '"]').click();
   const row = page.locator('.task-row').filter({ hasText: title });
   await row.first().waitFor({ timeout: 10000 });
@@ -13,8 +14,11 @@ async function openDetail(page, title, filter) {
 }
 
 async function closeDetail(page) {
-  await page.evaluate(() => document.getElementById('detail-dialog').close());
-  await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 3000 }).catch(() => {});
+  await page.evaluate(() => {
+    const dialog = document.getElementById('detail-dialog');
+    if (dialog.open) dialog.close();
+  });
+  await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 5000 });
 }
 
 async function checkTaskDetail(browser, url, errors) {
