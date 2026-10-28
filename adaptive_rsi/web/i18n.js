@@ -1,6 +1,10 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "等待磁盘或内存压力解除": "Waiting for disk or memory pressure to clear",
+ "磁盘可用空间下限 / MiB": "Minimum free disk space / MiB",
+ "可用内存下限 / MiB": "Minimum available memory / MiB",
+ "0 表示关闭该项准入检查；资源不足时新任务保持排队，现有任务不会因此失败。内存读数包含平台估计。": "0 disables this admission check. Under resource pressure, new tasks remain queued without failing active tasks. Memory readings include platform estimates.",
  "回滚时的数据兼容条件": "Data compatibility for rollback",
  "未声明兼容，仅人工恢复": "Compatibility undeclared; manual recovery only",
  "确认旧版本可读取迁移后的数据": "Confirm older versions can read migrated data",

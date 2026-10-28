@@ -156,3 +156,5 @@ Deployment supports consecutive-success gates and multiple health endpoints. A r
 Automatic deployment rollback also requires an explicit backward-data-compatibility declaration; otherwise rollback is blocked and maintainer-provided manual recovery steps are shown.
 
 Execution resources queue model calls, commands and exclusive benchmarks by priority. Requests waiting at least 30 seconds take FIFO precedence; diagnostics include bounded wait samples and cancellation receipts.
+
+Optional disk and memory low-water admission keeps new tasks queued until resources recover. Both checks default to disabled; when configured, unavailable measurements also defer admission with an explicit reason.

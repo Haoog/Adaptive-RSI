@@ -108,6 +108,8 @@ class Runtime(Maintenance):
         self.auth_sessions = AuthSessions(self.store.root, config=lambda: self.config())
         from .operations import Operations
         self.operations = Operations(self)
+        from .resource_pressure import PressureMonitor
+        self.resource_pressure = PressureMonitor()
 
     def config(self, project=None):
         override = {}
@@ -1003,6 +1005,14 @@ class Runtime(Maintenance):
                     return (0, -age, services[key])
                 return (1, counts[key] / max(1, pair[1]["schedule"]["weight"]), services[key])
             project, config = min(ready, key=rank)
+            previous_pressure = self.resource_pressure.projects.get(project['id'])
+            pressure = self.resource_pressure.check(self.store.root, project, config)
+            if (previous_pressure and previous_pressure['reasons'] != pressure['reasons'] or
+                    previous_pressure is None and not pressure['admitted']):
+                self.store.event('resource_pressure', 'Execution resource admission changed', project['id'], data=pressure)
+            if not pressure['admitted']:
+                eligible = [(p, c) for p, c in eligible if p['id'] != project['id']]
+                continue
             self.store.put_setting("fair-accounting", {"at": now, "window_seconds": 86400,
                 "unit": "worker_elapsed_seconds", "minimum_run_seconds": 1,
                 "projects": [{"project": p["id"], "seconds": counts[p["id"]],

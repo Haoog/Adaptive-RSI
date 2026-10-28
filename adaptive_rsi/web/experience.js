@@ -8,6 +8,7 @@ window.RSIExperience = (() => {
     ready: "可开始",
     working_hours: "等待工作时段",
     capacity: "等待运行资源",
+    resource_pressure: "等待磁盘或内存压力解除",
   };
   let liveTimer,
     liveBusy = false,

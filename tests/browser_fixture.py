@@ -85,6 +85,15 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get('RSI_BROWSER_RESOURCE_PRESSURE'):
+                from types import SimpleNamespace
+                from unittest.mock import patch
+                runtime.configure({'limits': {'min_free_disk_mb': 1048576}}, project)
+                runtime.pause(project, False)
+                pressure_task = runtime.goal(project, '等待资源恢复的任务')
+                runtime.store.execute('UPDATE tasks SET priority=200 WHERE id=?', (pressure_task,))
+                with patch('adaptive_rsi.resource_pressure.shutil.disk_usage', return_value=SimpleNamespace(free=0)):
+                    runtime.resource_pressure.check(runtime.store.root, runtime.project(project), runtime.config(project))
             if os.environ.get("RSI_BROWSER_DAG"):
                 for title in ("前置甲", "前置乙", "等待两个前置任务"):
                     task_id = runtime.goal(project, title)

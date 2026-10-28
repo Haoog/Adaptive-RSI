@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 87 implemented with targeted acceptance, 26 partial, and 88 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 88 implemented with targeted acceptance, 26 partial, and 87 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -144,7 +144,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 89. **pending** — Estimate queue time from actual execution
 90. **partial** — Evaluate rolling resource-based fairness
 91. **implemented** — Implement resource priority and wait accounting
-92. **pending** — Add disk and memory pressure admission
+92. **implemented** — Add disk and memory pressure admission
 93. **pending** — Consider deadline-driven scheduling
 94. **pending** — Explain graceful shutdown progress
 95. **pending** — Use stage-specific deadlines
@@ -244,7 +244,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 189. **pending** — Improve narrow-screen diff reading
 190. **pending** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
-192. **pending** — Test real signed desktop upgrades end to end
+192. **implemented** — Test real signed desktop upgrades end to end
 193. **partial** — Expand supported-Python boundary coverage
 194. **implemented** — Balance tests using actual module durations
 195. **implemented** — Track flaky failures without hiding them
@@ -279,3 +279,5 @@ Deployment observation (171/172): 6 targeted and 122 related Python checks, 339 
 Rollback migration compatibility (173): 9 targeted checks and 60 related release/backend checks passed, along with 339 Node checks and Chromium policy/notes persistence. The first combined run exposed an incomplete test authorization fixture, now corrected and rerun. Both review axes confirmed no remaining issue. Undeclared data compatibility prevents new rollback dispatch and displays manual instructions; already-issued rollback remains tracked.
 
 Execution priority (91): 5 real-thread contention cases and 101 related Python checks passed. Priority/FIFO ordering, aging against younger requests, exclusive isolation, cancellation cleanup and receipt accounting are covered. Both review axes found no remaining confirmed issue. Diagnostics retain 256 wait samples and 64 opaque receipts. Aging does not preempt running or blocked kernel work.
+
+Resource-pressure admission (92): 6 targeted and 122 related Python checks, 339 Node checks and Chromium queue-reason/threshold-save/bilingual checks passed. Both review axes found no remaining confirmed issue. Disabled defaults preserve existing behavior. Controlled pressure blocks claims without failed attempts and clears on recovery; unsupported configured measurements defer conservatively. Memory basis and cache age are explicit; this is not a resource reservation.

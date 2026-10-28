@@ -29,7 +29,8 @@ DEFAULTS = {
     "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch", "require_provenance": False},
     "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
                "command_seconds": 3600, "concurrency": 1, "retries": 1,
-               "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30},
+               "max_output_mb": 12, "max_changed_files": 0, "retention_days": 30,
+               "min_free_disk_mb": 0, "min_available_memory_mb": 0},
     "sandbox": {"backend": "auto", "image": "python:3.12-slim",
                 "worker_image": "adaptive-rsi-worker:local", "memory_mb": 2048,
                 "cpus": 2, "pids": 128},
@@ -92,6 +93,8 @@ def validate(config):
         config["limits"]["command_seconds"] = DEFAULTS["limits"]["command_seconds"]
     if not 60 <= config["limits"]["command_seconds"] <= 86400:
         raise ValueError("Invalid command timeout: command_seconds must be 60..86400")
+    if any(not 0 <= config['limits'][key] <= 1048576 for key in ('min_free_disk_mb', 'min_available_memory_mb')):
+        raise ValueError('Resource admission thresholds must be 0..1048576 MiB')
     providers = {"openai", "ollama", "lmstudio", "opencode"}
     if len(config["providers"]) > 100:
         raise ValueError("Too many model providers")
@@ -161,7 +164,10 @@ def validate(config):
     from zoneinfo import ZoneInfo
     ZoneInfo(config["schedule"]["timezone"])
     for key, value in config["limits"].items():
-        if value < (0 if key in ["retries", "daily_calls", "run_calls", "run_seconds", "max_changed_files"] else 1) or value > 10000000:            raise ValueError("Invalid positive limit: " + key)
+        zero_allowed = key in ["retries", "daily_calls", "run_calls", "run_seconds", "max_changed_files",
+                               "min_free_disk_mb", "min_available_memory_mb"]
+        if value < (0 if zero_allowed else 1) or value > 10000000:
+            raise ValueError("Invalid positive limit: " + key)
     if config["limits"]["concurrency"] > 4:
         raise ValueError("Maximum concurrency is 4")
     if config["sandbox"]["backend"] not in ["auto", "seatbelt", "docker"]:

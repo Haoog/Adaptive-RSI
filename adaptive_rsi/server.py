@@ -541,7 +541,15 @@ class Handler(BaseHTTPRequestHandler):
                                    params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
                     capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
                     opening = None
+                    pressure = getattr(runtime, 'resource_pressure', None)
+                    pressure = pressure.projects.get(selected) if pressure else None
+                    selected_config = next((p['config'] for p in projects if p['id'] == selected), global_config)
+                    pressure_active = (pressure and time.time() - pressure['checked_at'] < 60 and not pressure['admitted'] and
+                                       pressure['min_free_disk_bytes'] == selected_config['limits']['min_free_disk_mb'] * 1048576 and
+                                       pressure['min_available_memory_bytes'] == selected_config['limits']['min_available_memory_mb'] * 1048576)
                     for task in rows["tasks"]:
+                        if task.get('wait_reason') == 'ready' and pressure_active:
+                            task['wait_reason'] = 'resource_pressure'
                         if task.get("wait_reason") == "ready" and capacity:
                             task["wait_reason"] = "capacity"
                         if task.get("wait_reason") in ["ready", "running"] and selected:
@@ -575,7 +583,8 @@ class Handler(BaseHTTPRequestHandler):
                             "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
                             "config_revision": store.config_revision(selected if selected else None),
                             "global_config_revision": store.config_revision(),
-                            "update": runtime.updates.snapshot(), "schedules": schedules}
+                            "update": runtime.updates.snapshot(), "schedules": schedules,
+                            "resource_admission": pressure}
                     include_candidates = legacy or "candidates" in requested
                     include_analytics = legacy or "analytics" in requested
                     if include_candidates:

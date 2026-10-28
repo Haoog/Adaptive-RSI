@@ -1445,9 +1445,20 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "受控低资源测试中不启动无法完成的工作，压力解除后恢复且不误报任务失败。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/resource_pressure.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_resource_pressure tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_comprehensive_audit tests.test_audit_round6",
+        "node tests/browser_resource_pressure.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Opt-in MiB thresholds default disabled. Low or unavailable configured measurements defer claims without consuming attempts; other eligible projects continue. Memory observations declare platform basis and are cached for five seconds. Visible Linux cgroup v2 limits are considered; inaccessible controllers are not guaranteed. Admission observes current resources but does not reserve them."
     },
     {
       "id": 93,
