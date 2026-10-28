@@ -150,3 +150,5 @@ Experiment cards compare paired quality, token usage (not currency) and latency,
 Database diagnostics correlate slow query fingerprints with opaque request/task/run IDs, separating SQL execution from connection waiting and excluding SQL text and bound parameters. Pool wait quantiles include capacity timeouts and declare their process/window scope. Normal metrics do not perform full relationship scans; explicit diagnostics inspect ownership and evidence links, disclosing per-check truncation. Explicit orphan-stage quarantine is transactional and bounded, retains every original column, and does not automatically delete other kinds of evidence.
 
 Settings include redacted change history and safe undo. Only the latest change with matching revision and content can be undone; later project or global changes reject stale undo.
+
+Deployment supports consecutive-success gates and multiple health endpoints. A round counts only when every endpoint confirms the same commit; rollout and rollback use the same rules.

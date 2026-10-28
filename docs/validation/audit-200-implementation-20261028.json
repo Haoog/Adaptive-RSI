@@ -2573,9 +2573,19 @@
       },
       "source": "adaptive_rsi/release.py",
       "acceptance": "间歇失败服务不能过早稳定，观察窗和失败阈值有界且可解释。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation tests.test_release tests.test_audit_round6",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Optional consecutive-success gate with bounded persisted observations; up to eight HTTPS endpoints share a 15-second per-round deadline. All endpoints must confirm the target SHA. Rollout and rollback apply identical gates and revalidate authorization/ownership after probing. Defaults remain one endpoint and one success."
     },
     {
       "id": 172,
@@ -2585,9 +2595,19 @@
       },
       "source": "adaptive_rsi/release.py",
       "acceptance": "部分区域故障被显式呈现，不把单点成功当作全量健康。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation tests.test_release tests.test_audit_round6",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Optional consecutive-success gate with bounded persisted observations; up to eight HTTPS endpoints share a 15-second per-round deadline. All endpoints must confirm the target SHA. Rollout and rollback apply identical gates and revalidate authorization/ownership after probing. Defaults remain one endpoint and one success."
     },
     {
       "id": 173,
@@ -2993,6 +3013,8 @@
     "7a391e4",
     "7d9d587",
     "b70ef84",
-    "a107b9a"
+    "a107b9a",
+    "64b6d66",
+    "c52d51e"
   ]
 }

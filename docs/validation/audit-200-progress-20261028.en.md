@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 83 implemented with targeted acceptance, 26 partial, and 92 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 85 implemented with targeted acceptance, 26 partial, and 90 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -223,8 +223,8 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 168. **pending** — Explain rewritten or diverged baselines
 169. **pending** — Persist retryable post-processing work
 170. **pending** — Offer optional authenticated event delivery
-171. **pending** — Require sustained deployment health
-172. **pending** — Support bounded multi-target health analysis
+171. **implemented** — Require sustained deployment health
+172. **implemented** — Support bounded multi-target health analysis
 173. **pending** — Declare deployment data compatibility
 174. **pending** — Bind target environments to authorization
 175. **pending** — Break down remote verification time
@@ -273,3 +273,5 @@ Database observability and evidence relationships (109/114/115/116): nine target
 Validation latency (194/201): 57 related regressions pass; five targeted planning tests cover reconstructed release patches, code/extra-file/mode/type contamination, a changed-classifier shell guard, skewed timing allocation, independent selector measurements and bad-cache fallback. Ordinary CI can avoid duplicate functional work for an exact mechanical release-metadata patch. The final exact-head release workflow still requires full Python, browser, desktop build, smoke and provenance before merging. No remote timing improvement is claimed yet. Type/mode changes are now rejected by the shared release validator, following review.
 
 Configuration audit and safe undo (112): 9 targeted and 138 related Python checks, the real Chromium history/undo/draft/bilingual flow, and 339 Node checks passed. Both read-only review axes found no remaining confirmed issue. Private snapshots are transactional; ordinary activity projections hide secrets, including legacy raw configuration events. Revision and content checks reject stale undo. Full-scope release readiness remains false.
+
+Deployment observation (171/172): 6 targeted and 122 related Python checks, 339 Node checks and the real Chromium multi-endpoint/consecutive-policy save, reload and bilingual flow passed. Both read-only review axes found no remaining confirmed issue. Total rounds, per-round shared deadline and retained observations are bounded. Forward deployment and rollback use the same consecutive gate and post-probe authorization/ownership checks. These local checks do not attest a real production deployment.

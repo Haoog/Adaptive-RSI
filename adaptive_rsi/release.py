@@ -396,6 +396,41 @@ def deployment_terminal(data, policy):
     return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded"}
 
 
+def health_sample(policy, sha):
+    """All declared endpoints must agree on one SHA within a shared deadline."""
+    urls = [policy["health_url"], *policy.get("health_urls", [])]
+    if len(urls) == 1:
+        return health_check(urls[0], sha)
+    deadline = time.monotonic() + 15
+    reports = []
+    for url in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reports.append({"url": url, "sha": sha, "healthy": False, "error": "Shared health deadline exhausted"})
+        else:
+            reports.append(health_check(url, sha, timeout=remaining))
+    return {"url": urls[0], "sha": sha, "checked_at": time.time(), "checks": reports,
+            "healthy": all(report.get("healthy") is True for report in reports)}
+
+
+def observe_health(data, report, policy, now):
+    """Persist bounded observations; successes must be consecutive across ticks."""
+    data["health_attempts"] = data.get("health_attempts", 0) + 1
+    data["health_successes"] = data.get("health_successes", 0) + 1 if report.get("healthy") is True else 0
+    data["health"] = report
+    data["health_observations"] = [*data.get("health_observations", []), report][-10:]
+    data["health_gate"] = {"required_consecutive": policy.get("health_consecutive_successes", 1),
+                           "observed_consecutive": data["health_successes"],
+                           "round_limit": policy.get("health_attempts", 1),
+                           "rounds": data["health_attempts"]}
+    if data["health_successes"] >= policy.get("health_consecutive_successes", 1):
+        return "healthy"
+    if data["health_attempts"] >= policy.get("health_attempts", 1):
+        return "health_failed"
+    data["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+    return "pending"
+
+
 def deployment_health(runtime, project, run, data, policy, cancel, persist=save):
     if not policy.get("health_url"):
         return data
@@ -410,23 +445,22 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             persist(runtime, run, "deploy", data)
             return data
         authorized(runtime, project, run, "deploy", policy, cancel)
-        report = health_check(policy["health_url"], data["sha"])
+        report = health_sample(policy, data["sha"])
         with runtime.dispatch_lock:
             authorized(runtime, project, run, "deploy", policy, cancel)
             current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; old health evidence was discarded")
                 return data
-            data["health_attempts"] = data.get("health_attempts", 0) + 1
-            if not report["healthy"] and data["health_attempts"] < policy.get("health_attempts", 1):
-                data.update(health=report, health_retry_at=now + policy.get("health_interval_seconds", 10))
+            observed = observe_health(data, report, policy, time.time())
+            if observed == "pending":
                 persist(runtime, run, "deploy", data)
                 return data
-            data.update(health=report, state="healthy" if report["healthy"] else "health_failed")
-            if not report["healthy"]:
+            data["state"] = observed
+            if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
             persist(runtime, run, "deploy", data)
-            if report["healthy"]:
+            if observed == "healthy":
                 runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
                                           {"sha": data["sha"], "run": run["id"], "health": report})
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
@@ -473,12 +507,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             if now < first + policy.get("health_warmup_seconds", 0) or now < rollback.get("health_retry_at", 0):
                 return data
             authorized(runtime, project, run, "deploy", policy, cancel)
-            rollback["health"] = health_check(policy["health_url"], rollback["sha"])
-            rollback["health_attempts"] = rollback.get("health_attempts", 0) + 1
-            if not rollback["health"]["healthy"] and rollback["health_attempts"] < policy.get("health_attempts", 1):
-                rollback["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
-                return data
-            data["state"] = "rolled_back" if rollback["health"]["healthy"] else "rollback_failed"
+            report = health_sample(policy, rollback["sha"])
+            with runtime.dispatch_lock:
+                authorized(runtime, project, run, "deploy", policy, cancel)
+                current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
+                if current_owner and current_owner["run"] != run["id"]:
+                    data.update(state="superseded", error="A newer deployment owns this target; old rollback health evidence was discarded")
+                    return data
+                observed = observe_health(rollback, report, policy, time.time())
+                if observed != "pending":
+                    data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
     return data
 
 
@@ -611,7 +649,7 @@ def retry(runtime, project_id, run_id, kind):
         if kind == "deploy" and data.get("state") == "health_failed":
             expected_health = encode(data)
             data.update(state="workflow_succeeded", error="", health_attempts=0)
-            for field in ("health_started_at", "health_retry_at"):
+            for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate"):
                 data.pop(field, None)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy)

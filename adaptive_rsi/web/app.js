@@ -743,7 +743,7 @@ function renderSettingsConflicts(key){
 }
 function durationUnit(node){return node.dataset.duration?Number(document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value):1;}
 function fieldValue(node){
- let value=node.type==='checkbox'?node.checked:node.type==='number'?Number(node.value)*durationUnit(node):node.value;
+ let value=node.type==='checkbox'?node.checked:node.type==='number'?Number(node.value)*durationUnit(node):node.dataset.lines?node.value.split('\n').map(line=>line.trim()).filter(Boolean):node.value;
  if(node.dataset.duration&&Math.abs(value-Math.round(value))<1e-7)value=Math.round(value);
  if(node.dataset.duration&&(!Number.isInteger(value)||value<5||value>525600))throw Error(t('检查间隔须为 5 分钟至 365 天，且精确到整分钟。'));
  return value;
@@ -751,7 +751,7 @@ function fieldValue(node){
 function syncDelivery(){
  const deploying=document.querySelector('[data-path="delivery.deploy.enabled"]')?.checked;
  $('deploy-health-settings').hidden=!deploying;
- for(const path of ['health_url','automatic_rollback']){const field=document.querySelector('[data-path="delivery.deploy.'+path+'"]');if(field)field.disabled=!deploying||$('config-scope').value!=='project'||!projectId;}
+ for(const path of ['health_url','health_urls','health_attempts','health_consecutive_successes','health_interval_seconds','health_warmup_seconds','automatic_rollback']){const field=document.querySelector('[data-path="delivery.deploy.'+path+'"]');if(field)field.disabled=!deploying||$('config-scope').value!=='project'||!projectId;}
  const mode=document.querySelector('[data-path="delivery.mode"]').value,auto=document.querySelector('[data-path="delivery.auto_merge"]').checked;
  $('delivery-choice').value=mode==='pr'?(auto?'auto':'pr'):auto?'custom':'local';
  $('delivery-choice').disabled=$('config-scope').value!=='project'||!projectId;
@@ -781,7 +781,7 @@ function syncSchedulePresets(){
  document.querySelectorAll('[data-schedule-preset]').forEach(select=>{const input=document.querySelector('[data-path="schedule.'+select.dataset.schedulePreset+'_minutes"]'),minutes=Number(input.value)*durationUnit(input);select.value=[...select.options].some(o=>o.value===String(minutes))?String(minutes):'custom';});
 }
 function renderSettings(){settingsGeneration++;const feedback=$('settings-form').querySelector('[data-form-error]');if(feedback)feedback.hidden=true;settingsBaseline=structuredClone($('config-scope').value==='global'?state.config:(currentProject()?.config||state.config));
- document.querySelectorAll('[data-path]').forEach(node=>{const value=getPath(settingsBaseline,node.dataset.path);if(node.type==='checkbox')node.checked=value;else node.value=value??'';if(node.dataset.duration){const factor=value%1440===0?1440:value%60===0?60:1;document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value=String(factor);document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}});
+ document.querySelectorAll('[data-path]').forEach(node=>{const value=getPath(settingsBaseline,node.dataset.path);if(node.type==='checkbox')node.checked=value;else node.value=node.dataset.lines&&Array.isArray(value)?value.join('\n'):value??'';if(node.dataset.duration){const factor=value%1440===0?1440:value%60===0?60:1;document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value=String(factor);document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}});
  document.querySelector('[data-path="limits.concurrency"]').disabled=$('config-scope').value!=='global';
  document.querySelectorAll('[data-path^="delivery."]').forEach(node=>node.disabled=$('config-scope').value!=='project'||!projectId);
  document.querySelectorAll('[data-path^="updates."]').forEach(node=>node.disabled=$('config-scope').value!=='global');

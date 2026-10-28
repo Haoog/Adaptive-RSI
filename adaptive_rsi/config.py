@@ -38,7 +38,8 @@ DEFAULTS = {
     "delivery": {"mode": "local", "auto_merge": False, "base_branch": "", "feedback_minutes": 1440,
                  "release": {"enabled": False, "workflow": "", "ref": "", "sha": ""},
                  "deploy": {"enabled": False, "workflow": "", "ref": "", "sha": "", "health_url": "", "automatic_rollback": False,
-                            "health_attempts": 1, "health_interval_seconds": 10, "health_warmup_seconds": 0}},
+                            "health_attempts": 1, "health_interval_seconds": 10, "health_warmup_seconds": 0,
+                            "health_consecutive_successes": 1, "health_urls": []}},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -194,14 +195,23 @@ def validate(config):
             raise ValueError("Automation requires the trusted workflow tag's full commit SHA")
         if target["enabled"] and (not repo or not all(target[k] for k in ["workflow", "ref", "sha"])):
             raise ValueError("Release/deploy requires an explicit project and a pinned workflow tag")
-    health = urlsplit(delivery["deploy"]["health_url"])
-    if delivery["deploy"]["health_url"] and (health.scheme != "https" or not health.hostname or health.username is not None or
-            health.password is not None or health.query or health.fragment or
-            any(c.isspace() or ord(c) < 32 for c in delivery["deploy"]["health_url"])):
-        raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
+    additional = delivery["deploy"]["health_urls"]
+    if (len(additional) > 7 or any(not isinstance(url, str) or not url for url in additional) or
+            additional and not delivery["deploy"]["health_url"]):
+        raise ValueError("Additional deployment health URLs require a primary URL and at most seven HTTPS targets")
+    urls = [delivery["deploy"]["health_url"], *additional]
+    if len([url for url in urls if url]) != len(set(url for url in urls if url)):
+        raise ValueError("Deployment health URLs must be unique")
+    for url in urls:
+        health = urlsplit(url)
+        if url and (health.scheme != "https" or not health.hostname or health.username is not None or
+                health.password is not None or health.query or health.fragment or
+                any(c.isspace() or ord(c) < 32 for c in url)):
+            raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
     if (not 1 <= delivery["deploy"]["health_attempts"] <= 10 or
+            not 1 <= delivery["deploy"]["health_consecutive_successes"] <= delivery["deploy"]["health_attempts"] or
             not 1 <= delivery["deploy"]["health_interval_seconds"] <= 300 or
             not 0 <= delivery["deploy"]["health_warmup_seconds"] <= 900):
         raise ValueError("Invalid deployment health retry policy")

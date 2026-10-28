@@ -1,6 +1,12 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "其他健康检查地址（每行一个）": "Additional health URLs (one per line)",
+ "最多增加 7 个端点；每一轮所有端点必须确认同一完整提交 SHA。": "Add up to seven endpoints; every endpoint must confirm the same full commit SHA in each round.",
+ "最多检查轮数": "Maximum health rounds",
+ "要求连续成功轮数": "Required consecutive successful rounds",
+ "轮次间隔（秒）": "Round interval (seconds)",
+ "启动预热（秒）": "Startup warmup (seconds)",
  "设置变更记录": "Settings change history",
  "仅最新且未被覆盖的设置可以撤销；活动中的任务继续使用原快照。": "Only the latest unchanged configuration can be undone; active tasks retain their original snapshot.",
  "撤销这次设置修改": "Undo this settings change",
