@@ -1280,9 +1280,14 @@
       },
       "source": "desktop/src-tauri/src/native_update.rs",
       "acceptance": "成功、取消及恢复均有明确记录，回执不含用户认证信息。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update_receipt.cjs"
+      ]
     },
     {
       "id": 80,

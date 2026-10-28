@@ -34,10 +34,11 @@ window.RSINativeUpdate=(()=>{
    buttons[action]=[button,text];
   }
   const manual=el('a');manual.href='https://github.com/Haoog/Adaptive-RSI/releases/latest';manual.target='_blank';manual.rel='noreferrer';
+  const receipt=el('button',undefined,'button');receipt.type='button';receipt.onclick=()=>safe(exportReceipt);
   const scope=el('p',undefined,'muted'),saved=el('p',undefined,'form-error');
-  panel.append(status,progress,error,details,label,scopeLabel,windowLabel,scope,...Object.values(buttons).map(row=>row[0]),manual,saved);
+  panel.append(status,progress,error,details,label,scopeLabel,windowLabel,scope,...Object.values(buttons).map(row=>row[0]),manual,receipt,saved);
   $('update-status').after(panel);
-  nodes={panel,status,progress,error,details,summary,notes,labelText,select,options,buttons,manual,scope,saved,scopeText,scopeSelect,scopeOptions,windowText,windowSelect,windowOptions};
+  nodes={panel,status,progress,error,details,summary,notes,labelText,select,options,buttons,manual,receipt,scope,saved,scopeText,scopeSelect,scopeOptions,windowText,windowSelect,windowOptions};
  }
  function render(){
   if(!enabled())return;
@@ -61,7 +62,19 @@ window.RSINativeUpdate=(()=>{
    button.hidden=action==='download'?snapshot.state!=='available':action==='install'?snapshot.state!=='ready':action==='cancel'?!['downloading','waiting_idle'].includes(snapshot.state):false;
   }
   n.manual.textContent=t('手动下载安装包');
+  n.receipt.textContent=t('导出升级回执');
   n.saved.hidden=!storageError;n.saved.textContent=t('偏好未保存到磁盘，本次会话已生效。');
+ }
+ function exportReceipt(){
+  const receipt={receipt_version:1,generated_at:new Date().toISOString(),
+   current_version:snapshot.current_version||'',target_version:snapshot.version||'',
+   state:snapshot.state||'',error_code:snapshot.error_code||'',
+   policy,version_scope:versionScope,install_window:installWindow,
+   platform:(window.navigator&&navigator.platform)||'',locale:document.documentElement.lang||''};
+  const blob=new Blob([JSON.stringify(receipt,null,2)],{type:'application/json'});
+  const link=document.createElement('a');link.href=URL.createObjectURL(blob);
+  link.download='adaptive-rsi-update-receipt.json';link.click();URL.revokeObjectURL(link.href);
+  return receipt;
  }
  function eligible(current,target,scope=versionScope){
   const parse=value=>/^\d+\.\d+\.\d+$/.test(value||'')?value.split('.').map(Number):null,a=parse(current),b=parse(target);

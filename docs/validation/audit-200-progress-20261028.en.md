@@ -6,7 +6,7 @@ Current continuation: the user has authorized work to continue. Read the [curren
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 116 implemented with targeted acceptance, 55 partial, and 30 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 117 implemented with targeted acceptance, 55 partial, and 29 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -133,7 +133,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 76. **pending** — Diagnose proxy and certificate configuration
 77. **partial** — Explain which components an update affects
 78. **implemented** — Add update maintenance windows
-79. **pending** — Export upgrade receipts
+79. **implemented** — Export upgrade receipts
 80. **partial** — Negotiate feature capabilities
 81. **implemented** — Support bounded dependency DAGs
 82. **implemented** — Preview dependency cancellation effects

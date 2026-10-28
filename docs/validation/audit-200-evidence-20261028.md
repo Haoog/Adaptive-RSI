@@ -84,7 +84,7 @@
 | 76 | 待做 | 提供代理和企业证书连接诊断 | — | — |
 | 77 | 部分完成 | 升级确认说明本机客户端与运行服务的作用范围 | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | — |
 | 78 | 已实现 | 自动安装增加维护时间窗口 | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
-| 79 | 待做 | 提供可导出的升级回执 | — | — |
+| 79 | 已实现 | 提供可导出的升级回执 | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) <br> [adaptive_rsi/web/i18n.js](../../adaptive_rsi/web/i18n.js) | `node --test tests/web_native_update_receipt.cjs` |
 | 80 | 部分完成 | 按功能能力协商和界面降级 | [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) <br> [adaptive_rsi/contracts.py](../../adaptive_rsi/contracts.py) | `node tests/browser_frontend_remaining.cjs` |
 | 81 | 已实现 | 任务依赖从单前置扩展为受控 DAG | [adaptive_rsi/task_dependencies.py](../../adaptive_rsi/task_dependencies.py) <br> [adaptive_rsi/migrations/006_dependency_dag.sql](../../adaptive_rsi/migrations/006_dependency_dag.sql) <br> [adaptive_rsi/store.py](../../adaptive_rsi/store.py) <br> [adaptive_rsi/web/experience.js](../../adaptive_rsi/web/experience.js) | `python3 -B -m unittest tests.test_dependency_dag` <br> `node tests/browser_dependency_dag.cjs` <br> `node --test tests/web_*.cjs` |
 | 82 | 已实现 | 取消前置任务时预览受影响的后继 | [adaptive_rsi/task_lifecycle.py](../../adaptive_rsi/task_lifecycle.py) <br> [adaptive_rsi/runtime.py](../../adaptive_rsi/runtime.py) <br> [adaptive_rsi/server.py](../../adaptive_rsi/server.py) <br> [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) | `python3 -B -m unittest tests.test_task_lifecycle` <br> `node tests/browser_task_detail.cjs` <br> `node tests/browser_revision_flow.cjs` |
