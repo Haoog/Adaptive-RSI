@@ -192,7 +192,7 @@ def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     subprocess.run(["cargo", "run", "--quiet", "--locked", "--manifest-path",
                     str(ROOT / "desktop/src-tauri/Cargo.toml"), "--bin", "verify_updater", "--",
                     str(output / name), str(output / (name + ".sig")), version], check=True, timeout=120)
-    feed = {"version": version, "notes": "", "platforms": {"darwin-aarch64": {
+    feed = {"version": version, "notes": "", "size": (output / name).stat().st_size, "platforms": {"darwin-aarch64": {
         "signature": signed,
         "url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + version + "/" + name}}}
     (output / "desktop-latest.json").write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")

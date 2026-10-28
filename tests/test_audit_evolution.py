@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from adaptive_rsi.config import fingerprint
 from adaptive_rsi.evolution import Evolution
@@ -55,6 +56,13 @@ class AuditEvolutionTest(unittest.TestCase):
             self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
                                (split, 'p', split, split, encode(spec), holdout_uses if split == 'holdout' else 0, 1))
         return {'id': 'p'}, repo, self.root / 'run', {'id': 'run', 'task': 'task', 'config': encode(self.config)}
+
+    def test_manifest_failure_leaves_no_holdout_reservation(self):
+        args = self.setup_proposal()
+        with patch('adaptive_rsi.evolution.git', side_effect=RuntimeError('repository unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'repository unavailable'):
+                self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
 
     @unittest.skip("待实现：付费前要求全新 holdout 与现有 max_holdout_uses 复用契约冲突")
     def test_no_fresh_holdout_stops_before_any_paid_call(self):

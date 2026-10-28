@@ -296,9 +296,6 @@ class Evolution:
                           (project["id"], time.time() - 3600)):
             return {"reason": "Another proposal currently reserves the holdout cases", "status": "insufficient_evidence"}
         reservation = uid()
-        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
-            (reservation, project["id"], "strategy", "reserved", encode({"guidance": "", "triggers": []}),
-             encode({"reservation": {"holdout": reserved}, "reason": "reserved"}), time.time()))
         manifest = []
         for case in cases:
             spec = json.loads(case["spec"])
@@ -327,6 +324,11 @@ class Evolution:
         current = self.runtime.active_strategies(project["id"])
         archive = self.store.query("SELECT id,kind,content,status FROM candidates WHERE project=? "
                                    "ORDER BY created DESC LIMIT 20", (project["id"],))
+        # Reserve only for the paid call window: manifest or observation reads may
+        # fail and must not leave a blocking reservation behind.
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (reservation, project["id"], "strategy", "reserved", encode({"guidance": "", "triggers": []}),
+             encode({"reservation": {"holdout": reserved}, "reason": "reserved"}), time.time()))
         try:
             proposal = self.runtime.invoke("evolution", "Propose one small, testable improvement to agent execution, "
                                        "opportunity discovery/meta-planning, or toolchain/context adapter guidance. "
