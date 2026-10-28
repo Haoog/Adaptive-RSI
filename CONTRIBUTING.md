@@ -8,15 +8,32 @@
 
 需要 Python 3.9+。支持 macOS Seatbelt 和 Linux Docker；模型可走 Codex、OpenCode CLI 或支持工具调用的原生 API。GitHub 导入、同步及确认后的交付使用已登录的 `gh`。日常测试通过替代模型接口运行，不需要付费调用。
 
-日常开发不必每次跑全量测试（约 8 分钟）。按 CI 的分组只跑受影响的模块，例如 `python3 -m unittest tests.test_runtime.RuntimeTest` 或 `python3 -m unittest tests.test_store`；推送后由 CI 并行执行全量检查。
+日常修改先跑具体用例或受影响模块；整理好一批改动后再执行全量检查。推送后的 CI 保留平台兼容、隔离和发布门禁。不要在每次小改动后重复安装依赖、构建桌面应用或重跑全部浏览器场景。
 
 ```sh
-python3 -m unittest discover -v
+# 单个失败用例或一个模块，直接运行即可
+python3 -B -m unittest tests.test_store -q
+# 多个独立模块，最多四个进程；真实耗时只用于下次分组，不跳过测试
+python3 -B scripts/test_selected.py --durations .ci/selected-durations.json tests.test_validation_planning tests.test_release_parallel
+# 浏览器场景先查看选择范围，再执行；可单选 hardening 的一个分组
+npm run test:browser -- --list browser_task_detail.cjs
+npm run test:browser -- browser_task_detail.cjs
+npm run test:browser -- browser_hardening.cjs:routes
+```
+
+修改前端共享请求、状态或渲染逻辑时，运行 `node --test tests/web_*.cjs` 以及相关真实浏览器场景；修改后端共享运行时、数据或隔离边界时，扩大到对应模块并在交付前运行全量。文档改动使用 `python3 -B scripts/check_docs.py`。首次准备环境或锁文件变化后才需要 `npm ci --ignore-scripts` 和浏览器安装。
+
+选择器会在启动任何进程前展开成具体用例：整类与其中某个方法同时选择、选择器互相包含、或选择不到任何用例，都会直接报错而不启动 worker。worker 内禁止再启动 runner（`RSI_TEST_ACTIVE`），父进程结束后 worker 也会自行退出。这两道护栏是防止测试递归耗尽系统资源的硬性边界，不要为了让某个测试跑起来而绕过；需要嵌套执行时请显式拆分批次。
+
+批次完成后的完整本地检查如下。全量 Python 按完整 discovery 分配到最多四个进程，未缓存时按测试数分组，后续按真实模块耗时分组；串行 discovery 仍可用于排查顺序相关问题。
+
+```sh
+python3 -B scripts/test_parallel.py --durations .ci/test-durations.json
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
 node --check adaptive_rsi/web/auth.js
-node --test tests/web_requests.cjs
+node --test tests/web_*.cjs
 npm ci --ignore-scripts
 npx playwright install chromium
 npm run test:browser

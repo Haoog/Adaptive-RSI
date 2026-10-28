@@ -126,8 +126,10 @@ Long-term capability improvement still requires real tasks and sustained experim
 
 ## Development
 
+Start local changes with affected modules and browser scenarios; see the [layered validation commands](CONTRIBUTING.en.md#local-development). Run the full checks when a batch is ready:
+
 ```sh
-python3 -m unittest discover -v
+python3 -B scripts/test_parallel.py --durations .ci/test-durations.json
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 npm run test:browser

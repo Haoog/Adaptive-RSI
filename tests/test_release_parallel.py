@@ -16,6 +16,48 @@ from scripts import test_parallel as parallel
 
 
 class ParallelReleaseTest(unittest.TestCase):
+    def test_log_reader_cannot_rewind_a_running_workers_output(self):
+        writes = []
+        class RunningWorker:
+            returncode = None
+
+            def __init__(self, descriptor):
+                self.descriptor = descriptor
+                self.iteration = 0
+
+            def poll(self):
+                self.iteration += 1
+                if self.iteration == 1:
+                    os.write(self.descriptor, b'first result\n')
+                    return None
+                os.write(self.descriptor, b'second result\n')
+                self.returncode = 0
+                return 0
+
+        def spawn(*args, **kwargs):
+            log = kwargs['stdout']
+            process = RunningWorker(os.dup(log.fileno()))
+            seek = log.seek
+            def write_during_read(*args, **kwargs):
+                result = seek(*args, **kwargs)
+                # A child write can race a parent that just rewound its reader.
+                os.write(process.descriptor, b'concurrent result\n')
+                return result
+            log.seek = write_during_read
+            writes.append(process.descriptor)
+            return process
+
+        output = io.StringIO()
+        try:
+            with patch.object(parallel.subprocess, 'Popen', side_effect=spawn), \
+                    patch.object(parallel.time, 'sleep'), redirect_stdout(output):
+                self.assertEqual(parallel.run_groups([['tests.synthetic']]), 0)
+            self.assertIn('first result', output.getvalue())
+            self.assertIn('second result', output.getvalue())
+        finally:
+            for descriptor in writes:
+                os.close(descriptor)
+
     def test_groups_cover_exact_discovery_once_including_platform_tests(self):
         groups = parallel.discover_groups()
         self.assertEqual(len(groups), 4)

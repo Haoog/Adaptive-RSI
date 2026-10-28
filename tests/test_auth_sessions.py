@@ -116,6 +116,19 @@ class AuthSessionTests(unittest.TestCase):
             time.sleep(0.005)
         self.fail("Expected " + state + ": " + repr(result))
 
+    def test_corrupt_credentials_preserve_healthy_backend_snapshot(self):
+        for broken in ("codex", "opencode"):
+            with self.subTest(backend=broken):
+                def read(path):
+                    if ("codex" in str(path)) == (broken == "codex"):
+                        raise AuthError("invalid_credentials")
+                    return {"tokens": {"refresh_token": "fixture"}, "openai": {"type": "api"}}
+                with patch("adaptive_rsi.auth_sessions._read_json", side_effect=read):
+                    result = self.manager.snapshot()
+                self.assertEqual(result[broken]["error"], "invalid_credentials")
+                self.assertEqual(result[broken]["state"], "signed_out")
+                self.assertEqual(result["opencode" if broken == "codex" else "codex"]["state"], "authenticated")
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)

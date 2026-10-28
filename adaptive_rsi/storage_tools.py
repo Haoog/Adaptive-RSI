@@ -212,6 +212,35 @@ def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 10
             Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
+def _restore_result(raw):
+    """Decode historical result evidence without letting one row abort the restore."""
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        value = None
+    if isinstance(value, dict):
+        return value
+    # Preserve the original bytes so a malformed historical record stays diagnosable.
+    return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
+
+
+def _validate_recovery_schema(db, version):
+    from .schema_migrations import validate_history
+    db.row_factory = sqlite3.Row
+    if version > 2:
+        raise ValueError("Backup schema is newer than this runtime")
+    try:
+        validate_history(db)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    tables = ["projects", "tasks", "runs", "settings"]
+    if version >= 2:
+        tables += ["task_decisions", "task_revisions", "task_dependencies", "submissions",
+                   "phase_times", "remote_waits", "task_completions", "schema_migrations"]
+    for table in tables:
+        db.execute("SELECT * FROM " + table + " LIMIT 0")
+
+
 def verify_backup(path, deadline=None):
     """Open a backup in read-only mode and prove it is a usable state snapshot."""
     path = Path(path).expanduser().absolute()
@@ -225,10 +254,9 @@ def verify_backup(path, deadline=None):
         version = db.execute("PRAGMA user_version").fetchone()[0]
         if version > 2:
             raise ValueError("Backup schema is newer than this runtime")
+        _validate_recovery_schema(db, version)
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Backup contains invalid relationships")
-        for table in ("projects", "tasks", "runs", "settings"):
-            db.execute("SELECT * FROM " + table + " LIMIT 0")
     return {"valid": True, "schema_version": version, "bytes": path.stat().st_size}
 
 
@@ -330,14 +358,7 @@ def restore(source, destination):
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
-        tables = ["projects", "tasks", "runs", "settings"]
-        # Parent schema version 1 databases did not have these additive tables;
-        # Store performs the supported migration after the snapshot is copied.
-        if version >= 2:
-            tables += ["task_decisions", "task_revisions", "task_dependencies", "submissions",
-                       "phase_times", "remote_waits", "task_completions", "schema_migrations"]
-        for table in tables:
-            db.execute("SELECT * FROM " + table + " LIMIT 0")
+        _validate_recovery_schema(db, version)
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Backup contains invalid relationships")
         if db.execute("SELECT 1 FROM runs r LEFT JOIN tasks t ON t.id=r.task "
@@ -363,12 +384,7 @@ def restore(source, destination):
                 db.execute("UPDATE tasks SET state='expired' WHERE state='awaiting_approval'")
                 invalidated = db.execute("SELECT id,result FROM runs WHERE state='awaiting_approval'").fetchall()
                 for row in invalidated:
-                    try:
-                        result = json.loads(row["result"] or "{}")
-                    except (TypeError, ValueError):
-                        result = {}
-                    if not isinstance(result, dict):
-                        result = {}
+                    result = _restore_result(row["result"])
                     # Candidate workspaces are not part of the database snapshot; record the real reason.
                     result["restore_invalidation"] = {"reason": "candidate_not_in_backup"}
                     db.execute("UPDATE runs SET state='expired',result=? WHERE id=?",
@@ -389,8 +405,11 @@ def restore(source, destination):
                                 restore_invalidation="case_files_not_in_database_backup")
                     db.execute("UPDATE cases SET spec=? WHERE id=?", (json.dumps(spec), case["id"]))
                 for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
-                    result = json.loads(row["result"])
-                    result["feedback"] = unavailable_feedback(result.get("feedback", {}))
+                    result = _restore_result(row["result"])
+                    previous = result.get("feedback", {})
+                    if not isinstance(previous, dict):
+                        previous = {"restore_invalidation": {"original_feedback": previous}}
+                    result["feedback"] = unavailable_feedback(previous)
                     db.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), row["id"]))
                 # Local verification caches describe artifacts/environments absent from this restore.
                 # Keep sealed remote identities, PR receipts and automation reconciliation state.

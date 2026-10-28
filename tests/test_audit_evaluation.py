@@ -26,6 +26,62 @@ class AuditEvaluationTest(unittest.TestCase):
         store.data['sealed-read-checkpoint:read']['result']['pass'] = False
         self.assertIsNone(runner.reuse_checkpoint('read', inputs))
 
+    def test_clean_committed_harness_change_cannot_reuse_frozen_regression(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.gitops import git, snapshot
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            git(source, 'init', '-q')
+            (source / 'test_value.py').write_text('assert True\n')
+            git(source, 'add', '.')
+            git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
+            candidate = snapshot(source, root / 'candidate')
+            (candidate / 'test_value.py').write_text('assert False\n')
+            git(candidate, 'add', '.')
+            git(candidate, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
+            check = {'name': 'criterion', 'argv': ['python3', 'test_value.py']}
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                failed = 'False' in (Path(workspace) / 'test_value.py').read_text()
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': int(failed),
+                        'stdout': '', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': [check]}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state')).evaluate(
+                    source, candidate, [check], root / 'evaluation', merge(DEFAULTS, {}), changed_files=[])
+            self.assertFalse(result['candidate_full_reused'])
+            self.assertTrue(result['checks']['candidate'][0]['passed'])
+            self.assertFalse(result['checks']['candidate_full'][0]['passed'])
+            self.assertEqual(result['decision'], 'fail')
+
+    def test_detected_additions_run_once_with_unchanged_harness(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            checks = [{'name': name, 'argv': ['python3', '-c', 'print(1)'], 'timeout_seconds': i + 1}
+                      for i, name in enumerate(['fixed', 'detected'])]
+            # Different argv are distinct commands; timeout is also part of the identity.
+            checks[1]['argv'][-1] = 'print(2)'
+            calls = []
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                calls.append((Path(workspace).name, check['name']))
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': '', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': checks}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state')).evaluate(
+                    source, source, checks[:1], root / 'evaluation', merge(DEFAULTS, {}))
+            self.assertEqual([name for stage, name in calls if stage != 'baseline'], ['fixed', 'detected'])
+            self.assertEqual(len(result['checks']['candidate_full']), 2)
+
     def test_exact_host_tool_versions_are_recorded_without_cache_authorization(self):
         tools = evaluator.host_tool_versions([{'argv': ['python3', '-m', 'unittest']}])
         self.assertIn('python3', tools)

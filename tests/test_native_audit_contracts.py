@@ -19,6 +19,23 @@ class NativeAuditContractsTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.tools = WorkspaceTools(self.root, "review", self.root / "state", {"limits": {"command_seconds": 30}}, None, ())
 
+    def test_capability_override_has_provenance_and_rejects_invalid_limits(self):
+        from adaptive_rsi.agent import model_capabilities
+        result = model_capabilities("unknown", "responses", {"context_tokens": 4096,
+            "max_output_tokens": 1024, "updated_at": "2026-10-28"})
+        self.assertEqual(result["context_tokens"], 4096)
+        self.assertEqual(result["source"], "manual")
+        self.assertEqual(result["updated_at"], "2026-10-28")
+        self.assertFalse(result["streaming_implemented"])
+        self.assertEqual(result["metadata_version"], 1)
+        for override in [{"context_tokens": True}, {"max_output_tokens": -1},
+                         {"context_tokens": 4096, "max_output_tokens": 8192}]:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                model_capabilities("unknown", "responses", override)
+        heuristic = model_capabilities("gpt-future-unverified", "responses")
+        self.assertEqual(heuristic["confidence"], "heuristic")
+        self.assertIsNone(heuristic["updated_at"])
+
     def test_transport_receipts_distinguish_rejected_and_ambiguous_billing(self):
         errors = [
             (urllib.error.URLError(ConnectionRefusedError()), "not_sent", False),

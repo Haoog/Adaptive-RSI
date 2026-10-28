@@ -1240,7 +1240,7 @@ class ServerTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.runtime = Runtime(Store(self.tmp.name), FakeAgent())
         self.server = Server(self.runtime)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
 
     def tearDown(self):

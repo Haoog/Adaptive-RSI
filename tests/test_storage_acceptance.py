@@ -20,6 +20,58 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.store.execute("INSERT INTO projects VALUES ('p','private project','/private/source','{}',0,0)")
 
+    def test_incompatible_migration_backup_never_evicts_recovery_point(self):
+        import os
+        import sqlite3
+        good = storage_tools.backup(self.store)
+        good_path = self.store.root / 'backups' / (good['id'] + '.sqlite3')
+        os.utime(good_path, (1, 1))
+        for corruption in ('future', 'checksum', 'gap'):
+            with self.subTest(corruption=corruption):
+                bad = storage_tools.backup(self.store)
+                path = good_path.parent / (bad['id'] + '.sqlite3')
+                with sqlite3.connect(path) as db:
+                    if corruption == 'future':
+                        db.execute("INSERT INTO schema_migrations VALUES (999,'future',0)")
+                    elif corruption == 'checksum':
+                        db.execute("UPDATE schema_migrations SET checksum='changed' WHERE version=3")
+                    else:
+                        db.execute("DELETE FROM schema_migrations WHERE version=2")
+                with self.assertRaisesRegex(ValueError, 'migration'):
+                    storage_tools.verify_backup(path)
+                report = storage_tools.retain_backups(self.store, max_count=1)
+                self.assertEqual(report['protected'], good_path.name)
+                self.assertIn(path.name, report['invalid'])
+                self.assertTrue(good_path.exists())
+                destination = self.root / ('rejected-' + corruption)
+                with self.assertRaisesRegex(ValueError, 'migration'):
+                    storage_tools.restore(path, destination)
+                self.assertFalse(destination.exists())
+                self.assertFalse(storage_tools.rehearse_restore(path)['valid'])
+                path.unlink()
+
+    def test_restore_preserves_malformed_historical_results(self):
+        for index, raw in enumerate(('[]', 'null', '42', '"scalar"', '{broken')):
+            self.store.execute("INSERT INTO runs(id,project,state,result,ended) VALUES (?,'p','merged',?,1)",
+                               ('bad' + str(index), raw))
+        healthy = {'pr': 'fixture', 'review': {'approved': True}, 'feedback': {'state': 'old'}}
+        self.store.execute("INSERT INTO runs(id,project,state,result,ended) VALUES ('healthy','p','pr_open',?,1)",
+                           (json.dumps(healthy),))
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+        destination = self.root / 'restored'
+        storage_tools.restore(source, destination)
+        restored = Store(destination)
+        self.addCleanup(restored.close)
+        for index, raw in enumerate(('[]', 'null', '42', '"scalar"', '{broken')):
+            result = json.loads(restored.one('SELECT result FROM runs WHERE id=?', ('bad' + str(index),))['result'])
+            self.assertEqual(result['restore_invalidation']['original_result'], raw)
+            self.assertEqual(result['feedback']['state'], 'insufficient_evidence')
+        result = json.loads(restored.one("SELECT result FROM runs WHERE id='healthy'")['result'])
+        self.assertEqual(result['review'], healthy['review'])
+        self.assertEqual(result['feedback']['previous'], healthy['feedback'])
+        self.assertTrue(storage_tools.rehearse_restore(source)['valid'])
+
     def test_corrupt_setting_isolated_and_typed_namespace_expires(self):
         self.store.execute("INSERT INTO settings VALUES ('broken','not-json')")
         self.assertEqual(self.store.setting('broken', {'fallback': True}), {'fallback': True})

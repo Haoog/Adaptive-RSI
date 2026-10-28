@@ -1,0 +1,1531 @@
+{
+  "baseline_commit": "e78aea5cc892010b86987bac8fc54254728370a4",
+  "branch": "chore/audit-validation-feedback-20261028",
+  "scope": "Current whole-project review; independent findings, isolated probes and local validation. No remote CI/release certification.",
+  "total_findings": 39,
+  "counts": {
+    "severity": {
+      "P1": 3,
+      "P2": 30,
+      "P3": 6
+    },
+    "kind": {
+      "bug": 27,
+      "performance": 10,
+      "improvement": 2
+    },
+    "confidence": {
+      "confirmed": 34,
+      "code_supported": 5
+    },
+    "status": {
+      "open": 33,
+      "fixed_in_working_tree": 6
+    },
+    "area": {
+      "data": 5,
+      "delivery": 6,
+      "desktop": 5,
+      "frontend": 5,
+      "runtime": 4,
+      "validation": 14
+    }
+  },
+  "historical_ledger": {
+    "path": "docs/validation/audit-200-implementation-20261028.json",
+    "counts": {
+      "implemented": 114,
+      "partial": 56,
+      "pending": 31
+    },
+    "remaining": 87,
+    "limitation": "Historical statuses are not re-certified and are not added to this finding count."
+  },
+  "validation": {
+    "python_baseline_seconds": 310.8408002909273,
+    "python_final_seconds": 131.6767974998802,
+    "reduction_percent": 57.638509044939056,
+    "speed_ratio": 2.3606345703479774,
+    "original_groups_retained": true,
+    "baseline_test_count": 1075,
+    "final_discovered": 1078,
+    "final_executed": 1068,
+    "final_skipped": 10,
+    "node_tests": {
+      "tests": 356,
+      "pass": 356,
+      "fail": 0,
+      "skipped": 0
+    },
+    "browser_scenarios": 35,
+    "browser_seconds": 117.42783441697247,
+    "limitations": [
+      "Single local macOS arm64 Python 3.14 comparison, not a controlled multi-run benchmark.",
+      "Three regression tests were added; no existing test was removed.",
+      "The earlier 130.995-second run had incomplete log counts and is not the final evidence.",
+      "Linux Docker, remote CI, desktop build and signed installation were not run."
+    ],
+    "file_sha256": {
+      "CONTRIBUTING.en.md": "c5dccb08eed20f1ac496169f3bbc12e7142ea0597350a7d044236da35d8bb9c5",
+      "CONTRIBUTING.md": "55e531a2022cfe27d9c02747fd684f325a1262e2c277e370ba36d7a4f568443a",
+      "README.en.md": "91ae190df3e281f27316dff1ef94e8801a28bdab2d2db985544311e2ef4823f6",
+      "README.md": "34d1bb93d48fb7c468188b890ae345272245c01fb8355ad9f8a906c8566c4799",
+      "adaptive_rsi/process.py": "3f1c658b4edd4e1694e513ff8d3a210d9f752b689f6072a3b1a4ce91a6977cd1",
+      "scripts/test_browser.cjs": "6e2166de3969efd1975a62526f38213f526d0b01e2d463e50b8862c00d07a65b",
+      "scripts/test_parallel.py": "0672701c5f3af1e14c945049eb85679d109a31ffad1a4323bc042e1d51b8e10b",
+      "scripts/test_selected.py": "235e70fcedf52135ae239ce6a74575deecf98a8315c8d656851dd3da283f5654",
+      "tests/test_audit_boundaries.py": "114c835f53429539562f6d34fce1ae20f73ee3add4a3f62f6964f7cd14eaf1a6",
+      "tests/test_backend_hardening.py": "f2d9e398a9f405d676082a6a5cc31c18f6db9c17d921db2d7f50c49d3448bc37",
+      "tests/test_catalog.py": "1e8d4bf1a193494a4ec85d6b2756148ae28057eeaa678d21af1a1d2a0b6666c5",
+      "tests/test_data_hardening.py": "1f1dec980ec404799c9e3eeaa1aa95da3855e67f38a5ea7a34efcd93f43225f3",
+      "tests/test_experience.py": "9264843fb45c809a404f1741400e7c6e3101509cf57959d82f5a7e7083273ac7",
+      "tests/test_model_center.py": "c18033019389dd9d9000cca61b62b9cd29c5413465773298ced7004cdf314bb1",
+      "tests/test_protocols.py": "da6dc1f810bf18ac2dc3102f41fe42be854273d7afbd56182c912213fe324be5",
+      "tests/test_release_parallel.py": "1df5c1977625d242938fc5abfe7b9748cfb8d7567aeb74c74c3a0a91fa690bf4",
+      "tests/test_runtime.py": "53068a72c3a6160f6a79dba246d33235f84efd1537f536785bd845b11454997b",
+      "tests/test_server_hardening.py": "e7c4f68c98c91684cc5d654cde39682aefde08aefac4e80999d4e256d6521bc8",
+      "tests/test_validation_planning.py": "525a7d38d3dd1bf2845df7e19016de816ee8e8df0a8f768c7eac974b02a437a0",
+      "tests/web_browser_runner.cjs": "b76f2329302056ed3e4f83ef7994ffb9c81bcb63954ffd09340f368b1b0a34f8"
+    }
+  },
+  "independent_reviews": [
+    {
+      "passed": true,
+      "security_concerns": [],
+      "logic_errors": [],
+      "suggestions": [],
+      "summary": "只读审查 git diff HEAD 及未跟踪 tests/web_browser_runner.cjs，通过；排除 docs/research/，未发现阻断问题。证据：adaptive_rsi/process.py:123-147 保留取消、超时、输出上限的检查顺序，wait(timeout=0.08) 只替换固定 sleep；:148-170 保留等待回收、退出后的输出复查、进程组 SIGKILL、输出尾部截断和 Cancelled 传播。独立执行真实取消探针，第3次检查触发，0.166秒返回且 exit_code=-9；Python 针对性3项通过，其中真实超时和输出超限均保留类型化错误。scripts/test_browser.cjs:9-14 对未知、重复、空字符串 selector 拒绝，空发现集拒绝；:24-30 保留隔离进程、180秒超时、终止及失败汇总。实际 --list 精确匹配30个 browser 文件展开的35个场景，错误、重复、空字符串 selector 均退出1；tests/web_browser_runner.cjs 的2项测试通过，并覆盖空发现集。scripts/test_selected.py:23-34 使用过滤后的 timing_cache 仅计算分组权重，逐个添加全部 selector；损坏JSON、错误结构、非数值、负耗时的回归测试通过。scripts/test_parallel.py:40-61 保留完整 discovery 与模块展开计数相等校验。CI工作流未修改：.github/workflows/checks.yml:95-102 保留 Python3.9/3.14，:174-230 保留 macOS 门禁，:255 通过 web_*.cjs 纳入新测试，:280 无参数运行全部浏览器，:301-326 保留 Linux Docker，:372-376 要求各门禁成功；check_test_matrix.py 实际报告覆盖1077项。中英文 README/CONTRIBUTING 的分层验证与全量命令一致，check_docs.py 通过37个文件。未编辑仓库、未提交或推送、未调用模型或用户凭据；只创建本审查JSON。按授权未运行全套测试，本结论不替代父任务正在执行的完整回归或真实跨平台CI。"
+    },
+    {
+      "passed": true,
+      "security_concerns": [],
+      "logic_errors": [],
+      "suggestions": [],
+      "summary": "独立只读复核通过：scripts/test_parallel.py:98-110 使用 NamedTemporaryFile 二进制 writer 和单独 open 的只读文本 reader，分别持有独立 open file description，父进程 seek 不再回退子进程写入偏移；ExitStack 按逆序关闭 reader、关闭并删除 writer 临时文件，异常和取消时仍先通过 finally 的 stop_workers 终止并回收子进程，未发现新增资源泄漏或退出结果变化。新回归以 os.dup 重现共享偏移，当前实现通过，内存加载的 HEAD 旧实现确定性断言失败（first result 丢失）。新回归、真实 worker 成败传播、取消清理及启动失败清理共 4 项测试全部通过，耗时 2.233 秒；旧实现反证耗时 0.002 秒。未运行全量，未修改仓库或提交；仅创建指定 scratch JSON。"
+    }
+  ],
+  "items": [
+    {
+      "title_zh": "备份验证未检查迁移账本，轮换可删除唯一可恢复备份",
+      "title_en": "Backup validation ignores migration history and retention can delete the only recoverable snapshot",
+      "severity": "P1",
+      "kind": "bug",
+      "file": "adaptive_rsi/storage_tools.py",
+      "line": 215,
+      "end_line": 232,
+      "trigger_zh": "备份保持 SQLite 完整性和 user_version=2，但 schema_migrations 包含未知版本、校验和不匹配或缺口；随后执行 retain_backups(max_count=1)。",
+      "impact_zh": "verify_backup 返回 valid=true，轮换把无法由当前运行时打开的最新快照当作保护点，删除真正可恢复的旧快照。归档验证与恢复演练的前置校验也会接受该文件。",
+      "evidence_zh": "verify_backup 仅检查 integrity_check、user_version、外键及四张表；实际 Store.__init__ 在 store.py:94-98 调用 schema_migrations.validate_history，拒绝同一快照。retain_backups 在 storage_tools.py:249-265 据前者决定保护与删除。实测在快照中插入 schema_migrations(999,'future',0)，验证 valid=true；restore 抛 RuntimeError: Database migration history is newer than this runtime；轮换结果 good_backup_exists=false、bad_backup_exists=true。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe_extra.py；另运行 data_probe.py 查看验证通过、恢复失败的配对结果。两个脚本仅创建 scratch 临时 Store。",
+      "proposal_zh": "在只读验证连接上设置 sqlite3.Row 并调用与 Store 一致的迁移账本校验，检查必要 schema；轮换仅保护当前运行时可打开的快照。增加未知版本、坏 checksum、账本缺口和唯一旧恢复点的 fixture。可选将隔离恢复演练成功作为更强的可恢复标记。",
+      "confidence": "confirmed",
+      "existing_id": 4,
+      "area": "data",
+      "source_key": "data-1",
+      "status": "open",
+      "id": "R4-001",
+      "assessment_en": "SQLite integrity and user_version checks accept an unknown migration ledger that Store refuses to open. Retention then deletes the older usable backup. Validate migration history and recovery compatibility before selecting a protected snapshot."
+    },
+    {
+      "title_zh": "合并后通过的是后续主线，却发布尚未通过检查的原合并提交",
+      "title_en": "Later mainline verification authorizes release of a failing merge commit",
+      "severity": "P1",
+      "kind": "bug",
+      "file": "adaptive_rsi/release.py",
+      "line": 578,
+      "end_line": 637,
+      "trigger_zh": "合并提交 M 的固定检查失败，第一次反馈轮询前主线 H 已修复它；该运行启用了 release 或 deploy。",
+      "impact_zh": "自动化会把失败的 M 作为 rsi_sha 派发，即使实际通过的是 H；部署可能把已经修好的线上版本回退为坏版本。",
+      "evidence_zh": "调用链 Runtime._process(system_delivery) runtime.py:1317-1319 → delivery.tick:563 feedback → feedback:667-676 以 merged_sha 为 baseline、当前 head 为 candidate → Evaluator._evaluate:934-938 只要求 candidate/candidate_full/acceptance_candidate 通过，不要求 baseline 通过 → feedback:678-681 标记 verified，head=H → tick:566 release.advance → advance:578 仅检查 feedback.state，不验证 feedback.head 或 M 的检查 → advance:621,636-637 派发 merged_sha=M。真实隔离 Git fixture 中 M 的 baseline_passed=[false]、H 的 candidate_passed=[true]，decision=pass；进一步执行真实 advance 控制流并替换外部服务后，state=submitted、dispatch_sha=M、verified_head=H。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 delivery-probe-results.json 的 failed_merge_fixed_later 和 release_uses_failed_merge。只运行本地 fixture 的 Python assert；GitHub API、授权和存储为隔离替身，没有远程写。",
+      "proposal_zh": "将发布准入证据绑定实际派发 SHA；单独验证 merged_sha 并持久化其通过回执，或要求该 SHA 对应的所有发布门禁通过。主线漂移监控应保留独立状态，不能直接成为原合并提交的发布凭证。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "delivery",
+      "source_key": "delivery-1",
+      "status": "open",
+      "id": "R4-002",
+      "assessment_en": "Feedback verifies later head H but release.advance dispatches merged SHA M based only on state=verified. The fixture demonstrates failing M, passing H, then dispatch of M. Bind authorization to successful evidence for the exact dispatched SHA."
+    },
+    {
+      "title_zh": "合并后快照比较把修改过的失败测试恢复为旧测试并复用为完整检查",
+      "title_en": "Post-merge snapshots hide changed failing tests behind the old harness",
+      "severity": "P1",
+      "kind": "bug",
+      "file": "adaptive_rsi/delivery.py",
+      "line": 667,
+      "end_line": 676,
+      "trigger_zh": "merged_sha 到当前主线之间修改了已有测试、配置或检查入口；当前工作树是已提交且干净的 snapshot。",
+      "impact_zh": "主线真实检查失败仍可显示 verified，并解锁 release/deploy。合并后候选完整检查实际上没有覆盖当前提交的真实测试入口。",
+      "evidence_zh": "feedback:667-676 → Evaluator._evaluate:822-823 → _changed_files:466-472 用 git diff HEAD 获取变更，干净 snapshot 始终返回 []，没有比较 baseline SHA 与 current SHA → _evaluate:836,850 判定 harness 未变化且 reuse_full=True → _standard_stage:671-672 对 candidate 使用 merged baseline 的 freeze_harness → freeze_harness:317 覆盖 current 修改后的测试 → _evaluate:928-929 把这一轮直接当成 candidate_full。fixture 中 current 的 test_app.py 直接执行 exit=1，evaluate 返回 pass、candidate_full_reused=true。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；changed_mainline_test_hidden: direct_current_exit=1, decision=pass, candidate_full_reused=true。",
+      "proposal_zh": "反馈比较显式计算 merged_sha..head 的提交差异并传 changed_files；当测试或入口发生变化时，保留旧 harness 回归检查，同时强制在当前快照的真实 harness 下执行 candidate_full。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "delivery",
+      "source_key": "delivery-2",
+      "status": "open",
+      "id": "R4-003",
+      "assessment_en": "Clean post-merge snapshots yield an empty working-tree diff. The evaluator freezes the old harness and reuses it as candidate_full, hiding a changed failing test. Compute the committed baseline-to-head diff and run the current real harness when it changed."
+    },
+    {
+      "title_zh": "历史运行结果容器异常会中止整库恢复",
+      "title_en": "Malformed historical run result containers abort the entire restore",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/storage_tools.py",
+      "line": 391,
+      "end_line": 394,
+      "trigger_zh": "数据库中有 pr_open 或 merged 运行，其 result 为合法 JSON 数组、null，或非法 JSON；其余结构和关系有效。",
+      "impact_zh": "备份验证报告成功，但恢复在写反馈不可用标记时崩溃，随后删除新建的恢复目录；单条历史证据阻止全部项目和任务恢复。",
+      "evidence_zh": "同一 restore 函数在 365-371 行对 awaiting_approval 结果执行 JSON 异常隔离和 dict 类型校验，391-394 行对 merged/pr_open 未做保护。fixture 写入 merged result='[]'，verify_backup 返回 valid=true，restore 抛 AttributeError: 'list' object has no attribute 'get'。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；查看 malformed_result_verification 与 malformed_result_restore。",
+      "proposal_zh": "统一使用容器校验解码；对异常原始结果保留原文或可追溯隔离记录，只附加 restore_invalidation，不让历史证据中断恢复。覆盖数组、null、标量和坏 JSON，并确认健康运行证据不变。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "data",
+      "source_key": "data-2",
+      "status": "open",
+      "id": "R4-004",
+      "assessment_en": "A merged run with result=[] passes backup checks but crashes restore with AttributeError. Validate historical result containers per record, preserve malformed source evidence, and continue restoring healthy data."
+    },
+    {
+      "title_zh": "用量报告多次读取缺少共同快照，总计与明细可能自相矛盾",
+      "title_en": "Usage report reads lack a shared snapshot and can contradict their own totals",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/usage_report.py",
+      "line": 59,
+      "end_line": 130,
+      "trigger_zh": "模型调用在 /api/usage 计算 summary 后、读取 daily、roles、tasks 或 calls 前完成写入或更新 token。",
+      "impact_zh": "同一响应显示不同调用数和成本；导出与任务明细无法核对，分页 total 也可与返回行不同。",
+      "evidence_zh": "report 顺序调用 store.one、store.stream 和多个 store.query，server.py:378-380 直接调用 report，未包 store.snapshot；每次独立借连接。fixture 在 summary 读完后插入第二个调用，实测同一响应 summary_calls=1、daily_calls=2、task_calls=2。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；脚本通过 one 包装器在两次读取之间确定性插入一条本地调用记录，不执行模型。",
+      "proposal_zh": "将报告所有关系读取放在同一 store.snapshot 中，使 summary、趋势、分组、分页和调用详情引用同一 SQLite 读事务；尽量缩短 Python 处理持有读事务的时长，避免长读拖延 WAL 检查点。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "data",
+      "source_key": "data-3",
+      "status": "open",
+      "id": "R4-005",
+      "assessment_en": "A write between summary and detail queries yields summary_calls=1 and daily_calls=2 in one response. Read the report through one SQLite snapshot, keeping the transaction as short as practical."
+    },
+    {
+      "title_zh": "存储概览刷新重复读取全部备份内容计算 hash",
+      "title_en": "Storage overview refresh rehashes unchanged backup contents",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/storage_tools.py",
+      "line": 557,
+      "end_line": 567,
+      "trigger_zh": "访问 /api/storage?refresh=true，或十秒概览缓存到期后再次读取；backups 中包含大型且未变的 SQLite 快照。",
+      "impact_zh": "每次扫描都完整读取最多二十份备份，延迟和磁盘 I/O 随备份总字节线性增长；流式 hash 限制了内存，却没有限制常规概览的工作量。diagnostics 调用 overview 也继承该成本。",
+      "evidence_zh": "560-562 行清单直接对 backups[:20] 无条件调用 file_digest；529-539 行读取完整文件，缓存只保存整体结果十秒。fixture 连续两次强制刷新，在没有任何文件变化时每次均计算两份备份 hash（first_scan=2、second_scan=2）。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；overview_hashes 通过包装真实 file_digest 计数，不使用大文件或长时间压测。",
+      "proposal_zh": "备份发布时计算并保存 digest；概览按 inode/size/mtime_ns 缓存未变文件结果，外部改动失效。将完整内容重新校验留给明确的验证动作，并展示最近校验时间，避免把缓存 hash 宣称为新完整性验证。",
+      "confidence": "confirmed",
+      "existing_id": 104,
+      "area": "data",
+      "source_key": "data-4",
+      "status": "open",
+      "id": "R4-006",
+      "assessment_en": "Two unchanged backups are fully hashed on each forced overview refresh. Cache published digests by file identity, invalidate changed files, and distinguish cached metadata from an explicit integrity verification."
+    },
+    {
+      "title_zh": "单条损坏的待关闭 PR 记录阻断整个交付扫描与恢复",
+      "title_en": "One malformed superseded receipt aborts delivery scanning and recovery",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/delivery.py",
+      "line": 387,
+      "end_line": 389,
+      "trigger_zh": "runs 中存在 state=superseded 且 result 不是合法 JSON 的历史、恢复或损坏记录，同时其他项目仍有 merged/pr_open 工作。",
+      "impact_zh": "schedule 在进入 scheduler_scope 的逐项隔离前抛 malformed JSON，无法调度健康项目的交付监控；tick:431-434 的同类批量查询也在 try:440 之前失败。",
+      "evidence_zh": "schedule:387-389 和 tick:431-434 都在 SQL WHERE 中直接 json_extract(result,'$.close_pending')；单行 JSON 解析失败会中止整个 SELECT，不会进入每条运行的错误处理。SQLite 内存小用例插入 merged/'{}' 和 superseded/'broken-json'，执行同型条件得到 OperationalError: malformed JSON。",
+      "reproduction": "sqlite3 :memory: 中 CREATE TABLE runs(state TEXT,result TEXT); INSERT INTO runs VALUES('merged','{}'),('superseded','broken-json'); SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR (state='superseded' AND json_extract(result,'$.close_pending')=1)); 返回 malformed JSON。实际已用 Python sqlite3 执行，无仓库或远程状态修改。",
+      "proposal_zh": "将解析与校验移至每项异常边界，或使用 CASE WHEN json_valid(result) THEN json_extract(...) END；损坏记录应保留原文并记录独立诊断，不阻塞其他运行。schedule 和 tick 同时修复。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "delivery",
+      "source_key": "delivery-3",
+      "status": "open",
+      "id": "R4-007",
+      "assessment_en": "json_extract in a batch WHERE clause fails on one malformed superseded result before per-item error handling. Guard JSON extraction or move parsing inside each item boundary in both schedule and tick."
+    },
+    {
+      "title_zh": "candidate_full 追加探测检查时再次执行全部已跑固定检查",
+      "title_en": "Additional detected checks make candidate_full repeat configured checks",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/evaluator.py",
+      "line": 831,
+      "end_line": 903,
+      "trigger_zh": "配置的 checks 不是 detect(candidate).checks 的完整超集，例如用户自定义 Python 检查同时仓库存在 pyproject.toml 与测试文件。",
+      "impact_zh": "candidate_full 重跑已在 candidate 运行的全部固定命令，只为增加一个探测命令；若固定命令是完整测试套件，每次候选和每次反馈都会多跑一轮。",
+      "evidence_zh": "execute_candidate:410 → _evaluate:831-835 构建 full_checks；只要新增命令，850 的全量相等判定失败 → 897-903 同时创建 candidate 和 candidate_full → _standard_stage:698-707 candidate_full 从 list(checks) 开始，再追加 detect 检查。fixture 实际记录 baseline/python test_app.py、candidate/python test_app.py、candidate_full/python test_app.py、candidate_full/python3 -m unittest discover，证明同一固定命令在两个候选阶段重复执行。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 candidate_full_duplicate.calls 和 candidate_full_reused=false。",
+      "proposal_zh": "区分 harness 真正改变与仅追加命令：在树、依赖和 harness 相同的情况下复用已完成的固定检查，仅运行探测增加的检查；harness 变化时继续执行独立完整检查。不要按名称复用，绑定 argv/cwd 和执行输入。",
+      "confidence": "confirmed",
+      "existing_id": 201,
+      "area": "delivery",
+      "source_key": "delivery-4",
+      "status": "open",
+      "id": "R4-008",
+      "assessment_en": "When detection adds one command, candidate_full starts with every configured check again. Reuse completed checks only when exact source, dependencies, harness and execution identities match, and run the added commands separately."
+    },
+    {
+      "title_zh": "相同 SHA 的合并后验证仍无缓存地执行基线和候选两轮",
+      "title_en": "Identical post-merge SHAs still run uncached baseline and candidate stages",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/delivery.py",
+      "line": 667,
+      "end_line": 676,
+      "trigger_zh": "首次合并后反馈时 head==merged_sha，或多个历史 merged 运行在同一主线 SHA 上同时需要反馈。",
+      "impact_zh": "同一代码、依赖和固定命令被重复执行；多个历史运行的反馈没有共享 baseline cache，长期监控会放大执行和磁盘复制成本。",
+      "evidence_zh": "feedback:667-668 无条件创建 merged_sha 与 head 两份快照；675-676 调 evaluate 未传 cache_scope/cache_base/environment_digest，Evaluator:820-821 因而没有执行身份，_cache_key:580-581 返回 None，885-899 必定执行 baseline/candidate。首次反馈 previous.head 不存在，653 的跳过条件不适用。隔离相同提交 fixture 实际 physical_stages=['baseline','candidate']。非 Docker 主机即使生产候选传缓存参数，也被 _execution_environment:591-599 明确禁止跨运行复用；这部分是保守策略，不能把缓存失效全部归咎于配置变化。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 identical_postmerge_trees.physical_stages。",
+      "proposal_zh": "为 head==merged_sha 的 preservation 验证提供绑定不可变输入的单次执行路径，复用为同版本证据；其他情况传递明确缓存作用域与依赖摘要，并保留对不稳定宿主环境的保守禁用。",
+      "confidence": "confirmed",
+      "existing_id": 201,
+      "area": "delivery",
+      "source_key": "delivery-5",
+      "status": "open",
+      "id": "R4-009",
+      "assessment_en": "Feedback always creates two snapshots and runs baseline and candidate even for identical SHAs, without baseline-cache inputs. Design a single-execution preservation path for identical immutable inputs; retain conservative host-environment restrictions."
+    },
+    {
+      "title_zh": "认证快照的 RuntimeError 分支遮蔽 AuthError 恢复逻辑",
+      "title_en": "RuntimeError handler shadows credential recovery in auth snapshots",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/auth_sessions.py",
+      "line": 869,
+      "end_line": 877,
+      "trigger_zh": "Codex 或 OpenCode 的凭据 JSON 损坏、超限或不是对象，_read_json 抛出 AuthError('invalid_credentials')。",
+      "impact_zh": "整个 /api/auth 状态请求失败，不能返回原本设计的 signed_out/invalid_credentials，也丢失另一后端的正常状态；用户难以从认证面板诊断和恢复。",
+      "evidence_zh": "AuthError 在第58行继承 RuntimeError；snapshot 第869行先捕获 RuntimeError，仅处理特定 OpenCode credential listing 错误，其余重新抛出，因此第876行的 except AuthError 永远接不到 AuthError。server.py:630 直接调用此快照。纯替身执行结果为 raised=AuthError, code=invalid_credentials。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/desktop_probes.py；见 desktop-probe-results.json 的 corrupt_credentials_snapshot。注入 _read_json 异常，不读取任何用户凭据。",
+      "proposal_zh": "将 except AuthError 放到 except RuntimeError 之前；分别测试 Codex/OpenCode 凭据读取错误，并断言另一个后端状态仍返回。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "desktop",
+      "source_key": "desktop-1",
+      "status": "open",
+      "id": "R4-010",
+      "assessment_en": "AuthError inherits RuntimeError, so the earlier RuntimeError handler rethrows it and makes the intended invalid-credential fallback unreachable. Catch AuthError first and preserve the healthy backend status."
+    },
+    {
+      "title_zh": "API key 写入未加入关闭跟踪且关闭后仍可安装凭据",
+      "title_en": "API key workers can install credentials after session service closes",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/auth_sessions.py",
+      "line": 1161,
+      "end_line": 1173,
+      "trigger_zh": "set_api_key 通过 closed 检查后阻塞在临时 worker 的网络请求；并发调用 AuthSessions.close，再让请求返回。",
+      "impact_zh": "关闭函数返回后仍可能写入宿主认证存储，临时认证服务也未及时关闭；关闭、退出或错误恢复边界不能保证停止凭据变更。",
+      "evidence_zh": "set_api_key 仅在创建 worker 前检查 closed，worker 不登记 workers/discoveries/threads，安装前不再检查 closed 或 shutdown。close 第1192-1205行只关闭这些登记集合。fixture 在 worker.set_api_key 阻塞时调用 close，随后得到 install_credential(after_closed=true)，无异常。server.py:816 为调用入口，runtime.py:788 在退出时调用 close。",
+      "reproduction": "运行 desktop_probes.py；key_install_after_close.installed[0].after_closed 为 true。Worker 为纯内存替身，FAKE_TEST_VALUE 未发送到网络或真实凭据存储。",
+      "proposal_zh": "把密钥写入 worker 纳入关闭跟踪，使用取消事件，并在提交宿主凭据前在会话锁下重新检查 closed；关闭与提交之间建立明确的所有权交接。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "desktop",
+      "source_key": "desktop-2",
+      "status": "open",
+      "id": "R4-011",
+      "assessment_en": "An API-key worker is not tracked by close and does not recheck closed before credential installation. A pure in-memory worker installs after close returns. Track ownership and cancellation and serialize the final commit with shutdown."
+    },
+    {
+      "title_zh": "更新空闲屏障遗漏正在运行的模型目录请求",
+      "title_en": "Update admission ignores in-flight model catalog requests",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/model_center.py",
+      "line": 319,
+      "end_line": 343,
+      "trigger_zh": "模型目录 fetch 已通过 updates.is_busy 检查并阻塞在 list_models 时，桌面更新执行 prepare/commit 或 Python 更新检查 work_busy。",
+      "impact_zh": "服务宣称空闲并进入替换时仍有外部 HTTP 或 CLI 目录任务；任务可被退出打断，或在新版本启动/状态备份期间继续执行旧版本操作，破坏更新排空承诺。",
+      "evidence_zh": "fetch 只登记 catalog_inflight，不增加 busy。lifecycle.py:71 只读取 model_center.busy，updates.py:359 同样如此；Runtime._close 也不等待 catalog_inflight。fixture 阻塞 list_models 后调用真实 readiness prepare/commit，输出 catalog_inflight=1、ready=true、phase=installing、reasons=[]。",
+      "reproduction": "运行 desktop_probes.py；见 desktop-probe-results.json 的 catalog_drain。list_models 使用事件阻塞替身，不访问网络或模型。",
+      "proposal_zh": "在 dispatch_lock 内把目录请求加入统一的可取消活动操作登记，并在 finally 释放；更新屏障和关闭逻辑都应等待或取消该操作，避免检查与登记之间再次竞态。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "desktop",
+      "source_key": "desktop-3",
+      "status": "open",
+      "id": "R4-012",
+      "assessment_en": "Catalog fetch records catalog_inflight but update readiness only checks model_center.busy. A blocked fake catalog request still allows readiness commit to installing. Register it atomically as cancellable active work and drain it during shutdown."
+    },
+    {
+      "title_zh": "桌面复用已有服务时丢弃后续会话轮换消息",
+      "title_en": "Desktop discards session rotation messages from reused services",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "desktop/src-tauri/src/main.rs",
+      "line": 654,
+      "end_line": 661,
+      "trigger_zh": "先独立启动服务，再启动桌面复用该服务；其他浏览器窗口调用 session/rotate。",
+      "impact_zh": "桌面 Connection 保留旧 cookie/csrf，后续请求持续认证失败；Python 原本发送 rotated 消息的复用监视进程也会因 stdout 管道已关闭而在 print 时退出。桌面无法自动恢复到仍正常运行的已有服务。",
+      "evidence_zh": "bootstrap 启动的线程仅 BufReader::new(stdout).read_line 一次，发送第一条握手后销毁 reader，后续没有 stdout 消费者。desktop.py:63-69 明确设计成在 marker token 改变后持续打印 rotated 握手。transport.rs:126-133 仅对本桌面亲自发起的 rotate 回包更新凭据，不能处理其他客户端轮换。",
+      "reproduction": "代码支持，未启动真实应用：检查 main.rs:654-661 的一次性 reader、desktop.py:63-69 的持续 rotated 输出以及 transport.rs:126-133 的凭据发布条件。集成复现需隔离状态目录下先 serve，再 desktop-runtime，随后从另一客户端 rotate。",
+      "proposal_zh": "保留并持续读取私有握手管道，校验轮换消息对应的服务实例后更新 local/target；对监视进程意外退出给出重连或明确恢复入口。",
+      "confidence": "code_supported",
+      "existing_id": null,
+      "area": "desktop",
+      "source_key": "desktop-4",
+      "status": "open",
+      "id": "R4-013",
+      "assessment_en": "The desktop bootstrap reads one handshake then drops stdout, while the reused Python service emits later rotated handshakes. Other-client session rotation can leave stale desktop credentials. This is code-supported; real desktop integration was not run."
+    },
+    {
+      "title_zh": "更新停止运行器超时后保留已失去控制管道的旧连接",
+      "title_en": "Runtime shutdown timeout leaves an unrecoverable stale connection",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "desktop/src-tauri/src/native_update.rs",
+      "line": 376,
+      "end_line": 383,
+      "trigger_zh": "更新关闭 stdin 请求运行器退出，但 Python 清理超过30秒；原生 worker 判定 update_runtime_shutdown_failed，运行器随后自行退出。",
+      "impact_zh": "child 被放回状态时 stdin 已被取走并关闭，无法撤销退出。engine_stopped 仍为 false，错误恢复不会 bootstrap，local/target 继续指向即将死亡的服务。应用返回 ready 可重试外观，但普通 API 连接随后不可用，且取消更新屏障也可能触发恢复中的任务准入。",
+      "evidence_zh": "第378行 child.stdin.take 的局部变量在 if 块结束即 drop；第379行仅等待30秒，超时把无 stdin 的 child 放回并返回错误；engine_stopped 直到第383行才置 true。第402行只在 engine_stopped=true 时 bootstrap。Python desktop.py:94-98 在 stdin EOF 后停止服务，runtime.py:783-806 有 join、worker shutdown、维护线程等可超过30秒的清理。",
+      "reproduction": "代码支持，未更新实际应用：用隔离假运行器在读到 stdin EOF 后延迟超过30秒退出，执行安装停止阶段，观察失败回包后进程退出而 local/target 未重新 bootstrap。当前未运行该超过30秒实验，符合本次单项验证<=30秒约束。",
+      "proposal_zh": "把已发送停止请求作为独立不可撤销状态管理；超时后继续监视并在退出后重启旧运行器，或提供明确恢复流程；不要把仍在退出中的 child 视作可用连接或重新开放其更新屏障。",
+      "confidence": "code_supported",
+      "existing_id": null,
+      "area": "desktop",
+      "source_key": "desktop-5",
+      "status": "open",
+      "id": "R4-014",
+      "assessment_en": "After stdin EOF requests shutdown, a 30-second timeout restores a child whose control pipe is already gone. engine_stopped remains false, so later exit has no bootstrap recovery. Track shutdown-requested ownership and recover when the old process actually exits. The long experiment was not run."
+    },
+    {
+      "title_zh": "模型诊断成功返回后调用不可见的 dialog 函数",
+      "title_en": "Model diagnostics calls an out-of-scope dialog helper",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/web/model-center.js",
+      "line": 167,
+      "end_line": 168,
+      "trigger_zh": "在模型服务中选择包含模型的连接，点击「只读诊断」且接口返回成功。",
+      "impact_zh": "所有诊断结果都无法展示；safe 捕获 ReferenceError 后仅显示错误提示，用户无法查看诊断。",
+      "evidence_zh": "experience.js 的 dialog 仅定义在 RSIExperience IIFE 内，也未导出；model-center.js 自身没有 dialog 定义。直接提取原始诊断回调执行，成功取得结果后抛 ReferenceError: dialog is not defined。浏览器模型中心测试未覆盖该按钮。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；输出 error=ReferenceError: dialog is not defined",
+      "proposal_zh": "在模型中心定义或复用已明确导出的模态框工厂；增加点击诊断并确认结果可见的浏览器用例。",
+      "confidence": "confirmed",
+      "existing_id": 1,
+      "area": "frontend",
+      "source_key": "frontend-1",
+      "status": "open",
+      "id": "R4-015",
+      "assessment_en": "A successful diagnostics request calls dialog, which exists only inside a different IIFE. The actual callback raises ReferenceError. Use a locally defined or explicitly exported modal helper and test visible results."
+    },
+    {
+      "title_zh": "项目模型诊断始终使用全局配置",
+      "title_en": "Project diagnostics always sends the global scope",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/web/model-center.js",
+      "line": 166,
+      "end_line": 166,
+      "trigger_zh": "切到某个项目的模型设置，在项目专有连接或覆盖的模型上点击只读诊断。",
+      "impact_zh": "发送 project:null，导致项目专有连接报不存在，或诊断全局同名连接的凭据、目录和健康状态。",
+      "evidence_zh": "scope 的取值为项目 ID 或 null（show/changeScope/load 调用链），但此处比较 scope===project 后才发送 scope。Node fixture 设置 scope=project-123，真实回调发送 project:null；服务端 diagnose 使用 runtime.config(project) 和 provider(provider_id,project)。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；request.payload.project 为 null，而 fixture scope 为 project-123",
+      "proposal_zh": "发送实际 scope；浏览器分别断言全局和项目诊断的请求体及结果来源。",
+      "confidence": "confirmed",
+      "existing_id": 1,
+      "area": "frontend",
+      "source_key": "frontend-2",
+      "status": "open",
+      "id": "R4-016",
+      "assessment_en": "Project settings store an ID in scope, but the callback compares it with the literal project, sending project:null. Send the actual scope and cover both global and project requests."
+    },
+    {
+      "title_zh": "推荐任务簇路径遗漏批量幂等恢复",
+      "title_en": "Recommended groups bypass batch idempotency recovery",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/web/batch.js",
+      "line": 44,
+      "end_line": 48,
+      "trigger_zh": "确认推荐合并任务簇后请求回执丢失，再次点击推荐并确认，或同一操作返回 complete:false。",
+      "impact_zh": "此路径没有保存 request_id 或提示待核对回执，重试使用新 ID，不能像普通批量操作一样恢复原操作；已执行任务可能从推荐中消失，用户只能另行查找批次记录。服务端状态校验存在，未据此声称一定重复创建任务组。",
+      "evidence_zh": "普通 perform 在 92–110 行读取/保存 RSIDraftStore 并重用 ID；recommendations 每次直接 crypto.randomUUID()，也不处理 complete:false 的反馈。Chromium fixture 模拟受理后丢响应，连续两次提交产生 request-1/request-2。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；batch.request_ids=[request-1,request-2]",
+      "proposal_zh": "让推荐簇复用普通批量提交/回执恢复机制，逐簇持久化稳定 ID，并在未知结果时展示核对入口；覆盖受理后断线场景。",
+      "confidence": "confirmed",
+      "existing_id": 37,
+      "area": "frontend",
+      "source_key": "frontend-3",
+      "status": "open",
+      "id": "R4-017",
+      "assessment_en": "Recommended groups generate a fresh request ID on every confirmation and bypass normal batch receipt recovery. A lost response followed by retry produces two IDs. Persist a stable ID and expose unknown-result reconciliation; duplicate grouping is not asserted."
+    },
+    {
+      "title_zh": "授权轮询重绘打断供应商搜索和键盘导航",
+      "title_en": "Auth rerenders discard provider search focus and selection focus",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/web/auth.js",
+      "line": 96,
+      "end_line": 104,
+      "trigger_zh": "有进行中的授权会话时，在 OpenCode 供应商搜索框输入或用键盘操作供应商下拉；轮询每 1.5 秒结束会 render，切语言也触发相同路径。",
+      "impact_zh": "搜索框/下拉被 replaceChildren 移除，焦点落到 body，键盘输入被中断；搜索值 providerQuery 被保留，但控件焦点没有恢复。",
+      "evidence_zh": "render 仅保存 [data-auth-field]，而 mc-auth-provider-search 和 mc-auth-provider 没有该标记。poll finally 总是 render；Chromium fixture 将搜索框 focus 后调用真实 RSIAuth.translate，document.activeElement.id 从 mc-auth-provider-search 变空，旧节点 isConnected=false。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；focus={before:mc-auth-provider-search,after:\"\",oldConnected:false}",
+      "proposal_zh": "保持供应商控件 DOM，或为搜索框和下拉保存/恢复焦点和选择；用一次确定性 poll 而非真实等待验证键盘焦点。",
+      "confidence": "confirmed",
+      "existing_id": 188,
+      "area": "frontend",
+      "source_key": "frontend-4",
+      "status": "open",
+      "id": "R4-018",
+      "assessment_en": "Auth rendering replaces the provider search/select without focus restoration. A Chromium fixture loses search focus during translation; polling uses the same render path. Preserve these controls or restore focus and selection."
+    },
+    {
+      "title_zh": "桌面后台下载在重新打开页面后被六小时检查间隔阻塞",
+      "title_en": "Background download stalls behind the check interval after reload",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/web/native-update.js",
+      "line": 98,
+      "end_line": 104,
+      "trigger_zh": "最近一次成功检查发现 available，下载前重载/重开页面，或在六小时内从 manual 切到 download；原生状态仍为 available。",
+      "impact_zh": "设置为后台下载后 tick 仅获取 status，直到六小时检查过期才下载；automatic 策略也无法走到 ready/install。用户可手动下载，因此非完全阻断。",
+      "evidence_zh": "下载只在「需要重新检查」的 if 内执行；持久化 checked 在 check 成功时已写入，刷新后 failureCounts 清空。真实 native-update.js Chromium fixture 预置 checked=Date.now、policy=download、IPC available，连续 tick 两次调用只有 status/status，没有 download。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/native-resume-repro.cjs；calls=[status,status]，policy=download，界面发现新版本。",
+      "proposal_zh": "将已知 available 且满足策略/范围时的下载决策移出检查间隔分支，并保留独立下载失败退避；测试重载后 available 和策略切换。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "frontend",
+      "source_key": "frontend-5",
+      "status": "open",
+      "id": "R4-019",
+      "assessment_en": "Downloading an already available update is nested inside the six-hour check interval. Reloading with download policy and a recent check only calls status. Move download policy evaluation outside the check-due branch while retaining failure backoff."
+    },
+    {
+      "title_zh": "实验评估沿用父运行 planning 状态，命中准备时限且丢失阶段超时回执",
+      "title_en": "Experiment evaluation uses the parent's planning state and loses deadline receipts",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/evolution.py",
+      "line": 387,
+      "end_line": 398,
+      "trigger_zh": "system_evolve 的配对试验进入 evaluator；准备和评估时限不同，或前一试验准备时间已接近上限。",
+      "impact_zh": "慢测试按 preparation_seconds 提前停止，或超过 evaluation_seconds 仍继续；trial_run 的 _timed_out_stage 没有同步父 run，最终被记作 interrupted 而非带 evaluation 阶段的 deadline 故障，误导恢复判断。",
+      "evidence_zh": "pipeline.py:112-115 在 experiment=True 时完全跳过 transition，因此父 run 在 DB 保持 planning。Runtime.is_cancelled:1210-1217 仅凭 DB state=='evaluating' 切换 evaluation 时钟。evolution.py:387 浅拷贝 run 后让 pipeline 使用 trial_run，而 overlay 的 cancel 又改用父 run；runtime.py:1439-1445 仅查父字典的 _timed_out_stage。隔离探针实际返回 database_state=planning,cancelled=true,timed_out_stage=preparation,parent_receives_timeout=null。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/runtime-probes.py；experiment_deadline 使用真实 Store.claim 和 Runtime.is_cancelled， preparation_seconds=1、evaluation_seconds=100、准备时钟过去5秒。当前测试 test_evaluation_deadline_has_its_own_clock 先显式 transition('evaluating')，未覆盖 experiment=True 的不落库分支。",
+      "proposal_zh": "为运行上下文显式记录当前阶段和阶段开始时间，实验路径也更新此上下文；独立 trial 阶段时钟不要从父 run 复制旧时间。将阶段超时作为结构化异常传回父运行，并让 overlay 和普通实验检查使用同一上下文。补充 experiment=True 的 evaluation 超时及回执测试。",
+      "confidence": "confirmed",
+      "existing_id": 95,
+      "area": "runtime",
+      "source_key": "runtime-1",
+      "status": "open",
+      "id": "R4-020",
+      "assessment_en": "Experiment mode skips the parent database transition to evaluating. Runtime.is_cancelled therefore uses the preparation clock, and the shallow trial context does not propagate its timeout marker to the parent. Use an explicit per-trial phase clock and propagate structured deadline evidence."
+    },
+    {
+      "title_zh": "停用的 development 样本仍进入策略提案上下文",
+      "title_en": "Retired development cases remain in strategy proposal prompts",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "adaptive_rsi/evolution.py",
+      "line": 315,
+      "end_line": 327,
+      "trigger_zh": "通过 update_case(active=False) 停用 development 样本，或先把样本重分类为 development 并停用，随后执行策略进化。",
+      "impact_zh": "用户已经停用的问题、低质量或失效任务仍被送入付费提案并影响新策略；停用 development 样本对实际学习上下文没有效果。",
+      "evidence_zh": "update_case:118-123 把 active 写入 spec。validation/holdout 选择在279-280检查 active，但 development 查询315-316仅按 split 筛选。隔离探针插入 active=false 的 development 样本后截获实际 propose_and_evaluate 的提案提示，retired_task_in_prompt=true；截获点主动抛异常，未调用任何模型。",
+      "reproduction": "运行同目录 runtime-probes.py，查看 retired_development。现有 test_retirement_and_reclassification_keep_exposure 只核对数据库中的 active/uses/lifecycle，不断言提案提示或样本选择排除 inactive 数据。",
+      "proposal_zh": "查询 development 样本时使用与 validation/holdout 一致的 active/available 条件；过滤后再应用数量上限，避免前10个停用样本占满窗口。新增停用样本不出现在提案提示的测试。",
+      "confidence": "confirmed",
+      "existing_id": 153,
+      "area": "runtime",
+      "source_key": "runtime-2",
+      "status": "open",
+      "id": "R4-021",
+      "assessment_en": "The development-case query ignores spec.active although validation and holdout selection honor it. A retired task still appears in the actual proposal prompt. Apply lifecycle filtering before the query limit and assert prompt exclusion."
+    },
+    {
+      "title_zh": "后处理每轮扫描并解析全部历史完成记录且持有全局调度锁",
+      "title_en": "Postprocessing rescans completed history while holding the dispatch lock",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/runtime.py",
+      "line": 1137,
+      "end_line": 1151,
+      "trigger_zh": "长期运行累积大量已完成或 obsolete 的 postprocess:* settings；调度器每5秒调用 drain_postprocess()。",
+      "impact_zh": "每轮时间和分配内存随成功历史线性增长，即使没有待办也 SELECT、传回并 json.loads 全部记录；这段工作持有 dispatch_lock，延迟项目暂停、配置保存、交付批准和新任务领取。",
+      "evidence_zh": "loop:1010-1011 每轮无条件 drain_postprocess。1138 获取 dispatch_lock 后，1142-1143查询所有 postprocess:*，1147先解析JSON，1150才跳过 completed。1191-1192完成记录永久留在同一命名空间。极小真实Store探针插入3个completed记录，生产查询仍读回全部3个。未进行大型性能测试，因此不声称具体毫秒收益。",
+      "reproduction": "运行同目录 runtime-probes.py 查看 postprocess_query.loaded_completed_records=3；可补充一个无 pending、上千 completed 的测试，断言读取/解析记录数与 pending 数关联，而不是只测耗时。现有恢复测试只用少量记录，不覆盖历史放大。",
+      "proposal_zh": "使用有状态索引的专用待办表，或把 pending 与归档回执分开存储；仅分页领取到期 pending。把历史回执解析移出 dispatch_lock，持锁范围限于实际需序列化的副作用和状态提交。",
+      "confidence": "confirmed",
+      "existing_id": 169,
+      "area": "runtime",
+      "source_key": "runtime-3",
+      "status": "open",
+      "id": "R4-022",
+      "assessment_en": "Every scheduler pass loads and parses all postprocess settings, including completed receipts, while holding dispatch_lock. Separate indexed pending work from historical receipts and keep critical sections short. No large-load timing is claimed."
+    },
+    {
+      "title_zh": "明知新鲜 holdout 数不足仍执行整套付费试验后才拒绝晋升",
+      "title_en": "Evolution runs paid trials despite insufficient fresh holdout cases",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/evolution.py",
+      "line": 279,
+      "end_line": 282,
+      "trigger_zh": "holdout 记录仍在 max_holdout_uses 范围内，但 uses==0 的数量少于 min_cases_per_split；常见于第一次进化已经消耗样本、默认允许同一样本使用3次的后续进化。",
+      "impact_zh": "预检认为样本足够，于是调用提案、完整 validation 和 holdout 两个变体重复试验；即使质量全部提升，也会在最后因 fresh=false 必定转 insufficient_evidence。新增样本前的后续自动进化持续花费模型和全套检查时间，却不可能晋升。",
+      "evidence_zh": "279-282只校验 uses<limit 的总数；344按该集合选择holdout。363-366在开始实验前已经算出fresh=false，但369-408仍执行全部实验，直到422-423才依据该已知值拒绝通过。select_cases虽然按uses排序，但不能补足不存在的新鲜样本。此为静态调用链证据，未运行付费实验。",
+      "reproduction": "最小用例：min_cases_per_split=3，提供3个validation和3个uses=1的holdout，max_holdout_uses=3；用计数fake runtime.invoke/execute_candidate观察仍触发提案和试验，而最终fresh恒为false。现有测试仅检查元数据完整性，无不满足fresh前置条件时模型调用数必须为0的测试。",
+      "proposal_zh": "在首次模型调用前，按晋升用途校验并选择足够的 uses==0 holdout；不足时直接返回需要新复核集的可操作原因。如确实允许探索性复用，应显式区分探索运行并提前说明该次无晋升资格，避免自动调度浪费。",
+      "confidence": "code_supported",
+      "existing_id": 143,
+      "area": "runtime",
+      "source_key": "runtime-4",
+      "status": "open",
+      "id": "R4-023",
+      "assessment_en": "Freshness is known to be insufficient before paired trials start, but proposal and full trials still run before promotion is rejected. Check promotion-eligible fresh holdout availability before model work or explicitly mark an exploratory run."
+    },
+    {
+      "source_key": "local-1",
+      "area": "validation",
+      "title_zh": "命令执行固定睡眠放大 Git 和检查的完成等待",
+      "title_en": "Fixed command polling sleep delays short Git and validation commands",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "adaptive_rsi/process.py",
+      "line": 142,
+      "end_line": 147,
+      "trigger_zh": "短命令在第一次 poll 后很快退出。",
+      "impact_zh": "每次命令仍等待80毫秒轮询间隔，真实任务和测试中反复执行Git时放大耗时。",
+      "evidence_zh": "同机12次短Python命令，中位耗时87.81ms；改为有界wait后39.25ms。超时、取消和输出上限检查继续保留。",
+      "reproduction": "tests.test_audit_boundaries.AuditProcessBoundariesTest.test_completed_commands_do_not_wait_for_a_fixed_polling_sleep; process-before.json / process-after.json",
+      "proposal_zh": "使用能随进程结束返回的wait(timeout=0.08)，继续保持相同检查间隔上界。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "status": "fixed_in_working_tree",
+      "id": "R4-024",
+      "assessment_en": "Twelve short-command samples show median latency falling from 87.81 ms to 39.25 ms after replacing a fixed sleep with wait(timeout=0.08). Existing cancellation, timeout and output-limit checks remain in place."
+    },
+    {
+      "source_key": "local-2",
+      "area": "validation",
+      "title_zh": "并行日志读写共用文件位置导致结果行被覆盖",
+      "title_en": "Parallel log readers rewind the worker write offset and overwrite results",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_parallel.py",
+      "line": 98,
+      "end_line": 110,
+      "trigger_zh": "父进程seek读取日志时子进程仍在写入同一open file description。",
+      "impact_zh": "通过/失败行、测试摘要可丢失，不能可靠核对数量，排查需要重跑；退出码仍由worker返回。",
+      "evidence_zh": "首次优化后日志缺8项测试摘要；os.dup加seek期间并发write确定性重现覆盖。独立reader修复后1078项、68个模块摘要和4组退出结果全部对齐。",
+      "reproduction": "tests.test_release_parallel.ParallelReleaseTest.test_log_reader_cannot_rewind_a_running_workers_output",
+      "proposal_zh": "对子进程保留二进制writer，父进程通过独立open只读reader采集。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "status": "fixed_in_working_tree",
+      "id": "R4-025",
+      "assessment_en": "A shared file description let parent seeks rewind child output and overwrite result lines. A deterministic regression fails on the old implementation. Independent writer and reader opens restore all 1,078 test counts, 68 summaries and four exit results."
+    },
+    {
+      "title_zh": "选测入口收到 SIGTERM 后遗留独立 worker",
+      "title_en": "Selected-test SIGTERM leaves detached workers running",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_selected.py",
+      "line": 31,
+      "end_line": 35,
+      "trigger_zh": "CI 取消作业或外部向 test_selected 父进程发送 SIGTERM。",
+      "impact_zh": "父进程被默认信号处理直接终止，绕过 run_groups 的 finally；独立 session 的 worker 继续执行，消耗资源并可能继续修改 fixture。",
+      "evidence_zh": "真实 scratch 子进程树：worker 写出 PID 后 SIGTERM 父进程，父退出 -15，os.kill(worker,0) 仍成功；probe finally 已显式杀死自己的 worker。全量 main 在 test_parallel.py:182-185 安装了将 SIGTERM 转为 KeyboardInterrupt 的 handler，选测入口没有。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "复用全量入口的信号转换与退出码约定，覆盖真实 SIGTERM、SIGINT、启动一半失败及第二次中断的有界清理；不要只 mock KeyboardInterrupt。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-1",
+      "status": "open",
+      "id": "R4-026",
+      "assessment_en": "test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full runner. A real isolated parent exits -15 while its detached worker survives. Share bounded signal cleanup and verify actual process termination."
+    },
+    {
+      "title_zh": "空 suite 被选测 worker 标记通过",
+      "title_en": "Empty selected suites pass as successful validation",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_worker.py",
+      "line": 18,
+      "end_line": 26,
+      "trigger_zh": "selector 指向没有 test 方法的有效 TestCase，或 load_tests 返回空 suite。",
+      "impact_zh": "带--durations的自定义worker执行零项仍返回0。无durations的标准unittest行为随Python版本变化；本机3.14已拒绝零项，不能一概而论。",
+      "evidence_zh": "最小 Empty TestCase 的 test_worker.run 返回 0；worker 日志显示 Ran 0 tests/OK。全量 discover_groups 已拒绝空 discovery，但选测路径没有对应检查。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "执行前要求每个 selector 展开至少一个真实测试，检查 loader.errors，并在父进程对有/无 --durations 两条路径统一执行；添加空 module/class/load_tests 回归。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-2",
+      "status": "open",
+      "id": "R4-027",
+      "assessment_en": "test_worker.run considers an empty suite successful. The direct standard-unittest path is version-dependent: local Python 3.14 rejects empty suites, while the custom worker still returns 0. Require nonempty expansion for each selector and report loader errors."
+    },
+    {
+      "title_zh": "选测仅按 selector 字符串去重，允许同一测试重复并发执行",
+      "title_en": "Overlapping selectors duplicate and parallelize the same tests",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_selected.py",
+      "line": 18,
+      "end_line": 30,
+      "trigger_zh": "同时传入 tests.module.Case 和 tests.module.Case.test_a，或 module 与其 class。",
+      "impact_zh": "相同测试在不同 worker 重复执行，增加耗时；具有共享外部 fixture 的测试还可能争用资源。",
+      "evidence_zh": "scratch 两方法类加其中一个方法：输入字符串唯一但选测规划到两个 group；worker 实际执行计数为 3，退出 0。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "先展开 selector 得到测试 ID Counter，拒绝重叠或合并成不重叠的选择，再按 fixture 边界分组；保留明确 requested/expanded/executed 清单。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-3",
+      "status": "open",
+      "id": "R4-028",
+      "assessment_en": "Distinct selector strings can overlap: a class plus one of its methods executes three tests instead of two across groups. Expand IDs first and reject overlap or normalize it while preserving fixture boundaries."
+    },
+    {
+      "title_zh": "选测耗时缓存未复用已有安全过滤器",
+      "title_en": "Selected-test timing cache bypasses validation and fallback",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_selected.py",
+      "line": 22,
+      "end_line": 30,
+      "trigger_zh": "传入损坏 JSON、JSON 数组，或记录值为字符串的 --durations 文件。",
+      "impact_zh": "辅助缓存可使整次选测在启动任何测试前崩溃，违背缓存只影响分配、不阻止验证的约定。",
+      "evidence_zh": "实测损坏 JSON 抛 JSONDecodeError，[] 抛 AttributeError，字符串耗时抛 TypeError；test_parallel.timing_cache 已实现类型、范围、finite 检查和 main 的读取容错。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "复用 timing_cache 和 OSError/ValueError 回退逻辑；无效缓存回退默认权重并继续全部 selector。补充直接覆盖 test_selected 的畸形值及不可读路径测试。",
+      "confidence": "confirmed",
+      "existing_id": 201,
+      "area": "validation",
+      "source_key": "validation-4",
+      "status": "fixed_in_working_tree",
+      "id": "R4-029",
+      "assessment_en": "Malformed JSON, non-object data and nonnumeric timings crashed selected-test planning. The working-tree fix reuses timing_cache and read-error fallback; every requested selector remains scheduled.",
+      "fix_validation": "python3 -B -m unittest tests.test_validation_planning.ValidationPlanningTest.test_selected_tests_ignore_invalid_timing_cache_and_run_every_selector"
+    },
+    {
+      "title_zh": "按 selector 单独启动 runner 重复执行同类 fixture",
+      "title_en": "Timing mode repeats class fixtures for separate method selectors",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "scripts/test_worker.py",
+      "line": 16,
+      "end_line": 21,
+      "trigger_zh": "使用 --durations 运行同一 TestCase 的多个方法 selector。",
+      "impact_zh": "每个方法重新执行 setUpClass/tearDownClass；无 --durations 时 unittest 一次加载所有 selector，可共享相邻同类 fixture，导致记录耗时模式改变实际测试语义及成本。",
+      "evidence_zh": "scratch 同类两个方法经 test_worker.run 执行后 setUpClass 计数为 2。macos_sandbox_flows 当前对 DeliveryLoopTest、ReliabilityTest 传入多个方法且始终启用 --durations。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "在一个 suite 中运行并用 TestResult 记录各方法时间，或先按 class/module 合并 fixture 分组；在保留 fixture 一次性语义的条件下记录调度权重。",
+      "confidence": "confirmed",
+      "existing_id": 194,
+      "area": "validation",
+      "source_key": "validation-5",
+      "status": "open",
+      "id": "R4-030",
+      "assessment_en": "Timing mode creates one runner per selector, repeating setUpClass for methods from the same class. Preserve suite fixture semantics while collecting result timing or group selectors by fixture ownership."
+    },
+    {
+      "title_zh": "HTTP 测试 fixture 默认半秒轮询耗时远大于测试主体",
+      "title_en": "HTTP fixture shutdown polling dominates short test cases",
+      "severity": "P2",
+      "kind": "performance",
+      "file": "tests/test_server_hardening.py",
+      "line": 29,
+      "end_line": 39,
+      "trigger_zh": "每个 HTTP 用例新建 serve_forever 默认 poll_interval=0.5 的 server，并在 tearDown 调用 shutdown。",
+      "impact_zh": "每个短用例固定等待接近半秒；该文件有 16 个用例，且 Python 3.9/3.14/3.12 都运行。tests/test_runtime.py:1243-1247 等 fixture 有相同模式。",
+      "evidence_zh": "真实 test_audit_is_bounded_and_never_records_request_secrets：默认 setup 0.0155s、body 0.0114s、teardown 0.5014s；仅在 scratch harness 给测试线程注入 poll_interval=0.01 后分别为 0.0150s、0.0083s、0.0115s。这是单用例实测，未跑整套，不将其外推为总提速。",
+      "reproduction": "见 http-fixture-probe-results.json；在 scratch 临时目录实例化 ServerHardeningTest，分别以默认值和 serve_forever(poll_interval=0.01) 执行同一用例。",
+      "proposal_zh": "抽取仅供测试的 HTTP fixture，使用较短 poll interval 和明确线程 join；逐个确认 shutdown/close/Store 资源释放，不修改生产轮询默认值。",
+      "confidence": "confirmed",
+      "existing_id": 201,
+      "area": "validation",
+      "source_key": "validation-6",
+      "status": "fixed_in_working_tree",
+      "id": "R4-031",
+      "assessment_en": "Default serve_forever polling adds about half a second to each short HTTP fixture shutdown. Eight fixture files now use a test-only 0.01-second interval. Existing real HTTP assertions are retained."
+    },
+    {
+      "title_zh": "浏览器取消升级定时器 unref 可能导致漏杀顽固后代",
+      "title_en": "Unreferenced browser kill escalation may never run",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_browser.cjs",
+      "line": 11,
+      "end_line": 15,
+      "trigger_zh": "取消或超时后直属浏览器测试进程先退出，但同 session 后代忽略 SIGTERM 且关闭继承的 stdio。",
+      "impact_zh": "child close 后 active 清空，父进程可在 1.5 秒 SIGKILL 定时器前退出；残留后代没有最后的强制清理。",
+      "evidence_zh": "VM seam 执行真实调度脚本：SIGTERM 注册一个 1500ms 且 unref 的升级 timer，直属 child close 后立即写结果并置 exitCode；实现没有等待升级完成。未运行真实 Chromium/后代信号实验，结论基于 Node timer 生命周期和代码路径。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/browser_probe.cjs",
+      "proposal_zh": "取消/超时维护独立的 cleanup pending 状态，直到保有进程组的安全升级和回收完成才结束；为忽略 SIGTERM、关闭 stdio 的后代增加真实无浏览器回归。",
+      "confidence": "code_supported",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-7",
+      "status": "open",
+      "id": "R4-032",
+      "assessment_en": "The browser termination escalation timer is unreferenced. If the leader exits and descendants close stdio while ignoring SIGTERM, the parent can exit before SIGKILL. Track cleanup completion; a real descendant test remains necessary."
+    },
+    {
+      "title_zh": "浏览器测试发现为空仍返回成功",
+      "title_en": "Empty browser test discovery reports success",
+      "severity": "P2",
+      "kind": "bug",
+      "file": "scripts/test_browser.cjs",
+      "line": 6,
+      "end_line": 9,
+      "trigger_zh": "tests 目录缺失所有 browser_*.cjs，或文件命名/发现过滤变更导致结果为空。",
+      "impact_zh": "test:browser 执行零个场景却退出 0，并写空 durations 对象。",
+      "evidence_zh": "VM seam 令 readdirSync 返回 []，执行原始脚本：spawned=0、exitCode=0、写入 {}。",
+      "reproduction": "node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/browser_probe.cjs",
+      "proposal_zh": "对 files/pending 非空作硬检查；记录计划与完成数量并在完成时核对，不把取消清空 pending 当正常零测试。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-8",
+      "status": "fixed_in_working_tree",
+      "id": "R4-033",
+      "assessment_en": "An empty browser discovery previously wrote an empty timing object and returned success. The working-tree fix now rejects an empty scenario plan and includes regression coverage.",
+      "fix_validation": "node --test tests/web_browser_runner.cjs"
+    },
+    {
+      "title_zh": "人工干预历史按项目扫描普通事件，分页限制不能约束查询工作量",
+      "title_en": "Intervention history scans unrelated project events despite a page limit",
+      "severity": "P3",
+      "kind": "performance",
+      "file": "adaptive_rsi/task_lifecycle.py",
+      "line": 24,
+      "end_line": 27,
+      "trigger_zh": "项目有大量普通运行事件，但指定任务很少或没有 manual_retry、requirements_revised 等干预记录。",
+      "impact_zh": "打开单任务干预历史会扫描项目的大量事件；LIMIT 101 仅限制匹配结果，无法使空结果或稀疏历史读取有界。随着运行历史增长，该界面查询持续变慢。",
+      "evidence_zh": "EXPLAIN QUERY PLAN 实际使用 project_events(project,seq)，逐行过滤 kind 与 json_extract(data,'$.task')。一万条同项目非干预事件且零匹配的 fixture 执行约 100064 条 SQLite VM 指令，返回仍为空；项目索引无法跳过这些普通事件。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe_extra.py；输出 intervention_plan、events=10000、matching_interventions=0、vm_instructions=100064。",
+      "proposal_zh": "为固定干预 kind 集合建立部分索引，进一步将经过验证的 task 标识提取到结构化列或使用受 json_valid 保护的表达式索引，以 (project,task,seq DESC) 提供游标分页；用 EXPLAIN 和稀疏历史 fixture 确认读取规模随匹配记录而非项目事件总数增长。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "data",
+      "source_key": "data-5",
+      "status": "open",
+      "id": "R4-034",
+      "assessment_en": "The intervention query scans unrelated project events. A 10,000-event fixture with zero matches performs about 100,064 VM instructions. Index the validated task identifier and fixed intervention kinds, then verify sparse-history query work."
+    },
+    {
+      "title_zh": "恢复 validated_candidate 仅复用补丁，仍无条件重跑完整评价",
+      "title_en": "Validated candidate recovery reuses the patch but always reevaluates it",
+      "severity": "P3",
+      "kind": "improvement",
+      "file": "adaptive_rsi/pipeline.py",
+      "line": 355,
+      "end_line": 415,
+      "trigger_zh": "同输入运行已通过 evaluation 并保存 validated_candidate，但在 review 或后续阶段中断后重试。",
+      "impact_zh": "重试会显示复用 validated_candidate，但只跳过实现；固定候选、完整候选和独立候选验收仍全部再次执行。macOS Seatbelt 没有跨运行 baseline cache，基线也会重跑。",
+      "evidence_zh": "recovery.cached:68-75 按任务与签名取阶段；pipeline:329 取得 validated_candidate → 355-361 校验 patch_hash 并 git apply → 410 无条件 evaluate，不读取421保存的 evaluation 阶段 → 425-429 再保存 validated_candidate。334 的提前 acceptance_baseline 被跳过，但 evaluator 仍负责补跑。候选签名324-328还包含 planning_outcomes、open_prs 和 related_work；这些变动会让仅交付背景变化也失去候选复用。这里没有把安全必需的重验定性为错误，而是记录重复验证的真实来源。",
+      "reproduction": "代码支持：对已有 validated_candidate 的 execute_candidate 入口将 evaluator.evaluate 替换为计数器，会在补丁恢复后调用一次。未运行模型或完整 pipeline；执行位置和无条件调用可直接由 pipeline.py:355-415 复核。",
+      "proposal_zh": "先明确恢复契约：区分复用补丁与复用验证。对精确补丁、固定依赖、不可变执行镜像、harness、build 和检查契约一致的情况，可设计独立 evaluation checkpoint；宿主环境无法证明一致时继续重验，并在界面解释具体原因。",
+      "confidence": "code_supported",
+      "existing_id": 201,
+      "area": "delivery",
+      "source_key": "delivery-6",
+      "status": "open",
+      "id": "R4-035",
+      "assessment_en": "validated_candidate recovery restores the patch but unconditionally reevaluates it. This is a conservative contract, not a correctness defect. Consider a separately sealed evaluation checkpoint only for demonstrably identical execution inputs."
+    },
+    {
+      "source_key": "local-3",
+      "area": "validation",
+      "title_zh": "浏览器入口无场景选择，局部修改容易触发全套验证",
+      "title_en": "Browser runner lacks scenario selection for focused validation",
+      "severity": "P3",
+      "kind": "improvement",
+      "file": "scripts/test_browser.cjs",
+      "line": 9,
+      "end_line": 14,
+      "trigger_zh": "按npm默认验证命令只想检查一个页面或hardening分组。",
+      "impact_zh": "原入口忽略参数并发现全部35个场景；贡献文档首个命令仍为串行全量，快速反馈路径不明显。",
+      "evidence_zh": "新增--list、文件及hardening分组selector，未知/重复/空发现拒绝。实跑两个定向场景约5.3秒；全套35场景117.4秒。",
+      "reproduction": "node --test tests/web_browser_runner.cjs; npm run test:browser -- browser_task_detail.cjs browser_hardening.cjs:routes",
+      "proposal_zh": "保留默认全套发现，局部验证显式选择，并同步中英文分层验证命令。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "status": "fixed_in_working_tree",
+      "id": "R4-036",
+      "assessment_en": "The runner now supports --list, scenario files and individual hardening groups while retaining full default discovery. Two selected real-browser scenarios completed in about 5.3 seconds; all 35 took 117.4 seconds. Bilingual development guidance now describes the focused loop."
+    },
+    {
+      "title_zh": "每个 Python 分组重复执行全库矩阵发现检查",
+      "title_en": "Every Python matrix job repeats full-suite coverage discovery",
+      "severity": "P3",
+      "kind": "performance",
+      "file": ".github/workflows/checks.yml",
+      "line": 140,
+      "end_line": 141,
+      "trigger_zh": "普通 full CI 启动 12 个 Python matrix entry。",
+      "impact_zh": "同一覆盖检查重复导入全库并 loadTestsFromNames；它不是分组特有验证，还会在仅需少量模块的 job 执行所有测试导入。",
+      "evidence_zh": "静态统计为 12 个 modules entry，所有共用 line 140；本机单次 check() 发现 1075 个 ID，耗时 0.179s。未实测 GitHub 时间，预计收益较小，不应夸大为主要瓶颈。",
+      "reproduction": "python3 -B -c \"import time; from scripts.check_test_matrix import check; s=time.monotonic(); print(check(),time.monotonic()-s)\"",
+      "proposal_zh": "将静态矩阵覆盖检查集中在单个 quick job；如 discovery 有版本条件，仅在必要解释器上各跑一次，分组 job 保留自身 unittest 执行。",
+      "confidence": "confirmed",
+      "existing_id": 201,
+      "area": "validation",
+      "source_key": "validation-10",
+      "status": "open",
+      "id": "R4-037",
+      "assessment_en": "All 12 Python matrix entries repeat complete coverage discovery. Local cost is small; centralize only after preserving interpreter-dependent discovery coverage. This is not a primary wall-clock bottleneck."
+    },
+    {
+      "title_zh": "快速测试数量的 sed 转义错误使指标总为零",
+      "title_en": "Overescaped sed expression records zero quick tests",
+      "severity": "P3",
+      "kind": "bug",
+      "file": ".github/workflows/checks.yml",
+      "line": 170,
+      "end_line": 172,
+      "trigger_zh": "quick_python 完成 unittest 并尝试从 Ran N tests 提取数量。",
+      "impact_zh": "成功执行的快速测试被上报为 0，误导吞吐和测试数量判断；当前 stderr 重定向还会使失败信息难以从 step 日志直接看到。",
+      "evidence_zh": "直接取工作流的原始 count 行（未 YAML 二次解码，run 为 literal block），输入 Ran 42 tests in 0.123s，bash 返回 0 且 count=0。表达式用双反斜杠代替 sed BRE 分组单反斜杠。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/metrics_probe.py",
+      "proposal_zh": "修正 literal shell 中的 BRE 转义，或由结构化 unittest runner 写真实 testsRun；同时 tee/失败时输出完整测试日志。为原始 workflow shell 的已知样本增加小契约检查。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-11",
+      "status": "open",
+      "id": "R4-038",
+      "assessment_en": "The literal shell block overescapes sed grouping and records zero quick tests. The parent independently reproduced 32 executed tests yielding an empty count. Use structured counts or correct the expression and retain failing logs."
+    },
+    {
+      "title_zh": "矩阵覆盖检查只做集合包含，漏报组内重复和额外 selector",
+      "title_en": "Matrix coverage check misses duplicate and extra test IDs",
+      "severity": "P3",
+      "kind": "bug",
+      "file": "scripts/check_test_matrix.py",
+      "line": 13,
+      "end_line": 25,
+      "trigger_zh": "同一 matrix.modules 内添加 module+class 或重复 module，或 selector 额外引入非 discovery 测试。",
+      "impact_zh": "检查仍显示覆盖通过，不能阻止重复执行成本或发现范围偏移。",
+      "evidence_zh": "mock loader discovery 为 test_a、selection 为 test_a 两次及额外 test_b，check() 仍返回 1；Counter 建立后只用于 set 差集，丢弃重复和 extra。当前跨 Python 版本重复是有意兼容验证，应与组内重复区分。",
+      "reproduction": "python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py",
+      "proposal_zh": "解析每条矩阵 entry，分别验证组内 Counter 唯一，并对受支持环境的预期测试集合做显式覆盖；允许有声明的跨版本/平台重复，不做全局一刀切去重。",
+      "confidence": "confirmed",
+      "existing_id": null,
+      "area": "validation",
+      "source_key": "validation-9",
+      "status": "open",
+      "id": "R4-039",
+      "assessment_en": "The matrix checker reduces a Counter to a set and checks only missing IDs, accepting duplicates and extra IDs. Validate each entry and explicitly account for intended platform/version overlap."
+    }
+  ],
+  "reproduction_evidence": {
+    "runtime": {
+      "original_script": "import sys, json, tempfile, time, threading\nfrom pathlib import Path\nfrom types import SimpleNamespace\nfrom unittest.mock import patch\nsys.path.insert(0, '/Users/neg-entropy/Desktop/Adaptive RSI')\nfrom adaptive_rsi.config import validate\nfrom adaptive_rsi.process import Sandbox\nfrom adaptive_rsi.runtime import Runtime\nfrom adaptive_rsi.store import Store, encode\nfrom adaptive_rsi.evolution import Evolution\nfrom adaptive_rsi.recovery import save, cached\nBASE=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028')\nresults={}\nwith tempfile.TemporaryDirectory(dir=BASE) as tmp:\n    root=Path(tmp)\n    config=validate({})\n    with patch.object(Sandbox,'command',return_value=(['fake'],str(root))), patch('adaptive_rsi.process.run_process',return_value={'exit_code':0,'error':None}) as proc:\n        Sandbox(root/'state',config)._check({'name':'bounded','argv':['fake'],'timeout_seconds':1},root)\n        results['check_timeout']={'configured_check_seconds':1,'actual_run_process_seconds':proc.call_args.args[2]}\n    store=Store(root/'store')\n    store.execute('INSERT INTO projects VALUES (?,?,?,?,?,?)',('p','P',str(root/'project'),'{}',0,1))\n    runtime=Runtime.__new__(Runtime); runtime.store=store; runtime.stop=threading.Event()\n    task=store.add_task('p','goal','g','Goal','Goal',[])\n    run=store.claim('p',config)\n    # Production experiment mode keeps the parent run planning and copies its dictionary.\n    trial={**run,'_deadline_started':time.monotonic()-5,'_deadline_stage':'preparation'}\n    config['deadlines']['preparation_seconds']=1\n    config['deadlines']['evaluation_seconds']=100\n    trial['config']=encode(config)\n    cancelled=runtime.is_cancelled(trial)\n    results['experiment_deadline']={'database_state':store.one('SELECT state FROM runs WHERE id=?',(run['id'],))['state'],'cancelled':bool(cancelled),'timed_out_stage':trial.get('_timed_out_stage'),'parent_receives_timeout':run.get('_timed_out_stage')}\n    # Retrying a cancelled task uses exactly the same stage signature.\n    save(SimpleNamespace(store=store),run,'validated_candidate',{'patch':'old patch'},'same-inputs')\n    store.transition(run['id'],'cancelled',{},True)\n    runtime.wake=threading.Event()\n    runtime.retry(task)\n    new=store.claim('p',config)\n    results['manual_retry_cache']={'old_state':store.one('SELECT state FROM runs WHERE id=?',(run['id'],))['state'],'reused':cached(runtime,new,'validated_candidate','same-inputs')}\n    store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',('retired','p','f','development',encode({'task':'RETIRED_DEVELOPMENT_TASK','active':False}),0,1))\n    for split in ['validation','holdout']:\n        store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',(split,'p',split,split,encode({'task':split,'checks':[],'source':'real','signature':split,'repository':str(root),'base':'fake','overlay':None}),0,1))\n    captured={}\n    class Captured(Exception): pass\n    def invoke(role,text,*args):\n        captured['retired_task_in_prompt']='RETIRED_DEVELOPMENT_TASK' in text\n        raise Captured()\n    fake=SimpleNamespace(store=store,active_strategies=lambda _:[],invoke=invoke)\n    cfg=validate({'evolution':{'min_cases_per_split':1}})\n    try:\n        with patch('adaptive_rsi.evolution.git',return_value='tree'):\n            Evolution(fake).propose_and_evaluate({'id':'p'},root,root,{'id':'r','config':encode(cfg)})\n    except Captured: pass\n    results['retired_development']=captured\n    # Postprocessing loads completed records as well as pending records.\n    for i in range(3): store.put_setting('postprocess:completed'+str(i),{'state':'completed','steps':[]})\n    results['postprocess_query']={'loaded_completed_records':len(store.query(\"SELECT key,value FROM settings WHERE key LIKE 'postprocess:%'\"))}\n    store.close()\nprint(json.dumps(results,ensure_ascii=False,indent=2))\n(BASE/'runtime-probe-results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2))\n",
+      "observed": {
+        "check_timeout": {
+          "configured_check_seconds": 1,
+          "actual_run_process_seconds": 3600
+        },
+        "experiment_deadline": {
+          "database_state": "planning",
+          "cancelled": true,
+          "timed_out_stage": "preparation",
+          "parent_receives_timeout": null
+        },
+        "manual_retry_cache": {
+          "old_state": "cancelled",
+          "reused": {
+            "patch": "old patch"
+          }
+        },
+        "retired_development": {
+          "retired_task_in_prompt": true
+        },
+        "postprocess_query": {
+          "loaded_completed_records": 3
+        }
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "data": {
+      "original_script": "import sys, json, tempfile, sqlite3, time\nfrom pathlib import Path\nsys.path.insert(0, '/Users/neg-entropy/Desktop/Adaptive RSI')\nfrom adaptive_rsi.store import Store, encode\nfrom adaptive_rsi.storage_tools import backup, verify_backup, restore, retain_backups, overview\nfrom adaptive_rsi.usage_report import report\nBASE=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028')\nresults={}\nwith tempfile.TemporaryDirectory(dir=BASE, prefix='data-fixture-') as tmp:\n root=Path(tmp)\n s=Store(root/'source')\n s.execute(\"INSERT INTO projects(id,name,path,config,paused,created) VALUES ('p','fixture','fixture','{}',1,0)\")\n t=s.add_task('p','goal','f','fixture')\n # A valid SQLite file carrying an unknown migration passes verification.\n b=backup(s); p=s.root/'backups'/(b['id']+'.sqlite3')\n with sqlite3.connect(p) as db: db.execute(\"INSERT INTO schema_migrations VALUES(999,'future',0)\")\n results['unknown_migration_verification']=verify_backup(p)\n try: restore(p,root/'future-restore')\n except Exception as exc: results['unknown_migration_restore']=type(exc).__name__+': '+str(exc)\n # Valid JSON with wrong top-level type breaks restore's historical feedback rewrite.\n s.execute(\"INSERT INTO runs(id,task,project,state,result,started,ended) VALUES ('r',?,'p','merged','[]',1,2)\",(t,))\n b=backup(s); p2=s.root/'backups'/(b['id']+'.sqlite3')\n results['malformed_result_verification']=verify_backup(p2)\n try: restore(p2,root/'malformed-restore')\n except Exception as exc: results['malformed_result_restore']=type(exc).__name__+': '+str(exc)\n # Inject a real write between independent report reads.\n s.execute(\"INSERT INTO calls(id,project,run,role,model,effort,state,created) VALUES ('c1','p','r','worker','fixture','low','complete',10)\")\n original=s.one\n inserted=False\n def one(sql,args=()):\n  global inserted\n  result=original(sql,args)\n  if not inserted and 'count(DISTINCT t.id) AS tasks' in sql:\n   inserted=True\n   s.execute(\"INSERT INTO calls(id,project,run,role,model,effort,state,created) VALUES ('c2','p','r','worker','fixture','low','complete',11)\")\n  return result\n s.one=one\n output=report(s,{'start':['1'],'end':['20']})\n results['concurrent_usage']={'summary_calls':output['summary']['calls'],'daily_calls':sum(r['calls'] for r in output['daily']),'task_calls':sum(r['calls'] for r in output['tasks'])}\n s.one=original\n # Count repeated hash work, without creating large files.\n import adaptive_rsi.storage_tools as tools\n real_digest=tools.file_digest\n calls=[]\n def digest(path,*args):\n  calls.append(str(path)); return real_digest(path,*args)\n tools.file_digest=digest\n overview(s,refresh=True); first=len(calls)\n overview(s,refresh=True)\n results['overview_hashes']={'first_scan':first,'second_scan':len(calls)-first}\n tools.file_digest=real_digest\n s.close()\nprint(json.dumps(results,ensure_ascii=False,indent=2))\n(BASE/'data-probe-results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2))\n",
+      "observed": {
+        "unknown_migration_verification": {
+          "valid": true,
+          "schema_version": 2,
+          "bytes": 274432
+        },
+        "unknown_migration_restore": "RuntimeError: Database migration history is newer than this runtime",
+        "malformed_result_verification": {
+          "valid": true,
+          "schema_version": 2,
+          "bytes": 274432
+        },
+        "malformed_result_restore": "AttributeError: 'list' object has no attribute 'get'",
+        "concurrent_usage": {
+          "summary_calls": 1,
+          "daily_calls": 2,
+          "task_calls": 2
+        },
+        "overview_hashes": {
+          "first_scan": 2,
+          "second_scan": 2
+        }
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "retention": {
+      "original_script": "import sys,tempfile,sqlite3,os,json\nfrom pathlib import Path\nsys.path.insert(0,'/Users/neg-entropy/Desktop/Adaptive RSI')\nfrom adaptive_rsi.store import Store\nfrom adaptive_rsi.storage_tools import backup,retain_backups,restore\nBASE=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028')\nwith tempfile.TemporaryDirectory(dir=BASE,prefix='retention-fixture-') as tmp:\n root=Path(tmp);s=Store(root/'source')\n good=backup(s);good_path=s.root/'backups'/(good['id']+'.sqlite3');os.utime(good_path,(1,1))\n bad=backup(s);bad_path=s.root/'backups'/(bad['id']+'.sqlite3')\n with sqlite3.connect(bad_path) as db:db.execute(\"INSERT INTO schema_migrations VALUES(999,'future',0)\")\n retention=retain_backups(s,max_count=1)\n sql=\"SELECT seq,run,kind,created,data FROM events WHERE project=? AND seq<? AND kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') AND json_valid(data) AND json_extract(data,'$.task')=? ORDER BY seq DESC LIMIT 101\"\n plan=s.query('EXPLAIN QUERY PLAN '+sql,('p',2**63-1,'t'))\n statements=[]\n with s.connect() as db:\n  db.set_trace_callback(statements.append)\n  db.executemany(\"INSERT INTO events(project,kind,message,data,created) VALUES ('p','progress','fixture','{}',0)\",[()]*10000)\n  db.set_trace_callback(None)\n with s.connect() as db:\n  ticks=[0]\n  def progress():ticks[0]+=1;return 0\n  db.set_progress_handler(progress,1)\n  found=db.execute(sql,('p',2**63-1,'t')).fetchall()\n  db.set_progress_handler(None,0)\n result={'retention':retention,'good_backup_exists':good_path.exists(),'bad_backup_exists':bad_path.exists(),'intervention_plan':plan,'events':10000,'matching_interventions':len(found),'vm_instructions':ticks[0]}\n print(json.dumps(result,ensure_ascii=False,indent=2));(BASE/'data-probe-extra-results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2));s.close()\n",
+      "observed": {
+        "retention": {
+          "kept": 1,
+          "removed": [
+            "7a5894d3c4ac4dff.sqlite3"
+          ],
+          "invalid": [],
+          "protected": "d4ba38b69e444dd0.sqlite3"
+        },
+        "good_backup_exists": false,
+        "bad_backup_exists": true,
+        "intervention_plan": [
+          {
+            "id": 5,
+            "parent": 0,
+            "notused": 50,
+            "detail": "SEARCH events USING INDEX project_events (project=? AND seq<?)"
+          }
+        ],
+        "events": 10000,
+        "matching_interventions": 0,
+        "vm_instructions": 100064
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "delivery": {
+      "original_script": "import copy, json, subprocess, tempfile, sys\nfrom pathlib import Path\nfrom unittest.mock import patch\nsys.path.insert(0, '/Users/neg-entropy/Desktop/Adaptive RSI')\nfrom adaptive_rsi.config import DEFAULTS\nfrom adaptive_rsi.evaluator import Evaluator\nfrom adaptive_rsi.gitops import git, snapshot\nfrom adaptive_rsi import release\n\nROOT=Path(__file__).parent\nclass Store:\n    root=ROOT\n    def query(self,*args): return []\nclass LocalSandbox:\n    def __init__(self,*args): pass\n    def check(self,check,target,*args):\n        p=subprocess.run(check['argv'],cwd=Path(target)/check.get('cwd','.'),capture_output=True,text=True,timeout=5)\n        return {**check,'stdout':p.stdout,'stderr':p.stderr,'exit_code':p.returncode,'error':None}\n\ndef commit(p):\n    git(p,'add','-A');git(p,'-c','user.name=Probe','-c','user.email=probe@localhost','commit','-qm','fixture')\n    return git(p,'rev-parse','HEAD')\n\ndef repo(p):\n    p.mkdir(); git(p,'init','-q'); (p/'app.py').write_text('VALUE = 0\\n'); (p/'test_app.py').write_text('from app import VALUE\\nassert VALUE == 1\\n'); return p\n\nout={}\nwith tempfile.TemporaryDirectory(dir=ROOT,prefix='delivery-fixture-') as d:\n    d=Path(d); source=repo(d/'source'); merged=commit(source)\n    (source/'app.py').write_text('VALUE = 1\\n'); head=commit(source)\n    checks=[{'name':'behavior','argv':[sys.executable,'test_app.py'],'cwd':'.'}]\n    config=copy.deepcopy(DEFAULTS); config['checks']=checks\n    with patch('adaptive_rsi.evaluator.Sandbox',LocalSandbox):\n        result=Evaluator(Store()).evaluate(snapshot(source,d/'merged',merged),snapshot(source,d/'current',head),checks,d/'evaluation',config)\n    out['failed_merge_fixed_later']={'merged_sha':merged,'feedback_head':head,'decision':result['decision'],'baseline_passed':[r['passed'] for r in result['checks']['baseline']],'candidate_passed':[r['passed'] for r in result['checks']['candidate']]}\n    (source/'test_app.py').write_text('from app import VALUE\\nassert VALUE == 1\\n'); good=head\n    (source/'test_app.py').write_text('from app import VALUE\\nassert VALUE == 2\\n'); bad=commit(source)\n    direct=subprocess.run([sys.executable,'test_app.py'],cwd=source,capture_output=True,text=True)\n    with patch('adaptive_rsi.evaluator.Sandbox',LocalSandbox):\n        result=Evaluator(Store()).evaluate(snapshot(source,d/'good',good),snapshot(source,d/'bad',bad),checks,d/'evaluation2',config)\n    out['changed_mainline_test_hidden']={'direct_current_exit':direct.returncode,'decision':result['decision'],'candidate_full_reused':result['candidate_full_reused'],'candidate_passed':[r['passed'] for r in result['checks']['candidate_full']]}\n    # Show the physical stage executions when no acceptance changes the harness.\n    counts=[]\n    evaluator=Evaluator(Store()); original=evaluator._standard_stage\n    def counted(label,*args,**kwargs):\n        counts.append(label);return original(label,*args,**kwargs)\n    with patch('adaptive_rsi.evaluator.Sandbox',LocalSandbox), patch.object(evaluator,'_standard_stage',counted):\n        evaluator.evaluate(snapshot(source,d/'same1',good),snapshot(source,d/'same2',good),checks,d/'evaluation3',config)\n    out['identical_postmerge_trees']={'physical_stages':counts}\n    # Candidate-full adds detected checks, but executes configured checks again.\n    (source/'test_app.py').write_text('from app import VALUE\\nassert VALUE == 1\\n')\n    (source/'pyproject.toml').write_text('[project]\\nname=\"probe\"\\nversion=\"0.0.0\"\\n')\n    expanded=commit(source)\n    calls=[]\n    original_check=LocalSandbox.check\n    def recording(self,check,target,*args):\n        calls.append({'stage':Path(target).name,'argv':check['argv']})\n        return original_check(self,check,target,*args)\n    with patch('adaptive_rsi.evaluator.Sandbox',LocalSandbox),patch.object(LocalSandbox,'check',recording):\n        result=Evaluator(Store()).evaluate(snapshot(source,d/'expanded1',expanded),snapshot(source,d/'expanded2',expanded),checks,d/'evaluation4',config)\n    out['candidate_full_duplicate']={'calls':calls,'candidate_full_reused':result['candidate_full_reused']}\n    # Exercise real advance control flow, replacing only external services/storage.\n    class AutomationStore:\n        def __init__(self): self.data={}\n        def setting(self,k,default=None): return copy.deepcopy(self.data.get(k,default))\n        def event(self,*a,**kw): pass\n    class Runtime:\n        store=AutomationStore()\n        import threading\n        dispatch_lock=threading.RLock()\n    runtime=Runtime()\n    saved=copy.deepcopy(DEFAULTS)\n    saved['delivery']['release'].update(enabled=True,workflow='.github/workflows/release.yml',ref='rsi-workflow/'+head,sha=head)\n    run={'id':'probe','project':'project','config':json.dumps(saved)}\n    dispatched=[]\n    def save(rt,r,k,data,**kw): rt.store.data[release.key(r['id'],k)]=copy.deepcopy(data);return data\n    with patch.object(release,'save',save),patch.object(release,'authorized',return_value='fixture/repo'),patch.object(release,'validate_pin'),patch.object(release,'api',side_effect=lambda *a: dispatched.append(a) or {}):\n        result=release.advance(runtime,{'id':'project'},run,{'merged_sha':merged,'feedback':{'state':'verified','head':head}})\n    out['release_uses_failed_merge']={'state':result['release']['state'],'dispatch_sha':dispatched[0][3]['inputs[rsi_sha]'],'verified_head':head}\nprint(json.dumps(out,ensure_ascii=False,indent=2))\n(ROOT/'delivery-probe-results.json').write_text(json.dumps(out,ensure_ascii=False,indent=2))\n",
+      "observed": {
+        "failed_merge_fixed_later": {
+          "merged_sha": "1a50555387f7d9ded58e85627c7156a750223550",
+          "feedback_head": "def9a87dda4226ef2ded743f7cb270e9c7dd6763",
+          "decision": "pass",
+          "baseline_passed": [
+            false
+          ],
+          "candidate_passed": [
+            true
+          ]
+        },
+        "changed_mainline_test_hidden": {
+          "direct_current_exit": 1,
+          "decision": "pass",
+          "candidate_full_reused": true,
+          "candidate_passed": [
+            true
+          ]
+        },
+        "identical_postmerge_trees": {
+          "physical_stages": [
+            "baseline",
+            "candidate"
+          ]
+        },
+        "candidate_full_duplicate": {
+          "calls": [
+            {
+              "stage": "baseline",
+              "argv": [
+                "/usr/local/bin/python3",
+                "test_app.py"
+              ]
+            },
+            {
+              "stage": "candidate",
+              "argv": [
+                "/usr/local/bin/python3",
+                "test_app.py"
+              ]
+            },
+            {
+              "stage": "candidate_full",
+              "argv": [
+                "/usr/local/bin/python3",
+                "test_app.py"
+              ]
+            },
+            {
+              "stage": "candidate_full",
+              "argv": [
+                "python3",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                ".",
+                "-v"
+              ]
+            }
+          ],
+          "candidate_full_reused": false
+        },
+        "release_uses_failed_merge": {
+          "state": "submitted",
+          "dispatch_sha": "1a50555387f7d9ded58e85627c7156a750223550",
+          "verified_head": "def9a87dda4226ef2ded743f7cb270e9c7dd6763"
+        }
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "desktop": {
+      "original_script": "import sys, tempfile, threading, json\nfrom pathlib import Path\nfrom types import SimpleNamespace\nfrom unittest.mock import patch\nsys.path.insert(0, '/Users/neg-entropy/Desktop/Adaptive RSI')\nfrom adaptive_rsi.auth_sessions import AuthSessions, AuthError\nfrom adaptive_rsi.model_center import ModelCenter\nfrom adaptive_rsi.lifecycle import readiness\n\nresults={}\nbase=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028')\nwith tempfile.TemporaryDirectory(dir=base) as folder:\n    auth=AuthSessions(folder, factory=lambda backend: None)\n    with patch('adaptive_rsi.auth_sessions._read_json', side_effect=AuthError('invalid_credentials')):\n        try:\n            results['corrupt_credentials_snapshot']=auth.snapshot()\n        except Exception as exc:\n            results['corrupt_credentials_snapshot']={'raised':type(exc).__name__,'code':getattr(exc,'code',None)}\n\nwith tempfile.TemporaryDirectory(dir=base) as folder:\n    installed=[]\n    entered=threading.Event(); resume=threading.Event()\n    class Worker:\n        capabilities=SimpleNamespace(modern=True)\n        def set_api_key(self, provider, key):\n            entered.set(); assert resume.wait(3)\n        def export_credential(self, provider): return [{'integrationID':provider,'fixture':True}]\n        def install_credential(self, provider, credentials): installed.append({'after_closed':auth.closed})\n        def close(self): pass\n    auth=AuthSessions(folder, factory=lambda backend: Worker())\n    auth.providers=lambda backend: [{'id':'fixture','methods':[{'type':'api','supported':True}]}]\n    auth.snapshot=lambda: {'closed':auth.closed}\n    errors=[]\n    def write_key():\n        try: auth.set_api_key('opencode','fixture','FAKE_TEST_VALUE')\n        except Exception as exc: errors.append(type(exc).__name__)\n    thread=threading.Thread(target=write_key)\n    thread.start(); assert entered.wait(3)\n    auth.close(); resume.set(); thread.join(3)\n    assert not thread.is_alive()\n    results['key_install_after_close']={'installed':installed,'errors':errors}\n\nclass Store:\n    def __init__(self): self.values={}\n    def query(self,*args): return []\n    def setting(self,key,*args): return self.values.get(key)\n    def put_setting(self,key,value): self.values[key]=value\nstore=Store()\nruntime=SimpleNamespace(store=store,dispatch_lock=threading.RLock(),updates=SimpleNamespace(desktop_managed=True,desktop_owner_pid=None,is_busy=lambda:False),auth_sessions=SimpleNamespace(busy=0),import_in_progress=False,maintenance_lock=threading.Lock(),operations=SimpleNamespace(busy=lambda:False))\ncenter=ModelCenter.__new__(ModelCenter)\ncenter.runtime=runtime; center.store=store; center.lock=threading.RLock(); center.catalog_inflight=set(); center.busy=0\ncenter.provider=lambda *args:{'id':'openai'}\ncenter.signature=lambda provider:'fixture'\ncenter._save_directory=lambda *args: None\ncenter.directory=lambda *args,**kwargs:{'models':[]}\nruntime.model_center=center\nentered=threading.Event(); resume=threading.Event(); errors=[]\ndef catalog(*args,**kwargs):\n    entered.set(); assert resume.wait(3)\n    return {'models':[],'truncated':False}\ndef fetch():\n    try: center.fetch('openai')\n    except Exception as exc: errors.append(type(exc).__name__+':'+str(exc))\nwith patch('adaptive_rsi.model_center.list_models',side_effect=catalog):\n    thread=threading.Thread(target=fetch); thread.start(); assert entered.wait(3)\n    prepared=readiness(runtime,'prepare','0.5.126')\n    committed=readiness(runtime,'commit',lease=prepared['barrier']['lease'])\n    results['catalog_drain']={'catalog_inflight':len(center.catalog_inflight),'ready':committed['ready'],'phase':committed['barrier']['phase'],'reasons':committed['reasons']}\n    resume.set(); thread.join(3); assert not thread.is_alive()\ncenter.directory=lambda *args,**kwargs:{'models':[{'id':'fixture-model'}]}\ntry:\n    center.edit_model('openai',{'id':'fixture-model','favorite':True})\nexcept Exception as exc:\n    results['edit_model']={'raised':type(exc).__name__,'error':str(exc)}\nresults['catalog_fetch_errors']=errors\n(base/'desktop-probe-results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2))\nprint(json.dumps(results,ensure_ascii=False,indent=2))\n",
+      "observed": {
+        "corrupt_credentials_snapshot": {
+          "raised": "AuthError",
+          "code": "invalid_credentials"
+        },
+        "key_install_after_close": {
+          "installed": [
+            {
+              "after_closed": true
+            }
+          ],
+          "errors": []
+        },
+        "catalog_drain": {
+          "catalog_inflight": 1,
+          "ready": true,
+          "phase": "installing",
+          "reasons": []
+        },
+        "catalog_fetch_errors": []
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "validation": {
+      "original_script": "import contextlib, io, json, os, pathlib, signal, subprocess, sys, time, types, unittest\nfrom unittest.mock import Mock, patch\nROOT=pathlib.Path('/Users/neg-entropy/Desktop/Adaptive RSI')\nSCRATCH=pathlib.Path(__file__).parent\nsys.path.insert(0,str(ROOT))\nfrom scripts import test_worker, test_selected, check_test_matrix, test_parallel\nout={}\nclass Empty(unittest.TestCase): pass\nclass Cases(unittest.TestCase):\n    setups=0\n    runs=0\n    @classmethod\n    def setUpClass(cls): cls.setups+=1\n    def test_a(self): type(self).runs+=1\n    def test_b(self): type(self).runs+=1\nmodule=types.ModuleType('tests.validation_probe_synthetic'); module.Empty=Empty;module.Cases=Cases\nsys.modules[module.__name__]=module\nimport tests\nsetattr(tests,'validation_probe_synthetic',module)\nwith open(SCRATCH/'worker-probe.log','w') as workerlog,contextlib.redirect_stdout(workerlog),contextlib.redirect_stderr(workerlog):\n    out['empty_worker_exit']=test_worker.run([module.__name__+'.Empty'],SCRATCH/'empty.json')\n    out['overlap_worker_exit']=test_worker.run([module.__name__+'.Cases',module.__name__+'.Cases.test_a'],SCRATCH/'overlap.json')\n    out['overlap_test_runs']=Cases.runs\n    Cases.runs=Cases.setups=0\n    test_worker.run([module.__name__+'.Cases.test_a',module.__name__+'.Cases.test_b'],SCRATCH/'fixtures.json')\n    out['per_selector_class_setups']=Cases.setups\nfor raw in ('{invalid','[]','{\"tests.validation_probe_synthetic.Cases\":\"slow\"}'):\n    target=SCRATCH/'cache-probe.json';target.write_text(raw)\n    with patch.object(sys,'argv',['test_selected','--durations',str(target),module.__name__+'.Cases']),patch.object(test_selected,'run_groups',return_value=0):\n        try: out['selected_cache_'+raw]=test_selected.main()\n        except Exception as e: out['selected_cache_'+raw]=type(e).__name__+': '+str(e)\nwith patch.object(sys,'argv',['test_selected',module.__name__+'.Cases',module.__name__+'.Cases.test_a']),patch.object(test_selected,'run_groups',return_value=0) as execute:\n    out['selected_overlap_exit']=test_selected.main()\n    out['selected_overlap_groups']=execute.call_args.args[0]\nloader=Mock(errors=[])\nloader.discover.side_effect=lambda *a,**k:unittest.TestSuite([Cases('test_a')])\nloader.loadTestsFromNames.side_effect=lambda *a,**k:unittest.TestSuite([Cases('test_a'),Cases('test_a'),Cases('test_b')])\nwith patch.object(check_test_matrix.unittest,'TestLoader',return_value=loader),patch.object(pathlib.Path,'read_text',return_value='modules: tests.fake tests.fake\\n'):\n    out['matrix_duplicate_and_extra_accepted_count']=check_test_matrix.check()\n# Reject NaN through both CLI entry points, without discovering/running tests.\nwith patch.object(test_parallel,'discover_groups') as discover,contextlib.redirect_stderr(io.StringIO()):\n    out['parallel_nan_exit']=test_parallel.main(['--timeout','nan'])\n    out['parallel_nan_discovery_called']=discover.called\nwith patch.object(sys,'argv',['test_selected','--timeout','nan',module.__name__+'.Cases']),contextlib.redirect_stderr(io.StringIO()):\n    try:test_selected.main()\n    except SystemExit as e:out['selected_nan_exit']=e.code\n# Isolated real SIGTERM probe: only our own short-lived synthetic process tree.\nprobe_root=SCRATCH/'cancel-root';(probe_root/'tests').mkdir(parents=True,exist_ok=True)\n(probe_root/'tests/__init__.py').write_text('')\nmarker=probe_root/'pid'\n(probe_root/'tests/synthetic.py').write_text('import os,time,unittest\\nfrom pathlib import Path\\nclass Case(unittest.TestCase):\\n def test_sleep(self):\\n  Path('+repr(str(marker))+').write_text(str(os.getpid()))\\n  time.sleep(20)\\n')\nmarker.unlink(missing_ok=True)\ndriver='import sys;sys.path.insert(0,'+repr(str(ROOT))+');from scripts import test_selected as s;from scripts.test_parallel import run_groups;s.run_groups=lambda groups,**kw:run_groups(groups,root='+repr(str(probe_root))+',**kw);sys.argv=[\"test_selected\",\"--timeout\",\"25\",\"tests.synthetic.Case.test_sleep\"];sys.exit(s.main())'\np=subprocess.Popen([sys.executable,'-B','-c',driver],cwd=probe_root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)\nworker=None\ntry:\n    deadline=time.monotonic()+5\n    while not marker.exists() and time.monotonic()<deadline:time.sleep(.02)\n    if marker.exists():\n        worker=int(marker.read_text());p.send_signal(signal.SIGTERM);out['selected_sigterm_parent_exit']=p.wait(timeout=3)\n        try:os.kill(worker,0);out['selected_sigterm_worker_survives']=True\n        except ProcessLookupError:out['selected_sigterm_worker_survives']=False\n    else:out['selected_sigterm_probe']='worker did not become ready'\nfinally:\n    if p.poll() is None:os.killpg(p.pid,signal.SIGKILL);p.wait()\n    if worker:\n        try:os.killpg(worker,signal.SIGKILL)\n        except ProcessLookupError:pass\nprint(json.dumps(out,ensure_ascii=False,indent=2))\n(SCRATCH/'validation-probe-results.json').write_text(json.dumps(out,ensure_ascii=False,indent=2)+'\\n')\n",
+      "observed": {
+        "empty_worker_exit": 0,
+        "overlap_worker_exit": 0,
+        "overlap_test_runs": 3,
+        "per_selector_class_setups": 2,
+        "selected_cache_{invalid": 0,
+        "selected_cache_[]": 0,
+        "selected_cache_{\"tests.validation_probe_synthetic.Cases\":\"slow\"}": 0,
+        "selected_overlap_exit": 0,
+        "selected_overlap_groups": [
+          [
+            "tests.validation_probe_synthetic.Cases"
+          ],
+          [
+            "tests.validation_probe_synthetic.Cases.test_a"
+          ]
+        ],
+        "matrix_duplicate_and_extra_accepted_count": 1,
+        "parallel_nan_exit": 1,
+        "parallel_nan_discovery_called": false,
+        "selected_nan_exit": 2,
+        "selected_sigterm_parent_exit": -15,
+        "selected_sigterm_worker_survives": true
+      },
+      "execution_scope": "Temporary fixtures and external-service substitutes; no user-state mutation or paid models."
+    },
+    "frontend": {
+      "diagnostics_script": "const fs=require('fs'),vm=require('vm');const root='/Users/neg-entropy/Desktop/Adaptive RSI/';const text=fs.readFileSync(root+'adaptive_rsi/web/model-center.js','utf8');const body=text.slice(text.indexOf('diagnostics.onclick=()=>safe(')+'diagnostics.onclick=()=>safe('.length,text.indexOf('\\n    });',text.indexOf('diagnostics.onclick=()=>safe(')))+');';let request;const ctx={provider:{id:'custom',catalog:{models:[{id:'project-model',enabled:true}]}},scope:'project-123',t:x=>x,api:async(path,payload)=>{request={path,payload};return {};},el:()=>({}),console};(async()=>{try{await vm.runInNewContext('('+body.slice(0,-2)+'\\n})()',ctx);}catch(e){console.log(JSON.stringify({request,error:e.toString()}));}})();",
+      "browser_script": "const fs=require('fs');const {chromium}=require('/Users/neg-entropy/Desktop/Adaptive RSI/node_modules/playwright');const root='/Users/neg-entropy/Desktop/Adaptive RSI/';\n(async()=>{const browser=await chromium.launch({channel:'chrome'});try{const page=await browser.newPage();await page.route('**/*',r=>r.abort());await page.setContent('<p id=\"update-status\"></p><div id=\"mc-auth\"></div><div class=\"task-toolbar\"></div>');await page.evaluate(()=>{window.t=x=>x;window.el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};window.$=id=>document.getElementById(id);window.safe=fn=>Promise.resolve().then(fn);window.action=(txt,fn)=>{const b=el('button',txt);b.onclick=()=>safe(fn);return b;};window.localRead=k=>window.store?.[k]||null;window.localStorage={getItem:()=>null,setItem:()=>{}};window.readinessCache=new Map();window.stamp=x=>String(x);window.calls=[];window.store={};window.RSIDesktop={invoke:async(_,body)=>{calls.push(body.action);return {state:'available',current_version:'0.5.125',version:'0.5.126'};}};});await page.addScriptTag({content:fs.readFileSync(root+'adaptive_rsi/web/native-update.js','utf8')});const native=await page.evaluate(async()=>{await RSINativeUpdate.run('check');await RSINativeUpdate.tick();return {calls,storedChecked:store['rsi-native-update-checked']};});\n// localStorage requires a real origin; route the synthetic page locally without network.\nawait page.route('http://fixture.test/**',r=>r.fulfill({body:'<div id=\"mc-auth\"></div><div class=\"task-toolbar\"></div>',contentType:'text/html'}));await page.goto('http://fixture.test');await page.evaluate(()=>{window.t=x=>x;window.el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};window.$=id=>document.getElementById(id);window.errors=[];window.safe=fn=>Promise.resolve().then(fn).catch(e=>errors.push(e.message));window.action=(txt,fn)=>{const b=el('button',txt);b.onclick=()=>safe(fn);return b;};window.readinessCache=new Map();window.stamp=x=>String(x);window.api=async path=>path==='auth/status'?{opencode:{authenticated_providers:[]},sessions:[{backend:'opencode',provider:'alpha',id:'s1',state:'awaiting_authorization'}]}:path.startsWith('auth/providers')?{providers:[{id:'alpha',name:'Alpha',methods:[]},{id:'beta',name:'Beta',methods:[]}]}:{id:'s1',state:'awaiting_authorization'};});await page.addScriptTag({content:fs.readFileSync(root+'adaptive_rsi/web/auth.js','utf8')});await page.evaluate(()=>RSIAuth.show('opencode',async()=>{}));await page.waitForSelector('#mc-auth-provider-search');await page.locator('#mc-auth-provider-search').focus();const focus=await page.evaluate(()=>{const search=$('mc-auth-provider-search');RSIAuth.translate();return {before:search.id,after:document.activeElement.id,oldConnected:search.isConnected};});\nawait page.evaluate(()=>{window.projectId='p';window.ids=0;window.posts=[];window.refresh=async()=>{};window.toast=()=>{};window.uiConfirm=async()=>true;window.crypto.randomUUID=()=> 'request-'+(++ids);window.api=async(path,body)=>{if(body?.action==='recommend')return {tasks:[{id:'t',title:'T'}],recommendations:[{tasks:['t'],revision:'r',verification_cost:{}}]};posts.push(body);throw new TypeError('response lost after acceptance');};});await page.addScriptTag({content:fs.readFileSync(root+'adaptive_rsi/web/batch.js','utf8')});const batch=await page.evaluate(async()=>{const row=RSIBatch.row({id:'t',title:'T'});row.checked=true;row.dispatchEvent(new Event('change'));const click=async()=>{[...document.querySelectorAll('#batch-actions button')].find(b=>b.textContent==='推荐任务簇').click();await new Promise(r=>setTimeout(r,10));};await click();await click();return {request_ids:posts.map(p=>p.request_id),errors};});console.log(JSON.stringify({native,focus,batch},null,2));}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});\n",
+      "native_resume_script": "const fs=require('fs');const {chromium}=require('/Users/neg-entropy/Desktop/Adaptive RSI/node_modules/playwright');(async()=>{const browser=await chromium.launch({channel:'chrome'});try{const page=await browser.newPage();await page.route('**/*',r=>r.fulfill({body:'<p id=\"update-status\"></p>',contentType:'text/html'}));await page.goto('http://fixture.test');await page.evaluate(()=>{window.t=x=>x;window.el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};window.$=id=>document.getElementById(id);window.localRead=k=>localStorage.getItem(k);window.safe=fn=>fn();window.calls=[];localStorage.setItem('rsi-native-update-policy','download');localStorage.setItem('rsi-native-update-checked',String(Date.now()));window.RSIDesktop={invoke:async(_,body)=>{calls.push(body.action);return {state:'available',current_version:'0.5.125',version:'0.5.126'};}};});await page.addScriptTag({content:fs.readFileSync('/Users/neg-entropy/Desktop/Adaptive RSI/adaptive_rsi/web/native-update.js','utf8')});console.log(await page.evaluate(async()=>{await RSINativeUpdate.tick();await RSINativeUpdate.tick();return {calls,policy:localStorage.getItem('rsi-native-update-policy'),status:document.querySelector('#native-update-panel p').textContent};}));}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});",
+      "observed": {
+        "diagnostics_error": "ReferenceError: dialog is not defined",
+        "project_scope_sent": null,
+        "auth_focus_after_render": "",
+        "batch_request_ids": [
+          "request-1",
+          "request-2"
+        ],
+        "native_resume_calls": [
+          "status",
+          "status"
+        ]
+      }
+    }
+  },
+  "measurement_evidence": {
+    "baseline": {
+      "checkpoint": "e78aea5cc892010b86987bac8fc54254728370a4",
+      "python": "3.14.6 (v3.14.6:c63aec69bd5, Jun 10 2026, 08:07:54) [Clang 21.0.0 (clang-2100.1.1.101)]",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "runs": [
+        {
+          "label": "python-baseline",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/test_parallel.py",
+            "--durations",
+            "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/python-baseline-durations.json"
+          ],
+          "exit_code": 0,
+          "seconds": 310.8408002909273,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/python-baseline.log",
+          "python_tests_reported": 1075,
+          "python_suite_reports": 68
+        },
+        {
+          "label": "node-baseline",
+          "argv": [
+            "node",
+            "--test",
+            "tests/web_batch_planning.cjs",
+            "tests/web_desktop_transport.cjs",
+            "tests/web_i18n_ast.cjs",
+            "tests/web_native_update.cjs",
+            "tests/web_native_update_policy.cjs",
+            "tests/web_requests.cjs",
+            "tests/web_service_worker.cjs"
+          ],
+          "exit_code": 0,
+          "seconds": 1.457994292024523,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/node-baseline.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0
+        },
+        {
+          "label": "matrix-baseline",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/check_test_matrix.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.4116818751208484,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/matrix-baseline.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0
+        }
+      ]
+    },
+    "final_python": {
+      "argv": [
+        "/usr/local/bin/python3",
+        "-B",
+        "-c",
+        "import json,sys;from pathlib import Path;from scripts.test_parallel import run_groups;p=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028');sys.exit(run_groups(json.loads((p/\"original-groups.json\").read_text()),durations_file=p/\"python-final-durations.json\"))"
+      ],
+      "exit_code": 0,
+      "seconds": 131.6767974998802,
+      "expected_test_count": 1078,
+      "reported_test_count": 1078,
+      "suite_reports": 68,
+      "skipped": 10,
+      "executed": 1068,
+      "group_exits": [
+        [
+          "3",
+          "0"
+        ],
+        [
+          "1",
+          "0"
+        ],
+        [
+          "4",
+          "0"
+        ],
+        [
+          "2",
+          "0"
+        ]
+      ],
+      "selector_coverage_exact": true,
+      "file_sha256": {
+        "CONTRIBUTING.en.md": "c5dccb08eed20f1ac496169f3bbc12e7142ea0597350a7d044236da35d8bb9c5",
+        "CONTRIBUTING.md": "55e531a2022cfe27d9c02747fd684f325a1262e2c277e370ba36d7a4f568443a",
+        "README.en.md": "91ae190df3e281f27316dff1ef94e8801a28bdab2d2db985544311e2ef4823f6",
+        "README.md": "34d1bb93d48fb7c468188b890ae345272245c01fb8355ad9f8a906c8566c4799",
+        "adaptive_rsi/process.py": "3f1c658b4edd4e1694e513ff8d3a210d9f752b689f6072a3b1a4ce91a6977cd1",
+        "scripts/test_browser.cjs": "6e2166de3969efd1975a62526f38213f526d0b01e2d463e50b8862c00d07a65b",
+        "scripts/test_parallel.py": "0672701c5f3af1e14c945049eb85679d109a31ffad1a4323bc042e1d51b8e10b",
+        "scripts/test_selected.py": "235e70fcedf52135ae239ce6a74575deecf98a8315c8d656851dd3da283f5654",
+        "tests/test_audit_boundaries.py": "114c835f53429539562f6d34fce1ae20f73ee3add4a3f62f6964f7cd14eaf1a6",
+        "tests/test_backend_hardening.py": "f2d9e398a9f405d676082a6a5cc31c18f6db9c17d921db2d7f50c49d3448bc37",
+        "tests/test_catalog.py": "1e8d4bf1a193494a4ec85d6b2756148ae28057eeaa678d21af1a1d2a0b6666c5",
+        "tests/test_data_hardening.py": "1f1dec980ec404799c9e3eeaa1aa95da3855e67f38a5ea7a34efcd93f43225f3",
+        "tests/test_experience.py": "9264843fb45c809a404f1741400e7c6e3101509cf57959d82f5a7e7083273ac7",
+        "tests/test_model_center.py": "c18033019389dd9d9000cca61b62b9cd29c5413465773298ced7004cdf314bb1",
+        "tests/test_protocols.py": "da6dc1f810bf18ac2dc3102f41fe42be854273d7afbd56182c912213fe324be5",
+        "tests/test_release_parallel.py": "1df5c1977625d242938fc5abfe7b9748cfb8d7567aeb74c74c3a0a91fa690bf4",
+        "tests/test_runtime.py": "53068a72c3a6160f6a79dba246d33235f84efd1537f536785bd845b11454997b",
+        "tests/test_server_hardening.py": "e7c4f68c98c91684cc5d654cde39682aefde08aefac4e80999d4e256d6521bc8",
+        "tests/test_validation_planning.py": "525a7d38d3dd1bf2845df7e19016de816ee8e8df0a8f768c7eac974b02a437a0",
+        "tests/web_browser_runner.cjs": "b76f2329302056ed3e4f83ef7994ffb9c81bcb63954ffd09340f368b1b0a34f8"
+      },
+      "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/python-final.log",
+      "verified": true
+    },
+    "other_checks": {
+      "checkpoint": "e78aea5cc892010b86987bac8fc54254728370a4",
+      "python": "3.14.6 (v3.14.6:c63aec69bd5, Jun 10 2026, 08:07:54) [Clang 21.0.0 (clang-2100.1.1.101)]",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "runs": [
+        {
+          "label": "python-after",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "-c",
+            "import json,sys;from pathlib import Path;from scripts.test_parallel import run_groups;p=Path('/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028');sys.exit(run_groups(json.loads((p/\"original-groups.json\").read_text()),durations_file=p/\"python-after-durations.json\"))"
+          ],
+          "exit_code": 0,
+          "seconds": 130.99504162487574,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/python-after.log",
+          "python_tests_reported": 1069,
+          "python_suite_reports": 67,
+          "python_skipped": 10,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "node-after",
+          "argv": [
+            "node",
+            "--test",
+            "tests/web_batch_planning.cjs",
+            "tests/web_browser_runner.cjs",
+            "tests/web_desktop_transport.cjs",
+            "tests/web_i18n_ast.cjs",
+            "tests/web_native_update.cjs",
+            "tests/web_native_update_policy.cjs",
+            "tests/web_requests.cjs",
+            "tests/web_service_worker.cjs"
+          ],
+          "exit_code": 0,
+          "seconds": 1.192602250026539,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/node-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {
+            "tests": 356,
+            "pass": 356,
+            "fail": 0,
+            "skipped": 0
+          },
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "browser-after",
+          "argv": [
+            "npm",
+            "run",
+            "test:browser"
+          ],
+          "exit_code": 0,
+          "seconds": 117.42783441697247,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/browser-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 35,
+          "browser_nonzero": []
+        },
+        {
+          "label": "matrix-after",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/check_test_matrix.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.21205833298154175,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/matrix-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "docs-after",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/check_docs.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.1173518339637667,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/docs-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "api-after",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/check_api_contract.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.6733187921345234,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/api-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "i18n-after",
+          "argv": [
+            "/usr/local/bin/python3",
+            "-B",
+            "scripts/check_i18n.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.05857808282598853,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/i18n-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        },
+        {
+          "label": "i18n-ast-after",
+          "argv": [
+            "node",
+            "scripts/check_i18n_ast.cjs"
+          ],
+          "exit_code": 0,
+          "seconds": 0.16520204092375934,
+          "log": "/Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/i18n-ast-after.log",
+          "python_tests_reported": 0,
+          "python_suite_reports": 0,
+          "python_skipped": 0,
+          "node_counts": {},
+          "browser_scenarios": 0,
+          "browser_nonzero": []
+        }
+      ],
+      "scope": "Working tree validation; original baseline module groups retained for comparison"
+    },
+    "process_before": {
+      "current_run_process": {
+        "samples": [
+          0.0880024170037359,
+          0.08774408302269876,
+          0.08493550005368888,
+          0.08803545800037682,
+          0.090014792047441,
+          0.08507937495596707,
+          0.08787266700528562,
+          0.08326670899987221,
+          0.08274691691622138,
+          0.08830604096874595,
+          0.08740629116073251,
+          0.08888212498277426
+        ],
+        "median_seconds": 0.08780837501399219,
+        "total_seconds": 1.0422923751175404
+      },
+      "direct_subprocess": {
+        "samples": [
+          0.02263520797714591,
+          0.024221082916483283,
+          0.021770957857370377,
+          0.02211058302782476,
+          0.02188204205594957,
+          0.020645375130698085,
+          0.02303679217584431,
+          0.023196666035801172,
+          0.022760875057429075,
+          0.021631000097841024,
+          0.022448374889791012,
+          0.022978750057518482
+        ],
+        "median_seconds": 0.02254179143346846,
+        "total_seconds": 0.26931770727969706
+      }
+    },
+    "process_after": {
+      "updated_run_process": {
+        "samples": [
+          0.04269037512131035,
+          0.03768133302219212,
+          0.03791466704569757,
+          0.0367247078102082,
+          0.04208962502889335,
+          0.038276541978120804,
+          0.03844570810906589,
+          0.0399255829397589,
+          0.041313083143904805,
+          0.04157258407212794,
+          0.041614624904468656,
+          0.03856858378276229
+        ],
+        "median_seconds": 0.03924708336126059,
+        "total_seconds": 0.4768174169585109
+      },
+      "direct_subprocess": {
+        "samples": [
+          0.023948832880705595,
+          0.021683417027816176,
+          0.025660375133156776,
+          0.023015750106424093,
+          0.023038874845951796,
+          0.022565915947780013,
+          0.024408499943092465,
+          0.023794374894350767,
+          0.025353207951411605,
+          0.025254833046346903,
+          0.02586608286947012,
+          0.02252962510101497
+        ],
+        "median_seconds": 0.02387160388752818,
+        "total_seconds": 0.2871197897475213
+      }
+    },
+    "http_shutdown": {
+      "0.5": {
+        "samples": [
+          0.5013015000149608,
+          0.5012160839978606,
+          0.5011903329286724,
+          0.5011744999792427,
+          0.5011541249696165,
+          0.5011083749122918
+        ],
+        "median_seconds": 0.5011824164539576,
+        "sum_seconds": 3.0071449168026447
+      },
+      "0.01": {
+        "samples": [
+          0.010211625136435032,
+          0.011176374973729253,
+          0.011152290971949697,
+          0.012516624992713332,
+          0.011113957967609167,
+          0.010805875062942505
+        ],
+        "median_seconds": 0.011133124469779432,
+        "sum_seconds": 0.06697674910537899
+      }
+    }
+  }
+}

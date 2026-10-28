@@ -6,7 +6,12 @@ const root=path.resolve(__dirname,'..');
 const files=readdirSync(path.join(root,'tests')).filter(name=>/^browser_.*\.cjs$/.test(name)).sort();
 const concurrency=Number(process.env.RSI_BROWSER_WORKERS||2);
 if(!Number.isInteger(concurrency)||concurrency<1||concurrency>4)throw Error('RSI_BROWSER_WORKERS must be 1..4');
-const pending=files.flatMap(file=>file==='browser_hardening.cjs'?['core','providers','routes','updates','settings','recovery'].map(group=>({file,group,label:file+':'+group})):[{file,label:file}]),active=new Set(),timings={};
+const available=files.flatMap(file=>file==='browser_hardening.cjs'?['core','providers','routes','updates','settings','recovery'].map(group=>({file,group,label:file+':'+group})):[{file,label:file}]);
+const args=process.argv.slice(2),listing=args.includes('--list'),selectors=args.filter(arg=>arg!=='--list');
+if(new Set(selectors).size!==selectors.length)throw Error('Browser selectors must be unique');
+for(const selector of selectors)if(!available.some(item=>item.file===selector||item.label===selector))throw Error('Unknown browser selector: '+selector);
+const pending=available.filter(item=>!selectors.length||selectors.includes(item.file)||selectors.includes(item.label)),active=new Set(),timings={};
+if(!pending.length)throw Error('No browser scenarios found');
 let failed=false,stopping=false;
 function terminate(child){
  try{process.kill(-child.pid,'SIGTERM');}catch{}
@@ -24,4 +29,4 @@ function next(){
  }
  if(!pending.length&&!active.size){mkdirSync(path.join(root,'.ci'),{recursive:true});writeFileSync(path.join(root,'.ci/browser-durations.json'),JSON.stringify(timings,null,2)+'\n');process.exitCode=failed?1:0;}
 }
-next();
+if(listing)for(const item of pending)console.log(item.label);else next();

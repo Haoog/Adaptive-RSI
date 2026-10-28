@@ -312,3 +312,57 @@ fn child_wait_deadline_does_not_wait_for_process_exit() {
     stop_child(&mut child, Duration::ZERO);
     assert!(child.try_wait().unwrap().is_some());
 }
+
+#[test]
+fn private_handshake_stream_keeps_rotations_and_bounds_each_message() {
+    let receiver = handshake_stream(std::io::Cursor::new(b"first\nrotated\n".to_vec()));
+    assert_eq!(receiver.recv().unwrap().unwrap(), "first\n");
+    assert_eq!(receiver.recv().unwrap().unwrap(), "rotated\n");
+    assert!(receiver.recv().is_err());
+    let receiver = handshake_stream(std::io::Cursor::new(vec![b'x'; 65537]));
+    assert!(receiver.recv().unwrap().is_err());
+}
+
+#[test]
+fn private_rotation_is_bound_to_generation_and_service_identity() {
+    let state = RuntimeState::default();
+    let (client, transport) = transport::clients().unwrap();
+    let connection = Connection { client, transport, origin: "http://127.0.0.1:4321".into(),
+        csrf_origin: "https://public.example.test".into(), cookie: Some("rsi_fixture=old".into()),
+        csrf: "old".into(), name: "fixture".into(), owned: false };
+    *state.local.lock().unwrap() = Some(connection.clone());
+    *state.target.lock().unwrap() = Some(connection);
+    let fixture = json!({"origin":"https://public.example.test","local_origin":"http://127.0.0.1:4321",
+        "cookie":"rsi_fixture","token":"new","csrf":"new","owned":false,"pid":123,"rotated":true});
+    for (field, value) in [("pid", json!(124)), ("local_origin", json!("http://127.0.0.1:4322")),
+                            ("cookie", json!("other")), ("owned", json!(true))] {
+        let mut invalid = fixture.clone(); invalid[field] = value;
+        assert!(!publish_runtime_session(&state, 0, 123, serde_json::from_value(invalid).unwrap()));
+    }
+    assert!(!publish_runtime_session(&state, 1, 123, serde_json::from_value(fixture.clone()).unwrap()));
+    assert!(publish_runtime_session(&state, 0, 123, serde_json::from_value(fixture).unwrap()));
+    assert_eq!(state.local.lock().unwrap().as_ref().unwrap().csrf, "new");
+    assert_eq!(state.target.lock().unwrap().as_ref().unwrap().cookie.as_deref(), Some("rsi_fixture=new"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_timeout_invalidates_connection_until_actual_exit_recovery() {
+    let state = RuntimeState::default();
+    let (client, transport) = transport::clients().unwrap();
+    let connection = Connection { client, transport, origin: "http://127.0.0.1:4321".into(),
+        csrf_origin: "http://127.0.0.1:4321".into(), cookie: None, csrf: "fixture".into(),
+        name: "fixture".into(), owned: true };
+    *state.local.lock().unwrap() = Some(connection.clone());
+    *state.target.lock().unwrap() = Some(connection);
+    let child = Command::new("python3").args(["-c", "import sys,time; sys.stdin.read(); time.sleep(0.2)"])
+        .stdin(Stdio::piped()).spawn().unwrap();
+    *state.child.lock().unwrap() = Some(child);
+    let mut exiting = shutdown_runtime(&state, Duration::from_millis(10)).expect("still exiting");
+    assert!(state.child.lock().unwrap().is_none());
+    assert!(state.local.lock().unwrap().is_none());
+    assert!(state.target.lock().unwrap().is_none());
+    assert!(state.recovering.load(Ordering::SeqCst));
+    assert!(exiting.stdin.is_none());
+    assert!(wait_for_child(&mut exiting, Duration::from_secs(3)));
+}

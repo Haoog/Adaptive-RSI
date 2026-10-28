@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
@@ -43,6 +43,9 @@ struct RuntimeState {
     error: Mutex<String>,
     update: Mutex<Option<DesktopUpdate>>,
     transport: transport::Control,
+    generation: AtomicU64,
+    pid: AtomicU32,
+    recovering: AtomicBool,
 }
 
 ///桌面应用自身的更新状态；percent 存百分比×100，避免浮点原子。
@@ -467,6 +470,100 @@ fn stop_child(child: &mut Child, grace: Duration) {
     }
 }
 
+///持续读取私有握手管道；每次只接受一条有界消息，读取端销毁后线程自然结束。
+fn handshake_stream<R: Read + Send + 'static>(
+    reader: R,
+) -> std::sync::mpsc::Receiver<std::io::Result<String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut bytes = Vec::new();
+            match reader.read_until(b'\n', &mut bytes) {
+                Ok(0) => break,
+                Ok(_) if bytes.len() > 65536 => {
+                    let _ = sender.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "runtime handshake line exceeds bound",
+                    )));
+                    break;
+                }
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&bytes).into_owned();
+                    if sender.send(Ok(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
+}
+
+///只接受同一服务代次、同一进程及其原有连接的轮换回执。
+fn publish_runtime_session(state: &RuntimeState, generation: u64, pid: u32, session: Session) -> bool {
+    if !session.rotated
+        || session.pid != Some(pid)
+        || generation != state.generation.load(Ordering::SeqCst)
+    {
+        return false;
+    }
+    let origin = session
+        .local_origin
+        .clone()
+        .unwrap_or_else(|| session.origin.clone());
+    let name = session.cookie.split('=').next().unwrap_or("");
+    if name.is_empty() {
+        return false;
+    }
+    let owned = {
+        let mut local = state.local.lock().unwrap();
+        let Some(current) = local.as_mut() else {
+            return false;
+        };
+        if origin != current.origin
+            || session.owned != current.owned
+            || current.cookie.as_deref().map(|value| value.split('=').next().unwrap_or("")) != Some(name)
+        {
+            return false;
+        }
+        current.csrf = session.csrf.clone();
+        current.cookie = Some(format!("{}={}", name, session.token));
+        current.owned
+    };
+    if let Some(target) = state.target.lock().unwrap().as_mut() {
+        if target.origin == origin && target.owned == owned {
+            target.csrf = session.csrf;
+            target.cookie = Some(format!("{}={}", name, session.token));
+        }
+    }
+    true
+}
+
+///请求旧运行器退出。超时后保留仍在退出的子进程，但立即撤销可用连接，
+///避免后续 API 或更新回执继续使用已失去控制管道的服务。
+fn shutdown_runtime(state: &RuntimeState, grace: Duration) -> Result<Child, String> {
+    let mut child = state
+        .child
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("Runtime is not running")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.flush();
+    }
+    if !wait_for_child(&mut child, grace) {
+        *state.local.lock().unwrap() = None;
+        *state.target.lock().unwrap() = None;
+        state.recovering.store(true, Ordering::SeqCst);
+    }
+    Ok(child)
+}
+
 impl Drop for PendingChild {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
@@ -483,6 +580,10 @@ struct Session {
     token: String,
     csrf: String,
     owned: bool,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    rotated: bool,
 }
 #[derive(Serialize)]
 struct Reply {
@@ -650,15 +751,9 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
         .stdout
         .take()
         .ok_or("Cannot read runtime handshake")?;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(stdout)
-            .take(65536)
-            .read_line(&mut line)
-            .map(|_| line);
-        let _ = sender.send(result);
-    });
+    // Keep the private channel open: the reused service publishes later
+    // rotations on the same stream, not only the first handshake.
+    let receiver = handshake_stream(stdout);
     let handshake = receiver
         .recv_timeout(health_deadline.saturating_duration_since(std::time::Instant::now()))
         .ok()
@@ -740,7 +835,23 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<RuntimeState>();
     *state.local.lock().unwrap() = Some(connection.clone());
     *state.target.lock().unwrap() = Some(connection);
+    let pid = child.get_mut().id();
     *state.child.lock().unwrap() = Some(child.take());
+    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+    state.pid.store(pid, Ordering::SeqCst);
+    state.recovering.store(false, Ordering::SeqCst);
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        while let Ok(Ok(line)) = receiver.recv() {
+            let Ok(session) = serde_json::from_str::<Session>(&line) else {
+                continue;
+            };
+            if session.rotated {
+                let state = handle.state::<RuntimeState>();
+                let _ = publish_runtime_session(&state, generation, pid, session);
+            }
+        }
+    });
     Ok(())
 }
 #[tauri::command]

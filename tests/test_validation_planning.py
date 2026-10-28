@@ -7,11 +7,60 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from scripts import classify_changes, release, test_parallel
+from scripts import classify_changes, release, test_parallel, test_selected
 from tests.test_runtime import git
 
 
+class EmptySelection(unittest.TestCase):
+    pass
+
+
 class ValidationPlanningTest(unittest.TestCase):
+    def test_selected_rejects_empty_and_overlapping_expansions(self):
+        for selectors in ([__name__ + '.EmptySelection'],
+                          [__name__ + '.ValidationPlanningTest', __name__ + '.ValidationPlanningTest.test_selected_rejects_empty_and_overlapping_expansions']):
+            with self.subTest(selectors=selectors), patch('sys.argv', ['selected', *selectors]), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    test_selected.main()
+                self.assertNotEqual(result.exception.code, 0)
+
+    def test_selected_keeps_same_module_fixtures_in_one_worker(self):
+        names = [__name__ + '.ValidationPlanningTest.test_selected_rejects_empty_and_overlapping_expansions',
+                 __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker']
+        with patch('sys.argv', ['selected', *names]), patch.object(test_selected, 'run_groups', return_value=0) as run:
+            self.assertEqual(test_selected.main(), 0)
+        self.assertEqual(len(run.call_args.args[0]), 1)
+
+    def test_worker_preserves_class_fixture_once_and_rejects_empty(self):
+        from scripts import test_worker
+        events = []
+        class Case(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls): events.append('setup')
+            @classmethod
+            def tearDownClass(cls): events.append('teardown')
+            def test_a(self): events.append('a')
+            def test_b(self): events.append('b')
+        def load(name):
+            return unittest.TestSuite([Case(name)]) if name.startswith('test_') else unittest.TestSuite()
+        with tempfile.TemporaryDirectory() as directory, patch.object(unittest.TestLoader, 'loadTestsFromName', side_effect=load), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            output = Path(directory) / 'timing.json'
+            self.assertEqual(test_worker.run(['test_a', 'test_b'], output), 0)
+            self.assertEqual(events, ['setup', 'a', 'b', 'teardown'])
+            with self.assertRaises(ValueError):
+                test_worker.run(['empty'], output)
+
+    def test_selected_tests_ignore_invalid_timing_cache_and_run_every_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'durations.json'
+            for content in ('{broken', '[]', '{"tests.fast": "slow"}', '{"tests.fast": -1}'):
+                with self.subTest(content=content):
+                    cache.write_text(content)
+                    argv = ['test_selected.py', '--durations', str(cache), 'tests.fast', 'tests.slow']
+                    with patch('sys.argv', argv), patch.object(test_selected, 'run_groups', return_value=0) as execute:
+                        self.assertEqual(test_selected.main(), 0)
+                    self.assertCountEqual(sum(execute.call_args.args[0], []), ['tests.fast', 'tests.slow'])
+
     def test_real_release_patch_is_metadata_only_but_any_extra_or_edited_content_is_full(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(release, 'ROOT', Path(directory)):
             root = Path(directory)
@@ -87,9 +136,16 @@ class ValidationPlanningTest(unittest.TestCase):
             def runTest(self):pass
         with tempfile.TemporaryDirectory() as directory:
             destination=Path(directory)/'timings.json'
-            with tempfile.TemporaryFile(mode='w+') as errors,patch.object(unittest.defaultTestLoader,'loadTestsFromName',side_effect=lambda name:unittest.TestSuite([Passing()])),patch.object(test_worker.time,'monotonic',side_effect=[10,11,20,30]),redirect_stdout(io.StringIO()),redirect_stderr(errors):
+            with tempfile.TemporaryFile(mode='w+') as errors,patch.object(unittest.defaultTestLoader,'loadTestsFromName',side_effect=lambda name:unittest.TestSuite([type('Passing_'+name,(unittest.TestCase,),{'runTest':lambda self:None})()])),patch.object(test_worker.time,'monotonic',side_effect=[10,11,20,30]),redirect_stdout(io.StringIO()),redirect_stderr(errors):
                 self.assertEqual(test_worker.run(['fast','slow'],destination),0)
             self.assertEqual(json.loads(destination.read_text()),{'fast':1,'slow':10})
+
+    def test_worker_refuses_to_spawn_another_runner(self):
+        import os
+        from scripts import test_parallel
+        with patch.dict(os.environ, {'RSI_TEST_RUNNING': 'tests.test_runtime'}):
+            with self.assertRaisesRegex(ValueError, 'already running'):
+                test_parallel.run_groups([['tests.test_runtime']])
 
     def test_changed_classifier_cannot_select_the_metadata_shortcut_in_workflow(self):
         import os

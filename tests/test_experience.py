@@ -170,7 +170,7 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
         self.auth.status.return_value = {"id": "login", "state": "cancelled"}
         self.auth.set_api_key.return_value = {"saved": True}
         self.server = Server(self.runtime)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.headers = {"Cookie": self.server.cookie + "=" + self.server.token,
                         "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,

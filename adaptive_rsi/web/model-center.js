@@ -134,6 +134,11 @@ window.RSIModelCenter = (() => {
     }
   }
   function protocolName(protocol){return {codex:'Codex / Responses',responses:'Responses API',chat_completions:'Chat Completions',anthropic:'Anthropic Messages',gemini:'Gemini',ollama:'Ollama API',codex_login:t('本机账户')}[protocol]||protocol;}
+  function diagnosticDialog(title){
+    const box=el('dialog',undefined,'experience-dialog'),heading=el('div',undefined,'dialog-heading');
+    heading.append(el('h2',t(title)),el('button',t('关闭'),'text-button'));
+    box.append(heading);document.body.append(box);box.showModal();return box;
+  }
   function renderProvider(){
     const provider=selected(),catalog=provider.catalog;
     $('mc-provider-name').textContent=provider.id==='openai'?t('Codex 登录'):provider.name;
@@ -163,8 +168,8 @@ window.RSIModelCenter = (() => {
     diagnostics.onclick=()=>safe(async()=>{
       const model=provider.catalog.models.find(item=>item.enabled)?.id||provider.catalog.models[0]?.id;
       if(!model)return;
-      const result=await api('model-center/diagnose',{provider:provider.id,model,project:scope==='project'?scope:null});
-      const box=dialog(t('模型路由诊断')),body=el('pre',JSON.stringify(result,null,2));
+      const result=await api('model-center/diagnose',{provider:provider.id,model,project:scope});
+      const box=diagnosticDialog(t('模型路由诊断')),body=el('pre',JSON.stringify(result,null,2));
       box.append(el('p',t('本次只读取本地状态，不发送模型请求，也不产生费用。'),'muted'),body);
     });
     const authProvider=provider.id,authScope=scope;window.RSIAuth?.show(authProvider,()=>fetchProvider(authProvider,authScope,true));

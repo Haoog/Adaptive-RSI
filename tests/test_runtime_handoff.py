@@ -66,6 +66,35 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(row['state'], 'blocked')
         self.assertEqual(json.loads(row['result'])['failure']['stage'], 'preparation')
 
+    def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
+        _, parent = self.claim()
+        parent['_deadline_started'] = time.monotonic() - 5000
+        parent['_deadline_stage'] = 'preparation'
+        trial = self.runtime.new_trial_context(parent)
+        self.runtime.begin_phase(trial, 'evaluation')
+        self.assertFalse(self.runtime.is_cancelled(trial))
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (parent['id'],))['state'], 'planning')
+        trial['_deadline_started'] -= 4000
+        self.assertTrue(self.runtime.is_cancelled(trial))
+        self.runtime.propagate_deadline(parent, trial)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
+
+    def test_postprocess_does_not_reload_completed_history_after_migration(self):
+        for index in range(1000):
+            self.store.put_setting('postprocess:history-' + str(index), {'state': 'completed', 'steps': []})
+        self.runtime.drain_postprocess()
+        loaded = []
+        original = self.store.query
+        def observe(sql, args=()):
+            rows = original(sql, args)
+            if 'settings' in sql:
+                loaded.extend(rows)
+            return rows
+        with patch.object(self.store, 'query', side_effect=observe):
+            self.runtime.drain_postprocess()
+        self.assertEqual(loaded, [])
+
     def test_postprocess_recovers_without_duplicate_observation(self):
         task, run = self.claim()
         self.runtime.queue_postprocess(run)

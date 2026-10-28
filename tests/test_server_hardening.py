@@ -26,7 +26,7 @@ class ServerHardeningTest(unittest.TestCase):
         self.runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
                                        updates=SimpleNamespace(require_ready=lambda: None))
         self.server = Server(self.runtime)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.backups = self.store.root / "backups"
         self.backups.mkdir()

@@ -866,6 +866,8 @@ class AuthSessions:
                                    "error": exc.code, "authenticated_providers": []}
                 if exc.version:
                     result[backend]["version"] = exc.version
+            except AuthError:
+                result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
             except RuntimeError as exc:
                 if backend == "opencode" and str(exc).startswith("OpenCode credential listing"):
                     result[backend] = {"state": "signed_out", "available": available,
@@ -873,8 +875,6 @@ class AuthSessions:
                                        "error": "opencode_error", "authenticated_providers": []}
                 else:
                     raise
-            except AuthError:
-                result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
             except (OSError, ValueError):
                 result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
         with self.lock:

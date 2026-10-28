@@ -291,6 +291,14 @@ class Evolution:
                 (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
                  encode({"reason": reason}), time.time()))
             return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence"}
+        reserved = sorted(case["id"] for case in cases if case["split"] == "holdout")
+        if self.store.one("SELECT id FROM candidates WHERE project=? AND status='reserved' AND created>?",
+                          (project["id"], time.time() - 3600)):
+            return {"reason": "Another proposal currently reserves the holdout cases", "status": "insufficient_evidence"}
+        reservation = uid()
+        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+            (reservation, project["id"], "strategy", "reserved", encode({"guidance": "", "triggers": []}),
+             encode({"reservation": {"holdout": reserved}, "reason": "reserved"}), time.time()))
         manifest = []
         for case in cases:
             spec = json.loads(case["spec"])
@@ -313,11 +321,14 @@ class Evolution:
                 res = {}
             failures.append({"state": r["state"], "reason": res.get("reason", "")[:1000]})
         development = [json.loads(row["spec"])["task"] for row in self.store.query(
-            "SELECT spec FROM cases WHERE project=? AND split='development' LIMIT 10", (project["id"],))]
+            "SELECT spec FROM cases WHERE project=? AND split='development' "
+            "AND (NOT json_valid(spec) OR json_extract(spec,'$.active') IS NOT 0) "
+            "ORDER BY created DESC, id LIMIT 10", (project["id"],))]
         current = self.runtime.active_strategies(project["id"])
         archive = self.store.query("SELECT id,kind,content,status FROM candidates WHERE project=? "
                                    "ORDER BY created DESC LIMIT 20", (project["id"],))
-        proposal = self.runtime.invoke("evolution", "Propose one small, testable improvement to agent execution, "
+        try:
+            proposal = self.runtime.invoke("evolution", "Propose one small, testable improvement to agent execution, "
                                        "opportunity discovery/meta-planning, or toolchain/context adapter guidance. "
                                        "Do not change evaluator, budgets, permissions, or promotion rules. "
                                        "Guidance is a retrieved instruction, never executable controller code. "
@@ -325,6 +336,11 @@ class Evolution:
                                        encode({"observations": observations, "failures": failures,
                                                "development_tasks": development, "current": current,
                                                "candidate_archive": archive}), workspace, run)
+        except Exception as exc:
+            self.store.execute("UPDATE candidates SET status='insufficient_evidence', evidence=? WHERE id=?",
+                (encode({"reservation": {"holdout": reserved}, "reason": str(exc)}), reservation))
+            raise
+        self.store.execute("DELETE FROM candidates WHERE id=?", (reservation,))
         if not isinstance(proposal, dict) or "kind" not in proposal:
             raise RuntimeError("Model proposal must be an object with kind and content")
         candidate = uid()
@@ -384,12 +400,16 @@ class Evolution:
                             before = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
                             started = time.monotonic()
                             trial_config = merge(config, {"checks": spec["checks"]})
-                            trial_run = {**run, "config": encode(trial_config),
-                                         "_case_exposure": {"case": case["id"], "experiment": candidate, "limit": limit}}
+                            new_context = getattr(self.runtime, "new_trial_context", None)
+                            trial_run = new_context(run) if new_context else {**run}
+                            trial_run.update({"config": encode(trial_config),
+                                              "_case_exposure": {"case": case["id"], "experiment": candidate, "limit": limit}})
                             trial_task = {"id": run["task"], "title": spec["task"].splitlines()[0], "body": spec["task"],
                                           "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
                             outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
                                 trial_task, spec["repository"], spec["base"], trial_dir, worker, guide, experiment=True)
+                            if hasattr(self.runtime, "propagate_deadline"):
+                                self.runtime.propagate_deadline(run, trial_run)
                             # A case overlay is host-owned and remains outside model-visible workspaces.
                             if spec.get("overlay") and (trial_dir / "candidate").exists():
                                 overlay_result = self.runtime.evaluator.evaluate(

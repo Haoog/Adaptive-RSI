@@ -44,8 +44,20 @@ window.RSIBatch=(()=>{
    for(const cluster of report.recommendations){
     const titles=cluster.tasks.map(id=>report.tasks.find(task=>task.id===id)?.title||id).join('\n');
     if(!(await uiConfirm(t('确认合并此推荐任务簇？')+'\n'+titles+'\n'+costText(cluster.verification_cost))))continue;
-    const result=await api('tasks/batch',{project,tasks:cluster.tasks,action:'group',request_id:crypto.randomUUID(),revision:cluster.revision,preview:false});
-    if(result.complete)for(const id of cluster.tasks)selected.get(project)?.delete(id);
+    // Reuse the same receipt identity as ordinary batch operations so a lost
+    // response can be reconciled instead of creating a second request.
+    const signature=JSON.stringify(['group',cluster.tasks]),saved=window.RSIDraftStore?.get('batch',project);
+    let prior=null;
+    if(saved?.signature===signature){
+     try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
+     catch{prior=null;}
+    }
+    if(prior?.complete){window.RSIDraftStore?.remove('batch',project);for(const id of cluster.tasks)selected.get(project)?.delete(id);continue;}
+    const request_id=saved?.signature===signature?saved.id:crypto.randomUUID();
+    window.RSIDraftStore?.set('batch',project,{signature,id:request_id,tasks:cluster.tasks,action:'group'});
+    const result=await api('tasks/batch',{project,tasks:cluster.tasks,action:'group',request_id,revision:cluster.revision,preview:false});
+    if(result.complete){window.RSIDraftStore?.remove('batch',project);for(const id of cluster.tasks)selected.get(project)?.delete(id);}
+    else toast(t('部分结果待核对，请打开批次记录。'));
    }
    await refresh({force:true});
   }finally{pending.delete(project);toolbar();}

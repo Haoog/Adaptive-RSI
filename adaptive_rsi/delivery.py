@@ -386,10 +386,15 @@ def schedule(runtime, now=None):
     from .release import pending
     for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
                            "WHERE p.paused=0 AND (r.state IN ('pr_open','merged') OR "
-                           "(r.state='superseded' AND json_extract(r.result,'$.close_pending')=1))"):
+                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1))"):
         with runtime.scheduler_scope("delivery_run", run["project"], run["id"]):
+            outcome = parsed_result(run)
+            if "restore_invalidation" in outcome:
+                # Keep scanning other runs: the scheduler scope records this run's
+                # error once and clears it when the row becomes readable again.
+                raise ValueError("Delivery run result is not valid JSON")
             if (run["state"] in ["pr_open", "superseded"] or pending(runtime, run) or
-                    monitoring_due(json.loads(run["result"]), runtime.config(run["project"]), now)):
+                    monitoring_due(outcome, runtime.config(run["project"]), now)):
                 projects.add(run["project"])
     for project_id in projects:
         with runtime.scheduler_scope("delivery_project", project_id):
@@ -429,7 +434,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         return not current or runtime.is_cancelled(current)
 
     for run in store.query("SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR "
-                           "(state='superseded' AND json_extract(result,'$.close_pending')=1))" +
+                           "(state='superseded' AND json_valid(result) AND json_extract(result,'$.close_pending')=1))" +
                            (" AND project=?" if project_id else "") + " ORDER BY started",
                            (project_id,) if project_id else ()):
         if tracking_cancelled():
@@ -439,7 +444,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             continue
         try:
             config = runtime.config(project["id"])
-            outcome = json.loads(run["result"])
+            outcome = parsed_result(run)
             repo = config["github"]["repository"]
             policy = store.setting("delivery:" + run["id"])
             if not policy or not repo or repo.lower() != origin_repository(project["path"]).lower():
@@ -569,6 +574,26 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             store.event("delivery_error", str(exc), project["id"], run["id"])
 
 
+def committed_changes(source, start, end):
+    """Diff two committed SHAs; clean snapshots have no working-tree delta to read."""
+    if start == end:
+        return []
+    return [name for name in git(
+        source, "diff", "--name-only", "-z", start, end, "--").split("\0") if name]
+
+
+def parsed_result(run):
+    """Decode a run result without letting one malformed historical row abort a scan."""
+    raw = run["result"]
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        value = None
+    if isinstance(value, dict):
+        return value
+    return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
+
+
 def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if not monitoring_due(outcome, config, now):
         return
@@ -672,8 +697,17 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     checks = saved["checks"] or detect(baseline_tree)["checks"]
     effective = {**config, "environment": saved["environment"]}
     output_path("evaluation/report.json")
+    # A clean snapshot has no working-tree diff, so compare the two committed SHAs
+    # explicitly; otherwise changed tests/harness in the later mainline are hidden.
+    try:
+        committed = committed_changes(source, outcome["merged_sha"], head)
+    except (RuntimeError, OSError, ValueError):
+        # Unreadable or non-repository history cannot prove which files changed.
+        # Fall back to the evaluator's own diff instead of claiming an empty set,
+        # which would let frozen regression evidence be reused.
+        committed = None
     result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"), effective,
-                                       cancel=cancel, acceptance=acceptance, seeds=seeds)
+                                       cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=committed)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state,
