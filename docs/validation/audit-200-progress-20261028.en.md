@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 77 implemented with targeted acceptance, 30 partial, and 94 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 81 implemented with targeted acceptance, 27 partial, and 93 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -161,14 +161,14 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 106. **implemented** — Diagnose WAL checkpoint pressure
 107. **pending** — Set large-history performance budgets
 108. **pending** — Expand relational constraint coverage
-109. **partial** — Extend relationship auditing beyond stages
+109. **implemented** — Extend relationship auditing beyond stages
 110. **partial** — Execute migrations once per version
 111. **implemented** — Add a read-only database recovery mode
 112. **pending** — Explain configuration changes and safe undo
 113. **pending** — Type and version settings namespaces
-114. **partial** — Trace slow SQL without sensitive parameters
-115. **partial** — Measure connection-pool wait latency
-116. **partial** — Separate full integrity scans from live metrics
+114. **implemented** — Trace slow SQL without sensitive parameters
+115. **implemented** — Measure connection-pool wait latency
+116. **implemented** — Separate full integrity scans from live metrics
 117. **partial** — Bound backup duration and space consumption
 118. **pending** — Offer previewable reversible cleanup
 119. **implemented** — Verify archive content integrity
@@ -267,3 +267,5 @@ Rust explicitly passes the native desktop owner PID, independent of the PyInstal
 Bounded dependency DAGs (81): nine targeted tests cover diamonds, cycles through a second parent, missing/cross-project nodes, cancelled parents, combined ancestry budgets and legacy migration rollback. Chromium validates two-parent selection, bilingual draft preservation, save and reload. All 339 Node tests pass. Invalid legacy self-edges block migration without silently deleting evidence; missing historical parents block admission. Two-axis review found no remaining confirmed issue.
 
 Experiment comparisons and native tools (53/54/55/133/155/160): 13 targeted checks, 120 related Python regressions, 339 Node tests and the Chromium evolution flow pass. Unknown usage and zero baselines remain incomparable; real candidate zeros remain real zeros. Cohorts preserve any observed regression. Real symlink/directory races cannot redirect source access outside the workspace. Search cancellation retains locations; raw arguments/results are excluded from tool events. A real process kill after a write but before the terminal receipt preserves a started step after restart without replay. Review caught and fixed command success being misclassified as failure. Sealed-plan display/export does not replace an offline replay bundle or final holdout independence.
+
+Database observability and evidence relationships (109/114/115/116): nine targeted tests and 108 related regressions pass (two existing environment skips). SQL execution timing excludes pool waiting; timeout waits join declared nearest-rank quantiles. HTTP request IDs and task/run contexts correlate diagnostics without parameters or SQL text. Relationship checks disclose truncation and catch cross-project events; global NULL events remain valid. Bounded stage quarantine preserves complete evidence, including duplicate NULL keys, with transactional rollback. The 50k synthetic-history measurements are in [store metrics](store-metrics-20261028.json); they are local fixture data, not production or CI throughput. Soak checks retain zero borrowed connections and no model calls.

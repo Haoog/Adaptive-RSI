@@ -103,4 +103,4 @@ def inspect_database(source, timeout=10, max_mb=1024):
 KNOWN_TABLES = {"settings", "projects", "tasks", "runs", "calls", "events", "cases", "skills",
                 "candidates", "schedules", "stages", "task_revisions", "task_dependencies", "task_decisions",
                 "submissions", "phase_times", "remote_waits", "task_completions", "schema_migrations",
-                "request_log", "relationship_quarantine", "operations"}
+                "request_log", "relationship_quarantine", "operations", "task_revision_snapshots", "task_group_members"}

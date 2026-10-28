@@ -1,7 +1,9 @@
 import contextlib
+import contextvars
 from collections import deque
 import hashlib
 import json
+import math
 import queue
 import re
 import sqlite3
@@ -82,6 +84,7 @@ class Store:
         self._query_samples = deque(maxlen=128)
         self._wait_samples = deque(maxlen=512)
         self._slow_queries = deque(maxlen=20)
+        self._query_context = contextvars.ContextVar("rsi_query_context", default={})
         self._active_snapshots = {}
         self._poll_log_windows = {}
         self._request_log_counts = {"observed": 0, "persisted": 0, "sampled_out": 0, "failed": 0}
@@ -268,6 +271,9 @@ class Store:
             with self._metrics_lock:
                 self._metrics["waiting"] -= 1
                 self._metrics["timeouts"] = self._metrics.get("timeouts", 0) + 1
+                waited = time.monotonic() - waiting_since
+                self._metrics["wait_seconds"] = self._metrics.get("wait_seconds", 0) + waited
+                self._wait_samples.append(waited)
             raise sqlite3.OperationalError("Database connection capacity exhausted")
         with self._metrics_lock:
             self._metrics["waiting"] -= 1
@@ -338,23 +344,43 @@ class Store:
                 except Exception:
                     pass
 
+    @contextlib.contextmanager
+    def query_scope(self, **identity):
+        context = dict(self._query_context.get())
+        context.update({key: value for key, value in identity.items() if key in ("request", "run", "task")
+                        and isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value)})
+        token = self._query_context.set(context)
+        try:
+            yield
+        finally:
+            self._query_context.reset(token)
+
     def query(self, sql, args=()):
         started = time.monotonic()
+        execution_seconds = None
+        def execute(db):
+            nonlocal execution_seconds
+            began = time.monotonic()
+            try:
+                return [dict(row) for row in db.execute(sql, args).fetchall()]
+            finally:
+                execution_seconds = time.monotonic() - began
         try:
             active = getattr(self._read_snapshot, "connection", None)
             if active is not None:
-                return [dict(row) for row in active.execute(sql, args).fetchall()]
+                return execute(active)
             with self.connect() as db:
-                return [dict(row) for row in db.execute(sql, args).fetchall()]
+                return execute(db)
         finally:
             elapsed = time.monotonic() - started
             with self._metrics_lock:
                 self._metrics["queries"] = self._metrics.get("queries", 0) + 1
                 self._query_samples.append(elapsed)
-                if elapsed > 0.1:
+                if execution_seconds is not None and execution_seconds > 0.1:
                     normalized = re.sub(r"'(?:''|[^'])*'", "?", " ".join(sql.split()))
                     self._slow_queries.append({"fingerprint": hashlib.sha256(normalized.encode()).hexdigest()[:16],
-                                               "seconds": elapsed, "at": time.time()})
+                                               "seconds": execution_seconds, "total_seconds": elapsed, "at": time.time(),
+                                               "context": dict(self._query_context.get())})
 
     def stream(self, sql, args=()):
         """Yield rows without materializing an unbounded result set."""
@@ -447,8 +473,10 @@ class Store:
             borrowed = self._metrics["borrowed"]
             values = dict(self._metrics)
             waits = sorted(self._wait_samples)
-            values.update(wait_p50_seconds=waits[len(waits) // 2] if waits else 0,
-                          wait_p95_seconds=waits[min(len(waits) - 1, int(len(waits) * .95))] if waits else 0,
+            quantile = lambda fraction: waits[max(0, math.ceil(len(waits) * fraction) - 1)] if waits else None
+            values.update(wait_p50_seconds=quantile(.5), wait_p95_seconds=quantile(.95), wait_p99_seconds=quantile(.99),
+                          wait_samples=len(waits), wait_window=512, wait_quantile="nearest_rank", wait_timeout_seconds=15,
+                          wait_scope="completed_admissions_including_timeouts_this_process",
                           slow_queries=list(self._slow_queries))
             values["request_logging"] = {**self._request_log_counts, "poll_sample_seconds": 60,
                                          "counter_scope": "this_process", "errors_and_writes": "all"}
@@ -490,36 +518,60 @@ class Store:
 
     def relationship_audit(self, limit=100):
         checks = {
-            "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project<>t.project",
+            "tasks_without_project": "SELECT t.id FROM tasks t LEFT JOIN projects p ON p.id=t.project WHERE p.id IS NULL",
+            "runs_without_project": "SELECT r.id FROM runs r LEFT JOIN projects p ON p.id=r.project WHERE p.id IS NULL",
+            "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project IS NOT t.project",
             "runs_without_task": "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.task IS NOT NULL AND t.id IS NULL",
-            "events_without_project": "SELECT e.seq FROM events e LEFT JOIN projects p ON p.id=e.project WHERE e.project IS NOT NULL AND p.id IS NULL",
+            "events_without_project": "SELECT e.seq FROM events e LEFT JOIN projects p ON p.id=e.project WHERE e.project IS NOT NULL AND p.id IS NULL AND NOT (e.project='model-center' AND coalesce(e.run,'') LIKE 'model-test-%')",
+            "events_without_run": "SELECT e.seq FROM events e LEFT JOIN runs r ON r.id=e.run WHERE e.run IS NOT NULL AND r.id IS NULL AND e.run NOT LIKE 'model-test-%'",
+            "event_project_mismatch": "SELECT e.seq FROM events e JOIN runs r ON r.id=e.run WHERE e.project IS NOT NULL AND e.project IS NOT r.project",
             "candidates_without_project": "SELECT c.id FROM candidates c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "invalid_candidate_parent": "SELECT c.id FROM candidates c LEFT JOIN candidates p ON p.id=c.parent WHERE c.parent IS NOT NULL AND (p.id IS NULL OR p.project IS NOT c.project OR p.kind IS NOT c.kind)",
             "cases_without_project": "SELECT c.id FROM cases c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "skills_without_project": "SELECT s.id FROM skills s LEFT JOIN projects p ON p.id=s.project WHERE p.id IS NULL",
+            "invalid_skill_task": "SELECT s.id FROM skills s LEFT JOIN tasks t ON t.id=s.task WHERE s.task IS NOT NULL AND (t.id IS NULL OR t.project IS NOT s.project)",
             "calls_without_run": "SELECT c.id FROM calls c LEFT JOIN runs r ON r.id=c.run WHERE c.run IS NOT NULL AND c.run NOT LIKE 'model-test-%' AND r.id IS NULL",
+            "calls_without_project": "SELECT c.id FROM calls c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL AND NOT (coalesce(c.project,'')='model-center' AND coalesce(c.run,'') LIKE 'model-test-%')",
+            "call_project_mismatch": "SELECT c.id FROM calls c JOIN runs r ON r.id=c.run WHERE c.project IS NOT r.project",
+            "schedules_without_project": "SELECT s.project FROM schedules s LEFT JOIN projects p ON p.id=s.project WHERE p.id IS NULL",
+            "decisions_without_task": "SELECT d.task FROM task_decisions d LEFT JOIN tasks t ON t.id=d.task WHERE t.id IS NULL",
+            "revisions_without_task": "SELECT d.id FROM task_revisions d LEFT JOIN tasks t ON t.id=d.task WHERE t.id IS NULL",
+            "snapshots_without_revision": "SELECT s.revision FROM task_revision_snapshots s LEFT JOIN task_revisions r ON r.id=s.revision WHERE r.id IS NULL",
+            "invalid_dependencies": "SELECT d.task FROM task_dependencies d LEFT JOIN tasks t ON t.id=d.task LEFT JOIN tasks p ON p.id=d.dependency WHERE t.id IS NULL OR p.id IS NULL OR t.project IS NOT p.project OR t.id=p.id",
+            "invalid_group_members": "SELECT m.group_task FROM task_group_members m LEFT JOIN tasks g ON g.id=m.group_task LEFT JOIN tasks t ON t.id=m.original_task WHERE g.id IS NULL OR t.id IS NULL OR g.project IS NOT t.project OR g.id=t.id",
+            "invalid_submissions": "SELECT s.request FROM submissions s LEFT JOIN tasks t ON t.id=s.task WHERE t.id IS NULL OR s.project IS NOT t.project",
+            "invalid_completions": "SELECT c.task FROM task_completions c LEFT JOIN tasks t ON t.id=c.task WHERE t.id IS NULL OR c.project IS NOT t.project",
+            "phases_without_run": "SELECT p.id FROM phase_times p LEFT JOIN runs r ON r.id=p.run WHERE r.id IS NULL",
+            "waits_without_run": "SELECT w.id FROM remote_waits w LEFT JOIN runs r ON r.id=w.run WHERE r.id IS NULL",
+            "stages_without_run": "SELECT s.run FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL",
         }
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("Relationship audit limit must be 1..1000")
         result = {}
+        truncated = {}
         for name, sql in checks.items():
-            result[name] = [row[next(iter(row))] for row in self.query(sql + " LIMIT ?", (limit,))]
+            rows = self.query(sql + " LIMIT ?", (limit + 1,))
+            result[name] = [row[next(iter(row))] for row in rows[:limit]]
+            truncated[name] = len(rows) > limit
+        result["_truncated"] = truncated
+        result["_limit"] = limit
         return result
 
-    def quarantine_orphans(self):
+    def quarantine_orphans(self, limit=100):
         """Move provable orphan rows into an audit table without deleting evidence."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Relationship audit limit must be 1..1000")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            specs = [
-                ("stages", "stages_without_run", "SELECT s.run,s.data FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL"),
-            ]
-            quarantined = {}
-            for table, label, select in specs:
-                rows = db.execute(select).fetchall()
-                quarantined[label] = len(rows)
-                for row in rows:
-                    db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES (?,?,?,?)",
-                               (table, row[0], json.dumps(dict(row), ensure_ascii=False), time.time()))
-                db.execute("DELETE FROM stages WHERE run IN (" + select.replace("SELECT s.run,s.data", "SELECT s.run") + ")")
-            return quarantined
+            rows = db.execute("SELECT s.rowid AS original_rowid,s.* FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL "
+                              "ORDER BY s.run,s.stage,s.rowid LIMIT ?", (limit + 1,)).fetchall()
+            for row in rows[:limit]:
+                evidence = dict(row)
+                original_rowid = evidence.pop("original_rowid")
+                db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES ('stages',?,?,?)",
+                           (str(original_rowid), encode(evidence), time.time()))
+                db.execute("DELETE FROM stages WHERE rowid=?", (original_rowid,))
+            return {"stages_without_run": min(len(rows), limit), "has_more": len(rows) > limit}
 
     def config_revision(self, project=None):
         row = self.one("SELECT value FROM settings WHERE key=?", ("config-revision:" + (project or "global"),))

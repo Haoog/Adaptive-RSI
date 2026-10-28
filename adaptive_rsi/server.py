@@ -302,8 +302,12 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
-        request_id = secrets.token_hex(8)
-        self._request_id = request_id
+        self._request_id = secrets.token_hex(8)
+        with self.server.runtime.store.query_scope(request=self._request_id):
+            return self._do_GET()
+
+    def _do_GET(self):
+        request_id = self._request_id
         started = time.time()
         error_code = ""
         parsed = urlparse(self.path)
@@ -738,6 +742,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
+        with self.server.runtime.store.query_scope(request=self._request_id):
+            return self._do_POST()
+
+    def _do_POST(self):
         started = time.time()
         if not self.authenticated():
             return

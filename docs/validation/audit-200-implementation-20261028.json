@@ -1690,12 +1690,18 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "合成各种孤儿关系，只有可证明无效的记录进入可恢复隔离。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/store.py"
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
       ],
-      "validation": [],
-      "residual": "Relationship audit expanded; corrupt-history test matrix remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
     },
     {
       "id": 110,
@@ -1766,12 +1772,18 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "慢查询可关联请求或任务，绑定参数和用户正文默认不记录。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/store.py"
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
       ],
-      "validation": [],
-      "residual": "Slow SQL fingerprints implemented; benchmark remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
     },
     {
       "id": 115,
@@ -1781,12 +1793,18 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "饱和测试中等待分位数、超时次数和实际请求延迟可对齐。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/store.py"
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
       ],
-      "validation": [],
-      "residual": "Wait quantiles/timeouts implemented; saturation test remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
     },
     {
       "id": 116,
@@ -1796,12 +1814,18 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "大库下日常指标有耗时界限，完整审计仍能发现全部已注入违规。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/store.py"
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
       ],
-      "validation": [],
-      "residual": "Integrity scan opt-in and bounded; large history measurement remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
     },
     {
       "id": 117,
@@ -2948,6 +2972,7 @@
     "2354f4a",
     "ffdca68",
     "7a391e4",
-    "7d9d587"
+    "7d9d587",
+    "b70ef84"
   ]
 }

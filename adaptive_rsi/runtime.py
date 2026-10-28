@@ -1111,7 +1111,7 @@ class Runtime(Maintenance):
 
     def process(self, run):
         from .process import operation_cancellation
-        with operation_cancellation(lambda: self.is_cancelled(run)):
+        with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
             return self._process(run)
 
     def _process(self, run):

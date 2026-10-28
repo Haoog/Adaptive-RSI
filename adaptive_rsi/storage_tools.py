@@ -529,7 +529,8 @@ def overview(store, refresh=False):
 def diagnostics(store):
     from . import __version__
     return {"version": __version__, "created": time.time(),
-            "included": ["version", "state_counts", "failure_codes", "storage_bytes"],
+            "included": ["version", "state_counts", "failure_codes", "storage_bytes", "database_metrics",
+                         "query_fingerprints_and_opaque_context", "schema_migrations", "relationship_identifiers"],
             "tasks": store.query("SELECT state,count(*) AS count FROM tasks GROUP BY state"),
             "runs": store.query("SELECT state,count(*) AS count FROM runs GROUP BY state"),
             "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
