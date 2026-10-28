@@ -1,7 +1,7 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=name=>fs.readFileSync('adaptive_rsi/web/'+name+'.js','utf8');
-function node(tag,text){return {tag,textContent:text,children:[],dataset:{},append(...items){this.children.push(...items);},setAttribute(){},remove(){},focus(){},showModal(){this.open=true;},close(){this.open=false;this.onclose?.();}};}
+function node(tag,text){return {tag,textContent:text,children:[],dataset:{},append(...items){this.children.push(...items);},setAttribute(){},addEventListener(){},remove(){},focus(){},showModal(){this.open=true;},close(){this.open=false;this.onclose?.();}};}
 function diagnostics(scope){
  const text=source('model-center'),start=text.indexOf('    diagnostics.onclick='),end=text.indexOf('    const authProvider=',start),calls=[];
  const context={diagnostics:{},scope,provider:{id:'local',catalog:{models:[{id:'model',enabled:true}]}},api:async(path,body)=>{calls.push(body);return{scope:body.project};},safe:fn=>fn(),el:node,t:x=>x,document:{body:node('body')},JSON};
