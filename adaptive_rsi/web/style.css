@@ -848,3 +848,7 @@ input:disabled,select:disabled {
 }
 
 .readable-diff.diff-wrap{white-space:pre-wrap!important;overflow-wrap:anywhere}.diff-selected{outline:2px solid currentColor;outline-offset:-2px}.task-actions label:has(input[type=checkbox]){display:inline-flex;align-items:center;gap:6px}.task-actions input[type=checkbox]{width:auto}
+
+.readable-diff .diff-file{margin:0 0 8px;min-width:0}.readable-diff .diff-file>summary{white-space:normal;overflow-wrap:anywhere;position:sticky;top:0;background:#f2f5ef;padding:10px;cursor:pointer}.readable-diff .diff-file>pre{max-height:none;white-space:pre;overflow:visible;margin:0;padding:8px}.readable-diff.diff-wrap .diff-file>pre{white-space:pre-wrap;overflow-wrap:anywhere}.readable-diff .diff-file>pre>div{min-height:1.5em}
+
+.readable-diff .diff-file>pre>div{scroll-margin-top:64px}

@@ -504,7 +504,7 @@ async function checkObsoleteActions(browser,url,errors) {
     const project=await page.locator('#project-select').inputValue();
     assert.equal((await (await page.request.get(new URL('/api/task?id='+task+'&project='+project,url).href)).json()).state,'queued');
     await page.getByRole('button',{name:'过时任务补充入口',exact:true}).click();
-    await page.locator('.task-controls textarea').fill('补充过时任务的新验收要求');
+    await page.getByRole('textbox', {name:'补充需求（保留在当前任务）',exact:true}).fill('补充过时任务的新验收要求');
     const revised=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/task/revise'&&response.request().method()==='POST');
     await page.getByRole('button',{name:'保存补充并重新评估',exact:true}).click();
     assert.equal((await revised).status(),200);

@@ -431,7 +431,7 @@ async function checkQueueEditor(page, evidence) {
     await page
       .getByRole("button", { name: "手机测试目标", exact: true })
       .click();
-    await page.locator(".task-controls textarea").fill("增加手机验收要求");
+    await page.getByRole("textbox", {name:"补充需求（保留在当前任务）",exact:true}).fill("增加手机验收要求");
     await page
       .getByRole("button", { name: "保存补充并重新评估", exact: true })
       .click();

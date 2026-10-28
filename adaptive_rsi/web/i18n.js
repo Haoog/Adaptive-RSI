@@ -1,6 +1,9 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "折叠全部文件": "Collapse all files",
+ "展开全部文件": "Expand all files",
+ "差异超过 2000 行，按文件展开纯文本，搜索会自动定位。": "The diff exceeds 2000 lines. Expand files to read plain text; search opens and locates matches automatically.",
  "等待磁盘或内存压力解除": "Waiting for disk or memory pressure to clear",
  "磁盘可用空间下限 / MiB": "Minimum free disk space / MiB",
  "可用内存下限 / MiB": "Minimum available memory / MiB",

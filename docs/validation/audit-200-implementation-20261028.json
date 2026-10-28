@@ -2852,9 +2852,17 @@
       },
       "source": "adaptive_rsi/web/style.css",
       "acceptance": "窄屏长行、Unicode 文件名及大文件样本可读，不改变补丁原文。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/style.css"
+      ],
+      "validation": [
+        "node tests/browser_diff_mobile.cjs",
+        "node tests/browser_experience.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Files fold independently and render content on first expansion; mobile wraps by default. Search opens matching files; large plain-text files locate using actual Range layout. All-file expansion can increase browser memory. A review-discovered inherited pre height cap was removed and multi-file non-overlap is covered."
     },
     {
       "id": 190,

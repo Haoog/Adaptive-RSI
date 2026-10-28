@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 88 implemented with targeted acceptance, 26 partial, and 87 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 89 implemented with targeted acceptance, 26 partial, and 86 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -241,7 +241,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 186. **partial** — Preserve meaningful browser navigation history
 187. **implemented** — Optionally synchronize saved views
 188. **implemented** — Preserve focus and limit live announcements
-189. **pending** — Improve narrow-screen diff reading
+189. **implemented** — Improve narrow-screen diff reading
 190. **pending** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
 192. **implemented** — Test real signed desktop upgrades end to end
@@ -281,3 +281,5 @@ Rollback migration compatibility (173): 9 targeted checks and 60 related release
 Execution priority (91): 5 real-thread contention cases and 101 related Python checks passed. Priority/FIFO ordering, aging against younger requests, exclusive isolation, cancellation cleanup and receipt accounting are covered. Both review axes found no remaining confirmed issue. Diagnostics retain 256 wait samples and 64 opaque receipts. Aging does not preempt running or blocked kernel work.
 
 Resource-pressure admission (92): 6 targeted and 122 related Python checks, 339 Node checks and Chromium queue-reason/threshold-save/bilingual checks passed. Both review axes found no remaining confirmed issue. Disabled defaults preserve existing behavior. Controlled pressure blocks claims without failed attempts and clears on recovery; unsupported configured measurements defer conservatively. Memory basis and cache age are explicit; this is not a resource reservation.
+
+Mobile diff reading (189): new 390px/2300-line Chromium cases, the existing experience browser flow and 339 Node checks passed. Search expands lazily loaded files and locates wrapped text. Review found an inherited 420px child-pre cap; clearing it and a long-first-file/non-overlap regression resolved the issue. Ambiguous legacy textarea selectors now use accessible names. No remaining confirmed review finding.
