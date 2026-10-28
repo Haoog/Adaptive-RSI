@@ -423,6 +423,16 @@ class Handler(BaseHTTPRequestHandler):
                                     "AND json_extract(value,'$.signature') IS NOT NULL "
                                     "ORDER BY json_extract(value,'$.created') DESC,key DESC LIMIT 50", (prefix + "%",))
                 self.respond({"batches": [decode_object(row["value"]) for row in found], "limit": 50})
+            elif parsed.path == "/api/candidate":
+                from .experiment_report import comparison
+                candidate = store.one("SELECT id,project,status,content,evidence FROM candidates WHERE id=? AND project=?",
+                                      (params.get("id", [""])[0], params.get("project", [""])[0]))
+                if not candidate:
+                    raise RequestError("Candidate not found")
+                evidence = decode_evidence(candidate.pop("evidence"))
+                candidate.update(content=decode_object(candidate["content"]), evidence=evidence,
+                                 comparison=comparison(evidence.get("trials", [])))
+                self.respond(candidate)
             elif parsed.path == "/api/task-groups":
                 from .task_groups import lineage
                 try:
@@ -572,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
                             candidate["independent_cases"] = len({trial.get("case") for trial in trials
                                                                   if trial.get("case")})
                             candidate["monitor"] = evidence.get("monitor", {})
+                            from .experiment_report import comparison
+                            candidate["comparison"] = comparison(trials)
                         data["candidates"] = candidates
                     if include_analytics:
                         data.update({

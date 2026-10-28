@@ -861,12 +861,18 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "用量缺失与真实零成本分开；比较结论明确呈现不可判断的成本。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/evolution.py"
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
       ],
-      "validation": [],
-      "residual": "Unknown cost explicitly marked incomparable; UI presentation remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
     },
     {
       "id": 54,
@@ -876,12 +882,18 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "竞争替换目录和链接的受控测试；必要时用目录 fd 与无跟随打开约束。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/native.py"
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
       ],
-      "validation": [],
-      "residual": "Descriptor-relative no-follow tools implemented; race proof remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
     },
     {
       "id": 55,
@@ -891,12 +903,19 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "注入慢文件读取；搜索在设定取消延迟内退出并报告部分结果。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/native.py"
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
       ],
-      "validation": [],
-      "residual": "Cancellation checks added; slow filesystem test remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ],
+      "residual": "Cooperative checks bound injected slow reads between 64 KiB chunks and every 256 search lines; they cannot hard-interrupt one blocked kernel/filesystem call. Cancellation retains bounded file/line references, not source snippets."
     },
     {
       "id": 56,
@@ -2012,9 +2031,18 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "进程中断后可查已完成步骤，不自动重放文件写入或命令。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
     },
     {
       "id": 134,
@@ -2300,9 +2328,18 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "构造总体提升但单类退化的样例，报告不能隐藏该退化。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
     },
     {
       "id": 156,
@@ -2360,9 +2397,18 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "没有用量时显示不可比较，不用零值制造优于其他候选的假象。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
     },
     {
       "id": 161,
@@ -2901,6 +2947,7 @@
     "5a70142",
     "2354f4a",
     "ffdca68",
-    "7a391e4"
+    "7a391e4",
+    "7d9d587"
   ]
 }

@@ -252,11 +252,19 @@ def main():
                 stable_evidence = json.dumps({
                     "reason": "Repeated paired improvement on both splits without observed regressions",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "validation",
-                                "repetition": index // 3} for index in range(12)]})
+                                "repetition": index // 3, "source": "real", "stratum": ["real", "small"],
+                                "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": True},
+                                "candidate": {"pass": True, "tokens": 50, "seconds": 1, "usage_known": True}}
+                               for index in range(12)]})
                 ready_evidence = json.dumps({
                     "reason": "Paired quality improved without observed regressions; usage recorded separately",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "holdout",
-                                "repetition": index // 3} for index in range(12)]})
+                                "repetition": index // 3, "source": "synthetic", "stratum": ["synthetic", "large"],
+                                "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": False},
+                                "candidate": {"pass": True, "tokens": 1, "seconds": 1, "usage_known": False}}
+                               for index in range(12)],
+                    "preregistered_plan": {"sha256": "fixture-plan-hash", "data": {"metric": "fixture_only", "samples": ["browser-case-0"]}},
+                    "dataset": {"version": 1, "manifest": [{"case": "browser-case-0", "tree": "fixture-tree"}]}})
                 exhausted_evidence = json.dumps({
                     "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
                     "trials": []})

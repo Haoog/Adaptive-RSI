@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 62 implemented with targeted acceptance, 38 partial, and 101 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 77 implemented with targeted acceptance, 30 partial, and 94 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -105,9 +105,9 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 50. **implemented** — Win-rate diagnostics mix units
 51. **implemented** — Concurrent imports may bypass split deduplication
 52. **implemented** — Go summaries need hierarchical counting rules
-53. **partial** — Unknown usage can bypass cost-ratio checks
-54. **partial** — Host file tools need path-race verification
-55. **partial** — Long searches need cooperative cancellation
+53. **implemented** — Unknown usage can bypass cost-ratio checks
+54. **implemented** — Host file tools need path-race verification
+55. **implemented** — Long searches need cooperative cancellation
 56. **partial** — Database initialization precedes runtime ownership
 57. **implemented** — Polling logs may amplify database writes
 58. **partial** — Restored cases retain old absolute paths
@@ -185,7 +185,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 130. **pending** — Classify retry safety for paid requests
 131. **implemented** — Correlate provider request identifiers
 132. **pending** — Add native streaming progress
-133. **pending** — Persist redacted tool traces
+133. **implemented** — Persist redacted tool traces
 134. **implemented** — Preserve provider stop reasons end to end
 135. **pending** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
@@ -205,14 +205,14 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 150. **pending** — Collect standard test and coverage artifacts
 151. **pending** — Cache immutable prepared environments
 152. **pending** — Gate performance gains on secondary guardrails
-153. **pending** — Audit dataset retirement and reclassification
-154. **pending** — Explain strategy changes before promotion
-155. **pending** — Expose heterogeneous evaluation effects
+153. **implemented** — Audit dataset retirement and reclassification
+154. **implemented** — Explain strategy changes before promotion
+155. **implemented** — Expose heterogeneous evaluation effects
 156. **pending** — Export sealed experiment reproduction bundles
 157. **pending** — Record exact host tool versions
 158. **pending** — Model monorepo check dependencies
 159. **pending** — Separate strategy and skill attribution
-160. **pending** — Compare quality, cost and latency jointly
+160. **implemented** — Compare quality, cost and latency jointly
 161. **pending** — Explain merge queue states
 162. **pending** — Inspect GitHub ruleset requirements
 163. **pending** — Share trustworthy CI setup work
@@ -265,3 +265,5 @@ Installer admission recovery: seven targeted tests pass, including an actual pro
 Rust explicitly passes the native desktop owner PID, independent of the PyInstaller onefile bootloader parent. Seven admission and 107 related Python tests pass; 13 Rust tests pass. This does not replace signed replacement E2E evidence.
 
 Bounded dependency DAGs (81): nine targeted tests cover diamonds, cycles through a second parent, missing/cross-project nodes, cancelled parents, combined ancestry budgets and legacy migration rollback. Chromium validates two-parent selection, bilingual draft preservation, save and reload. All 339 Node tests pass. Invalid legacy self-edges block migration without silently deleting evidence; missing historical parents block admission. Two-axis review found no remaining confirmed issue.
+
+Experiment comparisons and native tools (53/54/55/133/155/160): 13 targeted checks, 120 related Python regressions, 339 Node tests and the Chromium evolution flow pass. Unknown usage and zero baselines remain incomparable; real candidate zeros remain real zeros. Cohorts preserve any observed regression. Real symlink/directory races cannot redirect source access outside the workspace. Search cancellation retains locations; raw arguments/results are excluded from tool events. A real process kill after a write but before the terminal receipt preserves a started step after restart without replay. Review caught and fixed command success being misclassified as failure. Sealed-plan display/export does not replace an offline replay bundle or final holdout independence.

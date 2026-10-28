@@ -1,11 +1,13 @@
 """Native API adapters with a host-controlled, workspace-only tool loop."""
 import json
+import hashlib
 import contextlib
 import concurrent.futures
 import http.client
 import os
 import re
 import stat
+import sqlite3
 import uuid
 import sys
 import time
@@ -266,9 +268,16 @@ class WorkspaceTools:
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError("Source must be a regular file")
-            data = stream.read(maximum + 1)
+            data = bytearray()
+            while len(data) <= maximum:
+                self.check_cancelled()
+                chunk = stream.read(min(65536, maximum + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
             if len(data) > maximum:
                 raise ValueError("Source file is too large")
+            self.check_cancelled()
             return data.decode("utf-8")
 
     def write_source(self, path, text):
@@ -330,6 +339,44 @@ class WorkspaceTools:
         self._file_cache = result
         return result
 
+    def search(self, args):
+        if not args["text"] or len(args["text"]) > 1000:
+            raise ValueError("Search requires 1..1000 characters")
+        result = []
+        remaining = 12 * 1024 * 1024
+        try:
+            for file in self.files():
+                self.check_cancelled()
+                path = self.path(file)
+                if path.stat().st_size > 1024 * 1024:
+                    continue
+                try:
+                    if remaining < path.stat().st_size:
+                        return {"matches": result, "truncated": True, "reason": "search byte limit"}
+                    text = self._text_cache.get(file)
+                    if text is None:
+                        text = self.read_source(path, 1024 * 1024)
+                        size = len(text.encode("utf-8"))
+                        if self._text_cache_bytes + size <= 4 * 1024 * 1024:
+                            self._text_cache[file] = text
+                            self._text_cache_bytes += size
+                    remaining -= len(text.encode("utf-8"))
+                    lines = text.splitlines()
+                except (UnicodeError, ValueError, OSError):
+                    continue
+                for i, line in enumerate(lines, 1):
+                    if i % 256 == 0:
+                        self.check_cancelled()
+                    if args["text"] in line:
+                        result.append({"path": file, "line": i, "text": line[:1000]})
+                        if len(result) >= 100:
+                            return {"matches": result, "truncated": True, "reason": "match limit", "limit": 100}
+            return {"matches": result, "truncated": self.files_truncated,
+                    "reason": "file limit" if self.files_truncated else None, "limit": 100}
+        except Cancelled as exc:
+            exc.partial_results = [{"path": row["path"], "line": row["line"]} for row in result[:100]]
+            raise
+
     def execute(self, name, args):
         self.remaining()
         if self.cancel and self.cancel():
@@ -367,36 +414,7 @@ class WorkspaceTools:
                         rows.append(str(number) + ": " + line.decode("utf-8").rstrip("\r\n"))
             return "\n".join(rows)
         if name == "search":
-            if not args["text"] or len(args["text"]) > 1000:
-                raise ValueError("Search requires 1..1000 characters")
-            result = []
-            remaining = 12 * 1024 * 1024
-            for file in self.files():
-                self.check_cancelled()
-                path = self.path(file)
-                if path.stat().st_size > 1024 * 1024:
-                    continue
-                try:
-                    if remaining < path.stat().st_size:
-                        return {"matches": result, "truncated": True, "reason": "search byte limit"}
-                    text = self._text_cache.get(file)
-                    if text is None:
-                        text = self.read_source(path, 1024 * 1024)
-                        size = len(text.encode("utf-8"))
-                        if self._text_cache_bytes + size <= 4 * 1024 * 1024:
-                            self._text_cache[file] = text
-                            self._text_cache_bytes += size
-                    remaining -= len(text.encode("utf-8"))
-                    lines = text.splitlines()
-                except (UnicodeError, ValueError, OSError):
-                    continue
-                for i, line in enumerate(lines, 1):
-                    if args["text"] in line:
-                        result.append({"path": file, "line": i, "text": line[:1000]})
-                        if len(result) >= 100:
-                            return {"matches": result, "truncated": True, "reason": "match limit", "limit": 100}
-            return {"matches": result, "truncated": self.files_truncated,
-                    "reason": "file limit" if self.files_truncated else None, "limit": 100}
+            return self.search(args)
         if name in ["write_file", "replace_text"]:
             path = self.path(args["path"])
             relative = path.relative_to(self.workspace).as_posix()
@@ -455,6 +473,21 @@ def execute_tools(tools, calls):
                                     tools.cancel, tools.protected)
             worker.deadline, worker.scope = tools.deadline, tools.scope
             worker._file_cache = tools._file_cache
+        callback = getattr(tools, "trace", None)
+        def trace(detail):
+            if callback:
+                try:
+                    callback(detail)
+                except (OSError, sqlite3.Error):
+                    if not getattr(tools, "trace_warning", False):
+                        tools.trace_warning = True
+                        print("Native tool trace persistence unavailable", file=sys.stderr)
+        identity = {"invocation": uuid.uuid4().hex,
+                    "tool_call_hash": hashlib.sha256(json.dumps(call_id).encode()).hexdigest(),
+                    "tool": name if name in {item[0] for item in tools_for(tools.role)} else "unknown",
+                    "arguments_hash": hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()}
+        began = time.monotonic()
+        trace({**identity, "state": "started"})
         try:
             value = worker.execute(name, args)
             if len(json.dumps(value).encode()) > 128000:
@@ -465,6 +498,16 @@ def execute_tools(tools, calls):
                     value = {"error": "Tool output exceeds limit; narrow the request"}
         except (ValueError, OSError, UnicodeError) as error:
             value = {"error": str(error)}
+        except Exception as error:
+            trace({**identity, "state": "cancelled" if isinstance(error, Cancelled) else "failed",
+                       "seconds": time.monotonic() - began,
+                   "partial_results": getattr(error, "partial_results", [])})
+            raise
+        failed = isinstance(value, dict) and (bool(value.get("error")) or
+                                              "exit_code" in value and value["exit_code"] != 0)
+        trace({**identity, "state": "failed" if failed else "completed",
+               "seconds": time.monotonic() - began, "output_bytes": len(json.dumps(value).encode()),
+               "truncated": isinstance(value, dict) and value.get("truncated") is True})
         tools.check_cancelled()
         return call_id, name, value
     if len(calls) > 1 and tools.remaining() > 5 and all(
@@ -703,6 +746,8 @@ class NativeAgent:
                     conversation.results([(call_id, name, {"error": error})])
                     self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                     continue
+                tools.trace = lambda detail: self.store.event("native_tool", "Native tool lifecycle", project, run,
+                                                             {"call": call, "turn": turn, "role": role, **detail})
                 results = execute_tools(tools, calls)
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))

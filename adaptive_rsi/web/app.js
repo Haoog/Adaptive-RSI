@@ -281,7 +281,7 @@ async function showActivityHistory(){
  const project=projectId,box=el('dialog',undefined,'experience-dialog'),list=el('div'),more=action(t('加载更早活动'),load),close=action(t('关闭'),()=>box.close());
  box.append(el('h2',t('活动历史')),el('p',t('显示时区')+' · '+(displayTz||Intl.DateTimeFormat().resolvedOptions().timeZone)),list,more,close);
  box.addEventListener('close',()=>box.remove());document.body.append(box);box.showModal();let before='';
- async function load(){more.disabled=true;try{const data=await api('events?'+new URLSearchParams({project,limit:100,...(before?{before}:{})}));if(!box.open)return;for(const event of data.events)list.append(el('p',stamp(event.created)+' · '+eventCopy(event)));before=data.next_before;more.hidden=!data.has_more;}finally{more.disabled=false;}}
+ async function load(){more.disabled=true;try{const data=await api('events?'+new URLSearchParams({project,limit:100,...(before?{before}:{})}));if(!box.open)return;for(const event of data.events){list.append(el('p',stamp(event.created)+' · '+eventCopy(event)));if(event.kind==='native_tool'){const detail=el('details'),raw=el('pre');detail.append(el('summary',t('工具轨迹元数据')),raw);detail.addEventListener('toggle',()=>{if(detail.open&&!raw.textContent)raw.textContent=typeof event.data==='string'?event.data:JSON.stringify(event.data,null,2);});list.append(detail);}}before=data.next_before;more.hidden=!data.has_more;}finally{more.disabled=false;}}
  await load();
 }
 function badge(status){return el('span',t(statusNames[status]||status),'badge '+(['stable','completed','pr_open','merged','verified','pass','awaiting_approval'].includes(status)?'good':['failed','fail','blocked','rolled_back','ci_failed','regressed'].includes(status)?'bad':['queued','planning','executing','evaluating'].includes(status)?'warn':'neutral'));}
@@ -392,8 +392,11 @@ function issueSyncCopy(scanned,changed,complete){
 }
 function eventCopy(event){
 const known={'Project registered (paused)':'项目已接入，等待启动','Project registered and enabled':'项目已接入并启动','Settings saved; active runs retain their snapshot':'设置已保存','Model routes updated':'模型分工已保存','Project paused':'项目已暂停','Project enabled':'项目已启动','Cancellation requested':'已申请取消任务','Dependency snapshot frozen':'已准备独立工作环境','Committed snapshot unchanged; no model call':'项目没有新改动，本次检查未调用模型','Fresh run scheduled with bounded backoff':'已安排重试','Provider resumed by user':'模型连接已恢复','Issue closed or excluded during execution; recheck before delivery':'运行期间 Issue 已关闭或被排除，将在交付前复核','Earlier attempt ended without a fix; rediscovered finding queued for fresh verification':'此前尝试未产出修复；重新发现的问题已入队等待全新验证','Dependency will not merge; waiting released and the task needs manual review':'前置任务无法合并；等待已解除，任务需要人工复核后重试'};
+ if(event.message==='Dependency will not merge; task needs manual review')return t('前置任务无法合并；请复核其他依赖并手动重试。');
+ if(event.message==='Desktop update admission recovered')return t('桌面更新屏障已恢复');
  if(known[event.message])return t(known[event.message]);
  let data=event.data;if(typeof data==='string'){try{data=JSON.parse(data);}catch{}}
+ if(event.kind==='native_tool'&&data){const states={started:t('开始'),completed:t('已完成'),failed:t('未通过'),cancelled:t('已取消')};return t('原生工具轨迹')+' · '+data.tool+' · '+(states[data.state]||t('未知'))+(data.partial_results?.length?' · '+t('已保留命中位置')+' '+data.partial_results.length:'');}
  if(event.kind==='issues'&&data&&Number.isInteger(data.scanned)&&Number.isInteger(data.changed))return issueSyncCopy(data.scanned,data.changed,data.complete);
  const issues=event.message.match(/^(\d+) Issue updates synchronized$/);
  if(issues){const copy=t('已同步 Issue 更新')+' · '+issues[1];return data?.complete===false?copy+t('；')+t('本次同步未完成，下一轮继续'):copy;}
@@ -626,10 +629,32 @@ const evolutionReasons={
  "Paired quality improved without observed regressions; usage recorded separately":"配对质量有所提升且未观察到退步；用量单独记录。"
 };
 function evolutionReason(reason){return evolutionReasons[reason]?t(evolutionReasons[reason]):reason;}
+function experimentEvidence(card,c){
+ const comparison=c.comparison||{}, ratio=value=>typeof value==='number'&&Number.isFinite(value)?value.toFixed(2)+'×':t('不可比较');
+ card.append(el('p',t('Token 用量比')+' · '+ratio(comparison.token_ratio)+' / '+t('延迟比')+' · '+ratio(comparison.latency_ratio),'muted'));
+ if(!comparison.comparable)card.append(el('p',t('缺失用量或零基线时不可比较成本；质量通过不代表更便宜。'),'muted'));
+ const detail=el('details');detail.append(el('summary',t('查看实验依据与分组结果')));let loading=false,loaded=false;
+ detail.addEventListener('toggle',()=>{if(!detail.open||loading||loaded)return;safe(async()=>{
+  loading=true;
+  try{
+   const data=await api('candidate?id='+encodeURIComponent(c.id)+'&project='+encodeURIComponent(c.project));
+   if(!detail.isConnected)return;
+   const report=data.comparison, cohorts=el('div');
+   for(const row of report.cohorts){const source={real:t('真实任务'),synthetic:t('合成任务')}[row.source]||t('未知'),split={validation:t('验证集'),holdout:t('最终评估集'),development:t('开发集')}[row.split]||t('未知'),size={small:t('短任务'),medium:t('中等任务'),large:t('长任务')}[row.size]||t('未知');cohorts.append(el('p',source+' · '+split+' · '+size+' / '+t('独立用例')+': '+row.families+' / '+t('胜 / 负 / 平')+': '+row.wins+' / '+row.losses+' / '+row.ties));}
+   cohorts.append(el('p',t('分组结果仅描述已观察样本，不代表对其他任务的收益。')));
+   detail.append(cohorts);
+   const evidence=el('details'),raw=el('pre');evidence.append(el('summary',t('封存计划与输入清单')),raw);
+   evidence.addEventListener('toggle',()=>{if(evidence.open&&!raw.textContent)raw.textContent=JSON.stringify({preregistered_plan:data.evidence.preregistered_plan||null,dataset:data.evidence.dataset||null,config_hash:data.evidence.config_hash||null},null,2);});
+   const download=el('button',t('导出实验依据'),'text-button');download.type='button';download.onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'})),link=el('a');link.href=url;link.download='adaptive-rsi-experiment-'+c.id+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+   detail.append(evidence,download);loaded=true;
+  }finally{loading=false;}
+ });});card.append(detail);
+}
 function renderEvolution(){const summary=$('suite-summary');summary.replaceChildren();if(loadedStateSections.analyticsProject===(projectId||null)){const limit=Number(currentProject()?.config?.evolution?.max_holdout_uses??state.config?.evolution?.max_holdout_uses);for(const [split,title,description]of [['development',t('开发集'),t('用于提出和调整待验证改动')],['validation',t('验证集'),t('配对比较 · 受限复用')],['holdout',t('最终评估集'),t('隐藏任务 · 限制曝光次数')]]){const row=(state.cases||[]).find(c=>c.project===projectId&&c.split===split),count=row?.count||0,uses=row?.uses||0,usage=split!=='development'&&count>0&&Number.isFinite(limit)&&limit>0?t('已用 ')+uses+'/'+(count*limit)+' · ':'',card=el('article',undefined,'suite-card');card.append(el('strong',count),el('span',title),el('small',usage+description));summary.append(card);}}else summary.append(el('p',t('验证统计加载中。'),'muted'));
  $('experiment-readiness').textContent=t('改进方案需通过独立样本的前后对照验证；调用与 tokens 只记录用量。');
  const list=$('candidates');list.replaceChildren();if(loadedStateSections.candidatesProject!==(projectId||null)){list.append(el('p',t('正在加载改进方案…'),'empty-copy'));return;}const candidates=scoped(state.candidates||[]);if(!candidates.length)list.append(el('p',t('还没有改进方案。积累运行记录后会自动提出，也可以手动发起。'),'empty-copy'));
  for(const c of candidates){const card=el('article',undefined,'panel candidate-card'),top=el('div',undefined,'panel-title'),independent=c.independent_cases??c.trial_count??0,trials=c.trial_count??independent;top.append(el('h2',{strategy:t('执行策略'),meta_strategy:t('规划方法'),adapter:t('项目执行说明')}[c.kind]||c.kind),badge(c.status));card.append(top,el('div',(c.parent?c.parent.slice(0,8):'BASELINE')+' → '+c.id.slice(0,8),'lineage'),el('p',c.content.guidance),el('p',evolutionReason(c.reason),'muted'),el('small',independent+t(' 个独立用例 · 共 ')+trials+t(' 次配对运行 · ')+stamp(c.created),'muted'));
+  experimentEvidence(card,c);
   if(c.status==='stable')card.append(action(t('恢复到上一个已验证版本'),async()=>{await api('rollback',{candidate:c.id});toast(t('策略已恢复旧版本'));await refresh({force:true});}));
   if(c.status==='ready')card.append(action(t('启用这个策略'),async()=>{if(!(await uiConfirm(t('启用后会替换当前稳定策略，并开始有限监控；出现回归时可以回滚。确认启用？'))))return;await api('evolution/promote',{candidate:c.id});toast(t('策略已启用'));await refresh({force:true});}));
   list.append(card);}}
