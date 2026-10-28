@@ -85,7 +85,11 @@ async function checkEvolution(browser, url, errors) {
     assert.match(consequence, /替换当前稳定策略/);
     assert.match(consequence, /有限监控/);
     assert.match(consequence, /回滚/);
+    const promotionResponse = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/evolution/promote' && response.request().method() === 'POST');
     await dialog.getByRole('button', {name: '确认', exact: true}).click();
+    const promoted = await promotionResponse;
+    assert.equal(promoted.status(), 200, await promoted.text());
     await page.waitForFunction(() => ![...document.querySelectorAll('#candidates .candidate-card')]
       .some(card => card.textContent.includes('等待启用')), null, {timeout: 15000});
     assert.ok(posts.includes('/api/evolution/promote'), 'manual promotion uses the controlled API');

@@ -43,6 +43,48 @@ def split_preview(store, group, project, db=None):
             "revision": fingerprint({"group": group, "originals": originals})}
 
 
+def acceptance_evidence(store, task, project):
+    """Map original criteria to actual independent check rows, never group summaries."""
+    grouped = store.one("SELECT evidence FROM tasks WHERE id=? AND project=?", (task, project))
+    try:
+        originals = json.loads(grouped["evidence"])[0]["originals"]
+    except (TypeError, ValueError, KeyError, IndexError):
+        originals = []
+    run = store.one("SELECT id,result FROM runs WHERE task=? AND project=? ORDER BY started DESC,id DESC LIMIT 1", (task, project))
+    result = decode_object(run["result"]) if run else {}
+    evaluation = result.get("evaluation") or {}
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    criteria = evaluation.get("criteria", [])
+    criteria = criteria if isinstance(criteria, list) else []
+    coverage = evaluation.get("coverage", [])
+    coverage = coverage if isinstance(coverage, list) else []
+    check_groups = evaluation.get("checks")
+    checks = check_groups.get("acceptance_candidate", []) if isinstance(check_groups, dict) else []
+    checks = checks if isinstance(checks, list) else []
+    requirements = []
+    for original in originals if isinstance(originals, list) else []:
+        if not isinstance(original, dict):
+            continue
+        for index, criterion in enumerate(original.get("acceptance", [])):
+            indexes = [i for i, value in enumerate(criteria) if value == criterion]
+            names = {entry.get("name") for entry in coverage if isinstance(entry, dict) and
+                     isinstance(entry.get("criteria"), list) and any(i in entry["criteria"] for i in indexes) and
+                     isinstance(entry.get("name"), str)}
+            linked = [{**check, "run": run["id"], "stage": "acceptance_candidate", "index": i}
+                      for i, check in enumerate(checks) if isinstance(check, dict) and check.get("name") in names]
+            state = "fail" if any(check.get("passed") is False for check in linked) else (
+                "pass" if linked and names == {check.get("name") for check in linked} and
+                all(check.get("passed") is True for check in linked) else "unknown")
+            requirements.append({"task": original["id"], "index": index, "criterion": criterion,
+                                 "state": state, "checks": linked})
+    from .batching import verification_cost
+    current_task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (task, project))
+    actual = verification_cost(store, project, [current_task]) if current_task else None
+    return {"requirements": requirements, "actual_verification_cost": actual,
+            "all_passed": bool(requirements) and
+            evaluation.get("decision") == "pass" and all(row["state"] == "pass" for row in requirements)}
+
+
 def lineage(store, task, project, before=2**63 - 1):
     if not isinstance(before, int) or not 0 < before <= 2**63 - 1:
         raise ValueError("Invalid event pagination")
@@ -62,5 +104,6 @@ def lineage(store, task, project, before=2**63 - 1):
     members = store.query("SELECT t.id,t.title,t.state,m.restored FROM task_group_members m JOIN tasks t "
                           "ON t.id=m.original_task WHERE m.group_task=? AND t.project=? ORDER BY t.created,t.id LIMIT 101",
                           (task, project))
-    return {"groups": groups[:100], "groups_truncated": len(groups) > 100, "members": members,
+    return {"acceptance_evidence": acceptance_evidence(store, task, project),
+            "groups": groups[:100], "groups_truncated": len(groups) > 100, "members": members,
             "next_before": groups[99]["cursor"] if len(groups) > 100 else None}

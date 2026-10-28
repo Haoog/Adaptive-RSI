@@ -177,6 +177,14 @@ class ParallelReleaseTest(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
+    def test_release_entrypoints_share_one_immutable_asset_writer(self):
+        from tests.test_release import WorkflowConfigurationTest
+        workflow = WorkflowConfigurationTest().workflow("release.yml")
+        # Both a version-merge push and an explicit dispatch can resolve to
+        # publish. Event-based groups would let them clobber the same draft.
+        self.assertEqual(workflow["concurrency"]["group"], "adaptive-rsi-release")
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+
     def test_release_paths_keep_full_parallel_gate_on_macos_python312(self):
         from tests.test_release import WorkflowConfigurationTest
         parser = WorkflowConfigurationTest()

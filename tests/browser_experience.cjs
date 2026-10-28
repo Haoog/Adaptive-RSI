@@ -516,10 +516,18 @@ async function checkQueueEditor(page, evidence) {
     assert.equal(await acceptanceCard.locator('img').count(),0);
     assert.equal(await page.evaluate(()=>window.__evidenceExecuted),undefined);
     await page.locator('[data-run="old-run-1"] > summary').click();
-    await page.waitForFunction(() =>
-      document.querySelector('[data-run="old-run-1"] pre'),
-    );
+    const historicalRaw = page.locator('[data-run="old-run-1"] details').filter({
+      has: page.getByText('原始运行记录', {exact: true}),
+    });
+    await historicalRaw.locator(':scope > summary').waitFor();
     assert.equal(runRequests, 2);
+    assert.equal(await historicalRaw.locator('pre').count(), 0, 'collapsed raw evidence stays lazy');
+    await historicalRaw.locator(':scope > summary').click();
+    await historicalRaw.locator('pre').filter({hasText: 'original baseline failure'}).waitFor();
+    assert.match(await historicalRaw.locator('pre').innerText(), /<img src=x/);
+    assert.equal(await historicalRaw.locator('img').count(), 0);
+    assert.equal(await page.evaluate(()=>window.__evidenceExecuted), undefined);
+    assert.equal(runRequests, 2, 'opening loaded raw evidence must not fetch the run again');
     const timeline = page.locator('#live-task-outcome details').filter({has: page.getByText('阶段耗时', {exact: true})});
     await timeline.locator('summary').click();
     liveSummary = 'Live checkpoint received';

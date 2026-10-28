@@ -2,6 +2,7 @@
 import json
 import gzip
 import hashlib
+import math
 import os
 import sqlite3
 import stat
@@ -176,7 +177,9 @@ def verify_archive(path, timeout=60, max_source_mb=102400):
 def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 1024 * 1024, deadline=None):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
-    if not 1 <= timeout <= 3600 or reserve_bytes < 0:
+    if (type(timeout) not in (int, float) or not 1 <= timeout <= 3600 or
+            type(reserve_bytes) is not int or reserve_bytes < 0 or
+            (deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)))):
         raise ValueError("Invalid backup resource budget")
     deadline = min(deadline, time.monotonic() + timeout) if deadline is not None else time.monotonic() + timeout
     if shutil.disk_usage(folder).free < store.path.stat().st_size + reserve_bytes:
@@ -375,12 +378,16 @@ def restore(source, destination):
                 for case in db.execute("SELECT id,spec FROM cases").fetchall():
                     try:
                         spec = json.loads(case["spec"])
-                        spec.update(repository=str(destination / "suites" / case["id"] / "repository"),
-                                    overlay=None, available=False,
-                                    restore_invalidation="case_files_not_in_database_backup")
-                        db.execute("UPDATE cases SET spec=? WHERE id=?", (json.dumps(spec), case["id"]))
-                    except (ValueError, TypeError, AttributeError):
-                        continue
+                    except (ValueError, TypeError):
+                        spec = {}
+                    if not isinstance(spec, dict):
+                        spec = {}
+                    # Case IDs from older databases are untrusted path components.
+                    safe_id = hashlib.sha256(case["id"].encode()).hexdigest()
+                    spec.update(repository=str(destination / "suites" / safe_id / "repository"),
+                                overlay=None, available=False,
+                                restore_invalidation="case_files_not_in_database_backup")
+                    db.execute("UPDATE cases SET spec=? WHERE id=?", (json.dumps(spec), case["id"]))
                 for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
                     result = json.loads(row["result"])
                     result["feedback"] = unavailable_feedback(result.get("feedback", {}))
@@ -397,6 +404,41 @@ def restore(source, destination):
         _discard_incomplete_restore(destination, created)
         raise
     return {"restored": True, "paused": True, "artifacts_restored": False}
+
+
+def rehearse_restore(source):
+    """Exercise database recovery in disposable state without constructing a runtime.
+
+    Project repositories, credentials and remote APIs are never opened. Missing
+    files are reported, not treated as successful artifact recovery.
+    """
+    try:
+        verify_backup(source)
+    except (ValueError, sqlite3.Error) as exc:
+        return {"valid": False, "checked_at": time.time(), "scope": "database_only",
+                "remote_operations": 0, "error_type": type(exc).__name__,
+                "failure_stage": "snapshot_validation", "artifacts_restored": False}
+    with tempfile.TemporaryDirectory(prefix="rsi-restore-drill-") as directory:
+        destination = Path(directory) / "state"
+        restore(source, destination)
+        store = Store(destination)
+        try:
+            audit = store.relationship_audit()
+            relationships_valid = not any(value for key, value in audit.items() if not key.startswith('_'))
+            complete = not any(audit['_truncated'].values())
+            paused = not store.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
+            active = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
+            cases = store.one("SELECT count(*) AS n FROM cases")["n"]
+            return {"valid": relationships_valid and complete and paused and active == 0,
+                    "checked_at": time.time(), "scope": "database_only", "remote_operations": 0,
+                    "all_projects_paused": paused, "active_runs": active,
+                    "projects": store.one("SELECT count(*) AS n FROM projects")["n"],
+                    "tasks": store.one("SELECT count(*) AS n FROM tasks")["n"],
+                    "runs": store.one("SELECT count(*) AS n FROM runs")["n"],
+                    "unavailable_cases": cases, "relationship_audit": audit,
+                    "artifacts_restored": False, "repository_revalidation_required": True}
+        finally:
+            store.close()
 
 
 def _file_info(paths, follow_symlinks=False):
@@ -546,3 +588,43 @@ def diagnostics(store):
             if store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relationship_quarantine'")
             else {"count": 0},
             "storage_bytes": overview(store)["bytes"]}
+
+
+def diagnostic_preview(store):
+    """Return the exact minimal export body for review, with no arbitrary DB text.
+
+    Unlike local detailed diagnostics, this allowlist excludes failure strings,
+    identifiers, query contexts, repositories, credentials and source files.
+    """
+    from . import __version__
+    with store.snapshot():
+        counts = {table: store.one('SELECT count(*) AS n FROM ' + table)['n']
+                  for table in ('projects', 'tasks', 'runs', 'cases')}
+        invalid = store.one("SELECT count(*) AS n FROM runs WHERE NOT json_valid(result)")['n']
+    return {"format": 1, "version": __version__, "created": time.time(),
+            "included": ["version", "row_counts", "invalid_evidence_count", "sqlite_version"],
+            "row_counts": counts, "invalid_evidence_count": invalid,
+            "sqlite_version": sqlite3.sqlite_version}
+
+
+def export_diagnostics(preview, destination, consent=False):
+    """Write the reviewed body only after explicit opt-in; never overwrite files."""
+    if consent is not True:
+        raise ValueError("Diagnostic export requires explicit consent")
+    # Validate the preview shape before publication, without accepting arbitrary fields.
+    if (not isinstance(preview, dict) or set(preview) != {
+            'format', 'version', 'created', 'included', 'row_counts',
+            'invalid_evidence_count', 'sqlite_version'}):
+        raise ValueError("Invalid diagnostic preview")
+    encoded = json.dumps(preview, ensure_ascii=False, sort_keys=True, allow_nan=False).encode('utf-8')
+    destination = Path(destination)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return {"path": str(destination), "bytes": len(encoded)}

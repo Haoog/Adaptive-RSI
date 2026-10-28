@@ -1,8 +1,8 @@
 'use strict';
 window.RSINativeUpdate=(()=>{
  const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
- const errors={update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。'};
- let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0;
+ const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。'};
+ let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0,automaticInstall=false;
  const failureCounts={};
  let policy=localRead('rsi-native-update-policy')||'download';
  let versionScope=localRead('rsi-native-update-scope')||'patch',installWindow=localRead('rsi-native-update-window')||'any';
@@ -19,7 +19,7 @@ window.RSINativeUpdate=(()=>{
    const option=el('option');option.value=value;select.append(option);options.push([option,text]);
   }
   select.value=policy;
-  select.onchange=()=>{policy=select.value;if(policy==='manual'&&busy)window.RSIDesktop.invoke('native_update',{action:'cancel'}).catch(()=>{});storageError=false;persist('rsi-native-update-policy',policy);render();};
+  select.onchange=()=>{policy=select.value;if(busy&&(policy==='manual'||automaticInstall&&policy!=='automatic'))window.RSIDesktop.invoke('native_update',{action:'cancel'}).catch(()=>{});storageError=false;persist('rsi-native-update-policy',policy);render();};
   label.append(labelText,select);
   const scopeLabel=el('label'),scopeText=el('span'),scopeSelect=el('select'),scopeOptions=[];
   for(const [value,text] of [['patch','仅补丁版本'],['minor','同主版本内更新'],['stable','所有稳定版本']]){const option=el('option');option.value=value;scopeSelect.append(option);scopeOptions.push([option,text]);}
@@ -75,7 +75,7 @@ window.RSINativeUpdate=(()=>{
   return installWindow==='night'?(date.getHours()>=22||date.getHours()<6):installWindow==='weekend'?[0,6].includes(date.getDay()):false;
  }
  async function run(action,automatic=false){
-  if(busy)return;busy=true;render();
+  if(busy)return;busy=true;automaticInstall=action==='install'&&automatic;render();
   try{
    snapshot=await window.RSIDesktop.invoke('native_update',{action,installationWindow:action==='install'?(automatic?installWindow:'any'):null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
@@ -86,7 +86,7 @@ window.RSINativeUpdate=(()=>{
   }catch(error){
    snapshot={state:'error',error_code:String(error)};
    failureCounts[action]=(failureCounts[action]||0)+1;failures=failureCounts[action];const next=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));if(action==='install')installRetryAt=next;else retryAt=next;
-  }finally{busy=false;render();}
+  }finally{busy=false;automaticInstall=false;render();}
  }
  async function tick(){
   if(polling||!enabled())return;polling=true;

@@ -590,7 +590,44 @@ class Store:
 
     def setting(self, key, default=None):
         row = self.one("SELECT value FROM settings WHERE key=?", (key,))
-        return json.loads(row["value"]) if row else default
+        try:
+            return json.loads(row["value"]) if row else default
+        except (ValueError, TypeError):
+            # Configuration and credential registry corruption must reach their repair/rejection flows.
+            if key in ('config', 'credential-cleanup-pending') or key.startswith('config:'):
+                raise
+            return default
+
+    def put_namespaced_setting(self, namespace, key, value, version=1, ttl=None):
+        """Explicit opt-in envelope; existing settings retain their wire format."""
+        if not isinstance(namespace, str) or not namespace or ':' in namespace:
+            raise ValueError("Invalid settings namespace")
+        if not isinstance(key, str) or not key or type(version) is not int or version < 1:
+            raise ValueError("Invalid settings key or version")
+        if ttl is not None and (type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0):
+            raise ValueError("Invalid settings TTL")
+        if type(value) not in (dict, list, str, int, float, bool, type(None)):
+            raise ValueError("Settings value must be a JSON type")
+        try:
+            json.dumps(value, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Settings value must be finite JSON") from exc
+        self.put_setting('namespace:' + namespace + ':' + key,
+                         {"version": version, "type": type(value).__name__, "value": value,
+                          "expires": time.time() + ttl if ttl is not None else None})
+
+    def namespaced_setting(self, namespace, key, expected_type, version=1, default=None, now=None):
+        envelope = self.setting('namespace:' + namespace + ':' + key)
+        if not isinstance(envelope, dict) or envelope.get('version') != version:
+            return default
+        value = envelope.get('value')
+        if type(value) is not expected_type or envelope.get('type') != expected_type.__name__:
+            return default
+        expires = envelope.get('expires')
+        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
+                                    expires <= (time.time() if now is None else now)):
+            return default
+        return value
 
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))

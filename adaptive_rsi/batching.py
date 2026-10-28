@@ -38,6 +38,11 @@ def reconcile_receipt(runtime, task, action, receipt, candidate=None):
             **({} if accepted else {"error_code": "batch_result_unknown"})}
 
 
+def requires_independent_acceptance(task):
+    """Grouped requirements need sealed per-criterion checks regardless of change kind."""
+    return (task.get("fingerprint") or "").startswith("batch:")
+
+
 def preserve_acceptance(task, plan):
     """Keep every original criterion in a grouped task's downstream plan."""
     if not (task.get("fingerprint") or "").startswith("batch:") or plan.get("decision") != "ready":
@@ -51,12 +56,70 @@ def preserve_acceptance(task, plan):
     plan["acceptance"] = list(dict.fromkeys([*plan["acceptance"], *required]))
 
 
+def verification_cost(store, project, rows):
+    """Historical local check time is an estimate, never evidence of CI speedup."""
+    samples = []
+    for row in rows:
+        run = store.one("SELECT id,result FROM runs WHERE project=? AND task=? AND ended IS NOT NULL "
+                        "ORDER BY started DESC,id DESC LIMIT 1", (project, row["id"]))
+        try:
+            evaluation = json.loads(run["result"]).get("evaluation", {}) if run else {}
+            checks = evaluation.get("checks", {}).get("candidate_full", [])
+            if not checks or any(not isinstance(check.get("seconds"), (float, int)) or
+                                 isinstance(check.get("seconds"), bool) or
+                                 not 0 <= check["seconds"] < float("inf") for check in checks):
+                continue
+            samples.append({"task": row["id"], "run": run["id"],
+                            "seconds": sum(check["seconds"] for check in checks)})
+        except (ValueError, TypeError, AttributeError):
+            continue
+    known = len(samples) == len(rows)
+    separate = sum(sample["seconds"] for sample in samples) if known else None
+    return {"source": "local_candidate_full_checks", "samples": samples,
+            "separate_seconds": separate, "grouped_seconds": None,
+            "shared_savings_seconds": None, "failure_redo_seconds": None,
+            "full_gates_required": True, "speedup_proven": False,
+            "ci_comparison": {"status": "unknown", "reason": "No matched actual CI strategy comparison"}}
+
+
+def recommend(runtime, project, rows, scopes):
+    """Offer bounded compatible clusters without changing tasks or settings."""
+    buckets = {}
+    for row in sorted(rows, key=lambda row: row["id"]):
+        if row["state"] != "queued" or row["source"] != "goal" or not scopes[row["id"]]:
+            continue
+        if runtime.store.one("SELECT 1 FROM task_dependencies WHERE task=? OR dependency=?", (row["id"], row["id"])):
+            continue
+        roots = sorted({path.split('/')[0] for path in scopes[row["id"]]})
+        key = (tuple(roots), row["overrides"])
+        buckets.setdefault(key, []).append(row)
+    clusters = []
+    for bucket in buckets.values():
+        chunk, seconds = [], 0
+        for row in bucket:
+            cost = verification_cost(runtime.store, project, [row])
+            duration = cost["separate_seconds"]
+            if chunk and (len(chunk) >= 5 or duration is not None and seconds + duration > 600):
+                clusters.append(chunk)
+                chunk, seconds = [], 0
+            chunk.append(row)
+            seconds += duration or 0
+        if chunk:
+            clusters.append(chunk)
+    return [{"tasks": [row["id"] for row in cluster], "revision": fingerprint(cluster),
+             "confirmation_required": True, "full_gates_required": True,
+             "verification_cost": verification_cost(runtime.store, project, cluster)}
+            for cluster in clusters if len(cluster) > 1]
+
+
 def execute(runtime, project, tasks, action, request=None, preview=True, expected=None):
     if (not isinstance(tasks, list) or not 1 <= len(tasks) <= 100 or
             any(not isinstance(task, str) for task in tasks) or len(set(tasks)) != len(tasks)):
         raise ValueError("Batch requires 1..100 unique task IDs")
-    if action not in ("retry", "cancel", "approve", "group", "ungroup", "split_retry"):
+    if action not in ("retry", "cancel", "approve", "group", "ungroup", "split_retry", "recommend"):
         raise ValueError("Unknown batch action")
+    if action == "recommend" and not preview:
+        raise ValueError("Recommendations are preview only; confirm a group instead")
     runtime.require_active_project(project)
     with runtime.dispatch_lock:
         rows = [runtime.store.one("SELECT * FROM tasks WHERE id=? AND project=?", (task, project)) for task in tasks]
@@ -87,6 +150,10 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                   "signature": signature}
         if action == "group":
             report["revision"] = fingerprint(rows)
+            report["verification_cost"] = verification_cost(runtime.store, project, rows)
+        if action == "recommend":
+            report["recommendations"] = recommend(runtime, project, rows, scopes)
+            return report
         if action == "split_retry":
             from .task_groups import split_preview
             if len(rows) != 1:
@@ -242,6 +309,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                            "VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)",
                            (group, project, "goal", "batch:" + request, rows[0]["title"], body,
                             encode([{"batch_tasks": tasks, "conflicts": conflicts,
+                                     "verification_cost": report["verification_cost"],
                                      "originals": [{"id": row["id"], "source": row["source"],
                                                     "evidence": json.loads(row["evidence"] or "[]"),
                                                     "acceptance": json.loads(row["acceptance"] or "[]")}

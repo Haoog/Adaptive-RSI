@@ -56,7 +56,7 @@ SCHEMAS["planning"]["properties"]["performance_threshold"] = object_schema({
 
 def validate_output(value, schema):
     kind = schema["type"]
-    types = {"object": (dict,), "array": (list,), "string": (str,), "integer": (int,), "number": (int, float)}
+    types = {"object": (dict,), "array": (list,), "string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
     if type(value) not in types[kind]:
         raise RuntimeError("Agent returned invalid structured output")
     if "enum" in schema and value not in schema["enum"]:

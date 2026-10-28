@@ -1,10 +1,12 @@
 # Third Audit Implementation Progress
 
+Current continuation: the user has authorized work to continue. Read the [current implementation and validation scope](audit-followup-20261028.en.md); earlier stop instructions and validation totals below are historical. Final release readiness remains false.
+
 [简体中文](audit-200-progress-20261028.md)
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 95 implemented with targeted acceptance, 24 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 114 implemented with targeted acceptance, 56 partial, and 31 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -96,11 +98,11 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 41. **implemented** — Grouped originals need outcome semantics
 42. **implemented** — Deployment intent and ownership commit separately
 43. **implemented** — Health deadlines may overrun on blocking reads
-44. **partial** — Existing closed PRs need explicit handling
+44. **implemented** — Existing closed PRs need explicit handling
 45. **implemented** — Local cooldown rejection may inflate failures
 46. **implemented** — Account cooldowns remain project-scoped
 47. **implemented** — Malformed usage containers may abort valid responses
-48. **pending** — Monitoring stops after its initial window
+48. **implemented** — Monitoring stops after its initial window
 49. **implemented** — Exposure accounting needs reservation semantics
 50. **implemented** — Win-rate diagnostics mix units
 51. **implemented** — Concurrent imports may bypass split deduplication
@@ -111,7 +113,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 56. **partial** — Database initialization precedes runtime ownership
 57. **implemented** — Polling logs may amplify database writes
 58. **partial** — Restored cases retain old absolute paths
-59. **partial** — Expired auth cleanup may retain an outer lock
+59. **implemented** — Expired auth cleanup may retain an outer lock
 60. **implemented** — Deployment ownership is not shared across projects
 61. **implemented** — Unify desktop and engine update policy semantics
 62. **pending** — Add pausable staged rollout
@@ -125,32 +127,32 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 70. **pending** — Explain update progress by stage
 71. **pending** — Estimate space from actual assets
 72. **pending** — Make desktop lifecycle preferences explicit
-73. **pending** — Offer opt-in crash diagnostics
-74. **pending** — Scope navigation preferences to runtime instances
+73. **partial** — Offer opt-in crash diagnostics
+74. **partial** — Scope navigation preferences to runtime instances
 75. **pending** — Add native desktop commands
 76. **pending** — Diagnose proxy and certificate configuration
 77. **partial** — Explain which components an update affects
 78. **implemented** — Add update maintenance windows
 79. **pending** — Export upgrade receipts
-80. **pending** — Negotiate feature capabilities
+80. **partial** — Negotiate feature capabilities
 81. **implemented** — Support bounded dependency DAGs
 82. **implemented** — Preview dependency cancellation effects
-83. **pending** — Map grouped acceptance to individual evidence
-84. **pending** — Size task groups by verification cost
-85. **pending** — Preview grouping benefits and rework costs
-86. **pending** — Recommend task groups without automatic mutation
+83. **implemented** — Map grouped acceptance to individual evidence
+84. **partial** — Size task groups by verification cost
+85. **partial** — Preview grouping benefits and rework costs
+86. **implemented** — Recommend task groups without automatic mutation
 87. **implemented** — Make batch receipts searchable and exportable
 88. **implemented** — Support splitting failed task groups
 89. **pending** — Estimate queue time from actual execution
 90. **partial** — Evaluate rolling resource-based fairness
 91. **implemented** — Implement resource priority and wait accounting
 92. **implemented** — Add disk and memory pressure admission
-93. **pending** — Consider deadline-driven scheduling
-94. **pending** — Explain graceful shutdown progress
-95. **pending** — Use stage-specific deadlines
-96. **pending** — Reuse sealed read-only checkpoints
+93. **partial** — Consider deadline-driven scheduling
+94. **partial** — Explain graceful shutdown progress
+95. **implemented** — Use stage-specific deadlines
+96. **partial** — Reuse sealed read-only checkpoints
 97. **implemented** — Capture intervention reasons and outcomes
-98. **pending** — Clarify timezone-aware task scheduling
+98. **partial** — Clarify timezone-aware task scheduling
 99. **partial** — Add archive restoration and relocation
 100. **implemented** — Explain requirement revisions and rerun impact
 101. **pending** — Stabilize pagination under mutation
@@ -165,82 +167,82 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 110. **partial** — Execute migrations once per version
 111. **implemented** — Add a read-only database recovery mode
 112. **implemented** — Explain configuration changes and safe undo
-113. **pending** — Type and version settings namespaces
+113. **partial** — Type and version settings namespaces
 114. **implemented** — Trace slow SQL without sensitive parameters
 115. **implemented** — Measure connection-pool wait latency
 116. **implemented** — Separate full integrity scans from live metrics
-117. **partial** — Bound backup duration and space consumption
-118. **pending** — Offer previewable reversible cleanup
+117. **implemented** — Bound backup duration and space consumption
+118. **partial** — Offer previewable reversible cleanup
 119. **implemented** — Verify archive content integrity
-120. **pending** — Rehearse business-level restoration
+120. **partial** — Rehearse business-level restoration
 121. **pending** — Version capability metadata with provenance
-122. **pending** — Budget and paginate tool results independently
+122. **partial** — Budget and paginate tool results independently
 123. **pending** — Estimate tokens with language-aware uncertainty
 124. **implemented** — Parallelize independent read-only tools
 125. **implemented** — Make source writes atomic
 126. **implemented** — Stream bounded line ranges from large sources
-127. **pending** — Respect ignore rules during indexing
-128. **pending** — Add scoped search options
+127. **implemented** — Respect ignore rules during indexing
+128. **implemented** — Add scoped search options
 129. **pending** — Reference large tool output as artifacts
-130. **pending** — Classify retry safety for paid requests
+130. **implemented** — Classify retry safety for paid requests
 131. **implemented** — Correlate provider request identifiers
 132. **pending** — Add native streaming progress
 133. **implemented** — Persist redacted tool traces
 134. **implemented** — Preserve provider stop reasons end to end
-135. **pending** — Expand cross-protocol response contracts
+135. **partial** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
 137. **pending** — Price input, output and cache usage separately
 138. **pending** — Explain currency and estimation limits
 139. **pending** — Compare estimated and actual task cost
 140. **implemented** — Invalidate stale evidence after credential rotation
 141. **implemented** — Stratify evaluation sampling
-142. **partial** — Hash complete experiment inputs
-143. **pending** — Use fresh final promotion evidence
-144. **pending** — Calibrate monitoring with optional human feedback
-145. **partial** — Seal experiment plans before execution
-146. **pending** — Measure benchmark noise and uncertainty
-147. **pending** — Validate harness sensitivity with negative controls
-148. **pending** — Exercise criterion-specific counterexamples
-149. **pending** — Record executed test identities
-150. **pending** — Collect standard test and coverage artifacts
-151. **pending** — Cache immutable prepared environments
-152. **pending** — Gate performance gains on secondary guardrails
-153. **pending** — Audit dataset retirement and reclassification
-154. **pending** — Explain strategy changes before promotion
+142. **implemented** — Hash complete experiment inputs
+143. **partial** — Use fresh final promotion evidence
+144. **partial** — Calibrate monitoring with optional human feedback
+145. **implemented** — Seal experiment plans before execution
+146. **implemented** — Measure benchmark noise and uncertainty
+147. **partial** — Validate harness sensitivity with negative controls
+148. **partial** — Exercise criterion-specific counterexamples
+149. **implemented** — Record executed test identities
+150. **implemented** — Collect standard test and coverage artifacts
+151. **partial** — Cache immutable prepared environments
+152. **implemented** — Gate performance gains on secondary guardrails
+153. **implemented** — Audit dataset retirement and reclassification
+154. **partial** — Explain strategy changes before promotion
 155. **implemented** — Expose heterogeneous evaluation effects
-156. **pending** — Export sealed experiment reproduction bundles
-157. **pending** — Record exact host tool versions
-158. **pending** — Model monorepo check dependencies
-159. **pending** — Separate strategy and skill attribution
+156. **partial** — Export sealed experiment reproduction bundles
+157. **implemented** — Record exact host tool versions
+158. **partial** — Model monorepo check dependencies
+159. **partial** — Separate strategy and skill attribution
 160. **implemented** — Compare quality, cost and latency jointly
 161. **pending** — Explain merge queue states
-162. **pending** — Inspect GitHub ruleset requirements
+162. **partial** — Inspect GitHub ruleset requirements
 163. **pending** — Share trustworthy CI setup work
 164. **pending** — Combine affected checks with full final gates
-165. **pending** — Attribute post-merge failures carefully
+165. **partial** — Attribute post-merge failures carefully
 166. **pending** — Separate tracking cancellation from remote cancellation
-167. **pending** — Coordinate GitHub rate-limit handling
-168. **pending** — Explain rewritten or diverged baselines
-169. **pending** — Persist retryable post-processing work
+167. **partial** — Coordinate GitHub rate-limit handling
+168. **partial** — Explain rewritten or diverged baselines
+169. **partial** — Persist retryable post-processing work
 170. **pending** — Offer optional authenticated event delivery
 171. **implemented** — Require sustained deployment health
 172. **implemented** — Support bounded multi-target health analysis
 173. **implemented** — Declare deployment data compatibility
-174. **pending** — Bind target environments to authorization
-175. **pending** — Break down remote verification time
-176. **pending** — Preview stale remote branch cleanup
-177. **pending** — Explain synchronized requirement changes
-178. **pending** — Check GitHub capabilities without test writes
-179. **pending** — Expose ambiguous dispatch reconciliation
+174. **partial** — Bind target environments to authorization
+175. **partial** — Break down remote verification time
+176. **partial** — Preview stale remote branch cleanup
+177. **partial** — Explain synchronized requirement changes
+178. **partial** — Check GitHub capabilities without test writes
+179. **partial** — Expose ambiguous dispatch reconciliation
 180. **pending** — Plan explicit GitHub Enterprise support
-181. **pending** — Add navigation within long logs
+181. **implemented** — Add navigation within long logs
 182. **partial** — Lazily construct large evidence views
 183. **implemented** — Improve navigation inside diffs
 184. **implemented** — Explain chains of blocking causes
 185. **implemented** — Keep both sides of settings conflicts
 186. **implemented** — Preserve meaningful browser navigation history
-187. **pending** — Optionally synchronize saved views
-188. **pending** — Preserve focus and limit live announcements
+187. **partial** — Optionally synchronize saved views
+188. **partial** — Preserve focus and limit live announcements
 189. **implemented** — Improve narrow-screen diff reading
 190. **implemented** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
@@ -249,7 +251,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 194. **implemented** — Balance tests using actual module durations
 195. **implemented** — Track flaky failures without hiding them
 196. **implemented** — Extend soak coverage to runtime interactions
-197. **pending** — Inject crashes at side-effect receipt boundaries
+197. **partial** — Inject crashes at side-effect receipt boundaries
 198. **implemented** — Check dynamic localization structurally
 199. **partial** — Generate a dependency-complete SBOM
 200. **implemented** — Link audit completion to verifiable evidence

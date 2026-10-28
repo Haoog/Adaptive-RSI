@@ -1,7 +1,8 @@
 'use strict';
-function localRead(key){try{return localStorage.getItem(key);}catch{return null;}}
-function localWrite(key,value){try{localStorage.setItem(key,value);}catch{}}
-function localRemove(key){try{localStorage.removeItem(key);}catch{}}
+function preferenceKey(key){return ['rsi-project','rsi-navigation'].includes(key)&&window.__RSI_MACHINE_KEY__?key+':'+window.__RSI_MACHINE_KEY__:key;}
+function localRead(key){try{return localStorage.getItem(preferenceKey(key));}catch{return null;}}
+function localWrite(key,value){try{localStorage.setItem(preferenceKey(key),value);}catch{}}
+function localRemove(key){try{localStorage.removeItem(preferenceKey(key));}catch{}}
 let state, projectId = localRead('rsi-project') || '', view = 'overview', settingsBaseline, toastTimer;
 const $ = id => document.getElementById(id);
 const evaluationNames={baseline:'修改前的版本',candidate:'原有功能检查',candidate_full:'修改后的完整测试',acceptance_baseline:'修改前的独立检查',acceptance_candidate:'修改后的独立检查'};
@@ -173,8 +174,49 @@ for(const type of ['input','change','reset'])document.addEventListener(type,even
 document.addEventListener('close',event=>{if(event.target.tagName==='DIALOG')reviseForm(event.target.querySelector('form'));},true);
 function unchangedForm(form,{projectSensitive=true}={}){const revision=formRevisions.get(form)||0,project=projectId;return ()=>(formRevisions.get(form)||0)===revision&&(!projectSensitive||projectId===project);}
 function el(tag, text, cls){ const node=document.createElement(tag); if(text!==undefined)node.textContent=text; if(cls)node.className=cls; return node; }
+function lazyEvidence(label,produce){
+ const box=el('details'),summary=el('summary',t(label));box.append(summary);let loaded=false,text='',offset=0,anchorOffset=0,searchTicket=0;
+ box.addEventListener('toggle',()=>{
+  if(!box.open||loaded)return;loaded=true;text=String(produce()??'');
+  const controls=el('div',undefined,'task-actions'),search=el('input'),raw=el('pre'),status=el('span');search.type='search';search.placeholder=t('搜索日志');search.setAttribute('aria-label',t('搜索日志'));status.dataset.logStatus='';status.setAttribute('role','status');
+  const size=16000;
+  const lineStarts=[0];for(let cursor=0;cursor<text.length;cursor++)if(text.charCodeAt(cursor)===10)lineStarts.push(cursor+1);
+  function lineAt(position){let low=0,high=lineStarts.length;while(low+1<high){const middle=(low+high)>>1;if(lineStarts[middle]<=position)low=middle;else high=middle;}return low+1;}
+  function paint(){raw.textContent=text.slice(offset,offset+size);status.textContent=t('原文位置')+' '+(offset+1)+'–'+Math.min(offset+size,text.length)+' / '+text.length+' · '+t('行')+' '+lineAt(offset);previous.disabled=offset===0;next.disabled=offset+size>=text.length;}
+  async function find(anchor=false){const ticket=++searchTicket,needle=search.value;if(!anchor&&!needle){offset=0;paint();return;}const start=anchor?Math.max(offset,anchorOffset)+1:0;
+   for(let cursor=start;cursor<text.length;cursor+=262144){if(ticket!==searchTicket||!box.isConnected)return;const chunk=text.slice(cursor,cursor+262144+(anchor?256:needle.length)),match=anchor?/(?:\b\d{4}-\d\d-\d\d[T ][\d:.+Z-]+|\[(?:planning|implementation|evaluation|review|delivery)\])/i.exec(chunk):null,index=anchor?(match?.index??-1):chunk.indexOf(needle);
+    if(index>=0){anchorOffset=cursor+index;offset=Math.max(0,anchorOffset-200);paint();return;}await new Promise(resolve=>setTimeout(resolve,0));}
+   if(ticket===searchTicket)status.textContent=t('未找到匹配内容');
+  }
+  const previous=action(t('上一段'),()=>{searchTicket++;offset=Math.max(0,offset-size);paint();},'text-button'),next=action(t('下一段'),()=>{searchTicket++;offset=Math.min(Math.max(0,text.length-1),offset+size);paint();},'text-button');
+  const anchor=action(t('下一个时间或阶段'),()=>find(true),'text-button');search.addEventListener('input',()=>find());
+  const download=action(t('导出完整原文'),()=>{const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'})),link=el('a');link.href=url;link.download='evidence.txt';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'text-button');
+  controls.append(search,previous,next,anchor,download,status);box.append(controls,raw);paint();
+ });return box;
+}
 function toast(message,error=false){ $('toast').textContent=message; $('toast').className=error?'error':''; $('toast').hidden=false; clearTimeout(toastTimer); if(!error)toastTimer=setTimeout(()=>$('toast').hidden=true,6500);else{const close=el('button','×','toast-close');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>$('toast').hidden=true);$('toast').append(close);} }
+let serviceCapabilities=null,serviceContractPromise=null;
+function featureForPath(path){
+ const route=path.split('?')[0];
+ if(/^(?:tasks\/batch(?:es)?|task-batch(?:\/.*)?)$/.test(route))return 'task-batch';
+ if(/^(?:operations?|operations\/.*)$/.test(route))return 'operations';
+ if(route==='config-history'||route==='config/undo')return 'config-history';
+ // Configuration repair predates capability descriptors and remains a baseline operation.
+ return null;
+}
+async function negotiateCapabilities(){
+ if(serviceCapabilities!==null)return serviceCapabilities;
+ if(!serviceContractPromise)serviceContractPromise=(async()=>{
+  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
+  try{const response=await fetch('/api/contract',{signal:controller.signal});if(!response.ok){if([404,405].includes(response.status))return serviceCapabilities=new Set();throw Error('contract unavailable');}const contract=await response.json();return serviceCapabilities=new Set(Array.isArray(contract.descriptor?.capabilities)?contract.descriptor.capabilities:[]);}
+  catch{return null;}
+  finally{clearTimeout(timeout);serviceContractPromise=null;}
+ })();
+ return serviceContractPromise;
+}
 async function sendApi(path,body,signal,{text=false}={}){
+ const feature=featureForPath(path);
+ if(feature){const supported=await negotiateCapabilities();if(!supported?.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
  const bootstrapRepair=body!==undefined&&!state&&path==='config/repair-global';
  if(body!==undefined&&!state&&!bootstrapRepair)throw Error(t('正在连接本地服务，请稍候再提交。'));
  const controller=new AbortController();
@@ -395,12 +437,13 @@ async function refresh(options={}){
 }
 function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
+ localWrite('rsi-navigation',JSON.stringify({view,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
  document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+parent);
  const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  document.querySelectorAll('.nav').forEach(node=>{const selected=node.dataset.view===parent;if(selected)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
- document.querySelector('#tasks-list')?.setAttribute('aria-live','polite');
+ document.querySelector('#tasks-list')?.setAttribute('aria-live','off');
  $('settings-tabs').hidden=parent!=='settings';$('settings-context').hidden=parent!=='settings';
  $('page-name').textContent=t(parent==='settings'?(configScope==='global'?'通用设置':'项目设置'):{overview:'工作台',evolution:'自我改进记录',usage:'记录与用量'}[parent]);
  $('project-settings').hidden=!projectId;$('back-workspace').hidden=parent==='overview';
@@ -510,7 +553,15 @@ let navigationHomeProject=typeof history!=='undefined'&&typeof history.state?.rs
 function rememberNavigationHome(){
  if(!navigationHomeProject&&projectId){navigationHomeProject=projectId;if(location.href&&!new URLSearchParams(String(location.hash||'').replace(/^#/, '')).has('project'))history.replaceState({...history.state,rsi_home_project:projectId},'',location.href);}
 }
+function restoreRuntimeNavigation(){
+ projectId=localRead('rsi-project')||'';let saved;try{saved=JSON.parse(localRead('rsi-navigation')||'null');}catch{}
+ view=saved&&['overview','evolution','settings','usage'].includes(saved.view)?saved.view:'overview';
+ if(saved&&['active','attention','history','all'].includes(saved.filter))$('task-filter').value=saved.filter;
+ if(saved)$('show-system-tasks').checked=saved.system===true;
+ if(window.__RSI_MACHINE_KEY__&&location.pathname!==undefined)history.replaceState(null,'',location.pathname+location.search);
+}
 function writeNavigation(name){
+ localWrite('rsi-navigation',JSON.stringify({view:name==='models'?'settings':name,filter:$('task-filter').value,system:$('show-system-tasks').checked}));
  rememberNavigationHome();
  if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');const target=location.pathname+location.search+'#'+navigation;if(target!==location.pathname+location.search+location.hash)history.pushState(null,'',target);}
 }
@@ -540,10 +591,25 @@ typeof window.addEventListener==='function'&&window.addEventListener('hashchange
  if(task&&project&&state.projects.some(item=>item.id===project))window.dispatchEvent(new CustomEvent('rsi-history-task',{detail:{task,project}}));
  else if(projectChanged)safe(refresh);
 });
+function exportSavedView(){return JSON.stringify({version:1,view,project:projectId,filter:$('task-filter').value,system:$('show-system-tasks').checked},null,2);}
+function importSavedView(text){
+ if(typeof text!=='string'||text.length>4096)throw Error(t('视图文件无效或项目不可用。'));
+ let saved;try{saved=JSON.parse(text);}catch{throw Error(t('视图文件无效或项目不可用。'));}
+ if(!saved||saved.version!==1||!['overview','evolution','settings','usage'].includes(saved.view)||!['active','attention','history','all'].includes(saved.filter)||typeof saved.system!=='boolean'||!state.projects.some(project=>project.id===saved.project))throw Error(t('视图文件无效或项目不可用。'));
+ stashSettings();stashGoalDraft();closeTaskDetail();projectId=saved.project;localWrite('rsi-project',projectId);$('project-select').value=projectId;$('task-filter').value=saved.filter;$('show-system-tasks').checked=saved.system;taskOffset=0;settingsBaseline=null;restoreGoalDraft();showView(saved.view);safe(refresh);
+}
+function savedViewControls(){
+ if($('saved-view-controls')){const box=$('saved-view-controls');if(!box.querySelector('summary'))return;box.querySelector('summary').textContent=t('跨浏览器恢复视图');box.querySelector('p').textContent=t('视图仅保存在本机。导出文件包含项目标识和筛选条件，请仅传给自己的浏览器。');box.querySelector('button').textContent=t('导出当前视图');box.querySelector('input').setAttribute('aria-label',t('导入视图文件'));return;}const box=el('details');box.id='saved-view-controls';box.append(el('summary',t('跨浏览器恢复视图')),el('p',t('视图仅保存在本机。导出文件包含项目标识和筛选条件，请仅传给自己的浏览器。')));
+ const input=el('input');input.type='file';input.accept='application/json,.json';input.setAttribute('aria-label',t('导入视图文件'));input.addEventListener('change',()=>safe(async()=>{const file=input.files[0];if(!file)return;if(file.size>4096)throw Error(t('视图文件无效或项目不可用。'));importSavedView(await file.text());input.value='';}));
+ box.append(action(t('导出当前视图'),()=>{const url=URL.createObjectURL(new Blob([exportSavedView()],{type:'application/json'})),link=el('a');link.href=url;link.download='rsi-view.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);},'text-button'),input);$('tasks-page').after(box);
+}
 function renderTasks(){
+ savedViewControls();
  const list=$('tasks-list'),filter=$('task-filter').value;
  const waitingRetries=scoped(state.tasks).filter(task=>task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000).map(task=>task.id);
  if(!changedList(list,[filter,$('show-system-tasks').checked,taskOffset,state.selected_project,state.pagination,scoped(state.tasks),scoped(state.runs),waitingRetries]))return;
+ const focused=document.activeElement,focusedRow=focused?.closest?.('.task-row'),focusedTask=focusedRow?.dataset.taskId,focusIndex=focusedRow?[...focusedRow.querySelectorAll('button,input,a[href]')].indexOf(focused):-1;
+ const oldIndex=focusedRow?[...list.children].indexOf(focusedRow):-1;
  list.replaceChildren();
  if(state.tasks.length>120){
   const pages=Math.ceil(state.pagination?.total/50);
@@ -557,7 +623,7 @@ function renderTasks(){
  $('tasks-prev').disabled=!taskOffset;$('tasks-next').disabled=!page?.has_more;$('tasks-page').textContent=page?(tasks.length?page.offset+1:0)+'–'+(tasks.length?Math.min(page.offset+tasks.length,page.total):0)+' / '+page.total:'';
  if(!tasks.length)list.append(el('p',t('这里暂无任务。其他分组中可能有历史记录。'),'empty-copy'));
  for(const task of tasks){
-  const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');
+  const row=el('div',undefined,'task-row'),title=el('div'),actions=el('div',undefined,'task-actions');row.dataset.taskId=task.id;
   title.append(action(task.title,()=>showTask(task),'task-title'),el('span',t(sourceNames[task.source]||task.source)+' · '+stamp(task.updated),'task-meta'));
   if(task.wait_reason)title.append(el('p',window.RSIExperience?.queueCopy(task)||'','task-meta'));
   // 暂缓/不采纳的任务可能没有运行记录：理由回退到 task_decisions 的决定记录（批量初筛或规划）。
@@ -575,9 +641,12 @@ function renderTasks(){
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   if(!task.source.startsWith('system_')&&window.RSIBatch)row.append(window.RSIBatch.row(task));
   row.append(title,badge(task.display_state||task.state),actions);list.append(row);
- }
-}
-let detailTask,detailSequence=0;
+  }
+  if(focusedTask){const rows=[...list.querySelectorAll('.task-row')],row=rows.find(item=>item.dataset.taskId===focusedTask)||rows[Math.min(Math.max(0,oldIndex),rows.length-1)],controls=row?[...row.querySelectorAll('button,input,a[href]')].filter(node=>!node.disabled):[];(controls[Math.max(0,Math.min(focusIndex,controls.length-1))]||document.querySelector('[data-task-filter="'+filter+'"]')).focus?.({preventScroll:true});}
+  let announcement=$('task-list-announcement');if(!announcement){announcement=el('span');announcement.id='task-list-announcement';announcement.setAttribute('role','status');announcement.setAttribute('aria-live','polite');$('tasks-page').after(announcement);}
+  const announcementKey=JSON.stringify([language,projectId,taskOffset,filter,tasks.map(task=>task.id)]);if(announcement.dataset.key!==announcementKey){announcement.dataset.key=announcementKey;announcement.textContent=t('当前列表任务数')+' '+tasks.length;}
+  }
+  let detailTask,detailSequence=0;
 const pendingDetailCloseEvents=[];
 function closeTaskDetail(){
  const closingTask=detailTask?.id;detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();
@@ -605,14 +674,14 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  const stillCurrent=()=>ticket===detailSequence&&projectId===project&&detailTask?.id===task.id;
  if(!$('detail-dialog').open)$('detail-dialog').showModal();
  window.RSIExperience?.taskOpened(task,queueDraft);
- const evidence=el('details',undefined,'detail-section');let evidenceText=task.evidence||'';try{evidenceText=JSON.stringify(JSON.parse(task.evidence),null,2);}catch{}evidence.append(el('summary',t('来源与证据')),el('p',task.body,'muted'),el('pre',evidenceText));body.append(evidence);
+ const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';evidence.append(el('p',task.body,'muted'));body.append(evidence);
  const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
  async function loadRun(run,index,section){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
   section.replaceChildren();
   if(index===0){const outcome=taskOutcome(data);outcome.id='live-task-outcome';body.insertBefore(outcome,evidence);window.RSIExperience?.enhanceOutcome(outcome,data);await renderReleaseOutcome(outcome,run,project);if(ticket!==detailSequence||projectId!==project)return;}
   section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id),el('p',data.result.failure?failureCopy(data.result.failure):data.result.reason,'muted'));
   if(index>0)section.append(stageProgress(data));
-  const raw=el('details');raw.append(el('summary',t('原始运行记录')),el('pre',JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));section.append(raw);
+  section.append(lazyEvidence('原始运行记录',()=>JSON.stringify({models:data.config.models,calls:data.calls,tokens:data.tokens,base:data.base,result:data.result},null,2)));
   if(data.result.value){const report=el('details',undefined,'review-report');report.append(el('summary',t('为什么值得做')),valueReport(data.result.value,data.result.plan_reason,data.result.scope));section.append(report);}
   if(data.result.review){
    const review=data.result.review,report=el('details',undefined,'review-report');report.append(el('summary',t('代码评审')),badge(review.decision),el('p',review.reason));
@@ -620,7 +689,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
    for(const finding of review.findings||[]){const card=el('div',undefined,'provider-card');card.append(el('strong',t(reviewNames[finding.severity]||finding.severity)+' · '+finding.title),el('p',finding.path+':'+finding.line),el('p',finding.reason),el('p',t('修改建议')+t('：')+finding.suggestion));report.append(card);}
    section.append(report);
   }
-  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=el('details');detail.append(el('summary',t(evaluationNames[label]||label)+' · '+rows.filter(r=>r.passed).length+'/'+rows.length),el('pre'));detail.addEventListener('toggle',()=>{if(detail.open&&!detail.dataset.loaded){detail.dataset.loaded='true';detail.querySelector('pre').textContent=JSON.stringify(rows,null,2);}});report.append(detail);}section.append(report);}
+  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=lazyEvidence(evaluationNames[label]||label,()=>JSON.stringify(rows,null,2));detail.querySelector('summary').append(' · '+rows.filter(r=>r.passed).length+'/'+rows.length);report.append(detail);}section.append(report);}
   if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
@@ -1133,7 +1202,7 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  renderUpdateExtras(update);}
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
-safe(refresh);
+safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();}await refresh();});
 if(window.RSIDesktop)safe(checkDesktopUpdate);
 $('language-select').addEventListener('change',()=>safe(async()=>{
  language=$('language-select').value;

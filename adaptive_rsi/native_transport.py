@@ -11,7 +11,12 @@ def main():
         raw = sys.stdin.read()
         if not raw.strip():
             raise ValueError("Empty transport payload")
-        response = post_json(*json.loads(raw))
+        payload = json.loads(raw)
+        if isinstance(payload, dict) and payload.get("operation") == "regex_search":
+            from .native_search import search
+            print(json.dumps(search(payload["arguments"])))
+            return
+        response = post_json(*payload)
         result = {"ok": True, "response": response,
                   "request_id": getattr(response, "provider_request_id", None)}
     except Exception as exc:
@@ -19,6 +24,9 @@ def main():
                   "unavailable": isinstance(exc, ProviderUnavailable),
                   "retry_after": getattr(exc, "retry_after", 0),
                   "request_id": getattr(exc, "provider_request_id", None),
+                  "request_outcome": getattr(exc, "request_outcome", "unknown"),
+                  "possibly_billed": getattr(exc, "possibly_billed", True),
+                  "retry_may_duplicate": getattr(exc, "retry_may_duplicate", True),
                   "stop_reason": getattr(exc, "stop_reason", None)}
     print(json.dumps(result, ensure_ascii=False))
 

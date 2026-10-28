@@ -711,8 +711,8 @@ class RuntimeSafetyTest(unittest.TestCase):
         patch_path = workspace.parent / "candidate.patch"
         patch_text = "diff --git a/calculator.py b/calculator.py\n@@ -1 +1 @@\n-return a-b\n+return a+b\n"
         patch_path.write_text(patch_text)
-        run = {"id": "review-run", "project": self.project,
-               "config": encode(self.runtime.config(self.project)), "started": time.time()}
+        self.runtime.goal(self.project, "Review sealed candidate")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
 
         self.runtime.invoke("review", "Review this candidate", workspace, run)
         self.assertIn(patch_text, agent.prompt)

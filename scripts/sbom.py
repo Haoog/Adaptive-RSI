@@ -11,11 +11,13 @@ def components(root, require_inventory=False):
     lock = root / "desktop/src-tauri/Cargo.lock"
     cargo_receipt = root / "desktop/.generated/cargo-inventory.json"
     licenses = {}
+    sources = {}
     if cargo_receipt.exists():
         receipt = json.loads(cargo_receipt.read_text())
         if receipt["lock_sha256"] != hashlib.sha256(lock.read_bytes()).hexdigest():
             raise ValueError("Cargo inventory does not match the locked build inputs")
         licenses = {(package["name"], package["version"]): package.get("license") for package in receipt["packages"]}
+        sources = {(package["name"], package["version"]): package.get("source") for package in receipt["packages"]}
     elif require_inventory:
         raise ValueError("Formal releases require Cargo dependency metadata")
     for block in lock.read_text().split("[[package]]")[1:]:
@@ -23,6 +25,8 @@ def components(root, require_inventory=False):
         if not fields.get("source", "").startswith("registry+"):
             continue
         name, version = fields["name"], fields["version"]
+        if require_inventory and sources.get((name, version)) != fields["source"]:
+            raise ValueError("Cargo dependency metadata missing or mismatched: " + name + "@" + version)
         checksum = fields.get("checksum", "")
         if not re.fullmatch(r"[a-f0-9]{64}", checksum):
             raise ValueError("Locked crate is missing its content checksum: " + name)

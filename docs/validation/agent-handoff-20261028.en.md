@@ -1,5 +1,7 @@
 # Agent handoff: audit implementation and remaining scope
 
+**Current authorization supersedes this historical handoff:** the user has authorized continued implementation, verification, push, merge, release and installation update, subject to final gates. The stop instruction and counts below describe the old handoff, not the current working tree. Current ledger: **114 implemented, 56 partial, 31 pending**; `release_ready=false`. See the [current follow-up](audit-followup-20261028.en.md) and [ledger](audit-200-implementation-20261028.json). Historical text is retained unchanged below.
+
 [中文](agent-handoff-20261028.md)
 
 The user's latest instruction is to finish the current ledger/index task, summarize the work and stop. Do not resume implementation, push, merge, release or update the installed application without a new user instruction. Earlier release authorization has been narrowed by this instruction.

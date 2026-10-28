@@ -80,6 +80,9 @@ class Runtime(Maintenance):
         self.store = store
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
+        self._shutdown = {"phase": "running", "started": None, "ended": None}
+        self._close_lock = threading.Lock()
+        self._closed = False
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.thread = None
@@ -88,6 +91,7 @@ class Runtime(Maintenance):
         self.futures = set()
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
+        self._project_deadlines = {}
         self._config_cache = {}
         self.import_lock = threading.Lock()
         self.import_in_progress = False
@@ -612,6 +616,39 @@ class Runtime(Maintenance):
                         "after": {"state": "queued", "body_hash": fingerprint(body)}}), now))
         self.wake.set()
 
+    def schedule_task(self, task, local_time, timezone, fold=None):
+        """Authorize one absolute instant; reject missing and unspecified repeated hours."""
+        local = datetime.datetime.fromisoformat(local_time)
+        if local.tzinfo is not None or fold not in (None, 0, 1):
+            raise ValueError('Use a naive local time and fold 0 or 1')
+        zone = ZoneInfo(timezone)
+        candidates = {}
+        for choice in (0, 1):
+            instant = local.replace(tzinfo=zone, fold=choice).timestamp()
+            if datetime.datetime.fromtimestamp(instant, zone).replace(tzinfo=None) == local:
+                candidates[choice] = instant
+        if not candidates:
+            raise ValueError('Scheduled local time is nonexistent')
+        if len(set(candidates.values())) > 1 and fold is None:
+            raise ValueError('Scheduled local time is ambiguous; specify fold')
+        instant = candidates[fold if fold is not None else min(candidates)]
+        if instant <= time.time():
+            raise ValueError('Scheduled time must be in the future')
+        data = {'local_time': local_time, 'timezone': timezone, 'fold': fold, 'at': instant}
+        with self.dispatch_lock, self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task,)).fetchone()
+            if not row or row['state'] != 'queued' or db.execute(
+                    'SELECT 1 FROM runs WHERE task=? AND ended IS NULL', (task,)).fetchone():
+                raise ValueError('Only queued inactive tasks can be scheduled')
+            self.require_active_project(row['project'])
+            db.execute('UPDATE tasks SET available=?,updated=? WHERE id=?', (instant, time.time(), task))
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('task-schedule:' + task, encode(data)))
+            db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,'task_scheduled','Task scheduled at an authorized absolute instant',?,?)",
+                       (row['project'], encode({'task': task, **data}), time.time()))
+        self.wake.set()
+        return data
+
     def set_dependency(self, task, dependency=None, urgency=0, reason=None):
         from .task_dependencies import save
         save(self, task, dependency, urgency, reason)
@@ -725,20 +762,44 @@ class Runtime(Maintenance):
             self.lockfile = None
             raise
 
+    def shutdown_status(self):
+        return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
+                'remaining_operations': len(self.operations.active),
+                'maintenance_running': bool(self.maintenance_thread and self.maintenance_thread.is_alive())}
+
     def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            self._shutdown.update(phase='stopping', started=time.time())
+            try:
+                self._close()
+            except BaseException:
+                self._shutdown.update(phase='failed', ended=time.time())
+                raise
+            self._closed = True
+            self._shutdown.update(phase='completed', ended=time.time())
+
+    def _close(self):
         self.stop.set()
         self.maintenance_stop.set()
         self.wake.set()
+        self._shutdown['phase'] = 'authentication'
         self.auth_sessions.close()
+        self._shutdown['phase'] = 'operations'
         self.operations.close()
+        self._shutdown['phase'] = 'scheduler'
         if self.thread:
             self.thread.join()
+        self._shutdown['phase'] = 'workers'
         try:
             self.pool.shutdown(wait=True, cancel_futures=True)
         except TypeError:
             self.pool.shutdown(wait=True)
+        self._shutdown['phase'] = 'maintenance'
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
             self.maintenance_thread.join()
+        self._shutdown['phase'] = 'storage'
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
         self.store.close()
         if self.lockfile:
@@ -896,6 +957,8 @@ class Runtime(Maintenance):
             yield
         except Exception as exc:
             message = str(exc)
+            if phase == "project":
+                self._project_deadlines.pop(project, None)
             # 相同故障只记一次；恢复后再失败仍保留新证据。
             with self._scheduler_failures_lock:
                 if self._scheduler_failures.get(key) != message:
@@ -910,6 +973,29 @@ class Runtime(Maintenance):
             with self._scheduler_failures_lock:
                 self._scheduler_failures.pop(key, None)
 
+    def scheduler_projects(self, now=None):
+        now = time.time() if now is None else now
+        if self.wake.is_set():
+            self._project_deadlines.clear()
+        # One indexed candidate query replaces per-project readiness/config reads.
+        return self.store.query("SELECT * FROM projects p WHERE paused=0 AND ("
+            "NOT json_valid(p.config) OR "
+            "id IN (SELECT project FROM tasks WHERE state IN ('queued','waiting_budget') AND available<=?) "
+            "OR id IN (SELECT project FROM runs WHERE ended IS NULL) "
+            "OR coalesce(json_extract(?, '$.' || '\"' || id || '\"'),0)<=?) ORDER BY created",
+            (now, encode(self._project_deadlines), now))
+
+    def defer_project_tick(self, project, config, now=None):
+        now = time.time() if now is None else now
+        rows = self.store.query('SELECT kind,due FROM schedules WHERE project=?', (project,))
+        enabled = {kind for kind, source in [('light', 'inspection'), ('issues', 'issues')]
+                   if config['sources'][source] and (kind != 'issues' or config['github']['repository'])}
+        due = {row['kind']: row['due'] for row in rows}
+        deadlines = [due.get(kind, now) for kind in enabled]
+        deadlines.append(self.store.setting('deferred-check:' + project, now) + config['schedule']['light_minutes'] * 60)
+        candidate = min(deadlines)
+        self._project_deadlines[project] = self.next_effective_schedule(project, candidate, now)
+
     def loop(self):
         while not self.stop.is_set():
             with self.scheduler_scope("loop"):
@@ -921,6 +1007,8 @@ class Runtime(Maintenance):
                 if self.updates.is_busy():
                     continue
                 self.maintenance_async()
+                with self.scheduler_scope('postprocess'):
+                    self.drain_postprocess()
                 for future in tuple(self.futures):
                     if future.done():
                         self.futures.remove(future)
@@ -935,7 +1023,7 @@ class Runtime(Maintenance):
                 with self.scheduler_scope("dependencies"):
                     self.release_dead_dependencies()
                 eligible = []
-                for project in self.store.query("SELECT * FROM projects WHERE paused=0 ORDER BY created"):
+                for project in self.scheduler_projects():
                     with self.scheduler_scope("project", project["id"]):
                         config = self.config(project["id"])
                         hour = datetime.datetime.now(ZoneInfo(config["schedule"]["timezone"])).hour
@@ -946,14 +1034,16 @@ class Runtime(Maintenance):
                         if within_hours(hour, config["schedule"]["working_hours"]):
                             self.schedule(project["id"], config)
                             eligible.append((project, config))
+                        self.defer_project_tick(project['id'], config)
                 self.dispatch(eligible)
-            self.wake.wait(timeout=5)
+            if self.wake.wait(timeout=5):
+                self._project_deadlines.clear()
             self.wake.clear()
 
     def dispatch(self, eligible):
         # 配置刷新、资格复核、选择与领取共用保存/暂停的锁，避免成功保存后仍封存旧配置。
         with self.dispatch_lock:
-            if self.import_in_progress or self.updates.is_busy():
+            if self.stop.is_set() or self.import_in_progress or self.updates.is_busy():
                 return
             refreshed = []
             for project, _ in eligible:
@@ -982,9 +1072,9 @@ class Runtime(Maintenance):
                 if task and task["oldest"] is not None:
                     ready.append((project, config))
                     counts[project["id"]] = self.store.one(
-                        "SELECT coalesce(sum(max(1,min(ended,?)-max(started,?))),0) AS seconds "
-                        "FROM runs WHERE project=? AND ended IS NOT NULL AND ended>?",
-                        (now, now - 86400, project["id"], now - 86400))["seconds"]
+                        "SELECT coalesce(sum(max(1,min(coalesce(ended,?),?)-max(started,?))),0) AS seconds "
+                        "FROM runs WHERE project=? AND (ended IS NULL OR ended>?)",
+                        (now, now, now - 86400, project["id"], now - 86400))["seconds"]
             if not ready:
                 return
             services = self.store.setting("fair-service", {})
@@ -1038,6 +1128,69 @@ class Runtime(Maintenance):
                 self.futures.add(future)
                 future.add_done_callback(lambda _: self.wake.set())
 
+    def queue_postprocess(self, run):
+        key = 'postprocess:' + run['id']
+        with self.store.connect() as db:
+            db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',
+                       (key, encode({'state': 'pending', 'steps': [], 'created': time.time()})))
+
+    def drain_postprocess(self, run_id=None):
+        with self.dispatch_lock:
+            return self._drain_postprocess(run_id)
+
+    def _drain_postprocess(self, run_id=None):
+        rows = self.store.query("SELECT key,value FROM settings WHERE key LIKE 'postprocess:%' " +
+                                (' AND key=?' if run_id else ''), ('postprocess:' + run_id,) if run_id else ())
+        for item in rows:
+            identifier = item['key'].split(':', 1)[1]
+            with self.scheduler_scope('postprocess_run', run=identifier):
+                record = json.loads(item['value'])
+                if not isinstance(record, dict) or not isinstance(record.get('steps'), list):
+                    raise ValueError('Invalid postprocess record')
+                if record.get('state') != 'pending':
+                    continue
+                try:
+                    self._postprocess_run(item['key'], identifier, record)
+                except Exception as exc:
+                    record.update(last_error=str(exc), last_failed=time.time())
+                    self.store.put_setting(item['key'], record)
+                    raise
+
+    def _postprocess_run(self, key, identifier, record):
+        run = self.store.one('SELECT * FROM runs WHERE id=?', (identifier,))
+        if not run or run['ended'] is None:
+            return
+        if self.store.setting('project-archived:' + run['project']):
+            record.update(state='obsolete', reason='Project archived; postprocessing terminated', ended=time.time())
+            self.store.put_setting(key, record)
+            return
+        if run['state'] not in ('awaiting_approval', 'pr_open', 'merged'):
+            record['state'] = 'obsolete'
+            self.store.put_setting(key, record)
+            return
+        outcome, config = json.loads(run['result']), json.loads(run['config'])
+        for step in ('delivery', 'observation', 'monitor', 'evolution'):
+            if step in record['steps']:
+                continue
+            if step == 'delivery':
+                if config['delivery']['mode'] == 'pr' and self.config(run['project'])['delivery']['mode'] == 'pr' and run['state'] == 'awaiting_approval':
+                    self.deliver(run['id'], automatic=True)
+            elif step == 'observation':
+                identifier = hashlib.sha256(('observation:' + run['id']).encode()).hexdigest()[:16]
+                self.store.execute('INSERT OR IGNORE INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                    (identifier, run['project'], run['task'], 'observation',
+                     encode([self.store.one('SELECT title FROM tasks WHERE id=?', (run['task'],))['title']]),
+                     outcome.get('summary', ''), encode({'run': run['id'], 'base': run['base']}),
+                     run['ended'] + 30 * 86400, run['ended']))
+            elif step == 'monitor':
+                self.monitor_strategy(run['project'], True, run)
+            else:
+                self.maybe_evolve(run['project'], config)
+            record['steps'].append(step)
+            self.store.put_setting(key, record)
+        record.update(state='completed', ended=time.time())
+        self.store.put_setting(key, record)
+
     def outcomes(self, project):
         rows = self.store.query("SELECT id,result FROM runs WHERE project=? AND state IN ('merged','pr_closed','reverted','unverified_merge') ORDER BY started DESC LIMIT 20", (project,))
         result = []
@@ -1051,6 +1204,18 @@ class Runtime(Maintenance):
         return result
 
     def is_cancelled(self, run):
+        if self.stop.is_set():
+            return True
+        if '_deadline_started' in run:
+            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+            stage = ('model' if run.get('_model_started') is not None else
+                     'evaluation' if state and state['state'] == 'evaluating' else 'preparation')
+            if run.get('_deadline_stage') != stage:
+                run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
+            limits = merge(DEFAULTS['deadlines'], json.loads(run['config']).get('deadlines', {}))
+            if time.monotonic() - run['_deadline_started'] >= limits[stage + '_seconds']:
+                run['_timed_out_stage'] = stage
+                return True
         row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
                              "WHERE s.key='run-stop:' || r.id) AS stop_requested "
                              "FROM runs r JOIN tasks t ON r.task=t.id "
@@ -1111,22 +1276,30 @@ class Runtime(Maintenance):
                      "This is the exact patch that will be evaluated and delivered:\n```diff\n" +
                      patch.decode("utf-8", "replace") + "\n```")
         self.store.phase(run["id"], role)
+        run['_model_started'] = time.monotonic()
+        run['_deadline_stage'], run['_deadline_started'] = 'model', run['_model_started']
         try:
             exposure = run.get("_case_exposure")
             key = self.store.reserve_case_exposure(run["project"], exposure["case"], exposure["experiment"],
                                                   exposure["limit"]) if exposure else None
             result = self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
                                        config, lambda: self.is_cancelled(run), protected)
+            if self.is_cancelled(run):
+                raise Cancelled('Model invocation cancelled or stage deadline exceeded')
             if key:
                 value = self.store.setting(key)
                 value.update(state="response_observed", adapter=type(self.agent).__name__, last_role=role)
                 self.store.put_setting(key, value)
             return result
         finally:
+            run.pop('_model_started', None)
+            run['_deadline_stage'], run['_deadline_started'] = 'preparation', time.monotonic()
             self.store.phase(run["id"], "preparation")
 
     def process(self, run):
         from .process import operation_cancellation
+        run['_deadline_started'] = time.monotonic()
+        run['_deadline_stage'] = 'preparation'
         with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
             return self._process(run)
 
@@ -1242,6 +1415,7 @@ class Runtime(Maintenance):
                 return
             if self.is_cancelled(run):
                 raise Cancelled("Cancelled before delivery")
+            self.queue_postprocess(run)
             transitioned = self.store.transition(run["id"], "awaiting_approval", outcome, True)
             # transition 的 True 表示已写入；暂停/取消可能在事务内改为停止终态。
             if not transitioned or self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] != "awaiting_approval":
@@ -1261,15 +1435,14 @@ class Runtime(Maintenance):
                                                  "effort": call["effort"], "signature": self.model_center.signature(provider),
                                                  "at": time.time(), "base": base}
                 self.store.put_setting("task-proof-current:" + project["id"], task_proofs)
-            if config["delivery"]["mode"] == "pr" and self.config(project["id"])["delivery"]["mode"] == "pr":
-                self.deliver(run["id"], automatic=True)
-            self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
-                               (uid(), project["id"], task["id"], "observation", encode([task["title"]]),
-                                result["summary"], encode({"run": run["id"], "base": base}), time.time() + 30 * 86400, time.time()))
-            self.monitor_strategy(project["id"], True, run)
-            self.maybe_evolve(project["id"], config)
+            self.drain_postprocess(run['id'])
         except Cancelled as exc:
-            self.store.transition(run["id"], "interrupted", {"reason": str(exc)}, True)
+            if run.get('_timed_out_stage') and not self.stop.is_set():
+                stage = run['_timed_out_stage']
+                self.store.transition(run['id'], 'blocked', {'reason': 'Stage deadline exceeded',
+                    'failure': {'code': 'deadline', 'action': 'inspect_details', 'stage': stage}}, True)
+            else:
+                self.store.transition(run["id"], "interrupted", {"reason": str(exc)}, True)
         except Exception as exc:
             from .recovery import failure
             problem = failure(exc)
@@ -1601,7 +1774,26 @@ class Runtime(Maintenance):
         if not repo:
             raise ValueError("No GitHub repository configured")
         from .discovery import sync
-        sync(self, project, config, checked, cancel=(lambda: self.is_cancelled(run)) if run else None)
+        before = {row['id']: row for row in self.store.query(
+            "SELECT id,title,body,evidence FROM tasks WHERE project=? AND source='issue'", (project['id'],))}
+        try:
+            sync(self, project, config, checked, cancel=(lambda: self.is_cancelled(run)) if run else None)
+        finally:
+            import difflib
+            for row in self.store.query("SELECT id,title,body,evidence FROM tasks WHERE project=? AND source='issue'", (project['id'],)):
+                prior = before.get(row['id'])
+                if not prior or (prior['title'], prior['body']) == (row['title'], row['body']):
+                    continue
+                evidence = json.loads(row['evidence'])
+                source = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
+                self.store.event('issue_requirements_diff', 'Synchronized Issue requirements changed', project['id'],
+                    run['id'] if run else None, {'task': row['id'],
+                    'before': {key: prior[key] for key in ('title', 'body', 'evidence')},
+                    'after': {key: row[key] for key in ('title', 'body', 'evidence')},
+                    'source': {key: source.get(key) for key in ('number', 'url', 'updated')},
+                    'observed_at': time.time(), 'authority': 'untrusted_task_data',
+                    'diff': '\n'.join(difflib.unified_diff(prior['body'].splitlines(), row['body'].splitlines(),
+                                                        fromfile='previous', tofile='synchronized', lineterm=''))})
         prs = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
                                   "--json", "number,title,headRefName,url"], timeout=60))
         self.store.put_setting("prs:" + project["id"], prs)

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.auth_sessions import AuthSessions
+from adaptive_rsi.config import fingerprint
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store
 from tests.test_runtime import FakeAgent, fixture, CHECKS
@@ -210,7 +211,6 @@ def main():
             if os.environ.get("RSI_BROWSER_TRIAGE_VISIBILITY"):
                 # 批量初筛决定可见性：新决定直接落库 task_decisions；
                 # 存量 triage-state 键经 reassess 迁移后同样可见。全程无模型调用。
-                from adaptive_rsi.config import fingerprint
                 from adaptive_rsi.gitops import git
                 from adaptive_rsi.store import encode as dump
                 triage_config = runtime.config(project)
@@ -270,6 +270,9 @@ def main():
                                 "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": True},
                                 "candidate": {"pass": True, "tokens": 50, "seconds": 1, "usage_known": True}}
                                for index in range(12)]})
+                ready_plan = {"metric": "fixture_only", "repeats": 4,
+                              "samples": [{"id": "browser-case-" + str(index), "split": "holdout"}
+                                          for index in range(3)]}
                 ready_evidence = json.dumps({
                     "reason": "Paired quality improved without observed regressions; usage recorded separately",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "holdout",
@@ -277,7 +280,9 @@ def main():
                                 "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": False},
                                 "candidate": {"pass": True, "tokens": 1, "seconds": 1, "usage_known": False}}
                                for index in range(12)],
-                    "preregistered_plan": {"sha256": "fixture-plan-hash", "data": {"metric": "fixture_only", "samples": ["browser-case-0"]}},
+                    "preregistered_plan": {"sha256": fingerprint(ready_plan), "data": ready_plan},
+                    "final_review": {"split": "holdout", "purpose": "final_confirmation_only", "fresh": True,
+                                     "cases": [sample["id"] for sample in ready_plan["samples"]]},
                     "dataset": {"version": 1, "manifest": [{"case": "browser-case-0", "tree": "fixture-tree"}]}})
                 exhausted_evidence = json.dumps({
                     "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",

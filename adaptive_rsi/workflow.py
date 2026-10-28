@@ -291,7 +291,13 @@ def improvement(results, acceptance):
         threshold = acceptance.get("contract", {}).get("threshold")
         if not threshold:
             return {"decision": "insufficient_evidence", "kind": kind}
-        def measurements(rows):
+        import statistics
+        contract = acceptance.get("contract", {})
+        repeats = contract.get("repetitions", 1)
+        loads = contract.get("load_conditions", [None])
+        if type(repeats) is not int or not 1 <= repeats <= 100 or not isinstance(loads, list) or not loads or len(loads) > 20:
+            return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_measurement_plan"}
+        def measurements(rows, rule, load):
             values = []
             for row in rows:
                 for line in row.get("stdout", "").splitlines():
@@ -299,19 +305,46 @@ def improvement(results, acceptance):
                         sample = json.loads(line)
                     except ValueError:
                         continue
-                    if isinstance(sample, dict) and sample.get("metric") == threshold["metric"] and sample.get("unit") == threshold["unit"]:
+                    if (isinstance(sample, dict) and sample.get("metric") == rule["metric"]
+                            and sample.get("unit") == rule["unit"] and sample.get("load") == load):
                         value = sample.get("value")
                         if type(value) in [int, float] and math.isfinite(value):
                             values.append(value)
             return values
-        old, new = measurements(before), measurements(after)
-        if len(old) != 1 or len(new) != 1:
-            return {"decision": "insufficient_evidence", "kind": kind, "basis": "one_matching_measurement_required_per_version"}
-        target, tolerance = threshold["target"], threshold["tolerance"]
-        passed = (new[0] <= target + tolerance and old[0] - new[0] > tolerance if threshold["direction"] == "lower"
-                  else new[0] >= target - tolerance and new[0] - old[0] > tolerance)
+        guardrails, estimates, passed = [], [], True
+        rules = [threshold] + contract.get("guardrails", [])
+        for index, rule in enumerate(rules):
+            if (not isinstance(rule, dict) or not rule.get("metric") or not rule.get("unit")
+                    or rule.get("direction") not in ("lower", "higher")
+                    or any(type(rule.get(k)) not in (int, float) or not math.isfinite(rule[k]) for k in ("target", "tolerance"))
+                    or rule["tolerance"] < 0):
+                return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
+            for load in loads:
+                old, new = measurements(before, rule, load), measurements(after, rule, load)
+                if len(old) != repeats or len(new) != repeats:
+                    return {"decision": "insufficient_evidence", "kind": kind,
+                            "basis": "one_matching_measurement_required_per_version" if repeats == 1 else "planned_repeated_measurements_required"}
+                target, tolerance = rule["target"], rule["tolerance"]
+                # Every planned measurement must satisfy the target. Disjoint ranges
+                # conservatively reject gains explainable by observed run noise.
+                lower = rule["direction"] == "lower"
+                within = max(new) <= target + tolerance if lower else min(new) >= target - tolerance
+                gain = (min(old) - max(new) > tolerance if lower else min(new) - max(old) > tolerance)
+                if index:
+                    gain = max(new) <= max(old) + tolerance if lower else min(new) >= min(old) - tolerance
+                good = within and gain
+                passed = passed and good
+                item = {"metric": rule["metric"], "load": load, "passed": good,
+                        "before": statistics.mean(old), "after": statistics.mean(new),
+                        "before_range": [min(old), max(old)], "after_range": [min(new), max(new)],
+                        "before_stdev": statistics.stdev(old) if repeats > 1 else None,
+                        "after_stdev": statistics.stdev(new) if repeats > 1 else None, "samples": repeats}
+                (guardrails if index else estimates).append(item)
         return {"decision": "pass" if passed else "insufficient_evidence", "kind": kind,
-                "before": old[0], "after": new[0], "threshold": threshold, "basis": "independent_benchmark_measurements"}
+                "before": estimates[0]["before"], "after": estimates[0]["after"], "threshold": threshold,
+                "guardrails": guardrails, "uncertainty": estimates,
+                "noise_warning": "One sample cannot characterize noise" if repeats == 1 else "Observed ranges only; no causal or population confidence claim",
+                "basis": "independent_benchmark_measurements"}
     # An unrelated import/setup failure is not evidence of an observed improvement.
     import re
     changed = [i for i, (old, new) in enumerate(zip(before, after)) if not old["passed"] and new["passed"]
@@ -333,6 +366,10 @@ def evidence_contract(task, plan):
     }
     contract = {"kind": kind, "requirements": requirements[kind], "fixed_regression": True,
                 "all_criteria_covered": True, "before_after_required": kind != "refactor"}
+    import copy
+    for field in ("required_test_ids", "check_dependencies"):
+        if field in plan:
+            contract[field] = copy.deepcopy(plan[field])
     if kind == "performance":
         threshold = plan.get("performance_threshold")
         if not isinstance(threshold, dict) or not threshold.get("metric") or not threshold.get("unit") or threshold.get("direction") not in ["lower", "higher"]:
@@ -340,4 +377,8 @@ def evidence_contract(task, plan):
         if any(type(threshold.get(k)) not in [int, float] or not math.isfinite(threshold[k]) for k in ["target", "tolerance"]) or threshold["tolerance"] < 0:
             raise ValueError("Performance threshold must be finite and tolerance nonnegative")
         contract["threshold"] = threshold
+        for name in ("guardrails", "repetitions", "load_conditions"):
+            if name in plan:
+                import copy
+                contract[name] = copy.deepcopy(plan[name])
     return contract

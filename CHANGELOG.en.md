@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+- Add Git-aware paginated search, per-criterion group acceptance with exact preview confirmation, execution-stage deadlines, long-term strategy sentinels, test identities and bounded artifact records, plus segmented log search and explicit view transfer. See the [follow-up notes](docs/validation/audit-followup-20261028.en.md) for product integration and real-environment limits of new interfaces.
+- Restore the desktop project-import deadline, bind installation approval to the exact version and signed asset, and cancel waiting automatic installation when policy is tightened. Formal release entrypoints share one serialization lock to prevent concurrent writes to the same version assets.
+- Fix audited database capacity leaks, backup retention, provider recovery races, archived-task admission and inherited configuration conflicts; strengthen incremental migration checksums and historical retention.
+- Add task revision snapshots, group split/retry lineage, multiple prerequisites and blocking explanations; support safe configuration history undo, multi-endpoint deployment health observation and data compatibility declarations for rollback.
+- Improve desktop update caching, pre-install version revalidation, process identity admission and recovery after update cancellation; refine mobile file diffs, navigation history, bilingual errors and request diagnostics.
+- Separate Python, browser and desktop release verification into parallel jobs, balance full tests using valid historical timings, and add history-query performance budgets, translation syntax checks and audit evidence reconciliation. Incomplete audit items and real-environment acceptance limits remain in the [audit ledger](docs/validation/audit-200-implementation-20261028.json).
+
 ## 0.5.124
 
 <!-- adaptive-rsi-release:0.5.124;base:3fb8cbba3cc857fa110134aa006fafb19dd48215 -->

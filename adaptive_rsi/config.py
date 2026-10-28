@@ -25,6 +25,7 @@ DEFAULTS = {
     },
     "review": {"block_on": "medium"},
     "recovery": {"provider_retry_minutes": 0},
+    "deadlines": {"preparation_seconds": 900, "model_seconds": 3600, "evaluation_seconds": 3600},
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
     "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch", "require_provenance": False},
     "limits": {"daily_calls": 0, "run_calls": 0, "run_seconds": 0,
@@ -82,6 +83,8 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
+    if any(type(value) is not int or not 1 <= value <= 86400 for value in config['deadlines'].values()):
+        raise ValueError('Stage deadlines must be 1..86400 seconds')
     if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
         raise ValueError("provider_retry_minutes must be 0..1440")
     # 旧额度字段仅用于读取历史配置，不再阻断运行；command_seconds 是安全超时而非额度，单独保留。

@@ -106,6 +106,9 @@ jobs:
           - name: 运行时核心
             os: ubuntu-latest
             modules: tests.test_runtime.RuntimeTest
+          - name: 交接审计补齐
+            os: ubuntu-latest
+            modules: tests.test_audit_environment tests.test_audit_evaluation tests.test_audit_evolution tests.test_batch_planning tests.test_cleanup_recovery tests.test_delivery_readiness_audit tests.test_desktop_update_boundaries tests.test_frontend_capabilities tests.test_native_audit_contracts tests.test_runtime_handoff tests.test_storage_acceptance
           - name: 运行时适配与服务
             os: ubuntu-latest
             modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest

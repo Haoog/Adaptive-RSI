@@ -136,11 +136,14 @@ class ValueAndIsolationTest(unittest.TestCase):
                 captured.append(args)
                 return {}
         self.runtime.agent = Capture()
-        self.runtime.invoke("analysis", "Project A", self.repo, {"project": self.project, "id": "test", "config": encode(self.runtime.config(self.project))})
+        self.runtime.pause(self.project, False)
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.invoke("analysis", "Project A", self.repo, run)
         self.assertEqual(set(captured[0][-1]), {str(self.repo), str(self.other)})
         self.assertEqual(captured[0][3], self.project)
         self.assertEqual(self.runtime.memories(self.project, "Project B"), [])
         self.assertEqual(self.runtime.config(self.project_b)["checks"], [])
+        self.store.transition(run["id"], "completed", {}, True)
         with self.assertRaisesRegex(ValueError, "contain"):
             self.runtime.add_project(fixture(self.repo / "nested"))
 

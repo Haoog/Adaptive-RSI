@@ -5,6 +5,266 @@ import threading
 import time
 import zlib
 from pathlib import Path
+import os
+import stat
+import uuid
+
+
+CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiments",
+                 "dependencies", "acceptance-design", "feedback")
+
+
+def preview_cleanup(store, run_id):
+    """Preview only finished, unheld direct run artifacts; never inspect source content."""
+    run = store.one("SELECT * FROM runs WHERE id=?", (run_id,))
+    if (not run or run['ended'] is None or run['state'] not in
+            {'failed', 'cancelled', 'expired', 'rejected', 'obsolete', 'completed', 'verified'} or
+            _cleanup_hold(store, 'legal-hold:' + run_id) or
+            _cleanup_hold(store, 'legal-hold-project:' + run['project']) or
+            store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
+                      "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
+                      (run['project'], run_id))):
+        raise ValueError("Run is active or protected from cleanup")
+    if not run_id or Path(run_id).parts != (run_id,) or run_id in ('.', '..'):
+        raise ValueError("Unsafe cleanup run identifier")
+    directory = store.root / 'runs' / run_id
+    if (not run['path'] or Path(run['path']) != directory or
+            any(path.is_symlink() for path in (directory, *directory.parents))):
+        raise ValueError("Unsafe cleanup run path")
+    objects = []
+    for name in CLEANUP_NAMES:
+        target = directory / name
+        if target.is_symlink():
+            raise ValueError("Unsafe cleanup artifact symlink")
+        if target.exists():
+            info = target.stat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError("Cleanup artifact must be a directory")
+            objects.append({'name': name, 'device': info.st_dev, 'inode': info.st_ino,
+                            'modified_ns': info.st_mtime_ns})
+    return {'run': run_id, 'objects': objects}
+
+
+def _cleanup_hold(store, key):
+    row = store.one('SELECT value FROM settings WHERE key=?', (key,))
+    if row is None:
+        return False
+    try:
+        return json.loads(row['value']) is not False
+    except (ValueError, TypeError):
+        return True
+
+
+def _sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_cleanup_receipt(folder, receipt):
+    """Persist intent before any rename, independently of the SQLite transaction."""
+    temporary = folder / ('.receipt-' + uuid.uuid4().hex)
+    try:
+        with temporary.open('x', encoding='utf-8') as stream:
+            os.chmod(temporary, 0o600)
+            json.dump(receipt, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, folder / 'receipt.json')
+        _sync_directory(folder)
+        _sync_directory(folder.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _cleanup_paths(store, receipt):
+    identifier, run_id = receipt['id'], receipt['run']
+    if (not isinstance(identifier, str) or len(identifier) != 32 or
+            any(c not in '0123456789abcdef' for c in identifier) or
+            not isinstance(run_id, str) or not run_id or
+            Path(run_id).parts != (run_id,) or run_id in ('.', '..')):
+        raise ValueError('Invalid cleanup receipt')
+    directory = store.root / 'runs' / run_id
+    folder = store.root / 'recycle' / identifier
+    if any(p.is_symlink() for p in (directory, *directory.parents, folder, folder.parent)):
+        raise ValueError('Unsafe cleanup recovery path')
+    names = [item['name'] for item in receipt['objects']]
+    if len(set(names)) != len(names) or any(name not in CLEANUP_NAMES for name in names):
+        raise ValueError('Invalid cleanup receipt object')
+    return directory, folder
+
+
+def _rename_cleanup(source, target):
+    """Use the OS no-replace primitive, including for empty destination directories."""
+    import ctypes
+    import sys
+    if sys.platform in ('darwin', 'linux'):
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == 'darwin':
+            result = library.renamex_np(os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
+        else:
+            result = library.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+        if result:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(target))
+    elif os.name == 'nt':
+        os.rename(source, target)  # Windows rename never replaces an existing destination.
+    else:
+        raise OSError('Atomic no-replace cleanup rename unavailable')
+    _sync_directory(source.parent)
+    _sync_directory(target.parent)
+
+
+def _place_cleanup(store, receipt, recycled):
+    directory, folder = _cleanup_paths(store, receipt)
+    source_root, target_root = (directory, folder) if recycled else (folder, directory)
+    for item in receipt['objects']:
+        source, target = source_root / item['name'], target_root / item['name']
+        def matches(path):
+            if path.is_symlink() or not path.is_dir():
+                return False
+            info = path.stat()
+            return (info.st_dev, info.st_ino) == (item['device'], item['inode'])
+        if matches(target):
+            continue
+        if target.exists() or target.is_symlink() or not matches(source):
+            raise ValueError('Cleanup recovery conflicts with current artifacts; receipt retained')
+        _rename_cleanup(source, target)
+    _sync_directory(source_root)
+    _sync_directory(target_root)
+    if not recycled:
+        (folder / 'receipt.json').unlink()
+        _sync_directory(folder)
+        # Unexpected files are preserved, even when the operation is complete.
+        if not any(folder.iterdir()):
+            folder.rmdir()
+        _sync_directory(folder.parent)
+
+
+def _recover_cleanup_locked(store):
+    recycle = store.root / 'recycle'
+    if not recycle.exists():
+        return
+    # A fresh connection avoids stale snapshots and observes the actual commit outcome.
+    db = sqlite3.connect(str(store.path), timeout=15)
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        for folder in sorted(recycle.iterdir()):
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            journal = folder / 'receipt.json'
+            if journal.is_symlink():
+                raise ValueError('Unsafe cleanup disk receipt')
+            if not journal.exists():
+                continue
+            receipt = json.loads(journal.read_text(encoding='utf-8'))
+            if receipt['id'] != folder.name:
+                raise ValueError('Cleanup disk receipt identifier mismatch')
+            row = db.execute('SELECT value FROM settings WHERE key=?',
+                             ('recycle:' + receipt['id'],)).fetchone()
+            if row and json.loads(row[0]) != receipt:
+                raise ValueError('Cleanup disk and database receipts disagree')
+            _place_cleanup(store, receipt, recycled=bool(row))
+    finally:
+        db.rollback()
+        db.close()
+
+
+def _cleanup_lock(store):
+    import contextlib
+    import fcntl
+    @contextlib.contextmanager
+    def locked():
+        recycle = store.root / 'recycle'
+        if any(p.is_symlink() for p in (recycle, *recycle.parents)):
+            raise ValueError('Unsafe recycle directory')
+        recycle.mkdir(mode=0o700, exist_ok=True)
+        _sync_directory(recycle.parent)
+        descriptor = os.open(recycle / '.cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+    return locked()
+
+
+def recover_cleanup(store):
+    """Reconcile interrupted cleanup/undo from durable receipts after restart.
+
+    Database unavailability or path conflicts leave the disk receipt intact for retry.
+    Expiry never discards the only copy of an artifact.
+    """
+    with _cleanup_lock(store):
+        _recover_cleanup_locked(store)
+
+
+def recycle_cleanup(store, preview):
+    """Move finished artifacts with durable intent and commit-outcome reconciliation."""
+    with _cleanup_lock(store):
+        _recover_cleanup_locked(store)
+        try:
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                with store.snapshot():
+                    current = preview_cleanup(store, preview['run'])
+                if current != preview:
+                    raise ValueError('Cleanup preview changed; review again')
+                identifier = uuid.uuid4().hex
+                folder = store.root / 'recycle' / identifier
+                folder.mkdir(mode=0o700)
+                receipt = {**current, 'id': identifier, 'expires': time.time() + 7 * 86400}
+                _write_cleanup_receipt(folder, receipt)
+                _place_cleanup(store, receipt, recycled=True)
+                db.execute('INSERT INTO settings VALUES (?,?)',
+                           ('recycle:' + identifier, json.dumps(receipt)))
+        except BaseException as error:
+            # Includes __exit__/commit failure, whose durable outcome may be unknown.
+            try:
+                _recover_cleanup_locked(store)
+            except BaseException as recovery_error:
+                raise recovery_error from error
+            raise
+    return receipt
+
+
+def undo_cleanup(store, identifier):
+    """Restore a live receipt without overwriting newly generated artifacts."""
+    if not isinstance(identifier, str) or len(identifier) != 32 or any(c not in '0123456789abcdef' for c in identifier):
+        raise ValueError('Invalid cleanup receipt')
+    with _cleanup_lock(store):
+        _recover_cleanup_locked(store)
+        try:
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                row = db.execute('SELECT value FROM settings WHERE key=?', ('recycle:' + identifier,)).fetchone()
+                receipt = json.loads(row['value']) if row else None
+                if not receipt or receipt['expires'] <= time.time():
+                    raise ValueError('Cleanup receipt missing or expired')
+                if receipt['id'] != identifier:
+                    raise ValueError('Invalid cleanup receipt identifier')
+                directory, folder = _cleanup_paths(store, receipt)
+                for item in receipt['objects']:
+                    source = folder / item['name']
+                    if (source.is_symlink() or not source.is_dir() or
+                            (source.stat().st_dev, source.stat().st_ino) != (item['device'], item['inode']) or
+                            (directory / item['name']).exists() or (directory / item['name']).is_symlink()):
+                        raise ValueError('Undo conflicts with current artifacts')
+                # Upgrade receipts made before disk journaling was introduced.
+                _write_cleanup_receipt(folder, receipt)
+                for item in receipt['objects']:
+                    _rename_cleanup(folder / item['name'], directory / item['name'])
+                db.execute('DELETE FROM settings WHERE key=?', ('recycle:' + identifier,))
+        except BaseException as error:
+            try:
+                _recover_cleanup_locked(store)
+            except BaseException as recovery_error:
+                raise recovery_error from error
+            raise
+        _recover_cleanup_locked(store)
+    return {'restored': [item['name'] for item in receipt['objects']], 'run': receipt['run']}
 
 
 class Maintenance:
@@ -33,6 +293,8 @@ class Maintenance:
 
     def maintenance(self):
         import shutil
+        if (self.store.root / 'recycle').exists():
+            recover_cleanup(self.store)
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < 3600:
             return

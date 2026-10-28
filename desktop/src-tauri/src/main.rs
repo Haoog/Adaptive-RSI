@@ -20,6 +20,8 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod native_update;
+#[cfg(test)]
+mod update_boundary_tests;
 mod transport;
 
 #[derive(Clone)]
@@ -993,10 +995,7 @@ async fn native_update(app: tauri::AppHandle, action: String, installation_windo
         "download" => native_update::check(app, true).await,
         "cancel" => { native_update::cancel(&app); Ok(native_update::snapshot(&app)) },
         "install" => {
-            let eligibility = native_update::check(app.clone(), false).await?;
-            if eligibility["state"] != "ready" { return Err("update_not_downloaded".into()); }
-            tauri::async_runtime::spawn_blocking(move || native_update::install(app, installation_window.unwrap_or_else(|| "any".into())))
-                .await.map_err(|_| "update_worker_failed".to_string())??;
+            native_update::install(app, installation_window.unwrap_or_else(|| "any".into())).await?;
             Ok(json!({"state":"restarting"}))
         },
         _ => Err("invalid_update_action".into()),

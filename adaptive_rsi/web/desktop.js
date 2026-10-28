@@ -2,7 +2,7 @@
 if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
- const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.kind==='local'?'local':info.scope;return info;}).catch(error=>{console.warn(error);return null;});
+ const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.scope||'disconnected';return info;}).catch(error=>{console.warn(error);return null;});
  window.RSIDesktop={invoke,ready};
  window.fetch=async(input,options={})=>{
   if(typeof input!=='string'||!input.startsWith('/api/'))return originalFetch(input,options);

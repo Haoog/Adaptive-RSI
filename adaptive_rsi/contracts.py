@@ -6,6 +6,8 @@ CAPABILITIES = {
     "operations": "background operation receipts, progress and safe cancellation",
     "desktop-update-drain": "serialized application replacement after runtime work drains",
     "task-batch": "preview, approval and restore of grouped tasks",
+    "config-history": "read and undo configuration history with revision checks",
+    "config-repair": "explicit repair of invalid project or global settings",
     "config-revisions": "optimistic concurrency for settings changes",
     "state-snapshot": "related state fields read from one database snapshot",
     "documented-state": "JSON schema for the state response",

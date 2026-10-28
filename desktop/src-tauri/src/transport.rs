@@ -68,16 +68,24 @@ impl Drop for Lease<'_> {
     fn drop(&mut self) { self.control.requests.lock().unwrap().remove(&self.id); }
 }
 
+pub(super) fn request_timeout(path: &str) -> Duration {
+    Duration::from_secs(match path.split('?').next() {
+        Some("model-center/probe") => 960,
+        Some("projects/import") => 210,
+        _ => 60,
+    })
+}
+
 async fn call(target: &Target, path: &str, body: Option<Value>) -> Result<(Reply, Option<(String, String)>), String> {
     if !valid_api_path(path) { return Err("Invalid API path".into()); }
     let rotating = path.split('?').next() == Some("session/rotate") && body.is_some();
-    let timeout = if path.split('?').next() == Some("model-center/probe") { 960 } else { 60 };
+    let timeout = request_timeout(path);
     let url = format!("{}/api/{}", target.origin, path);
     let mut request = if let Some(data) = body {
         target.transport.0.post(url).json(&data).header("Origin", &target.csrf_origin).header("X-RSI-CSRF", &target.csrf)
     } else { target.transport.0.get(url) };
     if let Some(cookie) = &target.cookie { request = request.header("Cookie", cookie); }
-    let mut response = request.timeout(Duration::from_secs(timeout)).send().await
+    let mut response = request.timeout(timeout).send().await
         .map_err(|_| "Cannot connect to the selected runtime")?;
     let status = response.status().as_u16();
     let cookie = if rotating { response.cookies().find(|cookie| {

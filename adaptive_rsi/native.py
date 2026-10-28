@@ -2,6 +2,7 @@
 import json
 import hashlib
 import contextlib
+import fnmatch
 import concurrent.futures
 import http.client
 import os
@@ -15,6 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 from .agent import SCHEMAS, TEXT, model_capabilities, object_schema, validate_output
 from .config import relative_path
@@ -24,6 +26,9 @@ from .process import Cancelled, Sandbox, scrub_tree
 
 
 class ProviderUnavailable(ModelFailure):
+    request_outcome = "unknown"
+    possibly_billed = True
+    retry_may_duplicate = True
     def __init__(self, message, code=None):
         # Preserve compatibility for callers supplying legacy provider diagnostics.
         super().__init__(message, code or provider_text_code(message))
@@ -39,6 +44,8 @@ class ProviderInterrupted(ModelFailure):
         self.retry_after = getattr(cause, "retry_after", 0)
         self.provider_id = getattr(cause, "provider_id", None)
         self.provider_request_id = getattr(cause, "provider_request_id", None)
+        for field in ("request_outcome", "possibly_billed", "retry_may_duplicate"):
+            setattr(self, field, getattr(cause, field, "unknown" if field == "request_outcome" else True))
 
 
 def response_stop_reason(protocol, response):
@@ -129,6 +136,8 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
                        if envelope.get("unavailable") else
                        ModelFailure(envelope.get("error", "Model failure"), envelope.get("code")))
             problem.retry_after = envelope.get("retry_after", 0)
+            for field, default in (("request_outcome", "unknown"), ("possibly_billed", True), ("retry_may_duplicate", True)):
+                setattr(problem, field, envelope.get(field, default))
             problem.provider_request_id = provider_request_id({"x-request-id": envelope.get("request_id")})
             stop_reason = envelope.get("stop_reason")
             if isinstance(stop_reason, str) and stop_reason in {"output_limit", "safety", "refusal", "paused", "stop_sequence", "text_only", "unknown"}:
@@ -169,6 +178,10 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
         if exc.code in [404, 429, 502, 503, 504]:
             problem = ProviderUnavailable(error, problem.code)
         problem.provider_request_id = provider_request_id(exc.headers)
+        outcome = "rejected" if exc.code in (400, 401, 403, 404, 429) else "unknown"
+        setattr(problem, "request_outcome", outcome)
+        setattr(problem, "possibly_billed", outcome == "unknown")
+        setattr(problem, "retry_may_duplicate", outcome == "unknown")
         from email.utils import parsedate_to_datetime
         retry = exc.headers.get("Retry-After", "") if exc.headers else ""
         try:
@@ -193,6 +206,10 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
         reason = getattr(exc, "reason", exc)
         code = "timeout" if isinstance(reason, TimeoutError) else "connection"
         problem = ProviderUnavailable("Model API connection failed or timed out", code)
+        if isinstance(reason, ConnectionRefusedError):
+            problem.request_outcome = "not_sent"
+            problem.possibly_billed = False
+            problem.retry_may_duplicate = False
         problem.provider_request_id = request_id
         raise problem from None
     except ValueError:
@@ -204,11 +221,16 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
 def tools_for(role):
     if role == "probe":
         return [("finish", "Return summary RSI_OK to test structured tool output.", SCHEMAS[role])]
+    listing = object_schema({})
+    listing["properties"].update(offset={"type": "integer"}, limit={"type": "integer"})
+    searching = object_schema({"text": TEXT})
+    searching["properties"].update(path=TEXT, case_sensitive={"type": "boolean"}, regex={"type": "boolean"},
+                                   cursor=TEXT, limit={"type": "integer"})
     tools = [
-        ("list_files", "List tracked and new source files in the snapshot, excluding internal metadata.", object_schema({})),
+        ("list_files", "List source files with optional offset and limit (1..1000); inspect truncation metadata.", listing),
         ("read_file", "Read at most 500 lines. Paths must be relative to this snapshot.", object_schema({
             "path": TEXT, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}})),
-        ("search", "Find literal text in source files. Results are bounded.", object_schema({"text": TEXT})),
+        ("search", "Find text with optional path glob, case_sensitive, regex, limit (1..100), and continuation cursor. Regex has a per-file time limit.", searching),
     ]
     if role == "implementation":
         tools += [
@@ -221,6 +243,7 @@ def tools_for(role):
 
 
 class WorkspaceTools:
+    cancel: Optional[Callable[[], bool]]
     def __init__(self, workspace, role, state, config, cancel, protected):
         self.workspace = Path(workspace).resolve()
         self.role, self.state, self.config = role, state, config
@@ -230,6 +253,7 @@ class WorkspaceTools:
         self._text_cache = {}
         self._text_cache_bytes = 0
         self.files_truncated = False
+        self.index_source = "filesystem_fallback"
         self.scope = None
         self.deadline = None
 
@@ -323,6 +347,41 @@ class WorkspaceTools:
     def files(self):
         if self._file_cache is not None:
             return self._file_cache
+        # Let Git interpret nested negations and tracked-file exceptions. Bound
+        # subprocess output and time; never silently use a truncated Git listing.
+        if (self.workspace / ".git").exists():
+            from .process import run_process
+            command = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=" + os.devnull,
+                       "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+            ignore = self.workspace / ".rsiignore"
+            if ignore.is_file() and not ignore.is_symlink():
+                command.append("--exclude-from=.rsiignore")
+            outcome = run_process(command, cwd=self.workspace, timeout=min(10, self.remaining()),
+                                  cancel=self.cancel, output_mb=4,
+                                  env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+            if not outcome["error"] and not outcome["exit_code"]:
+                self.index_source = "git"
+                result = []
+                for name in sorted(set(outcome["stdout"].split("\0"))):
+                    self.check_cancelled()
+                    if not name:
+                        continue
+                    try:
+                        path = self.path(name)
+                        if any((self.workspace.joinpath(*Path(name).parts[:i])).is_symlink()
+                               for i in range(1, len(Path(name).parts) + 1)):
+                            continue
+                        if not path.is_file():
+                            continue
+                    except (ValueError, OSError):
+                        continue
+                    if len(result) >= 4000:
+                        self.files_truncated = True
+                        break
+                    result.append(name)
+                self._file_cache = result
+                return result
+            self.index_source = "filesystem_fallback_git_unavailable"
         result = []
         for root, dirs, files in os.walk(self.workspace, followlinks=False):
             self.check_cancelled()
@@ -333,26 +392,67 @@ class WorkspaceTools:
                 if path.is_file() and not path.is_symlink() and not name.startswith(".rsi-"):
                     if len(result) >= 4000:
                         self.files_truncated = True
-                        self._file_cache = result
-                        return result
+                        self._file_cache = sorted(result)
+                        return self._file_cache
                     result.append(path.relative_to(self.workspace).as_posix())
-        self._file_cache = result
-        return result
+        self._file_cache = sorted(result)
+        return self._file_cache
 
     def search(self, args):
         if not args["text"] or len(args["text"]) > 1000:
             raise ValueError("Search requires 1..1000 characters")
         result = []
+        limit = args.get("limit", 100)
+        if not 1 <= limit <= 100:
+            raise ValueError("Search limit must be 1..100")
+        glob = args.get("path", "*")
+        if len(glob) > 1000 or glob.startswith("/") or ".." in Path(glob).parts:
+            raise ValueError("Invalid search path glob")
+        regex = args.get("regex", False)
+        if regex:
+            try:
+                re.compile(args["text"])
+            except re.error:
+                raise ValueError("Invalid regular expression") from None
+        signature = hashlib.sha256(json.dumps([args["text"], glob, args.get("case_sensitive", True), regex]).encode()).hexdigest()
+        start_file, start_line = "", 1
+        if args.get("cursor"):
+            try:
+                sig, start_file, start_line = json.loads(args["cursor"])
+                if sig != signature or not isinstance(start_file, str) or type(start_line) is not int or start_line < 1:
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ValueError("Invalid search cursor") from None
+        skipped = 0
+        output_bytes = 0
+        def add_match(file, number, text):
+            nonlocal output_bytes
+            row = {"path": file, "line": number, "text": text[:1000]}
+            size = len(json.dumps(row).encode())
+            if output_bytes + size > 96000:
+                return False
+            result.append(row)
+            output_bytes += size
+            return True
+        def page(reason=None, file=None, line=1):
+            return {"matches": result, "truncated": reason is not None or self.files_truncated or skipped > 0,
+                    "reason": reason or ("file limit" if self.files_truncated else "unreadable or oversized files" if skipped else None),
+                    "limit": limit, "skipped_files": skipped, "index_source": self.index_source,
+                    "next_cursor": json.dumps([signature, file, line]) if file else None}
+        needle = args["text"] if args.get("case_sensitive", True) else args["text"].casefold()
         remaining = 12 * 1024 * 1024
         try:
             for file in self.files():
                 self.check_cancelled()
+                if file < start_file or not fnmatch.fnmatchcase(file, glob):
+                    continue
                 path = self.path(file)
                 if path.stat().st_size > 1024 * 1024:
+                    skipped += 1
                     continue
                 try:
                     if remaining < path.stat().st_size:
-                        return {"matches": result, "truncated": True, "reason": "search byte limit"}
+                        return page("search byte limit", file)
                     text = self._text_cache.get(file)
                     if text is None:
                         text = self.read_source(path, 1024 * 1024)
@@ -363,21 +463,42 @@ class WorkspaceTools:
                     remaining -= len(text.encode("utf-8"))
                     lines = text.splitlines()
                 except (UnicodeError, ValueError, OSError):
+                    skipped += 1
+                    continue
+                if regex:
+                    from .process import run_process
+                    argv = ([sys.executable, "internal-native-transport"] if getattr(sys, "frozen", False) else
+                            [sys.executable, "-m", "adaptive_rsi.native_transport"])
+                    outcome = run_process(argv,
+                                          cwd=Path(__file__).resolve().parents[1], timeout=min(2, self.remaining()), cancel=self.cancel,
+                                          output_mb=1, input_data=json.dumps({"operation": "regex_search", "arguments": [args["text"], args.get("case_sensitive", True),
+                                                                            lines, start_line if file == start_file else 1,
+                                                                            limit - len(result)]}).encode())
+                    if outcome["error"] or outcome["exit_code"]:
+                        return page("regex time limit" if outcome.get("error_kind") == "timeout" else "regex worker failure", file)
+                    found = json.loads(outcome["stdout"])
+                    for i in found["lines"]:
+                        if not add_match(file, i, lines[i - 1]):
+                            return page("result byte limit", file, i)
+                    if found["next_line"] is not None:
+                        return page("match limit", file, found["next_line"])
                     continue
                 for i, line in enumerate(lines, 1):
+                    if file == start_file and i < start_line:
+                        continue
                     if i % 256 == 0:
                         self.check_cancelled()
-                    if args["text"] in line:
-                        result.append({"path": file, "line": i, "text": line[:1000]})
-                        if len(result) >= 100:
-                            return {"matches": result, "truncated": True, "reason": "match limit", "limit": 100}
-            return {"matches": result, "truncated": self.files_truncated,
-                    "reason": "file limit" if self.files_truncated else None, "limit": 100}
+                    if needle in (line if args.get("case_sensitive", True) else line.casefold()):
+                        if len(result) >= limit:
+                            return page("match limit", file, i)
+                        if not add_match(file, i, line):
+                            return page("result byte limit", file, i)
+            return page()
         except Cancelled as exc:
             exc.partial_results = [{"path": row["path"], "line": row["line"]} for row in result[:100]]
             raise
 
-    def execute(self, name, args):
+    def execute(self, name, args) -> Any:
         self.remaining()
         if self.cancel and self.cancel():
             raise Cancelled("Cancelled before model tool execution")
@@ -390,7 +511,15 @@ class WorkspaceTools:
             raise ArgumentsError("Tool arguments failed schema validation: " + str(exc)) from None
         if name == "list_files":
             files = self.files()
-            return {"files": files, "truncated": self.files_truncated, "limit": 4000}
+            offset, limit = args.get("offset", 0), args.get("limit", 1000)
+            if offset < 0 or not 1 <= limit <= 1000:
+                raise ValueError("Invalid file pagination")
+            following = offset + limit if offset + limit < len(files) else None
+            return {"files": files[offset:offset + limit], "truncated": following is not None or self.files_truncated,
+                    "limit": limit, "offset": offset, "next_offset": following,
+                    "reason": "page limit" if following is not None else "file limit" if self.files_truncated else None,
+                    "index_truncated": self.files_truncated, "index_source": self.index_source,
+                    "ignore_rules_applied": self.index_source == "git"}
         if name == "read_file":
             start, end = args["start_line"], args["end_line"]
             if not 1 <= start <= end <= start + 499:
@@ -473,6 +602,7 @@ def execute_tools(tools, calls):
                                     tools.cancel, tools.protected)
             worker.deadline, worker.scope = tools.deadline, tools.scope
             worker._file_cache = tools._file_cache
+            worker.files_truncated, worker.index_source = tools.files_truncated, tools.index_source
         callback = getattr(tools, "trace", None)
         def trace(detail):
             if callback:
@@ -586,12 +716,21 @@ class Conversation:
     def receive(self, response):
         if not isinstance(response, dict):
             raise RuntimeError("Model API response must be an object")
+        before = list(self.history)
         try:
             from .usage import native_usage
             details = native_usage(self.protocol, response)
-            return self._receive(response), details["tokens"] if details else 0
+            calls = self._receive(response)
+            for call_id, name, _ in calls:
+                if not isinstance(call_id, str) or not call_id or len(call_id) > 1024 or not isinstance(name, str) or not name:
+                    raise ValueError("Invalid tool identity")
+            return calls, details["tokens"] if details else 0
         except (KeyError, IndexError, TypeError, AttributeError, ValueError):
+            self.history = before
             raise RuntimeError("Model API returned an invalid tool response structure") from None
+        except RuntimeError:
+            self.history = before
+            raise
 
     def _receive(self, response):
         p = self.protocol
@@ -752,6 +891,9 @@ class NativeAgent:
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             except ProviderUnavailable as exc:
+                self.store.event("model_transport", "Model request retry safety", project, run,
+                                 {"call": call, "request_outcome": exc.request_outcome,
+                                  "possibly_billed": exc.possibly_billed, "retry_may_duplicate": exc.retry_may_duplicate})
                 if getattr(exc, "provider_request_id", None):
                     self.store.event("model_response", "Model provider request failed", project, run,
                                      {"call": call, "provider_request_id": exc.provider_request_id})

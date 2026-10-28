@@ -20,7 +20,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: adaptive-rsi-release-${{ (github.event_name == 'push' || inputs.prepare_release) && 'prepare' || 'publish' }}
+  group: adaptive-rsi-release
   cancel-in-progress: false
 jobs:
   prepare:

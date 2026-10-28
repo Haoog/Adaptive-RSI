@@ -27,7 +27,15 @@ class ApiRejected(RuntimeError):
         self.status = status
 
 
+_API_BACKOFF = {}
+
+
 def api(repo, endpoint, method="GET", fields=None):
+    # Never sleep in the scheduler or automatically replay a write. All callers
+    # of this transport share the primary/secondary limit cooldown.
+    retry_at = _API_BACKOFF.get("github.com", 0)
+    if time.monotonic() < retry_at:
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429)
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -36,6 +44,9 @@ def api(repo, endpoint, method="GET", fields=None):
         output = checked(argv)
     except RuntimeError as exc:
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
+        if status and (int(status[1]) == 429 or int(status[1]) == 403 and
+                       any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
+            _API_BACKOFF["github.com"] = time.monotonic() + 60
         if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
             raise ApiRejected(str(exc), int(status[1])) from exc
         raise
@@ -259,7 +270,13 @@ def find_remote(repo, data):
         if len(runs) < 100:
             break
     if len(found) > 1:
-        raise ValueError("Multiple workflow runs match one operation; inspect GitHub before retrying")
+        data["reconciliation"] = {"state": "manual_inspection_required",
+                                  "candidate_run_ids": [item["id"] for item in found],
+                                  "checked_at": time.time(), "redispatch_allowed": False}
+        return None
+    data["reconciliation"] = {"state": "matched" if found else "awaiting_remote_visibility",
+                              "candidate_run_ids": [item["id"] for item in found],
+                              "checked_at": time.time(), "redispatch_allowed": False}
     return found[0] if found else None
 
 
@@ -280,6 +297,20 @@ def reconcile(runtime, run, kind, data, persist=True):
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
+    from datetime import datetime
+    def timestamp(name):
+        try:
+            return datetime.fromisoformat(remote[name].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+            return None
+    created, started = timestamp("created_at"), timestamp("run_started_at")
+    finished = timestamp("updated_at") if remote.get("status") == "completed" else None
+    data["timing"] = {"created_at": remote.get("created_at"), "started_at": remote.get("run_started_at"),
+                      "completed_at": remote.get("updated_at") if finished is not None else None,
+                      "completed_at_basis": "updated_at" if finished is not None else None,
+                      "queue_seconds": started - created if created is not None and started is not None and started >= created else None,
+                      "execution_seconds": finished - started if started is not None and finished is not None and finished >= started else None,
+                      "build_seconds": None, "reverification_seconds": None}
     data.update(workflow_run_id=remote["id"], url=remote.get("html_url", ""),
                 attempt=remote.get("run_attempt", 1), checked_at=time.time(), conclusion=remote.get("conclusion"))
     if remote.get("status") == "completed":
@@ -590,6 +621,12 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data = {"state": "pending", "repository": repo, "sha": outcome["merged_sha"], "kind": kind,
                             "workflow": policy["workflow"], "ref": policy["ref"], "workflow_sha": policy["sha"],
                             "operation_id": operation, "created_at": time.time(), "attempt": 0}
+                # Persist the exact policy and transmitted input identities. The
+                # workflow's own environment selection is still not observable here.
+                data["authorization"] = {"policy_hash": fingerprint(normalized_policy(kind, policy)),
+                                         "inputs_hash": fingerprint({"rsi_operation_id": data["operation_id"], "rsi_sha": data["sha"]}),
+                                         "health_targets": [url for url in [policy.get("health_url"), *policy.get("health_urls", [])] if url],
+                                         "github_environment": "unknown"}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
                 ownership = ((owner_key(project["id"], repo, policy), expected_owner,

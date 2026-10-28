@@ -27,6 +27,7 @@ FULL_BUILD_FILES = {
     "requirements-build.txt",
     "scripts/package.py",
     "scripts/package_desktop.py",
+    "scripts/sbom.py",
     "scripts/test_updater_signing.py",
 }
 
@@ -153,6 +154,28 @@ def package_desktop(bundle_dir=BUNDLE_DIR, output_dir=OUTPUT_DIR, version=None,
 
 
 def package_updater(bundle_dir, output_dir, version, require_inventory=False):
+    """Validate the entire release set before publishing any of its assets."""
+    if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version):
+        raise ValueError("A stable package version is required")
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    published = []
+    with tempfile.TemporaryDirectory(prefix=".desktop-updater-", dir=output) as directory:
+        staged = Path(directory)
+        feed = _package_updater(bundle_dir, staged, version, require_inventory)
+        try:
+            for asset in sorted(staged.iterdir()):
+                destination = output / asset.name
+                os.link(asset, destination)
+                published.append(destination)
+        except BaseException:
+            for asset in published:
+                asset.unlink()
+            raise
+    return feed
+
+
+def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     """Publish a manifest only when the complete signed updater artifact exists."""
     bundle_dir, output = Path(bundle_dir), Path(output_dir)
     bundles = [p for p in bundle_dir.glob("*.app.tar.gz") if p.is_file() and not p.is_symlink()]
@@ -184,7 +207,7 @@ def package_updater(bundle_dir, output_dir, version, require_inventory=False):
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
-        "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(os.environ["SOURCE_DATE_EPOCH"]) if "SOURCE_DATE_EPOCH" in os.environ else None)),
                      "component": {"type": "application", "name": "adaptive-rsi", "version": version}},
         "components": [
             {"type": "application", "name": "adaptive-rsi-desktop", "version": version},

@@ -43,8 +43,10 @@ class Operations:
             pending = set(pending)
             for row in rows:
                 if row["id"] not in pending:
-                    db.execute("UPDATE operations SET state='interrupted',ended=? WHERE id=? AND ended IS NULL",
-                               (time.time(), row["id"]))
+                    from .store import encode
+                    db.execute("UPDATE operations SET state='interrupted',result=?,ended=? WHERE id=? AND ended IS NULL",
+                               (encode({'outcome': 'unknown', 'reason': 'No durable terminal receipt; inspect effects before retrying'}),
+                                time.time(), row["id"]))
 
     def _save_terminal(self, operation, state, result, ended=None, existing_receipt=False):
         from .store import encode
@@ -91,6 +93,8 @@ class Operations:
         if not isinstance(parameters, dict):
             raise ValueError("Background operation parameters must be an object")
         with self.runtime.dispatch_lock, self.lock:
+            if self.runtime.stop.is_set():
+                raise ValueError('Runtime is shutting down')
             self.runtime.updates.require_ready()
             if len(self.active) >= 4:
                 raise ValueError("Background operations busy")
