@@ -30,6 +30,8 @@ def run(selectors, destination, warn_after=60):
                 receipts = json.loads(failure_path.read_text())
             except (OSError, ValueError):
                 receipts = []
+            if not isinstance(receipts, list):
+                receipts = []
             receipts.append({"attempt": uuid.uuid4().hex, "selector": selector,
                              "failed_tests": [test.id() for test, _ in result.failures + result.errors],
                              "python": platform.python_version(), "platform": platform.platform(),

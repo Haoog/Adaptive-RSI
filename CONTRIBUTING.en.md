@@ -62,3 +62,5 @@ For scheduler, isolation, budget, acceptance, or promotion changes, explain thei
 For bundles and update assets, see [RELEASING.en.md](RELEASING.en.md). Automatic PRs and merging require explicit project authorization and all delivery gates.
 
 Contributions are provided under the repository's MIT license.
+
+Mechanical version PRs take a metadata-only path in ordinary CI only when their six changed files exactly match an independently reconstructed release patch. Any source, workflow, classifier or generator change requires the full ordinary CI path. This removes duplicate source checks; automatic release merge still requires the exact-head full Python, browser, desktop build, smoke and provenance gate in `release-verify.yml`. Timing caches affect worker distribution only. Invalid entries fall back to complete discovery, and cached timings never skip tests.

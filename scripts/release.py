@@ -84,6 +84,18 @@ def bump_files(base, target):
 
 
 def verify_generated(base, head):
+    def modes(revision):
+        result = {}
+        for row in run("git", "ls-tree", "-z", revision, "--", *RELEASE_FILES).split("\0"):
+            if row:
+                attributes, path = row.split("\t", 1)
+                mode, kind, _ = attributes.split()
+                result[path] = (mode, kind)
+        return result
+    before, after = modes(base), modes(head)
+    if (set(before) != set(RELEASE_FILES) or before != after or
+            any(kind != "blob" or mode not in ("100644", "100755") for mode, kind in before.values())):
+        raise ValueError("Release PR changes a file type or executable mode")
     target = get_version(read_at(head, "adaptive_rsi/__init__.py"))
     expected = bump_files(base, target)
     changed = set(run("git", "diff", "--name-only", base, head).splitlines())

@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 81 implemented with targeted acceptance, 27 partial, and 93 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 82 implemented with targeted acceptance, 26 partial, and 93 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -246,7 +246,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 191. **partial** — Pin remaining build toolchains
 192. **pending** — Test real signed desktop upgrades end to end
 193. **partial** — Expand supported-Python boundary coverage
-194. **partial** — Balance tests using actual module durations
+194. **implemented** — Balance tests using actual module durations
 195. **implemented** — Track flaky failures without hiding them
 196. **implemented** — Extend soak coverage to runtime interactions
 197. **pending** — Inject crashes at side-effect receipt boundaries
@@ -269,3 +269,5 @@ Bounded dependency DAGs (81): nine targeted tests cover diamonds, cycles through
 Experiment comparisons and native tools (53/54/55/133/155/160): 13 targeted checks, 120 related Python regressions, 339 Node tests and the Chromium evolution flow pass. Unknown usage and zero baselines remain incomparable; real candidate zeros remain real zeros. Cohorts preserve any observed regression. Real symlink/directory races cannot redirect source access outside the workspace. Search cancellation retains locations; raw arguments/results are excluded from tool events. A real process kill after a write but before the terminal receipt preserves a started step after restart without replay. Review caught and fixed command success being misclassified as failure. Sealed-plan display/export does not replace an offline replay bundle or final holdout independence.
 
 Database observability and evidence relationships (109/114/115/116): nine targeted tests and 108 related regressions pass (two existing environment skips). SQL execution timing excludes pool waiting; timeout waits join declared nearest-rank quantiles. HTTP request IDs and task/run contexts correlate diagnostics without parameters or SQL text. Relationship checks disclose truncation and catch cross-project events; global NULL events remain valid. Bounded stage quarantine preserves complete evidence, including duplicate NULL keys, with transactional rollback. The 50k synthetic-history measurements are in [store metrics](store-metrics-20261028.json); they are local fixture data, not production or CI throughput. Soak checks retain zero borrowed connections and no model calls.
+
+Validation latency (194/201): 57 related regressions pass; five targeted planning tests cover reconstructed release patches, code/extra-file/mode/type contamination, a changed-classifier shell guard, skewed timing allocation, independent selector measurements and bad-cache fallback. Ordinary CI can avoid duplicate functional work for an exact mechanical release-metadata patch. The final exact-head release workflow still requires full Python, browser, desktop build, smoke and provenance before merging. No remote timing improvement is claimed yet. Type/mode changes are now rejected by the shared release validator, following review.

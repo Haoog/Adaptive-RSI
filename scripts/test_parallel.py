@@ -2,6 +2,7 @@
 """Run complete unittest discovery in at most four isolated Python processes."""
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
 from contextlib import ExitStack
 import os
@@ -16,6 +17,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_WORKERS = 4
+
+
+def timing_cache(value):
+    if not isinstance(value, dict):
+        return {}
+    return {name: seconds for name, seconds in value.items() if isinstance(name, str) and
+            type(seconds) in (int, float) and 0 < seconds <= 86400 and math.isfinite(seconds)}
 
 
 def test_ids(suite):
@@ -45,7 +53,8 @@ def discover_groups(root=ROOT, workers=MAX_WORKERS, durations=None):
         raise ValueError("Module selectors do not exactly reproduce discovery")
     groups = [[] for _ in range(min(workers, len(modules)))]
     sizes = [0] * len(groups)
-    weights = {name: max(0.01, float((durations or {}).get(name, count))) for name, count in modules.items()}
+    durations = timing_cache(durations)
+    weights = {name: max(0.01, durations.get(name, count)) for name, count in modules.items()}
     for module in sorted(modules, key=lambda name: (-weights[name], name)):
         index = min(range(len(groups)), key=lambda i: (sizes[i], i))
         groups[index].append(module)
@@ -145,7 +154,7 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
     if durations_file and observed:
         target = Path(durations_file)
         try:
-            previous = json.loads(target.read_text())
+            previous = timing_cache(json.loads(target.read_text()))
         except (OSError, ValueError):
             previous = {}
         previous.update(observed)
@@ -156,6 +165,8 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
         try:
             previous = json.loads(target.read_text())
         except (OSError, ValueError):
+            previous = []
+        if not isinstance(previous, list):
             previous = []
         target.write_text(json.dumps((previous + failures)[-2000:], sort_keys=True, indent=2) + "\n")
     return int(failed)
@@ -177,7 +188,10 @@ def main(argv=None):
             raise ValueError("timeout must be 1..86400 seconds")
         durations = {}
         if args.durations and args.durations.is_file():
-            durations = json.loads(args.durations.read_text())
+            try:
+                durations = timing_cache(json.loads(args.durations.read_text()))
+            except (OSError, ValueError):
+                print("Ignoring invalid or unreadable timing cache; full discovery remains required", file=sys.stderr)
         return run_groups(discover_groups(workers=args.workers, durations=durations),
                           timeout=args.timeout, durations_file=args.durations)
     except KeyboardInterrupt:

@@ -2857,12 +2857,14 @@
       },
       "source": "scripts/test_parallel.py",
       "acceptance": "固定不均衡样本能形成更均衡分组，时长记录不受其他模块拖累。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "scripts/test_parallel.py"
+        "scripts/test_parallel.py",
+        "scripts/test_worker.py"
       ],
-      "validation": [],
-      "residual": "Real selector timings recorded; skew-balance acceptance remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
+      ]
     },
     {
       "id": 195,
@@ -2955,10 +2957,16 @@
       },
       "status": "partial",
       "implementation": [
-        ".github/workflows/release-verify.yml"
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/checks.yml",
+        "scripts/classify_changes.py",
+        "scripts/release.py",
+        "scripts/test_parallel.py"
       ],
-      "validation": [],
-      "residual": "Independent release jobs and cached timing implemented; remote timing comparison remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
+      ],
+      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback and strict mechanical-metadata ordinary-CI path implemented. Final exact-head full release verification remains mandatory. Remote timing comparison and final release queue behavior remain unverified."
     }
   ],
   "release_ready": false,
@@ -2973,6 +2981,7 @@
     "ffdca68",
     "7a391e4",
     "7d9d587",
-    "b70ef84"
+    "b70ef84",
+    "a107b9a"
   ]
 }
