@@ -14,10 +14,9 @@ async function openDetail(page, title, filter) {
 }
 
 async function closeDetail(page) {
-  await page.evaluate(() => {
-    const dialog = document.getElementById('detail-dialog');
-    if (dialog && dialog.open) dialog.close();
-  });
+  if (await page.locator('#detail-dialog').evaluate(dialog => dialog.open)) {
+    await page.locator('#detail-dialog .close-dialog').click();
+  }
   await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 10000 });
 }
 
