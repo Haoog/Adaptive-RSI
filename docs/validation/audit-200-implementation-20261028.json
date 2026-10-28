@@ -2617,9 +2617,20 @@
       },
       "source": "adaptive_rsi/release.py",
       "acceptance": "用不兼容迁移测试阻止危险回滚，并给出人工恢复步骤。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation",
+        "python3 -B -m unittest tests.test_release tests.test_backend_hardening",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "New automatic rollback dispatch requires explicit backward_compatible data policy; missing legacy declarations default to manual. Blocked receipts retain maintainer recovery steps. Already-dispatched rollbacks continue reconciliation. Compatibility is a maintainer declaration, not proof that arbitrary migrations are reversible."
     },
     {
       "id": 174,

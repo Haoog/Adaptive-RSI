@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 85 implemented with targeted acceptance, 26 partial, and 90 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 86 implemented with targeted acceptance, 26 partial, and 89 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -225,7 +225,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 170. **pending** — Offer optional authenticated event delivery
 171. **implemented** — Require sustained deployment health
 172. **implemented** — Support bounded multi-target health analysis
-173. **pending** — Declare deployment data compatibility
+173. **implemented** — Declare deployment data compatibility
 174. **pending** — Bind target environments to authorization
 175. **pending** — Break down remote verification time
 176. **pending** — Preview stale remote branch cleanup
@@ -275,3 +275,5 @@ Validation latency (194/201): 57 related regressions pass; five targeted plannin
 Configuration audit and safe undo (112): 9 targeted and 138 related Python checks, the real Chromium history/undo/draft/bilingual flow, and 339 Node checks passed. Both read-only review axes found no remaining confirmed issue. Private snapshots are transactional; ordinary activity projections hide secrets, including legacy raw configuration events. Revision and content checks reject stale undo. Full-scope release readiness remains false.
 
 Deployment observation (171/172): 6 targeted and 122 related Python checks, 339 Node checks and the real Chromium multi-endpoint/consecutive-policy save, reload and bilingual flow passed. Both read-only review axes found no remaining confirmed issue. Total rounds, per-round shared deadline and retained observations are bounded. Forward deployment and rollback use the same consecutive gate and post-probe authorization/ownership checks. These local checks do not attest a real production deployment.
+
+Rollback migration compatibility (173): 9 targeted checks and 60 related release/backend checks passed, along with 339 Node checks and Chromium policy/notes persistence. The first combined run exposed an incomplete test authorization fixture, now corrected and rerun. Both review axes confirmed no remaining issue. Undeclared data compatibility prevents new rollback dispatch and displays manual instructions; already-issued rollback remains tracked.

@@ -152,3 +152,5 @@ Database diagnostics correlate slow query fingerprints with opaque request/task/
 Settings include redacted change history and safe undo. Only the latest change with matching revision and content can be undone; later project or global changes reject stale undo.
 
 Deployment supports consecutive-success gates and multiple health endpoints. A round counts only when every endpoint confirms the same commit; rollout and rollback use the same rules.
+
+Automatic deployment rollback also requires an explicit backward-data-compatibility declaration; otherwise rollback is blocked and maintainer-provided manual recovery steps are shown.

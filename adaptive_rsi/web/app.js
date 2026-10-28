@@ -751,7 +751,7 @@ function fieldValue(node){
 function syncDelivery(){
  const deploying=document.querySelector('[data-path="delivery.deploy.enabled"]')?.checked;
  $('deploy-health-settings').hidden=!deploying;
- for(const path of ['health_url','health_urls','health_attempts','health_consecutive_successes','health_interval_seconds','health_warmup_seconds','automatic_rollback']){const field=document.querySelector('[data-path="delivery.deploy.'+path+'"]');if(field)field.disabled=!deploying||$('config-scope').value!=='project'||!projectId;}
+ for(const path of ['health_url','health_urls','health_attempts','health_consecutive_successes','health_interval_seconds','health_warmup_seconds','automatic_rollback','rollback_data_policy','rollback_recovery_notes']){const field=document.querySelector('[data-path="delivery.deploy.'+path+'"]');if(field)field.disabled=!deploying||$('config-scope').value!=='project'||!projectId;}
  const mode=document.querySelector('[data-path="delivery.mode"]').value,auto=document.querySelector('[data-path="delivery.auto_merge"]').checked;
  $('delivery-choice').value=mode==='pr'?(auto?'auto':'pr'):auto?'custom':'local';
  $('delivery-choice').disabled=$('config-scope').value!=='project'||!projectId;
@@ -1011,7 +1011,7 @@ async function renderReleaseOutcome(node,run,project){
   if(operation.error&&!rerunUnknown)row.append(el('p',t(apiErrors[operation.error]||operation.error),waitingNotice?'muted':'form-error'));
   if(dispatchRejected)row.append(el('p',t('提交未被接受。修复授权或工作流配置后，可以安全重试。'),'muted'));
   if(kind==='deploy'&&operation.state==='workflow_succeeded')row.append(el('p',t('部署工作流已完成，服务健康状态尚未验证。'),'muted'));
-  if(operation.rollback_unavailable)row.append(el('p',t('没有已验证的历史版本可恢复，请人工检查服务。'),'form-error'));
+  if(operation.rollback_unavailable){row.append(el('p',t(operation.rollback_blocked_reason==='data_compatibility'?'未确认数据迁移向后兼容，已阻止自动回滚。请检查迁移和备份，再人工恢复兼容版本。':'没有已验证的历史版本可恢复，请人工检查服务。'),'form-error'));if(operation.rollback_recovery_notes)row.append(el('p',operation.rollback_recovery_notes));}
   if(operation.rollback){const rollback=operation.rollback;row.append(el('p',t('恢复旧版本')+' · '+t(releaseStates[rollback.state]||rollback.state)));}
   if(operation.url&&/^https:\/\/github\.com\//.test(operation.url)){const link=el('a',t('查看 GitHub 工作流'));link.href=operation.url;link.target='_blank';link.rel='noreferrer';row.append(link);}
   if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));

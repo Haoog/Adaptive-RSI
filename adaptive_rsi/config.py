@@ -39,7 +39,8 @@ DEFAULTS = {
                  "release": {"enabled": False, "workflow": "", "ref": "", "sha": ""},
                  "deploy": {"enabled": False, "workflow": "", "ref": "", "sha": "", "health_url": "", "automatic_rollback": False,
                             "health_attempts": 1, "health_interval_seconds": 10, "health_warmup_seconds": 0,
-                            "health_consecutive_successes": 1, "health_urls": []}},
+                            "health_consecutive_successes": 1, "health_urls": [],
+                            "rollback_data_policy": "manual", "rollback_recovery_notes": ""}},
     "checks": [],
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
@@ -210,6 +211,10 @@ def validate(config):
             raise ValueError("Deployment health URL requires HTTPS without credentials, query or fragment")
     if delivery["deploy"]["automatic_rollback"] and not delivery["deploy"]["health_url"]:
         raise ValueError("Automatic deployment rollback requires an explicit health URL")
+    if delivery["deploy"]["rollback_data_policy"] not in ("manual", "backward_compatible"):
+        raise ValueError("Invalid deployment rollback data compatibility policy")
+    if len(delivery["deploy"]["rollback_recovery_notes"]) > 2000:
+        raise ValueError("Deployment rollback recovery notes exceed 2000 characters")
     if (not 1 <= delivery["deploy"]["health_attempts"] <= 10 or
             not 1 <= delivery["deploy"]["health_consecutive_successes"] <= delivery["deploy"]["health_attempts"] or
             not 1 <= delivery["deploy"]["health_interval_seconds"] <= 300 or

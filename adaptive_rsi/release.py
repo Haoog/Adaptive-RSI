@@ -464,6 +464,11 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                 runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
                                           {"sha": data["sha"], "run": run["id"], "health": report})
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
+        if policy.get("rollback_data_policy", "manual") != "backward_compatible":
+            data.update(rollback_unavailable=True, rollback_blocked_reason="data_compatibility",
+                        rollback_recovery_notes=policy.get("rollback_recovery_notes", ""),
+                        error="Automatic rollback requires an explicit backward-compatible data policy; inspect migrations and backups before manually restoring data and deploying a compatible version")
+            return data
         previous = data.get("rollback_target")
         if not previous or previous["sha"] == data["sha"]:
             data["rollback_unavailable"] = True

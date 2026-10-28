@@ -1,6 +1,12 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "回滚时的数据兼容条件": "Data compatibility for rollback",
+ "未声明兼容，仅人工恢复": "Compatibility undeclared; manual recovery only",
+ "确认旧版本可读取迁移后的数据": "Confirm older versions can read migrated data",
+ "人工恢复步骤": "Manual recovery steps",
+ "只有明确确认数据向后兼容时才允许自动回滚；请记录迁移、备份和恢复步骤。": "Automatic rollback requires explicit backward compatibility; document migrations, backups and recovery steps.",
+ "未确认数据迁移向后兼容，已阻止自动回滚。请检查迁移和备份，再人工恢复兼容版本。": "Automatic rollback was blocked because backward data compatibility is unconfirmed. Inspect migrations and backups, then manually restore a compatible version.",
  "其他健康检查地址（每行一个）": "Additional health URLs (one per line)",
  "最多增加 7 个端点；每一轮所有端点必须确认同一完整提交 SHA。": "Add up to seven endpoints; every endpoint must confirm the same full commit SHA in each round.",
  "最多检查轮数": "Maximum health rounds",

@@ -103,3 +103,36 @@ class DeploymentObservationTest(unittest.TestCase):
         with patch('adaptive_rsi.release.health_check', return_value={'healthy': True}) as probe:
             health_sample({'health_url': 'https://app.example/health'}, 'b' * 40)
         probe.assert_called_once_with('https://app.example/health', 'b' * 40)
+
+    def test_undeclared_or_incompatible_migration_never_dispatches_rollback(self):
+        self.data.update(state='health_failed', rollback_target={'sha': 'c' * 40})
+        self.policy.update(automatic_rollback=True, rollback_recovery_notes='Restore the schema backup before deploying the compatible binary.')
+        for policy in ({**self.policy}, {**self.policy, 'rollback_data_policy': 'manual'}):
+            data = json.loads(json.dumps(self.data))
+            with self.subTest(policy=policy), patch('adaptive_rsi.release.api') as dispatch, patch('adaptive_rsi.release.validate_pin') as pin:
+                result = deployment_health(self.runtime, self.project, self.run, data, policy, None)
+            self.assertEqual(result['state'], 'health_failed')
+            self.assertTrue(result['rollback_unavailable'])
+            self.assertEqual(result['rollback_blocked_reason'], 'data_compatibility')
+            self.assertIn('schema backup', result['rollback_recovery_notes'])
+            dispatch.assert_not_called()
+            pin.assert_not_called()
+
+    def test_explicit_compatible_policy_permits_the_authorized_rollback(self):
+        self.data.update(state='health_failed', rollback_target={'sha': 'c' * 40},
+                         workflow='.github/workflows/deploy.yml', ref='trusted', workflow_sha='a' * 40,
+                         operation_id='deployment-operation')
+        self.policy.update(automatic_rollback=True, rollback_data_policy='backward_compatible',
+                           workflow='.github/workflows/deploy.yml', ref='trusted', sha='a' * 40)
+        with patch('adaptive_rsi.release.api') as dispatch, patch('adaptive_rsi.release.validate_pin'), patch(
+                'adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, data, **kwargs: data):
+            result = deployment_health(self.runtime, self.project, self.run, self.data, self.policy, None)
+        self.assertEqual(result['state'], 'rolling_back')
+        self.assertEqual(result['rollback']['sha'], 'c' * 40)
+        dispatch.assert_called_once()
+
+    def test_migration_declaration_and_recovery_notes_are_validated(self):
+        for policy in [{'rollback_data_policy': 'assume_safe'}, {'rollback_recovery_notes': 'x' * 2001}]:
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                validate({'delivery': {'deploy': policy}})
+        self.assertEqual(validate({})['delivery']['deploy']['rollback_data_policy'], 'manual')

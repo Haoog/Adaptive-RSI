@@ -530,7 +530,8 @@ class ReleaseDispatchRejectionTest(unittest.TestCase):
 
     def test_rollback_rejection_is_retryable_without_repeating_ambiguous_dispatch(self):
         deploy = {"enabled": True, "workflow": ".github/workflows/publish.yml", "ref": "trusted-v1", "sha": TRUSTED,
-                  "health_url": "https://service.example/health", "automatic_rollback": True}
+                  "health_url": "https://service.example/health", "automatic_rollback": True,
+                  "rollback_data_policy": "backward_compatible"}
         self.runtime.configure({"delivery": {"deploy": deploy}}, self.project)
         run = self.make_merged_run("Rollback dispatch")
         self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?",

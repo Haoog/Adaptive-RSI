@@ -322,7 +322,8 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertFalse(self.runtime.config(self.project)["delivery"]["auto_merge"])
 
     def setup_deployment(self, rollback=False):
-        deploy = {**self.policy, "health_url": "https://app.example/health", "automatic_rollback": rollback}
+        deploy = {**self.policy, "health_url": "https://app.example/health", "automatic_rollback": rollback,
+                  "rollback_data_policy": "backward_compatible" if rollback else "manual"}
         self.runtime.configure({"delivery": {"release": {"enabled": False}, "deploy": deploy}}, self.project)
         config = self.runtime.config(self.project)
         self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(config), self.run["id"]))

@@ -342,3 +342,5 @@ adaptive-rsi recover-diagnostics /PATH/TO/STATE/state.sqlite3 --timeout 10 --max
 数据库兼容格式仍为 v2。后续维护迁移按实际 SQL 字节保存 SHA-256，并在执行迁移前验证已应用历史；迁移正文变化、未知历史版本或版本缺口会阻止普通启动，原库可用离线诊断检查。SQL 变更与迁移记录同事务提交。原有 1/2 号迁移保留旧标识符校验和，不能据此追溯验证旧引导正文；封存后不再每次启动重复全量回填。该机制没有把旧引导中的事务外建表追溯改成原子迁移。
 
 部署健康策略：`delivery.deploy.health_attempts` 为总轮数（1–10），`health_consecutive_successes` 为要求连续成功轮数（1–总轮数，默认 1），`health_interval_seconds` 为轮次间隔（1–300 秒），`health_warmup_seconds` 为预热（0–900 秒）。`health_url` 是主端点，`health_urls` 最多增加 7 个不同 HTTPS 地址，不允许账号、查询参数或片段。每一轮共享 15 秒总时限，所有端点必须确认目标完整 SHA；失败会清零连续成功计数，耗尽轮数也未满足连续成功要求时判为健康门禁失败。观察记录持久化，重启继续，回滚同样适用。一次健康采样成功不等于连续观察门禁通过。
+
+数据迁移回滚保护：`delivery.deploy.rollback_data_policy` 默认 `manual`，包括升级前没有该字段的配置；仅 `backward_compatible` 表示维护者确认旧程序可以读取已迁移数据。即使开启 `automatic_rollback`，未明确兼容仍会阻止新派发旧版本。`rollback_recovery_notes` 可保存最多 2000 字符的人工恢复步骤；失败详情会显示这些原始说明。请描述数据库备份位置、迁移逆向步骤和兼容程序版本，不要填入凭据。该声明不能代替真实迁移兼容验证；已在远端派发的回滚仍继续核对结果，系统不会假装撤回已发生的副作用。
