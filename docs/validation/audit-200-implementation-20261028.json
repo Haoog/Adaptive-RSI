@@ -2889,9 +2889,19 @@
       },
       "source": "adaptive_rsi/web/app.js",
       "acceptance": "中英文同一错误提供等价指引，未知错误保留可复制诊断 ID。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/error_details.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_error_details tests.test_server_hardening tests.test_backend_hardening tests.test_audit_round4",
+        "node tests/browser_error_details.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Configuration reasons use stable codes and schema-owned field paths; unrecognized exception text is not reflected. Existing nonconfiguration code/generic error handling remains compatible. Unknown and malformed HTTP errors retain a validated request-header ID, copy action and manual fallback. Arbitrary user/server text is not claimed fully translatable."
     },
     {
       "id": 191,

@@ -1,6 +1,27 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "无法自动复制，请手动复制诊断标识。": "Automatic copy is unavailable. Copy this diagnostic ID manually.",
+ "开始和结束时间须不同，开始为 0–23，结束为 1–24。": "Start and end must differ: start is 0\u201323 and end is 1\u201324.",
+ "并行项目数须为 1–4。": "Parallel projects must be 1\u20134.",
+ "仓库须填写 owner/name。": "Enter the repository as owner/name.",
+ "项目调度权重须为 1–10。": "Project scheduling weight must be 1\u201310.",
+ "资源准入门槛须为 0–1048576 MiB，0 表示关闭。": "Resource thresholds must be 0\u20131048576 MiB; 0 disables the check.",
+ "连续成功次数不能超过总检查轮数；请检查轮数、间隔和预热范围。": "Consecutive successes cannot exceed total rounds. Check rounds, interval and warmup limits.",
+ "请保留主检查地址，最多增加 7 个不同的 HTTPS 端点。": "Keep a primary health URL and add up to seven distinct HTTPS endpoints.",
+ "健康检查地址须为 HTTPS，且不含账号、查询参数或片段。": "Health URLs require HTTPS without credentials, query parameters or fragments.",
+ "自动回滚需要主健康检查地址。": "Automatic rollback requires a primary health URL.",
+ "请选择人工恢复或明确确认数据向后兼容。": "Choose manual recovery or explicitly confirm backward data compatibility.",
+ "人工恢复说明不能超过 2000 个字符。": "Manual recovery notes must not exceed 2000 characters.",
+ "设置已在其他页面更新，请核对两份内容后再保存。": "Settings changed in another window. Compare both versions before saving again.",
+ "字段类型不匹配，请检查数字、开关、列表或对象格式。": "The field type does not match. Check number, boolean, list or object formatting.",
+ "数值超出字段允许范围，请检查运行选项。": "The value is outside the allowed field range. Check execution options.",
+ "设置格式或字段无效，请检查配置后重试。": "Settings format or fields are invalid. Check configuration and retry.",
+ "字段": "Field",
+ "诊断标识": "Diagnostic ID",
+ "复制诊断标识": "Copy diagnostic ID",
+ "诊断标识已复制": "Diagnostic ID copied",
+
  "需要人工处理": "Needs manual attention",
  "软件更新中": "Software update in progress",
  "检查时间": "Checked at",

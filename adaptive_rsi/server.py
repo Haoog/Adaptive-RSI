@@ -183,12 +183,17 @@ class Handler(BaseHTTPRequestHandler):
             self.respond({"error": "Request failed: " + code, key: code},
                          409 if code == "auth_credentials_busy" else 400)
         elif isinstance(exc, ValueError) and str(exc) in SAFE_VALIDATION_MESSAGES:
-            self.respond({"error": str(exc), "error_code": "validation_error"}, 400)
+            extra = {}
+            if urlparse(self.path).path in {'/api/config', '/api/model-center/routes'}:
+                from .error_details import detail
+                extra = detail(exc)
+            self.respond({"error": str(exc), "error_code": "validation_error", **extra}, 400)
         elif isinstance(exc, (ValueError, KeyError, TypeError)):
             path = urlparse(self.path).path
             if path in {"/api/config", "/api/model-center/routes"}:
+                from .error_details import detail
                 self.respond({"error": "Check configuration field names, types, model routes and timezone",
-                              "error_code": "invalid_configuration"}, 400)
+                              "error_code": "invalid_configuration", **detail(exc)}, 400)
             else:
                 self.respond({"error": "Invalid request", "error_code": "invalid_request"}, 400)
         else:

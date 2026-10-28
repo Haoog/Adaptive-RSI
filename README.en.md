@@ -162,3 +162,5 @@ Optional disk and memory low-water admission keeps new tasks queued until resour
 Diff reading folds by file and loads content when expanded. Mobile defaults to wrapping; search opens the matching file, and large diffs locate matches using their actual wrapped layout.
 
 Task details can explain why work has not started, showing prerequisite chains, pause, retry time, working hours, global capacity and resource pressure together. Clearing one condition preserves the others.
+
+Configuration validation shows localized stable reasons and safe field paths. Unknown request errors retain a copyable diagnostic ID for log correlation.

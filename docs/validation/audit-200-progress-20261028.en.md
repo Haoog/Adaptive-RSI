@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 92 implemented with targeted acceptance, 26 partial, and 83 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 93 implemented with targeted acceptance, 26 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -242,7 +242,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 187. **implemented** — Optionally synchronize saved views
 188. **implemented** — Preserve focus and limit live announcements
 189. **implemented** — Improve narrow-screen diff reading
-190. **pending** — Localize structured runtime errors
+190. **implemented** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
 192. **implemented** — Test real signed desktop upgrades end to end
 193. **partial** — Expand supported-Python boundary coverage
@@ -289,3 +289,5 @@ History budgets (107): 4 targeted tests passed. The fixed 50000-task/100000-run 
 Structural localization (198): 8 mutation tests, the repository AST check, all 347 Node tests and 12 workflow/planning checks passed. Reviews found and fixed template-expression recursion and loop/switch shadowing omissions. Both axes confirmed no remaining issue within declared static coverage. Acorn is pinned and installed before ordinary and final-release JavaScript checks; Python duplicate-key checks remain. Runtime value propagation and paired-doc semantic equivalence are explicitly outside automated proof.
 
 Blocking causes (184): 7 targeted and 52 related Python checks, the real Chromium chain/refresh/bilingual flow and 347 Node checks passed. Reviews found and fixed a missing global-capacity cause; only counts are exposed. The explanation path avoids update journal/lease recovery and preserves an expired lease in its read-only test. Cycles and truncation remain bounded; clearing one cause retains others. Both review axes confirmed no remaining issue.
+
+Structured errors (190): 3 targeted and 51 related Python checks, all 350 Node tests and Chromium bilingual field guidance/diagnostic-copy passed. Reviews found and fixed a null/scalar error-envelope path that dropped the request ID. Stable configuration reasons expose only schema-owned fields, and unknown HTTP failures retain validated request IDs with copy/manual fallback. Both axes confirmed no remaining issue within scope.

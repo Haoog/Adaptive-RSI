@@ -10,6 +10,28 @@ const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/w
 const usageSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/usage.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
+test('structured configuration reasons use localized guidance and safe schema fields', async()=>{
+  const page=browser();
+  page.context.fetch=async()=>({...response({error:'Generic safe configuration error',error_code:'invalid_configuration',reason_code:'config_field_type',field_path:'limits.concurrency'},400),headers:{get:()=> '0123456789abcdef'}});
+  await assert.rejects(page.context.api('config',{values:{}}),error=>
+    /字段类型不匹配/.test(error.message)&&error.message.includes('limits.concurrency')&&error.requestId==='0123456789abcdef'&&error.reasonCode==='config_field_type');
+});
+test('unknown API errors preserve only valid diagnostic IDs and unsafe field paths are omitted', async()=>{
+  const page=browser();
+  page.context.fetch=async()=>({...response({error:'Unknown safe server failure',error_code:'internal_error',field_path:'<PRIVATE>bad path'},500),headers:{get:()=> '0123456789abcdef'}});
+  await assert.rejects(page.context.api('retry',{task:'task'}),error=>
+    error.message.includes('诊断标识')&&error.message.includes('0123456789abcdef')&&!error.message.includes('PRIVATE')&&error.evidence.request_id==='0123456789abcdef');
+  page.context.fetch=async()=>({...response({error:'Unknown'},500),headers:{get:()=> '<script>not-an-id'}});
+  await assert.rejects(page.context.api('retry',{task:'task'}),error=>error.requestId===null&&!error.message.includes('script'));
+});
+test('malformed error envelopes retain the request ID for diagnostics', async()=>{
+  const page=browser();
+  for(const data of [null,[],42,'unexpected']){
+    page.context.fetch=async()=>({...response(data,500),headers:{get:()=> '0123456789abcdef'}});
+    await assert.rejects(page.context.api('retry',{task:'task'}),error=>
+      error.requestId==='0123456789abcdef'&&error.evidence.code==='invalid_response'&&error.evidence.request_id===error.requestId);
+  }
+});
 async function waitFor(predicate) {
   const deadline = Date.now() + 5000;
   while (!predicate()) {

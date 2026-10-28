@@ -32,6 +32,23 @@ const draftStore=(()=>{
  return{get,set,remove};
 })();
 window.RSIDraftStore=draftStore;
+const configReasonLabels={
+ "config_working_hours": "开始和结束时间须不同，开始为 0–23，结束为 1–24。",
+ "config_concurrency": "并行项目数须为 1–4。",
+ "config_repository": "仓库须填写 owner/name。",
+ "config_weight": "项目调度权重须为 1–10。",
+ "config_resource_threshold": "资源准入门槛须为 0–1048576 MiB，0 表示关闭。",
+ "config_health_observation": "连续成功次数不能超过总检查轮数；请检查轮数、间隔和预热范围。",
+ "config_health_targets": "请保留主检查地址，最多增加 7 个不同的 HTTPS 端点。",
+ "config_health_url": "健康检查地址须为 HTTPS，且不含账号、查询参数或片段。",
+ "config_rollback_health": "自动回滚需要主健康检查地址。",
+ "config_rollback_data": "请选择人工恢复或明确确认数据向后兼容。",
+ "config_rollback_notes": "人工恢复说明不能超过 2000 个字符。",
+ "config_revision_conflict": "设置已在其他页面更新，请核对两份内容后再保存。",
+ "config_field_type": "字段类型不匹配，请检查数字、开关、列表或对象格式。",
+ "config_limit": "数值超出字段允许范围，请检查运行选项。",
+ "config_invalid": "设置格式或字段无效，请检查配置后重试。"
+};
 const apiErrors={
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
@@ -174,17 +191,24 @@ async function sendApi(path,body,signal,{text=false}={}){
  }
  let response;
  try{response=await fetch('/api/'+path,options);}catch(error){throw new TypeError(t('无法连接本地服务。输入已保留，请确认服务仍在运行后重试。'));}
- if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;throw error;}
+ const requestHeader=response.headers?.get?.('X-RSI-Request-ID');
+ const requestId=typeof requestHeader==='string'&&/^[a-f0-9]{16}$/.test(requestHeader)?requestHeader:null;
+ if(response.status===401){const error=Error(t('登录已失效，输入已保留。请从启动入口重新打开控制台，无需重启。'));error.code='session_required';error.status=401;error.requestId=requestId;throw error;}
  if(text&&response.ok)return await response.text();
+ const invalidResponse=()=>{const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;invalid.requestId=requestId;invalid.evidence={status:response.status,code:'invalid_response',request_id:requestId};return invalid;};
  let data;
- try{data=await response.json();}catch(error){const invalid=Error(t('服务返回了无法识别的结果。输入已保留，请稍后重试。'));invalid.status=response.status;throw invalid;}
+ try{data=await response.json();}catch(error){throw invalidResponse();}
+ if(!response.ok&&(!data||typeof data!=='object'||Array.isArray(data)))throw invalidResponse();
  if(!response.ok){
   // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
-  const known=apiErrors[data.error];
-  const message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
+  const known=configReasonLabels[data.reason_code]||apiErrors[data.error];
+  const field=typeof data.field_path==='string'&&/^[a-zA-Z0-9_.]{1,160}$/.test(data.field_path)?data.field_path:null;
+  let message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
+  if(field)message+=' · '+t('字段')+' '+field;
+  if(!known&&requestId)message+=' · '+t('诊断标识')+' '+requestId;
   if(!known&&data.error)console.warn('[adaptive-rsi]',data.error);
   if(data.error_code==='invalid_global_configuration')queueMicrotask(()=>offerGlobalConfigRepair(data.raw));
-  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.evidence={status:response.status,code:error.code,error:data.error};throw error;
+  const error=Error(message);error.code=data.error_code||data.catalog_error;error.status=response.status;error.requestId=requestId;error.reasonCode=data.reason_code;error.evidence={status:response.status,code:error.code,reason_code:data.reason_code,field_path:field,request_id:requestId,error:data.error};throw error;
  }
  if(body!==undefined&&(path==='config'||path==='config/repair'||path.startsWith('model-center/')))readinessCache.clear();
  return data;
@@ -319,7 +343,7 @@ async function safe(fn,form){
   const message=error instanceof SyntaxError?t('JSON 格式有误，请检查逗号、引号和括号；输入已保留。'):error.message;
   if(form&&!feedbackCurrent()){toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);return;}
   if(form){if(!feedback){feedback=el('p',undefined,'form-error');feedback.dataset.formError='';feedback.setAttribute('role','alert');form.append(feedback);}feedback.textContent=message;feedback.hidden=false;}
-  toast(message,true);if(error.evidence&&window.RSIProduct){const evidence=window.RSIProduct.raw(error.evidence,'查看原始诊断');$('toast').append(evidence);}
+  toast(message,true);if(error.requestId){const copy=el('button',t('复制诊断标识'),'text-button');copy.type='button';copy.onclick=async()=>{try{await navigator.clipboard.writeText(error.requestId);toast(t('诊断标识已复制'));}catch{toast(t('无法自动复制，请手动复制诊断标识。')+' '+error.requestId,true);}};$('toast').append(copy);}if(error.evidence&&window.RSIProduct){const evidence=window.RSIProduct.raw(error.evidence,'查看原始诊断');$('toast').append(evidence);}
  }finally{if(form)pendingForms.delete(form);if(submit){submit.disabled=false;submit.textContent=label;}}
 }
 function refreshDelay(){if(document.visibilityState==='hidden')return 60000;return state?.runs?.some(run=>!run.ended)?5000:15000;}
