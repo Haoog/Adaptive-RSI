@@ -605,8 +605,8 @@ async function checkQueueEditor(page, evidence) {
     assert.equal(await page.evaluate(()=>currentProject().paused),1);
     await page.locator('#language-select').selectOption('zh-CN');
     await page.reload();
-    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.waitForFunction(()=>state&&currentProject()?.paused);
+    await page.locator('#view-settings').waitFor();
     assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'UI argv regression renamed');
     assert.deepEqual(await page.locator('#checks-editor fieldset').last().locator('[data-check-arg]').evaluateAll(nodes=>nodes.map(node=>node.value)),['python3','-c','print("argument with spaces")\nprint(2)']);
     // Acknowledging weight=2 must keep a newer weight=1 draft visibly dirty.

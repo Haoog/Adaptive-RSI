@@ -63,7 +63,7 @@ window.RSIExperience = (() => {
     box.showModal();
     return box;
   }
-  async function openTask(task) {
+  async function openTask(task, recordHistory = true) {
     stashSettings();
     stashGoalDraft();
     closeTaskDetail();
@@ -72,7 +72,7 @@ window.RSIExperience = (() => {
     restoreGoalDraft();
     settingsBaseline = null;
     taskOffset = 0;
-    showView("overview");
+    showView("overview", recordHistory);
     const ticket = detailSequence, navigation = navigationSequence;
     const current = () => ticket === detailSequence && navigation === navigationSequence && projectId === task.project;
     await refresh();
@@ -772,7 +772,8 @@ window.RSIExperience = (() => {
     lastDetail = "";
     backoffRetry = null;
     if (location.href && typeof URL === "function") {
-      const route = new URLSearchParams({project: task.project, task: task.id});
+      const route = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+      route.set('project', task.project);route.set('task', task.id);route.set('view', view);
       try {
         const url = new URL(location.href);
         url.hash = route.toString();
@@ -1257,19 +1258,25 @@ window.RSIExperience = (() => {
       if (window.RSIDesktop && event.detail?.task && event.detail?.project)
         safe(() => openTask({id:event.detail.task,project:event.detail.project}));
     });
+    window.addEventListener('rsi-history-task',event=>{
+      if(event.detail?.task&&event.detail?.project)safe(()=>openTask({id:event.detail.task,project:event.detail.project},false));
+    });
     $("attention-inbox").onclick = () => safe(inbox);
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);
     usageButton = action(t("流程质量与耗时"), metrics, "text-button");
     $("view-usage").prepend(usageButton);
-    $("detail-dialog").addEventListener("close", () => {
+    $("detail-dialog").addEventListener("close", event => {
+      if(event.rsiProgrammaticClose)return;
+      if($("detail-dialog").open)return;
       clearTimeout(liveTimer);
-      history.replaceState(null, "", location.pathname + location.search);
+      const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));route.delete('task');
+      history.replaceState(null, "", location.pathname + location.search + (route.size?'#'+route:''));
     });
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
 })();
 
 'use strict';

@@ -91,7 +91,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.waitForTimeout(1650);await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();assert.equal(authStarts,1);
   assert.equal(await code.inputValue(),'keep-my-code');assert(await code.evaluate(node=>document.activeElement===node));
   if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#mc-auth').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/account-sign-in.png'});
-  await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
+  await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
   await page.getByRole('button',{name:'取消登录',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'已取消登录'}).waitFor();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();await code.fill('official-code');await page.getByRole('button',{name:'完成授权',exact:true}).click();
   await page.locator('#mc-auth').filter({hasText:'账号已连接'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/complete')).body.code,'official-code');

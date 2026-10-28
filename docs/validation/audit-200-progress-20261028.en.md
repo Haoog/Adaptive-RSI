@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 93 implemented with targeted acceptance, 26 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 94 implemented with targeted acceptance, 25 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -238,7 +238,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 183. **implemented** — Improve navigation inside diffs
 184. **implemented** — Explain chains of blocking causes
 185. **implemented** — Keep both sides of settings conflicts
-186. **partial** — Preserve meaningful browser navigation history
+186. **implemented** — Preserve meaningful browser navigation history
 187. **implemented** — Optionally synchronize saved views
 188. **implemented** — Preserve focus and limit live announcements
 189. **implemented** — Improve narrow-screen diff reading
@@ -291,3 +291,5 @@ Structural localization (198): 8 mutation tests, the repository AST check, all 3
 Blocking causes (184): 7 targeted and 52 related Python checks, the real Chromium chain/refresh/bilingual flow and 347 Node checks passed. Reviews found and fixed a missing global-capacity cause; only counts are exposed. The explanation path avoids update journal/lease recovery and preserves an expired lease in its read-only test. Cycles and truncation remain bounded; clearing one cause retains others. Both review axes confirmed no remaining issue.
 
 Structured errors (190): 3 targeted and 51 related Python checks, all 350 Node tests and Chromium bilingual field guidance/diagnostic-copy passed. Reviews found and fixed a null/scalar error-envelope path that dropped the request ID. Stable configuration reasons expose only schema-owned fields, and unknown HTTP failures retain validated request IDs with copy/manual fallback. Both axes confirmed no remaining issue within scope.
+
+Navigation history (186): real Chromium covers first-action project switch/reload/back, three back/forward steps, view reload, retained drafts, notification task restore and old-close/notification races with a delayed state response. Button, Escape and backdrop use the same close path. Both axes confirmed no remaining issue; all 351 Node tests passed. The broader 33-group browser run had 32 passes and one delivery-copy regression; its generic-reason priority was corrected and the failing delivery group rerun successfully. This is not a new final full-release CI attestation. The prior full Python run had three assertions caused by a config test stub missing the source keyword; that module was corrected and its 16 tests rerun successfully.

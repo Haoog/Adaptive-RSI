@@ -32,6 +32,11 @@ test('malformed error envelopes retain the request ID for diagnostics', async()=
       error.requestId==='0123456789abcdef'&&error.evidence.code==='invalid_response'&&error.evidence.request_id===error.requestId);
   }
 });
+test('a generic structured reason preserves existing specific safe guidance',async()=>{
+  const page=browser();
+  page.context.fetch=async()=>response({error:"Automation requires the trusted workflow tag's full commit SHA",error_code:'validation_error',reason_code:'config_invalid',field_path:null},400);
+  await assert.rejects(page.context.api('config',{values:{}}),error=>error.message.includes('小写'));
+});
 async function waitFor(predicate) {
   const deadline = Date.now() + 5000;
   while (!predicate()) {
@@ -68,7 +73,7 @@ function browser(savedSession = new Map()) {
       hasAttribute(name) { return Object.hasOwn(this.attributes, name) || name==='data-unit-for' && !!this.dataset.unitFor; },
       focus() {}, scrollIntoView() {},
       showModal() { this.open = true; },
-      close() { this.open = false; this.handlers.close?.(); }
+      close() { this.open = false; this.handlers.close?.({target:this}); }
     });
     return nodes.get(id);
   };

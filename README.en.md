@@ -164,3 +164,5 @@ Diff reading folds by file and loads content when expanded. Mobile defaults to w
 Task details can explain why work has not started, showing prerequisite chains, pause, retry time, working hours, global capacity and resource pressure together. Clearing one condition preserves the others.
 
 Configuration validation shows localized stable reasons and safe field paths. Unknown request errors retain a copyable diagnostic ID for log correlation.
+
+Project and page navigation enter browser history. Back, forward and reload retain the selected project; notification task details can be restored through history, and closing details preserves project and page context.

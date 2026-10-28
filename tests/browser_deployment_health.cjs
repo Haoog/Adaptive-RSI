@@ -42,7 +42,7 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('[data-path="delivery.deploy.rollback_data_policy"]').inputValue(), 'backward_compatible');
     assert.equal(await page.locator('[data-path="delivery.deploy.rollback_recovery_notes"]').inputValue(), 'Inspect schema backup; restore a compatible version.');
     await page.getByText('Required consecutive successful rounds',{exact:true}).waitFor();
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').waitFor();
     await page.locator('#project-settings').click();
     assert.equal(await additional.inputValue(), 'https://eu.example/health\nhttps://us.example/health');

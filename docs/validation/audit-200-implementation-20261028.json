@@ -2830,12 +2830,18 @@
       },
       "source": "adaptive_rsi/web/app.js",
       "acceptance": "连续跨项目浏览后前进后退准确，刷新和通知跳转兼容。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/web/app.js"
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js"
       ],
-      "validation": [],
-      "residual": "History and project URL synchronization implemented; back/forward test remains."
+      "validation": [
+        "node tests/browser_navigation_history.cjs",
+        "node tests/browser_experience.cjs",
+        "node tests/browser_notifications.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Cross-project view history replays without pushes. Initial hashless entries retain their original project across reload/back. Task route close preserves project/view; programmatic/button/Escape/backdrop close events do not cancel a newer notification open. Real Chromium covers delayed state responses, repeated back/forward, reload and retained drafts with zero task writes."
     },
     {
       "id": 187,

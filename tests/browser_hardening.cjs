@@ -189,7 +189,7 @@ async function checkRouteSaveRace(browser,url,errors) {
     await page.unroute('**/api/model-center/routes');
     await page.locator('#mc-save-routes').click();
     await page.locator('#mc-dirty').filter({hasText:'模型分工已保存'}).waitFor();
-    await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
     assert.equal(await effort.inputValue(),original);
   }finally{release();await page.close();}
 }
@@ -341,7 +341,7 @@ async function checkPendingSettingsDraft(browser, url, errors) {
         assert.ok(draft, JSON.stringify({scenario, original, submitted, posts, baseline: await weight.inputValue(), storage: await page.evaluate(() => sessionStorage.getItem('rsi-ui-drafts'))}));
         const saved = draft.values.find(entry => entry.path === 'schedule.weight');
         assert.equal(saved.value, original); assert.equal(saved.baselineValue, Number(submitted));
-        await page.reload(); await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+        await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click(); await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
         await page.locator('#project-settings').click();
         if (global) await page.locator('[data-settings-scope="global"]').click();
         await page.locator('#advanced-settings > summary').click();
@@ -366,7 +366,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.goto(url);
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('#goal-text').fill('Unsubmitted browser goal draft');
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'Unsubmitted browser goal draft');
 
@@ -389,7 +389,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#mc-input-key').fill(secret);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('BROWSER-SECRET-MUST-NOT-PERSIST')||false),false);
 
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'Unsubmitted browser goal draft');
     await page.locator('#project-settings').click();
@@ -408,7 +408,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#goal-form button[type="submit"]').click();
     assert.equal((await saved).status(),200);
     await page.waitForFunction(()=>document.getElementById('goal-text').value==='');
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'');
   }finally{await page.close();}

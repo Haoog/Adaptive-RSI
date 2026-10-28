@@ -201,7 +201,8 @@ async function sendApi(path,body,signal,{text=false}={}){
  if(!response.ok&&(!data||typeof data!=='object'||Array.isArray(data)))throw invalidResponse();
  if(!response.ok){
   // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
-  const known=configReasonLabels[data.reason_code]||apiErrors[data.error];
+  const structured=data.reason_code==='config_invalid'?null:configReasonLabels[data.reason_code];
+  const known=structured||apiErrors[data.error]||configReasonLabels[data.reason_code];
   const field=typeof data.field_path==='string'&&/^[a-zA-Z0-9_.]{1,160}$/.test(data.field_path)?data.field_path:null;
   let message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
   if(field)message+=' · '+t('字段')+' '+field;
@@ -385,7 +386,7 @@ async function refresh(options={}){
    const select=$('project-select'),old=projectId;if(!state.projects.some(p=>p.id===projectId)){stashGoalDraft();projectId=state.projects[0]?.id||'';restoreGoalDraft();goalDraftRestoredProject=projectId;}
    if(JSON.stringify([...select.options].map(x=>[x.value,x.text]))!==JSON.stringify(state.projects.map(p=>[p.id,projectLabel(p)]))){select.replaceChildren(...state.projects.map(p=>{const o=el('option',projectLabel(p));o.value=p.id;o.title=projectPath(p);return o;}));if(!state.projects.length){const o=el('option',t('尚未接入项目'));o.value='';select.append(o);}}
    if(projectId&&!scopeChosen&&!scopeInitialized){stashSettings();$('config-scope').value='project';settingsBaseline=null;scopeInitialized=true;}
-   select.value=projectId;if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
+   select.value=projectId;rememberNavigationHome();if(old!==projectId){stashSettings();closeTaskDetail();settingsBaseline=null;localWrite('rsi-project',projectId);goalDraftRestoredProject=projectId;}if(goalDraftRestoredProject!==projectId){restoreGoalDraft();goalDraftRestoredProject=projectId;}
    render();window.RSIExperience?.refreshed();
   }catch(error){if(controller.signal.aborted){if(timedOut&&requestedProject===projectId)$('connection').textContent=t('连接超时');return;}throw error;}
   finally{clearTimeout(timeout);}
@@ -395,6 +396,7 @@ async function refresh(options={}){
 function parentView(name){return name==='models'?'settings':name==='tasks'?'overview':name;}
 function renderNavigation(){
  const parent=parentView(view),configScope=$('config-scope').value,project=currentProject();
+ document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+parent);
  const path=projectPath(project);document.title=(project?projectName(project)+(path?' · '+path:'')+' · ':'')+t('Adaptive RSI · 控制台');
  document.querySelectorAll('.nav').forEach(node=>node.classList.toggle('active',node.dataset.view===parent));
  document.querySelectorAll('.nav').forEach(node=>{const selected=node.dataset.view===parent;if(selected)node.setAttribute('aria-current','page');else node.removeAttribute('aria-current');});
@@ -504,15 +506,20 @@ async function confirmCandidateApproval(data){
  const summary=window.RSIProduct?.approval(data);if(summary)content.append(summary);content.append(label);
  return await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),content)?{reason:reason.value}:null;
 }
+let navigationHomeProject=typeof history!=='undefined'&&typeof history.state?.rsi_home_project==='string'?history.state.rsi_home_project:null;
+function rememberNavigationHome(){
+ if(!navigationHomeProject&&projectId){navigationHomeProject=projectId;if(location.href&&!new URLSearchParams(String(location.hash||'').replace(/^#/, '')).has('project'))history.replaceState({...history.state,rsi_home_project:projectId},'',location.href);}
+}
 function writeNavigation(name){
+ rememberNavigationHome();
  if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');const target=location.pathname+location.search+'#'+navigation;if(target!==location.pathname+location.search+location.hash)history.pushState(null,'',target);}
 }
-function showView(name){
+function showView(name,recordHistory=true){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':models?'settings':name;
  navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections();document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
- writeNavigation(models?'models':name);
+ if(recordHistory)writeNavigation(models?'models':name);
  render();if(['overview','evolution'].includes(name))safe(refresh);if(name==='settings')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
  if(name==='usage')window.RSIUsage?.show();
  if(models)$('view-models').scrollIntoView({block:'start'});
@@ -525,9 +532,13 @@ function showView(name){
  }
 })();
 typeof window.addEventListener==='function'&&window.addEventListener('hashchange',()=>{
- if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project');
- if(project&&state.projects.some(item=>item.id===project)&&project!==projectId){stashSettings();stashGoalDraft();closeTaskDetail();projectId=project;taskOffset=0;settingsBaseline=null;restoreGoalDraft();localWrite('rsi-project',projectId);}
- if(requested&&['overview','tasks','evolution','settings','models','usage'].includes(requested))showView(requested);
+ if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project')||history.state?.rsi_home_project||navigationHomeProject;let projectChanged=false;
+ if(project&&state.projects.some(item=>item.id===project)&&project!==projectId){stashSettings();stashGoalDraft();closeTaskDetail();projectId=project;projectChanged=true;$('project-select').value=project;taskOffset=0;settingsBaseline=null;restoreGoalDraft();localWrite('rsi-project',projectId);}
+ const task=route.get('task');
+ if(!task&&$('detail-dialog').open)closeTaskDetail();
+ showView(requested&&['overview','tasks','evolution','settings','models','usage'].includes(requested)?requested:'overview',false);
+ if(task&&project&&state.projects.some(item=>item.id===project))window.dispatchEvent(new CustomEvent('rsi-history-task',{detail:{task,project}}));
+ else if(projectChanged)safe(refresh);
 });
 function renderTasks(){
  const list=$('tasks-list'),filter=$('task-filter').value;
@@ -567,7 +578,13 @@ function renderTasks(){
  }
 }
 let detailTask,detailSequence=0;
-function closeTaskDetail(){detailSequence++;detailTask=null;if($('detail-dialog').open)$('detail-dialog').close();}
+const pendingDetailCloseEvents=[];
+function closeTaskDetail(){
+ const closingTask=detailTask?.id;detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();
+ if($('detail-dialog').open){pendingDetailCloseEvents.push(true);$('detail-dialog').close();
+  if(location.href&&closingTask){const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));if(route.get('task')===closingTask){route.delete('task');history.replaceState(history.state,'',location.pathname+location.search+(route.size?'#'+route:''));}}
+ }
+}
 function taskOutcome(data){
  const result=data.result,outcome=el('section',undefined,'task-outcome');outcome.append(el('h3',t('这次的结果')));
  outcome.append(el('h4',t('改了什么')),el('p',result.summary||result.reason||t('还没有完成结果。')));
@@ -579,7 +596,7 @@ function taskOutcome(data){
  outcome.append(el('p',t('交付状态')+' · '+next));
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
- if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{$('detail-dialog').close();showView(target);},'text-button'));}
+ if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
  if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}outcome.append(stageProgress(data));return outcome;
 }
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
@@ -608,9 +625,9 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
   if(data.result.files){delivery.append(action(t('阅读代码差异'),()=>window.RSIExperience?.showDiff(run.id),'text-button'));if(!window.RSIDesktop){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
-  let delivering=false;if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async(evt)=>{if(delivering)return;const approval=await confirmCandidateApproval(data);if(!approval)return;delivering=true;if(evt?.target)evt.target.disabled=true;try{await api('deliver',{run:run.id,...approval});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}finally{delivering=false;if(evt?.target)evt.target.disabled=false;}}));
+  let delivering=false;if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async(evt)=>{if(delivering)return;const approval=await confirmCandidateApproval(data);if(!approval)return;delivering=true;if(evt?.target)evt.target.disabled=true;try{await api('deliver',{run:run.id,...approval});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));closeTaskDetail();await refresh();}finally{delivering=false;if(evt?.target)evt.target.disabled=false;}}));
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
-  if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
+  if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));closeTaskDetail();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
   restoreView?.(body);
   }
@@ -638,7 +655,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
   const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
   if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview)))return;
-  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});$('detail-dialog').close();await refresh();}));
+  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});closeTaskDetail();await refresh();}));
  restoreView?.(body);
  if(stillCurrent()&&!$('detail-dialog').open)$('detail-dialog').showModal();}
 const evolutionReasons={
@@ -887,7 +904,8 @@ $('schedule-mode').addEventListener('change',syncScheduleMode);
 document.querySelectorAll('[data-schedule-preset]').forEach(select=>select.addEventListener('change',()=>{if(select.value==='custom')return;const node=document.querySelector('[data-path="schedule.'+select.dataset.schedulePreset+'_minutes"]'),unit=document.querySelector('[data-unit-for="'+node.dataset.duration+'"]'),value=Number(select.value),factor=value%1440===0?1440:60;unit.value=String(factor);unit.dataset.previous=String(factor);node.value=value/factor;node.min=5/factor;node.max=525600/factor;}));
 document.querySelectorAll('[data-duration]').forEach(node=>node.addEventListener('input',syncSchedulePresets));
 $('delivery-project-settings').addEventListener('click',()=>changeSettingsScope('project'));
-$('detail-dialog').addEventListener('close',()=>{detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();});
+$('detail-dialog').addEventListener('close',event=>{if(pendingDetailCloseEvents.length){pendingDetailCloseEvents.shift();event.rsiProgrammaticClose=true;return;}if($('detail-dialog').open)return;detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();});
+$('detail-dialog').addEventListener('cancel',event=>{event.preventDefault();closeTaskDetail();});
 document.querySelectorAll('[data-settings-scope]').forEach(button=>button.addEventListener('click',()=>changeSettingsScope(button.dataset.settingsScope)));
 document.querySelectorAll('[data-task-filter]').forEach(button=>button.addEventListener('click',()=>{$('task-filter').value=button.dataset.taskFilter;taskOffset=0;safe(refresh);}));
 $('show-system-tasks').addEventListener('change',()=>{taskOffset=0;safe(refresh);});
@@ -905,8 +923,8 @@ var offerGlobalConfigRepair=function(raw){
  cancel.onclick=()=>dialog.close();repair.onclick=()=>safe(async()=>{repair.disabled=true;try{await api('config/repair-global',{confirmation:'reset-invalid-global-config'});dialog.close();await refresh({force:true});toast(t('通用配置已重置，所有项目保持暂停。'));}finally{repair.disabled=false;}});
 };
 for(const id of ['add-project','onboard-add'])$(id).addEventListener('click',()=>$('project-dialog').showModal());
-document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
-document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d)d.close();}));
+document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>{const box=button.closest('dialog');if(box.id==='detail-dialog')closeTaskDetail();else box.close();}));
+document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){if(d.id==='detail-dialog')closeTaskDetail();else d.close();}}));
 $('project-source').addEventListener('change',()=>{const remote=$('project-source').value==='github';$('local-project-fields').hidden=remote;$('github-project-fields').hidden=!remote;$('project-path').required=!remote;$('project-urls').required=remote;});
 $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
  const unchanged=unchangedForm(event.target,{projectSensitive:false});
@@ -1040,7 +1058,7 @@ async function renderReleaseOutcome(node,run,project){
   if(operation.url&&/^https:\/\/github\.com\//.test(operation.url)){const link=el('a',t('查看 GitHub 工作流'));link.href=operation.url;link.target='_blank';link.rel='noreferrer';row.append(link);}
   if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));
   if(rerunUnknown||dispatchRejected||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):dispatchRejected?t('修复权限后重试'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
-  if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{$('detail-dialog').close();changeSettingsScope('project');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
+  if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{closeTaskDetail();changeSettingsScope('project');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
   section.append(row);
  }node.append(section);
 }

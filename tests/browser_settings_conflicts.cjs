@@ -13,13 +13,13 @@ const {chromium}=require('playwright');
    const page=await browser.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
    await page.evaluate(async()=>{await api('config',{project:projectId,revision:state.config_revision,values:{schedule:{weight:1}}});});
-   await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('#advanced-settings > summary').click();
+   await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('#advanced-settings > summary').click();
    const weight=page.locator('[data-path="schedule.weight"]');await weight.fill('3');await weight.blur();
    await page.evaluate(async()=>{await api('config',{project:projectId,revision:state.config_revision,values:{schedule:{weight:2}}});});
-   await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
+   await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
    const panel=page.locator('#settings-conflicts');await panel.waitFor();assert.match(await panel.innerText(),/schedule.weight/);assert.match(await panel.innerText(),/服务端值：2/);
    // Conflict copies must survive another reload even when no ordinary draft remains.
-   await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await panel.waitFor();
+   await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await panel.waitFor();
    await page.locator('#advanced-settings > summary').click();await weight.fill('4');
    await panel.getByRole('button',{name:choice,exact:true}).click();
    assert.equal(await weight.inputValue(),choice==='使用本地修改'?'3':'2');
