@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import copy
 import datetime
 import fcntl
 import hashlib
@@ -284,9 +285,9 @@ class Runtime(Maintenance):
                 with self.dispatch_lock:
                     self.import_in_progress = False
 
-    def configure(self, values, project=None, inherit=None, expected_revision=None):
+    def configure(self, values, project=None, inherit=None, expected_revision=None, source="runtime"):
         with self.dispatch_lock:
-            return self._configure(values, project, inherit, expected_revision)
+            return self._configure(values, project, inherit, expected_revision, source=source)
 
     def repair_project_config(self, project, confirmation):
         if confirmation != "reset-invalid-overrides-to-global-defaults":
@@ -352,7 +353,11 @@ class Runtime(Maintenance):
                            (encode({"backup_key": backup_key, "sha256": digest}), time.time()))
             return {"saved": True, "repaired": True, "backup_key": backup_key}
 
-    def _configure(self, values, project=None, inherit=None, expected_revision=None):
+    def _configure(self, values, project=None, inherit=None, expected_revision=None,
+                   replacement=False, source="runtime", undo_of=None):
+        project = project or None
+        if source not in ("runtime", "console", "undo"):
+            raise ValueError("Invalid configuration source")
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
         allowed = {"schedule.light_minutes", "schedule.issues_minutes", "schedule.deep_minutes",
@@ -382,7 +387,7 @@ class Runtime(Maintenance):
             except (ValueError, TypeError, KeyError, AttributeError):
                 if project:
                     raise
-        updated = merge(previous, values)
+        updated = copy.deepcopy(values) if replacement else merge(previous, values)
         for path in inherit:
             group, key = path.split(".")
             updated.get(group, {}).pop(key, None)
@@ -410,13 +415,14 @@ class Runtime(Maintenance):
                     key = "config-revision:" + row["id"]
                     db.execute("INSERT INTO settings VALUES (?, '1') ON CONFLICT(key) "
                                "DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)", (key,))
-            revision_data = {"before": previous, "after": updated, "revision": next_revision}
+            from .config_history import write_snapshot
+            revision_data = write_snapshot(db, project, previous, updated, next_revision, source, undo_of)
         # Keep the historical post-commit audit failure observable; callers already
         # perform a compensating cleanup and must not mistake an audit error for a
         # settings write that never happened.
         self.store.event("config", "Settings saved; active runs retain their snapshot", project,
                          data=revision_data)
-        if "schedule" in values or inherit:
+        if "schedule" in values or inherit or replacement:
             for row in projects:
                 if row["id"] not in schedules:
                     continue

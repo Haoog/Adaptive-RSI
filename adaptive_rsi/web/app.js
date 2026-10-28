@@ -921,6 +921,26 @@ document.querySelector('#project-workspace')?.addEventListener('click',event=>{i
 $('goal-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const project=projectId,text=$('goal-text').value,draftRevision=goalDraftRevisions.get(project)||0;if(!text.trim()||text.length>30000)throw Error(t('目标不能为空，且不能超过 30000 个字符。'));const submission=await pendingGoalSubmission(project,text);await api('goal',{project,text,request_id:submission.id});saveGoalSubmissions(project,(await goalSubmissions(project)).filter(entry=>entry.id!==submission.id));await renderGoalRecovery();if((goalDraftRevisions.get(project)||0)===draftRevision){if(goalDrafts.get(project)===text)goalDrafts.delete(project);if(draftStore.get('goal',project)===text)draftStore.remove('goal',project);if(projectId===project&&$('goal-text').value===text)$('goal-text').value='';}await refresh();toast(state.projects.find(p=>p.id===project)?.paused?t('目标已入队；启用项目后执行'):t('目标已加入任务列表'));},event.target);});
 document.querySelectorAll('[data-inspect]').forEach(button=>button.addEventListener('click',()=>safe(async()=>{await api('request',{project:projectId,kind:button.dataset.inspect});await refresh();toast(currentProject().paused?t('已加入队列；启用项目后执行'):t('已加入队列'));})));
 $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$('config-scope').addEventListener('change',()=>changeSettingsScope($('config-scope').value));
+let configHistoryDialog=null;
+async function showConfigHistory(){
+ if(configHistoryDialog?.open)return;
+ const scope=settingsKey(),project=scope==='global'?null:projectId,box=el('dialog',undefined,'experience-dialog'),rows=el('div'),more=el('button',t('加载更多'),'text-button'),close=el('button',t('关闭'),'text-button');
+ if(scope!=='global'&&!project)return;
+ box.append(el('h2',t('设置变更记录')),el('p',t('仅最新且未被覆盖的设置可以撤销；活动中的任务继续使用原快照。')),rows,more,close);
+ more.type=close.type='button';close.onclick=()=>box.close();box.addEventListener('close',()=>{box.remove();if(configHistoryDialog===box)configHistoryDialog=null;});document.body.append(box);box.showModal();configHistoryDialog=box;let before=null,loading=false,undoing=false;
+ async function load(){if(loading)return;loading=true;more.disabled=true;
+  try{const params=new URLSearchParams();if(project)params.set('project',project);if(before)params.set('before',before);const data=await api('config-history?'+params);if(!box.open)return;
+   for(const entry of data.entries){const card=el('details');if(entry.error){card.append(el('summary',t('配置记录损坏，无法安全撤销。')));rows.append(card);continue;}
+    const sources={console:t('界面保存'),runtime:t('运行器保存'),undo:t('撤销操作')};card.append(el('summary',stamp(entry.created)+' · '+(sources[entry.source]||t('未知'))+' · '+entry.revision));
+    for(const change of entry.changes){const value=item=>item==='[redacted]'?t('已隐藏'):JSON.stringify(item);card.append(el('p',change.path+' : '+value(change.before)+' → '+value(change.after)));}
+    if(entry.truncated)card.append(el('p',t('差异仅显示前 200 项；撤销将恢复完整设置快照。')));
+    if(entry.can_undo){const undo=el('button',t('撤销这次设置修改'),'button');undo.type='button';undo.onclick=()=>safe(async()=>{if(undoing)return;undoing=true;undo.disabled=true;try{if(!(await uiConfirm(t('确定恢复这次修改之前的设置？这将影响之后的新任务。'))))return;await api('config/undo',{project,revision:entry.revision,expected:data.revision});box.close();await refresh({force:true});toast(t('设置已撤销'));}finally{undoing=false;undo.disabled=false;}});card.append(undo);}
+    rows.append(card);
+   }before=data.next_before;more.hidden=!data.has_more;
+  }finally{loading=false;more.disabled=false;}
+ }more.onclick=()=>safe(load);await load();
+}
+$('settings-history').addEventListener('click',()=>safe(showConfigHistory));
 $('settings-form').addEventListener('invalid',event=>{let detail=event.target.closest('details');while(detail){detail.open=true;detail=detail.parentElement.closest('details');}},true);
 $('settings-form').addEventListener('input',stashSettings);$('settings-form').addEventListener('change',stashSettings);
 $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{const button=$('settings-save'),saveKey=settingsKey();if(button.disabled)return;button.disabled=true;try{if($('config-scope').value==='project'&&!projectId)throw Error(t('请先接入项目，或切换到全局默认'));const unchanged=unchangedForm(event.target),baseline=settingsBaseline,scope=$('config-scope').value,project=projectId,key=settingsKey();let patch={};document.querySelectorAll('[data-path]').forEach(node=>{if(node.disabled)return;const value=fieldValue(node);if(JSON.stringify(value)!==JSON.stringify(getPath(settingsBaseline,node.dataset.path)))setPath(patch,node.dataset.path,value);});

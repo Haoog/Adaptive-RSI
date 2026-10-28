@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 82 implemented with targeted acceptance, 26 partial, and 93 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 83 implemented with targeted acceptance, 26 partial, and 92 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -164,7 +164,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 109. **implemented** — Extend relationship auditing beyond stages
 110. **partial** — Execute migrations once per version
 111. **implemented** — Add a read-only database recovery mode
-112. **pending** — Explain configuration changes and safe undo
+112. **implemented** — Explain configuration changes and safe undo
 113. **pending** — Type and version settings namespaces
 114. **implemented** — Trace slow SQL without sensitive parameters
 115. **implemented** — Measure connection-pool wait latency
@@ -271,3 +271,5 @@ Experiment comparisons and native tools (53/54/55/133/155/160): 13 targeted chec
 Database observability and evidence relationships (109/114/115/116): nine targeted tests and 108 related regressions pass (two existing environment skips). SQL execution timing excludes pool waiting; timeout waits join declared nearest-rank quantiles. HTTP request IDs and task/run contexts correlate diagnostics without parameters or SQL text. Relationship checks disclose truncation and catch cross-project events; global NULL events remain valid. Bounded stage quarantine preserves complete evidence, including duplicate NULL keys, with transactional rollback. The 50k synthetic-history measurements are in [store metrics](store-metrics-20261028.json); they are local fixture data, not production or CI throughput. Soak checks retain zero borrowed connections and no model calls.
 
 Validation latency (194/201): 57 related regressions pass; five targeted planning tests cover reconstructed release patches, code/extra-file/mode/type contamination, a changed-classifier shell guard, skewed timing allocation, independent selector measurements and bad-cache fallback. Ordinary CI can avoid duplicate functional work for an exact mechanical release-metadata patch. The final exact-head release workflow still requires full Python, browser, desktop build, smoke and provenance before merging. No remote timing improvement is claimed yet. Type/mode changes are now rejected by the shared release validator, following review.
+
+Configuration audit and safe undo (112): 9 targeted and 138 related Python checks, the real Chromium history/undo/draft/bilingual flow, and 339 Node checks passed. Both read-only review axes found no remaining confirmed issue. Private snapshots are transactional; ordinary activity projections hide secrets, including legacy raw configuration events. Revision and content checks reject stale undo. Full-scope release readiness remains false.

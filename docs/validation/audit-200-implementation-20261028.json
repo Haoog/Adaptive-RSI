@@ -1748,9 +1748,20 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "并发修改时撤销不覆盖他人更新，凭据字段不进入普通审计文本。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config_history.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_config_history tests.test_model_center tests.test_store tests.test_audit_round6",
+        "node tests/browser_config_history.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Exact private snapshots and configuration commit together; normal audit projections redact legacy and new secrets. Revision, ownership and content hashes prevent stale undo. Post-commit event failures remain observable and snapshots remain discoverable. Namespace retention is tracked separately in item113."
     },
     {
       "id": 113,

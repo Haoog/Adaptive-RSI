@@ -385,7 +385,8 @@ class Handler(BaseHTTPRequestHandler):
                 rows = store.query("SELECT * FROM events WHERE seq<?" +
                                    (" AND (project=? OR project IS NULL)" if project else "") +
                                    " ORDER BY seq DESC LIMIT ?", (before, project, limit + 1) if project else (before, limit + 1))
-                self.respond({"events": rows[:limit], "has_more": len(rows) > limit,
+                from .config_history import public_events
+                self.respond({"events": public_events(rows[:limit]), "has_more": len(rows) > limit,
                               "next_before": rows[limit - 1]["seq"] if len(rows) > limit else None})
             elif parsed.path == "/api/mobile":
                 self.respond({"install_url": self.server.origin + "/install", "remote": self.server.origin.startswith("https://")})
@@ -427,6 +428,13 @@ class Handler(BaseHTTPRequestHandler):
                                     "AND json_extract(value,'$.signature') IS NOT NULL "
                                     "ORDER BY json_extract(value,'$.created') DESC,key DESC LIMIT 50", (prefix + "%",))
                 self.respond({"batches": [decode_object(row["value"]) for row in found], "limit": 50})
+            elif parsed.path == "/api/config-history":
+                from .config_history import page
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (ValueError, TypeError):
+                    raise RequestError("Invalid revision pagination") from None
+                self.respond(page(runtime, params.get("project", [""])[0] or None, before))
             elif parsed.path == "/api/candidate":
                 from .experiment_report import comparison
                 candidate = store.one("SELECT id,project,status,content,evidence FROM candidates WHERE id=? AND project=?",
@@ -856,8 +864,11 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"started": True}
                 elif path == "/api/config":
                     configured = runtime.configure(body["values"], body.get("project"), body.get("inherit"),
-                                                   body.get("revision"))
+                                                   body.get("revision"), source="console")
                     result = {**configured, "config": runtime.config(body.get("project"))}
+                elif path == "/api/config/undo":
+                    from .config_history import undo
+                    result = undo(runtime, body.get("project") or None, body.get("revision"), body.get("expected"))
                 elif path == "/api/config/repair":
                     result = runtime.repair_project_config(body["project"], body.get("confirmation"))
                 elif path == "/api/config/repair-global":

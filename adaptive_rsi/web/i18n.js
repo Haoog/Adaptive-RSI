@@ -1,6 +1,17 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "设置变更记录": "Settings change history",
+ "仅最新且未被覆盖的设置可以撤销；活动中的任务继续使用原快照。": "Only the latest unchanged configuration can be undone; active tasks retain their original snapshot.",
+ "撤销这次设置修改": "Undo this settings change",
+ "确定恢复这次修改之前的设置？这将影响之后的新任务。": "Restore the settings from before this change? This affects new tasks.",
+ "设置已撤销": "Settings change undone",
+ "配置记录损坏，无法安全撤销。": "This configuration record is damaged and cannot be safely undone.",
+ "界面保存": "Saved in console",
+ "运行器保存": "Saved by runtime",
+ "撤销操作": "Undo operation",
+ "已隐藏": "Hidden",
+ "差异仅显示前 200 项；撤销将恢复完整设置快照。": "Only the first 200 differences are shown; undo restores the complete settings snapshot.",
  "前置任务无法合并；请复核其他依赖并手动重试。": "A predecessor cannot merge. Review the remaining dependencies and retry manually.",
  "桌面更新屏障已恢复": "Desktop update admission recovered",
  "开始": "Started",

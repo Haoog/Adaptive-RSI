@@ -95,11 +95,11 @@ jobs:
           - name: Python 3.9 兼容
             os: ubuntu-latest
             python: '3.9'
-            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability
+            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: Python 3.14 兼容
             os: ubuntu-latest
             python: '3.14'
-            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability
+            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 控制、恢复与桌面
             os: ubuntu-latest
             modules: tests.test_controls tests.test_updates_recovery tests.test_update_safety tests.test_launcher_regressions tests.test_desktop_runtime tests.test_desktop_release
@@ -117,7 +117,7 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability
+            modules: tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery

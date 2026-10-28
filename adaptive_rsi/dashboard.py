@@ -88,7 +88,8 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         row["last_stage"] = stage["stage"] if stage else None
         row["last_stage_at"] = stage["created"] if stage else None
         row["last_stage_decision"] = stage["decision"] if stage else None
+    from .config_history import public_events
     return {"tasks": tasks, "runs": runs,
-            "events": store.query("SELECT * FROM events WHERE " + ("(project=? OR project IS NULL)" if project else "1=1") + " ORDER BY seq DESC LIMIT 100", base_args),
+            "events": public_events(store.query("SELECT * FROM events WHERE " + ("(project=? OR project IS NULL)" if project else "1=1") + " ORDER BY seq DESC LIMIT 100", base_args)),
             "pagination": {"total": total, "limit": limit, "offset": offset, "has_more": offset + limit < total},
             "task_counts": store.query("SELECT display_state AS state,count(*) AS count FROM " + TASKS + " WHERE " + count_clause + " GROUP BY display_state", base_args)}
