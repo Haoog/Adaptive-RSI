@@ -19,6 +19,19 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def installer_owner():
+    """The native owner is separate from a onefile engine's bootloader parent."""
+    value = os.environ.get("ADAPTIVE_RSI_DESKTOP_OWNER_PID", "")
+    if not 1 <= len(value) <= 10 or not value.isascii() or not value.isdigit() or not 1 < int(value) < 2**31:
+        return None
+    owner = int(value)
+    try:
+        os.kill(owner, 0)
+    except OSError:
+        return None
+    return owner
+
+
 def existing_session(root):
     try:
         session = json.loads((root / "server.json").read_text())
@@ -57,8 +70,9 @@ def run(root):
             except (OSError, ValueError):
                 pass
         return
-    runtime = Runtime(Store(root))
+    runtime = Runtime.open(root)
     runtime.updates.desktop_managed = True
+    runtime.updates.desktop_owner_pid = installer_owner()
     server = None
     try:
         from .lifecycle import barrier

@@ -322,7 +322,8 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertFalse(self.runtime.config(self.project)["delivery"]["auto_merge"])
 
     def setup_deployment(self, rollback=False):
-        deploy = {**self.policy, "health_url": "https://app.example/health", "automatic_rollback": rollback}
+        deploy = {**self.policy, "health_url": "https://app.example/health", "automatic_rollback": rollback,
+                  "rollback_data_policy": "backward_compatible" if rollback else "manual"}
         self.runtime.configure({"delivery": {"release": {"enabled": False}, "deploy": deploy}}, self.project)
         config = self.runtime.config(self.project)
         self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(config), self.run["id"]))
@@ -755,7 +756,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         steps = workflow["jobs"]["verify"]["steps"]
         attest = next(step for step in steps if step.get("id") == "attest")
         self.assertTrue(attest["continue-on-error"])
-        upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact"))
+        upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact") and step.get("with", {}).get("name", "").startswith("release-verified-"))
         self.assertIn("steps.attest.outcome", upload["if"])
         text = (self.ROOT / ".github/workflows/release-verify.yml").read_text()
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
@@ -784,6 +785,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
 
     def test_manual_caches_only_store_public_build_inputs(self):
         allowed_paths = {
+            ".ci/test-durations.json",
             "~/.cache/ms-playwright",
             "~/.cache/pip",
             "~/Library/Caches/ms-playwright",

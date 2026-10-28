@@ -2,21 +2,37 @@
 import json
 import gzip
 import hashlib
+import math
 import os
 import sqlite3
 import stat
 import tempfile
 import time
-from contextlib import closing
+import copy
+import shutil
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .store import Store, uid
 
 
-def archive(store, max_mb=1024):
+@contextmanager
+def _regular_reader(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Archive source must be a regular file")
+        yield stream
+
+
+def archive(store, max_mb=1024, compression=6, timeout=300, cancel=None):
     """Export a private compressed consistent snapshot within an archive capacity budget."""
     if type(max_mb) is not int or not 1 <= max_mb <= 102400:
         raise ValueError("Archive capacity must be 1..102400 MiB")
+    if type(compression) is not int or not 0 <= compression <= 9:
+        raise ValueError("Archive compression must be 0..9")
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 3600:
+        raise ValueError("Archive timeout must be 1..3600 seconds")
     import fcntl
     fd = os.open(store.root / "archive.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(fd, "wb") as lock:
@@ -26,26 +42,44 @@ def archive(store, max_mb=1024):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("Another archive is in progress") from None
-        return _archive(store, max_mb)
+        return _archive(store, max_mb, compression, timeout, cancel)
 
 
-def _archive(store, max_mb):
+def _archive(store, max_mb, compression=6, timeout=300, cancel=None):
+    started = time.monotonic()
+    cpu_started = time.thread_time()
+    deadline = started + timeout
+    def check_budget():
+        if cancel and cancel():
+            from .process import Cancelled
+            raise Cancelled("Archive cancelled")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Archive deadline exceeded")
+    check_budget()
     folder = store.root / "archives"
     folder.mkdir(mode=0o700, exist_ok=True)
     capacity = max_mb * 1024 * 1024
-    used = sum(info.st_size for _, info in _file_info(folder.iterdir()))
+    used = 0
+    for _, info in _file_info(folder.iterdir()):
+        check_budget()
+        used += info.st_size
     if used >= capacity:
         raise ValueError("Archive capacity reached; move existing archives before retrying")
-    snapshot = backup(store)
+    snapshot = backup(store, timeout=timeout, cancel=cancel, deadline=deadline)
     source = store.root / "backups" / (snapshot["id"] + ".sqlite3")
     staging = None
+    manifest = None
+    manifest_owned = False
+    published = False
     try:
         fd, name = tempfile.mkstemp(prefix=".archive-", dir=folder)
         staging = Path(name)
         with os.fdopen(fd, "wb") as output:
-            with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+            with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0,
+                               compresslevel=compression) as compressed:
                 with source.open("rb") as raw:
                     while True:
+                        check_budget()
                         block = raw.read(65536)
                         if not block:
                             break
@@ -58,18 +92,98 @@ def _archive(store, max_mb):
             output.flush()
             os.fsync(output.fileno())
         target = folder / (snapshot["id"] + ".sqlite3.gz")
+        check_budget()
+        inventory = {"format": 1, "id": snapshot["id"], "created": time.time(),
+                     "compression": compression, "archive_bytes": staging.stat().st_size,
+                     "archive_sha256": file_digest(staging, check_budget), "source_bytes": source.stat().st_size,
+                     "source_sha256": file_digest(source, check_budget), "contents": ["state.sqlite3"],
+                     "scope": "database_only"}
+        encoded = json.dumps(inventory, sort_keys=True).encode()
+        if staging.stat().st_size + len(encoded) + used > capacity:
+            raise ValueError("Archive capacity reached; move existing archives before retrying")
+        check_budget()
+        manifest = target.with_suffix(target.suffix + ".manifest.json")
+        with manifest.open("xb") as output:
+            manifest_owned = True
+            os.chmod(manifest, 0o600)
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        check_budget()
         os.link(staging, target)
+        published = True
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
-                "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
+                "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False,
+                "manifest": str(manifest), "compression": compression,
+                "seconds": time.monotonic() - started, "cpu_seconds": time.thread_time() - cpu_started}
     finally:
+        if manifest_owned and not published:
+            manifest.unlink(missing_ok=True)
         if staging is not None:
             staging.unlink(missing_ok=True)
         source.unlink(missing_ok=True)
 
 
-def backup(store, cancel=None, progress=None):
+def verify_archive(path, timeout=60, max_source_mb=102400):
+    """Verify compressed bytes and restored SQLite without touching the active database."""
+    path = Path(path).absolute()
+    manifest = path.with_suffix(path.suffix + ".manifest.json")
+    if path.is_symlink() or manifest.is_symlink() or not path.is_file() or not manifest.is_file():
+        raise ValueError("Archive and manifest must be regular files")
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 3600:
+        raise ValueError("Archive timeout must be 1..3600 seconds")
+    if type(max_source_mb) is not int or not 1 <= max_source_mb <= 102400:
+        raise ValueError("Invalid archive verification capacity")
+    with _regular_reader(manifest) as stream:
+        content = stream.read(16385)
+    if len(content) > 16384:
+        raise ValueError("Archive manifest is too large")
+    metadata = json.loads(content)
+    if (not isinstance(metadata, dict) or metadata.get("format") != 1 or
+            type(metadata.get("source_bytes")) is not int or
+            not 0 < metadata["source_bytes"] <= max_source_mb * 1024 * 1024):
+        raise ValueError("Invalid archive manifest")
+    deadline = time.monotonic() + timeout
+    def check():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Archive verification deadline exceeded")
+    digest = hashlib.sha256()
+    with _regular_reader(path) as raw:
+        for block in iter(lambda: raw.read(65536), b""):
+            check()
+            digest.update(block)
+    if path.stat().st_size != metadata.get("archive_bytes") or digest.hexdigest() != metadata.get("archive_sha256"):
+        raise ValueError("Archive compressed content checksum mismatch")
+    with tempfile.TemporaryDirectory(prefix="rsi-archive-verify-") as directory:
+        if shutil.disk_usage(directory).free < metadata["source_bytes"] + 16 * 1024 * 1024:
+            raise ValueError("Insufficient disk space to verify archive")
+        restored = Path(directory) / "state.sqlite3"
+        digest, size = hashlib.sha256(), 0
+        with _regular_reader(path) as compressed, gzip.GzipFile(fileobj=compressed, mode="rb") as raw, restored.open("wb") as output:
+            for block in iter(lambda: raw.read(65536), b""):
+                check()
+                size += len(block)
+                if size > metadata["source_bytes"]:
+                    raise ValueError("Archive expanded size exceeds manifest")
+                digest.update(block)
+                output.write(block)
+        if size != metadata["source_bytes"] or digest.hexdigest() != metadata.get("source_sha256"):
+            raise ValueError("Archive source checksum mismatch")
+        check()
+        result = verify_backup(restored, deadline=deadline)
+    return {**result, "archive": path.name, "checked_at": time.time(), "scope": "database_only"}
+
+
+def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 1024 * 1024, deadline=None):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
+    if (type(timeout) not in (int, float) or not 1 <= timeout <= 3600 or
+            type(reserve_bytes) is not int or reserve_bytes < 0 or
+            (deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)))):
+        raise ValueError("Invalid backup resource budget")
+    deadline = min(deadline, time.monotonic() + timeout) if deadline is not None else time.monotonic() + timeout
+    if shutil.disk_usage(folder).free < store.path.stat().st_size + reserve_bytes:
+        raise ValueError("Insufficient disk space for a consistent backup")
     path = folder / (uid() + ".sqlite3")
     fd, name = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=folder)
     staging = Path(name)
@@ -80,28 +194,32 @@ def backup(store, cancel=None, progress=None):
                 if cancel and cancel():
                     from .process import Cancelled
                     raise Cancelled("Backup cancelled")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Backup exceeded its total deadline")
+                if shutil.disk_usage(folder).free < reserve_bytes:
+                    raise ValueError("Backup stopped to preserve disk reserve")
                 if progress:
                     progress(total - remaining, total)
-            if cancel or progress:
-                source.backup(target, pages=128, progress=advance)
-            else:
-                source.backup(target)
+            source.backup(target, pages=128, progress=advance)
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
         # Publish only the closed snapshot; a name collision must preserve the old backup.
         os.link(staging, path)
+        store._storage_snapshot = None
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
             Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
-def verify_backup(path):
+def verify_backup(path, deadline=None):
     """Open a backup in read-only mode and prove it is a usable state snapshot."""
-    path = Path(path).expanduser().resolve()
+    path = Path(path).expanduser().absolute()
     if not path.is_file() or path.is_symlink():
         raise ValueError("Backup must be a regular file")
-    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        if deadline is not None:
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -126,12 +244,28 @@ def retain_backups(store, max_count=20, max_age_days=90, now=None):
                     if path.is_file() and not path.is_symlink()),
                    key=lambda path: path.stat().st_mtime, reverse=True)
     removed = []
+    protected = None
+    invalid = []
+    for path in paths:
+        try:
+            verify_backup(path)
+        except (ValueError, OSError, sqlite3.Error):
+            invalid.append(path.name)
+        else:
+            protected = path
+            break
+    if paths and protected is None:
+        return {"kept": len(paths), "removed": [], "invalid": invalid,
+                "reason": "no_verified_recovery_point"}
     for index, path in enumerate(paths):
+        if path == protected or path.name in invalid:
+            continue
         if index < max_count and now - path.stat().st_mtime <= max_age_days * 86400:
             continue
         path.unlink()
         removed.append(path.name)
-    return {"kept": len(paths) - len(removed), "removed": removed}
+    return {"kept": len(paths) - len(removed), "removed": removed, "invalid": invalid,
+            "protected": protected.name if protected else None}
 
 
 def _create_directories(destination):
@@ -192,7 +326,7 @@ def restore(source, destination):
         raise ValueError("Restore requires a new state directory; existing state is never overwritten")
     # Normalize existing ancestors only; the final component must be claimed without following links.
     destination = destination.parent.resolve() / destination.name
-    with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -214,7 +348,7 @@ def restore(source, destination):
             raise ValueError("Restore requires a new state directory; existing state is never overwritten")
         try:
             target = destination / "state.sqlite3"
-            with sqlite3.connect(str(target)) as out:
+            with closing(sqlite3.connect(str(target))) as out:
                 db.backup(out)
             target.chmod(0o600)
         except BaseException:
@@ -241,6 +375,19 @@ def restore(source, destination):
                                (json.dumps(result), row["id"]))
                 # Only the database was copied. Never retain access to the source state's files.
                 db.execute("UPDATE runs SET path=NULL")
+                for case in db.execute("SELECT id,spec FROM cases").fetchall():
+                    try:
+                        spec = json.loads(case["spec"])
+                    except (ValueError, TypeError):
+                        spec = {}
+                    if not isinstance(spec, dict):
+                        spec = {}
+                    # Case IDs from older databases are untrusted path components.
+                    safe_id = hashlib.sha256(case["id"].encode()).hexdigest()
+                    spec.update(repository=str(destination / "suites" / safe_id / "repository"),
+                                overlay=None, available=False,
+                                restore_invalidation="case_files_not_in_database_backup")
+                    db.execute("UPDATE cases SET spec=? WHERE id=?", (json.dumps(spec), case["id"]))
                 for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
                     result = json.loads(row["result"])
                     result["feedback"] = unavailable_feedback(result.get("feedback", {}))
@@ -257,6 +404,41 @@ def restore(source, destination):
         _discard_incomplete_restore(destination, created)
         raise
     return {"restored": True, "paused": True, "artifacts_restored": False}
+
+
+def rehearse_restore(source):
+    """Exercise database recovery in disposable state without constructing a runtime.
+
+    Project repositories, credentials and remote APIs are never opened. Missing
+    files are reported, not treated as successful artifact recovery.
+    """
+    try:
+        verify_backup(source)
+    except (ValueError, sqlite3.Error) as exc:
+        return {"valid": False, "checked_at": time.time(), "scope": "database_only",
+                "remote_operations": 0, "error_type": type(exc).__name__,
+                "failure_stage": "snapshot_validation", "artifacts_restored": False}
+    with tempfile.TemporaryDirectory(prefix="rsi-restore-drill-") as directory:
+        destination = Path(directory) / "state"
+        restore(source, destination)
+        store = Store(destination)
+        try:
+            audit = store.relationship_audit()
+            relationships_valid = not any(value for key, value in audit.items() if not key.startswith('_'))
+            complete = not any(audit['_truncated'].values())
+            paused = not store.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
+            active = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
+            cases = store.one("SELECT count(*) AS n FROM cases")["n"]
+            return {"valid": relationships_valid and complete and paused and active == 0,
+                    "checked_at": time.time(), "scope": "database_only", "remote_operations": 0,
+                    "all_projects_paused": paused, "active_runs": active,
+                    "projects": store.one("SELECT count(*) AS n FROM projects")["n"],
+                    "tasks": store.one("SELECT count(*) AS n FROM tasks")["n"],
+                    "runs": store.one("SELECT count(*) AS n FROM runs")["n"],
+                    "unavailable_cases": cases, "relationship_audit": audit,
+                    "artifacts_restored": False, "repository_revalidation_required": True}
+        finally:
+            store.close()
 
 
 def _file_info(paths, follow_symlinks=False):
@@ -344,7 +526,25 @@ def _approval_candidates(store):
     return pending, delivering, delivered
 
 
-def overview(store):
+def file_digest(path, check=None):
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Manifest source must be a regular file")
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if check:
+                check()
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def overview(store, refresh=False):
+    cached = getattr(store, "_storage_snapshot", None)
+    if not refresh and cached and time.monotonic() - cached["clock"] < 10:
+        result = copy.deepcopy(cached["data"])
+        result["expiring"], result["delivering"], result["delivered"] = _approval_candidates(store)
+        return result
     categories = {}
     for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups"),
                              ("suites", store.root / "suites"), ("archives", store.root / "archives"),
@@ -354,29 +554,77 @@ def overview(store):
             paths = (p for p in paths if not p.name.startswith(".backup-"))
         categories[label] = sum(info.st_size for _, info in _file_info(paths))
     categories["database"] = sum(info.st_size for _, info in _file_info(store.root.glob("state.sqlite3*"), True))
-    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3"), True),
+    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3")),
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
     manifest = [{"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
-                 "modified": info.st_mtime, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                 "modified": info.st_mtime, "sha256": file_digest(p)}
                 for p, info in backups[:20]]
-    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+    result = {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
             for p, info in backups[:20]], "backup_manifest": manifest,
-            "expiring": expiring, "delivering": delivering, "delivered": delivered}
+            "expiring": expiring, "delivering": delivering, "delivered": delivered,
+            "scanned_at": time.time(), "cache_seconds": 10}
+    store._storage_snapshot = {"clock": time.monotonic(), "data": copy.deepcopy(result)}
+    return result
 
 
 def diagnostics(store):
     from . import __version__
+    from .resources import execution_resources
     return {"version": __version__, "created": time.time(),
-            "included": ["version", "state_counts", "failure_codes", "storage_bytes"],
+            "included": ["version", "state_counts", "failure_codes", "storage_bytes", "database_metrics",
+                         "query_fingerprints_and_opaque_context", "schema_migrations", "relationship_identifiers",
+                         "execution_resource_waits"],
             "tasks": store.query("SELECT state,count(*) AS count FROM tasks GROUP BY state"),
             "runs": store.query("SELECT state,count(*) AS count FROM runs GROUP BY state"),
             "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
             "invalid_evidence": store.one("SELECT count(*) AS count FROM runs WHERE NOT json_valid(result)")["count"],
-            "database": store.metrics(),
+            "database": store.metrics(integrity=True),
+            "execution_resources": execution_resources.status(),
+            "wal": store.wal_diagnostics(),
             "schema_migrations": store.schema_migrations(),
             "relationship_audit": store.relationship_audit(),
             "quarantined_orphans": store.one("SELECT count(*) AS count FROM relationship_quarantine")
             if store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='relationship_quarantine'")
             else {"count": 0},
             "storage_bytes": overview(store)["bytes"]}
+
+
+def diagnostic_preview(store):
+    """Return the exact minimal export body for review, with no arbitrary DB text.
+
+    Unlike local detailed diagnostics, this allowlist excludes failure strings,
+    identifiers, query contexts, repositories, credentials and source files.
+    """
+    from . import __version__
+    with store.snapshot():
+        counts = {table: store.one('SELECT count(*) AS n FROM ' + table)['n']
+                  for table in ('projects', 'tasks', 'runs', 'cases')}
+        invalid = store.one("SELECT count(*) AS n FROM runs WHERE NOT json_valid(result)")['n']
+    return {"format": 1, "version": __version__, "created": time.time(),
+            "included": ["version", "row_counts", "invalid_evidence_count", "sqlite_version"],
+            "row_counts": counts, "invalid_evidence_count": invalid,
+            "sqlite_version": sqlite3.sqlite_version}
+
+
+def export_diagnostics(preview, destination, consent=False):
+    """Write the reviewed body only after explicit opt-in; never overwrite files."""
+    if consent is not True:
+        raise ValueError("Diagnostic export requires explicit consent")
+    # Validate the preview shape before publication, without accepting arbitrary fields.
+    if (not isinstance(preview, dict) or set(preview) != {
+            'format', 'version', 'created', 'included', 'row_counts',
+            'invalid_evidence_count', 'sqlite_version'}):
+        raise ValueError("Invalid diagnostic preview")
+    encoded = json.dumps(preview, ensure_ascii=False, sort_keys=True, allow_nan=False).encode('utf-8')
+    destination = Path(destination)
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    return {"path": str(destination), "bytes": len(encoded)}

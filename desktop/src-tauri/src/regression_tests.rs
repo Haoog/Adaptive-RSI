@@ -1,5 +1,61 @@
 use super::*;
 
+fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Result<Reply, String> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+        .block_on(transport::request(state, path, body, "test-request".into()))
+}
+
+
+#[test]
+fn async_proxy_cancels_real_blocked_transport_and_releases_request_slot() {
+    for send_headers in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+            }
+            if send_headers {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n").unwrap();
+            }
+            entered_tx.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).unwrap(), 0, "cancelled transport remained open");
+            closed_tx.send(()).unwrap();
+        });
+        let state = std::sync::Arc::new(RuntimeState::default());
+        let (client, transport) = transport::clients().unwrap();
+        *state.target.lock().unwrap() = Some(Connection { client, transport, origin: origin.clone(),
+            csrf_origin: origin, cookie: None, csrf: "fixture".into(), name: "fixture".into(), owned: false });
+        let cancel_state = state.clone();
+        let canceller = std::thread::spawn(move || {
+            entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancel_state.transport.cancel("cancel-test");
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let began = std::time::Instant::now();
+        let result = runtime.block_on(async {
+            let result = transport::request(&state, "state", None, "cancel-test".into()).await;
+            assert_eq!(state.transport.active(), 0);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while closed_rx.try_recv().is_err() { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }).await.unwrap();
+            result
+        });
+        assert_eq!(result.err().unwrap(), "Request cancelled");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        canceller.join().unwrap();
+        worker.join().unwrap();
+    }
+}
+
 fn release() -> Value {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
@@ -97,8 +153,10 @@ fn session_rotation_refreshes_cookie_and_csrf_for_local_and_remote_connections()
                 write!(stream, "HTTP/1.1 200 OK\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
+        let (client, transport) = transport::clients().unwrap();
         let connection = Connection {
-            client: client().unwrap(),
+            client,
+            transport,
             origin,
             csrf_origin: "https://public.example.test".into(),
             cookie: explicit_cookie.then(|| "rsi_123=old".into()),

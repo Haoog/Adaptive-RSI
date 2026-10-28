@@ -10,6 +10,33 @@ const experienceSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/w
 const usageSource = fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/usage.js'), 'utf8');
 const response = (data, status = 200) => ({ok: status < 400, status, json: async () => data});
 const rejected = () => response({error_code: 'update_in_progress'}, 503);
+test('structured configuration reasons use localized guidance and safe schema fields', async()=>{
+  const page=browser();
+  page.context.fetch=async()=>({...response({error:'Generic safe configuration error',error_code:'invalid_configuration',reason_code:'config_field_type',field_path:'limits.concurrency'},400),headers:{get:()=> '0123456789abcdef'}});
+  await assert.rejects(page.context.api('config',{values:{}}),error=>
+    /字段类型不匹配/.test(error.message)&&error.message.includes('limits.concurrency')&&error.requestId==='0123456789abcdef'&&error.reasonCode==='config_field_type');
+});
+test('unknown API errors preserve only valid diagnostic IDs and unsafe field paths are omitted', async()=>{
+  const page=browser();
+  page.context.fetch=async()=>({...response({error:'Unknown safe server failure',error_code:'internal_error',field_path:'<PRIVATE>bad path'},500),headers:{get:()=> '0123456789abcdef'}});
+  await assert.rejects(page.context.api('retry',{task:'task'}),error=>
+    error.message.includes('诊断标识')&&error.message.includes('0123456789abcdef')&&!error.message.includes('PRIVATE')&&error.evidence.request_id==='0123456789abcdef');
+  page.context.fetch=async()=>({...response({error:'Unknown'},500),headers:{get:()=> '<script>not-an-id'}});
+  await assert.rejects(page.context.api('retry',{task:'task'}),error=>error.requestId===null&&!error.message.includes('script'));
+});
+test('malformed error envelopes retain the request ID for diagnostics', async()=>{
+  const page=browser();
+  for(const data of [null,[],42,'unexpected']){
+    page.context.fetch=async()=>({...response(data,500),headers:{get:()=> '0123456789abcdef'}});
+    await assert.rejects(page.context.api('retry',{task:'task'}),error=>
+      error.requestId==='0123456789abcdef'&&error.evidence.code==='invalid_response'&&error.evidence.request_id===error.requestId);
+  }
+});
+test('a generic structured reason preserves existing specific safe guidance',async()=>{
+  const page=browser();
+  page.context.fetch=async()=>response({error:"Automation requires the trusted workflow tag's full commit SHA",error_code:'validation_error',reason_code:'config_invalid',field_path:null},400);
+  await assert.rejects(page.context.api('config',{values:{}}),error=>error.message.includes('小写'));
+});
 async function waitFor(predicate) {
   const deadline = Date.now() + 5000;
   while (!predicate()) {
@@ -27,13 +54,18 @@ function browser(savedSession = new Map()) {
   let created = 0, nextTimer = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
-      id, value: '', dataset: {}, handlers: {}, options: [], children: [], disabled: false,
+      id, _value: '',
+      get value() {return this.tagName === 'SELECT' ? this.children.find(option=>option.selected)?.value || '' : this._value;},
+      set value(value) {this._value=value;if(this.tagName === 'SELECT')for(const option of this.children)option.selected=option.value===value;},
+      get selectedOptions() {return this.children.filter(option=>option.selected);},
+      dataset: {}, handlers: {}, options: [], children: [], disabled: false,
       attributes: {}, classList: {toggle() {}, add() {}, remove() {}}, isConnected: true,
       addEventListener(type, handler) { this.handlers[type] = handler; },
       closest() { return this.id.endsWith('-form') ? this : this.form; },
       replaceChildren(...children) { this.options = children; this.children = children; },
-      append(...children) { this.children.push(...children); },
+      append(...children) { this.children.push(...children); if(this.tagName === 'SELECT')this.options=this.children; },
       prepend(...children) { this.children.unshift(...children); },
+      remove() { this.isConnected=false;nodes.delete(this.id); },
       insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
       querySelectorAll() { return []; },
       querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
@@ -41,7 +73,7 @@ function browser(savedSession = new Map()) {
       hasAttribute(name) { return Object.hasOwn(this.attributes, name) || name==='data-unit-for' && !!this.dataset.unitFor; },
       focus() {}, scrollIntoView() {},
       showModal() { this.open = true; },
-      close() { this.open = false; this.handlers.close?.(); }
+      close() { this.open = false; this.handlers.close?.({target:this}); }
     });
     return nodes.get(id);
   };
@@ -51,7 +83,7 @@ function browser(savedSession = new Map()) {
     querySelector: () => null,
     activeElement: null,
     addEventListener(type, handler) { listeners.set(type, handler); },
-    createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase()}),
+    createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase(), ...(tag === 'input' ? {checked: false} : {})}),
     createTextNode: text => ({textContent: text})
   };
   const storage = values => ({
@@ -196,7 +228,7 @@ function productionSettingsPage(scope) {
   const config = JSON.parse(require('node:child_process').execFileSync(process.env.PYTHON || 'python3', ['-B', '-c', 'import json; from adaptive_rsi.config import DEFAULTS; print(json.dumps(DEFAULTS))'], {cwd: path.join(__dirname, '..'), encoding: 'utf8'}));
   page.context.initialState.config = structuredClone(config);
   page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); project.overrides = {}; });
-  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}}, language: 'zh-CN'});
+  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}, pushState() {}}, language: 'zh-CN'});
   page.context.window.addEventListener = () => {}; page.context.window.scrollTo = () => {};
   vm.runInContext(experienceSource, page.context);
   // Keep production renderSettings, refresh, draft restoration and dirty status.
@@ -811,6 +843,7 @@ test('live task details rerender when synced input changes but keep unchanged po
 
 test('out-of-order task details cannot attach cancellation for the previous task', async () => {
   const page = browser(), cancellations = [];
+  page.context.uiConfirm = async () => true;
   const task = id => ({id, project: 'a', title: 'Task ' + id, body: '', evidence: '[]', state: 'executing'});
   const a = task('a'), b = task('b');
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}, {id: 'rb', task: 'b', project: 'a'}];
@@ -821,6 +854,7 @@ test('out-of-order task details cannot attach cancellation for the previous task
     if (url.includes('task-runs?task=b')) return response([{id:'rb',task:'b',project:'a'}]);
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
+    if (url.includes('task-cancel-preview?')) return response({affected: [], revision: 'preview-b'});
     if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
     return response(snapshot());
   };
@@ -832,7 +866,7 @@ test('out-of-order task details cannot attach cancellation for the previous task
   const buttons = page.node('detail-body').children.filter(node => node.textContent === '取消任务');
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
-  assert.deepEqual(cancellations, [{task: 'b'}]);
+  assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
 });
 
 test('closing task details while a response waits keeps the dialog closed', async () => {
@@ -1671,7 +1705,7 @@ test('revision and backoff messages are mapped and localized for both console la
 function experiencePage({navigation = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
-    URL, navigator: {}, history: {replaceState() {}},
+    URL, navigator: {}, history: {replaceState() {}, pushState() {}},
     location: {origin: 'http://fixture.test', href: 'http://fixture.test/', pathname: '/', search: ''}
   });
   page.context.window.addEventListener = (type, handler) => windowEvents.set(type, handler);
@@ -1685,18 +1719,6 @@ function experiencePage({navigation = false} = {}) {
   vm.runInContext(experienceSource, page.context);
   if (navigation) ready[0]();
   page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
-  const create = page.document.createElement;
-  page.document.createElement = tag => {
-    const node = create(tag);
-    if (tag === 'select') {
-      let value = '';
-      Object.defineProperty(node, 'value', {
-        get: () => value,
-        set: next => { value = node.children.some(option => option.value === next) ? next : ''; }
-      });
-    }
-    return node;
-  };
   page.context.refresh = async () => {};
   return page;
 }
@@ -3194,4 +3216,25 @@ test('an available desktop update starts polling only after its download begins'
   assert.equal(page.desktop.downloads.length, 1, 'the download is requested once');
   assert.ok(vm.runInContext('desktopUpdateTimer', page.context), 'polling starts once the download begins');
   assert.equal(page.node('desktop-update').disabled, true);
+});
+
+test('multiple predecessors survive language rebuild and save as one dependency set', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push(JSON.parse(options.body));return response({saved:true});}
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks:[fixtureTask('first'),fixtureTask('second')]});
+    if (url.includes('id=first&')) return response(fixtureTask('first'));
+    if (url.includes('id=second&')) return response(fixtureTask('second'));
+    return response({...task,dependencies:[],urgency:0});
+  };
+  await openExperienceTask(page,task);
+  let form=queueForm(page), select=form.children[0].children[0];
+  for(const option of select.children)option.selected=['first','second'].includes(option.value);
+  await changeDetailLanguage(page);
+  await new Promise(setImmediate);
+  form=queueForm(page);select=form.children[0].children[0];
+  assert.deepEqual(select.selectedOptions.map(option=>option.value).sort(),['first','second']);
+  form.onsubmit({preventDefault(){}});await page.context.lastAction;
+  assert.deepEqual(posts,[{task:'child',dependencies:['first','second'],urgency:0}]);
 });

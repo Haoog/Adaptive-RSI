@@ -189,7 +189,7 @@ async function checkRouteSaveRace(browser,url,errors) {
     await page.unroute('**/api/model-center/routes');
     await page.locator('#mc-save-routes').click();
     await page.locator('#mc-dirty').filter({hasText:'模型分工已保存'}).waitFor();
-    await page.reload();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
     assert.equal(await effort.inputValue(),original);
   }finally{release();await page.close();}
 }
@@ -341,7 +341,7 @@ async function checkPendingSettingsDraft(browser, url, errors) {
         assert.ok(draft, JSON.stringify({scenario, original, submitted, posts, baseline: await weight.inputValue(), storage: await page.evaluate(() => sessionStorage.getItem('rsi-ui-drafts'))}));
         const saved = draft.values.find(entry => entry.path === 'schedule.weight');
         assert.equal(saved.value, original); assert.equal(saved.baselineValue, Number(submitted));
-        await page.reload(); await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+        await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click(); await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
         await page.locator('#project-settings').click();
         if (global) await page.locator('[data-settings-scope="global"]').click();
         await page.locator('#advanced-settings > summary').click();
@@ -366,7 +366,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.goto(url);
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('#goal-text').fill('Unsubmitted browser goal draft');
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'Unsubmitted browser goal draft');
 
@@ -389,7 +389,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#mc-input-key').fill(secret);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('BROWSER-SECRET-MUST-NOT-PERSIST')||false),false);
 
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'Unsubmitted browser goal draft');
     await page.locator('#project-settings').click();
@@ -408,7 +408,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.locator('#goal-form button[type="submit"]').click();
     assert.equal((await saved).status(),200);
     await page.waitForFunction(()=>document.getElementById('goal-text').value==='');
-    await page.reload();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'');
   }finally{await page.close();}
@@ -504,7 +504,7 @@ async function checkObsoleteActions(browser,url,errors) {
     const project=await page.locator('#project-select').inputValue();
     assert.equal((await (await page.request.get(new URL('/api/task?id='+task+'&project='+project,url).href)).json()).state,'queued');
     await page.getByRole('button',{name:'过时任务补充入口',exact:true}).click();
-    await page.locator('.task-controls textarea').fill('补充过时任务的新验收要求');
+    await page.getByRole('textbox', {name:'补充需求（保留在当前任务）',exact:true}).fill('补充过时任务的新验收要求');
     const revised=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/task/revise'&&response.request().method()==='POST');
     await page.getByRole('button',{name:'保存补充并重新评估',exact:true}).click();
     assert.equal((await revised).status(),200);
@@ -530,6 +530,16 @@ async function main() {
       server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
+    const group=process.env.RSI_BROWSER_HARDENING_GROUP;
+    if(group){
+      const steps={core:[()=>checkReadiness(browser,url,false,errors),()=>checkReadiness(browser,url,true,errors),()=>checkReadinessInstallAction(browser,url,errors),()=>checkRunProgress(browser,url,errors),()=>checkModelForms(browser,url,errors)],
+       providers:[()=>checkProviderSaveRace(browser,url,errors),()=>checkProviderSaveRace(browser,url,errors,true)],
+       routes:[()=>checkRouteSaveRace(browser,url,errors)],updates:[()=>checkUpdatePending(browser,url,errors),()=>checkUpdateRateLimit(browser,url,errors)],
+       settings:[()=>checkPendingSettingsDraft(browser,url,errors)],recovery:[()=>checkDraftRecovery(browser,url,errors),()=>checkInvalidConfigRepair(browser,url,errors)]};
+      assert.ok(steps[group],'Unknown hardening test group');
+      for(const [index,step] of steps[group].entries()){const began=Date.now();await step();console.log('Hardening '+group+' step '+(index+1)+': '+((Date.now()-began)/1000)+'s');}
+      assert.deepEqual(errors,[]);return;
+    }
     if(process.env.RSI_BROWSER_SETTINGS_ONLY){await checkPendingSettingsDraft(browser,url,errors);assert.deepEqual(errors,[]);return;}
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
     if(process.env.RSI_BROWSER_PROVIDERS_ONLY){await checkProviderSaveRace(browser,url,errors);await checkProviderSaveRace(browser,url,errors,true);assert.deepEqual(errors,[]);console.log('Provider creation acknowledgement checks passed.');return;}

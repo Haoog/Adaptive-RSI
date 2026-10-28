@@ -62,3 +62,11 @@ CI 会先区分文档改动和代码改动。纯文档改动检查本地链接�
 发布插件与维护更新资产见 [RELEASING.md](RELEASING.md)。自动 PR 与合并只适用于明确授权的项目，并须通过完整交付门禁。
 
 提交代码即表示同意按仓库的 MIT 许可证提供该贡献。
+
+纯机械版本 PR 只有在六个改动文件逐字匹配独立重建的发布补丁时，普通 CI 才走版本元数据检查；源码、工作流、分类器或生成脚本有变化均走完整普通 CI。该路径减少重复源码检查，自动合并版本 PR 仍必须通过 `release-verify.yml` 对最终提交的全量 Python、浏览器、桌面构建、smoke 和 provenance 门禁。耗时缓存只影响工作线程分配；无效记录回退完整发现，缓存不能跳过测试。
+
+历史规模性能基准：`python3 -B scripts/benchmark_history.py --tasks 10000 --samples 3 --enforce --output /tmp/rsi-history-performance.json`。固定四项目、每任务两次运行、2023 年锚点和稳定序号分布；每种读取及 JSON 序列化的 p95 上限 5000 ms，单响应 8 MiB。脚本仅替换指标模块的时钟以重放固定窗口，不调用模型。可用 `--tasks 50000` 本地加压，普通 CI 只运行一次万任务基准；报告包含 Python/SQLite/平台及数据集摘要，超预算明确失败并保留 artifact。它不测 HTTP 网络、真实磁盘冷缓存或生产并发负载。
+
+动态文案结构检查：先 `npm ci --ignore-scripts`，再 `node scripts/check_i18n_ast.cjs`。锁定的 Acorn 解析真实 JavaScript 语法，检查传入 `t()` 的字面量、条件表达式、可静态追踪的别名与动态字典，正确处理词法遮蔽和转义 Unicode；原有 Python 检查继续负责翻译重复键和中英内容非空。变量再赋值、解构和 for-of 的值传播、任意用户输入、服务端返回文本及无法静态解析的运行时拼接不视为已覆盖，仍需双语浏览器场景。中英文文档的内容等价由配对差异审查，链接检查不代表语义等价。
+
+审计台账核对：`python3 -B scripts/check_audit_ledger.py` 检查完成项的实现文件与验收入口，并核对由 JSON 生成的中英文计数和索引。修改台账后用 `--write` 更新生成文件。它不运行台账中的验收命令或测试用例，但核对 unittest selector 会导入测试模块并执行其 discovery hook，因此不是纯静态检查，仅用于可信仓库。它不代表当前提交已通过全部测试。隔离安装验证可运行 `python3 -B scripts/check_wheel_install.py`；脚本构建 wheel 并在仓库外临时环境启动 HTTP 契约检查，不调用模型，也不更新本地应用。

@@ -23,8 +23,11 @@ FULL_BUILD_FILES = {
     ".github/workflows/release-verify.yml",
     ".github/workflows/release.yml",
     "pyproject.toml",
+    "rust-toolchain.toml",
+    "requirements-build.txt",
     "scripts/package.py",
     "scripts/package_desktop.py",
+    "scripts/sbom.py",
     "scripts/test_updater_signing.py",
 }
 
@@ -150,7 +153,29 @@ def package_desktop(bundle_dir=BUNDLE_DIR, output_dir=OUTPUT_DIR, version=None,
     return destination
 
 
-def package_updater(bundle_dir, output_dir, version):
+def package_updater(bundle_dir, output_dir, version, require_inventory=False):
+    """Validate the entire release set before publishing any of its assets."""
+    if not re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", version):
+        raise ValueError("A stable package version is required")
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    published = []
+    with tempfile.TemporaryDirectory(prefix=".desktop-updater-", dir=output) as directory:
+        staged = Path(directory)
+        feed = _package_updater(bundle_dir, staged, version, require_inventory)
+        try:
+            for asset in sorted(staged.iterdir()):
+                destination = output / asset.name
+                os.link(asset, destination)
+                published.append(destination)
+        except BaseException:
+            for asset in published:
+                asset.unlink()
+            raise
+    return feed
+
+
+def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     """Publish a manifest only when the complete signed updater artifact exists."""
     bundle_dir, output = Path(bundle_dir), Path(output_dir)
     bundles = [p for p in bundle_dir.glob("*.app.tar.gz") if p.is_file() and not p.is_symlink()]
@@ -173,18 +198,21 @@ def package_updater(bundle_dir, output_dir, version):
     (output / "desktop-latest.json").write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")
     # Build a minimal, machine-readable release inventory. It contains only
     # public build inputs and proof hashes, never user state or credentials.
+    sys.path.insert(0, str(ROOT))
+    from scripts.sbom import components
+    inventory = components(ROOT, require_inventory=require_inventory)
+    if require_inventory and any(item["name"] == "engine-inventory-unavailable" for item in inventory):
+        raise ValueError("Formal releases require the actual engine dependency inventory")
     sbom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
-        "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "metadata": {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(os.environ["SOURCE_DATE_EPOCH"]) if "SOURCE_DATE_EPOCH" in os.environ else None)),
                      "component": {"type": "application", "name": "adaptive-rsi", "version": version}},
         "components": [
             {"type": "application", "name": "adaptive-rsi-desktop", "version": version},
             {"type": "application", "name": "adaptive-rsi-engine", "version": version},
-            {"type": "library", "name": "Tauri", "version": "2", "scope": "required"},
-            {"type": "library", "name": "Python", "version": ">=3.9", "scope": "required"},
-        ],
+        ] + inventory,
     }
     (output / "sbom.cdx.json").write_text(json.dumps(sbom, indent=2) + "\n", encoding="utf-8")
     return feed
@@ -214,7 +242,7 @@ def main():
         if os.environ.get("RSI_UPDATER_PUBLIC_KEY"):
             source = (ROOT / "adaptive_rsi/__init__.py").read_text()
             version = re.search(r'(?m)^__version__ = "(\d+\.\d+\.\d+)"$', source).group(1)
-            package_updater(BUNDLE_DIR.parent / "macos", OUTPUT_DIR, version)
+            package_updater(BUNDLE_DIR.parent / "macos", OUTPUT_DIR, version, require_inventory=True)
         print(json.dumps({"asset": image.name, "sha256": image.with_name(image.name + ".sha256").name,
                           "bytes": image.stat().st_size}, ensure_ascii=False))
 

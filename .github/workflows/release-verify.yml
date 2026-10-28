@@ -30,6 +30,65 @@ jobs:
           PR_NUMBER: ${{ inputs.pr }}
           PR_SHA: ${{ inputs.sha }}
         run: python3 scripts/release.py gate --pr "$PR_NUMBER" --sha "$PR_SHA"
+  tests:
+    needs: gate
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ci/test-durations.json
+          key: test-timings-${{ runner.os }}-${{ hashFiles('tests/test_*.py', 'scripts/test_worker.py') }}-${{ github.run_id }}
+          restore-keys: test-timings-${{ runner.os }}-
+      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
+      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js && node --check adaptive_rsi/web/auth.js && node --check adaptive_rsi/web/experience.js && node --check adaptive_rsi/web/install.js && node --check adaptive_rsi/web/sw.js
+      - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
+      - run: npm ci --ignore-scripts
+      - run: node scripts/check_i18n_ast.cjs
+      - run: node --test tests/web_*.cjs
+      - run: python3 scripts/check_i18n.py
+      - run: python3 scripts/check_api_contract.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: timing-${{ github.run_id }}
+          path: |
+            .ci/test-durations.json
+            .ci/test-durations.failures.json
+          if-no-files-found: ignore
+  browser:
+    needs: gate
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - run: npm run test:browser
   verify:
     needs: gate
     runs-on: macos-latest
@@ -73,29 +132,14 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
-      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
-      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js && node --check adaptive_rsi/web/auth.js && node --check adaptive_rsi/web/experience.js && node --check adaptive_rsi/web/install.js && node --check adaptive_rsi/web/sw.js
-      - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
-      - run: node --test tests/web_requests.cjs tests/web_service_worker.cjs
-      - run: python3 scripts/check_i18n.py
-      - run: python3 scripts/check_api_contract.py
-      - run: npm ci --ignore-scripts
-      - run: npx playwright install chromium
-      - run: npm run test:browser
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: steps.attest.outcome == 'success'
-        with:
-          name: timing-${{ github.run_id }}
-          path: .ci/test-durations.json
-          if-no-files-found: ignore
       - run: python3 scripts/package.py
-      - run: python3 -m pip install --disable-pip-version-check build
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-build.txt
       - run: python3 -m build --wheel
         env:
           SOURCE_DATE_EPOCH: '1577836800'
       - name: 安装 macOS ARM64 桌面构建工具
         run: |
-          rustup default stable
+          rustup default 1.99.1
           npm ci --prefix desktop
       - name: 构建、验证并收集桌面安装包
         env:
@@ -143,7 +187,7 @@ jobs:
           compression-level: 0
   report:
     if: always() && needs.gate.result == 'success'
-    needs: [gate, verify]
+    needs: [gate, tests, browser, verify]
     runs-on: ubuntu-latest
     permissions:
       checks: write
@@ -152,7 +196,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_SHA: ${{ needs.gate.outputs.sha }}
-          CHECK_RESULT: ${{ needs.verify.result }}
+          CHECK_RESULT: ${{ needs.verify.result == 'success' && needs.tests.result == 'success' && needs.browser.result == 'success' && 'success' || 'failure' }}
         run: |
           conclusion=failure
           if [ "$CHECK_RESULT" = success ]; then conclusion=success; fi
@@ -162,7 +206,7 @@ jobs:
             -f 'output[title]=版本 PR 独立检查' \
             -f 'output[summary]=可信主线工作流核对精确版本补丁、完整检查及 ZIP/wheel/桌面安装包；provenance 可用时传递精确源树产物供正式发布复验复用。'
   merge:
-    needs: [gate, verify, report]
+    needs: [gate, tests, browser, verify, report]
     runs-on: ubuntu-latest
     permissions:
       contents: write

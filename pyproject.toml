@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools==80.9.0; python_version < '3.10'", "setuptools==84.2.1; python_version >= '3.10'", "wheel==0.48.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,4 +18,4 @@ adaptive-rsi = "adaptive_rsi.cli:main"
 include = ["adaptive_rsi*"]
 
 [tool.setuptools.package-data]
-adaptive_rsi = ["web/*"]
+adaptive_rsi = ["web/*", "schemas/*.json", "migrations/*.sql"]

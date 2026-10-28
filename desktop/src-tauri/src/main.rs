@@ -7,7 +7,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::{Mutex, MutexGuard, RwLock},
+    sync::{Mutex, MutexGuard},
     time::Duration,
 };
 use tauri::{
@@ -20,10 +20,14 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod native_update;
+#[cfg(test)]
+mod update_boundary_tests;
+mod transport;
 
 #[derive(Clone)]
 struct Connection {
     client: Client,
+    transport: transport::Transport,
     origin: String,
     csrf_origin: String,
     cookie: Option<String>,
@@ -37,8 +41,8 @@ struct RuntimeState {
     local: Mutex<Option<Connection>>,
     child: Mutex<Option<Child>>,
     error: Mutex<String>,
-    request_gate: RwLock<()>,
     update: Mutex<Option<DesktopUpdate>>,
+    transport: transport::Control,
 }
 
 ///桌面应用自身的更新状态；percent 存百分比×100，避免浮点原子。
@@ -486,15 +490,6 @@ struct Reply {
     body: String,
 }
 
-fn client() -> Result<Client, String> {
-    Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .cookie_store(true)
-        .timeout(Duration::from_secs(210))
-        .build()
-        .map_err(|_| "Cannot create connection".into())
-}
 fn valid_api_path(path: &str) -> bool {
     let endpoint = path.split('?').next().unwrap_or("");
     !endpoint.is_empty()
@@ -584,35 +579,6 @@ fn call_with_session(
     Ok((reply, credentials))
 }
 
-fn proxy_request(state: &RuntimeState, path: &str, body: Option<Value>) -> Result<Reply, String> {
-    // 常规请求可并发；轮换需等已有请求结束，并在发布新凭据前阻止旧凭据请求。
-    let rotating = path.split('?').next() == Some("session/rotate") && body.is_some();
-    let _rotation = rotating.then(|| state.request_gate.write().unwrap());
-    let _request = (!rotating).then(|| state.request_gate.read().unwrap());
-    let connection = state
-        .target
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| state.error.lock().unwrap().clone())?;
-    let timeout = match path.split('?').next().unwrap_or("") {
-        "model-center/probe" => 960,
-        "projects/import" => 210,
-        _ => 60,
-    };
-    let (reply, credentials) = call_with_session(&connection, path, body, Some(Duration::from_secs(timeout)))?;
-    if let Some((cookie, csrf)) = credentials {
-        for slot in [&state.target, &state.local] {
-            if let Some(current) = slot.lock().unwrap().as_mut() {
-                if current.origin == connection.origin && current.csrf == connection.csrf {
-                    current.cookie = Some(cookie.clone());
-                    current.csrf = csrf.clone();
-                }
-            }
-        }
-    }
-    Ok(reply)
-}
 
 fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     if cfg!(target_os = "windows") {
@@ -671,6 +637,7 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     );
     let health_deadline = std::time::Instant::now() + Duration::from_secs(60);
     let child = command
+        .env("ADAPTIVE_RSI_DESKTOP_OWNER_PID", std::process::id().to_string())
         .arg("desktop-runtime")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -707,8 +674,10 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     if parsed.scheme() != "http" || parsed.host_str() != Some("127.0.0.1") {
         return Err("Invalid local runtime address".into());
     }
+    let (client, transport) = transport::clients()?;
     let connection = Connection {
-        client: client()?,
+        client,
+        transport,
         csrf_origin: session.origin,
         origin,
         cookie: Some(format!("{}={}", session.cookie, session.token)),
@@ -899,12 +868,15 @@ async fn request(
     app: tauri::AppHandle,
     path: String,
     body: Option<Value>,
+    request_id: Option<String>,
 ) -> Result<Reply, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        proxy_request(&app.state::<RuntimeState>(), &path, body)
-    })
-    .await
-    .map_err(|_| "Request interrupted".to_string())?
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = request_id.unwrap_or_else(|| format!("legacy-{}", NEXT.fetch_add(1, Ordering::SeqCst)));
+    transport::request(&app.state::<RuntimeState>(), &path, body, id).await
+}
+#[tauri::command]
+fn cancel_request(state: tauri::State<RuntimeState>, id: String) {
+    state.transport.cancel(&id);
 }
 #[tauri::command]
 fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
@@ -917,11 +889,13 @@ fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
 }
 #[tauri::command]
 async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, String> {
+    let state = app.state::<RuntimeState>();
+    state.transport.cancel_all();
+    let _connection_change = state.transport.gate.write().await;
     if url.as_deref().unwrap_or("").is_empty() {
         let handle = app.clone();
         return tauri::async_runtime::spawn_blocking(move || {
             let state = handle.state::<RuntimeState>();
-            let _gate = state.request_gate.write().unwrap();
             let local = state
                 .local
                 .lock()
@@ -953,7 +927,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
     }
     let origin = parsed.origin().ascii_serialization();
     let connection = tauri::async_runtime::spawn_blocking(move || {
-        let client = client()?;
+        let (client, transport) = transport::clients()?;
         let response = client
             .get(parsed)
             .send()
@@ -963,6 +937,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         }
         let mut c = Connection {
             client,
+            transport,
             csrf_origin: origin.clone(),
             origin,
             cookie: None,
@@ -973,7 +948,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         let health = call(&c, "health", None)?;
         let value: Value =
             serde_json::from_str(&health.body).map_err(|_| "Invalid runtime handshake")?;
-        if health.status != 200 || value.get("api_version").and_then(Value::as_u64) != Some(1) {
+        if health.status != 200 || !matches!(value.get("api_version").and_then(Value::as_u64), Some(1 | 2)) {
             return Err("Update the remote runtime before connecting".into());
         }
         let response = call(&c, "state?sections=core", None)?;
@@ -989,9 +964,9 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
     })
     .await
     .map_err(|_| "Connection interrupted")??;
+    let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<RuntimeState>();
-        let _gate = state.request_gate.write().unwrap();
+        let state = handle.state::<RuntimeState>();
         *state.target.lock().unwrap() = Some(connection);
         runtime_info(state.clone())
     })
@@ -1013,15 +988,14 @@ async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|_| "Request interrupted".to_string())?
 }
 #[tauri::command]
-async fn native_update(app: tauri::AppHandle, action: String) -> Result<Value, String> {
+async fn native_update(app: tauri::AppHandle, action: String, installation_window: Option<String>) -> Result<Value, String> {
     match action.as_str() {
         "status" => Ok(native_update::snapshot(&app)),
         "check" => native_update::check(app, false).await,
         "download" => native_update::check(app, true).await,
         "cancel" => { native_update::cancel(&app); Ok(native_update::snapshot(&app)) },
         "install" => {
-            tauri::async_runtime::spawn_blocking(move || native_update::install(app))
-                .await.map_err(|_| "update_worker_failed".to_string())??;
+            native_update::install(app, installation_window.unwrap_or_else(|| "any".into())).await?;
             Ok(json!({"state":"restarting"}))
         },
         _ => Err("invalid_update_action".into()),
@@ -1094,6 +1068,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             request,
+            cancel_request,
             runtime_info,
             connect,
             choose_folder,
@@ -1227,8 +1202,10 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
                 .unwrap();
         });
+        let (client, transport) = super::transport::clients().unwrap();
         let c = super::Connection {
-            client: super::client().unwrap(),
+            client,
+            transport,
             origin,
             csrf_origin: "https://rsi.example.test".into(),
             cookie: None,

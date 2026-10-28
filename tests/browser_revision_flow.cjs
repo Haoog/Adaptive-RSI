@@ -21,12 +21,12 @@ async function closeDetail(page) {
 async function checkOverflow(page, viewport, errors) {
   await openDetail(page, '修订长文本任务', 'attention');
   const revisions = page.locator('#detail-body details').filter({ hasText: '需求修订记录' });
-  await revisions.locator('summary').click();
+  await revisions.locator(':scope > summary').click();
   await page.waitForTimeout(300);
   const metrics = await page.evaluate(() => {
     const dialog = document.querySelector('#detail-dialog');
     const body = document.querySelector('#detail-body');
-    const longParagraphs = [...document.querySelectorAll('#detail-body p')]
+    const longParagraphs = [...document.querySelectorAll('#detail-body p,#detail-body .task-controls summary')]
       .filter(node => /X{100}|Z{100}|https:\/\/example\.test\//.test(node.textContent || ''));
     return {
       viewport: innerWidth,
@@ -118,6 +118,32 @@ async function checkRevisionFlow(browser, url, errors) {
       await page.locator('.task-row').first().waitFor({ timeout: 10000 });
       await checkOverflow(page, name, errors);
       if (name === 'mobile') await checkBackoffRetry(page, url, errors);
+      if (name === 'desktop') {
+        await openDetail(page, '修订长文本任务', 'attention');
+        await page.getByLabel('补充需求（保留在当前任务）', {exact: true}).fill('验证精确修订快照');
+        await page.getByLabel('干预原因（可选，保留原文）', {exact: true}).fill('补充边界条件');
+        const saved = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/revise' && response.request().method() === 'POST');
+        await page.getByRole('button', {name: '保存补充并重新评估', exact: true}).click();
+        assert.equal((await saved).status(), 200);
+        const history = page.locator('#detail-body .task-controls details').filter({has: page.locator('summary', {hasText: '需求修订记录'})}).first();
+        await history.locator(':scope > summary').click();
+        const revision = history.locator('details').filter({has: page.locator('summary', {hasText: '验证精确修订快照'})}).first();
+        await revision.locator(':scope > summary').click();
+        await revision.getByText('旧候选已失效，后续运行将重新验证。', {exact: true}).waitFor();
+        assert.ok((await revision.locator('pre').first().textContent()).includes('+验证精确修订快照'));
+        await revision.getByText('修改后需求', {exact: true}).click();
+        assert.ok((await revision.locator('details').filter({hasText: '修改后需求'}).locator('pre').textContent()).includes('来源正文'));
+        const interventions = page.locator('#detail-body .task-controls details').filter({has: page.locator(':scope > summary', {hasText: '人工干预记录'})}).first();
+        await interventions.locator(':scope > summary').click();
+        const event = interventions.locator('details').filter({hasText: '补充边界条件'}).first();
+        await event.locator(':scope > summary').click();
+        await event.getByText('补充边界条件', {exact: true}).waitFor();
+        const downloaded = page.waitForEvent('download');
+        await interventions.getByRole('button', {name: '导出已加载的干预记录', exact: true}).click();
+        const receipt = JSON.parse(await require('node:fs/promises').readFile(await (await downloaded).path(), 'utf8'));
+        assert.equal(receipt.complete, true);
+        assert.ok(receipt.entries.some(entry => entry.data.reason === '补充边界条件' && entry.data.before.body_hash !== entry.data.after.body_hash));
+      }
     } finally {
       await page.close();
     }

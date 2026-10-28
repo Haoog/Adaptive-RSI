@@ -1076,19 +1076,20 @@ class AuthSessions:
     def complete(self, session_id, code=""):
         if not isinstance(code, str) or len(code) > 8192:
             raise AuthError("invalid_auth_code")
+        self.status(session_id)
         with self.lock:
-            item = self.status(session_id)
+            item = self.sessions[session_id]
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
                 raise AuthError("invalid_auth_state")
             if not code.strip():
                 raise AuthError("invalid_auth_code")
             self.sessions[session_id]["_code"] = code.strip()
             self._update(session_id, state="completing")
-            return self.status(session_id)
+        return self.status(session_id)
 
     def cancel(self, session_id):
+        self.status(session_id)
         with self.lock:
-            self.status(session_id)
             self._update(session_id, state="cancelled")
             worker = self.workers.get(session_id)
         if worker:

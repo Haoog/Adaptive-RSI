@@ -93,15 +93,42 @@ def merge_protection(config):
     cached = _PROTECTION_CACHE.get(key)
     if cached and time.monotonic() - cached[0] < 300:
         return cached[1]
-    result = {"state": "unknown", "strict_checks": None, "branch": branch}
+    result = {"state": "unknown", "strict_checks": None, "branch": branch,
+              "merge_queue": None, "complete": False,
+              "sources": {"classic": "unknown", "rulesets": "unknown"}}
+    from urllib.parse import quote
     try:
-        from urllib.parse import quote
         if not branch:
             branch = json.loads(checked(["gh", "api", "repos/" + repo], timeout=10))["default_branch"]
-        policy = json.loads(checked(["gh", "api", "repos/" + repo + "/branches/" + quote(branch, safe="") +
-                                     "/protection"], timeout=10))
-        strict = bool((policy.get("required_status_checks") or {}).get("strict"))
-        result = {"state": "strict" if strict else "review_rules", "strict_checks": strict, "branch": branch}
+        result["branch"] = branch
+        strict_values = []
+        try:
+            policy = json.loads(checked(["gh", "api", "repos/" + repo + "/branches/" + quote(branch, safe="") +
+                                         "/protection"], timeout=10))
+            strict_values.append(bool((policy.get("required_status_checks") or {}).get("strict")))
+            result["sources"]["classic"] = "observed"
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        try:
+            # The effective branch rules endpoint includes inherited active rulesets.
+            rules = json.loads(checked(["gh", "api", "repos/" + repo + "/rules/branches/" +
+                                        quote(branch, safe=""), "--paginate", "--slurp"], timeout=10))
+            if not isinstance(rules, list):
+                raise ValueError("Invalid branch rules")
+            rules = [rule for page in rules for rule in (page if isinstance(page, list) else [page])]
+            if not all(isinstance(rule, dict) for rule in rules):
+                raise ValueError("Invalid branch rule")
+            result["sources"]["rulesets"] = "observed"
+            result["merge_queue"] = any(rule.get("type") == "merge_queue" for rule in rules)
+            strict_values.extend(bool((rule.get("parameters") or {}).get("strict_required_status_checks_policy"))
+                                 for rule in rules if rule.get("type") == "required_status_checks")
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        result["complete"] = all(value == "observed" for value in result["sources"].values())
+        if any(strict_values):
+            result.update(state="strict", strict_checks=True)
+        elif result["complete"]:
+            result.update(state="review_rules", strict_checks=False)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError):
         pass
     if len(_PROTECTION_CACHE) >= 64:
@@ -128,6 +155,71 @@ def merge_gate(pr, head, base):
     if pr.get("isDraft") or pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") != "CLEAN":
         return "waiting"
     return "ready"
+
+
+def baseline_change(source, previous, current):
+    """Diagnose a changed baseline using objects already fetched; never alter refs."""
+    result = {"previous": previous, "current": current, "relation": "unknown",
+              "evidence_invalidated": previous != current,
+              "recovery": "Preserve the candidate and local history; refresh the baseline and re-evaluate before publishing. Never force-push the upstream branch."}
+    if previous == current:
+        result["relation"] = "identical"
+        return result
+    try:
+        ancestor = git(source, "merge-base", previous, current)
+        result["relation"] = "advanced" if ancestor == previous else "rewritten" if ancestor == current else "diverged"
+    except (RuntimeError, OSError):
+        pass
+    return result
+
+
+def branch_cleanup_preview(repo, recovery_refs=None):
+    """Read-only, bounded preview. Omitted pages and unknown ownership stay protected.
+
+    Callers must supply all retained recovery branch names or commit SHAs. No
+    deletion endpoint is provided; candidates must be rechecked before deletion.
+    """
+    from .release import api
+    branches = api(repo, "branches?per_page=100")
+    prs = api(repo, "pulls?state=all&per_page=100")
+    if not isinstance(branches, list) or not isinstance(prs, list):
+        raise ValueError("Invalid branch cleanup response")
+    complete = len(branches) < 100 and len(prs) < 100
+    candidates, protected = [], []
+    recovery = set(recovery_refs or ())
+    for branch in branches:
+        name, sha = branch["name"], branch.get("commit", {}).get("sha")
+        matching = [pr for pr in prs if pr.get("head", {}).get("ref") == name]
+        reason = None
+        if not re.fullmatch(r"(?:feat|fix)/rsi-[A-Za-z0-9._-]+", name):
+            reason = "not_managed"
+        elif recovery_refs is None:
+            reason = "recovery_inventory_unknown"
+        elif branch.get("protected") or name in recovery or sha in recovery:
+            reason = "protected_or_recovery"
+        elif not complete:
+            reason = "incomplete_inventory"
+        elif any(pr.get("state", "").lower() == "open" for pr in matching):
+            reason = "open_pr"
+        elif not matching or not any(pr.get("state", "").lower() == "closed" and
+                                     pr.get("head", {}).get("sha") == sha for pr in matching):
+            reason = "unverified_ownership"
+        if reason:
+            protected.append({"branch": name, "reason": reason})
+        else:
+            candidates.append(name)
+    return {"candidates": candidates, "protected": protected, "complete": complete,
+            "deletion_performed": False, "checked_at": time.time()}
+
+
+def failure_attribution(merged, head, result):
+    """A failing later mainline is not evidence that the delivered candidate failed."""
+    checks = result.get("checks") or {}
+    baseline_checks = [check for label, rows in checks.items() if label in ("baseline", "acceptance_baseline") for check in rows]
+    baseline_passed = bool(baseline_checks) and all(check.get("passed") is True for check in baseline_checks)
+    return {"merged_sha": merged, "observed_head": head,
+            "scope": "subsequent_mainline" if head != merged and baseline_passed else "unknown",
+            "merge_baseline_passed": baseline_passed, "candidate_regression_proven": False}
 
 
 def publish(runtime, project, task, run, workspace, config):
@@ -168,7 +260,7 @@ def publish(runtime, project, task, run, workspace, config):
     repo = config["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise RuntimeError("PR repository must match project origin")
-    _, current, base_branch = baseline(runtime, project, config)
+    source, current, base_branch = baseline(runtime, project, config)
     authorize_write()
     identity = store.setting("run-baseline:" + run["id"])
     expected = {"repository": repo, "branch": base_branch, "sha": run["base"]}
@@ -198,6 +290,8 @@ def publish(runtime, project, task, run, workspace, config):
         existing_pr = pr_view(repo, url)
         if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName") != identity["branch"]:
             raise RuntimeError("Existing PR head or target differs from evaluated candidate")
+        if existing_pr.get("state") == "CLOSED":
+            raise RuntimeError("Existing PR is closed without merging; explicitly reopen it before retrying delivery")
         # Recover an observed remote fact before any later cancellation can discard it.
         # This path performs no remote write, so fresh publishing authorization is unnecessary.
         with store.connect() as db:
@@ -216,7 +310,9 @@ def publish(runtime, project, task, run, workspace, config):
                            (time.time(), task["id"]))
     else:
         if current != run["base"]:
-            raise StaleCandidate("Remote baseline changed; retry and re-evaluate before publishing")
+            change = baseline_change(source, run["base"], current)
+            store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
+            raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
         authorize_write()
         github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
@@ -581,7 +677,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state,
-                           "head": head, "checked_at": now, "evaluation": result}
+                           "head": head, "checked_at": now, "evaluation": result,
+                           "attribution": failure_attribution(outcome["merged_sha"], head, result)}
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
         outcome["feedback"]["investigation_pending"] = True
     runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
@@ -594,13 +691,16 @@ def investigate(runtime, project, run, outcome):
     from .storage_tools import pending_investigation
     feedback_status = outcome["feedback"]
     report = pending_investigation(feedback_status)
+    if report is None:
+        return
     failures = []
     for label, rows in report["evaluation"].get("checks", {}).items():
         for check in rows:
             if not check.get("passed") and len(failures) < 5:
                 failures.append({"group": label, "name": check.get("name", "")[:200],
                                  "output": (check.get("stderr", "") + check.get("stdout", ""))[-1200:]})
-    body = "Investigate verified post-merge regression from run " + run["id"] + ". "
+    body = "Investigate observed post-merge mainline failure while monitoring run " + run["id"] + ". "
+    body += "This does not prove a regression caused by the candidate. Attribution: " + encode(report.get("attribution", {"scope": "unknown"})) + ". "
     body += "Reproduce and assess value before changing code. Mainline: " + report["head"] + ". "
     body += "Full evidence is retained in the run's feedback report. Bounded excerpts: " + encode(failures)
     task = runtime.store.add_task(project["id"], "goal", "postmerge:" + run["id"] + ":" + report["head"],

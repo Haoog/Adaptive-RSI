@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
+      verification_mode: ${{ steps.classify.outputs.verification_mode }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -42,17 +43,23 @@ jobs:
             base="$(git rev-parse HEAD^)"
           fi
           git diff --name-only "$base" HEAD > /tmp/rsi-changed-paths
-          docs_only=true
+          metadata_candidate=true
           while IFS= read -r path; do
             case "$path" in
-              README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|EXPERIENCE.md|EXPERIENCE.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
-              *) docs_only=false; break ;;
+              plugin.json|pyproject.toml|adaptive_rsi/__init__.py|update.json|README.md|README.en.md|CHANGELOG.md|CHANGELOG.en.md|CONTRIBUTING.md|CONTRIBUTING.en.md|DESKTOP.md|DESKTOP.en.md|EXPERIENCE.md|EXPERIENCE.en.md|RELEASING.md|RELEASING.en.md|RELIABILITY.md|RELIABILITY.en.md|SERVER.md|SERVER.en.md|VALIDATION.md|VALIDATION.en.md|LIVE_VALIDATION.md|LIVE_VALIDATION.en.md|docs/*) ;;
+              *) metadata_candidate=false; break ;;
             esac
           done < /tmp/rsi-changed-paths
+          mode=full
+          if [ "$metadata_candidate" = true ]; then
+            mode="$(python3 scripts/classify_changes.py "$base" HEAD)"
+          fi
+          case "$mode" in docs|version|full) ;; *) exit 1 ;; esac
+          echo "verification_mode=$mode" >> "$GITHUB_OUTPUT"
+          if [ "$mode" = docs ]; then docs_only=true; else docs_only=false; fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "Changed paths:"
+          echo "Verification mode: $mode"
           cat /tmp/rsi-changed-paths
-          echo "docs_only=$docs_only"
 
   docs:
     needs: changes
@@ -63,9 +70,22 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: python3 scripts/check_docs.py
 
+  version_metadata:
+    needs: changes
+    if: needs.changes.outputs.verification_mode == 'version'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/check_docs.py
+      - name: 说明正式发版验证边界
+        run: echo "Only the independently reconstructed release metadata patch changed. Exact-head full tests, browser, desktop build and provenance remain mandatory in release-verify.yml before automatic release merge."
+
   python:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -75,17 +95,20 @@ jobs:
           - name: Python 3.9 兼容
             os: ubuntu-latest
             python: '3.9'
-            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report
+            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: Python 3.14 兼容
             os: ubuntu-latest
             python: '3.14'
-            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report
+            modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 控制、恢复与桌面
             os: ubuntu-latest
             modules: tests.test_controls tests.test_updates_recovery tests.test_update_safety tests.test_launcher_regressions tests.test_desktop_runtime tests.test_desktop_release
           - name: 运行时核心
             os: ubuntu-latest
             modules: tests.test_runtime.RuntimeTest
+          - name: 交接审计补齐
+            os: ubuntu-latest
+            modules: tests.test_audit_environment tests.test_audit_evaluation tests.test_audit_evolution tests.test_batch_planning tests.test_cleanup_recovery tests.test_delivery_readiness_audit tests.test_desktop_update_boundaries tests.test_frontend_capabilities tests.test_native_audit_contracts tests.test_runtime_handoff tests.test_storage_acceptance
           - name: 运行时适配与服务
             os: ubuntu-latest
             modules: tests.test_runtime.ConfigurationAndAdapterTest tests.test_runtime.ServerTest
@@ -97,7 +120,7 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_release tests.test_release_parallel tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5
+            modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery
@@ -119,7 +142,7 @@ jobs:
 
   quick_python:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     outputs:
       test_count: ${{ steps.summary.outputs.test_count }}
     runs-on: ubuntu-latest
@@ -129,8 +152,18 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
+      - run: python3 scripts/check_audit_ledger.py
       - run: python3 scripts/check_api_contract.py
       - run: python3 scripts/check_i18n.py
+      - name: 历史读取性能预算
+        run: python3 scripts/benchmark_history.py --tasks 10000 --samples 3 --budget-ms 5000 --enforce --output .ci/history-performance.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: history-performance
+          path: .ci/history-performance.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: 快速测试与数量指标
         id: summary
         run: |
@@ -140,7 +173,7 @@ jobs:
 
   macos_sandbox_core:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: macos-14
     timeout-minutes: 15
     steps:
@@ -152,6 +185,7 @@ jobs:
         run: |
           python3 -m unittest -v \
             tests.test_comprehensive_audit.AuditRegressionTest.test_command_cannot_write_outside_host_plan_scope \
+            tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate \
             tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project \
             tests.test_model_center.ModelCenterTest.test_real_keychain_round_trip_and_no_plaintext_database_key \
             tests.test_audit_boundaries.CodexExecutableTest.test_symlinked_codex_can_start_itself_inside_permissions \
@@ -165,7 +199,7 @@ jobs:
 
   macos_sandbox_flows:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: macos-14
     timeout-minutes: 15
     steps:
@@ -175,7 +209,7 @@ jobs:
           python-version: '3.12'
       - name: macOS 隔离交付与可靠性
         run: |
-          python3 -m unittest -v \
+          python3 scripts/test_selected.py --workers 4 --timeout 300 --durations .ci/macos-flow-durations.json \
             tests.test_delivery_loop.DeliveryLoopTest.test_candidate_cannot_weaken_a_modern_test_file_to_hide_a_regression \
             tests.test_delivery_loop.DeliveryLoopTest.test_high_risk_acceptance_artifacts_never_enter_implementer_workspace \
             tests.test_delivery_loop.DeliveryLoopTest.test_candidate_new_failing_test_is_not_erased_by_frozen_regression \
@@ -197,7 +231,7 @@ jobs:
 
   javascript:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -216,11 +250,13 @@ jobs:
       - run: node --check adaptive_rsi/web/sw.js
       - run: python3 scripts/check_i18n.py
       - run: python3 scripts/check_api_contract.py
-      - run: node --test tests/web_requests.cjs tests/web_service_worker.cjs
+      - run: npm ci --ignore-scripts
+      - run: node scripts/check_i18n_ast.cjs
+      - run: node --test tests/web_*.cjs
 
   browser:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: macos-14
     timeout-minutes: 10
     steps:
@@ -245,7 +281,7 @@ jobs:
 
   package:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -259,12 +295,12 @@ jobs:
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
       - run: python3 scripts/package.py
-      - run: python3 -m pip install --disable-pip-version-check build
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-build.txt
       - run: python3 -m build --wheel
 
   linux:
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.verification_mode == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -293,13 +329,15 @@ jobs:
 
   verify:
     if: always()
-    needs: [changes, docs, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
+    needs: [changes, docs, version_metadata, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: 汇总必需检查
         env:
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          VERIFICATION_MODE: ${{ needs.changes.outputs.verification_mode }}
+          VERSION_RESULT: ${{ needs.version_metadata.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
           PYTHON_RESULT: ${{ needs.python.result }}
@@ -314,6 +352,14 @@ jobs:
           if [ "$CHANGES_RESULT" != success ]; then
             echo "Change classification failed"
             exit 1
+          fi
+          if [ "$VERIFICATION_MODE" = version ]; then
+            if [ "$VERSION_RESULT" != success ]; then
+              echo "Release metadata checks failed: $VERSION_RESULT"
+              exit 1
+            fi
+            echo "Mechanical metadata checks passed; release-verify retains the full final gate"
+            exit 0
           fi
           if [ "$DOCS_ONLY" = true ]; then
             if [ "$DOCS_RESULT" != success ]; then
@@ -332,7 +378,7 @@ jobs:
           echo "All required checks passed"
 
   ci_metrics:
-    if: always() && needs.changes.outputs.docs_only != 'true'
+    if: always() && needs.changes.outputs.verification_mode == 'full'
     needs: [changes, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 2

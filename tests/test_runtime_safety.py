@@ -402,7 +402,8 @@ class RuntimeSafetyTest(unittest.TestCase):
                 self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (child,))["state"], expected)
                 self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='dependency_released'"))
 
-    def test_cancel_rechecks_terminal_state_after_initial_read(self):
+    def test_cancel_rechecks_terminal_state_after_preview(self):
+        from adaptive_rsi.task_lifecycle import cancellation_preview
         for state in ["pr_open", "merged", "completed"]:
             with self.subTest(state=state):
                 task = self.runtime.goal(self.project, "Finishing " + state)
@@ -410,21 +411,15 @@ class RuntimeSafetyTest(unittest.TestCase):
                 self.assertEqual(run["task"], task)
                 if state in ["pr_open", "merged"]:
                     self.store.transition(run["id"], "awaiting_approval", {}, True)
-                one = self.store.one
-
-                def finish_after_read(sql, args=()):
-                    row = one(sql, args)
-                    if sql == "SELECT * FROM tasks WHERE id=?" and args == (task,):
-                        if state in ["pr_open", "merged"]:
-                            self.store.execute("UPDATE runs SET state=? WHERE id=?", (state, run["id"]))
-                            self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, task))
-                        else:
-                            self.store.transition(run["id"], state, {}, True)
-                    return row
-
-                with patch.object(self.store, "one", side_effect=finish_after_read):
-                    with self.assertRaisesRegex(ValueError, "finished"):
-                        self.runtime.cancel_task(task)
+                with self.store.connect() as db:
+                    preview = cancellation_preview(db, task)
+                if state in ["pr_open", "merged"]:
+                    self.store.execute("UPDATE runs SET state=? WHERE id=?", (state, run["id"]))
+                    self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, task))
+                else:
+                    self.store.transition(run["id"], state, {}, True)
+                with self.assertRaisesRegex(ValueError, "finished"):
+                    self.runtime.cancel_task(task, expected=preview['revision'])
                 self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], state)
                 self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], state)
                 self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='cancelled'"))
@@ -716,8 +711,8 @@ class RuntimeSafetyTest(unittest.TestCase):
         patch_path = workspace.parent / "candidate.patch"
         patch_text = "diff --git a/calculator.py b/calculator.py\n@@ -1 +1 @@\n-return a-b\n+return a+b\n"
         patch_path.write_text(patch_text)
-        run = {"id": "review-run", "project": self.project,
-               "config": encode(self.runtime.config(self.project)), "started": time.time()}
+        self.runtime.goal(self.project, "Review sealed candidate")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
 
         self.runtime.invoke("review", "Review this candidate", workspace, run)
         self.assertIn(patch_text, agent.prompt)

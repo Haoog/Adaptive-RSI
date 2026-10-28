@@ -11,6 +11,32 @@ from .agent import CodexAgent
 from .process import Sandbox, run_process
 
 
+def github_capabilities(repo):
+    """Inspect repository permissions without exercising any write capability."""
+    import json
+    import re
+    result = {"read": "unknown", "write": "unknown", "actions_write": "unknown",
+              "pull_requests_write": "unknown", "test_write_performed": False}
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        return result
+    try:
+        response = run_process(["gh", "api", "repos/" + repo, "--method", "GET"], timeout=10)
+        if response["exit_code"] or response.get("error"):
+            return result
+        data = json.loads(response["stdout"])
+        if not isinstance(data, dict):
+            return result
+        result["read"] = "available"
+        permission = (data.get("permissions") or {}).get("push")
+        if isinstance(permission, bool):
+            result["write"] = "available" if permission else "unavailable"
+        # Repository push permission does not prove fine-grained token scopes,
+        # Actions dispatch permission, or permission to modify workflow files.
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return result
+
+
 def budget(store, project, config, required=1, run=None):
     # 保留旧调用方的数据结构；用量只记录，不参与准入判断。
     return {"ready": True, "remaining": None, "minimum": required,
@@ -187,9 +213,16 @@ def inspect(runtime, project, config=None, workspace=None, required=4, run=None)
         # 仓库缺失或损坏时 readiness 仍应给出可操作的结果，而不是整体报错。
         verified = False
     protection = None
+    capabilities = None
+    if config["delivery"]["mode"] == "pr" and config["github"]["repository"]:
+        capabilities = github_capabilities(config["github"]["repository"])
+        items.append(item("github_write", capabilities["write"] == "available",
+                          "Repository write permission: " + capabilities["write"] +
+                          ". Pull request and Actions token permissions remain unverified; no test write was performed.",
+                          "settings", reason="github_write_" + capabilities["write"]))
     if config["delivery"]["auto_merge"] and config["github"]["repository"]:
         from .delivery import merge_protection
         protection = merge_protection(config)
     return {"ready": all(i["ready"] for i in items), "items": items, "checks": checks, "merge_protection": protection,
-            "execution_verified": verified, "model_evidence": model_evidence,
+            "execution_verified": verified, "model_evidence": model_evidence, "github_capabilities": capabilities,
             "checked_at": time.time(), "budget": usage}

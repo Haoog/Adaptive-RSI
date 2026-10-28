@@ -309,3 +309,40 @@ Codex CLI must support named `permissions` profiles. macOS workers use Codex's o
 ## Desktop App
 
 A bundled local engine, menu-bar lifecycle, explicit project start, server connections and task-based usage reporting are available. Official releases include a macOS ARM64 DMG; its temporary signature is not Apple-notarized. See the [desktop guide](../DESKTOP.en.md) for limitations, lifecycle and platform support.
+
+## Storage Diagnostics and Archive Verification
+
+Successful console polling writes at most one request log per route per minute; error responses and writes are still recorded individually. `database.request_logging` reports process-local observed, persisted, sampled-out and failed-write counts. Logs contain paths without query values, bodies or authentication headers. Sampled-out request IDs have no persistent lookup.
+
+WAL maintenance uses only a `PASSIVE` checkpoint that does not wait for readers. The `wal` diagnostics report process-local snapshot count, oldest snapshot age, pending pages at the last checkpoint and its time. The snapshot count cannot describe readers in other processes. Long readers may retain WAL pages; maintenance does not interrupt them.
+
+Export and verify a private database archive with these commands. Compression levels are 0–9, with 6 as the default. Timeout or cancellation does not publish an incomplete archive.
+
+```sh
+adaptive-rsi --state-dir /PATH/TO/STATE archive --compression 6 --timeout 300 --max-mb 1024
+adaptive-rsi verify-archive /PATH/TO/STATE/archives/ARCHIVE.sqlite3.gz --timeout 60
+```
+
+The adjacent `.manifest.json` records SHA-256 hashes and sizes of both compressed content and source database, and declares the database-only scope. Verification decompresses within a budget into a temporary directory and checks hashes, SQLite integrity and relationships. It does not connect restored projects or dispatch remote work. Archives exclude source code, run artifacts and external credentials. The manifest detects corruption; it is not a signature or proof of origin. Legacy archives without a manifest fail explicitly and are not deleted automatically. Each maintenance cycle verifies at most one due archive; the same archive is normally rechecked every seven days.
+
+Native model failures retain normalized stop reasons including output limits, safety policy, refusal, pause and missing tool calls, with corresponding Chinese and English guidance. Provider request IDs from a fixed response-header allowlist are retained in call events or failure diagnostics after character and length validation. Authentication headers, cookies and complete response headers are excluded.
+
+If database corruption or an unwritable source directory prevents normal startup, run offline diagnostics without initializing `Store`:
+
+```sh
+adaptive-rsi recover-diagnostics /PATH/TO/STATE/state.sqlite3 --timeout 10 --max-mb 1024
+```
+
+The inspector opens the original database and existing WAL for reading, copies them into a temporary directory, and checks that copy. It creates no SHM or other files in the source directory. Output contains hashes, sizes, table counts and structured errors, excluding configuration values, task bodies and raw damaged pages. This is not a repair tool that can overwrite the original. Source changes during copying yield `consistent_source: false`; stop the runtime and inspect again. Damaged pages may prevent some counts; timeouts and insufficient space fail explicitly.
+
+Multi-project scheduling compares completed worker occupancy over the last 24 hours divided by each project's weight. Each run accounts for at least one second to avoid clock noise for very short jobs; this measures neither CPU time nor model cost. Projects continuously eligible for an hour take precedence over resource debt comparison, subject to pause, dependency, working-hour and concurrency constraints. The `fair-accounting` setting retains occupancy and waiting inputs for checking scheduling decisions.
+
+The database compatibility format remains v2. Subsequent maintenance migrations store SHA-256 hashes of their actual SQL bytes and validate applied history before changes. Modified migration content, unknown versions or history gaps block ordinary startup; offline diagnostics remain available for the source database. SQL changes and their ledger entry commit together. Legacy migrations 1/2 retain identifier-only checksums, which cannot retrospectively verify the old bootstrap body. Once sealed, startup no longer repeats the full backfill. This does not retroactively make the old bootstrap's transaction-external DDL atomic.
+
+Deployment health policy: `delivery.deploy.health_attempts` is the total round limit (1–10); `health_consecutive_successes` is the required consecutive count (1–round limit, default 1); `health_interval_seconds` is the interval (1–300 seconds); `health_warmup_seconds` is warmup (0–900 seconds). `health_url` is primary and `health_urls` adds up to seven distinct HTTPS URLs without credentials, query or fragment. Each round shares a 15-second total deadline. All endpoints must confirm the target full SHA; failure resets the success streak. Exhausting rounds without the required streak fails the gate. Observations persist across restart, and rollback follows the same policy. A successful individual sample does not by itself satisfy the observation gate.
+
+Data migration rollback protection: `delivery.deploy.rollback_data_policy` defaults to `manual`, including configurations created before this field existed. Only `backward_compatible` declares that the maintainer has verified the older program can read migrated data. Even with `automatic_rollback` enabled, an undeclared policy blocks new rollback dispatch. `rollback_recovery_notes` stores up to 2000 characters of manual instructions displayed verbatim in failure details. Describe database backups, reverse migration steps and compatible program versions; omit credentials. This declaration does not replace migration compatibility testing. Already-dispatched remote rollbacks remain tracked; the system does not pretend to retract an existing side effect.
+
+Execution resource queue: model calls have priority 10, normal commands 20, exclusive benchmarks 30; lower numbers go first, FIFO within a class. Requests waiting at least 30 seconds take FIFO precedence over younger requests, preventing unlimited overtaking by new arrivals. This does not preempt running work or promise an end time for blocked kernel calls. Exclusive evaluation waits until existing shared executions exit. Diagnostics include the latest 256 completed wait samples (including cancellations), nearest-rank p95, queue counts, oldest wait and the latest 64 receipts containing only sequence, priority, duration and outcome. Cancellation removes the queued reservation.
+
+Resource-pressure admission: `limits.min_free_disk_mb` and `limits.min_available_memory_mb` are configurable MiB low-water thresholds, 0–1048576. Both default to 0 (disabled), preserving existing configurations. Disk checks cover the state and project directories separately. A low or unavailable configured measurement defers new claims, keeping tasks queued without consuming retries. Other eligible projects can continue, and admission resumes when a later scheduler observation clears pressure. Running tasks are not terminated by this gate. This is an observation at claim time, not a reservation or guarantee against subsequent external consumption. Memory readings are cached for up to five seconds. macOS estimates reclaimable memory from vm_stat free/inactive/speculative pages; Linux uses MemAvailable capped by visible cgroup v2 limits, which does not imply every container controller is visible. An unsupported configured measurement defers admission. The API exposes observation time, basis, thresholds and reasons; the queue explains resource pressure. A changed threshold does not reuse the previous policy report for queue labels.

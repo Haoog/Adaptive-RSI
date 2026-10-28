@@ -46,19 +46,45 @@ class ModelCenter:
             raise CenterError("unknown_provider")
         return provider
 
-    @staticmethod
-    def signature(provider):
-        return fingerprint({k: v for k, v in provider.items() if k != "name"})
+    def signature(self, provider):
+        fields = {k: v for k, v in provider.items() if k != "name"}
+        generation = self.credentials.epoch(provider)
+        if generation:
+            fields["credential_generation"] = generation
+        return fingerprint(fields)
 
-    def key(self, provider, project=None):
-        return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + self.signature(provider)
+    def key(self, provider, project=None, signature=None):
+        return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + (signature or self.signature(provider))
 
-    def directory(self, provider, project=None):
-        value = self.store.setting(self.key(provider, project))
+    def _save_directory(self, key, provider, project, directory):
+        fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price"}
+        preferences = {"models": [{name: value for name, value in model.items() if name in fields}
+                                  for model in directory.get("models", [])],
+                       "fetched": None, "truncated": directory.get("truncated", False)}
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(directory)))
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                       ("model-preferences:" + (project or "global") + ":" + provider["id"], encode(preferences)))
+
+    def directory(self, provider, project=None, cache_key=None):
+        cache_key = cache_key or self.key(provider, project)
+        value = self.store.setting(cache_key)
+        if value is None:
+            value = self.store.setting("model-preferences:" + (project or "global") + ":" + provider["id"])
+        if value is None:
+            legacy = fingerprint({k: v for k, v in provider.items() if k != "name"})
+            old = self.store.setting("model-center:" + (project or "global") + ":" + provider["id"] + ":" + legacy)
+            if old:
+                value = copy.deepcopy(old)
+                value["fetched"] = None
+                for model in value.get("models", []):
+                    for key in ("verified", "probes", "last_attempt"):
+                        model.pop(key, None)
         if value is None and project:
             global_provider = next((p for p in [*BUILTINS, *self.runtime.config()["providers"]] if p["id"] == provider["id"]), None)
-            if global_provider and self.signature(global_provider) == self.signature(provider):
-                value = self.store.setting(self.key(provider))
+            if global_provider and self.signature(global_provider) == cache_key.rsplit(":", 1)[-1]:
+                value = self.directory(global_provider)
         return copy.deepcopy(value or {"models": [], "fetched": None, "truncated": False})
 
     def snapshot(self, project=None):
@@ -260,7 +286,7 @@ class ModelCenter:
                            for model in previous["models"]]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
-            self.store.put_setting(self.key(provider, project), {"models": preferences, "fetched": None, "truncated": False})
+            self._save_directory(self.key(provider, project), provider, project, {"models": preferences, "fetched": None, "truncated": False})
         self.cleanup_credentials()
         return {"id": provider["id"], "saved": True}
 
@@ -281,6 +307,7 @@ class ModelCenter:
         except ValueError:
             raise CenterError("provider_in_use") from None
         self.cleanup_credentials()
+        self.store.execute("DELETE FROM settings WHERE key=?", ("model-preferences:" + (project or "global") + ":" + provider_id,))
         return {"removed": True}
 
     @staticmethod
@@ -307,7 +334,7 @@ class ModelCenter:
                 raise CenterError("update_in_progress")
         provider = self.provider(provider_id, project)
         signature = self.signature(provider)
-        key = self.key(provider, project)
+        key = self.key(provider, project, signature=signature)
         try:
             secret = None if provider["id"] in {p["id"] for p in BUILTINS} else self.credentials.get(provider)
             if provider_id == "opencode":
@@ -317,16 +344,16 @@ class ModelCenter:
         except (CatalogError, CredentialError) as exc:
             with self.runtime.dispatch_lock, self.lock:
                 if not self.runtime.updates.is_busy() and self.signature(self.provider(provider_id, project)) == signature:
-                    previous = self.directory(provider, project)
+                    previous = self.directory(provider, project, cache_key=key)
                     previous.update(error=exc.code, attempted=time.time())
-                    self.store.put_setting(key, previous)
+                    self._save_directory(key, provider, project, previous)
             raise
         with self.runtime.dispatch_lock, self.lock:
             if self.runtime.updates.is_busy():
                 raise CenterError("update_in_progress")
             if self.signature(self.provider(provider_id, project)) != signature:
                 raise CenterError("connection_changed")
-            previous = self.directory(provider, project)
+            previous = self.directory(provider, project, cache_key=key)
             before = {m["id"]: m for m in previous["models"]}
             models = []
             for model in result["models"]:
@@ -344,7 +371,7 @@ class ModelCenter:
                 raise CenterError("too_many_models")
             models.extend({**model, "missing": not model.get("manual", False)} for model in retained[:max(0, 2000 - len(models))])
             directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"] or omitted}
-            self.store.put_setting(key, directory)
+            self._save_directory(key, provider, project, directory)
         return directory
 
     def edit_model(self, provider_id, data, project=None):
@@ -361,7 +388,8 @@ class ModelCenter:
             raise CenterError("invalid_model")
         with self.lock:
             provider = self.provider(provider_id, project)
-            directory = self.directory(provider, project)
+            key = self.key(provider, project)
+            directory = self.directory(provider, project, cache_key=key)
             model = next((m for m in directory["models"] if m["id"] == data["id"]), None)
             if not model:
                 if len(directory["models"]) >= 1500:
@@ -376,7 +404,7 @@ class ModelCenter:
             model.update({k: v for k, v in data.items() if k in ["enabled", "favorite", "unit_price"]})
             if data.get("manual"):
                 model.update(manual=True, missing=False)
-            self.store.put_setting(self.key(provider, project), directory)
+            self._save_directory(key, provider, project, directory)
         return {"saved": True}
 
     def resume_provider(self, provider_id, project=None):
@@ -450,6 +478,7 @@ class ModelCenter:
         validate(merge(config, {"models": {"implementation": route}}))
         provider = self.provider(provider_id, project)
         signature = self.signature(provider)
+        key = self.key(provider, project, signature=signature)
         config = copy.deepcopy(config)
         config["models"]["probe"] = route
         run = "model-test-" + uid()
@@ -475,13 +504,13 @@ class ModelCenter:
                 if self.signature(self.provider(provider_id, project)) != signature:
                     raise CenterError("connection_changed")
                 self.edit_model(provider_id, {"id": model_id}, project)
-                directory = self.directory(provider, project)
+                directory = self.directory(provider, project, cache_key=key)
                 model = next(m for m in directory["models"] if m["id"] == model_id)
                 model["verified"] = {"at": time.time(), "effort": effort, "kind": "structured_tool",
                                      "version": __version__, "compatibility": compatibility(config)}
                 model.pop("last_attempt", None)
                 model.setdefault("probes", {})[effort] = {**model["verified"], "state": "pass"}
-                self.store.put_setting(self.key(provider, project), directory)
+                self._save_directory(key, provider, project, directory)
             return {"verified": model["verified"], "calls": self.store.query("SELECT state,tokens,seconds FROM calls WHERE run=?", (run,))}
         except Exception as exc:
             code = "default_effort_required" if "requires effort=default" in str(exc) else error_code(exc)
@@ -489,7 +518,7 @@ class ModelCenter:
                 with self.runtime.dispatch_lock, self.lock:
                     if self.signature(self.provider(provider_id, project)) == signature:
                         self.edit_model(provider_id, {"id": model_id}, project)
-                        directory = self.directory(provider, project)
+                        directory = self.directory(provider, project, cache_key=key)
                         model = next(m for m in directory["models"] if m["id"] == model_id)
                         proof = {"at": time.time(), "effort": effort, "state": "fail", "code": code}
                         if code in ["budget_exhausted", "provider_paused", "missing_key", "keychain_locked", "keychain_unavailable", "keychain_failed", "default_effort_required"]:
@@ -499,7 +528,7 @@ class ModelCenter:
                             model.setdefault("probes", {})[effort] = proof
                             if model.get("verified", {}).get("effort") == effort:
                                 model.pop("verified", None)
-                        self.store.put_setting(self.key(provider, project), directory)
+                        self._save_directory(key, provider, project, directory)
             except Exception:
                 # 失败记录写入不成功时，绝不用目录更新错误掩盖原始探测错误。
                 pass

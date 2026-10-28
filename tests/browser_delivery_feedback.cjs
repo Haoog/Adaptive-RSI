@@ -96,7 +96,7 @@ async function main() {
       await save('{"delivery":{"deploy":{"automatic_rollback":true}}}');
       await feedback.filter({hasText: '自动回滚需要'}).waitFor({timeout: 10000});
       await save('{"delivery":{"deploy":{"automatic_rollback":false,"health_url":"http://example.com/health"}}}');
-      await feedback.filter({hasText: 'https:// 开头'}).waitFor({timeout: 10000});
+      await feedback.filter({hasText: '健康检查地址须为 HTTPS'}).waitFor({timeout: 10000});
       await save('{"delivery":{"deploy":{"health_url":""},"release":{"sha":"' + UPPER_SHA + '"}}}');
       await feedback.filter({hasText: '小写'}).waitFor({timeout: 10000});
       await page.close();

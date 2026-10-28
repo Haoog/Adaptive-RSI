@@ -1,0 +1,45 @@
+{
+  "scope": "Local model-free regression; future grouping is an estimate, not measured CI speedup",
+  "checkpoint": "de75578",
+  "tests": 842,
+  "groups_exit": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "observed_selector_sum_seconds": {
+    "1": 255.31400000000005,
+    "2": 116.26299999999998,
+    "3": 82.34399999999998,
+    "4": 183.00599999999997
+  },
+  "duration_weighted_predicted_seconds": [
+    176.73994245799258,
+    153.40708833234385,
+    153.38077666633762,
+    153.3993724975735
+  ],
+  "slowest_modules": [
+    [
+      "tests.test_runtime",
+      176.73994245799258
+    ],
+    [
+      "tests.test_reliability",
+      76.70429258304648
+    ],
+    [
+      "tests.test_delivery_loop",
+      57.85677199997008
+    ],
+    [
+      "tests.test_runtime_safety",
+      52.17570558283478
+    ],
+    [
+      "tests.test_workflow_experience",
+      42.501108000054955
+    ]
+  ]
+}

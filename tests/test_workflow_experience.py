@@ -44,8 +44,13 @@ class BackupPublicationTest(unittest.TestCase):
                     def __getattr__(self, name):
                         return getattr(source, name)
 
-                    def backup(self, target):
-                        source.backup(target, pages=1, progress=callback)
+                    def backup(self, target, **options):
+                        original = options.get("progress")
+                        def observe(status, remaining, total):
+                            callback(status, remaining, total)
+                            if original:
+                                original(status, remaining, total)
+                        source.backup(target, pages=1, progress=observe)
 
                 yield Source()
 
@@ -107,7 +112,7 @@ class BackupPublicationTest(unittest.TestCase):
                 self.assertEqual(staging[0].stat().st_mode & 0o777, 0o600)
                 self.assertTrue(all(path.name.startswith(staging[0].name)
                                     for path in self.folder.iterdir()))
-                snapshot = overview(self.store)
+                snapshot = overview(self.store, refresh=True)
                 self.assertEqual(snapshot["backups"], [])
                 self.assertEqual(snapshot["bytes"]["backups"], 0)
                 for params in ({}, {"format": ["json"], "offset": ["0"]}):
@@ -121,7 +126,7 @@ class BackupPublicationTest(unittest.TestCase):
         self.assertEqual(saved["bytes"], final.stat().st_size)
         self.assertEqual(list(self.folder.iterdir()), [final])
         self.assertEqual(final.stat().st_mode & 0o777, 0o600)
-        self.assertEqual([item["id"] for item in overview(self.store)["backups"]], [identifier])
+        self.assertEqual([item["id"] for item in overview(self.store, refresh=True)["backups"]], [identifier])
         handler = self.handler()
         handler.backup(final, {})
         self.assertEqual(handler.wfile.getvalue(), final.read_bytes())
@@ -155,7 +160,7 @@ class BackupPublicationTest(unittest.TestCase):
                 transient.parent.mkdir(parents=True, exist_ok=True)
                 if kind in ("runs", "database"):
                     transient.write_bytes(b"temporary")
-                method = "stat" if kind in ("database", "backup_listing") else "lstat"
+                method = "stat" if kind == "database" else "lstat"
                 original = getattr(Path, method)
                 vanished = []
 
@@ -166,7 +171,7 @@ class BackupPublicationTest(unittest.TestCase):
                     return original(path, *args, **kwargs)
 
                 with patch.object(Path, method, disappear):
-                    snapshot = overview(self.store)
+                    snapshot = overview(self.store, refresh=True)
                 self.assertEqual(vanished, [transient])
                 self.assertEqual(snapshot["backups"], [])
                 self.assertEqual(snapshot["bytes"]["runs"], 0)
@@ -180,8 +185,7 @@ class BackupPublicationTest(unittest.TestCase):
         run_file = self.store.root / "runs" / "evidence"
         run_file.parent.mkdir()
         run_file.write_bytes(b"evidence")
-        for path, method in ((run_file, "lstat"), (published, "lstat"),
-                             (published, "stat"), (self.store.path, "stat")):
+        for path, method in ((run_file, "lstat"), (published, "lstat"), (self.store.path, "stat")):
             for error in (PermissionError(errno.EACCES, "Denied"), OSError(errno.EIO, "I/O failure")):
                 with self.subTest(path=path.name, method=method, error=error.errno):
                     original = getattr(Path, method)
@@ -193,7 +197,7 @@ class BackupPublicationTest(unittest.TestCase):
 
                     with patch.object(Path, method, fail):
                         with self.assertRaises(type(error)) as raised:
-                            overview(self.store)
+                            overview(self.store, refresh=True)
                     self.assertIs(raised.exception, error)
 
     def test_overview_during_concurrent_backup_publication(self):
@@ -215,13 +219,13 @@ class BackupPublicationTest(unittest.TestCase):
             deadline = time.monotonic() + 10
             while not done.is_set() or observations < 30:
                 self.assertLess(time.monotonic(), deadline)
-                snapshot = overview(self.store)
+                snapshot = overview(self.store, refresh=True)
                 for saved in snapshot["backups"]:
                     self.assertGreater(saved["bytes"], 0)
                     self.assertTrue((self.folder / (saved["id"] + ".sqlite3")).is_file())
                 observations += 1
             published = future.result(timeout=10)
-        snapshot = overview(self.store)
+        snapshot = overview(self.store, refresh=True)
         self.assertEqual(len(snapshot["backups"]), len(published))
         self.assertEqual(snapshot["bytes"]["backups"], sum(saved["bytes"] for saved in published))
         self.assertTrue(all(path.suffix == ".sqlite3" for path in self.folder.iterdir()))

@@ -1,0 +1,23 @@
+{
+  "fixture": "synthetic temporary SQLite; no model calls",
+  "python": "3.14.6",
+  "platform": "Darwin",
+  "valid_stages": 50000,
+  "injected_orphan_stages": 120,
+  "light_metrics_seconds": [
+    0.0001374578569084406,
+    4.845811054110527e-05,
+    3.7665944546461105e-05,
+    3.320910036563873e-05,
+    3.087497316300869e-05,
+    3.0667055398225784e-05,
+    3.0124792829155922e-05,
+    3.0166935175657272e-05,
+    2.924981527030468e-05,
+    2.9084039852023125e-05
+  ],
+  "full_relationship_audit_seconds": 0.004588958108797669,
+  "orphan_stages_detected": 120,
+  "truncated": false,
+  "scope": "single local machine measurement; not production throughput or remote CI timing"
+}

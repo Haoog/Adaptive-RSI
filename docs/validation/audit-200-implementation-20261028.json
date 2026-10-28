@@ -1,0 +1,3453 @@
+{
+  "base": "75aecba5ef63bd719eb025b74d5c3c409d3ecf71",
+  "scope": "Third audit plus validation throughput; completion requires implementation and linked evidence",
+  "items": [
+    {
+      "id": 1,
+      "title": {
+        "zh": "免费模型诊断调用了不存在的方法",
+        "en": "Free diagnostics calls a missing method"
+      },
+      "source": "adaptive_rsi/model_center.py",
+      "acceptance": "实现统一只读诊断接口；默认及自定义供应商均返回有效报告且调用数不增加。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/model_center.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_diagnostics_never_calls_a_model"
+      ]
+    },
+    {
+      "id": 2,
+      "title": {
+        "zh": "连接创建失败泄漏数据库容量名额",
+        "en": "Connection initialization leaks capacity"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "把全部初始化纳入清理范围；连续注入连接失败后容量、borrowed 都恢复。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_failed_connection_open_returns_capacity"
+      ]
+    },
+    {
+      "id": 3,
+      "title": {
+        "zh": "备份轮换可能删除最后一个恢复点",
+        "en": "Retention can delete the final backup"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "至少保留最后一份验证通过的备份；全过期集合仍保有可恢复副本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_retention_keeps_last_expired_valid_backup"
+      ]
+    },
+    {
+      "id": 4,
+      "title": {
+        "zh": "损坏的新备份可以淘汰正常旧备份",
+        "en": "Corrupt snapshots can displace valid backups"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "只让通过完整性验证的新快照替代旧恢复点；损坏新文件不能触发淘汰。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_corrupt_new_backup_cannot_displace_valid_backup"
+      ]
+    },
+    {
+      "id": 5,
+      "title": {
+        "zh": "半开恢复允许多个调用者同时进入",
+        "en": "Half-open recovery admits multiple callers"
+      },
+      "source": "adaptive_rsi/provider_health.py",
+      "acceptance": "租约绑定 attempt ID；并发恢复时恰好一个调用取得资格。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/provider_health.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_half_open_lease_admits_one_attempt"
+      ]
+    },
+    {
+      "id": 6,
+      "title": {
+        "zh": "旧成功仍可清除新的 Retry-After",
+        "en": "Late success can clear a newer cooldown"
+      },
+      "source": "adaptive_rsi/provider_health.py",
+      "acceptance": "成功及失败携带请求代次；较旧成功不得撤销较新故障。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/provider_health.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_late_success_cannot_clear_newer_failure"
+      ]
+    },
+    {
+      "id": 7,
+      "title": {
+        "zh": "归档项目仍能被重新启用并接收任务",
+        "en": "Archived projects can be re-enabled"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "在统一准入层检查归档；直接 API 请求也不能启动归档项目。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_archived_project_rejects_resume_and_new_goals"
+      ]
+    },
+    {
+      "id": 8,
+      "title": {
+        "zh": "项目配置版本未涵盖继承的全局配置",
+        "en": "Project revisions omit inherited globals"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "保存携带项目及全局双版本；继承来源变化时明确冲突。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_effective_revision_changes_with_inherited_globals"
+      ]
+    },
+    {
+      "id": 9,
+      "title": {
+        "zh": "任务合并丢失预约时间、紧急度及优先级",
+        "en": "Grouping discards scheduling constraints"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "明确合并规则并预览；预约、紧急度与优先级按用户选择保留。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_group_preserves_scheduling_constraints"
+      ]
+    },
+    {
+      "id": 10,
+      "title": {
+        "zh": "普通界面优化被强制判为性能改进",
+        "en": "UI improvements are classified as performance"
+      },
+      "source": "adaptive_rsi/workflow.py",
+      "acceptance": "显式类型及语义优先；界面文案优化可按 UI 验收，性能任务仍需性能证据。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_explicit_ui_kind_does_not_require_performance_proof"
+      ]
+    },
+    {
+      "id": 11,
+      "title": {
+        "zh": "契约检查只验证数组第一项",
+        "en": "Contract checks ignore array tails"
+      },
+      "source": "scripts/check_api_contract.py",
+      "acceptance": "验证全部元素并限制错误输出数量；尾部畸形记录必须失败。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_api_contract.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_contract_validates_tail_and_numeric_bounds"
+      ]
+    },
+    {
+      "id": 12,
+      "title": {
+        "zh": "契约检查忽略数值范围约束",
+        "en": "Contract checks ignore numeric bounds"
+      },
+      "source": "scripts/check_api_contract.py",
+      "acceptance": "使用完整验证器或明确受支持子集；边界外数值必须失败。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_api_contract.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_contract_validates_tail_and_numeric_bounds"
+      ]
+    },
+    {
+      "id": 13,
+      "title": {
+        "zh": "wheel 缺少契约接口依赖的 schema",
+        "en": "Wheel omits the API schema resource"
+      },
+      "source": "pyproject.toml",
+      "acceptance": "将 schema 纳入包资源；从 wheel 安装后访问契约接口返回 200。",
+      "status": "implemented",
+      "implementation": [
+        "pyproject.toml"
+      ],
+      "validation": [
+        "python3 -B scripts/check_wheel_install.py --output docs/validation/wheel-install-20261028.json",
+        "docs/validation/wheel-install-20261028.json"
+      ]
+    },
+    {
+      "id": 14,
+      "title": {
+        "zh": "更新状态刷新会反复销毁策略控件",
+        "en": "Update polling replaces active controls"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "增量更新状态并保留焦点、选区和展开状态；持续刷新时仍可键盘选择。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update.cjs"
+      ]
+    },
+    {
+      "id": 15,
+      "title": {
+        "zh": "桌面远程入口拒绝当前 API v2 服务",
+        "en": "Remote connection rejects API v2"
+      },
+      "source": "desktop/src-tauri/src/main.rs",
+      "acceptance": "按受支持版本及能力协商；0.5.124 对接当前服务必须成功。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [],
+      "residual": "v1/v2 accepted; real remote compatibility and capability negotiation remain."
+    },
+    {
+      "id": 16,
+      "title": {
+        "zh": "契约 CI 验证的是手写样本",
+        "en": "Contract CI uses a handwritten sample"
+      },
+      "source": "scripts/check_api_contract.py",
+      "acceptance": "用隔离 HTTP 服务生成多种响应再验证；删除真实必需字段时 CI 应失败。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_api_contract.py"
+      ],
+      "validation": [
+        "python3 -B scripts/check_api_contract.py"
+      ],
+      "residual": "Live isolated HTTP now covers empty/populated projects, bad historical evidence, sections, filters and pagination; no model calls."
+    },
+    {
+      "id": 17,
+      "title": {
+        "zh": "全局坏 JSON 的错误回包再次读取坏 JSON",
+        "en": "Malformed global JSON breaks its repair response"
+      },
+      "source": "adaptive_rsi/server.py",
+      "acceptance": "修复路径读取原始字符串并独立限长；语法损坏的全局配置仍可诊断及恢复。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/server.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_malformed_global_configuration_still_has_a_repair_response"
+      ]
+    },
+    {
+      "id": 18,
+      "title": {
+        "zh": "输入上下文预算错误绑定输出上限",
+        "en": "Input context is capped by output capacity"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "分别计算输入上下文与响应限制；合法长输入可用，超上下文输入有明确诊断。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [],
+      "residual": "Context/output separated; metadata accuracy remains."
+    },
+    {
+      "id": 19,
+      "title": {
+        "zh": "名为任务耗时的模型实际采集 SQL 耗时",
+        "en": "Task-duration samples measure SQL"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "改为准确命名的查询诊断或真实运行样本；跨请求口径一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_task_duration_model_uses_actual_runs"
+      ]
+    },
+    {
+      "id": 20,
+      "title": {
+        "zh": "桌面请求取消只结束网页等待",
+        "en": "Desktop abort leaves transport running"
+      },
+      "source": "adaptive_rsi/web/desktop.js",
+      "acceptance": "传递请求 ID 并取消底层任务；取消后在界限内释放连接与后台工作。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/desktop.js",
+        "desktop/src-tauri/src/transport.rs"
+      ],
+      "validation": [
+        "node --test tests/web_desktop_transport.cjs",
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ]
+    },
+    {
+      "id": 21,
+      "title": {
+        "zh": "检查失败也会推迟下一次自动更新六小时",
+        "en": "Failed checks delay retries for six hours"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "区分尝试及成功时间，失败使用短退避；短暂断网恢复后能自动重试。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update.cjs"
+      ]
+    },
+    {
+      "id": 22,
+      "title": {
+        "zh": "备份验证的符号链接拒绝检查失效",
+        "en": "Backup symlink rejection checks the resolved target"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "先 lstat/O_NOFOLLOW 再验证已打开文件；链接输入应按声明的策略处理。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_backup_validation_rejects_input_symlink"
+      ]
+    },
+    {
+      "id": 23,
+      "title": {
+        "zh": "POST 请求日志丢失错误码",
+        "en": "POST logs discard error codes"
+      },
+      "source": "adaptive_rsi/server.py",
+      "acceptance": "把安全错误码与请求 ID 一并记录；已知 400/409/500 可从日志关联。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/server.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_post_failure_log_preserves_safe_error_code"
+      ]
+    },
+    {
+      "id": 24,
+      "title": {
+        "zh": "JUnit 摘要无法处理常规多行 XML",
+        "en": "JUnit summaries miss normal XML reports"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "从有大小限制的报告文件解析全部 suite；多行和多 suite 结果一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_multiline_multisuite_junit_summary"
+      ]
+    },
+    {
+      "id": 25,
+      "title": {
+        "zh": "迁移校验和与迁移内容无关",
+        "en": "Migration checksums ignore migration contents"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "hash 不可变迁移正文并记录版本；迁移内容变化必须被检测。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/schema_migrations.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest tests.test_audit_round5 tests.test_store"
+      ],
+      "residual": "SQL migration bytes and ordered history are checked before mutation; sealed bootstrap is not repeated; additive SQL and ledger roll back together. Legacy 1/2 hashes and transaction-external bootstrap DDL remain historical boundaries. Compatibility format stays v2. Installed wheel resource/startup verified."
+    },
+    {
+      "id": 26,
+      "title": {
+        "zh": "请求日志存在重复同列索引",
+        "en": "Request logs maintain duplicate indexes"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "通过 query plan 核对后保留一份；现有查询仍走索引，写放大下降。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest.test_request_history_has_one_time_index_and_query_uses_it"
+      ],
+      "residual": "Only one request started-time index is retained; EXPLAIN confirms request history ordering uses it."
+    },
+    {
+      "id": 27,
+      "title": {
+        "zh": "状态快照只包住部分返回数据",
+        "en": "State snapshots cover only part of the response"
+      },
+      "source": "adaptive_rsi/server.py",
+      "acceptance": "用并发保存故障注入验证；需要一致的字段放入同一读快照或同一版本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/server.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_state_configuration_and_revision_share_one_read_snapshot"
+      ]
+    },
+    {
+      "id": 28,
+      "title": {
+        "zh": "后台异常回执本身可能再次写库失败",
+        "en": "Background failure receipts may also fail"
+      },
+      "source": "adaptive_rsi/operations.py",
+      "acceptance": "注入结果落库失败；确保独立故障日志和恢复时的可核对终态。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/operations.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditOperationPersistenceTest"
+      ],
+      "residual": "Database/file fallback, independent redacted logs, immutable business result on persistence retry and deferred receipt replay are fault-tested. Permanent loss of both persistence destinations cannot retain a result; restart reports interruption rather than claiming success."
+    },
+    {
+      "id": 29,
+      "title": {
+        "zh": "重新接入已归档路径返回隐藏旧项目",
+        "en": "Re-adding archived paths may remain invisible"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "验证归档后重新接入流程；提供恢复选择和明确的最终状态。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_readding_archived_project_is_explicit_and_restore_stays_paused"
+      ]
+    },
+    {
+      "id": 30,
+      "title": {
+        "zh": "排空更新租约可能在长任务结束前失效",
+        "en": "Drain leases can expire during long work"
+      },
+      "source": "adaptive_rsi/lifecycle.py",
+      "acceptance": "模拟跨越租约边界的长任务；续租或明确终止等待，避免重新接收工作。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/lifecycle.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_update_drain_renews_only_with_owner_lease"
+      ]
+    },
+    {
+      "id": 31,
+      "title": {
+        "zh": "安装阶段崩溃可能留下不自动过期的屏障",
+        "en": "Installing barriers need crash recovery proof"
+      },
+      "source": "adaptive_rsi/lifecycle.py",
+      "acceptance": "在 commit 后逐点终止进程；旧版恢复后可明确解除屏障且不丢任务。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/lifecycle.py",
+        "adaptive_rsi/desktop.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_update_admission tests.test_desktop_runtime tests.test_audit_round5 tests.test_audit_round6",
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ],
+      "residual": "Legacy barriers without installer ownership require the existing owned-desktop startup or explicit matching-lease cancellation; unknown liveness remains blocked. This is admission recovery, not full signed app/data rollback proof (34/192)."
+    },
+    {
+      "id": 32,
+      "title": {
+        "zh": "更新包驻留内存可能形成显著峰值",
+        "en": "Staged updates can create memory peaks"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "测接近上限包的 RSS；优先落盘并设置可观测内存边界。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs"
+      ],
+      "validation": [],
+      "residual": "Disk staging added; verify/install still load one bounded buffer; peak RSS measurement remains."
+    },
+    {
+      "id": 33,
+      "title": {
+        "zh": "空间预检可能检查了不同的磁盘卷",
+        "en": "Disk checks may inspect the wrong volume"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "把 app、cache、临时目录放不同卷测试；各必需卷均做空间检查。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop space_check_includes_cache_application_and_extraction_volumes"
+      ],
+      "residual": "Cache/application/extraction volume preflight helper tests exist; actual split-volume updater installation remains unverified."
+    },
+    {
+      "id": 34,
+      "title": {
+        "zh": "原生更新缺少启动失败后的完整恢复证据",
+        "en": "Native update recovery needs startup-failure evidence"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "用真实签名包注入启动和迁移失败；验证应用及状态数据的一致回退。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 35,
+      "title": {
+        "zh": "已有下载包时检查直接返回旧状态",
+        "en": "Staged packages bypass subsequent feed checks"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "验证撤回及连续发布场景；安装前重新确认版本可用性并允许替换缓存。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop install_confirmation_is_bound_to_the_exact_feed_artifact"
+      ],
+      "residual": "Exact artifact/feed confirmation and withdrawal rejection helpers are tested; real consecutive signed-release/cache replacement remains unverified."
+    },
+    {
+      "id": 36,
+      "title": {
+        "zh": "更新策略保存失败没有反馈",
+        "en": "Update policy writes fail silently"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "禁用 localStorage 测试；偏好写入失败必须可见并保有本次选择。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update.cjs"
+      ]
+    },
+    {
+      "id": 37,
+      "title": {
+        "zh": "批量请求超时后重试会更换幂等键",
+        "en": "Batch retries generate new idempotency keys"
+      },
+      "source": "adaptive_rsi/web/batch.js",
+      "acceptance": "保存待确认请求 ID；断连重试先查询同一回执，再决定是否新建操作。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/batch.js",
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 38,
+      "title": {
+        "zh": "批量按钮缺少执行期间的防重入状态",
+        "en": "Batch actions can re-enter while pending"
+      },
+      "source": "adaptive_rsi/web/batch.js",
+      "acceptance": "双击及慢网络测试；同一选择只保留一个待确认或执行中的操作。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/batch.js",
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 39,
+      "title": {
+        "zh": "批量未知回执没有明确的核对终结流程",
+        "en": "Unknown batch receipts need reconciliation"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "在动作执行后、回执保存前中断；逐项核对并给出安全的后续操作。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 40,
+      "title": {
+        "zh": "冲突预览只比较完全相同的路径字符串",
+        "en": "Conflict previews compare exact strings only"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "建立父子目录、重命名及平台路径样本；保守展示真实交叉范围。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 41,
+      "title": {
+        "zh": "分组完成后原任务状态与成果关联需核实",
+        "en": "Grouped originals need outcome semantics"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "走完合并、失败、取消流程；每个原任务均能追踪实际成果及完成口径。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 42,
+      "title": {
+        "zh": "部署意图和目标所有权分两次事务保存",
+        "en": "Deployment intent and ownership commit separately"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "在两次写入之间终止进程；重启后不得并行部署或重复派发。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_dispatch_intent_and_owner_rollback_together"
+      ]
+    },
+    {
+      "id": 43,
+      "title": {
+        "zh": "健康检查总时限仍可能被阻塞读取超出",
+        "en": "Health deadlines may overrun on blocking reads"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "慢滴流和临界阻塞测试；每次读取依据剩余时限，取消也及时生效。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_health_transport_bounds_stalled_body_and_cancels_real_connection"
+      ]
+    },
+    {
+      "id": 44,
+      "title": {
+        "zh": "重用既有 PR 时需要区分已关闭状态",
+        "en": "Existing closed PRs need explicit handling"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "模拟同 head 的 closed PR；不能报告新 PR 已打开，应明确重开或新建策略。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/delivery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.ClosedPublicationTest.test_closed_pr_never_reports_open_or_writes_remote"
+      ],
+      "residual": "Closed PR regression rejects implicit reuse before any push; remote reopening policy is not implemented."
+    },
+    {
+      "id": 45,
+      "title": {
+        "zh": "本地冷却拒绝可能被计为新的供应商故障",
+        "en": "Local cooldown rejection may inflate failures"
+      },
+      "source": "adaptive_rsi/agent.py",
+      "acceptance": "在冷却期间反复调用；没有网络请求时不累加供应商故障或延长原始冷却。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/agent.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_account_retry_after_is_shared_without_inflating_failures"
+      ]
+    },
+    {
+      "id": 46,
+      "title": {
+        "zh": "同账号跨项目仍可能分别触发限流",
+        "en": "Account cooldowns remain project-scoped"
+      },
+      "source": "adaptive_rsi/provider_health.py",
+      "acceptance": "同账号多项目压测；区分账号级与模型级冷却，避免同时重试。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/provider_health.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_account_retry_after_is_shared_without_inflating_failures"
+      ]
+    },
+    {
+      "id": 47,
+      "title": {
+        "zh": "畸形用量容器可能中断有效模型响应",
+        "en": "Malformed usage containers may abort valid responses"
+      },
+      "source": "adaptive_rsi/usage.py",
+      "acceptance": "为各协议注入容器类型错误；保留未知用量并明确诊断是否继续执行。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/usage.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_malformed_usage_does_not_discard_valid_tool_response"
+      ]
+    },
+    {
+      "id": 48,
+      "title": {
+        "zh": "监控窗口结束后不再检测后续漂移",
+        "en": "Monitoring stops after its initial window"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "模拟窗口后再出现回归；选择性长期哨兵应发现并解释变化。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_long_term_failure_is_detected_after_initial_window"
+      ],
+      "residual": "Operational monitor continues after the initial window: all attributable failures and deterministic one-in-ten successes; retained run history is bounded."
+    },
+    {
+      "id": 49,
+      "title": {
+        "zh": "环境失败前消耗样本曝光额度的口径需核实",
+        "en": "Exposure accounting needs reservation semantics"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "注入快照或环境启动失败；分别记录预留、实际曝光及已完成实验。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_case_exposure_reservation_is_atomic_and_idempotent"
+      ]
+    },
+    {
+      "id": 50,
+      "title": {
+        "zh": "胜率诊断混用缺陷家族和重复试验计数",
+        "en": "Win-rate diagnostics mix units"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "用相同家族不同 repeats 验证；先统一统计单位，再给区间。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_paired_statistics_do_not_change_with_correlated_repeats"
+      ]
+    },
+    {
+      "id": 51,
+      "title": {
+        "zh": "并发导入相同样本的跨 split 去重窗口",
+        "en": "Concurrent imports may bypass split deduplication"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "并发导入相同签名到不同 split；最多一个成功，失败目录被完整清理。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_concurrent_imports_cannot_put_one_case_in_two_splits"
+      ]
+    },
+    {
+      "id": 52,
+      "title": {
+        "zh": "Go 测试摘要可能同时计算父测试和子测试",
+        "en": "Go summaries need hierarchical counting rules"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "定义叶子或顶层统计口径；层级 JSON 输出的显示总数应一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_go_summary_counts_top_level_tests_separately_from_subtests"
+      ]
+    },
+    {
+      "id": 53,
+      "title": {
+        "zh": "未知 token 的实验可能绕过成本比判断",
+        "en": "Unknown usage can bypass cost-ratio checks"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "用量缺失与真实零成本分开；比较结论明确呈现不可判断的成本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
+    },
+    {
+      "id": 54,
+      "title": {
+        "zh": "宿主文件工具存在路径检查与打开的时间窗口",
+        "en": "Host file tools need path-race verification"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "竞争替换目录和链接的受控测试；必要时用目录 fd 与无跟随打开约束。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
+    },
+    {
+      "id": 55,
+      "title": {
+        "zh": "长搜索单次工具内没有细粒度取消检查",
+        "en": "Long searches need cooperative cancellation"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "注入慢文件读取；搜索在设定取消延迟内退出并报告部分结果。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ],
+      "residual": "Cooperative checks bound injected slow reads between 64 KiB chunks and every 256 search lines; they cannot hard-interrupt one blocked kernel/filesystem call. Cancellation retains bounded file/line references, not source snippets."
+    },
+    {
+      "id": 56,
+      "title": {
+        "zh": "数据库初始化早于运行实例目录锁",
+        "en": "Database initialization precedes runtime ownership"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "同时启动两实例并注入迁移；拒绝的实例不能先修改数据库。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/cli.py",
+        "adaptive_rsi/desktop.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_service_ownership_is_acquired_before_database_initialization"
+      ],
+      "residual": "Service entry points claim ownership before initialization; standalone Store utilities and library callers still require a migration ownership contract."
+    },
+    {
+      "id": 57,
+      "title": {
+        "zh": "轮询请求日志可能造成持续写放大",
+        "en": "Polling logs may amplify database writes"
+      },
+      "source": "adaptive_rsi/server.py",
+      "acceptance": "对照关闭和开启请求日志的多窗口负载；按结果决定采样、聚合或批量落库。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRequestSamplingTest"
+      ],
+      "residual": "Successful poll requests are sampled once per route per minute; all writes/errors remain individually logged; process-local counters are retained."
+    },
+    {
+      "id": 58,
+      "title": {
+        "zh": "数据库恢复仍含案例的旧绝对路径",
+        "en": "Restored cases retain old absolute paths"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "恢复到不同目录后执行只读案例检查；路径映射明确，不访问原副本。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_restore_replaces_malformed_case_without_old_path",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_business_rehearsal_is_isolated_and_reports_relationships",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_business_rehearsal_reports_orphan_without_changing_snapshot"
+      ],
+      "residual": "Restored case paths are invalidated/remapped and isolated database-only business rehearsal checks relationships without remote operations. Periodic scheduling, repository/artifact restoration and business execution remain unverified."
+    },
+    {
+      "id": 59,
+      "title": {
+        "zh": "认证过期清理可能在外层锁内执行慢关闭",
+        "en": "Expired auth cleanup may retain an outer lock"
+      },
+      "source": "adaptive_rsi/auth_sessions.py",
+      "acceptance": "注入慢 worker.close 及并发取消；其他会话状态读取保持响应。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/auth_sessions.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_expired_auth_slow_close_does_not_block_other_session_reads"
+      ],
+      "residual": "Real-thread slow worker close does not retain the shared session lock."
+    },
+    {
+      "id": 60,
+      "title": {
+        "zh": "两个项目部署同一目标的所有权不互斥",
+        "en": "Deployment ownership is not shared across projects"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "模拟跨项目同目标部署；采用目标级共享租约或明确禁止重叠目标。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_target_ownership_is_shared_and_migrates_legacy_receipts"
+      ]
+    },
+    {
+      "id": 61,
+      "title": {
+        "zh": "桌面和引擎更新策略采用同一套版本范围语义",
+        "en": "Unify desktop and engine update policy semantics"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "分别发布 patch、minor、major 测试版本，两个入口按相同授权范围选择版本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update.cjs"
+      ]
+    },
+    {
+      "id": 62,
+      "title": {
+        "zh": "稳定版增加可暂停的分批更新机制",
+        "en": "Add pausable staged rollout"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "模拟暂停和恢复，已获授权的版本范围及签名校验始终有效。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 63,
+      "title": {
+        "zh": "下载策略可考虑网络和电源状态",
+        "en": "Respect network and power preferences"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "切换网络和电源状态，任务执行不受影响，用户可随时手动覆盖。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 64,
+      "title": {
+        "zh": "已签名更新包持久化缓存与断点续传",
+        "en": "Persist verified update downloads"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "在下载及就绪阶段重启应用，安全恢复下载或使用已验证缓存，损坏缓存必须重下。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs"
+      ],
+      "validation": [],
+      "residual": "Verified complete packages persist; partial resume not implemented."
+    },
+    {
+      "id": 65,
+      "title": {
+        "zh": "拆分更新请求连接及数据传输时限",
+        "en": "Separate update transport deadlines"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "注入 DNS、连接及慢响应故障，各阶段有可解释的时限且可取消。",
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop updater_feed_wait_can_be_cancelled_before_transport_deadline"
+      ],
+      "residual": "Feed cancellation and separate transport budgets have helper tests; DNS/connect/slow-body fault matrix and real signed update remain unverified."
+    },
+    {
+      "id": 66,
+      "title": {
+        "zh": "建立更新签名公钥轮换流程",
+        "en": "Exercise updater key rotation"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "用测试密钥演练跨两版本轮换，未经授权的签名仍被拒绝。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 67,
+      "title": {
+        "zh": "更新前显示操作系统和架构兼容性",
+        "en": "Explain update compatibility requirements"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "以不兼容测试资产验证提前解释原因，当前安装保持可用。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 68,
+      "title": {
+        "zh": "建立明确的平台资产支持矩阵",
+        "en": "Publish a tested platform asset matrix"
+      },
+      "source": "scripts/package_desktop.py",
+      "acceptance": "每个宣称支持的组合都有构建、安装及更新证据，未支持组合明确提示。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 69,
+      "title": {
+        "zh": "为后台下载提供可选带宽限制",
+        "en": "Offer download bandwidth limits"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "限速开启后吞吐符合配置，取消及时，签名校验不变。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 70,
+      "title": {
+        "zh": "更新进度区分速度、校验及替换阶段",
+        "en": "Explain update progress by stage"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "未知总大小不显示虚假百分比；慢速及校验阶段均有准确状态。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 71,
+      "title": {
+        "zh": "空间需求按实际资产估算",
+        "en": "Estimate space from actual assets"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "小包和大包的空间边界测试均通过，未知体积时保守拒绝并说明依据。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 72,
+      "title": {
+        "zh": "允许用户选择关窗、后台驻留和登录启动行为",
+        "en": "Make desktop lifecycle preferences explicit"
+      },
+      "source": "desktop/src-tauri/src/main.rs",
+      "acceptance": "逐一验证关窗、托盘退出及系统重启，不误停非自有服务。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 73,
+      "title": {
+        "zh": "增加用户主动启用的崩溃诊断包",
+        "en": "Offer opt-in crash diagnostics"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "导出前可预览内容，凭据和用户源码不进入默认诊断包。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_diagnostic_preview_export_is_explicit_and_contains_no_user_text"
+      ],
+      "residual": "Minimal allowlisted preview and explicit-consent export API are tested; no user-facing UI integration or full crash package workflow."
+    },
+    {
+      "id": 74,
+      "title": {
+        "zh": "按运行实例保存导航和视图偏好",
+        "en": "Scope navigation preferences to runtime instances"
+      },
+      "source": "adaptive_rsi/web/desktop.js",
+      "acceptance": "切换两个含不同项目的服务，分别恢复各自的有效视图。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/desktop.js"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "Runtime-scoped preference restoration is exercised with simulated machine identities; real switching between two separate services is not accepted."
+    },
+    {
+      "id": 75,
+      "title": {
+        "zh": "增加桌面常用操作的原生菜单与快捷键",
+        "en": "Add native desktop commands"
+      },
+      "source": "desktop/src-tauri/src/main.rs",
+      "acceptance": "在 macOS 菜单和键盘上完成常用流程，快捷键不干扰文本输入。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 76,
+      "title": {
+        "zh": "提供代理和企业证书连接诊断",
+        "en": "Diagnose proxy and certificate configuration"
+      },
+      "source": "desktop/src-tauri/src/main.rs",
+      "acceptance": "测试代理认证失败和自建 CA 环境，诊断不输出代理密码或令牌。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 77,
+      "title": {
+        "zh": "升级确认说明本机客户端与运行服务的作用范围",
+        "en": "Explain which components an update affects"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "本机自有、已有本机服务和远端三种模式分别显示准确影响。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [],
+      "residual": "Scope text implemented; three-mode browser proof remains."
+    },
+    {
+      "id": 78,
+      "title": {
+        "zh": "自动安装增加维护时间窗口",
+        "en": "Add update maintenance windows"
+      },
+      "source": "adaptive_rsi/web/native-update.js",
+      "acceptance": "跨午夜和时区变化测试；窗口外不安装，手动安装仍可用。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update.cjs"
+      ]
+    },
+    {
+      "id": 79,
+      "title": {
+        "zh": "提供可导出的升级回执",
+        "en": "Export upgrade receipts"
+      },
+      "source": "desktop/src-tauri/src/native_update.rs",
+      "acceptance": "成功、取消及恢复均有明确记录，回执不含用户认证信息。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 80,
+      "title": {
+        "zh": "按功能能力协商和界面降级",
+        "en": "Negotiate feature capabilities"
+      },
+      "source": "adaptive_rsi/contracts.py",
+      "acceptance": "新客户端接旧服务时可用功能继续工作，不支持操作有明确提示。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/contracts.py"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "Feature capability negotiation/degradation is exercised with simulated capability responses; real new-client/old-server compatibility remains unverified."
+    },
+    {
+      "id": 81,
+      "title": {
+        "zh": "任务依赖从单前置扩展为受控 DAG",
+        "en": "Support bounded dependency DAGs"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "菱形依赖、循环、取消和缺失节点均有明确调度结果。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_dependencies.py",
+        "adaptive_rsi/migrations/006_dependency_dag.sql",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_dependency_dag",
+        "node tests/browser_dependency_dag.cjs",
+        "node --test tests/web_*.cjs"
+      ]
+    },
+    {
+      "id": 82,
+      "title": {
+        "zh": "取消前置任务时预览受影响的后继",
+        "en": "Preview dependency cancellation effects"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "取消多层依赖时预览与最终逐项回执一致，不隐式扩大取消范围。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_lifecycle.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Preview-bound transactional cancellation; explicit cascade only, finished/cross-project tasks protected, large impact disclosed and root-only cancellation remains available."
+    },
+    {
+      "id": 83,
+      "title": {
+        "zh": "合并任务的每条验收要求链接独立证据",
+        "en": "Map grouped acceptance to individual evidence"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "一个子要求失败时组不能宣称全部通过，每条要求可导航到实际证据。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_duplicate_criteria_have_distinct_original_evidence_entries",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_missing_one_mapped_check_keeps_requirement_unknown",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_group_summary_without_coverage_never_marks_requirements_passed",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_group_requires_independent_acceptance_even_for_low_risk"
+      ],
+      "residual": "Grouped tasks require independent pipeline acceptance regardless of risk. Per-original criteria link run/stage/check indexes; missing coverage stays unknown and failed criteria cannot yield all_passed."
+    },
+    {
+      "id": 84,
+      "title": {
+        "zh": "按预计验证成本建议拆分过大任务组",
+        "en": "Size task groups by verification cost"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "用实际 CI 数据比较分组策略，用户确认拆分且每个组仍通过完整门禁。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_missing_measurements_are_unknown_not_zero_or_speedup",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_measured_local_cost_is_retained_for_later_comparison"
+      ],
+      "residual": "Local measured costs are retained and recommendations use bounded clustering. Matched real CI strategy comparisons, observed shared savings and failure/rework benefit data remain insufficient; no speedup claim."
+    },
+    {
+      "id": 85,
+      "title": {
+        "zh": "预览共享检查收益和失败重做代价",
+        "en": "Preview grouping benefits and rework costs"
+      },
+      "source": "adaptive_rsi/web/batch.js",
+      "acceptance": "估计与实际执行可对比，证据不足时标记未知而非保证加速。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_missing_measurements_are_unknown_not_zero_or_speedup",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_measured_local_cost_is_retained_for_later_comparison"
+      ],
+      "residual": "Local measured costs are retained and recommendations use bounded clustering. Matched real CI strategy comparisons, observed shared savings and failure/rework benefit data remain insufficient; no speedup claim."
+    },
+    {
+      "id": 86,
+      "title": {
+        "zh": "推荐任务簇但保留用户授权",
+        "en": "Recommend task groups without automatic mutation"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "推荐不产生任务变更；确认后执行范围与预览完全一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_recommendation_is_read_only_and_confirmation_uses_exact_snapshot",
+        "python3 -B -m unittest tests.test_batch_planning.BatchPlanningTest.test_recommendation_cannot_execute_without_confirmation"
+      ],
+      "residual": "Recommendation is read-only and exact preview revisions bind explicit group confirmation; stale previews fail without mutation."
+    },
+    {
+      "id": 87,
+      "title": {
+        "zh": "批量回执可检索、导出和重新打开",
+        "en": "Make batch receipts searchable and exportable"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "应用重启后仍能找到同一批次，导出内容与持久化回执一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 88,
+      "title": {
+        "zh": "为合并任务失败提供拆分重做流程",
+        "en": "Support splitting failed task groups"
+      },
+      "source": "adaptive_rsi/batching.py",
+      "acceptance": "部分成功不会被当作整组通过；重新拆分保留需求来源并重新验证。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
+    },
+    {
+      "id": 89,
+      "title": {
+        "zh": "用真实运行阶段样本估计排队时间区间",
+        "en": "Estimate queue time from actual execution"
+      },
+      "source": "adaptive_rsi/telemetry.py",
+      "acceptance": "历史回放报告区间覆盖率及误差，冷启动或样本不足明确说明。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 90,
+      "title": {
+        "zh": "调度公平性采用滚动窗口与实际资源消耗",
+        "en": "Evaluate rolling resource-based fairness"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "长短任务混合模拟中报告等待分位数和权重兑现程度，再选择策略。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditResourceFairnessTest tests.test_audit_round6.AuditResourceWorkloadTest"
+      ],
+      "residual": "Rolling worker-time accounting and starvation priority implemented; synthetic mixed-duration workload covered, production waiting quantiles and resource-pressure admission remain separate."
+    },
+    {
+      "id": 91,
+      "title": {
+        "zh": "让资源优先级和等待指标发挥作用",
+        "en": "Implement resource priority and wait accounting"
+      },
+      "source": "adaptive_rsi/resources.py",
+      "acceptance": "竞争测试证明优先级生效，低优先级有等待上界且指标与事件一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/agent.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_resource_priority tests.test_comprehensive_audit tests.test_audit_round6"
+      ],
+      "residual": "Named priorities and FIFO aging affect real reservations. Aged requests cannot be indefinitely overtaken by younger arrivals, but running reservations are not preempted and kernel-blocked work has no absolute completion bound. Bounded diagnostic wait samples and opaque receipts include cancellation."
+    },
+    {
+      "id": 92,
+      "title": {
+        "zh": "加入磁盘和内存压力准入判断",
+        "en": "Add disk and memory pressure admission"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "受控低资源测试中不启动无法完成的工作，压力解除后恢复且不误报任务失败。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/resource_pressure.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_resource_pressure tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_comprehensive_audit tests.test_audit_round6",
+        "node tests/browser_resource_pressure.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Opt-in MiB thresholds default disabled. Low or unavailable configured measurements defer claims without consuming attempts; other eligible projects continue. Memory observations declare platform basis and are cached for five seconds. Visible Linux cgroup v2 limits are considered; inaccessible controllers are not guaranteed. Admission observes current resources but does not reserve them."
+    },
+    {
+      "id": 93,
+      "title": {
+        "zh": "用到期队列减少大项目数下的全量轮询",
+        "en": "Consider deadline-driven scheduling"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "百千项目负载对比 CPU、查询数和到期误差，不降低取消与配置响应。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_idle_projects_use_deadline_cache_and_wake_invalidates_it",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_idle_deadline_selection_scales_to_thousand_projects"
+      ],
+      "residual": "Deadline-based project selection and wake invalidation are integrated and measured at 100/1000 projects. No matched old-policy CPU/query/deadline-error comparison or full response-latency benchmark."
+    },
+    {
+      "id": 94,
+      "title": {
+        "zh": "展示正常关闭的阶段和剩余工作",
+        "en": "Explain graceful shutdown progress"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "注入慢子进程和维护任务，关闭状态始终可解释且最终有明确结果。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/operations.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_shutdown_progress_is_readable_while_worker_drains",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_shutdown_rejects_new_worker_admission"
+      ],
+      "residual": "Shutdown progress API reports phases and remaining workers/operations while a worker drains; full slow-maintenance/subprocess matrix and user-facing status integration remain incomplete."
+    },
+    {
+      "id": 95,
+      "title": {
+        "zh": "按阶段配置时限并记录超时位置",
+        "en": "Use stage-specific deadlines"
+      },
+      "source": "adaptive_rsi/config.py",
+      "acceptance": "慢模型、慢准备和慢测试分别命中对应时限，取消保持及时。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/config.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_preparation_deadline_stops_real_subprocess_with_stage_receipt",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_model_deadline_cancels_actual_command",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_evaluation_deadline_has_its_own_clock",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_stage_limits_reject_invalid_values"
+      ],
+      "residual": "Preparation/model/evaluation clocks and stage receipts are wired through cooperative cancellation. A blocked kernel/filesystem call cannot be hard-interrupted by cooperative checks."
+    },
+    {
+      "id": 96,
+      "title": {
+        "zh": "安全复用已封存的只读阶段检查点",
+        "en": "Reuse sealed read-only checkpoints"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "任一输入变化都失效；写工作区或远端操作不因检查点自动重放。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_sealed_read_only_checkpoint_rejects_mutation_or_changed_input"
+      ],
+      "residual": "Sealed read-only checkpoint API rejects changed inputs/effects and tampering; automatic pipeline scheduling/reuse is not integrated."
+    },
+    {
+      "id": 97,
+      "title": {
+        "zh": "记录人工干预的结构化原因和效果",
+        "en": "Capture intervention reasons and outcomes"
+      },
+      "source": "adaptive_rsi/telemetry.py",
+      "acceptance": "导出可关联干预前后状态，用户原文保留且不强制填写。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_lifecycle.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Optional verbatim reasons, before/after effects, candidate/publication identity, stable history pagination and explicitly partial exports; older events may lack structured fields."
+    },
+    {
+      "id": 98,
+      "title": {
+        "zh": "预约任务明确时区与夏令时规则",
+        "en": "Clarify timezone-aware task scheduling"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "夏令时跳过及重复小时测试给出确定行为，时区变化不静默移动授权时间。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_scheduled_wall_time_rejects_gap_and_requires_fold"
+      ],
+      "residual": "Scheduling API rejects DST gaps and requires an explicit fold for repeated hours, preserving an authorized absolute instant. No HTTP endpoint/UI integration or browser acceptance."
+    },
+    {
+      "id": 99,
+      "title": {
+        "zh": "提供归档恢复与项目重定位流程",
+        "en": "Add archive restoration and relocation"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "移动仓库并恢复归档后历史仍可访问，活动任务及远端身份重新校验。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [],
+      "residual": "Explicit paused project restoration implemented; relocation remains."
+    },
+    {
+      "id": 100,
+      "title": {
+        "zh": "需求修订显示差异及重跑影响",
+        "en": "Explain requirement revisions and rerun impact"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "连续修订后可重建最终需求并追溯每次重跑的依据。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_revisions.py",
+        "adaptive_rsi/migrations/004_revision_snapshots.sql",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Atomic exact after snapshots and invalidation effects, lazy diffs and cursor history beyond 100 edits. Legacy missing snapshots are not inferred; retention still applies."
+    },
+    {
+      "id": 101,
+      "title": {
+        "zh": "为分页提供稳定游标或快照版本",
+        "en": "Stabilize pagination under mutation"
+      },
+      "source": "adaptive_rsi/server.py",
+      "acceptance": "翻页同时插入及更新任务，不漏读既定快照记录，并提示快照过期。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 102,
+      "title": {
+        "zh": "后台操作及批量回执增加保留策略",
+        "en": "Define operation and batch receipt retention"
+      },
+      "source": "adaptive_rsi/operations.py",
+      "acceptance": "生成大量终态回执后按规则清理，活动和未知结果回执不被提前删除。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMaintenanceRetentionTest"
+      ],
+      "residual": "Bounded cleanup removes old terminal operations and completed batch receipts while preserving unknown/active receipts."
+    },
+    {
+      "id": 103,
+      "title": {
+        "zh": "备份清单计算 hash 改为有界流式读取",
+        "en": "Hash backup manifests with bounded memory"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "大文件清单计算的峰值内存与文件大小解耦，结果 hash 与原算法一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_storage_manifest_is_streamed_and_cached_with_explicit_refresh"
+      ]
+    },
+    {
+      "id": 104,
+      "title": {
+        "zh": "存储概览采用可失效缓存或增量清单",
+        "en": "Cache or incrementally index storage usage"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "新增、删除及外部修改后可刷新到准确值，显示扫描时间和陈旧程度。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_storage_manifest_is_streamed_and_cached_with_explicit_refresh"
+      ]
+    },
+    {
+      "id": 105,
+      "title": {
+        "zh": "归档压缩级别与资源预算可选",
+        "en": "Budget archive compression resources"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "报告 CPU、耗时及体积对比，取消不发布不完整归档。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/cli.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest"
+      ],
+      "residual": "Configurable compression, shared deadline, cancellation checks and per-thread CPU/wall/size receipts; final publication rechecks cancellation."
+    },
+    {
+      "id": 106,
+      "title": {
+        "zh": "增加 WAL 检查点状态与长读事务诊断",
+        "en": "Diagnose WAL checkpoint pressure"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "持有长读事务压测时准确解释 WAL 增长，维护不阻塞正常任务。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest.test_passive_checkpoint_reports_reader_pin_without_waiting"
+      ],
+      "residual": "Passive checkpoint plus local snapshot ages; other-process reader identities cannot be observed."
+    },
+    {
+      "id": 107,
+      "title": {
+        "zh": "为大历史规模设查询和响应性能预算",
+        "en": "Set large-history performance budgets"
+      },
+      "source": "adaptive_rsi/telemetry.py",
+      "acceptance": "基准数据固定且可重放，超过预算时 CI 或性能报告明确告警。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/benchmark_history.py",
+        ".github/workflows/checks.yml"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_history_budget",
+        "python3 -B scripts/benchmark_history.py --tasks 50000 --samples 3 --enforce --output docs/validation/history-performance-20261028.json",
+        "docs/validation/history-performance-20261028.json"
+      ],
+      "residual": "Fixed synthetic history measures read-model construction plus JSON bytes, query wrapper calls and nearest-rank p95. Ordinary CI enforces one 10000-task/20000-run fixture and retains its report. Local 50000-task/100000-run report passed; it does not establish HTTP, cold-disk or concurrent production performance."
+    },
+    {
+      "id": 108,
+      "title": {
+        "zh": "完善项目及运行关系的外键覆盖",
+        "en": "Expand relational constraint coverage"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "导入既有孤儿数据时先审计隔离，合法历史升级后不丢失。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 109,
+      "title": {
+        "zh": "关系巡检覆盖更多证据表",
+        "en": "Extend relationship auditing beyond stages"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "合成各种孤儿关系，只有可证明无效的记录进入可恢复隔离。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
+    },
+    {
+      "id": 110,
+      "title": {
+        "zh": "将建表和回填迁移按版本分段执行",
+        "en": "Execute migrations once per version"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "从各历史 fixture 升级，第二次启动不重复回填，未来版本仍被拒绝。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/schema_migrations.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest tests.test_audit_round5 tests.test_store"
+      ],
+      "residual": "SQL migration bytes and ordered history are checked before mutation; sealed bootstrap is not repeated; additive SQL and ledger roll back together. Legacy 1/2 hashes and transaction-external bootstrap DDL remain historical boundaries. Compatibility format stays v2. Installed wheel resource/startup verified."
+    },
+    {
+      "id": 111,
+      "title": {
+        "zh": "提供数据库不可写或损坏时的只读恢复模式",
+        "en": "Add a read-only database recovery mode"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "模拟只读及部分损坏数据库，修复模式不修改原库且能导出有效诊断。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/recovery_diagnostics.py",
+        "adaptive_rsi/cli.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditOfflineRecoveryTest"
+      ],
+      "residual": "Offline CLI inspects a bounded temporary database/WAL copy without opening the source through SQLite; damaged sources return partial diagnostics, not repaired data."
+    },
+    {
+      "id": 112,
+      "title": {
+        "zh": "配置审计增加来源、脱敏差异及安全撤销",
+        "en": "Explain configuration changes and safe undo"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "并发修改时撤销不覆盖他人更新，凭据字段不进入普通审计文本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config_history.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/dashboard.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_config_history tests.test_model_center tests.test_store tests.test_audit_round6",
+        "node tests/browser_config_history.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Exact private snapshots and configuration commit together; normal audit projections redact legacy and new secrets. Revision, ownership and content hashes prevent stale undo. Post-commit event failures remain observable and snapshots remain discoverable. Namespace retention is tracked separately in item113."
+    },
+    {
+      "id": 113,
+      "title": {
+        "zh": "为 settings 命名空间声明类型、版本及 TTL",
+        "en": "Type and version settings namespaces"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "损坏单一 namespace 时其他功能仍可用，迁移和保留规则可检查。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/store.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_corrupt_setting_isolated_and_typed_namespace_expires",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_namespace_rejects_values_that_cannot_roundtrip_type"
+      ],
+      "residual": "Opt-in type/version/TTL envelopes and corrupt-setting isolation are tested. Existing namespaces have not been migrated and namespace retention/migration policy is incomplete."
+    },
+    {
+      "id": 114,
+      "title": {
+        "zh": "增加不含敏感参数的慢 SQL 诊断",
+        "en": "Trace slow SQL without sensitive parameters"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "慢查询可关联请求或任务，绑定参数和用户正文默认不记录。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
+    },
+    {
+      "id": 115,
+      "title": {
+        "zh": "连接池等待增加分位数与超时指标",
+        "en": "Measure connection-pool wait latency"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "饱和测试中等待分位数、超时次数和实际请求延迟可对齐。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
+    },
+    {
+      "id": 116,
+      "title": {
+        "zh": "将完整关系检查与轻量状态读取分开",
+        "en": "Separate full integrity scans from live metrics"
+      },
+      "source": "adaptive_rsi/store.py",
+      "acceptance": "大库下日常指标有耗时界限，完整审计仍能发现全部已注入违规。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_store_observability tests.test_store tests.test_audit_round6 tests.test_server_execution",
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10",
+        "docs/validation/store-metrics-20261028.json"
+      ]
+    },
+    {
+      "id": 117,
+      "title": {
+        "zh": "在线备份增加整体时限和空间余量控制",
+        "en": "Bound backup duration and space consumption"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "高写入与低空间实验中有明确终态，旧恢复点不受影响。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_backup_low_space_and_deadline_preserve_previous_recovery_point",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_backup_under_concurrent_writes_has_explicit_deadline",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_backup_rejects_nonfinite_and_boolean_resource_budgets"
+      ],
+      "residual": "Injected low free space and elapsed deadline preserve the previous verified recovery point; a real concurrent SQLite writer permits a verified bounded backup. This does not simulate a physically exhausted volume."
+    },
+    {
+      "id": 118,
+      "title": {
+        "zh": "清理动作增加可预览的短期回收区",
+        "en": "Offer previewable reversible cleanup"
+      },
+      "source": "adaptive_rsi/maintenance.py",
+      "acceptance": "预览与实际对象一致，活动及法律保留对象不清理，撤销可验证。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_cleanup_preview_recycle_undo_and_holds",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_cleanup_rejects_stale_preview_and_symlink",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_cleanup_undo_preserves_new_artifacts",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_cleanup_corrupt_hold_fails_closed"
+      ],
+      "residual": "Opt-in preview/recycle/undo APIs recheck active/legal holds and avoid overwriting new artifacts. Fsynced disk receipts reconcile failed or uncertain SQLite commits and process exit; tests.test_cleanup_recovery covers recovery and conflicts on macOS. Automatic cleanup integration, expiry purging and Linux renameat2 execution remain unverified."
+    },
+    {
+      "id": 119,
+      "title": {
+        "zh": "归档增加内容清单及定期完整性验证",
+        "en": "Verify archive content integrity"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "故意破坏一个归档字节，校验能定位损坏且不把它当作有效恢复点。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest tests.test_audit_round6.AuditMaintenanceRetentionTest"
+      ],
+      "residual": "Checksummed database-only manifest, bounded isolated decompression and periodic verification; legacy archives without manifests fail explicitly, not silently trusted."
+    },
+    {
+      "id": 120,
+      "title": {
+        "zh": "定期隔离演练业务级恢复",
+        "en": "Rehearse business-level restoration"
+      },
+      "source": "adaptive_rsi/storage_tools.py",
+      "acceptance": "恢复演练不派发真实远端操作，发现路径及对象关系问题并生成报告。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_restore_replaces_malformed_case_without_old_path",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_business_rehearsal_is_isolated_and_reports_relationships",
+        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_business_rehearsal_reports_orphan_without_changing_snapshot"
+      ],
+      "residual": "Restored case paths are invalidated/remapped and isolated database-only business rehearsal checks relationships without remote operations. Periodic scheduling, repository/artifact restoration and business execution remain unverified."
+    },
+    {
+      "id": 121,
+      "title": {
+        "zh": "模型能力元数据加入来源、日期和人工覆盖",
+        "en": "Version capability metadata with provenance"
+      },
+      "source": "adaptive_rsi/agent.py",
+      "acceptance": "未知模型保持保守，错误目录可回退，界面显示元数据来源及时间。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 122,
+      "title": {
+        "zh": "为各类工具设置独立结果预算和分页",
+        "en": "Budget and paginate tool results independently"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "各工具在边界处返回可继续读取的位置和准确截断原因。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_search.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_list_pages_can_be_resumed_without_loss",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_unicode_search_budget_keeps_results_and_continuation"
+      ],
+      "residual": "Listing/search have independent bounded pages, cursors and reasons; equivalent continuation and result-budget contracts are not complete for every tool."
+    },
+    {
+      "id": 123,
+      "title": {
+        "zh": "输入 token 估计显示语言相关不确定范围",
+        "en": "Estimate tokens with language-aware uncertainty"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "多语言样本与真实计数比较误差，未知 tokenizer 时不宣称精确。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 124,
+      "title": {
+        "zh": "有界并行执行相互独立的只读工具",
+        "en": "Parallelize independent read-only tools"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "读操作取得可测收益，输出顺序稳定，取消和总时限严格生效。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_readonly_tools_overlap_but_return_in_call_order"
+      ]
+    },
+    {
+      "id": 125,
+      "title": {
+        "zh": "文件写入采用原子替换并保留必要属性",
+        "en": "Make source writes atomic"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "注入写入中断和 ENOSPC，旧文件完整，合法新内容可发布。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_atomic_write_preserves_original_after_disk_failure"
+      ]
+    },
+    {
+      "id": 126,
+      "title": {
+        "zh": "按行流式读取大源文件",
+        "en": "Stream bounded line ranges from large sources"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "读取大文件尾部的内存有界，范围和编码错误清晰。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_large_source_ranges_are_streamed"
+      ]
+    },
+    {
+      "id": 127,
+      "title": {
+        "zh": "索引读取 Git 忽略规则及用户排除项",
+        "en": "Respect ignore rules during indexing"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "嵌套忽略、显式包含和未跟踪源码规则可预测，结果仍说明部分性。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_git_index_honors_nested_ignore_and_tracked_inclusion"
+      ],
+      "residual": "Git indexing honors nested ignore rules, tracked exceptions and .rsiignore user exclusions, with explicit fallback/truncation metadata."
+    },
+    {
+      "id": 128,
+      "title": {
+        "zh": "搜索增加路径、大小写及正则选项",
+        "en": "Add scoped search options"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "对无效正则、超长模式和大结果集保持有界执行及部分结果说明。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_search.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_regex_search_and_invalid_patterns",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_regex_pathological_pattern_is_bounded",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_regex_pages_and_invalid_search_inputs",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_regex_cancellation_terminates_worker",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_search_scopes_case_and_resumes_matches",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_skipped_files_are_reported"
+      ],
+      "residual": "Path/case/regex search has bounded worker execution, cancellation, continuation and explicit skipped/partial-result reasons."
+    },
+    {
+      "id": 129,
+      "title": {
+        "zh": "大工具输出保留为独立产物引用",
+        "en": "Reference large tool output as artifacts"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "超限输出不会进入模型上下文，保留产物仍按容量和敏感信息规则管理。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 130,
+      "title": {
+        "zh": "为可重试传输失败明确付费请求语义",
+        "en": "Classify retry safety for paid requests"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "分别注入连接失败、响应丢失和 429，回执准确说明是否可能产生费用。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_transport_receipts_distinguish_rejected_and_ambiguous_billing"
+      ],
+      "residual": "Injected not-sent, rejected and ambiguous transport failures record possible billing and duplicate-retry risk. No paid provider call was made; provider billing itself is not independently verified."
+    },
+    {
+      "id": 131,
+      "title": {
+        "zh": "记录供应商请求 ID 和脱敏调用关联",
+        "en": "Correlate provider request identifiers"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "请求 ID 可跨错误路径保留，认证和 cookie 头不被记录。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/recovery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditModelDiagnosticsTest"
+      ],
+      "residual": "Allowlisted header request IDs survive success, HTTP errors, malformed JSON/non-object, oversized body and truncated chunked transport; cookies/headers are excluded."
+    },
+    {
+      "id": 132,
+      "title": {
+        "zh": "原生模型支持流式进度与首字节指标",
+        "en": "Add native streaming progress"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "碎片化数据、取消及中断均有契约测试，不提前执行未完整解析的工具。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 133,
+      "title": {
+        "zh": "持久化脱敏工具轨迹用于崩溃调查",
+        "en": "Persist redacted tool traces"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "进程中断后可查已完成步骤，不自动重放文件写入或命令。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
+    },
+    {
+      "id": 134,
+      "title": {
+        "zh": "把停止原因传入最终诊断和恢复建议",
+        "en": "Preserve provider stop reasons end to end"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "各协议模拟不同停止原因，最终 UI 和诊断包保持原因一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/recovery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditModelDiagnosticsTest",
+        "python3 -B scripts/check_i18n.py"
+      ],
+      "residual": "Normalized stop reasons persist through failure reporting and bilingual UI; includes Ollama done_reason and safety/refusal/limits."
+    },
+    {
+      "id": 135,
+      "title": {
+        "zh": "建立多协议畸形响应的统一契约矩阵",
+        "en": "Expand cross-protocol response contracts"
+      },
+      "source": "adaptive_rsi/native.py",
+      "acceptance": "每个协议运行相同语义样本，异常不丢已完成工作也不重复执行工具。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_malformed_protocol_responses_do_not_mutate_history"
+      ],
+      "residual": "Malformed response structures across supported protocols preserve prior history in tested fixtures; full shared semantic matrix and completed-tool/no-duplicate guarantees remain incomplete."
+    },
+    {
+      "id": 136,
+      "title": {
+        "zh": "显示 fallback 原因及共享故障域",
+        "en": "Explain fallback fault domains"
+      },
+      "source": "adaptive_rsi/agent.py",
+      "acceptance": "模拟共享账号故障，用户能理解跳过路由及最终失败原因。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 137,
+      "title": {
+        "zh": "费用估计分开输入、输出及缓存价格",
+        "en": "Price input, output and cache usage separately"
+      },
+      "source": "adaptive_rsi/usage_report.py",
+      "acceptance": "用公开固定样例核对账单公式，历史调用使用当时价表而非当前价格。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 138,
+      "title": {
+        "zh": "明确费用币种、单位和订阅估值含义",
+        "en": "Explain currency and estimation limits"
+      },
+      "source": "adaptive_rsi/usage_report.py",
+      "acceptance": "混合 API 和订阅调用时总计准确标记未知部分，用户可导出依据。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 139,
+      "title": {
+        "zh": "展示任务成本预测与实际偏差",
+        "en": "Compare estimated and actual task cost"
+      },
+      "source": "adaptive_rsi/telemetry.py",
+      "acceptance": "样本不足时标未知，不新增强制额度限制；历史预测可与实际核对。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 140,
+      "title": {
+        "zh": "凭据轮换后失效旧健康及探测证据",
+        "en": "Invalidate stale evidence after credential rotation"
+      },
+      "source": "adaptive_rsi/provider_health.py",
+      "acceptance": "替换测试凭据但不改引用，旧冷却和 probe 记录不再当作新凭据的结论。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/provider_health.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_rotating_same_credential_reference_invalidates_probe_identity"
+      ]
+    },
+    {
+      "id": 141,
+      "title": {
+        "zh": "评估样本按来源和任务规模分层选择",
+        "en": "Stratify evaluation sampling"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "固定输入下抽样可复现，各层覆盖和曝光数可审计。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_stratified_selection_covers_source_and_task_size"
+      ]
+    },
+    {
+      "id": 142,
+      "title": {
+        "zh": "实验清单包含真实源码树及完整输入摘要",
+        "en": "Hash complete experiment inputs"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "改动任一实验输入都会改变对应摘要，离线核对能发现不一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_manifest_verification_detects_changed_task_and_tree",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_overlay_identity_includes_empty_directories_and_modes"
+      ],
+      "residual": "Task/spec/tree/overlay/environment identities are sealed and verified; this establishes input integrity, not independent reproduction or causal improvement."
+    },
+    {
+      "id": 143,
+      "title": {
+        "zh": "最终晋升使用未参与候选选择的独立复核集",
+        "en": "Use fresh final promotion evidence"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "复核集未参与提案或排序，使用记录可查，样本不足时不宣称提升。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_plan_tamper_and_incomplete_execution_are_rejected"
+      ],
+      "residual": "Fresh holdout metadata and complete-plan checks are wired into promotion, but concurrent holdout selection/reservation is not sealed; no independent fresh-final-set acceptance test establishes that boundary."
+    },
+    {
+      "id": 144,
+      "title": {
+        "zh": "将人工驳回和误报反馈用于校准监控",
+        "en": "Calibrate monitoring with optional human feedback"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "标签有来源且不直接篡改封存测试结果，展示样本量及偏差。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_feedback_is_separate_from_sealed_results"
+      ],
+      "residual": "Human-provenance labels, sample counts and selection bias are recorded separately from sealed trials. Feedback is not used to calibrate monitoring thresholds."
+    },
+    {
+      "id": 145,
+      "title": {
+        "zh": "实验运行前封存指标、样本量及停止规则",
+        "en": "Seal experiment plans before execution"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "修改实验规则产生新版本，报告明确区分预设和探索性分析。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_plan_tamper_and_incomplete_execution_are_rejected"
+      ],
+      "residual": "Plan hash and exact planned trial identities reject tampering/incomplete execution and label exploratory analysis; final holdout concurrency remains item143."
+    },
+    {
+      "id": 146,
+      "title": {
+        "zh": "记录性能实验的环境噪声和重复测量",
+        "en": "Measure benchmark noise and uncertainty"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "同一改动跨负载条件复测，结论能解释噪声且不把一次波动当提升。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/workflow.py",
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_repeated_benchmarks_require_consistent_loads_and_report_noise"
+      ],
+      "residual": "Planned repetitions and load conditions are required; observed ranges/stdev explain measured noise. Synthetic measurements do not prove production improvement or population confidence."
+    },
+    {
+      "id": 147,
+      "title": {
+        "zh": "用固定负例验证检查工具确实能抓到错误",
+        "en": "Validate harness sensitivity with negative controls"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "负例必须被现有门禁阻止；不以 mutation 分数替代真实需求验收。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate"
+      ],
+      "residual": "Explicit negative-control API executes real local gates on fixed examples; automatic criterion-control generation/scheduling in the normal pipeline is not integrated."
+    },
+    {
+      "id": 148,
+      "title": {
+        "zh": "按验收要求设计反例而非只验证正常路径",
+        "en": "Exercise criterion-specific counterexamples"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "关键要求的正例通过、反例失败，来源和执行结果可以追溯。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate"
+      ],
+      "residual": "Explicit negative-control API executes real local gates on fixed examples; automatic criterion-control generation/scheduling in the normal pipeline is not integrated."
+    },
+    {
+      "id": 149,
+      "title": {
+        "zh": "记录实际执行的测试 ID 和跳过原因",
+        "en": "Record executed test identities"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "只执行无关测试的样例不能冒充目标回归验证，跳过项可查。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_executed_identities_and_skip_reasons",
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_required_test_identity_cannot_be_satisfied_by_unrelated_tests"
+      ],
+      "residual": "Evaluator records supported runner-reported exact IDs and skip reasons, and checks explicit required IDs. Opaque runner output remains unavailable; reported IDs are not independent attestation."
+    },
+    {
+      "id": 150,
+      "title": {
+        "zh": "采集有界标准测试及覆盖率产物",
+        "en": "Collect standard test and coverage artifacts"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "产物缺失有明确状态，路径及大小受限，不从任意宿主路径采集。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_bounded_artifacts_reject_links_and_host_paths"
+      ],
+      "residual": "Standard and acceptance stages collect fixed workspace-relative reports with total byte limits and explicit missing/rejected states; arbitrary host paths and symlinks are rejected."
+    },
+    {
+      "id": 151,
+      "title": {
+        "zh": "缓存不可变的依赖准备环境",
+        "en": "Cache immutable prepared environments"
+      },
+      "source": "adaptive_rsi/environment.py",
+      "acceptance": "工具、锁文件、种子或配置变化自动失效，跨任务无可写污染。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/environment.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_environment.AuditEnvironmentTest.test_cache_invalidates_tools_locks_seeds_and_restores_private_copies"
+      ],
+      "residual": "Immutable dependency-seed cache API invalidates tools/locks/seeds/configuration and restores private writable copies. Normal preparation does not automatically select or schedule this cache."
+    },
+    {
+      "id": 152,
+      "title": {
+        "zh": "性能提升同时约束关键副指标不退化",
+        "en": "Gate performance gains on secondary guardrails"
+      },
+      "source": "adaptive_rsi/workflow.py",
+      "acceptance": "构造主指标通过但内存或错误率退化的样例，结果按预先封存的规则阻止晋升。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/workflow.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_performance_guardrail_blocks_primary_gain"
+      ],
+      "residual": "Explicit performance contracts enforce secondary guardrails across planned loads; absent real measurements do not prove gains."
+    },
+    {
+      "id": 153,
+      "title": {
+        "zh": "数据集删除和重分类保留曝光历史",
+        "en": "Audit dataset retirement and reclassification"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "历史实验仍可复核，已曝光样本不能通过改名变成新 holdout。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_retirement_and_reclassification_keep_exposure"
+      ],
+      "residual": "Explicit retirement/reclassification preserves case identity, uses and lifecycle provenance; previously classified cases cannot become fresh holdout."
+    },
+    {
+      "id": 154,
+      "title": {
+        "zh": "晋升前展示策略差异和适用边界",
+        "en": "Explain strategy changes before promotion"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "用户能从界面追溯每个行为变更到封存实验，未覆盖场景明确说明。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_plan_tamper_and_incomplete_execution_are_rejected"
+      ],
+      "residual": "Sealed evidence includes promotion-review baseline/proposal and covered-sample limitations; no dedicated promotion-diff UI or browser acceptance for this workflow."
+    },
+    {
+      "id": 155,
+      "title": {
+        "zh": "按任务家族展示收益异质性",
+        "en": "Expose heterogeneous evaluation effects"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "构造总体提升但单类退化的样例，报告不能隐藏该退化。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
+    },
+    {
+      "id": 156,
+      "title": {
+        "zh": "导出可离线复现的封存实验包",
+        "en": "Export sealed experiment reproduction bundles"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "在隔离机器验证输入完整性，缺凭据或外部依赖时明确列出限制。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_bundle_verification_detects_changed_inputs"
+      ],
+      "residual": "Export/verification API detects changed bundle files and declares excluded credentials/external dependencies; no isolated-machine offline reproduction was performed."
+    },
+    {
+      "id": 157,
+      "title": {
+        "zh": "证据记录宿主工具精确版本",
+        "en": "Record exact host tool versions"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "更换关键工具时环境身份或证据变化，报告可定位具体版本。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_exact_host_tool_versions_are_recorded_without_cache_authorization"
+      ],
+      "residual": "Evaluation evidence records allowlisted host tool version and binary digest; unsupported probes remain unavailable and version evidence does not authorize cache reuse."
+    },
+    {
+      "id": 158,
+      "title": {
+        "zh": "建立 monorepo 检查依赖图",
+        "en": "Model monorepo check dependencies"
+      },
+      "source": "adaptive_rsi/evaluator.py",
+      "acceptance": "跨包依赖变更触发正确检查，未知影响回退完整集合。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evaluator.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_dependency_graph_closes_over_dependents_and_unknown_falls_back"
+      ],
+      "residual": "Dependency graph closure API conservatively falls back to all checks on unknown/invalid impact. Automatic affected-check scheduling is not integrated."
+    },
+    {
+      "id": 159,
+      "title": {
+        "zh": "策略和技能共同变化时提供归因分析",
+        "en": "Separate strategy and skill attribution"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "同输入下比较各配置，报告不把组合收益全部归给单一模块。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/evolution.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_attribution_does_not_assign_combined_gain_to_strategy"
+      ],
+      "residual": "Matched four-configuration attribution helper reports interaction-only gains and insufficient evidence; automatic controlled ablation scheduling is not integrated."
+    },
+    {
+      "id": 160,
+      "title": {
+        "zh": "同时展示质量、成本和延迟权衡",
+        "en": "Compare quality, cost and latency jointly"
+      },
+      "source": "adaptive_rsi/evolution.py",
+      "acceptance": "没有用量时显示不可比较，不用零值制造优于其他候选的假象。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/experiment_report.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_native_path_races tests.test_experiment_report tests.test_protocols tests.test_audit_round5 tests.test_audit_round6",
+        "node --test tests/web_*.cjs",
+        "node tests/browser_evolution.cjs"
+      ]
+    },
+    {
+      "id": 161,
+      "title": {
+        "zh": "区分合并队列入队与实际合并状态",
+        "en": "Explain merge queue states"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "在启用队列的测试仓库验证入队、重排、失败和最终合并状态。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 162,
+      "title": {
+        "zh": "准备度检查兼容 GitHub rulesets",
+        "en": "Inspect GitHub ruleset requirements"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "分别在两种保护配置测试，权限不足时显示未知而不假称可合并。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/delivery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.ProtectionRulesTest.test_active_rules_endpoint_can_establish_strictness_without_classic_protection",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.ProtectionRulesTest.test_ruleset_read_failure_is_unknown_even_with_classic_rules"
+      ],
+      "residual": "Ruleset/classic protection read fixtures retain unknown permissions; no real GitHub ruleset acceptance."
+    },
+    {
+      "id": 163,
+      "title": {
+        "zh": "共享可信输入的 CI 环境准备",
+        "en": "Share trustworthy CI setup work"
+      },
+      "source": ".github/workflows/release-verify.yml",
+      "acceptance": "比较冷暖缓存耗时，缓存投毒和过期输入不能绕过最终验证。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 164,
+      "title": {
+        "zh": "早期受影响检查与最终完整门禁衔接",
+        "en": "Combine affected checks with full final gates"
+      },
+      "source": ".github/workflows/checks.yml",
+      "acceptance": "注入跨模块回归仍在最终门禁被发现，时间收益用真实运行数据确认。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 165,
+      "title": {
+        "zh": "合并后失败区分候选与其他主线提交影响",
+        "en": "Attribute post-merge failures carefully"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "候选通过但后续提交破坏的样例不被直接记为候选回归。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/delivery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.AttributionTest.test_later_mainline_failure_does_not_attribute_candidate_regression",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.AttributionTest.test_unverified_merge_baseline_stays_unknown"
+      ],
+      "residual": "Later-mainline failure attribution is conservative in local fixtures; no real post-merge/UI acceptance."
+    },
+    {
+      "id": 166,
+      "title": {
+        "zh": "区分停止本地跟踪和取消远端工作流",
+        "en": "Separate tracking cancellation from remote cancellation"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "两种取消分别验证，远端已完成或结果未知时不报告虚假的取消成功。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 167,
+      "title": {
+        "zh": "GitHub 主限流与次级限流统一退避",
+        "en": "Coordinate GitHub rate-limit handling"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "注入 403 次级限流、429 及未知写响应，不产生重复 PR 或 dispatch。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.RateLimitTest.test_secondary_limit_blocks_following_calls_without_replaying_write"
+      ],
+      "residual": "Secondary rate-limit cooldown prevents tested replay; complete primary/secondary 403/429/ambiguous PR and dispatch matrix and real GitHub acceptance remain."
+    },
+    {
+      "id": 168,
+      "title": {
+        "zh": "上游强制推送和分叉基线提供恢复指引",
+        "en": "Explain rewritten or diverged baselines"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "模拟 force-push 与分叉，旧证据失效且不会自动覆盖上游。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/delivery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.BaselineAndCleanupTest.test_diverged_baseline_is_explained_without_overwriting_any_ref",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.BaselineAndCleanupTest.test_rewritten_baseline_preserves_candidate_history"
+      ],
+      "residual": "Real local Git divergence/rewrite tests preserve refs and invalidate evidence; real remote force-push and UI recovery acceptance remain."
+    },
+    {
+      "id": 169,
+      "title": {
+        "zh": "终态后处理使用可核对的持久化待办",
+        "en": "Persist retryable post-processing work"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "在每个后处理步骤前后崩溃，重启后恰当恢复且无重复副作用。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_postprocess_recovers_without_duplicate_observation"
+      ],
+      "residual": "Persisted postprocessing todo and deterministic observation identity recover tested faults; per-record isolation preserves corrupt records and lets healthy projects continue, while archived work becomes obsolete. Not all delivery/monitor/evolution step crash windows or side effects are proven idempotent."
+    },
+    {
+      "id": 170,
+      "title": {
+        "zh": "可选签名 webhook 降低远端轮询成本",
+        "en": "Offer optional authenticated event delivery"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "乱序、重复和漏事件测试后状态正确，不要求普通本机用户部署额外服务。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 171,
+      "title": {
+        "zh": "部署健康要求连续成功或稳定观察窗口",
+        "en": "Require sustained deployment health"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "间歇失败服务不能过早稳定，观察窗和失败阈值有界且可解释。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation tests.test_release tests.test_audit_round6",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Optional consecutive-success gate with bounded persisted observations; up to eight HTTPS endpoints share a 15-second per-round deadline. All endpoints must confirm the target SHA. Rollout and rollback apply identical gates and revalidate authorization/ownership after probing. Defaults remain one endpoint and one success."
+    },
+    {
+      "id": 172,
+      "title": {
+        "zh": "可选多个健康端点和区域观察",
+        "en": "Support bounded multi-target health analysis"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "部分区域故障被显式呈现，不把单点成功当作全量健康。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation tests.test_release tests.test_audit_round6",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Optional consecutive-success gate with bounded persisted observations; up to eight HTTPS endpoints share a 15-second per-round deadline. All endpoints must confirm the target SHA. Rollout and rollback apply identical gates and revalidate authorization/ownership after probing. Defaults remain one endpoint and one success."
+    },
+    {
+      "id": 173,
+      "title": {
+        "zh": "部署回滚显式声明数据迁移兼容条件",
+        "en": "Declare deployment data compatibility"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "用不兼容迁移测试阻止危险回滚，并给出人工恢复步骤。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/index.html"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_deployment_observation",
+        "python3 -B -m unittest tests.test_release tests.test_backend_hardening",
+        "node tests/browser_deployment_health.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "New automatic rollback dispatch requires explicit backward_compatible data policy; missing legacy declarations default to manual. Blocked receipts retain maintainer recovery steps. Already-dispatched rollbacks continue reconciliation. Compatibility is a maintainer declaration, not proof that arbitrary migrations are reversible."
+    },
+    {
+      "id": 174,
+      "title": {
+        "zh": "将工作流目标环境绑定到授权证据",
+        "en": "Bind target environments to authorization"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "修改目标环境后旧授权失效，回执显示实际部署目标及输入 hash。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.AuthorizationReceiptTest.test_receipt_binds_exact_dispatch_inputs_and_target_policy"
+      ],
+      "residual": "Authorization receipt binds normalized target policy and exact dispatch-input hash in fixtures; real target changes and remote/UI acceptance remain."
+    },
+    {
+      "id": 175,
+      "title": {
+        "zh": "拆分远端排队、执行、构建和复验耗时",
+        "en": "Break down remote verification time"
+      },
+      "source": "adaptive_rsi/telemetry.py",
+      "acceptance": "指标与 GitHub 时间戳可核对，缺失阶段显示未知。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.RemoteTimingTest.test_remote_timestamps_preserved_with_unknown_build_phase"
+      ],
+      "residual": "Remote timestamp fixtures preserve queue/execution timing; build remains unknown and real GitHub timestamp comparison is outstanding."
+    },
+    {
+      "id": 176,
+      "title": {
+        "zh": "远端临时分支提供只读清理预览",
+        "en": "Preview stale remote branch cleanup"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "预览不执行删除，仍被 PR 或恢复点引用的分支得到保护。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/delivery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.BaselineAndCleanupTest.test_full_cleanup_page_yields_no_candidates",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.BaselineAndCleanupTest.test_cleanup_preview_protects_open_pr_recovery_and_unknown_branches"
+      ],
+      "residual": "Read-only bounded preview protects open PR/recovery/unknown branches and incomplete pages; no real GitHub or UI acceptance."
+    },
+    {
+      "id": 177,
+      "title": {
+        "zh": "Issue 更新显示需求差异和来源链",
+        "en": "Explain synchronized requirement changes"
+      },
+      "source": "adaptive_rsi/runtime.py",
+      "acceptance": "保留原文和来源时间，未获授权的评论不改变任务权限。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_issue_sync_retains_original_diff_and_source_without_permission_change"
+      ],
+      "residual": "Issue synchronization records original before/after text, source timestamps and diffs without permission changes. Audit persistence is not atomic with task synchronization."
+    },
+    {
+      "id": 178,
+      "title": {
+        "zh": "区分 GitHub 读取与写入权限的准备度",
+        "en": "Check GitHub capabilities without test writes"
+      },
+      "source": "adaptive_rsi/readiness.py",
+      "acceptance": "只读令牌不会被误报为所有交付可用，诊断不执行测试写入。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/readiness.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.CapabilityTest.test_read_only_repository_permissions_never_imply_write",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.CapabilityTest.test_missing_permissions_are_unknown"
+      ],
+      "residual": "Read-only permission fixtures distinguish read/write and unknown capabilities without test writes; real scoped-token and user-facing workflow acceptance remain."
+    },
+    {
+      "id": 179,
+      "title": {
+        "zh": "结果未知的远端派发提供人工核对界面",
+        "en": "Expose ambiguous dispatch reconciliation"
+      },
+      "source": "adaptive_rsi/release.py",
+      "acceptance": "延迟出现及多个匹配运行时不盲目重发，人工结论留审计记录。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/release.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.AuthorizationReceiptTest.test_multiple_matches_remain_unknown_and_expose_candidates"
+      ],
+      "residual": "Ambiguous dispatch exposes candidate runs and manual-inspection state without replay; no reconciliation UI/manual decision audit or real delayed-run acceptance."
+    },
+    {
+      "id": 180,
+      "title": {
+        "zh": "将 GitHub Enterprise 支持作为明确扩展项",
+        "en": "Plan explicit GitHub Enterprise support"
+      },
+      "source": "adaptive_rsi/delivery.py",
+      "acceptance": "在测试 Enterprise 主机完成读写流程，公共站点令牌不发送到其他主机。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 181,
+      "title": {
+        "zh": "长日志增加搜索、时间戳和阶段锚点",
+        "en": "Add navigation within long logs"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "大日志下查找响应有界，命中上下文和原始内容一致。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "Lazy bounded log views provide search and time/stage navigation with original-text export. Real Chromium searches a 19.5 MB fixture; this is local synthetic evidence."
+    },
+    {
+      "id": 182,
+      "title": {
+        "zh": "折叠日志真正按展开加载或虚拟渲染",
+        "en": "Lazily construct large evidence views"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "大证据样本下首屏时间和内存改善，展开内容完整且可导出。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "Lazy serialization, bounded rendered segments and complete export are browser-tested. No matched memory/RSS or first-screen before/after comparison; full content remains in client memory after expansion."
+    },
+    {
+      "id": 183,
+      "title": {
+        "zh": "差异阅读增加文件内搜索及 hunk 定位",
+        "en": "Improve navigation inside diffs"
+      },
+      "source": "adaptive_rsi/web/experience.js",
+      "acceptance": "多文件差异中前后跳转保持准确定位，复制内容不混入装饰字符。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/style.css"
+      ],
+      "validation": [
+        "node tests/browser_experience.cjs",
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_quoted_git_diff_paths_preserve_utf8_and_control_characters",
+        "node tests/browser_diff_mobile.cjs"
+      ]
+    },
+    {
+      "id": 184,
+      "title": {
+        "zh": "展示阻塞原因的因果链",
+        "en": "Explain chains of blocking causes"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "多个同时阻塞的样例中，解除一个原因后其余原因仍准确保留。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/blocking.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_blocking_causes tests.test_dependency_dag tests.test_store tests.test_experience tests.test_server_hardening",
+        "node tests/browser_blocking_causes.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Bounded read-only cause graph retains simultaneous prerequisites/backoff/shared blockers. Cross-project titles and global-capacity run identifiers are not exposed. Truncated graphs explicitly retain unknown remainder; update lease/journal recovery is not triggered by explanation GET."
+    },
+    {
+      "id": 185,
+      "title": {
+        "zh": "设置冲突保留本地与服务端两份并展示差异",
+        "en": "Keep both sides of settings conflicts"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "并发编辑同字段后两份内容都可恢复，保存仍进行版本检查。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "node tests/browser_settings_conflicts.cjs"
+      ]
+    },
+    {
+      "id": 186,
+      "title": {
+        "zh": "导航变化进入浏览器历史栈",
+        "en": "Preserve meaningful browser navigation history"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "连续跨项目浏览后前进后退准确，刷新和通知跳转兼容。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "node tests/browser_navigation_history.cjs",
+        "node tests/browser_experience.cjs",
+        "node tests/browser_notifications.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Cross-project view history replays without pushes. Initial hashless entries retain their original project across reload/back. Task route close preserves project/view; programmatic/button/Escape/backdrop close events do not cancel a newer notification open. Real Chromium covers delayed state responses, repeated back/forward, reload and retained drafts with zero task writes."
+    },
+    {
+      "id": 187,
+      "title": {
+        "zh": "保存的视图可选择跨浏览器同步",
+        "en": "Optionally synchronize saved views"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "在另一浏览器恢复同一视图，私有筛选不意外暴露给其他用户。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "Explicit view-file export/import restores a view in another browser context. Automatic account/service synchronization is not implemented; transfer includes project identifiers and filters."
+    },
+    {
+      "id": 188,
+      "title": {
+        "zh": "刷新列表保持焦点并限制读屏重复播报",
+        "en": "Preserve focus and limit live announcements"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "纯键盘和读屏测试覆盖自动刷新、删除及分页，焦点不丢到页面顶部。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "node tests/browser_frontend_remaining.cjs"
+      ],
+      "residual": "DOM focus restoration and reduced live announcements pass Chromium checks. No real screen-reader acceptance or complete keyboard/deletion/pagination matrix."
+    },
+    {
+      "id": 189,
+      "title": {
+        "zh": "手机差异阅读提供折叠和换行模式",
+        "en": "Improve narrow-screen diff reading"
+      },
+      "source": "adaptive_rsi/web/style.css",
+      "acceptance": "窄屏长行、Unicode 文件名及大文件样本可读，不改变补丁原文。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/style.css"
+      ],
+      "validation": [
+        "node tests/browser_diff_mobile.cjs",
+        "node tests/browser_experience.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Files fold independently and render content on first expansion; mobile wraps by default. Search opens matching files; large plain-text files locate using actual Range layout. All-file expansion can increase browser memory. A review-discovered inherited pre height cap was removed and multi-file non-overlap is covered."
+    },
+    {
+      "id": 190,
+      "title": {
+        "zh": "动态错误码及字段路径统一本地化",
+        "en": "Localize structured runtime errors"
+      },
+      "source": "adaptive_rsi/web/app.js",
+      "acceptance": "中英文同一错误提供等价指引，未知错误保留可复制诊断 ID。",
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/error_details.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_error_details tests.test_server_hardening tests.test_backend_hardening tests.test_audit_round4",
+        "node tests/browser_error_details.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Configuration reasons use stable codes and schema-owned field paths; unrecognized exception text is not reflected. Existing nonconfiguration code/generic error handling remains compatible. Unknown and malformed HTTP errors retain a validated request-header ID, copy action and manual fallback. Arbitrary user/server text is not claimed fully translatable."
+    },
+    {
+      "id": 191,
+      "title": {
+        "zh": "精确固定 Rust 和 Python 构建工具版本",
+        "en": "Pin remaining build toolchains"
+      },
+      "source": ".github/workflows/release-verify.yml",
+      "acceptance": "同提交在相同输入下可重建，升级工具链通过独立可审查变更完成。",
+      "status": "partial",
+      "implementation": [
+        "scripts/package_desktop.py",
+        ".github/workflows/release-verify.yml"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_desktop_update_boundaries.DesktopInventoryBoundaryTest.test_release_inventory_timestamp_uses_reproducible_build_epoch"
+      ],
+      "residual": "Toolchain pins and SOURCE_DATE_EPOCH inventory timestamp are present; full same-input reproducible rebuild comparison remains unverified."
+    },
+    {
+      "id": 192,
+      "title": {
+        "zh": "增加真实签名桌面 N 到 N+1 升级端到端测试",
+        "en": "Test real signed desktop upgrades end to end"
+      },
+      "source": "scripts/release_smoke.py",
+      "acceptance": "正确包成功升级，坏签名、断电窗口和启动失败各有经过验证的安全结果。",
+      "status": "pending",
+      "implementation": [],
+      "validation": []
+    },
+    {
+      "id": 193,
+      "title": {
+        "zh": "扩展 Python 边界版本的关键路径覆盖",
+        "en": "Expand supported-Python boundary coverage"
+      },
+      "source": ".github/workflows/checks.yml",
+      "acceptance": "两个边界版本都跑真实关键路径，跳过的环境依赖明确记录。",
+      "status": "partial",
+      "implementation": [
+        ".github/workflows/checks.yml"
+      ],
+      "validation": [],
+      "residual": "Boundary matrix expanded; remote results remain."
+    },
+    {
+      "id": 194,
+      "title": {
+        "zh": "按模块真实耗时分配并行测试",
+        "en": "Balance tests using actual module durations"
+      },
+      "source": "scripts/test_parallel.py",
+      "acceptance": "固定不均衡样本能形成更均衡分组，时长记录不受其他模块拖累。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/test_parallel.py",
+        "scripts/test_worker.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
+      ]
+    },
+    {
+      "id": 195,
+      "title": {
+        "zh": "建立可追踪且有期限的偶发失败记录",
+        "en": "Track flaky failures without hiding them"
+      },
+      "source": "scripts/test_parallel.py",
+      "acceptance": "一次失败保留原始证据，任何重跑及隔离决定都可审查。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/test_parallel.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_failure_history_keeps_original_attempts_and_review_deadlines"
+      ]
+    },
+    {
+      "id": 196,
+      "title": {
+        "zh": "资源 soak 扩展到调度、HTTP 与关闭交互",
+        "en": "Extend soak coverage to runtime interactions"
+      },
+      "source": "scripts/soak.py",
+      "acceptance": "长时间循环后线程、fd、连接和任务状态均回到预期范围。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/soak.py"
+      ],
+      "validation": [
+        "python3 -B scripts/soak.py --iterations 30 --runtime-cycles 10"
+      ]
+    },
+    {
+      "id": 197,
+      "title": {
+        "zh": "在副作用与回执间的精确窗口注入崩溃",
+        "en": "Inject crashes at side-effect receipt boundaries"
+      },
+      "source": "tests/test_audit_round5.py",
+      "acceptance": "每个窗口重启后既不重复外部副作用，也不把未知结果误报完成。",
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/operations.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_operation_crash_after_effect_is_unknown_and_never_reexecuted",
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_operation_effect_receipt_crash_recovers_receipt_without_repeating_effect"
+      ],
+      "residual": "Local side-effect/receipt fault injection preserves unknown outcomes and durable receipt recovery without repeating effects. Full real remote side-effect crash matrix is not accepted."
+    },
+    {
+      "id": 198,
+      "title": {
+        "zh": "文案检查扩展为语法级和动态错误覆盖",
+        "en": "Check dynamic localization structurally"
+      },
+      "source": "scripts/check_i18n.py",
+      "acceptance": "故意加入未翻译动态文案后检查失败，中英文文档对应内容有可审查差异。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_i18n_ast.cjs",
+        "package.json",
+        "package-lock.json",
+        ".github/workflows/checks.yml",
+        ".github/workflows/release-verify.yml"
+      ],
+      "validation": [
+        "node scripts/check_i18n_ast.cjs",
+        "node --test tests/web_i18n_ast.cjs",
+        "node --test tests/web_*.cjs",
+        "python3 -B -m unittest tests.test_release.WorkflowConfigurationTest tests.test_validation_planning"
+      ],
+      "residual": "AST checks literals, templates/conditionals and initialized aliases/dictionaries with lexical scope. Eight mutation tests include missing dynamic messages, Unicode, template expressions and loop/switch shadowing. Reassignments, destructuring, for-of value propagation and arbitrary runtime/server text remain outside static coverage. Paired document semantic equivalence still requires review."
+    },
+    {
+      "id": 199,
+      "title": {
+        "zh": "SBOM 从真实锁定依赖生成精确清单",
+        "en": "Generate a dependency-complete SBOM"
+      },
+      "source": "scripts/package_desktop.py",
+      "acceptance": "抽查打包中的依赖与 SBOM 对齐，发布产物和 provenance 指向同一清单。",
+      "status": "partial",
+      "implementation": [
+        "scripts/package_desktop.py",
+        "scripts/sbom.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_desktop_update_boundaries.DesktopInventoryBoundaryTest.test_formal_inventory_requires_every_locked_crate_metadata",
+        "python3 -B -m unittest tests.test_desktop_update_boundaries.DesktopInventoryBoundaryTest.test_dependency_inventory_changes_require_full_desktop_build",
+        "python3 -B -m unittest tests.test_desktop_update_boundaries.DesktopInventoryBoundaryTest.test_failed_inventory_validation_does_not_publish_partial_assets",
+        "python3 -B -m unittest tests.test_desktop_update_boundaries.DesktopInventoryBoundaryTest.test_existing_release_asset_is_preserved_and_new_assets_are_rolled_back"
+      ],
+      "residual": "Formal inventory requires locked-crate source alignment and stages assets before publication without replacing existing bytes. Real release artifact/dependency/provenance alignment and full license completeness remain unverified."
+    },
+    {
+      "id": 200,
+      "title": {
+        "zh": "审计完成项链接具体实现和验证证据",
+        "en": "Link audit completion to verifiable evidence"
+      },
+      "source": "docs/validation/audit-20261027-next-100.json",
+      "acceptance": "随机抽取完成项能直接重放验收，未覆盖边界明确列为残余限制。",
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_audit_ledger.py",
+        "scripts/check_wheel_install.py",
+        "tests/test_audit_ledger.py",
+        "docs/validation/audit-200-evidence-20261028.md",
+        "docs/validation/audit-200-evidence-20261028.en.md"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_ledger",
+        "python3 -B scripts/check_audit_ledger.py",
+        "docs/validation/wheel-install-20261028.json"
+      ],
+      "residual": "Replay references and derived bilingual counts are checked; unittest discovery imports trusted test modules and may execute load_tests hooks. This is not proof of final exact-commit test or remote CI success."
+    },
+    {
+      "id": 201,
+      "title": {
+        "zh": "验证分层、慢测试定位、并行发版及发布排队治理",
+        "en": "Layered validation, slow-test diagnosis, parallel release verification and release queue coordination"
+      },
+      "status": "partial",
+      "implementation": [
+        ".github/workflows/release-verify.yml",
+        ".github/workflows/checks.yml",
+        "scripts/classify_changes.py",
+        "scripts/release.py",
+        "scripts/test_parallel.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
+      ],
+      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback and strict mechanical-metadata ordinary-CI path implemented. Final exact-head full release verification remains mandatory. Remote timing comparison and final release queue behavior remain unverified."
+    }
+  ],
+  "release_ready": false,
+  "implementation_commit": null,
+  "ci_evidence": [],
+  "checkpoint_commits": [
+    "cd6e614",
+    "de75578",
+    "022d5ce",
+    "5a70142",
+    "2354f4a",
+    "ffdca68",
+    "7a391e4",
+    "7d9d587",
+    "b70ef84",
+    "a107b9a",
+    "64b6d66",
+    "c52d51e"
+  ]
+}

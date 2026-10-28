@@ -264,8 +264,19 @@ class ActiveRunCredentialTest(unittest.TestCase):
                 self.assertIsNone(self.runtime.store.setting("issue-comments:p:fixture"))
         # 损坏的原始 JSON 同样不能被当作空队列覆盖。
         self.runtime.store.execute("UPDATE settings SET value='{' WHERE key='credential-cleanup-pending'")
-        self.runtime.store.put_setting("maintenance-last", 0)
-        self.runtime.maintenance()
+        with patch.object(self.center.credentials, "put") as put, patch.object(
+                self.center.credentials, "delete") as delete:
+            for operation in (self.rotate, lambda: self.center.remove_provider("gateway"),
+                              self.center.cleanup_credentials):
+                with self.subTest(operation=operation):
+                    with self.assertRaises(CenterError) as error:
+                        operation()
+                    self.assertEqual(error.exception.code, "invalid_credential_registry")
+            self.runtime.store.put_setting("maintenance-last", 0)
+            self.runtime.maintenance()
+            put.assert_not_called()
+            delete.assert_not_called()
+        self.assertEqual(self.center.provider("gateway"), self.old)
         self.assertEqual(self.runtime.store.one("SELECT value FROM settings WHERE key='credential-cleanup-pending'")["value"], "{")
         self.assertEqual(self.center.credentials.get(self.old), "fixture-old")
 

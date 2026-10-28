@@ -2,8 +2,10 @@
 import base64
 import json
 import re
+import sys
 import time
 import urllib.request
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from .config import DEFAULTS, fingerprint, merge
@@ -25,7 +27,15 @@ class ApiRejected(RuntimeError):
         self.status = status
 
 
+_API_BACKOFF = {}
+
+
 def api(repo, endpoint, method="GET", fields=None):
+    # Never sleep in the scheduler or automatically replay a write. All callers
+    # of this transport share the primary/secondary limit cooldown.
+    retry_at = _API_BACKOFF.get("github.com", 0)
+    if time.monotonic() < retry_at:
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429)
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -34,6 +44,9 @@ def api(repo, endpoint, method="GET", fields=None):
         output = checked(argv)
     except RuntimeError as exc:
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
+        if status and (int(status[1]) == 429 or int(status[1]) == 403 and
+                       any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
+            _API_BACKOFF["github.com"] = time.monotonic() + 60
         if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
             raise ApiRejected(str(exc), int(status[1])) from exc
         raise
@@ -199,13 +212,19 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
-def save(runtime, run, kind, data, expected=_UNCONDITIONAL):
+def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if expected is not _UNCONDITIONAL:
             current = db.execute("SELECT value FROM settings WHERE key=?", (key(run["id"], kind),)).fetchone()
             if (current["value"] if current else None) != expected:
                 raise _AutomationChanged("Automation changed during reconciliation")
+        if ownership is not None:
+            owner_name, previous, owner = ownership
+            current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
+            if (json.loads(current["value"]) if current else None) != previous:
+                raise _AutomationChanged("Deployment ownership changed during reconciliation")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (owner_name, encode(owner)))
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
@@ -251,7 +270,13 @@ def find_remote(repo, data):
         if len(runs) < 100:
             break
     if len(found) > 1:
-        raise ValueError("Multiple workflow runs match one operation; inspect GitHub before retrying")
+        data["reconciliation"] = {"state": "manual_inspection_required",
+                                  "candidate_run_ids": [item["id"] for item in found],
+                                  "checked_at": time.time(), "redispatch_allowed": False}
+        return None
+    data["reconciliation"] = {"state": "matched" if found else "awaiting_remote_visibility",
+                              "candidate_run_ids": [item["id"] for item in found],
+                              "checked_at": time.time(), "redispatch_allowed": False}
     return found[0] if found else None
 
 
@@ -272,6 +297,20 @@ def reconcile(runtime, run, kind, data, persist=True):
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
+    from datetime import datetime
+    def timestamp(name):
+        try:
+            return datetime.fromisoformat(remote[name].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+            return None
+    created, started = timestamp("created_at"), timestamp("run_started_at")
+    finished = timestamp("updated_at") if remote.get("status") == "completed" else None
+    data["timing"] = {"created_at": remote.get("created_at"), "started_at": remote.get("run_started_at"),
+                      "completed_at": remote.get("updated_at") if finished is not None else None,
+                      "completed_at_basis": "updated_at" if finished is not None else None,
+                      "queue_seconds": started - created if created is not None and started is not None and started >= created else None,
+                      "execution_seconds": finished - started if started is not None and finished is not None and finished >= started else None,
+                      "build_seconds": None, "reverification_seconds": None}
     data.update(workflow_run_id=remote["id"], url=remote.get("html_url", ""),
                 attempt=remote.get("run_attempt", 1), checked_at=time.time(), conclusion=remote.get("conclusion"))
     if remote.get("status") == "completed":
@@ -283,7 +322,24 @@ def reconcile(runtime, run, kind, data, persist=True):
     return save(runtime, run, kind, data) if persist else data
 
 
-def health_check(url, sha):
+def health_check(url, sha, timeout=15):
+    from .process import checked
+    argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "adaptive_rsi.health_transport"])
+    try:
+        result = json.loads(checked([*argv, url, sha, str(timeout)],
+                                    cwd=Path(__file__).resolve().parents[1], timeout=timeout))
+        if not isinstance(result, dict) or result.get("sha") != sha:
+            raise ValueError("Invalid health transport result")
+        return result
+    except Cancelled:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False,
+                "error": "Health transport failed or exceeded its total deadline"}
+
+
+def direct_health_check(url, sha, timeout=15):
     class SameOrigin(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
             original, target = urlsplit(url), urlsplit(newurl)
@@ -292,10 +348,10 @@ def health_check(url, sha):
                 raise ValueError("Deployment health redirect changed the authorized origin")
             return super().redirect_request(request, fp, code, msg, headers, newurl)
     result = {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False}
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + timeout
     try:
         request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Adaptive-RSI-health"})
-        with urllib.request.build_opener(SameOrigin()).open(request, timeout=10) as response:
+        with urllib.request.build_opener(SameOrigin()).open(request, timeout=min(10, timeout)) as response:
             body = bytearray()
             while len(body) <= 65536:
                 if time.monotonic() >= deadline:
@@ -321,8 +377,46 @@ def stable_key(project, repo, url):
 
 
 def owner_key(project, repo, policy):
-    return "deployment-owner:" + fingerprint({"project": project, "repository": repo,
-                                              "target": policy.get("health_url") or policy["workflow"]})
+    url = policy.get("health_url")
+    if url:
+        parsed = urlsplit(url)
+        target = {"origin": parsed.hostname.lower(), "port": parsed.port or 443,
+                  "path": parsed.path or "/", "query": parsed.query}
+    else:
+        target = {"repository": repo.lower(), "workflow": policy["workflow"]}
+    return "deployment-owner:" + fingerprint(target)
+
+
+def deployment_owner(runtime, project, repo, policy):
+    name = owner_key(project, repo, policy)
+    with runtime.dispatch_lock:
+        current = runtime.store.setting(name)
+        if current:
+            return current
+        legacy = []
+        for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
+            try:
+                receipt = json.loads(row["value"])
+                run = runtime.store.one("SELECT project,config,started FROM runs WHERE id=?", (receipt["run"],))
+                if not run:
+                    continue
+                config = json.loads(run["config"])
+                previous_policy = config["delivery"]["deploy"]
+                previous_repo = config["github"]["repository"]
+                old_name = "deployment-owner:" + fingerprint({"project": run["project"], "repository": previous_repo,
+                    "target": previous_policy.get("health_url") or previous_policy["workflow"]})
+                if row["key"] == old_name and owner_key(run["project"], previous_repo, previous_policy) == name:
+                    state = runtime.store.setting(key(receipt["run"], "deploy"), {})
+                    legacy.append((not deployment_terminal(state, previous_policy), run["started"], receipt))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        if not legacy:
+            return None
+        if sum(active for active, _, _ in legacy) > 1:
+            raise ValueError("Multiple legacy deployments own this target; reconcile them before deploying")
+        receipt = max(legacy, key=lambda item: (item[0], item[1]))[2]
+        runtime.store.put_setting(name, receipt)
+        return receipt
 
 
 def deployment_terminal(data, policy):
@@ -333,10 +427,45 @@ def deployment_terminal(data, policy):
     return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded"}
 
 
+def health_sample(policy, sha):
+    """All declared endpoints must agree on one SHA within a shared deadline."""
+    urls = [policy["health_url"], *policy.get("health_urls", [])]
+    if len(urls) == 1:
+        return health_check(urls[0], sha)
+    deadline = time.monotonic() + 15
+    reports = []
+    for url in urls:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reports.append({"url": url, "sha": sha, "healthy": False, "error": "Shared health deadline exhausted"})
+        else:
+            reports.append(health_check(url, sha, timeout=remaining))
+    return {"url": urls[0], "sha": sha, "checked_at": time.time(), "checks": reports,
+            "healthy": all(report.get("healthy") is True for report in reports)}
+
+
+def observe_health(data, report, policy, now):
+    """Persist bounded observations; successes must be consecutive across ticks."""
+    data["health_attempts"] = data.get("health_attempts", 0) + 1
+    data["health_successes"] = data.get("health_successes", 0) + 1 if report.get("healthy") is True else 0
+    data["health"] = report
+    data["health_observations"] = [*data.get("health_observations", []), report][-10:]
+    data["health_gate"] = {"required_consecutive": policy.get("health_consecutive_successes", 1),
+                           "observed_consecutive": data["health_successes"],
+                           "round_limit": policy.get("health_attempts", 1),
+                           "rounds": data["health_attempts"]}
+    if data["health_successes"] >= policy.get("health_consecutive_successes", 1):
+        return "healthy"
+    if data["health_attempts"] >= policy.get("health_attempts", 1):
+        return "health_failed"
+    data["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+    return "pending"
+
+
 def deployment_health(runtime, project, run, data, policy, cancel, persist=save):
     if not policy.get("health_url"):
         return data
-    owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
+    owner = deployment_owner(runtime, project["id"], data["repository"], policy)
     if owner and owner["run"] != run["id"]:
         data.update(state="superseded", error="A newer deployment owns this target; no stale rollback will be issued")
         return data
@@ -347,26 +476,30 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             persist(runtime, run, "deploy", data)
             return data
         authorized(runtime, project, run, "deploy", policy, cancel)
-        report = health_check(policy["health_url"], data["sha"])
+        report = health_sample(policy, data["sha"])
         with runtime.dispatch_lock:
             authorized(runtime, project, run, "deploy", policy, cancel)
-            current_owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
+            current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; old health evidence was discarded")
                 return data
-            data["health_attempts"] = data.get("health_attempts", 0) + 1
-            if not report["healthy"] and data["health_attempts"] < policy.get("health_attempts", 1):
-                data.update(health=report, health_retry_at=now + policy.get("health_interval_seconds", 10))
+            observed = observe_health(data, report, policy, time.time())
+            if observed == "pending":
                 persist(runtime, run, "deploy", data)
                 return data
-            data.update(health=report, state="healthy" if report["healthy"] else "health_failed")
-            if not report["healthy"]:
+            data["state"] = observed
+            if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
             persist(runtime, run, "deploy", data)
-            if report["healthy"]:
+            if observed == "healthy":
                 runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
                                           {"sha": data["sha"], "run": run["id"], "health": report})
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
+        if policy.get("rollback_data_policy", "manual") != "backward_compatible":
+            data.update(rollback_unavailable=True, rollback_blocked_reason="data_compatibility",
+                        rollback_recovery_notes=policy.get("rollback_recovery_notes", ""),
+                        error="Automatic rollback requires an explicit backward-compatible data policy; inspect migrations and backups before manually restoring data and deploying a compatible version")
+            return data
         previous = data.get("rollback_target")
         if not previous or previous["sha"] == data["sha"]:
             data["rollback_unavailable"] = True
@@ -375,7 +508,7 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
         validate_pin(repo, policy)
         with runtime.dispatch_lock:
             authorized(runtime, project, run, "deploy", policy, cancel)
-            current_owner = runtime.store.setting(owner_key(project["id"], repo, policy))
+            current_owner = deployment_owner(runtime, project["id"], repo, policy)
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; rollback was cancelled")
                 return data
@@ -410,12 +543,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             if now < first + policy.get("health_warmup_seconds", 0) or now < rollback.get("health_retry_at", 0):
                 return data
             authorized(runtime, project, run, "deploy", policy, cancel)
-            rollback["health"] = health_check(policy["health_url"], rollback["sha"])
-            rollback["health_attempts"] = rollback.get("health_attempts", 0) + 1
-            if not rollback["health"]["healthy"] and rollback["health_attempts"] < policy.get("health_attempts", 1):
-                rollback["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
-                return data
-            data["state"] = "rolled_back" if rollback["health"]["healthy"] else "rollback_failed"
+            report = health_sample(policy, rollback["sha"])
+            with runtime.dispatch_lock:
+                authorized(runtime, project, run, "deploy", policy, cancel)
+                current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
+                if current_owner and current_owner["run"] != run["id"]:
+                    data.update(state="superseded", error="A newer deployment owns this target; old rollback health evidence was discarded")
+                    return data
+                observed = observe_health(rollback, report, policy, time.time())
+                if observed != "pending":
+                    data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
     return data
 
 
@@ -429,9 +566,9 @@ def advance(runtime, project, run, outcome, cancel=None):
         data = runtime.store.setting(key(run["id"], kind))
         expected = encode(data) if data is not None else None
 
-        def persist(runtime, run, kind, value):
+        def persist(runtime, run, kind, value, ownership=None):
             nonlocal expected
-            saved = save(runtime, run, kind, value, expected=expected)
+            saved = save(runtime, run, kind, value, expected=expected, **({"ownership": ownership} if ownership else {}))
             expected = encode(saved)
             return saved
 
@@ -461,7 +598,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             repo = authorized(runtime, project, run, kind, policy, cancel)
             expected_owner = None
             if kind == "deploy":
-                owner = runtime.store.setting(owner_key(project["id"], repo, policy))
+                owner = deployment_owner(runtime, project["id"], repo, policy)
                 expected_owner = owner
                 if owner and owner["run"] != run["id"]:
                     previous = runtime.store.setting(key(owner["run"], "deploy"), {})
@@ -475,7 +612,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             validate_pin(repo, policy)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy, cancel)
-                if kind == "deploy" and runtime.store.setting(owner_key(project["id"], repo, policy)) != expected_owner:
+                if kind == "deploy" and deployment_owner(runtime, project["id"], repo, policy) != expected_owner:
                     result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Deployment ownership changed during validation"})
                     continue
                 if not data or not data.get("operation_id"):
@@ -484,11 +621,17 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data = {"state": "pending", "repository": repo, "sha": outcome["merged_sha"], "kind": kind,
                             "workflow": policy["workflow"], "ref": policy["ref"], "workflow_sha": policy["sha"],
                             "operation_id": operation, "created_at": time.time(), "attempt": 0}
+                # Persist the exact policy and transmitted input identities. The
+                # workflow's own environment selection is still not observable here.
+                data["authorization"] = {"policy_hash": fingerprint(normalized_policy(kind, policy)),
+                                         "inputs_hash": fingerprint({"rsi_operation_id": data["operation_id"], "rsi_sha": data["sha"]}),
+                                         "health_targets": [url for url in [policy.get("health_url"), *policy.get("health_urls", [])] if url],
+                                         "github_environment": "unknown"}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
-                persist(runtime, run, kind, data)
-                if kind == "deploy":
-                    runtime.store.put_setting(owner_key(project["id"], repo, policy), {"run": run["id"], "sha": data["sha"]})
+                ownership = ((owner_key(project["id"], repo, policy), expected_owner,
+                              {"run": run["id"], "sha": data["sha"]}) if kind == "deploy" else None)
+                persist(runtime, run, kind, data, ownership=ownership)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
@@ -535,7 +678,7 @@ def retry(runtime, project_id, run_id, kind):
         project = runtime.project(project_id)
         repo = authorized(runtime, project, run, kind, policy)
         if kind == "deploy":
-            owner = runtime.store.setting(owner_key(project_id, repo, policy))
+            owner = deployment_owner(runtime, project_id, repo, policy)
             if owner and owner["run"] != run_id:
                 raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         if json.loads(run["result"]).get("feedback", {}).get("state") != "verified":
@@ -548,7 +691,7 @@ def retry(runtime, project_id, run_id, kind):
         if kind == "deploy" and data.get("state") == "health_failed":
             expected_health = encode(data)
             data.update(state="workflow_succeeded", error="", health_attempts=0)
-            for field in ("health_started_at", "health_retry_at"):
+            for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate"):
                 data.pop(field, None)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy)
@@ -563,7 +706,7 @@ def retry(runtime, project_id, run_id, kind):
                 if require_authorization:
                     authorized(runtime, project, run, kind, policy)
                 if require_authorization and kind == "deploy":
-                    owner = runtime.store.setting(owner_key(project_id, repo, policy))
+                    owner = deployment_owner(runtime, project_id, repo, policy)
                     if owner and owner["run"] != run_id:
                         raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
                 save(runtime, run, kind, data, expected=expected)

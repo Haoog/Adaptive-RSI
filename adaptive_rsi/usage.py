@@ -27,6 +27,8 @@ def usage(input_tokens=0, output_tokens=0, cache_read=0, cache_write=0, total=No
 
 
 def native_usage(protocol, response):
+    if not isinstance(response, dict):
+        return None
     data = response.get("usage")
     if protocol == "ollama":
         if "eval_count" not in response:
@@ -35,7 +37,7 @@ def native_usage(protocol, response):
         return usage(*values) if None not in values else None
     if protocol == "gemini":
         data = response.get("usageMetadata")
-        if not data:
+        if not isinstance(data, dict) or not data:
             return None
         fields = {key: _tolerated(data.get(key, 0)) for key in
                   ["promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "cachedContentTokenCount"]}
@@ -45,7 +47,7 @@ def native_usage(protocol, response):
         return usage(max(0, fields["promptTokenCount"] - fields["cachedContentTokenCount"]),
                      fields["candidatesTokenCount"] + fields["thoughtsTokenCount"],
                      fields["cachedContentTokenCount"], total=total)
-    if not data:
+    if not isinstance(data, dict) or not data:
         return None
     if protocol == "anthropic":
         fields = {key: _tolerated(data.get(key, 0)) for key in

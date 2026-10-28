@@ -2,6 +2,7 @@
 """Run complete unittest discovery in at most four isolated Python processes."""
 import argparse
 import json
+import math
 from collections import Counter, defaultdict
 from contextlib import ExitStack
 import os
@@ -16,6 +17,13 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_WORKERS = 4
+
+
+def timing_cache(value):
+    if not isinstance(value, dict):
+        return {}
+    return {name: seconds for name, seconds in value.items() if isinstance(name, str) and
+            type(seconds) in (int, float) and 0 < seconds <= 86400 and math.isfinite(seconds)}
 
 
 def test_ids(suite):
@@ -45,7 +53,8 @@ def discover_groups(root=ROOT, workers=MAX_WORKERS, durations=None):
         raise ValueError("Module selectors do not exactly reproduce discovery")
     groups = [[] for _ in range(min(workers, len(modules)))]
     sizes = [0] * len(groups)
-    weights = {name: max(0.01, float((durations or {}).get(name, count))) for name, count in modules.items()}
+    durations = timing_cache(durations)
+    weights = {name: max(0.01, durations.get(name, count)) for name, count in modules.items()}
     for module in sorted(modules, key=lambda name: (-weights[name], name)):
         index = min(range(len(groups)), key=lambda i: (sizes[i], i))
         groups[index].append(module)
@@ -81,22 +90,27 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
     failed = False
     began, offsets, recent = {}, {}, {}
     observed = {}
+    failures = []
     with ExitStack() as stack:
         try:
             pending = []
             for index, selectors in enumerate(groups, 1):
                 log = stack.enter_context(tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace"))
-                argv = [sys.executable, "-u", "-m", "unittest", "-v", *selectors]
+                timings = None
+                if durations_file:
+                    timings = stack.enter_context(tempfile.NamedTemporaryFile(suffix=".json"))
+                argv = ([sys.executable, "-u", "-m", "scripts.test_worker", "--timings", timings.name, *selectors]
+                        if timings else [sys.executable, "-u", "-m", "unittest", "-v", *selectors])
                 print("[group {}] {}".format(index, " ".join(selectors)), flush=True)
                 process = subprocess.Popen(argv, cwd=root, shell=False, stdout=log,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 processes.append(process)
-                pending.append((index, process, log))
+                pending.append((index, process, log, timings))
                 began[index] = recent[index] = time.monotonic()
                 offsets[index] = 0
             while pending:
                 for item in pending[:]:
-                    index, process, log = item
+                    index, process, log, timings = item
                     result = process.poll()
                     log.seek(offsets[index])
                     for line in log:
@@ -118,9 +132,21 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
                     print("[group {}] exit {}".format(index, result), flush=True)
                     failed = failed or result != 0
                     pending.remove(item)
-                    if result == 0:
-                        share = (now - began[index]) / len(groups[index - 1])
-                        observed.update({module: share for module in groups[index - 1]})
+                    if timings:
+                        receipt = Path(timings.name).with_suffix(".failures.json")
+                        try:
+                            failures.extend(json.loads(receipt.read_text()))
+                        except (OSError, ValueError):
+                            pass
+                        finally:
+                            receipt.unlink(missing_ok=True)
+                        try:
+                            values = json.loads(Path(timings.name).read_text())
+                            observed.update({selector: seconds for selector, seconds in values.items()
+                                             if selector in groups[index - 1] and type(seconds) in (int, float)
+                                             and 0 < seconds <= timeout})
+                        except (OSError, ValueError, AttributeError):
+                            pass
                 if pending:
                     time.sleep(0.1)
         finally:
@@ -128,12 +154,21 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
     if durations_file and observed:
         target = Path(durations_file)
         try:
-            previous = json.loads(target.read_text())
+            previous = timing_cache(json.loads(target.read_text()))
         except (OSError, ValueError):
             previous = {}
         previous.update(observed)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(previous, sort_keys=True, indent=2) + "\n")
+    if durations_file and failures:
+        target = Path(durations_file).with_suffix(".failures.json")
+        try:
+            previous = json.loads(target.read_text())
+        except (OSError, ValueError):
+            previous = []
+        if not isinstance(previous, list):
+            previous = []
+        target.write_text(json.dumps((previous + failures)[-2000:], sort_keys=True, indent=2) + "\n")
     return int(failed)
 
 
@@ -153,7 +188,10 @@ def main(argv=None):
             raise ValueError("timeout must be 1..86400 seconds")
         durations = {}
         if args.durations and args.durations.is_file():
-            durations = json.loads(args.durations.read_text())
+            try:
+                durations = timing_cache(json.loads(args.durations.read_text()))
+            except (OSError, ValueError):
+                print("Ignoring invalid or unreadable timing cache; full discovery remains required", file=sys.stderr)
         return run_groups(discover_groups(workers=args.workers, durations=durations),
                           timeout=args.timeout, durations_file=args.durations)
     except KeyboardInterrupt:

@@ -1,0 +1,377 @@
+{
+  "counts": {
+    "implemented": 114,
+    "partial": 56,
+    "pending": 31
+  },
+  "updated_ids": [
+    33,
+    35,
+    44,
+    48,
+    58,
+    59,
+    65,
+    73,
+    74,
+    80,
+    83,
+    84,
+    85,
+    86,
+    93,
+    94,
+    95,
+    96,
+    98,
+    113,
+    117,
+    118,
+    120,
+    122,
+    127,
+    128,
+    130,
+    135,
+    142,
+    143,
+    144,
+    145,
+    146,
+    147,
+    148,
+    149,
+    150,
+    151,
+    152,
+    153,
+    154,
+    156,
+    157,
+    158,
+    159,
+    162,
+    165,
+    167,
+    168,
+    169,
+    174,
+    175,
+    176,
+    177,
+    178,
+    179,
+    181,
+    182,
+    187,
+    188,
+    191,
+    197,
+    199
+  ],
+  "status_changes": [
+    {
+      "id": 44,
+      "before": "partial",
+      "after": "implemented"
+    },
+    {
+      "id": 48,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 59,
+      "before": "partial",
+      "after": "implemented"
+    },
+    {
+      "id": 73,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 74,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 80,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 83,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 84,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 85,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 86,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 93,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 94,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 95,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 96,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 98,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 113,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 117,
+      "before": "partial",
+      "after": "implemented"
+    },
+    {
+      "id": 118,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 120,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 122,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 127,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 128,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 130,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 135,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 142,
+      "before": "partial",
+      "after": "implemented"
+    },
+    {
+      "id": 143,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 144,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 145,
+      "before": "partial",
+      "after": "implemented"
+    },
+    {
+      "id": 146,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 147,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 148,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 149,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 150,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 151,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 152,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 153,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 154,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 156,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 157,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 158,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 159,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 162,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 165,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 167,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 168,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 169,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 174,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 175,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 176,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 177,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 178,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 179,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 181,
+      "before": "pending",
+      "after": "implemented"
+    },
+    {
+      "id": 187,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 188,
+      "before": "pending",
+      "after": "partial"
+    },
+    {
+      "id": 197,
+      "before": "pending",
+      "after": "partial"
+    }
+  ],
+  "release_ready": false,
+  "checks": {
+    "audit_ledger_write": "passed: implemented=114, partial=56, pending=31",
+    "documentation": "passed: 35 tracked files; new bilingual follow-up documents additionally checked without staging",
+    "audit_ledger_tests": "passed: 4 tests",
+    "all_unittest_selectors": "resolved, including partial entries; discovery is not test execution",
+    "git_diff_check": "passed",
+    "rust_execution_in_this_round": "not run",
+    "final_exact_commit_ci": "not run"
+  },
+  "validation": {
+    "python_targeted": {
+      "tests": 85,
+      "passed": 85
+    },
+    "browser_scripts": [
+      "tests/browser_frontend_remaining.cjs",
+      "tests/browser_batch_planning.cjs"
+    ],
+    "node_tests": 3,
+    "log_fixture_bytes": 19500000,
+    "log_search_ms": 321.60000014305115
+  }
+}

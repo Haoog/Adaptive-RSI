@@ -1,22 +1,43 @@
 """Admission barrier for replacement of a desktop-owned runtime."""
 import hmac
+import errno
+import os
 import re
 import secrets
 import time
 
 from . import __version__
+from .store import encode
 
 
 KEY = "desktop-update-barrier"
 
 
 def barrier(runtime):
-    state = runtime.store.setting(KEY)
-    if state and state.get("phase") != "installing" and state.get("expires", 0) <= time.time():
-        runtime.store.execute("DELETE FROM settings WHERE key=?", (KEY,))
-        runtime.wake.set()
-        return None
-    return state
+    with runtime.dispatch_lock:
+        state = runtime.store.setting(KEY)
+        if not state:
+            return state
+        expired = state.get("phase") != "installing" and state.get("expires", 0) <= time.time()
+        owner_exited = False
+        owner = state.get("owner_pid")
+        if state.get("phase") == "installing" and type(owner) is int and owner > 1:
+            try:
+                os.kill(owner, 0)
+            except OSError as exc:
+                # Permission errors and unknown process state must keep admission closed.
+                owner_exited = exc.errno == errno.ESRCH
+        if expired or owner_exited:
+            with runtime.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM settings WHERE key=?", (KEY,))
+                db.execute("INSERT INTO events(kind,message,data,created) VALUES "
+                           "('desktop_update_recovered','Desktop update admission recovered',?,?)",
+                           (encode({"phase": state.get("phase"), "version": state.get("version"),
+                                    "reason": "owner_exited" if owner_exited else "drain_expired"}), time.time()))
+            runtime.wake.set()
+            return None
+        return state
 
 
 def readiness(runtime, action="status", version=None, lease=None):
@@ -34,7 +55,9 @@ def readiness(runtime, action="status", version=None, lease=None):
                 raise ValueError("Another desktop update owns admission")
             if not state:
                 state = {"version": version, "lease": secrets.token_hex(24), "phase": "draining", "expires": time.time() + 3600}
-                runtime.store.put_setting(KEY, state)
+            elif state["phase"] == "draining":
+                state = {**state, "expires": time.time() + 3600}
+            runtime.store.put_setting(KEY, state)
         elif action in ("cancel", "complete") and state:
             if not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
                 raise ValueError("Desktop update lease changed")
@@ -59,7 +82,8 @@ def readiness(runtime, action="status", version=None, lease=None):
                 raise ValueError("Desktop update lease changed")
             if reasons:
                 raise ValueError("Runtime still has active operations")
-            state = {**state, "phase": "installing"}
+            state = {**state, "phase": "installing",
+                     "owner_pid": getattr(runtime.updates, "desktop_owner_pid", None), "committed": time.time()}
             runtime.store.put_setting(KEY, state)
         return {"ready": not reasons, "reasons": reasons, "runs": runs,
                 "barrier": state, "version": __version__}

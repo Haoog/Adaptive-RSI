@@ -68,3 +68,5 @@ GitHub 明确以 4xx 拒绝 rerun（408 超时除外）时，恢复为失败并�
 Codex 已加载的插件元数据仍需刷新 marketplace 并重启 Codex。成功托管升级后，`STATE/installations/current` 是稳定目录入口；wheel 用户使用 pip 更新，或改用随插件提供的启动器。
 
 可选 `updates.require_provenance=true` 会在安装前额外核对 GitHub attestation；默认关闭，详见 [本批加固与配置说明](docs/audit-hardening.md)。桌面 Developer ID 和公证通路需要真实 Apple 凭据；缺少凭据时仍为 ad-hoc 产物。
+
+纯机械版本 PR 只有在六个改动文件逐字匹配独立重建的发布补丁时，普通 CI 才走版本元数据检查；源码、工作流、分类器或生成脚本有变化均走完整普通 CI。该路径减少重复源码检查，自动合并版本 PR 仍必须通过 `release-verify.yml` 对最终提交的全量 Python、浏览器、桌面构建、smoke 和 provenance 门禁。耗时缓存只影响工作线程分配；无效记录回退完整发现，缓存不能跳过测试。

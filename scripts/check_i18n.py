@@ -29,9 +29,9 @@ def check():
             continue
         text = path.read_text(encoding="utf-8")
         literals = [(match[1], match.start()) for match in re.finditer(r"\bt\(\s*(" + STRING + ")", text)]
-        if path.name in ("app.js", "model-center.js", "native-update.js"):
+        if path.name in ("app.js", "model-center.js", "native-update.js", "batch.js"):
             # These dictionaries are passed through t() after lookup.
-            names = ("apiErrors", "statusNames", "sourceNames", "roleNames", "errors", "labels")
+            names = ("apiErrors", "statusNames", "sourceNames", "roleNames", "errors", "labels", "actionLabels", "stateLabels", "stopMessages", "failureMessages", "failureNext")
             for name in names:
                 block = re.search(r"const " + name + r"\s*=\s*\{(.*?)\};", text, re.S)
                 if block:

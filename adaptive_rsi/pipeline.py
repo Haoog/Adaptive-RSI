@@ -292,7 +292,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         transition("insufficient_evidence", {"reason": str(exc), "failure": {"code": "improvement", "action": "inspect_evidence"}}, True)
         return {"decision": "insufficient_evidence", "reason": str(exc)} if experiment else None
     acceptance = None
-    independent_acceptance = (plan["risk"] == "high" and change_type != "documentation" or
+    from .batching import requires_independent_acceptance
+    independent_acceptance = (requires_independent_acceptance(task) or
+                              plan["risk"] == "high" and change_type != "documentation" or
                               change_type == "performance" or test_first_requested and not test_first)
     if independent_acceptance:
         from .acceptance import seal

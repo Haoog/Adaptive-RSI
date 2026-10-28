@@ -11,6 +11,7 @@ from pathlib import Path
 
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.auth_sessions import AuthSessions
+from adaptive_rsi.config import fingerprint
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store
 from tests.test_runtime import FakeAgent, fixture, CHECKS
@@ -85,6 +86,32 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get('RSI_BROWSER_BLOCKERS'):
+                cause_tasks = [runtime.goal(project, title) for title in ('等待原因链任务', '原因链前置甲', '原因链前置乙')]
+                runtime.store.execute('UPDATE tasks SET available=?,priority=200 WHERE id=?', (time.time() + 600, cause_tasks[0]))
+                runtime.store.execute('INSERT INTO task_dependencies VALUES (?,?)', (cause_tasks[0], cause_tasks[1]))
+                runtime.store.execute('INSERT INTO task_dependencies VALUES (?,?)', (cause_tasks[1], cause_tasks[2]))
+            if os.environ.get('RSI_BROWSER_RESOURCE_PRESSURE'):
+                from types import SimpleNamespace
+                from unittest.mock import patch
+                runtime.configure({'limits': {'min_free_disk_mb': 1048576}}, project)
+                runtime.pause(project, False)
+                pressure_task = runtime.goal(project, '等待资源恢复的任务')
+                runtime.store.execute('UPDATE tasks SET priority=200 WHERE id=?', (pressure_task,))
+                with patch('adaptive_rsi.resource_pressure.shutil.disk_usage', return_value=SimpleNamespace(free=0)):
+                    runtime.resource_pressure.check(runtime.store.root, runtime.project(project), runtime.config(project))
+            if os.environ.get("RSI_BROWSER_DAG"):
+                for title in ("前置甲", "前置乙", "等待两个前置任务"):
+                    task_id = runtime.goal(project, title)
+                    runtime.store.execute("UPDATE tasks SET priority=200 WHERE id=?", (task_id,))
+            if os.environ.get("RSI_BROWSER_FAILED_GROUP"):
+                from adaptive_rsi.batching import execute as batch_execute
+                originals = [runtime.goal(project, title) for title in ("拆分来源一", "拆分来源二")]
+                grouped = batch_execute(runtime, project, originals, "group", "browser-failed-group", preview=False)["id"]
+                runtime.revise_task(grouped, "分组后新增的共同要求")
+                runtime.store.execute("UPDATE tasks SET state='failed',priority=200 WHERE id=?", (grouped,))
+                runtime.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) VALUES ('browser-group-run',?,?,'failed',1,2,?)",
+                                      (grouped, project, json.dumps({"summary": "整组失败证据"})))
             if os.environ.get("RSI_BROWSER_PROJECT_IDENTITY"):
                 # 同名但不同路径的两个项目，以及一个尚未接入的新仓库，供项目标识回归使用。
                 runtime.add_project(fixture(root / "identity-a"), "同名仓库")
@@ -147,6 +174,8 @@ def main():
                          started, started + 60, json.dumps(result)))
                 approval_task = runtime.store.add_task(project, "goal", "detail-approval", "待交付详情任务")
                 runtime.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (approval_task,))
+                dependent_task = runtime.store.add_task(project, "goal", "detail-dependent", "等待待交付任务的后继")
+                runtime.set_dependency(dependent_task, approval_task)
                 runtime.store.execute(
                     "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
                     "VALUES ('detail-appr',?,?,'awaiting_approval',?,'basemain',NULL,3,1200,?,?,?)",
@@ -182,7 +211,6 @@ def main():
             if os.environ.get("RSI_BROWSER_TRIAGE_VISIBILITY"):
                 # 批量初筛决定可见性：新决定直接落库 task_decisions；
                 # 存量 triage-state 键经 reassess 迁移后同样可见。全程无模型调用。
-                from adaptive_rsi.config import fingerprint
                 from adaptive_rsi.gitops import git
                 from adaptive_rsi.store import encode as dump
                 triage_config = runtime.config(project)
@@ -238,11 +266,24 @@ def main():
                 stable_evidence = json.dumps({
                     "reason": "Repeated paired improvement on both splits without observed regressions",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "validation",
-                                "repetition": index // 3} for index in range(12)]})
+                                "repetition": index // 3, "source": "real", "stratum": ["real", "small"],
+                                "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": True},
+                                "candidate": {"pass": True, "tokens": 50, "seconds": 1, "usage_known": True}}
+                               for index in range(12)]})
+                ready_plan = {"metric": "fixture_only", "repeats": 4,
+                              "samples": [{"id": "browser-case-" + str(index), "split": "holdout"}
+                                          for index in range(3)]}
                 ready_evidence = json.dumps({
                     "reason": "Paired quality improved without observed regressions; usage recorded separately",
                     "trials": [{"case": "browser-case-" + str(index % 3), "split": "holdout",
-                                "repetition": index // 3} for index in range(12)]})
+                                "repetition": index // 3, "source": "synthetic", "stratum": ["synthetic", "large"],
+                                "stable": {"pass": False, "tokens": 100, "seconds": 2, "usage_known": False},
+                                "candidate": {"pass": True, "tokens": 1, "seconds": 1, "usage_known": False}}
+                               for index in range(12)],
+                    "preregistered_plan": {"sha256": fingerprint(ready_plan), "data": ready_plan},
+                    "final_review": {"split": "holdout", "purpose": "final_confirmation_only", "fresh": True,
+                                     "cases": [sample["id"] for sample in ready_plan["samples"]]},
+                    "dataset": {"version": 1, "manifest": [{"case": "browser-case-0", "tree": "fixture-tree"}]}})
                 exhausted_evidence = json.dumps({
                     "reason": "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses",
                     "trials": []})

@@ -24,6 +24,21 @@ authorization_failed device_auth_unavailable auth_container_unavailable auth_wor
 
 # 精确匹配固定业务校验文案；不使用前缀匹配，也不携带用户提交的字段或值。
 SAFE_VALIDATION_MESSAGES = frozenset("""
+Dependencies require up to 100 unique task IDs
+Dependency graph exceeds 1000 ancestors
+Cancellation impact exceeds 1000 tasks; split the operation
+Cancellation impact is truncated; cancel only the current task
+Cascade cancellation must be a boolean
+Preview dependent cancellations before confirming
+Cancellation preview changed; review it again
+Intervention reason must be at most 2000 characters
+Task revision not found
+Invalid revision pagination
+Only a stopped failed or cancelled group can be split for retry
+Select one failed group to split for retry
+Wait for the grouped run to stop before splitting
+Grouped requirements changed; reconcile revisions before splitting
+Split retry preview changed; inspect it again
 Configuration changed in another window; reload before saving
 Invalid command timeout: command_seconds must be 60..86400
 provider_retry_minutes must be 0..1440

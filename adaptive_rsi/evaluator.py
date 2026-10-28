@@ -37,8 +37,154 @@ UNAVAILABLE_OUTPUT = re.compile(
 DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 
+def host_tool_versions(checks):
+    """Probe only known host tools, never execute candidate-provided binaries."""
+    import hashlib
+    flags = {"python": "--version", "python3": "--version", "node": "--version", "npm": "--version",
+             "git": "--version", "go": "version", "cargo": "--version", "rustc": "--version",
+             "java": "-version", "mvn": "--version", "ruby": "--version", "php": "--version"}
+    result = {}
+    for name in sorted({check.get("argv", [""])[0] for check in checks if check.get("argv")}):
+        if name not in flags:
+            result[name] = {"state": "unavailable", "reason": "not_an_allowlisted_host_probe"}
+            continue
+        path = shutil.which(name)
+        if not path:
+            result[name] = {"state": "missing"}
+            continue
+        from .process import run_process as probe_process
+        probe = probe_process([path, flags[name]], timeout=5)
+        try:
+            digest = hashlib.sha256(Path(path).resolve().read_bytes()).hexdigest()
+        except OSError:
+            digest = None
+        result[name] = {"state": "available" if probe["exit_code"] == 0 and not probe["error"] else "unavailable",
+                        "path": path, "binary_sha256": digest,
+                        "version": (probe["stdout"] + probe["stderr"])[:4096].strip()}
+    return result
+
+
+def test_identities(text):
+    """Record reported identities; opaque runners remain explicitly unverified."""
+    executed, skipped = [], []
+    if len(text) > 4 * 1024 * 1024:
+        return {"state": "unavailable", "executed": [], "skipped": []}
+    from xml.etree import ElementTree
+    start = text.find("<testsuite")
+    if start >= 0:
+        for ending in ("</testsuites>", "</testsuite>"):
+            end = text.rfind(ending)
+            if end < start:
+                continue
+            try:
+                root = ElementTree.fromstring(text[start:end + len(ending)])
+            except ElementTree.ParseError:
+                continue
+            for case in root.iter("testcase"):
+                identity = ".".join(filter(None, [case.get("classname"), case.get("name")]))
+                skip = case.find("skipped")
+                if skip is not None:
+                    skipped.append({"id": identity, "reason": skip.get("message") or skip.text or "unspecified"})
+                else:
+                    executed.append(identity)
+            break
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if isinstance(event, dict) and event.get("Test") and event.get("Package"):
+            identity = event["Package"] + "/" + event["Test"]
+            if event.get("Action") in ("pass", "fail"):
+                executed.append(identity)
+            elif event.get("Action") == "skip":
+                skipped.append({"id": identity, "reason": "unspecified by go event"})
+        match = re.match(r"^(test\S+ \([^)]+\)) \.\.\. (.*)$", line)
+        if match:
+            if match[2].startswith("skipped"):
+                skipped.append({"id": match[1], "reason": match[2][7:].strip()})
+            else:
+                executed.append(match[1])
+        match = re.match(r"^(\S+::\S+) (PASSED|FAILED|SKIPPED)(.*)$", line)
+        if match:
+            if match[2] == "SKIPPED":
+                skipped.append({"id": match[1], "reason": match[3].strip() or "unspecified"})
+            else:
+                executed.append(match[1])
+    return {"state": "reported" if executed or skipped else "unavailable",
+            "executed": sorted(set(executed)), "skipped": skipped,
+            "limitation": "Runner output is diagnostic; sealed check exit status remains authoritative"}
+
+
+def verify_test_identities(rows, required):
+    executed = {identity for row in rows for identity in row.get("test_identities", {}).get("executed", [])}
+    missing = sorted(set(required) - executed)
+    return {"valid": bool(required) and not missing, "required": required, "missing": missing,
+            "basis": "runner_reported_exact_test_ids"}
+
+
+def collect_test_artifacts(root, maximum=2 * 1024 * 1024):
+    """Collect only fixed workspace-relative reports with a total byte cap."""
+    import hashlib
+    import stat
+    root = Path(root).resolve()
+    rows, remaining = {}, maximum
+    for relative in ("junit.xml", "test-results.xml", "coverage.xml", "lcov.info", "coverage/lcov.info"):
+        path = root / relative
+        if any(parent.is_symlink() for parent in [path] + list(path.parents) if parent != root):
+            rows[relative] = {"state": "rejected", "reason": "symlink"}
+            continue
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            rows[relative] = {"state": "missing"}
+            continue
+        except OSError:
+            rows[relative] = {"state": "rejected", "reason": "unreadable"}
+            continue
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > remaining:
+                rows[relative] = {"state": "rejected", "reason": "type_or_size_limit"}
+                continue
+            data = stream.read(remaining + 1)
+        if len(data) > remaining:
+            rows[relative] = {"state": "rejected", "reason": "size_limit"}
+            continue
+        remaining -= len(data)
+        rows[relative] = {"state": "collected", "bytes": len(data),
+                          "sha256": hashlib.sha256(data).hexdigest(), "content": data.decode("utf-8", "replace")}
+    return rows
+
+
+def affected_checks(changed, checks, graph):
+    """Close over reverse package dependencies; uncertainty always runs all checks."""
+    if not changed or not isinstance(graph, dict) or not graph:
+        return list(checks)
+    names = {check["name"] for check in checks}
+    for spec in graph.values():
+        if (not isinstance(spec, dict) or not isinstance(spec.get("paths"), list)
+                or not spec["paths"] or any(not isinstance(p, str) or not p or p.startswith("/") or ".." in Path(p).parts for p in spec["paths"])
+                or not isinstance(spec.get("depends_on"), list) or not isinstance(spec.get("checks"), list)
+                or any(dep not in graph for dep in spec["depends_on"]) or not set(spec["checks"]) <= names):
+            return list(checks)
+    selected = set()
+    for path in changed:
+        matches = {name for name, spec in graph.items() if any(path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in spec["paths"])}
+        if not matches:
+            return list(checks)
+        selected.update(matches)
+    while True:
+        expanded = selected | {name for name, spec in graph.items() if set(spec["depends_on"]) & selected}
+        if expanded == selected:
+            break
+        selected = expanded
+    needed = {name for package in selected for name in graph[package]["checks"]}
+    return [check for check in checks if check["name"] in needed] or list(checks)
+
+
 def structured_test_summary(text):
-    count = 0
+    outcomes = {}
     detected = False
     for line in text.splitlines():
         if not line.startswith("{"):
@@ -49,26 +195,36 @@ def structured_test_summary(text):
             continue
         if isinstance(event, dict) and event.get("Action") in ("pass", "fail", "skip") and "Package" in event:
             detected = True
-            count += bool(event.get("Test") and event["Action"] in ("pass", "fail"))
-    return {"format": "go_test_json", "executed": count} if detected else None
+            if isinstance(event.get("Test"), str) and isinstance(event["Package"], str):
+                outcomes[(event["Package"], event["Test"])] = event["Action"]
+    return {"format": "go_test_json", "counting": "top_level_tests",
+            "executed": sum("/" not in name and action in ("pass", "fail") for (_, name), action in outcomes.items()),
+            "subtests": sum("/" in name and action in ("pass", "fail") for (_, name), action in outcomes.items()),
+            "skipped": sum(action == "skip" for action in outcomes.values())} if detected else None
 
 
 def junit_test_summary(text):
     """Read bounded JUnit XML from stdout without trusting it for gate decisions."""
     from xml.etree import ElementTree
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith(("<testsuite", "<?xml")):
+    start = text.find("<testsuite")
+    if start < 0 or len(text) > 4 * 1024 * 1024:
+        return None
+    for ending in ("</testsuites>", "</testsuite>", "/>"):
+        end = text.rfind(ending)
+        if end < start:
             continue
         try:
-            root = ElementTree.fromstring(line)
+            root = ElementTree.fromstring(text[start:end + len(ending)])
         except ElementTree.ParseError:
             continue
-        tests = root if root.tag == "testsuite" else root.find("testsuite")
-        if tests is None:
+        suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+        if not suites:
             continue
         try:
-            values = {name: int(tests.attrib.get(name, 0)) for name in ("tests", "failures", "errors", "skipped")}
+            values = {name: sum(int(suite.attrib.get(name, 0)) for suite in suites)
+                      for name in ("tests", "failures", "errors", "skipped")}
+            if any(value < 0 for value in values.values()):
+                return None
         except ValueError:
             continue
         return {"format": "junit", "executed": values["tests"], **values}
@@ -355,6 +511,69 @@ class Evaluator:
     def __init__(self, store):
         self.store = store
 
+    def validate_controls(self, source, checks, controls, directory, config, cancel=None):
+        """Execute host-owned criterion counterexamples through the same sandbox gate."""
+        from .config import relative_path
+        if not controls or len(controls) > 32 or not checks:
+            return {"decision": "insufficient_evidence", "controls": []}
+        root = Path(directory).resolve()
+        root.mkdir(parents=True, exist_ok=False)
+        sandbox = Sandbox(self.store.root, config)
+        def execute(target):
+            rows = []
+            for setup in config["environment"]["setup"]:
+                result = sandbox.check(setup, target, cancel)
+                if result["error"] or result["exit_code"]:
+                    return [], False
+            for check in checks:
+                result = sandbox.check(check, target, cancel)
+                result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
+                rows.append(result)
+            return rows, True
+        positive, ready = execute(copy_source(source, root / "positive"))
+        outcomes = []
+        seen = set()
+        for index, control in enumerate(controls):
+            if (not isinstance(control, dict) or not control.get("id") or control["id"] in seen
+                    or not control.get("source") or not control.get("criterion") or not control.get("files")):
+                raise ValueError("Controls require unique IDs, source, criterion and bounded fixture files")
+            seen.add(control["id"])
+            target = copy_source(source, root / str(index))
+            total = 0
+            for item in control["files"]:
+                path = target / relative_path(item["path"])
+                if any(p.is_symlink() for p in [path] + list(path.parents)):
+                    raise ValueError("Control overlaps symlink")
+                total += len(item["content"].encode())
+                if total > 1024 * 1024:
+                    raise ValueError("Control fixture too large")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(item["content"], encoding="utf-8")
+            rows, prepared = execute(target)
+            detected = prepared and any(row["exit_code"] not in (None, 0) and not row["error"]
+                                        and not environment_failure(row) for row in rows)
+            outcomes.append({"id": control["id"], "source": control["source"], "criterion": control["criterion"],
+                             "fixture_hash": fingerprint(control["files"]), "detected": detected, "rows": rows})
+        passed = ready and all(row["passed"] for row in positive) and all(row["detected"] for row in outcomes)
+        return {"decision": "pass" if passed else "insufficient_evidence", "positive": positive, "controls": outcomes,
+                "limitation": "Harness sensitivity only; not a substitute for real requirements acceptance"}
+
+    def seal_checkpoint(self, name, inputs, result, *, effect):
+        if effect != "read_only":
+            raise ValueError("Only explicitly read-only stages can be sealed")
+        data = {"build": BUILD_ID, "inputs": copy.deepcopy(inputs), "result": copy.deepcopy(result), "effect": effect}
+        self.store.put_setting("sealed-read-checkpoint:" + name, {**data, "sha256": fingerprint(data)})
+
+    def reuse_checkpoint(self, name, inputs):
+        entry = self.store.setting("sealed-read-checkpoint:" + name)
+        if not isinstance(entry, dict):
+            return None
+        data = {key: value for key, value in entry.items() if key != "sha256"}
+        if (data.get("effect") != "read_only" or data.get("build") != BUILD_ID
+                or data.get("inputs") != inputs or fingerprint(data) != entry.get("sha256")):
+            return None
+        return copy.deepcopy(data["result"])
+
     @staticmethod
     def _cache_key(cache_scope, cache_base, checks, config, environment_digest, execution_identity,
                    acceptance_hash=None):
@@ -492,6 +711,8 @@ class Evaluator:
             result["empty_tests"] = empty
             result["test_summary"] = (structured_test_summary(text) or junit_test_summary(text) or
                                       clarity_test_summary(text))
+            result["test_identities"] = test_identities(text)
+            result["artifacts"] = collect_test_artifacts(target)
             rows.append(result)
         outcome = {"rows": rows}
         if test_first_check is not None and label in {"baseline", "candidate"}:
@@ -526,6 +747,8 @@ class Evaluator:
             result = sandbox.check(check, target, cancel, protected, hidden)
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(
                 result["stdout"] + result["stderr"])
+            result["test_identities"] = test_identities(result["stdout"] + result["stderr"])
+            result["artifacts"] = collect_test_artifacts(target)
             rows.append(result)
         return {"rows": rows}
 
@@ -579,7 +802,7 @@ class Evaluator:
                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
         from .resources import execution_resources
         exclusive = acceptance and acceptance.get("change_kind") == "performance"
-        with execution_resources.acquire(exclusive=True, cancel=cancel) if exclusive else contextlib.nullcontext():
+        with execution_resources.acquire(exclusive=True, cancel=cancel, priority="benchmark") if exclusive else contextlib.nullcontext():
             return self._evaluate(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
                                   acceptance, acceptance_baseline, cache_scope, cache_base,
                                   environment_digest, test_first, test_first_kind, changed_files)
@@ -626,7 +849,7 @@ class Evaluator:
                         "checks": []}
         reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
                       not changed_harness)
-        baseline_key = None if test_first else self._cache_key(
+        baseline_key = None if test_first or overlay else self._cache_key(
             cache_scope, cache_base, checks, execution_config, environment_digest, execution_identity)
         cached_baseline = self._cache_get(cache_scope, baseline_key)
         if cached_baseline is not None:
@@ -715,7 +938,15 @@ class Evaluator:
         data = {"decision": "insufficient_evidence" if unavailable else "pass" if passing else "fail",
                 "reason": "Regression and full candidate checks passed" if passing else "Candidate failed independent checks",
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
-                "execution_environment": execution_identity}
+                "execution_environment": execution_identity, "host_tools": host_tool_versions(checks)}
+        if seeds:
+            from .process import scrub_tree
+            scrub_tree(seeds)
+        if (acceptance and acceptance.get("contract", {}).get("check_dependencies")):
+            data["check_dependency_analysis"] = {
+                "affected": [row["name"] for row in affected_checks(
+                    changed_files, checks, acceptance["contract"]["check_dependencies"])],
+                "execution": "full_checks_retained_until_graph_is_independently_validated"}
         if acceptance:
             from .workflow import improvement
             data["improvement"] = improvement(results, acceptance)
@@ -725,6 +956,11 @@ class Evaluator:
             data["criteria"] = acceptance["criteria"]
             data["coverage"] = [{"name": check["name"], "criteria": check["criteria"]} for check in acceptance["spec"]["checks"]]
             data["contract"] = acceptance.get("contract")
+            required = (acceptance.get("contract") or {}).get("required_test_ids")
+            if required:
+                data["test_identity_verification"] = verify_test_identities(results.get("acceptance_candidate", []), required)
+                if not data["test_identity_verification"]["valid"]:
+                    data.update(decision="insufficient_evidence", reason="Required regression test IDs were not executed")
         elif test_first:
             from .workflow import improvement
             data["improvement"] = improvement(results, {

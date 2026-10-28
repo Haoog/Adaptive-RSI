@@ -62,6 +62,93 @@ def capture(source, destination, config):
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
+def prepare_cached(source, cache, config, tools):
+    """Cache host-owned dependency seeds by complete inputs; restore always copies.
+
+    This deliberately does not replay setup commands or network operations. The
+    caller must supply an exact tool identity and explicitly selected seed paths.
+    """
+    import json
+    import tempfile
+    from .config import fingerprint
+    from .evaluator import MANIFESTS
+    source, cache = Path(source).resolve(), Path(cache).resolve()
+    if cache == source or source in cache.parents:
+        raise ValueError("Prepared cache must be outside the source tree")
+    if not tools or not config["environment"]["seed_paths"]:
+        raise ValueError("Prepared cache requires exact tools and explicit dependency seeds")
+    cache.mkdir(parents=True, exist_ok=True)
+    def tree_digest(root):
+        digest = hashlib.sha256()
+        scrub_tree(root)
+        for path in sorted(root.rglob("*")):
+            info = path.lstat()
+            data = {"path": path.relative_to(root).as_posix(), "mode": stat.S_IMODE(info.st_mode),
+                    "type": "link" if path.is_symlink() else "dir" if path.is_dir() else "file"}
+            digest.update(json.dumps(data, sort_keys=True).encode())
+            if path.is_symlink():
+                digest.update(os.readlink(path).encode())
+            elif path.is_file():
+                with path.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+        return digest.hexdigest()
+    with tempfile.TemporaryDirectory(prefix="prepare-", dir=cache) as temporary:
+        temporary = Path(temporary)
+        seeds = temporary / "seeds"
+        seed = capture(source, seeds, config)
+        manifests = {}
+        # Include nested package manifests and lockfiles; never traverse selected
+        # dependencies or symlinked directories looking for host inputs.
+        for parent, directories, files in os.walk(source, followlinks=False):
+            directories[:] = [name for name in directories if name != ".git" and
+                               not (Path(parent) / name).is_symlink() and
+                               not any((Path(parent) / name).relative_to(source).as_posix() == p.rstrip("/")
+                                       for p in config["environment"]["seed_paths"])]
+            for name in files:
+                path = Path(parent) / name
+                if name in MANIFESTS:
+                    if path.is_symlink() or not path.is_file():
+                        raise ValueError("Cache manifests must be regular files")
+                    manifests[path.relative_to(source).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        inputs = {"version": 1, "tools": tools, "environment": config["environment"],
+                  "sandbox": config["sandbox"], "manifests": manifests, "seed": seed}
+        key = fingerprint(inputs)
+        target = cache / key
+        if target.exists():
+            metadata = json.loads((target / "manifest.json").read_text())
+            if metadata.get("key") != key or metadata.get("digest") != tree_digest(target / "seeds"):
+                raise ValueError("Prepared environment cache integrity mismatch")
+            return {"key": key, "path": str(target / "seeds"), "reused": True, "inputs": inputs}
+        for path in sorted(seeds.rglob("*"), reverse=True) + [seeds]:
+            if not path.is_symlink():
+                path.chmod(stat.S_IMODE(path.stat().st_mode) & ~0o222)
+        metadata = {"key": key, "digest": tree_digest(seeds), "inputs": inputs}
+        (temporary / "manifest.json").write_text(json.dumps(metadata, sort_keys=True))
+        # Rename a completed immutable tree atomically; concurrent identical
+        # builders may reuse the winner only after a full integrity check.
+        staging = cache / ("sealed-" + temporary.name)
+        shutil.copytree(temporary, staging, symlinks=True)
+        try:
+            staging.rename(target)
+        except OSError:
+            if not target.exists():
+                raise
+            for path in staging.rglob("*"):
+                if not path.is_symlink():
+                    path.chmod(path.stat().st_mode | stat.S_IWUSR)
+            shutil.rmtree(staging)
+            winner = json.loads((target / "manifest.json").read_text())
+            if winner.get("key") != key or winner.get("digest") != tree_digest(target / "seeds"):
+                raise ValueError("Prepared environment cache integrity mismatch")
+        # TemporaryDirectory must be able to remove the private build copy.
+        for path in seeds.rglob("*"):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        seeds.chmod(seeds.stat().st_mode | stat.S_IWUSR)
+        return {"key": key, "path": str(target / "seeds"), "reused": False, "inputs": inputs}
+
+
 def restore(source, target, config):
     if not source:
         return
@@ -71,6 +158,11 @@ def restore(source, target, config):
             raise RuntimeError("Candidate/seed dependency overlap: " + relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(Path(source) / relative, destination, symlinks=True)
+        # Cache storage is immutable; each workspace owns an independently writable
+        # copy. Never hardlink dependency files between tasks.
+        for path in [destination] + list(destination.rglob("*")):
+            if not path.is_symlink():
+                path.chmod(path.stat().st_mode | stat.S_IWUSR)
         info = Path(target) / ".git/info/exclude"
         if info.exists():
             marker = "/" + relative.rstrip("/") + "/"

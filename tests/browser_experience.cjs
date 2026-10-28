@@ -431,7 +431,7 @@ async function checkQueueEditor(page, evidence) {
     await page
       .getByRole("button", { name: "手机测试目标", exact: true })
       .click();
-    await page.locator(".task-controls textarea").fill("增加手机验收要求");
+    await page.getByRole("textbox", {name:"补充需求（保留在当前任务）",exact:true}).fill("增加手机验收要求");
     await page
       .getByRole("button", { name: "保存补充并重新评估", exact: true })
       .click();
@@ -457,6 +457,17 @@ async function checkQueueEditor(page, evidence) {
       .getByRole("button", { name: "阅读代码差异", exact: true })
       .click();
     await page.locator(".readable-diff .diff-add").first().waitFor();
+    const diffDialog=page.locator('.experience-dialog');
+    await diffDialog.getByRole('searchbox',{name:'在差异中搜索',exact:true}).fill('return');
+    await diffDialog.getByRole('button',{name:'下一个匹配',exact:true}).click();
+    assert.ok(await diffDialog.locator('.diff-selected').count());
+    await diffDialog.getByRole('button',{name:'下一个变更块',exact:true}).click();
+    assert.match(await diffDialog.locator('.diff-selected').innerText(),/^@@/);
+    await diffDialog.getByLabel('自动换行',{exact:true}).check();
+    assert.equal(await diffDialog.locator('.readable-diff').evaluate(node=>node.classList.contains('diff-wrap')),true);
+    const jump=diffDialog.getByLabel('跳转到文件',{exact:true});
+    if(await jump.count()){await jump.selectOption({index:1});assert.match(await diffDialog.locator('.diff-selected').innerText(),/^diff --git /);}
+
     await page
       .locator(".experience-dialog")
       .getByRole("button", { name: "关闭", exact: true })
@@ -505,10 +516,18 @@ async function checkQueueEditor(page, evidence) {
     assert.equal(await acceptanceCard.locator('img').count(),0);
     assert.equal(await page.evaluate(()=>window.__evidenceExecuted),undefined);
     await page.locator('[data-run="old-run-1"] > summary').click();
-    await page.waitForFunction(() =>
-      document.querySelector('[data-run="old-run-1"] pre'),
-    );
+    const historicalRaw = page.locator('[data-run="old-run-1"] details').filter({
+      has: page.getByText('原始运行记录', {exact: true}),
+    });
+    await historicalRaw.locator(':scope > summary').waitFor();
     assert.equal(runRequests, 2);
+    assert.equal(await historicalRaw.locator('pre').count(), 0, 'collapsed raw evidence stays lazy');
+    await historicalRaw.locator(':scope > summary').click();
+    await historicalRaw.locator('pre').filter({hasText: 'original baseline failure'}).waitFor();
+    assert.match(await historicalRaw.locator('pre').innerText(), /<img src=x/);
+    assert.equal(await historicalRaw.locator('img').count(), 0);
+    assert.equal(await page.evaluate(()=>window.__evidenceExecuted), undefined);
+    assert.equal(runRequests, 2, 'opening loaded raw evidence must not fetch the run again');
     const timeline = page.locator('#live-task-outcome details').filter({has: page.getByText('阶段耗时', {exact: true})});
     await timeline.locator('summary').click();
     liveSummary = 'Live checkpoint received';
@@ -594,8 +613,8 @@ async function checkQueueEditor(page, evidence) {
     assert.equal(await page.evaluate(()=>currentProject().paused),1);
     await page.locator('#language-select').selectOption('zh-CN');
     await page.reload();
-    await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.waitForFunction(()=>state&&currentProject()?.paused);
+    await page.locator('#view-settings').waitFor();
     assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'UI argv regression renamed');
     assert.deepEqual(await page.locator('#checks-editor fieldset').last().locator('[data-check-arg]').evaluateAll(nodes=>nodes.map(node=>node.value)),['python3','-c','print("argument with spaces")\nprint(2)']);
     // Acknowledging weight=2 must keep a newer weight=1 draft visibly dirty.

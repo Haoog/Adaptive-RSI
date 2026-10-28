@@ -38,6 +38,22 @@ async function checkEvolution(browser, url, errors) {
       has: page.locator('.badge', {hasText: '稳定使用'}),
     }).getByRole('button', {name: '启用这个策略', exact: true}).count(), 0);
 
+    assert.match(await readyCard.innerText(), /Token 用量比 · 不可比较/);
+    assert.match(await readyCard.innerText(), /质量通过不代表更便宜/);
+    const experiment = readyCard.locator('details').filter({hasText:'查看实验依据与分组结果'}).first();
+    await experiment.locator(':scope > summary').click();
+    await experiment.getByText(/合成任务 · 最终评估集 · 长任务/).waitFor();
+    assert.match(await experiment.innerText(), /独立用例: 3/);
+    const downloadReady = page.waitForEvent('download');
+    await experiment.getByRole('button',{name:'导出实验依据',exact:true}).click();
+    const stream = await (await downloadReady).createReadStream(), chunks=[];
+    for await(const chunk of stream)chunks.push(chunk);
+    const exported=JSON.parse(Buffer.concat(chunks).toString());
+    assert.equal(exported.comparison.cost_state,'unknown_usage');
+    assert.equal(exported.comparison.token_ratio,null);
+    assert.equal(exported.evidence.dataset.manifest[0].tree,'fixture-tree');
+    assert.equal(exported.evidence.preregistered_plan.data.metric,'fixture_only');
+
     // ---------- 3) 曝光耗尽原因给出可操作中文说明，不再直出英文 ----------
     const exhaustedCard = page.locator('#candidates .candidate-card').filter({
       has: page.locator('.badge', {hasText: '证据不足'}),
@@ -69,14 +85,18 @@ async function checkEvolution(browser, url, errors) {
     assert.match(consequence, /替换当前稳定策略/);
     assert.match(consequence, /有限监控/);
     assert.match(consequence, /回滚/);
+    const promotionResponse = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/evolution/promote' && response.request().method() === 'POST');
     await dialog.getByRole('button', {name: '确认', exact: true}).click();
+    const promoted = await promotionResponse;
+    assert.equal(promoted.status(), 200, await promoted.text());
     await page.waitForFunction(() => ![...document.querySelectorAll('#candidates .candidate-card')]
       .some(card => card.textContent.includes('等待启用')), null, {timeout: 15000});
     assert.ok(posts.includes('/api/evolution/promote'), 'manual promotion uses the controlled API');
     assert.ok(stateSections.slice(fullBefore).includes('core,candidates,analytics'),
       'promotion bypasses the candidates/analytics TTL');
     assert.equal(await page.locator('#candidates .badge').filter({hasText: '稳定使用'}).count(), 1);
-    assert.equal(await page.locator('#candidates .badge').filter({hasText: '历史稳定版'}).count(), 1);
+    assert.equal(await page.locator('#candidates .badge').filter({hasText: '已被替代'}).count(), 1);
     await page.getByText('配对质量有所提升且未观察到退步；用量单独记录。').waitFor();
     assert.ok(![...posts].some(path => /model-center|probe|request$/.test(path)), 'no model calls were started');
     assert.deepEqual(errors, []);

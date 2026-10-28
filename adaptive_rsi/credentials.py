@@ -1,6 +1,7 @@
 """将 API 密钥保存在系统钥匙串或进程内存中，不写入配置。"""
 import ctypes
 import hashlib
+import hmac
 import os
 import platform
 import re
@@ -98,6 +99,7 @@ class MacKeychain:
 class Credentials:
     _sessions = {}
     _lock = threading.RLock()
+    _salts = {}
 
     def __init__(self, root):
         self.service = "org.adaptive-rsi.keys." + hashlib.sha256(str(root).encode()).hexdigest()[:24]
@@ -108,6 +110,9 @@ class Credentials:
         if not isinstance(value, str) or not 1 <= len(value) <= 8192 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise CredentialError("invalid_key")
         with self._lock:
+            if mode not in ("keychain", "session", "file"):
+                raise CredentialError("invalid_mode")
+            self._write_epoch(reference, mode)
             if mode == "keychain":
                 MacKeychain().request(self.service, reference, "put", value)
             elif mode == "session":
@@ -125,6 +130,87 @@ class Credentials:
             else:
                 raise CredentialError("invalid_mode")
 
+    def _write_epoch(self, reference, mode):
+        from .updates import atomic_json
+        folder = self.directory / "epochs"
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.directory.chmod(0o700)
+        atomic_json(folder / (reference + "-" + mode + ".json"), {"generation": os.urandom(16).hex()})
+
+    @staticmethod
+    def _read_metadata(path):
+        import json
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 256 or info.st_mode & 0o077 or
+                    hasattr(os, "getuid") and info.st_uid != os.getuid()):
+                raise ValueError("Invalid credential metadata")
+            return json.loads(source.read(257))
+
+    def epoch(self, provider):
+        mode = provider.get("credential", "env")
+        if mode == "env":
+            value = os.environ.get(provider.get("env_key", ""), "")
+            if not value:
+                return ""
+            with self._lock:
+                if self.service not in self._salts:
+                    import json
+                    path = self.directory / "epochs" / "environment.json"
+                    try:
+                        raw = self._read_metadata(path)
+                        salt = bytes.fromhex(raw["salt"])
+                        if len(salt) != 32:
+                            raise ValueError("Invalid salt")
+                    except FileNotFoundError:
+                        salt = os.urandom(32)
+                        import tempfile
+                        temporary = None
+                        try:
+                            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            self.directory.chmod(0o700)
+                            with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=".epoch-", delete=False) as output:
+                                temporary = Path(output.name)
+                                os.fchmod(output.fileno(), 0o600)
+                                json.dump({"salt": salt.hex()}, output)
+                                output.flush()
+                                os.fsync(output.fileno())
+                            try:
+                                os.link(temporary, path)
+                            except FileExistsError:
+                                salt = bytes.fromhex(self._read_metadata(path)["salt"])
+                        except (OSError, ValueError, KeyError, TypeError):
+                            pass
+                        finally:
+                            if temporary is not None:
+                                temporary.unlink(missing_ok=True)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        salt = os.urandom(32)
+                    self._salts[self.service] = salt
+                return hmac.new(self._salts[self.service], value.encode(), hashlib.sha256).hexdigest()
+        if mode not in ("keychain", "file", "session"):
+            return ""
+        reference = provider.get("secret_ref", "")
+        if not isinstance(reference, str) or not re.fullmatch(r"[a-f0-9]{32}", reference):
+            return ""
+        path = self.directory / "epochs" / (reference + "-" + mode + ".json")
+        try:
+            generation = self._read_metadata(path)["generation"]
+            if not isinstance(generation, str) or not re.fullmatch(r"[a-f0-9]{32}", generation):
+                raise ValueError("Invalid generation")
+        except FileNotFoundError:
+            generation = ""
+        except (OSError, ValueError, KeyError, TypeError):
+            generation = "unavailable"
+        if mode == "file":
+            try:
+                info = (self.directory / reference).lstat()
+                generation += ":" + str((info.st_ino, info.st_mtime_ns, info.st_size))
+            except OSError:
+                generation += ":missing"
+        return generation
+
     @staticmethod
     def check_reference(reference):
         if not isinstance(reference, str) or not re.fullmatch(r"[a-f0-9]{32}", reference):
@@ -139,6 +225,7 @@ class Credentials:
                 MacKeychain().request(self.service, reference, "delete")
             elif mode == "file":
                 (self.directory / reference).unlink(missing_ok=True)
+            (self.directory / "epochs" / (reference + "-" + mode + ".json")).unlink(missing_ok=True)
 
     def get(self, provider):
         mode = provider.get("credential", "env")

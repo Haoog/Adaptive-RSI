@@ -1,6 +1,11 @@
 import contextlib
+import contextvars
+from collections import deque
+import hashlib
 import json
+import math
 import queue
+import re
 import sqlite3
 import statistics
 import threading
@@ -76,142 +81,155 @@ class Store:
         self._metrics_lock = threading.Lock()
         self._metrics = {"opened": 0, "borrowed": 0, "waiting": 0, "peak": 0}
         self._read_snapshot = threading.local()
-        self._task_samples = threading.local()
+        self._query_samples = deque(maxlen=128)
+        self._wait_samples = deque(maxlen=512)
+        self._slow_queries = deque(maxlen=20)
+        self._query_context = contextvars.ContextVar("rsi_query_context", default={})
+        self._active_snapshots = {}
+        self._poll_log_windows = {}
+        self._request_log_counts = {"observed": 0, "persisted": 0, "sampled_out": 0, "failed": 0}
         with self.connect() as db:
             if db.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("Database schema is newer than this runtime")
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied REAL NOT NULL);
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS projects (
-                    id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, config TEXT,
-                    paused INTEGER DEFAULT 1, created REAL);
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id TEXT PRIMARY KEY, project TEXT REFERENCES projects(id), source TEXT,
-                    fingerprint TEXT, title TEXT, body TEXT, evidence TEXT, acceptance TEXT,
-                    state TEXT, priority INTEGER DEFAULT 50, attempts INTEGER DEFAULT 0,
-                    overrides TEXT DEFAULT '{}', available REAL DEFAULT 0, created REAL, updated REAL,
-                    UNIQUE(project, fingerprint));
-                CREATE TABLE IF NOT EXISTS runs (
-                    id TEXT PRIMARY KEY, task TEXT REFERENCES tasks(id), project TEXT,
-                    state TEXT, config TEXT, strategy TEXT, base TEXT, path TEXT,
-                    calls INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0, started REAL, ended REAL,
-                    result TEXT DEFAULT '{}');
-                CREATE TABLE IF NOT EXISTS events (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, run TEXT,
-                    kind TEXT, message TEXT, data TEXT, created REAL);
-                CREATE TABLE IF NOT EXISTS schedules (
-                    project TEXT, kind TEXT, due REAL, fingerprint TEXT DEFAULT '',
-                    PRIMARY KEY(project,kind));
-                CREATE TABLE IF NOT EXISTS candidates (
-                    id TEXT PRIMARY KEY, project TEXT, kind TEXT, parent TEXT, status TEXT,
-                    content TEXT, evidence TEXT DEFAULT '{}', created REAL, promoted REAL);
-                CREATE TABLE IF NOT EXISTS skills (
-                    id TEXT PRIMARY KEY, project TEXT, task TEXT, status TEXT, triggers TEXT,
-                    content TEXT, evidence TEXT, expires REAL, created REAL);
-                CREATE TABLE IF NOT EXISTS cases (
-                    id TEXT PRIMARY KEY, project TEXT, family TEXT, split TEXT,
-                    spec TEXT, uses INTEGER DEFAULT 0, created REAL,
-                    UNIQUE(project,family));
-                CREATE TABLE IF NOT EXISTS calls (
-                    id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
-                    state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL,
-                    provider TEXT DEFAULT 'openai');
-                CREATE TABLE IF NOT EXISTS stages (
-                    run TEXT REFERENCES runs(id), stage TEXT, signature TEXT, data TEXT, created REAL,
-                    PRIMARY KEY(run,stage));
-                CREATE INDEX IF NOT EXISTS project_tasks ON tasks(project,updated DESC);
-                CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
-                CREATE INDEX IF NOT EXISTS task_runs ON runs(task,started DESC,id DESC);
-                CREATE INDEX IF NOT EXISTS delivery_runs ON runs(state,project);
-                CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
-                CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
-                CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
-                CREATE TABLE IF NOT EXISTS task_decisions (
-                    task TEXT PRIMARY KEY REFERENCES tasks(id), data TEXT NOT NULL, created REAL);
-                CREATE TABLE IF NOT EXISTS task_revisions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT REFERENCES tasks(id),
-                    previous_body TEXT, supplement TEXT, created REAL);
-                CREATE TABLE IF NOT EXISTS task_dependencies (
-                    task TEXT PRIMARY KEY REFERENCES tasks(id), dependency TEXT REFERENCES tasks(id));
-                CREATE TABLE IF NOT EXISTS submissions (
-                    project TEXT, request TEXT, signature TEXT, task TEXT REFERENCES tasks(id),
-                    PRIMARY KEY(project,request));
-                CREATE TABLE IF NOT EXISTS phase_times (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), phase TEXT,
-                    started REAL, ended REAL);
-                CREATE TABLE IF NOT EXISTS remote_waits (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), reason TEXT,
-                    started REAL, ended REAL);
-                CREATE TABLE IF NOT EXISTS task_completions (
-                    task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
-                CREATE TABLE IF NOT EXISTS request_log (
-                    id TEXT PRIMARY KEY, method TEXT, path TEXT, status INTEGER, started REAL,
-                    ended REAL, error_code TEXT);
-                CREATE TABLE IF NOT EXISTS relationship_quarantine (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT, row_id TEXT, data TEXT, created REAL);
-                CREATE INDEX IF NOT EXISTS request_log_started ON request_log(started DESC);
-                CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
-                CREATE INDEX IF NOT EXISTS event_kind_created ON events(kind, created);
-                CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
-                CREATE INDEX IF NOT EXISTS remote_waits_run ON remote_waits(run);
-                CREATE INDEX IF NOT EXISTS task_revisions_task ON task_revisions(task);
-                CREATE INDEX IF NOT EXISTS task_dependencies_dependency ON task_dependencies(dependency);
-                CREATE INDEX IF NOT EXISTS runs_task_state ON runs(task, state);
-            """)
-            db.execute("BEGIN IMMEDIATE")
-            for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
-                                      ("budget_waits", "INTEGER DEFAULT 0")]:
-                if field not in {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}:
-                    db.execute("ALTER TABLE tasks ADD COLUMN " + field + " " + definition)
-            if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
-                db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
-            if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
-                db.execute("ALTER TABLE calls ADD COLUMN unit_price REAL")
-            if "unit" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
-                db.execute("ALTER TABLE calls ADD COLUMN unit TEXT DEFAULT 'unknown'")
-            for field in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]:
-                if field not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
-                    db.execute("ALTER TABLE calls ADD COLUMN " + field + " INTEGER DEFAULT 0")
-            db.execute("CREATE INDEX IF NOT EXISTS run_calls ON calls(run,created)")
-            db.execute("CREATE INDEX IF NOT EXISTS created_calls ON calls(created)")
-            for table in ("phase_times", "remote_waits"):
-                if "duration" not in {row["name"] for row in db.execute("PRAGMA table_info(" + table + ")")}:
-                    db.execute("ALTER TABLE " + table + " ADD COLUMN duration REAL")
-            # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
-            migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
-            if not migration:
-                for row in db.execute("SELECT id,config FROM projects").fetchall():
-                    config = json.loads(row["config"])
-                    if "delivery" in config:
-                        config["delivery"].update(mode="local", auto_merge=False)
-                        db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
-                row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
-                if row:
-                    config = json.loads(row["value"])
-                    if "delivery" in config:
-                        config["delivery"].update(mode="local", auto_merge=False)
-                        db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))
-                db.execute("INSERT INTO settings VALUES ('delivery-policy-v2','true')")
-            db.execute("DELETE FROM schedules WHERE kind='deep'")
-            db.execute("UPDATE tasks SET state='obsolete' WHERE source='system_deep' AND state IN ('queued','waiting_budget')")
-            db.execute("INSERT OR IGNORE INTO task_completions SELECT id,project,updated FROM tasks "
-                       "WHERE source NOT LIKE 'system_%' AND state IN ('awaiting_approval','pr_open','merged','completed')")
-            checksum = self._migration_checksum(1)
-            migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=1").fetchone()
-            if migration and migration["checksum"] != checksum:
-                raise RuntimeError("Database migration checksum mismatch")
-            db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (1,?,?)", (checksum, time.time()))
-            # Version 2 adds read-only observability tables and indexes.
-            db.execute("CREATE INDEX IF NOT EXISTS request_log_created ON request_log(started DESC)")
-            checksum = self._migration_checksum(2)
-            migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=2").fetchone()
-            if migration and migration["checksum"] != checksum:
-                raise RuntimeError("Database migration checksum mismatch")
-            db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (2,?,?)", (checksum, time.time()))
-            db.execute("PRAGMA user_version=2")
+            from .schema_migrations import apply, validate_history
+            sealed = validate_history(db)
+            if not sealed:
+                self._bootstrap(db)
+            apply(db)
+
+    def _bootstrap(self, db):
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied REAL NOT NULL);
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, config TEXT,
+                paused INTEGER DEFAULT 1, created REAL);
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY, project TEXT REFERENCES projects(id), source TEXT,
+                fingerprint TEXT, title TEXT, body TEXT, evidence TEXT, acceptance TEXT,
+                state TEXT, priority INTEGER DEFAULT 50, attempts INTEGER DEFAULT 0,
+                overrides TEXT DEFAULT '{}', available REAL DEFAULT 0, created REAL, updated REAL,
+                UNIQUE(project, fingerprint));
+            CREATE TABLE IF NOT EXISTS runs (
+                id TEXT PRIMARY KEY, task TEXT REFERENCES tasks(id), project TEXT,
+                state TEXT, config TEXT, strategy TEXT, base TEXT, path TEXT,
+                calls INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0, started REAL, ended REAL,
+                result TEXT DEFAULT '{}');
+            CREATE TABLE IF NOT EXISTS events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, run TEXT,
+                kind TEXT, message TEXT, data TEXT, created REAL);
+            CREATE TABLE IF NOT EXISTS schedules (
+                project TEXT, kind TEXT, due REAL, fingerprint TEXT DEFAULT '',
+                PRIMARY KEY(project,kind));
+            CREATE TABLE IF NOT EXISTS candidates (
+                id TEXT PRIMARY KEY, project TEXT, kind TEXT, parent TEXT, status TEXT,
+                content TEXT, evidence TEXT DEFAULT '{}', created REAL, promoted REAL);
+            CREATE TABLE IF NOT EXISTS skills (
+                id TEXT PRIMARY KEY, project TEXT, task TEXT, status TEXT, triggers TEXT,
+                content TEXT, evidence TEXT, expires REAL, created REAL);
+            CREATE TABLE IF NOT EXISTS cases (
+                id TEXT PRIMARY KEY, project TEXT, family TEXT, split TEXT,
+                spec TEXT, uses INTEGER DEFAULT 0, created REAL,
+                UNIQUE(project,family));
+            CREATE TABLE IF NOT EXISTS calls (
+                id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
+                state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL,
+                provider TEXT DEFAULT 'openai');
+            CREATE TABLE IF NOT EXISTS stages (
+                run TEXT REFERENCES runs(id), stage TEXT, signature TEXT, data TEXT, created REAL,
+                PRIMARY KEY(run,stage));
+            CREATE INDEX IF NOT EXISTS project_tasks ON tasks(project,updated DESC);
+            CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
+            CREATE INDEX IF NOT EXISTS task_runs ON runs(task,started DESC,id DESC);
+            CREATE INDEX IF NOT EXISTS delivery_runs ON runs(state,project);
+            CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
+            CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
+            CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
+            CREATE TABLE IF NOT EXISTS task_decisions (
+                task TEXT PRIMARY KEY REFERENCES tasks(id), data TEXT NOT NULL, created REAL);
+            CREATE TABLE IF NOT EXISTS task_revisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT REFERENCES tasks(id),
+                previous_body TEXT, supplement TEXT, created REAL);
+            CREATE TABLE IF NOT EXISTS task_dependencies (
+                task TEXT PRIMARY KEY REFERENCES tasks(id), dependency TEXT REFERENCES tasks(id));
+            CREATE TABLE IF NOT EXISTS submissions (
+                project TEXT, request TEXT, signature TEXT, task TEXT REFERENCES tasks(id),
+                PRIMARY KEY(project,request));
+            CREATE TABLE IF NOT EXISTS phase_times (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), phase TEXT,
+                started REAL, ended REAL);
+            CREATE TABLE IF NOT EXISTS remote_waits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), reason TEXT,
+                started REAL, ended REAL);
+            CREATE TABLE IF NOT EXISTS task_completions (
+                task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
+            CREATE TABLE IF NOT EXISTS request_log (
+                id TEXT PRIMARY KEY, method TEXT, path TEXT, status INTEGER, started REAL,
+                ended REAL, error_code TEXT);
+            CREATE TABLE IF NOT EXISTS relationship_quarantine (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT, row_id TEXT, data TEXT, created REAL);
+            CREATE INDEX IF NOT EXISTS request_log_started ON request_log(started DESC);
+            CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
+            CREATE INDEX IF NOT EXISTS event_kind_created ON events(kind, created);
+            CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
+            CREATE INDEX IF NOT EXISTS remote_waits_run ON remote_waits(run);
+            CREATE INDEX IF NOT EXISTS task_revisions_task ON task_revisions(task);
+            CREATE INDEX IF NOT EXISTS task_dependencies_dependency ON task_dependencies(dependency);
+            CREATE INDEX IF NOT EXISTS runs_task_state ON runs(task, state);
+        """)
+        db.execute("BEGIN IMMEDIATE")
+        for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
+                                  ("budget_waits", "INTEGER DEFAULT 0")]:
+            if field not in {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}:
+                db.execute("ALTER TABLE tasks ADD COLUMN " + field + " " + definition)
+        if "provider" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+            db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
+        if "unit_price" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+            db.execute("ALTER TABLE calls ADD COLUMN unit_price REAL")
+        if "unit" not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+            db.execute("ALTER TABLE calls ADD COLUMN unit TEXT DEFAULT 'unknown'")
+        for field in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]:
+            if field not in {row["name"] for row in db.execute("PRAGMA table_info(calls)")}:
+                db.execute("ALTER TABLE calls ADD COLUMN " + field + " INTEGER DEFAULT 0")
+        db.execute("CREATE INDEX IF NOT EXISTS run_calls ON calls(run,created)")
+        db.execute("CREATE INDEX IF NOT EXISTS created_calls ON calls(created)")
+        for table in ("phase_times", "remote_waits"):
+            if "duration" not in {row["name"] for row in db.execute("PRAGMA table_info(" + table + ")")}:
+                db.execute("ALTER TABLE " + table + " ADD COLUMN duration REAL")
+        # 只撤销旧版本遗留授权一次；之后保留用户明确保存的项目策略。
+        migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
+        if not migration:
+            for row in db.execute("SELECT id,config FROM projects").fetchall():
+                config = json.loads(row["config"])
+                if "delivery" in config:
+                    config["delivery"].update(mode="local", auto_merge=False)
+                    db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
+            row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+            if row:
+                config = json.loads(row["value"])
+                if "delivery" in config:
+                    config["delivery"].update(mode="local", auto_merge=False)
+                    db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))
+            db.execute("INSERT INTO settings VALUES ('delivery-policy-v2','true')")
+        db.execute("DELETE FROM schedules WHERE kind='deep'")
+        db.execute("UPDATE tasks SET state='obsolete' WHERE source='system_deep' AND state IN ('queued','waiting_budget')")
+        db.execute("INSERT OR IGNORE INTO task_completions SELECT id,project,updated FROM tasks "
+                   "WHERE source NOT LIKE 'system_%' AND state IN ('awaiting_approval','pr_open','merged','completed')")
+        checksum = self._migration_checksum(1)
+        migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=1").fetchone()
+        if migration and migration["checksum"] != checksum:
+            raise RuntimeError("Database migration checksum mismatch")
+        db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (1,?,?)", (checksum, time.time()))
+        # Version 2 adds read-only observability tables and indexes.
+        db.execute("DROP INDEX IF EXISTS request_log_created")
+        checksum = self._migration_checksum(2)
+        migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=2").fetchone()
+        if migration and migration["checksum"] != checksum:
+            raise RuntimeError("Database migration checksum mismatch")
+        db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (2,?,?)", (checksum, time.time()))
+        db.execute("PRAGMA user_version=2")
 
     @staticmethod
     def _migration_checksum(version):
@@ -229,8 +247,12 @@ class Store:
         # WAL 持久保存在数据库文件中，busy timeout 由 connect(timeout=15) 设置；
         # 借出期间连接由单线程独占，check_same_thread=False 因此是安全的。
         db = sqlite3.connect(str(self.path), timeout=15, check_same_thread=False, factory=PooledConnection)
-        db.identity = self._file_identity()
-        db.execute("PRAGMA journal_mode=WAL")
+        try:
+            db.identity = self._file_identity()
+            db.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            db.close()
+            raise
         return db
 
     @staticmethod
@@ -242,64 +264,71 @@ class Store:
 
     @contextlib.contextmanager
     def connect(self):
+        waiting_since = time.monotonic()
         with self._metrics_lock:
             self._metrics["waiting"] += 1
         if not self._connection_capacity.acquire(timeout=15):
             with self._metrics_lock:
                 self._metrics["waiting"] -= 1
+                self._metrics["timeouts"] = self._metrics.get("timeouts", 0) + 1
+                waited = time.monotonic() - waiting_since
+                self._metrics["wait_seconds"] = self._metrics.get("wait_seconds", 0) + waited
+                self._wait_samples.append(waited)
             raise sqlite3.OperationalError("Database connection capacity exhausted")
         with self._metrics_lock:
             self._metrics["waiting"] -= 1
             self._metrics["borrowed"] += 1
             self._metrics["peak"] = max(self._metrics["peak"], self._metrics["borrowed"])
-        with self._pool_lock:
-            generation = self._pool_generation
-            try:
-                db = self._pool.get_nowait()
-            except queue.Empty:
-                db = None
-        if db is not None and db.identity != self._file_identity():
-            # 升级回滚会整体替换 state.sqlite3（连同 -wal/-shm）；指向旧文件的
-            # 池连接必须弃用，否则轻则 I/O 错误，重则读到替换前的数据。
-            db.close()
-            db = None
-        if db is None:
-            db = self._new_connection()
-            with self._metrics_lock:
-                self._metrics["opened"] += 1
+            waited = time.monotonic() - waiting_since
+            self._metrics["wait_seconds"] = self._metrics.get("wait_seconds", 0) + waited
+            self._wait_samples.append(waited)
+        db = None
         try:
-            self._prepare(db)
-        except sqlite3.Error:
-            # 借出瞬间文件仍可能被替换；首条语句失败的连接直接重建一次。
-            db.close()
-            db = self._new_connection()
-            self._prepare(db)
-        try:
-            try:
-                yield db
-                db.commit()
-            except BaseException:
-                # 异常退出（包括 stream 被中途放弃）的连接可能持有坏状态：
-                # 回滚后直接关闭，绝不归还回池。
+            with self._pool_lock:
+                generation = self._pool_generation
                 try:
-                    db.rollback()
-                except sqlite3.Error:
+                    db = self._pool.get_nowait()
+                except queue.Empty:
                     pass
+            if db is not None and db.identity != self._file_identity():
                 db.close()
-                raise
-            else:
-                with self._pool_lock:
-                    if generation != self._pool_generation:
-                        db.close()
-                    else:
-                        try:
-                            self._pool.put_nowait(db)
-                        except queue.Full:
-                            db.close()
+                db = None
+            if db is None:
+                db = self._new_connection()
+                with self._metrics_lock:
+                    self._metrics["opened"] += 1
+            try:
+                self._prepare(db)
+            except sqlite3.Error:
+                db.close()
+                db = None
+                db = self._new_connection()
+                self._prepare(db)
+            yield db
+            db.commit()
+            with self._pool_lock:
+                if generation == self._pool_generation:
+                    try:
+                        self._pool.put_nowait(db)
+                        db = None
+                    except queue.Full:
+                        pass
         finally:
-            with self._metrics_lock:
-                self._metrics["borrowed"] -= 1
-            self._connection_capacity.release()
+            try:
+                if db is not None:
+                    try:
+                        db.rollback()
+                    except sqlite3.Error:
+                        pass
+                    try:
+                        db.close()
+                    except sqlite3.Error:
+                        with self._metrics_lock:
+                            self._metrics["close_failures"] = self._metrics.get("close_failures", 0) + 1
+            finally:
+                with self._metrics_lock:
+                    self._metrics["borrowed"] -= 1
+                self._connection_capacity.release()
 
     def close(self):
         """关闭池中空闲连接；已借出的连接由各自的 with 块负责关闭。"""
@@ -315,17 +344,43 @@ class Store:
                 except Exception:
                     pass
 
+    @contextlib.contextmanager
+    def query_scope(self, **identity):
+        context = dict(self._query_context.get())
+        context.update({key: value for key, value in identity.items() if key in ("request", "run", "task")
+                        and isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value)})
+        token = self._query_context.set(context)
+        try:
+            yield
+        finally:
+            self._query_context.reset(token)
+
     def query(self, sql, args=()):
-        active = getattr(self._read_snapshot, "connection", None)
-        if active is not None:
-            return [dict(row) for row in active.execute(sql, args).fetchall()]
-        with self.connect() as db:
-            started = time.monotonic()
-            result = [dict(row) for row in db.execute(sql, args).fetchall()]
-            if "FROM tasks" in sql:
-                self._task_samples.history = [*getattr(self._task_samples, "history", [])[-127:],
-                                              time.monotonic() - started]
-            return result
+        started = time.monotonic()
+        execution_seconds = None
+        def execute(db):
+            nonlocal execution_seconds
+            began = time.monotonic()
+            try:
+                return [dict(row) for row in db.execute(sql, args).fetchall()]
+            finally:
+                execution_seconds = time.monotonic() - began
+        try:
+            active = getattr(self._read_snapshot, "connection", None)
+            if active is not None:
+                return execute(active)
+            with self.connect() as db:
+                return execute(db)
+        finally:
+            elapsed = time.monotonic() - started
+            with self._metrics_lock:
+                self._metrics["queries"] = self._metrics.get("queries", 0) + 1
+                self._query_samples.append(elapsed)
+                if execution_seconds is not None and execution_seconds > 0.1:
+                    normalized = re.sub(r"'(?:''|[^'])*'", "?", " ".join(sql.split()))
+                    self._slow_queries.append({"fingerprint": hashlib.sha256(normalized.encode()).hexdigest()[:16],
+                                               "seconds": execution_seconds, "total_seconds": elapsed, "at": time.time(),
+                                               "context": dict(self._query_context.get())})
 
     def stream(self, sql, args=()):
         """Yield rows without materializing an unbounded result set."""
@@ -359,15 +414,72 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN")
             self._read_snapshot.connection = db
+            token = uuid.uuid4().hex
+            with self._metrics_lock:
+                self._active_snapshots[token] = time.monotonic()
             try:
                 yield
             finally:
+                with self._metrics_lock:
+                    self._active_snapshots.pop(token, None)
                 self._read_snapshot.connection = None
 
-    def metrics(self):
+    def wal_diagnostics(self, checkpoint=False):
+        """A passive checkpoint never waits for readers or truncates their WAL."""
+        now = time.monotonic()
+        with self._metrics_lock:
+            ages = [max(0, now - started) for started in self._active_snapshots.values()]
+        result = {"active_snapshots": len(ages), "oldest_snapshot_seconds": max(ages, default=0),
+                  "snapshot_scope": "this_process", "checked_at": time.time()}
+        if checkpoint:
+            with self.connect() as db:
+                busy, pages, copied = db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                result.update(busy=bool(busy), wal_pages=pages, checkpointed_pages=copied,
+                              pending_pages=max(0, pages - copied), mode="passive")
+            self._wal_snapshot = result
+        else:
+            previous = getattr(self, "_wal_snapshot", {})
+            result.update({key: value for key, value in previous.items()
+                           if key not in ("active_snapshots", "oldest_snapshot_seconds", "checked_at", "snapshot_scope")})
+            result["checkpoint_checked_at"] = previous.get("checked_at")
+        return result
+
+    def record_request(self, request, method, path, status, started, ended, error_code=""):
+        polls = {"/api/state", "/api/events", "/api/usage", "/api/auth/status", "/api/operation"}
+        sampled = method == "GET" and path in polls and 200 <= status < 400
+        window = int(time.monotonic() // 60)
+        with self._metrics_lock:
+            self._request_log_counts["observed"] += 1
+            if sampled:
+                if self._poll_log_windows.get(path) == window:
+                    self._request_log_counts["sampled_out"] += 1
+                    return False
+                self._poll_log_windows[path] = window
+        try:
+            self.execute("INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
+                         (request, method, path[:300], status, started, ended, error_code[:100]))
+        except Exception:
+            with self._metrics_lock:
+                self._request_log_counts["failed"] += 1
+                if sampled and self._poll_log_windows.get(path) == window:
+                    self._poll_log_windows.pop(path, None)
+            raise
+        with self._metrics_lock:
+            self._request_log_counts["persisted"] += 1
+        return True
+
+    def metrics(self, integrity=False):
         with self._metrics_lock:
             borrowed = self._metrics["borrowed"]
             values = dict(self._metrics)
+            waits = sorted(self._wait_samples)
+            quantile = lambda fraction: waits[max(0, math.ceil(len(waits) * fraction) - 1)] if waits else None
+            values.update(wait_p50_seconds=quantile(.5), wait_p95_seconds=quantile(.95), wait_p99_seconds=quantile(.99),
+                          wait_samples=len(waits), wait_window=512, wait_quantile="nearest_rank", wait_timeout_seconds=15,
+                          wait_scope="completed_admissions_including_timeouts_this_process",
+                          slow_queries=list(self._slow_queries))
+            values["request_logging"] = {**self._request_log_counts, "poll_sample_seconds": 60,
+                                         "counter_scope": "this_process", "errors_and_writes": "all"}
         with self.connect() as db:
             values.update({
                 "database_bytes": self.path.stat().st_size if self.path.exists() else 0,
@@ -376,43 +488,90 @@ class Store:
                 "page_count": db.execute("PRAGMA page_count").fetchone()[0],
                 "page_size": db.execute("PRAGMA page_size").fetchone()[0],
                 "busy_timeout_ms": db.execute("PRAGMA busy_timeout").fetchone()[0],
-                "foreign_key_violations": len(db.execute("PRAGMA foreign_key_check").fetchall()),
             })
+            if integrity:
+                deadline = time.monotonic() + 2
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                try:
+                    rows = db.execute("PRAGMA foreign_key_check").fetchmany(101)
+                    self._integrity_snapshot = {"foreign_key_violations": len(rows),
+                        "foreign_key_truncated": len(rows) > 100, "foreign_key_checked_at": time.time()}
+                except sqlite3.OperationalError:
+                    self._integrity_snapshot = {"foreign_key_violations": None,
+                        "foreign_key_check": "budget_exceeded", "foreign_key_checked_at": time.time()}
+                finally:
+                    db.set_progress_handler(None, 0)
+        values.update(getattr(self, "_integrity_snapshot", {"foreign_key_violations": None,
+                                                          "foreign_key_check": "not_requested"}))
         values.update(idle=self._pool.qsize(), borrowed=borrowed, limit=MAX_CONNECTIONS + POOL_SIZE)
         return values
 
     def task_duration_model(self):
-        samples = getattr(self._task_samples, "history", [])
-        return {"samples": len(samples), "median_seconds": statistics.median(samples) if samples else 0.0}
+        rows = self.query("SELECT max(0,ended-started) AS seconds FROM runs "
+                          "WHERE ended IS NOT NULL AND started IS NOT NULL ORDER BY ended DESC LIMIT 128")
+        samples = [row["seconds"] for row in rows]
+        return {"samples": len(samples), "median_seconds": statistics.median(samples) if samples else 0.0,
+                "source": "completed_runs", "window": 128}
 
     def schema_migrations(self):
         return self.query("SELECT version,checksum,applied FROM schema_migrations ORDER BY version")
 
     def relationship_audit(self, limit=100):
         checks = {
-            "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project<>t.project",
+            "tasks_without_project": "SELECT t.id FROM tasks t LEFT JOIN projects p ON p.id=t.project WHERE p.id IS NULL",
+            "runs_without_project": "SELECT r.id FROM runs r LEFT JOIN projects p ON p.id=r.project WHERE p.id IS NULL",
+            "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project IS NOT t.project",
+            "runs_without_task": "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.task IS NOT NULL AND t.id IS NULL",
+            "events_without_project": "SELECT e.seq FROM events e LEFT JOIN projects p ON p.id=e.project WHERE e.project IS NOT NULL AND p.id IS NULL AND NOT (e.project='model-center' AND coalesce(e.run,'') LIKE 'model-test-%')",
+            "events_without_run": "SELECT e.seq FROM events e LEFT JOIN runs r ON r.id=e.run WHERE e.run IS NOT NULL AND r.id IS NULL AND e.run NOT LIKE 'model-test-%'",
+            "event_project_mismatch": "SELECT e.seq FROM events e JOIN runs r ON r.id=e.run WHERE e.project IS NOT NULL AND e.project IS NOT r.project",
+            "candidates_without_project": "SELECT c.id FROM candidates c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "invalid_candidate_parent": "SELECT c.id FROM candidates c LEFT JOIN candidates p ON p.id=c.parent WHERE c.parent IS NOT NULL AND (p.id IS NULL OR p.project IS NOT c.project OR p.kind IS NOT c.kind)",
+            "cases_without_project": "SELECT c.id FROM cases c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "skills_without_project": "SELECT s.id FROM skills s LEFT JOIN projects p ON p.id=s.project WHERE p.id IS NULL",
+            "invalid_skill_task": "SELECT s.id FROM skills s LEFT JOIN tasks t ON t.id=s.task WHERE s.task IS NOT NULL AND (t.id IS NULL OR t.project IS NOT s.project)",
+            "calls_without_run": "SELECT c.id FROM calls c LEFT JOIN runs r ON r.id=c.run WHERE c.run IS NOT NULL AND c.run NOT LIKE 'model-test-%' AND r.id IS NULL",
+            "calls_without_project": "SELECT c.id FROM calls c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL AND NOT (coalesce(c.project,'')='model-center' AND coalesce(c.run,'') LIKE 'model-test-%')",
+            "call_project_mismatch": "SELECT c.id FROM calls c JOIN runs r ON r.id=c.run WHERE c.project IS NOT r.project",
+            "schedules_without_project": "SELECT s.project FROM schedules s LEFT JOIN projects p ON p.id=s.project WHERE p.id IS NULL",
+            "decisions_without_task": "SELECT d.task FROM task_decisions d LEFT JOIN tasks t ON t.id=d.task WHERE t.id IS NULL",
+            "revisions_without_task": "SELECT d.id FROM task_revisions d LEFT JOIN tasks t ON t.id=d.task WHERE t.id IS NULL",
+            "snapshots_without_revision": "SELECT s.revision FROM task_revision_snapshots s LEFT JOIN task_revisions r ON r.id=s.revision WHERE r.id IS NULL",
+            "invalid_dependencies": "SELECT d.task FROM task_dependencies d LEFT JOIN tasks t ON t.id=d.task LEFT JOIN tasks p ON p.id=d.dependency WHERE t.id IS NULL OR p.id IS NULL OR t.project IS NOT p.project OR t.id=p.id",
+            "invalid_group_members": "SELECT m.group_task FROM task_group_members m LEFT JOIN tasks g ON g.id=m.group_task LEFT JOIN tasks t ON t.id=m.original_task WHERE g.id IS NULL OR t.id IS NULL OR g.project IS NOT t.project OR g.id=t.id",
+            "invalid_submissions": "SELECT s.request FROM submissions s LEFT JOIN tasks t ON t.id=s.task WHERE t.id IS NULL OR s.project IS NOT t.project",
+            "invalid_completions": "SELECT c.task FROM task_completions c LEFT JOIN tasks t ON t.id=c.task WHERE t.id IS NULL OR c.project IS NOT t.project",
+            "phases_without_run": "SELECT p.id FROM phase_times p LEFT JOIN runs r ON r.id=p.run WHERE r.id IS NULL",
+            "waits_without_run": "SELECT w.id FROM remote_waits w LEFT JOIN runs r ON r.id=w.run WHERE r.id IS NULL",
+            "stages_without_run": "SELECT s.run FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL",
         }
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Relationship audit limit must be 1..1000")
         result = {}
+        truncated = {}
         for name, sql in checks.items():
-            result[name] = [row[next(iter(row))] for row in self.query(sql + " LIMIT ?", (limit,))]
+            rows = self.query(sql + " LIMIT ?", (limit + 1,))
+            result[name] = [row[next(iter(row))] for row in rows[:limit]]
+            truncated[name] = len(rows) > limit
+        result["_truncated"] = truncated
+        result["_limit"] = limit
         return result
 
-    def quarantine_orphans(self):
+    def quarantine_orphans(self, limit=100):
         """Move provable orphan rows into an audit table without deleting evidence."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Relationship audit limit must be 1..1000")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            specs = [
-                ("stages", "stages_without_run", "SELECT s.run,s.data FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL"),
-            ]
-            quarantined = {}
-            for table, label, select in specs:
-                rows = db.execute(select).fetchall()
-                quarantined[label] = len(rows)
-                for row in rows:
-                    db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES (?,?,?,?)",
-                               (table, row[0], json.dumps(dict(row), ensure_ascii=False), time.time()))
-                db.execute("DELETE FROM stages WHERE run IN (" + select.replace("SELECT s.run,s.data", "SELECT s.run") + ")")
-            return quarantined
+            rows = db.execute("SELECT s.rowid AS original_rowid,s.* FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL "
+                              "ORDER BY s.run,s.stage,s.rowid LIMIT ?", (limit + 1,)).fetchall()
+            for row in rows[:limit]:
+                evidence = dict(row)
+                original_rowid = evidence.pop("original_rowid")
+                db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES ('stages',?,?,?)",
+                           (str(original_rowid), encode(evidence), time.time()))
+                db.execute("DELETE FROM stages WHERE rowid=?", (original_rowid,))
+            return {"stages_without_run": min(len(rows), limit), "has_more": len(rows) > limit}
 
     def config_revision(self, project=None):
         row = self.one("SELECT value FROM settings WHERE key=?", ("config-revision:" + (project or "global"),))
@@ -431,10 +590,60 @@ class Store:
 
     def setting(self, key, default=None):
         row = self.one("SELECT value FROM settings WHERE key=?", (key,))
-        return json.loads(row["value"]) if row else default
+        try:
+            return json.loads(row["value"]) if row else default
+        except (ValueError, TypeError):
+            # Configuration and credential registry corruption must reach their repair/rejection flows.
+            if key in ('config', 'credential-cleanup-pending') or key.startswith('config:'):
+                raise
+            return default
+
+    def put_namespaced_setting(self, namespace, key, value, version=1, ttl=None):
+        """Explicit opt-in envelope; existing settings retain their wire format."""
+        if not isinstance(namespace, str) or not namespace or ':' in namespace:
+            raise ValueError("Invalid settings namespace")
+        if not isinstance(key, str) or not key or type(version) is not int or version < 1:
+            raise ValueError("Invalid settings key or version")
+        if ttl is not None and (type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0):
+            raise ValueError("Invalid settings TTL")
+        if type(value) not in (dict, list, str, int, float, bool, type(None)):
+            raise ValueError("Settings value must be a JSON type")
+        try:
+            json.dumps(value, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Settings value must be finite JSON") from exc
+        self.put_setting('namespace:' + namespace + ':' + key,
+                         {"version": version, "type": type(value).__name__, "value": value,
+                          "expires": time.time() + ttl if ttl is not None else None})
+
+    def namespaced_setting(self, namespace, key, expected_type, version=1, default=None, now=None):
+        envelope = self.setting('namespace:' + namespace + ':' + key)
+        if not isinstance(envelope, dict) or envelope.get('version') != version:
+            return default
+        value = envelope.get('value')
+        if type(value) is not expected_type or envelope.get('type') != expected_type.__name__:
+            return default
+        expires = envelope.get('expires')
+        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
+                                    expires <= (time.time() if now is None else now)):
+            return default
+        return value
 
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
+
+    def reserve_case_exposure(self, project, case, experiment, limit):
+        key = "case-exposure:" + experiment + ":" + case
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone():
+                return key
+            if db.execute("UPDATE cases SET uses=uses+1 WHERE id=? AND project=? AND uses<?",
+                          (case, project, limit)).rowcount != 1:
+                raise ValueError("Evaluation case exposure is unavailable or exhausted")
+            db.execute("INSERT INTO settings VALUES (?,?)", (key, encode({"state": "possible_exposure",
+                "case": case, "experiment": experiment, "created": time.time()})))
+        return key
 
     def event(self, kind, message, project=None, run=None, data=None):
         self.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
@@ -446,6 +655,8 @@ class Store:
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone():
+                raise ValueError("Project is archived; restore it before starting work")
             if request_id:
                 prior = db.execute("SELECT * FROM submissions WHERE project=? AND request=?", (project, request_id)).fetchone()
                 if prior:
@@ -527,8 +738,8 @@ class Store:
     @staticmethod
     def ready_clause():
         return ("state='queued' AND available<=? AND NOT EXISTS "
-                "(SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.dependency "
-                "WHERE d.task=tasks.id AND p.state<>'merged')")
+                "(SELECT 1 FROM task_dependencies d LEFT JOIN tasks p ON p.id=d.dependency "
+                "WHERE d.task=tasks.id AND (p.id IS NULL OR p.state<>'merged'))")
 
     def claim(self, project, config):
         now = time.time()
@@ -536,7 +747,8 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
             busy = db.execute("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project,)).fetchone()
-            if not p or p["paused"] or busy:
+            archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
+            if not p or p["paused"] or busy or archived:
                 return None
             from .config import merge, validate
             task = None

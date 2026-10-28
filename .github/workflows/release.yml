@@ -20,7 +20,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: adaptive-rsi-release-main
+  group: adaptive-rsi-release
   cancel-in-progress: false
 jobs:
   prepare:
@@ -156,7 +156,12 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
-      - run: python3 scripts/test_parallel.py
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ci/test-durations.json
+          key: test-timings-${{ runner.os }}-${{ hashFiles('tests/test_*.py', 'scripts/test_worker.py') }}-${{ github.run_id }}
+          restore-keys: test-timings-${{ runner.os }}-
+      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
       - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
       - run: node --check adaptive_rsi/web/auth.js
       - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
@@ -165,13 +170,13 @@ jobs:
       - run: npx playwright install chromium
       - run: npm run test:browser
       - run: python3 scripts/package.py
-      - run: python3 -m pip install --disable-pip-version-check build
+      - run: python3 -m pip install --disable-pip-version-check -r requirements-build.txt
       - run: python3 -m build --wheel
         env:
           SOURCE_DATE_EPOCH: '1577836800'
       - name: 安装 macOS ARM64 桌面构建工具
         run: |
-          rustup default stable
+          rustup default 1.99.1
           npm ci --prefix desktop
       - name: 构建、验证并收集桌面安装包
         env:

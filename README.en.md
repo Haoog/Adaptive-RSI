@@ -52,6 +52,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 
 The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
 
+Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
+
 ## Quick Start
 
 ### Desktop app (recommended)
@@ -136,3 +138,31 @@ Routine tests substitute the model interface and do not spend model sessions. Se
 ## License
 
 This project is available under the [MIT License](LICENSE).
+
+Failed or cancelled groups can be split after a preview: originals return to the queue for fresh independent verification while previous group evidence remains. A complete revised group specification becomes a separate task, preserving changes without guessing their attribution. Task details paginate group lineage and outcomes; a whole-group pass is not individual criterion evidence.
+
+During desktop replacement, admission stays closed while the installer process is alive, regardless of elapsed time. If the owned installer exits before stopping the service, admission recovers with an audit record and tasks remain intact. Unknown process status keeps the barrier closed; legacy barriers recover through the owned desktop restart or explicit lease cancellation.
+
+Queue settings support up to 100 predecessor tasks and a combined ancestry budget of 1000 nodes. All predecessors must merge before a task can start. Cycles, missing nodes and cross-project dependencies are rejected. A failed or cancelled predecessor blocks its dependent for manual review while retaining unrelated prerequisites. Multi-selection survives paging, language changes and live detail refreshes.
+
+Experiment cards compare paired quality, token usage (not currency) and latency, with real/synthetic and task-size cohorts. Unknown usage and zero baselines remain incomparable; observed subgroup losses remain visible. Expand a card to inspect or export its recorded plan, input manifest and evidence. Native tool activity records invocation hashes, status and timing without arguments, source text or command output. Interrupted search retains bounded file/line locations. A started step without a terminal receipt needs investigation and is never automatically replayed. Source reads check cancellation between 64 KiB chunks and search checks every 256 lines; an individual blocked operating-system filesystem call cannot be interrupted by these cooperative checks.
+
+Database diagnostics correlate slow query fingerprints with opaque request/task/run IDs, separating SQL execution from connection waiting and excluding SQL text and bound parameters. Pool wait quantiles include capacity timeouts and declare their process/window scope. Normal metrics do not perform full relationship scans; explicit diagnostics inspect ownership and evidence links, disclosing per-check truncation. Explicit orphan-stage quarantine is transactional and bounded, retains every original column, and does not automatically delete other kinds of evidence.
+
+Settings include redacted change history and safe undo. Only the latest change with matching revision and content can be undone; later project or global changes reject stale undo.
+
+Deployment supports consecutive-success gates and multiple health endpoints. A round counts only when every endpoint confirms the same commit; rollout and rollback use the same rules.
+
+Automatic deployment rollback also requires an explicit backward-data-compatibility declaration; otherwise rollback is blocked and maintainer-provided manual recovery steps are shown.
+
+Execution resources queue model calls, commands and exclusive benchmarks by priority. Requests waiting at least 30 seconds take FIFO precedence; diagnostics include bounded wait samples and cancellation receipts.
+
+Optional disk and memory low-water admission keeps new tasks queued until resources recover. Both checks default to disabled; when configured, unavailable measurements also defer admission with an explicit reason.
+
+Diff reading folds by file and loads content when expanded. Mobile defaults to wrapping; search opens the matching file, and large diffs locate matches using their actual wrapped layout.
+
+Task details can explain why work has not started, showing prerequisite chains, pause, retry time, working hours, global capacity and resource pressure together. Clearing one condition preserves the others.
+
+Configuration validation shows localized stable reasons and safe field paths. Unknown request errors retain a copyable diagnostic ID for log correlation.
+
+Project and page navigation enter browser history. Back, forward and reload retain the selected project; notification task details can be restored through history, and closing details preserves project and page context.

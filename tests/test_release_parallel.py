@@ -177,10 +177,18 @@ class ParallelReleaseTest(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
+    def test_release_entrypoints_share_one_immutable_asset_writer(self):
+        from tests.test_release import WorkflowConfigurationTest
+        workflow = WorkflowConfigurationTest().workflow("release.yml")
+        # Both a version-merge push and an explicit dispatch can resolve to
+        # publish. Event-based groups would let them clobber the same draft.
+        self.assertEqual(workflow["concurrency"]["group"], "adaptive-rsi-release")
+        self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
+
     def test_release_paths_keep_full_parallel_gate_on_macos_python312(self):
         from tests.test_release import WorkflowConfigurationTest
         parser = WorkflowConfigurationTest()
-        for name, job in [("release-verify.yml", "verify"), ("release.yml", "build")]:
+        for name, job in [("release-verify.yml", "tests"), ("release.yml", "build")]:
             workflow = parser.workflow(name)
             config = workflow["jobs"][job]
             with self.subTest(workflow=name):
@@ -196,8 +204,14 @@ class ParallelReleaseTest(unittest.TestCase):
                             if step.get("run", "").startswith("python3 scripts/test_parallel.py"))
                 self.assertFalse(gate.get("continue-on-error", False))
                 self.assertNotIn("if", gate)
-                self.assertTrue(any("scripts/release_smoke.py" in command for command in commands))
-                self.assertTrue(any("verify-dmg" in command for command in commands))
+                build = workflow["jobs"]["verify" if name == "release-verify.yml" else "build"]
+                build_commands = [step.get("run", "") for step in build["steps"]]
+                self.assertTrue(any("scripts/release_smoke.py" in command for command in build_commands))
+                self.assertTrue(any("verify-dmg" in command for command in build_commands))
+                if name == "release-verify.yml":
+                    self.assertTrue({"tests", "browser", "verify"} <= set(workflow["jobs"]["report"]["needs"]))
+                    self.assertTrue({"tests", "browser", "verify", "report"} <= set(workflow["jobs"]["merge"]["needs"]))
+                    self.assertEqual(build["needs"], "gate")
 
 
 if __name__ == "__main__":

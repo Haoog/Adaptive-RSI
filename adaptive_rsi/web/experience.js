@@ -8,6 +8,7 @@ window.RSIExperience = (() => {
     ready: "可开始",
     working_hours: "等待工作时段",
     capacity: "等待运行资源",
+    resource_pressure: "等待磁盘或内存压力解除",
   };
   let liveTimer,
     liveBusy = false,
@@ -62,7 +63,7 @@ window.RSIExperience = (() => {
     box.showModal();
     return box;
   }
-  async function openTask(task) {
+  async function openTask(task, recordHistory = true) {
     stashSettings();
     stashGoalDraft();
     closeTaskDetail();
@@ -71,7 +72,7 @@ window.RSIExperience = (() => {
     restoreGoalDraft();
     settingsBaseline = null;
     taskOffset = 0;
-    showView("overview");
+    showView("overview", recordHistory);
     const ticket = detailSequence, navigation = navigationSequence;
     const current = () => ticket === detailSequence && navigation === navigationSequence && projectId === task.project;
     await refresh();
@@ -381,6 +382,32 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    if(['queued','blocked','deferred','waiting_budget','interrupted'].includes(metadata.state)){
+      const causes=el('details'),content=el('div'),reload=el('button',t('刷新阻塞原因'),'text-button');reload.type='button';
+      causes.append(el('summary',t('为什么还没开始')),content,reload);controls.append(causes);let loading=false;
+      async function loadCauses(){
+        if(loading||!current())return;loading=true;reload.disabled=true;
+        try{
+          const report=await api('task-blockers?project='+encodeURIComponent(task.project)+'&id='+encodeURIComponent(task.id));
+          if(!current()||!causes.isConnected)return;content.replaceChildren();
+          const labels={needs_review:'需要人工处理',backoff:'等待连接重试时间',dependency:'等待前置任务合并',awaiting_merge:'等待前置任务合并',invalid_dependency:'前置任务缺失或属于其他项目',omitted_dependency:'更多前置原因未展开',paused:'项目已暂停',running:'等待当前任务结束',capacity:'等待运行资源',working_hours:'等待工作时段',resource_pressure:'等待磁盘或内存压力解除',update_in_progress:'软件更新中',project_import:'项目导入中'};
+          const describe=reason=>t(labels[reason.code]||reason.code)+(reason.until?' · '+stamp(reason.until):'');
+          for(const reason of report.shared_reasons)content.append(el('p',describe(reason)));
+          const nodes=new Map(report.nodes.map(node=>[node.id,node]));
+          for(const node of report.nodes){
+            const reasons=node.reasons.map(describe);
+            if(reasons.length)content.append(el('p',(node.title||node.id)+' · '+reasons.join(' · ')));
+            for(const edge of report.edges.filter(edge=>edge.task===node.id)){
+              const parent=nodes.get(edge.dependency);content.append(el('p',(node.title||node.id)+' → '+(parent?.title||edge.dependency),'muted'));
+            }
+          }
+          if(!report.shared_reasons.length&&!report.nodes.some(node=>node.reasons.length))content.append(el('p',t('当前未发现阻塞原因，等待调度器领取。')));
+          if(report.truncated)content.append(el('p',t('原因链超过展示上限；尚有原因未展开，不能据此认定已全部解除。'),'form-error'));
+          content.append(el('p',t('检查时间')+' · '+stamp(report.checked_at),'muted'));
+        }finally{loading=false;reload.disabled=false;}
+      }
+      causes.addEventListener('toggle',()=>{if(causes.open)safe(loadCauses);});reload.onclick=()=>safe(loadCauses);
+    }
     controls.append(el("h3", t("下一步")));
     if (
       [
@@ -444,9 +471,11 @@ window.RSIExperience = (() => {
         input.value = draftStore.get('task-supplement', task.id) || '';
         input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
+      const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
+      reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
-      form.append(label, submit);
+      form.append(label, reasonLabel, submit);
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
@@ -458,6 +487,7 @@ window.RSIExperience = (() => {
             await api("task/revise", {
               task: task.id,
               supplement: value,
+              reason: reason.value,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
             await refreshTaskDetail();
@@ -474,11 +504,14 @@ window.RSIExperience = (() => {
         select = el("select"),
         none = el("option", t("无前置任务"));
       none.value = "";
+      select.multiple = true;select.size = 6;
       select.append(none);
+      const selection = () => [...select.selectedOptions].map(option => option.value).filter(Boolean).sort();
+      const choose = values => {for (const option of select.options) option.selected = values.includes(option.value);};
       if (!editor.baseline || (!queueSaves.has(editor.key) && editor.version === baselineVersion))
-        editor.baseline = {dependency: metadata.dependency?.dependency || "", urgency: !!metadata.urgency};
+        editor.baseline = {dependencies: (metadata.dependencies || (metadata.dependency ? [metadata.dependency] : [])).map(parent => parent.dependency).sort(), urgency: !!metadata.urgency};
       queueDraft = readQueueDraft();
-      const dependency = editor.baseline.dependency;
+      const dependencies = editor.baseline.dependencies;
       const pager = el("div", undefined, "task-pagination"),
         pageNote = el("span");
       pageNote.setAttribute("aria-live", "polite");
@@ -502,9 +535,9 @@ window.RSIExperience = (() => {
           );
           if (!current()) return;
           // Read at response time so edits made while a page loads remain selected.
-          const selected = select.value || "", pinned = new Map();
+          const selected = selection(), pinned = new Map();
           for (const option of select.children)
-            if (option.value && [dependency, selected].includes(option.value))
+            if (option.value && [...dependencies, ...selected].includes(option.value))
               pinned.set(option.value, {id: option.value, title: option.textContent});
           const choices = new Map(pinned);
           for (const other of candidates.tasks || [])
@@ -515,7 +548,7 @@ window.RSIExperience = (() => {
             option.value = other.id;
             select.append(option);
           }
-          select.value = selected;
+          choose(selected);
           offset = requestedOffset;
           hasMore = !!candidates.pagination?.has_more;
           pageNote.textContent = t("前置任务候选页") + " " + (offset / 200 + 1);
@@ -525,13 +558,13 @@ window.RSIExperience = (() => {
         }
       }
       // Seed saved/draft selections before loading, including an off-page parent.
-      for (const id of new Set([dependency, queueDraft?.dependency])) {
+      for (const id of new Set([...dependencies, ...(queueDraft?.dependencies || (queueDraft?.dependency ? [queueDraft.dependency] : []))])) {
         if (!id) continue;
         const option = el("option", id);
         option.value = id;
         select.append(option);
       }
-      select.value = queueDraft?.dependency ?? dependency;
+      choose(queueDraft?.dependencies || (queueDraft?.dependency ? [queueDraft.dependency] : dependencies));
       // Resolve seed titles once; subsequent pages pin only the saved and selected parent.
       for (const option of [...select.children]) {
         if (!option.value) continue;
@@ -546,24 +579,24 @@ window.RSIExperience = (() => {
         urgency = el("input");
       urgency.type = "checkbox";
       urgency.checked = queueDraft?.urgency ?? editor.baseline.urgency;
-      editor.read = () => ({dependency: select.value, urgency: urgency.checked});
+      editor.read = () => ({dependencies: selection(), urgency: urgency.checked});
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
       editor.submit = submit;
       submit.disabled = queueSaves.has(editor.key);
-      form.append(label, urgencyLabel, submit, pager);
+      form.append(label, urgencyLabel, submit, pager, el("p", t("可选择多个前置任务；全部合并后再开始。")));
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
           if (!current() || queueSaves.has(editor.key)) return;
-          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          const parents = selection(), submitted = {task: task.id, ...(parents.length > 1 ? {dependencies: parents} : {dependency: parents[0] || null}), urgency: urgency.checked ? 1 : 0};
           queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
             await api("task/schedule", submitted);
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
-            editor.baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
             if (!queueEditorCurrent(editor)) return;
             await refresh();
@@ -615,12 +648,110 @@ window.RSIExperience = (() => {
     if (metadata.revisions?.length) {
       const revisions = el("details");
       revisions.append(el("summary", t("需求修订记录")));
-      for (const revision of metadata.revisions)
-        revisions.append(
-          el("p", stamp(revision.created) + " · " + revision.supplement),
-        );
+      function appendRevisions(items) {
+      for (const revision of items) {
+        const item = el("details");
+        item.append(el("summary", stamp(revision.created) + " · " + revision.supplement));
+        let loaded = false, loading = false;
+        item.addEventListener("toggle", () => {
+          if (!item.open || loaded || loading) return;
+          loading = true;
+          safe(async () => {
+            try {
+              const detail = await api("task-revision?id=" + encodeURIComponent(revision.id) + "&project=" + encodeURIComponent(task.project));
+              if (!current()) return;
+              if (!detail.snapshot_available) item.append(el("p", t("旧修订缺少修改后快照，保留原始补充记录。")));
+              else {
+                item.append(el("p", t("旧候选已失效，后续运行将重新验证。")));
+                if (detail.diff !== null) item.append(el("pre", detail.diff));
+                else item.append(el("p", t("差异行数较多，请对照完整的修改前后内容。")));
+                for (const [label, value] of [["修改前需求", detail.previous_body], ["修改后需求", detail.after_body]]) {
+                  const raw = el("details");raw.append(el("summary", t(label)), el("pre", value));item.append(raw);
+                }
+              }
+              loaded = true;
+            } finally { loading = false; }
+          });
+        });
+        revisions.append(item);
+      }
+      }
+      appendRevisions(metadata.revisions);
+      let revisionBefore = metadata.revisions_next_before, revisionsLoading = false;
+      const moreRevisions = el("button", t("加载更多修订"), "text-button");moreRevisions.type = "button";
+      moreRevisions.hidden = !metadata.revisions_has_more;
+      moreRevisions.onclick = () => safe(async () => {
+        if (revisionsLoading || !revisionBefore || !current()) return;
+        revisionsLoading = true;moreRevisions.disabled = true;
+        try {
+          const data = await api("task-revisions?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + "&before=" + revisionBefore);
+          if (!current()) return;
+          appendRevisions(data.revisions);revisionBefore = data.next_before;
+          moreRevisions.hidden = !data.has_more;revisions.append(moreRevisions);
+        } finally {revisionsLoading = false;moreRevisions.disabled = false;}
+      });
+      revisions.append(moreRevisions);
       controls.append(revisions);
     }
+    const lineage = metadata.group_lineage;
+    if (lineage?.groups?.length || lineage?.members?.length) {
+      const section = el("details");section.append(el("summary", t("任务组关联与成果")),
+        el("p", t("分组整体状态不代表每条原始要求均有独立验收证据。")));
+      const related = (item) => {
+        const card = el("div");card.append(el("p", item.title + " · " + t(statusNames[item.state] || item.state)));
+        if (item.latest_run?.summary) card.append(el("p", item.latest_run.summary));
+        const button = el("button", t("查看关联任务"), "text-button");button.type = "button";
+        button.onclick = () => safe(async () => {const target = await api("task?id=" + encodeURIComponent(item.id) + "&project=" + encodeURIComponent(task.project));if (current()) await showTask(target);});
+        card.append(button);return card;
+      };
+      const groupRows = el("div");section.append(groupRows);
+      for (const group of lineage.groups || []) groupRows.append(related(group));
+      let groupBefore = lineage.next_before, groupsLoading = false;
+      const moreGroups = el("button", t("加载更多"), "text-button");moreGroups.type = "button";
+      moreGroups.hidden = !lineage.groups_truncated;
+      moreGroups.onclick = () => safe(async () => {
+        if (groupsLoading || !groupBefore || !current()) return;
+        groupsLoading = true;moreGroups.disabled = true;
+        try {
+          const data = await api("task-groups?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + "&before=" + groupBefore);
+          if (!current()) return;
+          for (const group of data.groups) groupRows.append(related(group));
+          groupBefore = data.next_before;moreGroups.hidden = !data.groups_truncated;
+        } finally {groupsLoading = false;moreGroups.disabled = false;}
+      });section.append(moreGroups);
+      if (lineage.members?.length) section.append(el("h4", t("来源任务")));
+      for (const member of lineage.members || []) section.append(related(member));
+      controls.append(section);
+    }
+    const interventions = el("details"), entries = [], historyRows = el("div"),
+      more = el("button", t("加载更多"), "text-button"), download = el("button", t("导出已加载的干预记录"), "text-button");
+    interventions.append(el("summary", t("人工干预记录")), historyRows, more, download);
+    more.type = download.type = "button";more.hidden = true;download.disabled = true;
+    let historyLoading = false, historyLoaded = false, historyBefore = null, historyMore = false;
+    async function loadInterventions() {
+      if (historyLoading || !current()) return;
+      historyLoading = true;more.disabled = true;
+      try {
+        const data = await api("task-interventions?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + (historyBefore ? "&before=" + historyBefore : ""));
+        if (!current()) return;
+        entries.push(...data.entries);historyBefore = data.next_before;historyMore = data.has_more;historyLoaded = true;
+        for (const event of data.entries) {
+          const names = {manual_retry: t("重试"), cancelled: t("取消任务"), requirements_revised: t("补充需求（保留在当前任务）"), queue_settings: t("保存排队设置"), delivery_approved: t("批准推送并创建 PR")};
+          const row = el("details");row.append(el("summary", stamp(event.created) + " · " + (names[event.kind] || event.kind)));
+          if (typeof event.data.reason === "string" && event.data.reason) row.append(el("p", event.data.reason));
+          row.append(el("pre", JSON.stringify(event.data, null, 2)));historyRows.append(row);
+        }
+        more.hidden = !historyMore;download.disabled = false;
+      } finally {historyLoading = false;more.disabled = false;}
+    }
+    interventions.addEventListener("toggle", () => {if (interventions.open && !historyLoaded) safe(loadInterventions);});
+    more.onclick = () => safe(loadInterventions);
+    download.onclick = () => {
+      const data = {format: 1, task: task.id, project: task.project, entries, complete: !historyMore, next_before: historyBefore},
+        url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type: "application/json"})), link = el("a");
+      link.href = url;link.download = "adaptive-rsi-interventions.json";link.click();setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    controls.append(interventions);
     body.append(controls);
   }
   function readQueueDraft() {
@@ -628,7 +759,7 @@ window.RSIExperience = (() => {
     const values = queueEditor.read?.();
     if (!values) return queueEditor.draft;
     if (queueSaves.has(queueEditor.key)) return values;
-    return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== queueEditor.baseline[key]));
+    return Object.fromEntries(Object.entries(values).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(queueEditor.baseline[key])));
   }
   function taskOpened(task, queueDraft) {
     const key = queueKey(task);
@@ -641,7 +772,8 @@ window.RSIExperience = (() => {
     lastDetail = "";
     backoffRetry = null;
     if (location.href && typeof URL === "function") {
-      const route = new URLSearchParams({project: task.project, task: task.id});
+      const route = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
+      route.set('project', task.project);route.set('task', task.id);route.set('view', view);
       try {
         const url = new URL(location.href);
         url.hash = route.toString();
@@ -748,23 +880,60 @@ window.RSIExperience = (() => {
       summary.className += " diff-files";
       box.append(summary);
     }
-    if (patch.split("\n").length > 2000) {
-      box.append(
-        el("p", t("差异超过 2000 行，已折叠为纯文本。"), "muted"),
-        el("pre", patch, "readable-diff"),
-      );
-      return;
+    const lines=patch.split("\n"),large=lines.length>2000;
+    const controls=el("div",undefined,"task-actions"),search=el("input"),position=el("span",undefined,"muted");
+    search.type="search";search.placeholder=t("在差异中搜索");search.setAttribute("aria-label",t("在差异中搜索"));
+    const pre=el("div",undefined,"readable-diff");
+    pre.style.maxHeight="65vh";
+    const sections=[],lineNodes=new Map();
+    const starts=lines.flatMap((line,index)=>line.startsWith("diff --git ")?[index]:[]);
+    if(!starts.length||starts[0]!==0)starts.unshift(0);
+    for(let index=0;index<starts.length;index++){
+      const start=starts[index],end=starts[index+1]??lines.length,file=files.find(file=>file.line===start+1);
+      const detail=el("details",undefined,"diff-file"),summary=el("summary",file?.path||lines[start]||t("阅读代码差异")),content=el("pre");
+      const section={start,end,detail,content,loaded:false,offsets:[]};
+      detail.open=index===0;detail.append(summary,content);pre.append(detail);sections.push(section);
+      const load=()=>{
+        if(section.loaded)return;section.loaded=true;
+        if(large){let offset=0;section.offsets=lines.slice(start,end).map(line=>{const result=offset;offset+=line.length+1;return result;});content.textContent=lines.slice(start,end).join("\n");}
+        else for(let number=start;number<end;number++){
+          const line=lines[number],row=el("div",line);row.tabIndex=-1;
+          if(line.startsWith("+"))row.className="diff-add";else if(line.startsWith("-"))row.className="diff-remove";else if(line.startsWith("@@"))row.className="diff-location";
+          lineNodes.set(number,row);content.append(row);
+        }
+      };
+      section.load=load;detail.addEventListener("toggle",()=>{if(detail.open)load();});if(detail.open)load();
     }
-    const pre = el("pre", undefined, "readable-diff");
-    for (const line of patch.split("\n")) {
-      const row = el("div", line);
-      if (line.startsWith("+")) row.className = "diff-add";
-      else if (line.startsWith("-")) row.className = "diff-remove";
-      else if (line.startsWith("@@")) row.className = "diff-location";
-      pre.append(row);
+    let selected=-1,previous=null;
+    const jump=line=>{
+      if(line<0||line>=lines.length)return;
+      previous?.classList.remove("diff-selected");selected=line;position.textContent=t("行")+" "+(line+1)+" / "+lines.length;
+      const section=sections.find(section=>line>=section.start&&line<section.end);section.detail.open=true;section.load();
+      if(large){
+        const range=document.createRange(),text=section.content.firstChild,offset=section.offsets[line-section.start];
+        if(text){range.setStart(text,offset);range.setEnd(text,Math.min(text.length,offset+Math.max(1,lines[line].length)));const bounds=range.getBoundingClientRect();pre.scrollTop+=bounds.top-pre.getBoundingClientRect().top-section.detail.querySelector('summary').getBoundingClientRect().height;}
+        section.content.tabIndex=-1;section.content.focus({preventScroll:true});
+      }else{previous=lineNodes.get(line);previous.classList.add("diff-selected");previous.scrollIntoView({block:"nearest"});previous.focus({preventScroll:true});}
+    };
+    const find=direction=>{const needle=search.value.toLocaleLowerCase();if(!needle)return;
+      for(let offset=1;offset<=lines.length;offset++){const line=(Math.max(selected,0)+direction*offset+lines.length)%lines.length;if(lines[line].toLocaleLowerCase().includes(needle)){jump(line);return;}}
+      position.textContent=t("没有匹配结果");
+    };
+    search.addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();find(event.shiftKey?-1:1);}});
+    const nextHunk=()=>{for(let offset=1;offset<=lines.length;offset++){const line=(Math.max(selected,0)+offset)%lines.length;if(lines[line].startsWith("@@")){jump(line);return;}}};
+    const wrap=el("label"),checkbox=el("input");checkbox.type="checkbox";checkbox.checked=window.matchMedia?.("(max-width: 600px)")?.matches===true;pre.classList.toggle("diff-wrap",checkbox.checked);
+    checkbox.onchange=()=>pre.classList.toggle("diff-wrap",checkbox.checked);wrap.append(checkbox,document.createTextNode(t("自动换行")));
+    controls.append(search,action(t("上一个匹配"),()=>find(-1),"text-button"),action(t("下一个匹配"),()=>find(1),"text-button"),action(t("下一个变更块"),nextHunk,"text-button"),wrap,position);
+    if(files.length){const label=el("label"),select=el("select");label.append(document.createTextNode(t("跳转到文件")),select);
+      const first=el("option",t("选择文件"));first.value="";select.append(first);
+      for(const file of files){const option=el("option",file.path);option.value=file.path;select.append(option);}
+      select.onchange=()=>{const file=files.find(file=>file.path===select.value);const line=Number.isInteger(file?.line)?file.line-1:lines.findIndex(value=>value.startsWith("diff --git ")&&value.includes(select.value));jump(line);};controls.prepend(label);
     }
-    box.append(pre);
+    controls.append(action(t("折叠全部文件"),()=>sections.forEach(section=>{section.detail.open=false;}),"text-button"),action(t("展开全部文件"),()=>sections.forEach(section=>{section.detail.open=true;section.load();}),"text-button"));
+    if(large)box.append(el("p",t("差异超过 2000 行，按文件展开纯文本，搜索会自动定位。"),"muted"));
+    box.append(controls,pre);
   }
+
   async function mobile() {
     const data = await api("mobile"),
       box = dialog("手机安装");
@@ -1089,19 +1258,25 @@ window.RSIExperience = (() => {
       if (window.RSIDesktop && event.detail?.task && event.detail?.project)
         safe(() => openTask({id:event.detail.task,project:event.detail.project}));
     });
+    window.addEventListener('rsi-history-task',event=>{
+      if(event.detail?.task&&event.detail?.project)safe(()=>openTask({id:event.detail.task,project:event.detail.project},false));
+    });
     $("attention-inbox").onclick = () => safe(inbox);
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);
     usageButton = action(t("流程质量与耗时"), metrics, "text-button");
     $("view-usage").prepend(usageButton);
-    $("detail-dialog").addEventListener("close", () => {
+    $("detail-dialog").addEventListener("close", event => {
+      if(event.rsiProgrammaticClose)return;
+      if($("detail-dialog").open)return;
       clearTimeout(liveTimer);
-      history.replaceState(null, "", location.pathname + location.search);
+      const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));route.delete('task');
+      history.replaceState(null, "", location.pathname + location.search + (route.size?'#'+route:''));
     });
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
 })();
 
 'use strict';

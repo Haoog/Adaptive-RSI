@@ -322,7 +322,7 @@ class AuditRound5Test(unittest.TestCase):
         self.assertTrue(restored["restored"])
         checked = Store(self.root / "restored")
         self.addCleanup(checked.close)
-        self.assertEqual(checked.one("SELECT count(*) AS n FROM schema_migrations")["n"], 2)
+        self.assertEqual([row["version"] for row in checked.schema_migrations()], [1, 2, 3, 4, 5, 6])
 
     def test_snapshot_and_config_revision_prevent_cross_tab_overwrite(self):
         with self.store.snapshot():

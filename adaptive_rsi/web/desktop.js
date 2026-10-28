@@ -2,14 +2,15 @@
 if(window.__TAURI_INTERNALS__){
  const invoke=(command,args={})=>window.__TAURI_INTERNALS__.invoke(command,args);
  const originalFetch=window.fetch.bind(window);
- const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.kind==='local'?'local':info.scope;return info;}).catch(error=>{console.warn(error);return null;});
+ const ready=invoke('runtime_info').then(info=>{window.__RSI_MACHINE_KEY__=info.scope||'disconnected';return info;}).catch(error=>{console.warn(error);return null;});
  window.RSIDesktop={invoke,ready};
  window.fetch=async(input,options={})=>{
   if(typeof input!=='string'||!input.startsWith('/api/'))return originalFetch(input,options);
   await ready;if(options.signal?.aborted)throw new DOMException('Aborted','AbortError');
-  const operation=invoke('request',{path:input.slice(5),body:options.body?JSON.parse(options.body):null}).then(reply=>new Response(reply.body,{status:reply.status,headers:{'Content-Type':'application/json'}}));
+  const id=crypto.randomUUID();
+  const operation=invoke('request',{path:input.slice(5),body:options.body?JSON.parse(options.body):null,requestId:id}).then(reply=>new Response(reply.body,{status:reply.status,headers:{'Content-Type':'application/json'}}));
   if(!options.signal)return operation;
-  return new Promise((resolve,reject)=>{const abort=()=>reject(new DOMException('Aborted','AbortError'));options.signal.addEventListener('abort',abort,{once:true});operation.then(resolve,reject).finally(()=>options.signal.removeEventListener('abort',abort));});
+  return new Promise((resolve,reject)=>{const abort=()=>{invoke('cancel_request',{id}).catch(()=>{});reject(new DOMException('Aborted','AbortError'));};options.signal.addEventListener('abort',abort,{once:true});if(options.signal.aborted)abort();operation.then(resolve,reject).finally(()=>options.signal.removeEventListener('abort',abort));});
  };
  document.addEventListener('DOMContentLoaded',async()=>{
   const info=await ready,tools=document.querySelector('.project-tools');

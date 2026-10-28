@@ -148,6 +148,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def respond(self, data, code=200, content_type="application/json; charset=utf-8", headers=None):
         self._response_status = code
+        error = data.get("error_code", data.get("catalog_error")) if isinstance(data, dict) else None
+        self._response_error_code = (error if isinstance(error, str) and re.fullmatch(r"[a-z0-9_]{1,100}", error)
+                                     else "http_" + str(code)) if code >= 400 else ""
         payload = json.dumps(data, ensure_ascii=False).encode() if content_type.startswith("application/json") else data
         if isinstance(payload, str):
             payload = payload.encode()
@@ -180,12 +183,17 @@ class Handler(BaseHTTPRequestHandler):
             self.respond({"error": "Request failed: " + code, key: code},
                          409 if code == "auth_credentials_busy" else 400)
         elif isinstance(exc, ValueError) and str(exc) in SAFE_VALIDATION_MESSAGES:
-            self.respond({"error": str(exc), "error_code": "validation_error"}, 400)
+            extra = {}
+            if urlparse(self.path).path in {'/api/config', '/api/model-center/routes'}:
+                from .error_details import detail
+                extra = detail(exc)
+            self.respond({"error": str(exc), "error_code": "validation_error", **extra}, 400)
         elif isinstance(exc, (ValueError, KeyError, TypeError)):
             path = urlparse(self.path).path
             if path in {"/api/config", "/api/model-center/routes"}:
+                from .error_details import detail
                 self.respond({"error": "Check configuration field names, types, model routes and timezone",
-                              "error_code": "invalid_configuration"}, 400)
+                              "error_code": "invalid_configuration", **detail(exc)}, 400)
             else:
                 self.respond({"error": "Invalid request", "error_code": "invalid_request"}, 400)
         else:
@@ -299,8 +307,12 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
-        request_id = secrets.token_hex(8)
-        self._request_id = request_id
+        self._request_id = secrets.token_hex(8)
+        with self.server.runtime.store.query_scope(request=self._request_id):
+            return self._do_GET()
+
+    def _do_GET(self):
+        request_id = self._request_id
         started = time.time()
         error_code = ""
         parsed = urlparse(self.path)
@@ -378,7 +390,8 @@ class Handler(BaseHTTPRequestHandler):
                 rows = store.query("SELECT * FROM events WHERE seq<?" +
                                    (" AND (project=? OR project IS NULL)" if project else "") +
                                    " ORDER BY seq DESC LIMIT ?", (before, project, limit + 1) if project else (before, limit + 1))
-                self.respond({"events": rows[:limit], "has_more": len(rows) > limit,
+                from .config_history import public_events
+                self.respond({"events": public_events(rows[:limit]), "has_more": len(rows) > limit,
                               "next_before": rows[limit - 1]["seq"] if len(rows) > limit else None})
             elif parsed.path == "/api/mobile":
                 self.respond({"install_url": self.server.origin + "/install", "remote": self.server.origin.startswith("https://")})
@@ -395,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(data)
             elif parsed.path == "/api/storage":
                 from .storage_tools import overview
-                self.respond(overview(store))
+                self.respond(overview(store, refresh=params.get("refresh", ["false"])[0] == "true"))
             elif parsed.path == "/api/diagnostics":
                 from .storage_tools import diagnostics
                 self.respond(diagnostics(store))
@@ -405,124 +418,211 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
                 self.backup(path, params)
+            elif parsed.path == "/api/tasks/batch":
+                project = params.get("project", [""])[0]
+                runtime.project(project)
+                request = params.get("id", [""])[0]
+                if not isinstance(request, str) or not 1 <= len(request) <= 100:
+                    raise RequestError("Batch requires a request ID")
+                self.respond({"receipt": store.setting("batch:" + project + ":" + request)})
+            elif parsed.path == "/api/tasks/batches":
+                project = params.get("project", [""])[0]
+                runtime.project(project)
+                prefix = "batch:" + project + ":"
+                found = store.query("SELECT value FROM settings WHERE key LIKE ? AND json_valid(value) "
+                                    "AND json_extract(value,'$.signature') IS NOT NULL "
+                                    "ORDER BY json_extract(value,'$.created') DESC,key DESC LIMIT 50", (prefix + "%",))
+                self.respond({"batches": [decode_object(row["value"]) for row in found], "limit": 50})
+            elif parsed.path == "/api/config-history":
+                from .config_history import page
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (ValueError, TypeError):
+                    raise RequestError("Invalid revision pagination") from None
+                self.respond(page(runtime, params.get("project", [""])[0] or None, before))
+            elif parsed.path == "/api/candidate":
+                from .experiment_report import comparison
+                candidate = store.one("SELECT id,project,status,content,evidence FROM candidates WHERE id=? AND project=?",
+                                      (params.get("id", [""])[0], params.get("project", [""])[0]))
+                if not candidate:
+                    raise RequestError("Candidate not found")
+                evidence = decode_evidence(candidate.pop("evidence"))
+                candidate.update(content=decode_object(candidate["content"]), evidence=evidence,
+                                 comparison=comparison(evidence.get("trials", [])))
+                self.respond(candidate)
+            elif parsed.path == "/api/task-groups":
+                from .task_groups import lineage
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid event pagination") from None
+                self.respond(lineage(store, params.get("id", [""])[0], params.get("project", [""])[0], before))
+            elif parsed.path == "/api/task-interventions":
+                from .task_lifecycle import intervention_history
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid event pagination") from None
+                self.respond(intervention_history(store, params.get("id", [""])[0],
+                                                   params.get("project", [""])[0], before))
+            elif parsed.path == "/api/task-revisions":
+                from .task_revisions import revision_page
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid revision pagination") from None
+                self.respond(revision_page(store, params.get("id", [""])[0], params.get("project", [""])[0], before))
+            elif parsed.path == "/api/task-revision":
+                from .task_revisions import revision_detail
+                self.respond(revision_detail(store, params.get("id", [""])[0], params.get("project", [""])[0]))
+            elif parsed.path == "/api/task-cancel-preview":
+                from .task_lifecycle import cancellation_preview
+                task_id = params.get("id", [""])[0]
+                if not store.one("SELECT 1 FROM tasks WHERE id=? AND project=?",
+                                 (task_id, params.get("project", [""])[0])):
+                    raise RequestError("Task not found")
+                with store.connect() as db:
+                    db.execute("BEGIN")
+                    preview = cancellation_preview(db, task_id)
+                self.respond(preview)
+            elif parsed.path == "/api/task-blockers":
+                from .blocking import explain
+                self.respond(explain(runtime, params.get('project', [''])[0], params.get('id', [''])[0]))
             elif parsed.path == "/api/task":
                 task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not task:
                     raise RequestError("Task not found")
-                task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id DESC LIMIT 100", (task["id"],))
+                from .task_revisions import revision_page
+                revisions = revision_page(store, task["id"], task["project"])
+                task.update(revisions=revisions["revisions"], revisions_has_more=revisions["has_more"],
+                            revisions_next_before=revisions["next_before"])
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
-                task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
+                task["dependencies"] = store.query("SELECT dependency FROM task_dependencies WHERE task=? ORDER BY dependency", (task["id"],))
+                task["dependency"] = task["dependencies"][0] if task["dependencies"] else None
+                from .task_groups import lineage
+                task["group_lineage"] = lineage(store, task["id"], task["project"])
                 self.respond(task)
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics
                 self.respond(workflow_metrics(store, params.get("project", [None])[0]))
             elif parsed.path == "/api/state":
-                legacy = "sections" not in params
-                requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
-                unknown = requested - {"core", "candidates", "analytics"}
-                if unknown:
-                    raise RequestError("Unknown state section; expected core, candidates or analytics")
-                try:
-                    global_config = runtime.config()
-                except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-                    self.respond({"error": "Global configuration is invalid",
-                                  "error_code": "invalid_global_configuration",
-                                  "raw": store.setting("config", {})}, 400)
-                    return
-                archived = {row["key"].split(":", 1)[1] for row in store.query(
-                    "SELECT key FROM settings WHERE key LIKE 'project-archived:%'")}
-                projects = [row for row in store.query("SELECT * FROM projects ORDER BY created")
-                            if row["id"] not in archived]
-                raw_project_configs = {}
-                for project in projects:
-                    project["name"] = project_display_name(project["name"], project["path"])
-                    raw_config = project["config"]
-                    raw_project_configs[project["id"]] = raw_config
-                    overrides = None
-                    try:
-                        overrides = json.loads(raw_config or "{}")
-                        if not isinstance(overrides, dict):
-                            raise ValueError("Project configuration must be a JSON object")
-                        project["overrides"] = overrides
-                        project["config"] = runtime.config(project["id"])
-                    except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
-                        project["configuration_error"] = configuration_error(exc, raw_config)
-                        project["configured_paused"] = bool(project["paused"])
-                        project["paused"] = True
-                        project["overrides"] = overrides
-                        project["raw_overrides"] = raw_config
-                        project["config"] = global_config
-                selected = params.get("project", [None])[0] or (projects[0]["id"] if projects else None)
-                if selected not in {p["id"] for p in projects}:
-                    selected = projects[0]["id"] if projects else None
                 with store.snapshot():
-                    rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
-                                   params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
-                capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
-                opening = None
-                for task in rows["tasks"]:
-                    if task.get("wait_reason") == "ready" and capacity:
-                        task["wait_reason"] = "capacity"
-                    if task.get("wait_reason") in ["ready", "running"] and selected:
-                        # 同一请求内项目相同，工作时段开头只需计算一次；
-                        # 配置异常时跳过标注，控制台仍需返回以展示修复入口。
-                        try:
-                            if opening is None:
-                                opening = runtime.next_effective_schedule(selected, time.time())
-                        except (AttributeError, ValueError, TypeError, KeyError):
-                            break
-                        if opening > time.time() + 1:
-                            task.update(wait_reason="working_hours", available=opening)
-                schedules = store.query("SELECT * FROM schedules")
-                project_by_id = {project["id"]: project for project in projects}
-                for schedule in schedules:
-                    project = project_by_id.get(schedule["project"])
-                    if project and project.get("configuration_error"):
-                        schedule["next_effective"] = None
-                        continue
+                    legacy = "sections" not in params
+                    requested = {part.strip() for value in params.get("sections", []) for part in value.split(",") if part.strip()}
+                    unknown = requested - {"core", "candidates", "analytics"}
+                    if unknown:
+                        raise RequestError("Unknown state section; expected core, candidates or analytics")
                     try:
-                        schedule["next_effective"] = runtime.next_effective_schedule(schedule["project"], schedule["due"])
-                    except (ValueError, TypeError, KeyError, AttributeError) as exc:
-                        if project:
-                            project["configuration_error"] = configuration_error(exc, raw_project_configs.get(project["id"]))
+                        global_config = runtime.config()
+                    except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+                        self.respond({"error": "Global configuration is invalid",
+                                      "error_code": "invalid_global_configuration",
+                                      "raw": (store.one("SELECT value FROM settings WHERE key='config'") or {}).get("value", "")[:10000]}, 400)
+                        return
+                    archived = {row["key"].split(":", 1)[1] for row in store.query(
+                        "SELECT key FROM settings WHERE key LIKE 'project-archived:%'")}
+                    projects = [row for row in store.query("SELECT * FROM projects ORDER BY created")
+                                if row["id"] not in archived]
+                    raw_project_configs = {}
+                    for project in projects:
+                        project["name"] = project_display_name(project["name"], project["path"])
+                        raw_config = project["config"]
+                        raw_project_configs[project["id"]] = raw_config
+                        overrides = None
+                        try:
+                            overrides = json.loads(raw_config or "{}")
+                            if not isinstance(overrides, dict):
+                                raise ValueError("Project configuration must be a JSON object")
+                            project["overrides"] = overrides
+                            project["config"] = runtime.config(project["id"])
+                        except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+                            project["configuration_error"] = configuration_error(exc, raw_config)
                             project["configured_paused"] = bool(project["paused"])
                             project["paused"] = True
-                            project["raw_overrides"] = raw_project_configs.get(project["id"])
+                            project["overrides"] = overrides
+                            project["raw_overrides"] = raw_config
                             project["config"] = global_config
-                        schedule["next_effective"] = None
-                data = {"version": __version__, "build": BUILD_ID, "selected_project": selected,
-                        "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
-                        "config_revision": store.config_revision(selected if selected else None),
-                        "global_config_revision": store.config_revision(),
-                        "update": runtime.updates.snapshot(), "schedules": schedules}
-                include_candidates = legacy or "candidates" in requested
-                include_analytics = legacy or "analytics" in requested
-                if include_candidates:
-                    candidates = store.query("SELECT * FROM candidates " + ("WHERE project=? " if selected else "") + "ORDER BY created DESC LIMIT 100", (selected,) if selected else ())
-                    for candidate in candidates:
-                        evidence = decode_evidence(candidate.pop("evidence"))
-                        candidate["content"] = decode_object(candidate["content"])
-                        candidate["evidence_error"] = evidence.get("evidence_error") or candidate["content"].get("evidence_error")
-                        candidate["content"].setdefault("guidance", "")
-                        candidate["reason"] = evidence.get("reason", "")
-                        trials = evidence.get("trials", [])
-                        # trial_count 是配对运行次数（用例 × 重复）；独立样本按用例去重，
-                        # 与文档“重复运行不作为独立样本”的晋升语义一致。
-                        candidate["trial_count"] = len(trials)
-                        # 没有 case 标识的旧证据无法证明独立性，只统计明确去重后的用例。
-                        candidate["independent_cases"] = len({trial.get("case") for trial in trials
-                                                              if trial.get("case")})
-                        candidate["monitor"] = evidence.get("monitor", {})
-                    data["candidates"] = candidates
-                if include_analytics:
-                    data.update({
-                        "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
-                        "quality": quality_summary(store, selected),
-                        "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
-                        "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
-                if not legacy:
-                    data["sections"] = ["core", *sorted(requested - {"core"})]
-                self.respond(data)
+                    selected = params.get("project", [None])[0] or (projects[0]["id"] if projects else None)
+                    if selected not in {p["id"] for p in projects}:
+                        selected = projects[0]["id"] if projects else None
+                    rows = records(store, selected, params.get("limit", [50])[0], params.get("offset", [0])[0],
+                                   params.get("filter", ["all"])[0], params.get("system", ["true"])[0] == "true")
+                    capacity = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"] >= global_config["limits"]["concurrency"]
+                    opening = None
+                    pressure = getattr(runtime, 'resource_pressure', None)
+                    pressure = pressure.projects.get(selected) if pressure else None
+                    selected_config = next((p['config'] for p in projects if p['id'] == selected), global_config)
+                    pressure_active = (pressure and time.time() - pressure['checked_at'] < 60 and not pressure['admitted'] and
+                                       pressure['min_free_disk_bytes'] == selected_config['limits']['min_free_disk_mb'] * 1048576 and
+                                       pressure['min_available_memory_bytes'] == selected_config['limits']['min_available_memory_mb'] * 1048576)
+                    for task in rows["tasks"]:
+                        if task.get('wait_reason') == 'ready' and pressure_active:
+                            task['wait_reason'] = 'resource_pressure'
+                        if task.get("wait_reason") == "ready" and capacity:
+                            task["wait_reason"] = "capacity"
+                        if task.get("wait_reason") in ["ready", "running"] and selected:
+                            # 同一请求内项目相同，工作时段开头只需计算一次；
+                            # 配置异常时跳过标注，控制台仍需返回以展示修复入口。
+                            try:
+                                if opening is None:
+                                    opening = runtime.next_effective_schedule(selected, time.time())
+                            except (AttributeError, ValueError, TypeError, KeyError):
+                                break
+                            if opening > time.time() + 1:
+                                task.update(wait_reason="working_hours", available=opening)
+                    schedules = store.query("SELECT * FROM schedules")
+                    project_by_id = {project["id"]: project for project in projects}
+                    for schedule in schedules:
+                        project = project_by_id.get(schedule["project"])
+                        if project and project.get("configuration_error"):
+                            schedule["next_effective"] = None
+                            continue
+                        try:
+                            schedule["next_effective"] = runtime.next_effective_schedule(schedule["project"], schedule["due"])
+                        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                            if project:
+                                project["configuration_error"] = configuration_error(exc, raw_project_configs.get(project["id"]))
+                                project["configured_paused"] = bool(project["paused"])
+                                project["paused"] = True
+                                project["raw_overrides"] = raw_project_configs.get(project["id"])
+                                project["config"] = global_config
+                            schedule["next_effective"] = None
+                    data = {"version": __version__, "build": BUILD_ID, "selected_project": selected,
+                            "csrf": self.server.csrf, "projects": projects, **rows, "config": global_config,
+                            "config_revision": store.config_revision(selected if selected else None),
+                            "global_config_revision": store.config_revision(),
+                            "update": runtime.updates.snapshot(), "schedules": schedules,
+                            "resource_admission": pressure}
+                    include_candidates = legacy or "candidates" in requested
+                    include_analytics = legacy or "analytics" in requested
+                    if include_candidates:
+                        candidates = store.query("SELECT * FROM candidates " + ("WHERE project=? " if selected else "") + "ORDER BY created DESC LIMIT 100", (selected,) if selected else ())
+                        for candidate in candidates:
+                            evidence = decode_evidence(candidate.pop("evidence"))
+                            candidate["content"] = decode_object(candidate["content"])
+                            candidate["evidence_error"] = evidence.get("evidence_error") or candidate["content"].get("evidence_error")
+                            candidate["content"].setdefault("guidance", "")
+                            candidate["reason"] = evidence.get("reason", "")
+                            trials = evidence.get("trials", [])
+                            # trial_count 是配对运行次数（用例 × 重复）；独立样本按用例去重，
+                            # 与文档“重复运行不作为独立样本”的晋升语义一致。
+                            candidate["trial_count"] = len(trials)
+                            # 没有 case 标识的旧证据无法证明独立性，只统计明确去重后的用例。
+                            candidate["independent_cases"] = len({trial.get("case") for trial in trials
+                                                                  if trial.get("case")})
+                            candidate["monitor"] = evidence.get("monitor", {})
+                            from .experiment_report import comparison
+                            candidate["comparison"] = comparison(trials)
+                        data["candidates"] = candidates
+                    if include_analytics:
+                        data.update({
+                            "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
+                            "quality": quality_summary(store, selected),
+                            "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
+                            "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+                    if not legacy:
+                        data["sections"] = ["core", *sorted(requested - {"core"})]
+                    self.respond(data)
             elif parsed.path == "/api/readiness":
                 from .readiness import inspect
                 self.respond(inspect(runtime, runtime.project(params.get("project", [""])[0])))
@@ -606,7 +706,8 @@ class Handler(BaseHTTPRequestHandler):
                     path = run_artifact_path(store, run, "candidate.patch")
                     if not path.is_file():
                         raise ValueError("Missing patch")
-                    payload = path.read_bytes()
+                    with path.open("rb") as stream:
+                        payload = stream.read(2 * 1024 * 1024 + 1)
                     if len(payload) > 2 * 1024 * 1024:
                         raise ValueError("Candidate patch exceeds the UI size limit; download it from the run directory")
                 except (ValueError, OSError, RuntimeError):
@@ -621,12 +722,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not path.is_file() or path.is_symlink():
                     raise RequestError("Run has no artifacts in this state directory")
                 files, current = [], None
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                from .gitops import diff_path
+                with path.open("rb") as stream:
+                    payload = stream.read(2 * 1024 * 1024 + 1)
+                if len(payload) > 2 * 1024 * 1024:
+                    raise RequestError("Run has no artifacts in this state directory")
+                for number, line in enumerate(payload.decode("utf-8", errors="replace").splitlines(), 1):
                     if line.startswith("diff --git "):
-                        current = {"path": None, "additions": 0, "deletions": 0}
+                        current = {"path": None, "line": number, "additions": 0, "deletions": 0}
                         files.append(current)
-                    if current and line.startswith("+++ b/"):
-                        current["path"] = line[6:]
+                    if current and line.startswith(("+++ ", "--- ")):
+                        path_value = line[4:]
+                        if path_value != "/dev/null":
+                            current["path"] = diff_path(path_value)
                     elif current and line.startswith("+") and not line.startswith("+++"):
                         current["additions"] += 1
                     elif current and line.startswith("-") and not line.startswith("---"):
@@ -650,15 +758,19 @@ class Handler(BaseHTTPRequestHandler):
             # Record only the route shape, never query values, bodies, headers or errors.
             if urlparse(self.path).path.startswith("/api/"):
                 try:
-                    self.server.runtime.store.execute(
-                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
-                        (request_id, "GET", urlparse(self.path).path[:300],
-                         getattr(self, "_response_status", 500), started, time.time(), error_code[:100]))
+                    self.server.runtime.store.record_request(
+                        request_id, "GET", urlparse(self.path).path[:300],
+                         getattr(self, "_response_status", 500), started, time.time(),
+                         getattr(self, "_response_error_code", error_code)[:100])
                 except Exception:
                     pass
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
+        with self.server.runtime.store.query_scope(request=self._request_id):
+            return self._do_POST()
+
+    def _do_POST(self):
         started = time.time()
         if not self.authenticated():
             return
@@ -754,6 +866,8 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.updates.require_ready()
                 if path == "/api/project/archive":
                     result = runtime.archive_project(body["project"], body.get("confirmation"))
+                elif path == "/api/project/restore":
+                    result = runtime.restore_project(body["project"], body.get("confirmation"))
                 elif path == "/api/projects":
                     # id 保持兼容旧客户端；新客户端读取 existing/name/paused 准确提示重复路径。
                     result = runtime.add_project(body["path"], body.get("name"), body.get("enabled", False), details=True)
@@ -767,8 +881,11 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"started": True}
                 elif path == "/api/config":
                     configured = runtime.configure(body["values"], body.get("project"), body.get("inherit"),
-                                                   body.get("revision"))
+                                                   body.get("revision"), source="console")
                     result = {**configured, "config": runtime.config(body.get("project"))}
+                elif path == "/api/config/undo":
+                    from .config_history import undo
+                    result = undo(runtime, body.get("project") or None, body.get("revision"), body.get("expected"))
                 elif path == "/api/config/repair":
                     result = runtime.repair_project_config(body["project"], body.get("confirmation"))
                 elif path == "/api/config/repair-global":
@@ -780,7 +897,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"), body.get("request_id"))}
                 elif path == "/api/task/revise":
-                    runtime.revise_task(body["task"], body["supplement"])
+                    runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/tasks/batch":
                     from .batching import execute
@@ -788,7 +905,7 @@ class Handler(BaseHTTPRequestHandler):
                                      body.get("request_id"), preview=body.get("preview", True) is not False,
                                      expected=body.get("revision"))
                 elif path == "/api/task/schedule":
-                    runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0))
+                    runtime.set_dependency(body["task"], body.get("dependencies", body.get("dependency")), body.get("urgency", 0), body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/backup":
                     from .storage_tools import backup
@@ -799,13 +916,12 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"])
+                    runtime.retry(body["task"], body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/cancel":
-                    runtime.cancel_task(body["task"])
-                    result = {"saved": True}
+                    result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))
                 elif path == "/api/deliver":
-                    result = {"id": runtime.deliver(body["run"])}
+                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"))}
                 elif path == "/api/rollback":
                     runtime.rollback_strategy(body["candidate"])
                     result = {"saved": True}
@@ -831,9 +947,8 @@ class Handler(BaseHTTPRequestHandler):
             if urlparse(self.path).path.startswith("/api/"):
                 try:
                     status = getattr(self, "_response_status", 500)
-                    self.server.runtime.store.execute(
-                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
-                        (self._request_id, "POST", urlparse(self.path).path[:300], status,
-                         started, time.time(), ""))
+                    self.server.runtime.store.record_request(
+                        self._request_id, "POST", urlparse(self.path).path[:300], status,
+                         started, time.time(), getattr(self, "_response_error_code", "internal_error"))
                 except Exception:
                     pass

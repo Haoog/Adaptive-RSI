@@ -1,0 +1,39 @@
+{
+  "installed_version": "0.5.124",
+  "contract_status": 200,
+  "api_version": 2,
+  "schema_sha256": "72ba5612b906aeb34575a87e429589e1074f6998aff10b14f3ad895ad7d0dfde",
+  "migrations": [
+    {
+      "version": 1,
+      "checksum": "0b74a24e0728da7eb59c9e2e8cc0ef59fecbca988ee8e4d150670250acca46ac",
+      "applied": 1793172072.126435
+    },
+    {
+      "version": 2,
+      "checksum": "0131a254bb2433fd6a8d2f4f0b7463fc34204c899946d76ba9301e047c7a975d",
+      "applied": 1793172072.1264489
+    },
+    {
+      "version": 3,
+      "checksum": "46fe8580c72a05d84a819a22f0e88ff4742f59896e6fa32ed5ba8254e4be0d88",
+      "applied": 1793172072.127329
+    },
+    {
+      "version": 4,
+      "checksum": "64bb37f637f35f056bb9fee674866fd7dd294a5846c14c8e4b94a15ed6471036",
+      "applied": 1793172072.127382
+    },
+    {
+      "version": 5,
+      "checksum": "1219b75275a1189be7d186267f16ba370e3b769526cde6a070f9d5f0985587f4",
+      "applied": 1793172072.127525
+    },
+    {
+      "version": 6,
+      "checksum": "30500aacf9eaf4b22ad64d99153803285afea0b50fe35cade2d53b16857e2344",
+      "applied": 1793172072.128135
+    }
+  ],
+  "models_called": 0
+}
