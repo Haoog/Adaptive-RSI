@@ -382,6 +382,32 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    if(['queued','blocked','deferred','waiting_budget','interrupted'].includes(metadata.state)){
+      const causes=el('details'),content=el('div'),reload=el('button',t('刷新阻塞原因'),'text-button');reload.type='button';
+      causes.append(el('summary',t('为什么还没开始')),content,reload);controls.append(causes);let loading=false;
+      async function loadCauses(){
+        if(loading||!current())return;loading=true;reload.disabled=true;
+        try{
+          const report=await api('task-blockers?project='+encodeURIComponent(task.project)+'&id='+encodeURIComponent(task.id));
+          if(!current()||!causes.isConnected)return;content.replaceChildren();
+          const labels={needs_review:'需要人工处理',backoff:'等待连接重试时间',dependency:'等待前置任务合并',awaiting_merge:'等待前置任务合并',invalid_dependency:'前置任务缺失或属于其他项目',omitted_dependency:'更多前置原因未展开',paused:'项目已暂停',running:'等待当前任务结束',capacity:'等待运行资源',working_hours:'等待工作时段',resource_pressure:'等待磁盘或内存压力解除',update_in_progress:'软件更新中',project_import:'项目导入中'};
+          const describe=reason=>t(labels[reason.code]||reason.code)+(reason.until?' · '+stamp(reason.until):'');
+          for(const reason of report.shared_reasons)content.append(el('p',describe(reason)));
+          const nodes=new Map(report.nodes.map(node=>[node.id,node]));
+          for(const node of report.nodes){
+            const reasons=node.reasons.map(describe);
+            if(reasons.length)content.append(el('p',(node.title||node.id)+' · '+reasons.join(' · ')));
+            for(const edge of report.edges.filter(edge=>edge.task===node.id)){
+              const parent=nodes.get(edge.dependency);content.append(el('p',(node.title||node.id)+' → '+(parent?.title||edge.dependency),'muted'));
+            }
+          }
+          if(!report.shared_reasons.length&&!report.nodes.some(node=>node.reasons.length))content.append(el('p',t('当前未发现阻塞原因，等待调度器领取。')));
+          if(report.truncated)content.append(el('p',t('原因链超过展示上限；尚有原因未展开，不能据此认定已全部解除。'),'form-error'));
+          content.append(el('p',t('检查时间')+' · '+stamp(report.checked_at),'muted'));
+        }finally{loading=false;reload.disabled=false;}
+      }
+      causes.addEventListener('toggle',()=>{if(causes.open)safe(loadCauses);});reload.onclick=()=>safe(loadCauses);
+    }
     controls.append(el("h3", t("下一步")));
     if (
       [

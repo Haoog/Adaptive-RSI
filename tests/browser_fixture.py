@@ -85,6 +85,11 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get('RSI_BROWSER_BLOCKERS'):
+                cause_tasks = [runtime.goal(project, title) for title in ('等待原因链任务', '原因链前置甲', '原因链前置乙')]
+                runtime.store.execute('UPDATE tasks SET available=?,priority=200 WHERE id=?', (time.time() + 600, cause_tasks[0]))
+                runtime.store.execute('INSERT INTO task_dependencies VALUES (?,?)', (cause_tasks[0], cause_tasks[1]))
+                runtime.store.execute('INSERT INTO task_dependencies VALUES (?,?)', (cause_tasks[1], cause_tasks[2]))
             if os.environ.get('RSI_BROWSER_RESOURCE_PRESSURE'):
                 from types import SimpleNamespace
                 from unittest.mock import patch

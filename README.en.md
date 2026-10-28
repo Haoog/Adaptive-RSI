@@ -160,3 +160,5 @@ Execution resources queue model calls, commands and exclusive benchmarks by prio
 Optional disk and memory low-water admission keeps new tasks queued until resources recover. Both checks default to disabled; when configured, unavailable measurements also defer admission with an explicit reason.
 
 Diff reading folds by file and loads content when expanded. Mobile defaults to wrapping; search opens the matching file, and large diffs locate matches using their actual wrapped layout.
+
+Task details can explain why work has not started, showing prerequisite chains, pause, retry time, working hours, global capacity and resource pressure together. Clearing one condition preserves the others.

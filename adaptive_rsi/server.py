@@ -480,6 +480,9 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute("BEGIN")
                     preview = cancellation_preview(db, task_id)
                 self.respond(preview)
+            elif parsed.path == "/api/task-blockers":
+                from .blocking import explain
+                self.respond(explain(runtime, params.get('project', [''])[0], params.get('id', [''])[0]))
             elif parsed.path == "/api/task":
                 task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not task:

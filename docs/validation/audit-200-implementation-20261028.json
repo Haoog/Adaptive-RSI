@@ -2793,9 +2793,18 @@
       },
       "source": "adaptive_rsi/web/app.js",
       "acceptance": "多个同时阻塞的样例中，解除一个原因后其余原因仍准确保留。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/blocking.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_blocking_causes tests.test_dependency_dag tests.test_store tests.test_experience tests.test_server_hardening",
+        "node tests/browser_blocking_causes.cjs",
+        "node --test tests/web_*.cjs"
+      ],
+      "residual": "Bounded read-only cause graph retains simultaneous prerequisites/backoff/shared blockers. Cross-project titles and global-capacity run identifiers are not exposed. Truncated graphs explicitly retain unknown remainder; update lease/journal recovery is not triggered by explanation GET."
     },
     {
       "id": 185,

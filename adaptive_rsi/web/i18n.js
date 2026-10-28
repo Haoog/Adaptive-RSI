@@ -1,6 +1,17 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "需要人工处理": "Needs manual attention",
+ "软件更新中": "Software update in progress",
+ "检查时间": "Checked at",
+ "刷新阻塞原因": "Refresh blocking causes",
+ "为什么还没开始": "Why has this not started?",
+ "前置任务缺失或属于其他项目": "A prerequisite is missing or belongs to another project",
+ "更多前置原因未展开": "Further prerequisite causes are not expanded",
+ "项目导入中": "Project import in progress",
+ "当前未发现阻塞原因，等待调度器领取。": "No current blocking cause was found; waiting for the scheduler to claim this task.",
+ "原因链超过展示上限；尚有原因未展开，不能据此认定已全部解除。": "The cause chain exceeds the display limit. Some causes remain unexpanded; this does not prove all blockers are cleared.",
+
  "折叠全部文件": "Collapse all files",
  "展开全部文件": "Expand all files",
  "差异超过 2000 行，按文件展开纯文本，搜索会自动定位。": "The diff exceeds 2000 lines. Expand files to read plain text; search opens and locates matches automatically.",
