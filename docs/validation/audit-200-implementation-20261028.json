@@ -582,12 +582,17 @@
       },
       "source": "adaptive_rsi/web/batch.js",
       "acceptance": "保存待确认请求 ID；断连重试先查询同一回执，再决定是否新建操作。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/web/batch.js"
+        "adaptive_rsi/web/batch.js",
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py"
       ],
-      "validation": [],
-      "residual": "Unknown batch IDs persist; interruption browser regression remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 38,
@@ -597,12 +602,17 @@
       },
       "source": "adaptive_rsi/web/batch.js",
       "acceptance": "双击及慢网络测试；同一选择只保留一个待确认或执行中的操作。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/web/batch.js"
+        "adaptive_rsi/web/batch.js",
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py"
       ],
-      "validation": [],
-      "residual": "Pending admission implemented; double-click browser regression remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 39,
@@ -612,12 +622,17 @@
       },
       "source": "adaptive_rsi/batching.py",
       "acceptance": "在动作执行后、回执保存前中断；逐项核对并给出安全的后续操作。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/batching.py"
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
       ],
-      "validation": [],
-      "residual": "Conservative reconciliation implemented; precise crash-window proof remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 40,
@@ -627,12 +642,17 @@
       },
       "source": "adaptive_rsi/batching.py",
       "acceptance": "建立父子目录、重命名及平台路径样本；保守展示真实交叉范围。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/batching.py"
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
       ],
-      "validation": [],
-      "residual": "Normalized parent and rename overlap implemented; platform matrix remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 41,
@@ -642,9 +662,17 @@
       },
       "source": "adaptive_rsi/batching.py",
       "acceptance": "走完合并、失败、取消流程；每个原任务均能追踪实际成果及完成口径。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 42,
@@ -1292,12 +1320,17 @@
       },
       "source": "adaptive_rsi/batching.py",
       "acceptance": "应用重启后仍能找到同一批次，导出内容与持久化回执一致。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/batching.py"
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
       ],
-      "validation": [],
-      "residual": "Receipt search/reopen/export implemented; browser regression remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 88,
@@ -1307,9 +1340,17 @@
       },
       "source": "adaptive_rsi/batching.py",
       "acceptance": "部分成功不会被当作整组通过；重新拆分保留需求来源并重新验证。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/batching.py",
+        "adaptive_rsi/task_groups.py",
+        "adaptive_rsi/web/batch.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_groups",
+        "node tests/browser_group_retry.cjs",
+        "node tests/browser_batch.cjs"
+      ]
     },
     {
       "id": 89,
@@ -2840,6 +2881,7 @@
     "cd6e614",
     "de75578",
     "022d5ce",
-    "5a70142"
+    "5a70142",
+    "2354f4a"
   ]
 }

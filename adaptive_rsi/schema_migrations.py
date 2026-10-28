@@ -5,7 +5,8 @@ import sqlite3
 import time
 
 
-SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"))
+SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
+           (5, "005_task_group_lineage.sql"))
 
 
 def scripts():

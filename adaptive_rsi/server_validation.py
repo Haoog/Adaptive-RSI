@@ -32,6 +32,11 @@ Cancellation preview changed; review it again
 Intervention reason must be at most 2000 characters
 Task revision not found
 Invalid revision pagination
+Only a stopped failed or cancelled group can be split for retry
+Select one failed group to split for retry
+Wait for the grouped run to stop before splitting
+Grouped requirements changed; reconcile revisions before splitting
+Split retry preview changed; inspect it again
 Configuration changed in another window; reload before saving
 Invalid command timeout: command_seconds must be 60..86400
 provider_retry_minutes must be 0..1440

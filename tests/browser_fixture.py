@@ -85,6 +85,14 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get("RSI_BROWSER_FAILED_GROUP"):
+                from adaptive_rsi.batching import execute as batch_execute
+                originals = [runtime.goal(project, title) for title in ("拆分来源一", "拆分来源二")]
+                grouped = batch_execute(runtime, project, originals, "group", "browser-failed-group", preview=False)["id"]
+                runtime.revise_task(grouped, "分组后新增的共同要求")
+                runtime.store.execute("UPDATE tasks SET state='failed',priority=200 WHERE id=?", (grouped,))
+                runtime.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) VALUES ('browser-group-run',?,?,'failed',1,2,?)",
+                                      (grouped, project, json.dumps({"summary": "整组失败证据"})))
             if os.environ.get("RSI_BROWSER_PROJECT_IDENTITY"):
                 # 同名但不同路径的两个项目，以及一个尚未接入的新仓库，供项目标识回归使用。
                 runtime.add_project(fixture(root / "identity-a"), "同名仓库")

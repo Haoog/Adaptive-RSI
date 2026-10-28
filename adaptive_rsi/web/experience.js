@@ -663,6 +663,36 @@ window.RSIExperience = (() => {
       revisions.append(moreRevisions);
       controls.append(revisions);
     }
+    const lineage = metadata.group_lineage;
+    if (lineage?.groups?.length || lineage?.members?.length) {
+      const section = el("details");section.append(el("summary", t("任务组关联与成果")),
+        el("p", t("分组整体状态不代表每条原始要求均有独立验收证据。")));
+      const related = (item) => {
+        const card = el("div");card.append(el("p", item.title + " · " + t(statusNames[item.state] || item.state)));
+        if (item.latest_run?.summary) card.append(el("p", item.latest_run.summary));
+        const button = el("button", t("查看关联任务"), "text-button");button.type = "button";
+        button.onclick = () => safe(async () => {const target = await api("task?id=" + encodeURIComponent(item.id) + "&project=" + encodeURIComponent(task.project));if (current()) await showTask(target);});
+        card.append(button);return card;
+      };
+      const groupRows = el("div");section.append(groupRows);
+      for (const group of lineage.groups || []) groupRows.append(related(group));
+      let groupBefore = lineage.next_before, groupsLoading = false;
+      const moreGroups = el("button", t("加载更多"), "text-button");moreGroups.type = "button";
+      moreGroups.hidden = !lineage.groups_truncated;
+      moreGroups.onclick = () => safe(async () => {
+        if (groupsLoading || !groupBefore || !current()) return;
+        groupsLoading = true;moreGroups.disabled = true;
+        try {
+          const data = await api("task-groups?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + "&before=" + groupBefore);
+          if (!current()) return;
+          for (const group of data.groups) groupRows.append(related(group));
+          groupBefore = data.next_before;moreGroups.hidden = !data.groups_truncated;
+        } finally {groupsLoading = false;moreGroups.disabled = false;}
+      });section.append(moreGroups);
+      if (lineage.members?.length) section.append(el("h4", t("来源任务")));
+      for (const member of lineage.members || []) section.append(related(member));
+      controls.append(section);
+    }
     const interventions = el("details"), entries = [], historyRows = el("div"),
       more = el("button", t("加载更多"), "text-button"), download = el("button", t("导出已加载的干预记录"), "text-button");
     interventions.append(el("summary", t("人工干预记录")), historyRows, more, download);

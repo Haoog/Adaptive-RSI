@@ -55,7 +55,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
     if (not isinstance(tasks, list) or not 1 <= len(tasks) <= 100 or
             any(not isinstance(task, str) for task in tasks) or len(set(tasks)) != len(tasks)):
         raise ValueError("Batch requires 1..100 unique task IDs")
-    if action not in ("retry", "cancel", "approve", "group", "ungroup"):
+    if action not in ("retry", "cancel", "approve", "group", "ungroup", "split_retry"):
         raise ValueError("Unknown batch action")
     runtime.require_active_project(project)
     with runtime.dispatch_lock:
@@ -85,6 +85,19 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
         report = {"action": action, "tasks": [{"id": row["id"], "state": row["state"], "title": row["title"]} for row in rows],
                   "conflicts": conflicts, "unknown_scope": [task for task in tasks if not scopes[task]],
                   "signature": signature}
+        if action == "group":
+            report["revision"] = fingerprint(rows)
+        if action == "split_retry":
+            from .task_groups import split_preview
+            if len(rows) != 1:
+                raise ValueError("Select one failed group to split for retry")
+            if not preview and isinstance(request, str) and 1 <= len(request) <= 100:
+                saved = runtime.store.setting("batch:" + project + ":" + request)
+                if saved:
+                    if saved.get("signature") != signature:
+                        raise ValueError("Batch request ID reused with different tasks")
+                    return saved
+            report.update(split_preview(runtime.store, rows[0], project))
         if action == "approve":
             candidates = []
             for row in rows:
@@ -113,19 +126,60 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
         if prior:
             if prior["signature"] != signature:
                 raise ValueError("Batch request ID reused with different tasks")
-            if action in ("group", "ungroup") or prior.get("complete"):
+            if action in ("group", "ungroup", "split_retry") or prior.get("complete"):
                 return prior
             report = prior
         elif action == "approve" and expected != report["revision"]:
             raise ValueError("Batch approval preview changed; inspect it again")
-        if action == "ungroup":
+        elif action == "split_retry" and expected != report["revision"]:
+            raise ValueError("Split retry preview changed; inspect it again")
+        elif action == "group" and expected is not None and expected != report["revision"]:
+            raise ValueError("Batch task changed during grouping")
+        if action == "split_retry":
+            from .task_groups import split_preview
+            with runtime.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT * FROM tasks WHERE id=? AND project=?", (rows[0]["id"], project)).fetchone()
+                if current is None:
+                    raise ValueError("Batch task not found in project")
+                current = dict(current)
+                verified = split_preview(runtime.store, current, project, db=db)
+                if verified["revision"] != expected:
+                    raise ValueError("Split retry preview changed; inspect it again")
+                now = time.time()
+                db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (now, current["id"]))
+                for original in verified["originals"]:
+                    db.execute("UPDATE tasks SET state='queued',attempts=0,infra_retries=0,budget_waits=0,updated=? "
+                               "WHERE id=? AND project=? AND state='superseded'", (now, original["id"], project))
+                db.execute("UPDATE task_group_members SET restored=? WHERE group_task=?", (now, current["id"]))
+                report.update(complete=True, receipts=[{"id": row["id"], "state": "restored", "from_group": current["id"],
+                              "fresh_verification_required": True} for row in verified["originals"]])
+                if verified["supplement_required"]:
+                    # Shared revisions have no reliable per-original attribution. Keep the complete
+                    # revised specification as a separate task rather than guessing or discarding it.
+                    supplement = uid()
+                    db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,overrides,created,updated,available,urgency) "
+                               "VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)",
+                               (supplement, project, "goal", "group-revision:" + current["id"], current["title"],
+                                current["body"], encode([{"revised_group": current["id"], "scope": "complete_revised_specification"}]),
+                                current["acceptance"], current["priority"], current["overrides"], now, now,
+                                verified["supplement_available"], current["urgency"]))
+                    db.execute("INSERT INTO task_group_members(group_task,original_task,restored) VALUES (?,?,?)",
+                               (current["id"], supplement, now))
+                    report["receipts"].append({"id": supplement, "state": "restored", "from_group": current["id"],
+                                               "revised_specification": True, "fresh_verification_required": True})
+                db.execute("INSERT INTO events(project,kind,message,data,created) VALUES "
+                           "(?,'group_split_retry','Failed group split for fresh independent verification',?,?)",
+                           (project, encode(report), now))
+                db.execute("INSERT INTO settings VALUES (?,?)", (key, encode(report)))
+        elif action == "ungroup":
             if len(rows) != 1 or rows[0]["state"] != "queued":
                 raise ValueError("Only one queued grouped task can be restored")
             try:
                 evidence = json.loads(rows[0]["evidence"] or "[]")
                 originals = evidence[0]["batch_tasks"]
                 if (not rows[0]["fingerprint"].startswith("batch:") or not isinstance(originals, list) or
-                        not originals or any(not isinstance(item, str) for item in originals) or
+                        not 1 <= len(originals) <= 100 or any(not isinstance(item, str) for item in originals) or
                         len(set(originals)) != len(originals)):
                     raise ValueError("Invalid batch evidence")
             except (ValueError, TypeError, KeyError, IndexError) as exc:
@@ -133,6 +187,14 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
             now = time.time()
             with runtime.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                from .task_groups import grouped_body
+                grouped = db.execute("SELECT * FROM tasks WHERE id=?", (rows[0]["id"],)).fetchone()
+                source_rows = [db.execute("SELECT * FROM tasks WHERE id=? AND project=?", (task, project)).fetchone() for task in originals]
+                if not grouped or any(row is None for row in source_rows) or grouped["body"] != grouped_body(source_rows):
+                    raise ValueError("Grouped requirements changed; reconcile revisions before splitting")
+                members = db.execute("SELECT original_task,restored FROM task_group_members WHERE group_task=?", (grouped["id"],)).fetchall()
+                if ({row["original_task"] for row in members} != set(originals) or any(row["restored"] is not None for row in members)):
+                    raise ValueError("Original task changed during restore")
                 if db.execute("SELECT 1 FROM runs WHERE task=?", (rows[0]["id"],)).fetchone():
                     raise ValueError("Grouped task has already started")
                 if db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=? AND state='queued'",
@@ -142,6 +204,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                     if db.execute("UPDATE tasks SET state='queued',updated=? WHERE id=? AND project=? AND state='superseded'",
                                   (now, original, project)).rowcount != 1:
                         raise ValueError("Original task changed during restore")
+                db.execute("UPDATE task_group_members SET restored=? WHERE group_task=?", (now, rows[0]["id"]))
                 report.update(complete=True, receipts=[{"id": task, "state": "restored"} for task in originals])
                 db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,'tasks_ungrouped','Grouped tasks restored',?,?)",
                            (project, encode(report), now))
@@ -161,14 +224,20 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                 acceptance.extend(criteria)
             if any(runtime.store.one("SELECT 1 FROM task_dependencies WHERE task=? OR dependency=?", (task, task)) for task in tasks):
                 raise ValueError("Resolve explicit dependencies before grouping")
-            body = "\n\n".join("[" + row["id"] + "] " + row["title"] + "\n" + (row["body"] or "") +
-                                  "\nAcceptance: " + (row["acceptance"] or "[]") for row in rows)
+            from .task_groups import grouped_body
+            body = grouped_body(rows)
             if len(body) > 30000:
                 raise ValueError("Grouped requirements exceed 30000 characters")
             group = uid()
             now = time.time()
             with runtime.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
+                current = [db.execute("SELECT * FROM tasks WHERE id=? AND project=?", (row["id"], project)).fetchone() for row in rows]
+                if any(row is None for row in current):
+                    raise ValueError("Batch task not found in project")
+                current = [dict(row) for row in current]
+                if fingerprint(current) != fingerprint(rows):
+                    raise ValueError("Batch task changed during grouping")
                 db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,overrides,created,updated,available,urgency) "
                            "VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)",
                            (group, project, "goal", "batch:" + request, rows[0]["title"], body,
@@ -183,6 +252,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                     changed = db.execute("UPDATE tasks SET state='superseded',updated=? WHERE id=? AND state='queued'", (now, row["id"]))
                     if changed.rowcount != 1:
                         raise ValueError("Batch task changed during grouping")
+                    db.execute("INSERT INTO task_group_members(group_task,original_task) VALUES (?,?)", (group, row["id"]))
                 report.update(id=group, complete=True, receipts=[{"id": task, "state": "grouped", "group": group} for task in tasks])
                 db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,'tasks_grouped','Tasks combined for shared verification',?,?)",
                            (project, encode(report), now))

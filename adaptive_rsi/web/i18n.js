@@ -1,6 +1,19 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。": "The grouped requirements changed. Reconcile the added requirements before splitting.",
+ "任务组仍有运行，请先停止并等待运行结束，再拆分重做。": "A grouped run is still active. Stop it and wait for completion before splitting.",
+ "任务组或原任务已变化，请重新查看拆分预览。": "The group or original tasks changed. Review the split preview again.",
+ "请选择一个已停止的失败或已取消任务组。": "Select a stopped failed or cancelled group.",
+ "每次请选择一个失败任务组来拆分重做。": "Select one failed group at a time to split and retry.",
+ "拆分失败任务组并重做": "Split failed group and retry",
+ "原任务将恢复到队列，各自重新验证；任务组的失败证据继续保留。": "Original tasks return to the queue for fresh individual verification. The grouped failure evidence is retained.",
+ "已被替代": "Superseded",
+ "分组后修订的完整要求将另建任务重新验证，避免丢失或猜测归属。": "The complete revised specification will become a separate task for fresh verification, preserving changes without guessing their attribution.",
+ "任务组关联与成果": "Group lineage and outcomes",
+ "分组整体状态不代表每条原始要求均有独立验收证据。": "A group's overall state does not establish independent acceptance evidence for every original requirement.",
+ "查看关联任务": "Open related task",
+ "来源任务": "Original tasks",
  "加载更多": "Load more",
  "后继过多，预览仅展示前 999 项；本次只能取消当前任务。": "The preview shows only the first 999 downstream tasks. Only the current task can be cancelled in this operation.",
  "加载更多修订": "Load more revisions",

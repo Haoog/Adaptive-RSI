@@ -89,11 +89,11 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 34. **pending** — Native update recovery needs startup-failure evidence
 35. **partial** — Staged packages bypass subsequent feed checks
 36. **implemented** — Update policy writes fail silently
-37. **partial** — Batch retries generate new idempotency keys
-38. **partial** — Batch actions can re-enter while pending
-39. **partial** — Unknown batch receipts need reconciliation
-40. **partial** — Conflict previews compare exact strings only
-41. **pending** — Grouped originals need outcome semantics
+37. **implemented** — Batch retries generate new idempotency keys
+38. **implemented** — Batch actions can re-enter while pending
+39. **implemented** — Unknown batch receipts need reconciliation
+40. **implemented** — Conflict previews compare exact strings only
+41. **implemented** — Grouped originals need outcome semantics
 42. **implemented** — Deployment intent and ownership commit separately
 43. **implemented** — Health deadlines may overrun on blocking reads
 44. **partial** — Existing closed PRs need explicit handling
@@ -139,8 +139,8 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 84. **pending** — Size task groups by verification cost
 85. **pending** — Preview grouping benefits and rework costs
 86. **pending** — Recommend task groups without automatic mutation
-87. **partial** — Make batch receipts searchable and exportable
-88. **pending** — Support splitting failed task groups
+87. **implemented** — Make batch receipts searchable and exportable
+88. **implemented** — Support splitting failed task groups
 89. **pending** — Estimate queue time from actual execution
 90. **partial** — Evaluate rolling resource-based fairness
 91. **pending** — Implement resource priority and wait accounting
@@ -189,9 +189,9 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 134. **implemented** — Preserve provider stop reasons end to end
 135. **pending** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
-137. **pending** — Price input, output and cache usage separately
-138. **pending** — Explain currency and estimation limits
-139. **pending** — Compare estimated and actual task cost
+137. **implemented** — Price input, output and cache usage separately
+138. **implemented** — Explain currency and estimation limits
+139. **implemented** — Compare estimated and actual task cost
 140. **implemented** — Invalidate stale evidence after credential rotation
 141. **implemented** — Stratify evaluation sampling
 142. **partial** — Hash complete experiment inputs
@@ -239,8 +239,8 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 184. **pending** — Explain chains of blocking causes
 185. **implemented** — Keep both sides of settings conflicts
 186. **partial** — Preserve meaningful browser navigation history
-187. **pending** — Optionally synchronize saved views
-188. **pending** — Preserve focus and limit live announcements
+187. **implemented** — Optionally synchronize saved views
+188. **implemented** — Preserve focus and limit live announcements
 189. **pending** — Improve narrow-screen diff reading
 190. **pending** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
@@ -254,3 +254,8 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 199. **partial** — Generate a dependency-complete SBOM
 200. **pending** — Link audit completion to verifiable evidence
 201. **partial** — Layered validation, slow-test diagnosis, parallel release verification and release queue coordination
+
+
+## Group lineage and failed group retry
+
+Items 37–41/87/88 now have targeted evidence. Failed/cancelled groups restore originals for fresh verification; revised specifications become separate tasks without losing supplements. Whole-group outcomes retain explicit scope, and lineage uses stable pagination. Repeated old-group restores cannot reclaim members of newer groups. User reservations remain in effect. An exact-ID receipt lookup reconciles lost responses before repeat writes. Seventeen Python tests cover transaction/crash windows, reopen, provenance, scheduling and normalized path overlaps; real Chromium covers double clicks, response loss, reload, search and JSON export. The basic grouping browser regression and 338 JavaScript tests pass. Full final-commit CI remains outstanding.

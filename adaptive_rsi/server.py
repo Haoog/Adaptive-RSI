@@ -408,6 +408,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
                 self.backup(path, params)
+            elif parsed.path == "/api/tasks/batch":
+                project = params.get("project", [""])[0]
+                runtime.project(project)
+                request = params.get("id", [""])[0]
+                if not isinstance(request, str) or not 1 <= len(request) <= 100:
+                    raise RequestError("Batch requires a request ID")
+                self.respond({"receipt": store.setting("batch:" + project + ":" + request)})
             elif parsed.path == "/api/tasks/batches":
                 project = params.get("project", [""])[0]
                 runtime.project(project)
@@ -416,6 +423,13 @@ class Handler(BaseHTTPRequestHandler):
                                     "AND json_extract(value,'$.signature') IS NOT NULL "
                                     "ORDER BY json_extract(value,'$.created') DESC,key DESC LIMIT 50", (prefix + "%",))
                 self.respond({"batches": [decode_object(row["value"]) for row in found], "limit": 50})
+            elif parsed.path == "/api/task-groups":
+                from .task_groups import lineage
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid event pagination") from None
+                self.respond(lineage(store, params.get("id", [""])[0], params.get("project", [""])[0], before))
             elif parsed.path == "/api/task-interventions":
                 from .task_lifecycle import intervention_history
                 try:
@@ -454,6 +468,8 @@ class Handler(BaseHTTPRequestHandler):
                             revisions_next_before=revisions["next_before"])
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
                 task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
+                from .task_groups import lineage
+                task["group_lineage"] = lineage(store, task["id"], task["project"])
                 self.respond(task)
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics

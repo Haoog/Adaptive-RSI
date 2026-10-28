@@ -138,3 +138,5 @@ Routine tests substitute the model interface and do not spend model sessions. Se
 ## License
 
 This project is available under the [MIT License](LICENSE).
+
+Failed or cancelled groups can be split after a preview: originals return to the queue for fresh independent verification while previous group evidence remains. A complete revised group specification becomes a separate task, preserving changes without guessing their attribution. Task details paginate group lineage and outcomes; a whole-group pass is not individual criterion evidence.

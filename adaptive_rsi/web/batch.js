@@ -2,7 +2,7 @@
 window.RSIBatch=(()=>{
  const selected=new Map(),pending=new Set();
  let historyBox=null;
- const actionLabels={group:'合并任务',ungroup:'拆分任务',retry:'重试',cancel:'取消任务',approve:'批准交付'};
+ const actionLabels={group:'合并任务',ungroup:'拆分任务',split_retry:'拆分失败任务组并重做',retry:'重试',cancel:'取消任务',approve:'批准交付'};
  const stateLabels={accepted:'已受理',unknown:'结果待核对',executing:'正在处理',grouped:'已合并',restored:'已恢复',failed:'操作失败',skipped:'已跳过'};
  async function history(){
   if(historyBox?.open)return;
@@ -36,7 +36,7 @@ window.RSIBatch=(()=>{
   let panel=document.getElementById('batch-actions');
   if(!panel){panel=el('div',undefined,'task-actions');panel.id='batch-actions';host.after(panel);}
   panel.replaceChildren(el('span',t('已选择任务')+' · '+ids().size,'muted'));
-  for(const [kind,label] of [['group','合并任务'],['ungroup','拆分未开始的任务'],['retry','批量重试'],['cancel','批量取消'],['approve','批量批准交付']]){
+  for(const [kind,label] of [['group','合并任务'],['ungroup','拆分未开始的任务'],['split_retry','拆分失败任务组并重做'],['retry','批量重试'],['cancel','批量取消'],['approve','批量批准交付']]){
    const button=el('button',t(label),'text-button');button.type='button';button.disabled=!ids().size||pending.has(projectId);
    button.addEventListener('click',()=>safe(()=>perform(kind)));panel.append(button);
   }
@@ -52,7 +52,11 @@ window.RSIBatch=(()=>{
   const project=projectId,tasks=Array.from(ids()).sort();if(!project||!tasks.length||pending.has(project))return;
   pending.add(project);toolbar();
   try{
-  const preview=await api('tasks/batch',{project,tasks,action:kind,preview:true});
+  const signature=JSON.stringify([kind,tasks]),saved=window.RSIDraftStore?.get('batch',project);
+  let prior=null;
+  if(saved?.signature===signature)prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;
+  if(prior?.complete){window.RSIDraftStore?.remove('batch',project);selected.get(project)?.clear();toolbar();toast(t('批量操作已完成'));await refresh({force:true});return;}
+  const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true});
   const description=preview.tasks.map(item=>{
    const candidate=preview.candidates?.find(value=>value.task===item.id);
    const detail=candidate?'\n  '+t('风险')+': '+t(reviewNames[candidate.risk]||candidate.risk||'未知')+
@@ -61,9 +65,8 @@ window.RSIBatch=(()=>{
   }).join('\n');
   const conflict=preview.conflicts.length?t('存在重叠文件，请复核。')+'\n':'';
   const unknown=preview.unknown_scope.length?t('部分任务的文件范围未知，请先核对需求。')+'\n':'';
-  const grouping=kind==='group'?t('原任务将合并为一个新任务并保留原始要求。')+'\n':'';
+  const grouping=kind==='group'?t('原任务将合并为一个新任务并保留原始要求。')+'\n':kind==='split_retry'?t('原任务将恢复到队列，各自重新验证；任务组的失败证据继续保留。')+'\n'+preview.originals.map(item=>item.title).join('\n')+'\n'+(preview.supplement_required?t('分组后修订的完整要求将另建任务重新验证，避免丢失或猜测归属。')+'\n':''):'';
   if(!(await uiConfirm(t('确认对所选任务执行此操作？')+'\n'+grouping+conflict+unknown+description)))return;
-  const signature=JSON.stringify([kind,tasks]),saved=window.RSIDraftStore?.get('batch',project);
   const request_id=saved?.signature===signature?saved.id:crypto.randomUUID();
   window.RSIDraftStore?.set('batch',project,{signature,id:request_id,tasks,action:kind});
   const result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});

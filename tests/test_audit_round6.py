@@ -1155,10 +1155,11 @@ class AuditMigrationHistoryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(directory)
             store.close()
-            additions = scripts() + [(5, b'CREATE TABLE should_rollback(id TEXT);\nINVALID SQL;\n')]
+            next_version = max(version for version, _ in scripts()) + 1
+            additions = scripts() + [(next_version, b'CREATE TABLE should_rollback(id TEXT);\nINVALID SQL;\n')]
             with patch('adaptive_rsi.schema_migrations.scripts', return_value=additions):
                 with self.assertRaises(sqlite3.OperationalError):
                     Store(directory)
             with sqlite3.connect(str(Path(directory) / 'state.sqlite3')) as db:
                 self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='should_rollback'").fetchone())
-                self.assertIsNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=5').fetchone())
+                self.assertIsNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=?', (next_version,)).fetchone())
