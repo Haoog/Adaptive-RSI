@@ -1107,3 +1107,58 @@ class AuditOperationPersistenceTest(unittest.TestCase):
             rewriting.assert_not_called()
         self.runtime.operations.recover()
         self.assertEqual(self.runtime.operations.get(operation)['result'], {'artifact': 'existing'})
+
+
+class AuditMigrationHistoryTest(unittest.TestCase):
+    def test_request_history_has_one_time_index_and_query_uses_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                indexes = store.query('PRAGMA index_list(request_log)')
+                starts = [row['name'] for row in indexes if row['name'] == 'request_log_started']
+                self.assertEqual(starts, ['request_log_started'])
+                self.assertNotIn('request_log_created', {row['name'] for row in indexes})
+                plan = store.query('EXPLAIN QUERY PLAN SELECT id FROM request_log ORDER BY started DESC LIMIT 10')
+                self.assertIn('request_log_started', ' '.join(row['detail'] for row in plan))
+            finally:
+                store.close()
+
+    def test_sql_bytes_are_hashed_and_bootstrap_does_not_repeat(self):
+        import hashlib
+        from adaptive_rsi.schema_migrations import scripts
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            record = next(row for row in store.schema_migrations() if row['version'] == 3)
+            self.assertEqual(record['checksum'], hashlib.sha256(scripts()[0][1]).hexdigest())
+            self.assertEqual(store.one('PRAGMA user_version')['user_version'], 2)
+            store.close()
+            with patch.object(Store, '_bootstrap', side_effect=AssertionError('bootstrap repeated')):
+                for _ in range(2):
+                    reopened = Store(directory)
+                    reopened.close()
+
+    def test_changed_migration_content_fails_before_ddl(self):
+        from adaptive_rsi.schema_migrations import scripts
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            store.execute('CREATE INDEX sentinel_index ON events(created)')
+            store.close()
+            changed = [(version, content + b'\nDROP INDEX sentinel_index;\n') for version, content in scripts()]
+            with patch('adaptive_rsi.schema_migrations.scripts', return_value=changed):
+                with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                    Store(directory)
+            with sqlite3.connect(str(Path(directory) / 'state.sqlite3')) as db:
+                self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='sentinel_index'").fetchone())
+
+    def test_failed_new_migration_rolls_back_ddl_and_history_together(self):
+        from adaptive_rsi.schema_migrations import scripts
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            store.close()
+            additions = scripts() + [(4, b'CREATE TABLE should_rollback(id TEXT);\nINVALID SQL;\n')]
+            with patch('adaptive_rsi.schema_migrations.scripts', return_value=additions):
+                with self.assertRaises(sqlite3.OperationalError):
+                    Store(directory)
+            with sqlite3.connect(str(Path(directory) / 'state.sqlite3')) as db:
+                self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='should_rollback'").fetchone())
+                self.assertIsNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=4').fetchone())

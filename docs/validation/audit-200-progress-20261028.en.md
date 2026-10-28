@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 58 implemented with targeted acceptance, 37 partial, and 106 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 59 implemented with targeted acceptance, 38 partial, and 104 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -43,6 +43,8 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 
 Background receipt review fixed successful business results being replaced by failures after transient dual-write faults, and unnecessary file rewrites during receipt replay. Business execution occurs once; persistence retries retain the original result. Five fault regressions passed. See the [timing record](validation-timing-20261028.json) for observed group loads and the next grouping estimate; predictions are not measured CI speedup.
 
+Migration review: legacy `[1,2]` history upgrades to `[1,2,3]` while compatibility format stays v2; both old and new implementations reopened it successfully. SQL bytes are checked and failed DDL/history roll back together; legacy identifier hashes and transaction-external bootstrap DDL remain limits. Related checks passed (54 tests); a built wheel installed in isolation included migration resources and initialized a new database successfully.
+
 ## Original Items and Current Status
 
 1. **implemented** — Free diagnostics calls a missing method
@@ -69,8 +71,8 @@ Background receipt review fixed successful business results being replaced by fa
 22. **implemented** — Backup symlink rejection checks the resolved target
 23. **implemented** — POST logs discard error codes
 24. **implemented** — JUnit summaries miss normal XML reports
-25. **pending** — Migration checksums ignore migration contents
-26. **partial** — Request logs maintain duplicate indexes
+25. **partial** — Migration checksums ignore migration contents
+26. **implemented** — Request logs maintain duplicate indexes
 27. **implemented** — State snapshots cover only part of the response
 28. **implemented** — Background failure receipts may also fail
 29. **implemented** — Re-adding archived paths may remain invisible
@@ -154,7 +156,7 @@ Background receipt review fixed successful business results being replaced by fa
 107. **pending** — Set large-history performance budgets
 108. **pending** — Expand relational constraint coverage
 109. **partial** — Extend relationship auditing beyond stages
-110. **pending** — Execute migrations once per version
+110. **partial** — Execute migrations once per version
 111. **implemented** — Add a read-only database recovery mode
 112. **pending** — Explain configuration changes and safe undo
 113. **pending** — Type and version settings namespaces

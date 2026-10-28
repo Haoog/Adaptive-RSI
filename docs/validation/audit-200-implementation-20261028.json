@@ -395,9 +395,16 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "hash 不可变迁移正文并记录版本；迁移内容变化必须被检测。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/schema_migrations.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest tests.test_audit_round5 tests.test_store"
+      ],
+      "residual": "SQL migration bytes and ordered history are checked before mutation; sealed bootstrap is not repeated; additive SQL and ledger roll back together. Legacy 1/2 hashes and transaction-external bootstrap DDL remain historical boundaries. Compatibility format stays v2. Installed wheel resource/startup verified."
     },
     {
       "id": 26,
@@ -407,12 +414,15 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "通过 query plan 核对后保留一份；现有查询仍走索引，写放大下降。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/store.py"
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
       ],
-      "validation": [],
-      "residual": "Duplicate index dropped; comparative write benchmark remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest.test_request_history_has_one_time_index_and_query_uses_it"
+      ],
+      "residual": "Only one request started-time index is retained; EXPLAIN confirms request history ordering uses it."
     },
     {
       "id": 27,
@@ -1587,9 +1597,16 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "从各历史 fixture 升级，第二次启动不重复回填，未来版本仍被拒绝。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/schema_migrations.py",
+        "adaptive_rsi/migrations/003_seal_bootstrap.sql"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMigrationHistoryTest tests.test_audit_round5 tests.test_store"
+      ],
+      "residual": "SQL migration bytes and ordered history are checked before mutation; sealed bootstrap is not repeated; additive SQL and ledger roll back together. Legacy 1/2 hashes and transaction-external bootstrap DDL remain historical boundaries. Compatibility format stays v2. Installed wheel resource/startup verified."
     },
     {
       "id": 111,
@@ -2790,6 +2807,7 @@
   "ci_evidence": [],
   "checkpoint_commits": [
     "cd6e614",
-    "de75578"
+    "de75578",
+    "022d5ce"
   ]
 }
