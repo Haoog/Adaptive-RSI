@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 57 implemented with targeted acceptance, 38 partial, and 106 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 58 implemented with targeted acceptance, 37 partial, and 106 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -31,7 +31,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 
 ## Second Implementation Batch and Review
 
-- 92 targeted model-diagnostic, storage, scheduling, protocol and recovery regressions passed, as did all 338 JavaScript tests and 13 Rust desktop tests. Full Python regression is still running; these results do not replace CI on the final exact commit.
+- 92 targeted model-diagnostic, storage, scheduling, protocol and recovery regressions passed, as did all 338 JavaScript tests and 13 Rust desktop tests. All 842 Python tests in four groups passed for local checkpoint `de75578`; five subsequent background-receipt fault regressions also passed. These results do not replace CI on the final exact commit.
 - The API contract check uses isolated HTTP responses for empty/populated projects, pagination, history filters, sections and malformed historical evidence.
 - Successful poll logging is sampled once per route per minute; writes and errors remain complete. The real `/api/operation` GET route has regression coverage.
 - Archives add compression levels, a shared total deadline, cancellation, manifests and isolated verification. Maintenance verifies at most one due archive per cycle; damaged archives or manifests are not accepted as valid recovery points.
@@ -40,6 +40,8 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 - Native stop reasons and provider request IDs survive final diagnostics, including interrupted chunked responses, without cookies, authentication headers or complete response headers.
 - Scheduling adds 24-hour worker-occupancy accounting and priority for continuously waiting projects. Mixed-duration regressions pass; production waiting quantiles still require observations.
 - Read-only review findings about final-publication cancellation, the poll route, Ollama stop reasons and truncated response classification were fixed with regressions. No real application replacement, push, PR merge, formal release or local installation update has occurred.
+
+Background receipt review fixed successful business results being replaced by failures after transient dual-write faults, and unnecessary file rewrites during receipt replay. Business execution occurs once; persistence retries retain the original result. Five fault regressions passed. See the [timing record](validation-timing-20261028.json) for observed group loads and the next grouping estimate; predictions are not measured CI speedup.
 
 ## Original Items and Current Status
 
@@ -70,7 +72,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 25. **pending** — Migration checksums ignore migration contents
 26. **partial** — Request logs maintain duplicate indexes
 27. **implemented** — State snapshots cover only part of the response
-28. **partial** — Background failure receipts may also fail
+28. **implemented** — Background failure receipts may also fail
 29. **implemented** — Re-adding archived paths may remain invisible
 30. **implemented** — Drain leases can expire during long work
 31. **pending** — Installing barriers need crash recovery proof

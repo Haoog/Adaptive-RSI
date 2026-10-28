@@ -1015,3 +1015,95 @@ class AuditOfflineRecoveryTest(unittest.TestCase):
             link.symlink_to(source)
             with self.assertRaises(OSError):
                 inspect_database(link)
+
+
+class AuditOperationPersistenceTest(unittest.TestCase):
+    setUp = AuditRound6Test.setUp
+
+    def test_file_receipt_failure_does_not_prevent_database_completion(self):
+        operation = 'a' * 16
+        self.store.execute("INSERT INTO operations VALUES (?,'backup','running','{}',?,NULL)",
+                           (operation, time.time()))
+        with patch('adaptive_rsi.updates.atomic_json', side_effect=OSError('private payload not logged')):
+            with self.assertLogs('adaptive_rsi.operations', level='WARNING') as messages:
+                self.assertTrue(self.runtime.operations._save_terminal(operation, 'completed', {'id': 'backup'}))
+        row = self.store.one('SELECT state,result FROM operations WHERE id=?', (operation,))
+        self.assertEqual(row['state'], 'completed')
+        self.assertEqual(json.loads(row['result']), {'id': 'backup'})
+        self.assertNotIn('private payload', '\n'.join(messages.output))
+
+    def test_failed_receipt_replay_does_not_replace_known_result_with_interrupted(self):
+        operation = 'b' * 16
+        self.store.execute("INSERT INTO operations VALUES (?,'backup','running','{}',?,NULL)",
+                           (operation, time.time()))
+        execute = self.store.execute
+        def fail_update(sql, args=()):
+            if sql.startswith('UPDATE operations SET state=?'):
+                raise sqlite3.OperationalError('injected disk failure')
+            return execute(sql, args)
+        with patch.object(self.store, 'execute', side_effect=fail_update):
+            with self.assertLogs('adaptive_rsi.operations', level='ERROR'):
+                self.assertFalse(self.runtime.operations._save_terminal(operation, 'completed', {'id': 'backup'}))
+                self.runtime.operations.recover()
+        self.assertIsNone(self.store.one('SELECT ended FROM operations WHERE id=?', (operation,))['ended'])
+        self.runtime.operations.recover()
+        row = self.store.one('SELECT state,result FROM operations WHERE id=?', (operation,))
+        self.assertEqual(row['state'], 'completed')
+        self.assertEqual(json.loads(row['result']), {'id': 'backup'})
+        self.assertFalse((self.store.root / 'operation-receipts' / (operation + '.json')).exists())
+
+    def test_both_persistence_failures_have_independent_diagnostics(self):
+        with patch('adaptive_rsi.updates.atomic_json', side_effect=OSError('secret')), \
+                patch.object(self.store, 'execute', side_effect=sqlite3.OperationalError('secret')):
+            with self.assertLogs('adaptive_rsi.operations', level='WARNING') as messages:
+                with self.assertRaisesRegex(RuntimeError, 'both database and receipt file'):
+                    self.runtime.operations._save_terminal('c' * 16, 'completed', {'id': 'backup'})
+        self.assertNotIn('secret', '\n'.join(messages.output))
+
+    def test_success_result_survives_transient_dual_persistence_failure(self):
+        operation = 'd' * 16
+        self.store.execute("INSERT INTO operations VALUES (?,'diagnostics','running','{}',?,NULL)",
+                           (operation, time.time()))
+        from adaptive_rsi.updates import atomic_json
+        writes = {'file': 0, 'database': 0}
+        execute = self.store.execute
+        def fail_first_file(*args, **kwargs):
+            writes['file'] += 1
+            if writes['file'] == 1:
+                raise OSError('transient')
+            return atomic_json(*args, **kwargs)
+        def fail_first_database(sql, args=()):
+            if sql.startswith('UPDATE operations SET state=?'):
+                writes['database'] += 1
+                if writes['database'] == 1:
+                    raise sqlite3.OperationalError('transient')
+            return execute(sql, args)
+        with patch('adaptive_rsi.storage_tools.diagnostics', return_value={'artifact': 'actual-success'}) as business, \
+                patch('adaptive_rsi.updates.atomic_json', side_effect=fail_first_file), \
+                patch.object(self.store, 'execute', side_effect=fail_first_database):
+            with self.assertLogs('adaptive_rsi.operations', level='WARNING'):
+                self.runtime.operations._run(operation, 'diagnostics', {}, threading.Event())
+        business.assert_called_once()
+        row = self.runtime.operations.get(operation)
+        self.assertEqual(row['state'], 'completed')
+        self.assertEqual(row['result'], {'artifact': 'actual-success'})
+
+    def test_existing_receipt_recovery_does_not_need_file_rewrite(self):
+        operation = 'e' * 16
+        self.store.execute("INSERT INTO operations VALUES (?,'diagnostics','running','{}',?,NULL)",
+                           (operation, time.time()))
+        with patch.object(self.store, 'execute', side_effect=sqlite3.OperationalError('offline')):
+            with self.assertLogs('adaptive_rsi.operations', level='ERROR'):
+                self.runtime.operations._save_terminal(operation, 'completed', {'artifact': 'existing'})
+        execute = self.store.execute
+        def offline_terminal(sql, args=()):
+            if sql.startswith('UPDATE operations SET state=?'):
+                raise sqlite3.OperationalError('offline')
+            return execute(sql, args)
+        with patch('adaptive_rsi.updates.atomic_json', side_effect=OSError('readonly')) as rewriting, \
+                patch.object(self.store, 'execute', side_effect=offline_terminal):
+            with self.assertLogs('adaptive_rsi.operations', level='ERROR'):
+                self.runtime.operations.recover()
+            rewriting.assert_not_called()
+        self.runtime.operations.recover()
+        self.assertEqual(self.runtime.operations.get(operation)['result'], {'artifact': 'existing'})

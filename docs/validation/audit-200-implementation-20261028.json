@@ -438,12 +438,14 @@
       },
       "source": "adaptive_rsi/operations.py",
       "acceptance": "注入结果落库失败；确保独立故障日志和恢复时的可核对终态。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/operations.py"
       ],
-      "validation": [],
-      "residual": "Disk receipts and Future observation added; fault injection remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditOperationPersistenceTest"
+      ],
+      "residual": "Database/file fallback, independent redacted logs, immutable business result on persistence retry and deferred receipt replay are fault-tested. Permanent loss of both persistence destinations cannot retain a result; restart reports interruption rather than claiming success."
     },
     {
       "id": 29,
@@ -2787,6 +2789,7 @@
   "implementation_commit": null,
   "ci_evidence": [],
   "checkpoint_commits": [
-    "cd6e614"
+    "cd6e614",
+    "de75578"
   ]
 }
