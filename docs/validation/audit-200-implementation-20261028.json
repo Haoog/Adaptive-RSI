@@ -207,7 +207,8 @@
         "pyproject.toml"
       ],
       "validation": [
-        "Isolated wheel build/install: /api/contract HTTP 200 / API v2"
+        "python3 -B scripts/check_wheel_install.py --output docs/validation/wheel-install-20261028.json",
+        "docs/validation/wheel-install-20261028.json"
       ]
     },
     {
@@ -2779,10 +2780,14 @@
       "source": "adaptive_rsi/web/experience.js",
       "acceptance": "多文件差异中前后跳转保持准确定位，复制内容不混入装饰字符。",
       "status": "implemented",
-      "implementation": [],
+      "implementation": [
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/style.css"
+      ],
       "validation": [
         "node tests/browser_experience.cjs",
-        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_quoted_git_diff_paths_preserve_utf8_and_control_characters"
+        "python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_quoted_git_diff_paths_preserve_utf8_and_control_characters",
+        "node tests/browser_diff_mobile.cjs"
       ]
     },
     {
@@ -3059,9 +3064,20 @@
       },
       "source": "docs/validation/audit-20261027-next-100.json",
       "acceptance": "随机抽取完成项能直接重放验收，未覆盖边界明确列为残余限制。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_audit_ledger.py",
+        "scripts/check_wheel_install.py",
+        "tests/test_audit_ledger.py",
+        "docs/validation/audit-200-evidence-20261028.md",
+        "docs/validation/audit-200-evidence-20261028.en.md"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_ledger",
+        "python3 -B scripts/check_audit_ledger.py",
+        "docs/validation/wheel-install-20261028.json"
+      ],
+      "residual": "Replay references and derived bilingual counts are checked; unittest discovery imports trusted test modules and may execute load_tests hooks. This is not proof of final exact-commit test or remote CI success."
     },
     {
       "id": 201,

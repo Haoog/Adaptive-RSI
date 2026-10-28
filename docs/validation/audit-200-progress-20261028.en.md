@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 94 implemented with targeted acceptance, 25 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 95 implemented with targeted acceptance, 24 partial, and 82 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -189,9 +189,9 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 134. **implemented** — Preserve provider stop reasons end to end
 135. **pending** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
-137. **implemented** — Price input, output and cache usage separately
-138. **implemented** — Explain currency and estimation limits
-139. **implemented** — Compare estimated and actual task cost
+137. **pending** — Price input, output and cache usage separately
+138. **pending** — Explain currency and estimation limits
+139. **pending** — Compare estimated and actual task cost
 140. **implemented** — Invalidate stale evidence after credential rotation
 141. **implemented** — Stratify evaluation sampling
 142. **partial** — Hash complete experiment inputs
@@ -205,8 +205,8 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 150. **pending** — Collect standard test and coverage artifacts
 151. **pending** — Cache immutable prepared environments
 152. **pending** — Gate performance gains on secondary guardrails
-153. **implemented** — Audit dataset retirement and reclassification
-154. **implemented** — Explain strategy changes before promotion
+153. **pending** — Audit dataset retirement and reclassification
+154. **pending** — Explain strategy changes before promotion
 155. **implemented** — Expose heterogeneous evaluation effects
 156. **pending** — Export sealed experiment reproduction bundles
 157. **pending** — Record exact host tool versions
@@ -233,18 +233,18 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 178. **pending** — Check GitHub capabilities without test writes
 179. **pending** — Expose ambiguous dispatch reconciliation
 180. **pending** — Plan explicit GitHub Enterprise support
-181. **implemented** — Add navigation within long logs
+181. **pending** — Add navigation within long logs
 182. **partial** — Lazily construct large evidence views
 183. **implemented** — Improve navigation inside diffs
 184. **implemented** — Explain chains of blocking causes
 185. **implemented** — Keep both sides of settings conflicts
 186. **implemented** — Preserve meaningful browser navigation history
-187. **implemented** — Optionally synchronize saved views
-188. **implemented** — Preserve focus and limit live announcements
+187. **pending** — Optionally synchronize saved views
+188. **pending** — Preserve focus and limit live announcements
 189. **implemented** — Improve narrow-screen diff reading
 190. **implemented** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
-192. **implemented** — Test real signed desktop upgrades end to end
+192. **pending** — Test real signed desktop upgrades end to end
 193. **partial** — Expand supported-Python boundary coverage
 194. **implemented** — Balance tests using actual module durations
 195. **implemented** — Track flaky failures without hiding them
@@ -252,7 +252,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 197. **pending** — Inject crashes at side-effect receipt boundaries
 198. **implemented** — Check dynamic localization structurally
 199. **partial** — Generate a dependency-complete SBOM
-200. **pending** — Link audit completion to verifiable evidence
+200. **implemented** — Link audit completion to verifiable evidence
 201. **partial** — Layered validation, slow-test diagnosis, parallel release verification and release queue coordination
 
 
@@ -293,3 +293,7 @@ Blocking causes (184): 7 targeted and 52 related Python checks, the real Chromiu
 Structured errors (190): 3 targeted and 51 related Python checks, all 350 Node tests and Chromium bilingual field guidance/diagnostic-copy passed. Reviews found and fixed a null/scalar error-envelope path that dropped the request ID. Stable configuration reasons expose only schema-owned fields, and unknown HTTP failures retain validated request IDs with copy/manual fallback. Both axes confirmed no remaining issue within scope.
 
 Navigation history (186): real Chromium covers first-action project switch/reload/back, three back/forward steps, view reload, retained drafts, notification task restore and old-close/notification races with a delayed state response. Button, Escape and backdrop use the same close path. Both axes confirmed no remaining issue; all 351 Node tests passed. The broader 33-group browser run had 32 passes and one delivery-copy regression; its generic-reason priority was corrected and the failing delivery group rerun successfully. This is not a new final full-release CI attestation. The prior full Python run had three assertions caused by a config test stub missing the source keyword; that module was corrected and its 16 tests rerun successfully.
+
+## Handoff closure and stop
+
+At the user's latest request, only #200 ledger validation and replay indexing were closed before stopping further implementation and release work. The final count is 95 implemented with targeted acceptance, 24 partial and 82 pending; #200 was one of the original 83 pending entries. See the [agent handoff](agent-handoff-20261028.en.md) for all original pending items, partial residuals, commits and validation limits. Four ledger tests and seven workflow-configuration tests passed; selector coverage reports 975 tests, which does not mean they were all executed. No push, merge, release or local installed-app update was performed.
