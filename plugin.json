@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "adaptive-rsi",
-  "version": "0.5.124",
+  "version": "0.5.125",
   "description": "持续自主巡检、用户目标与 GitHub Issues 驱动的本地改进闭环，含可视化设置和独立验收。",
   "license": "MIT",
   "keywords": ["codex", "autonomous", "evaluation", "self-improvement"],
