@@ -263,6 +263,19 @@ class NativeProtocolsTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "effort=default"):
                 Conversation(protocol, "model", "prompt", tools_for("review"), "high").request()
 
+    def test_conversation_sends_the_model_output_limit(self):
+        for protocol, key in (("responses", "max_output_tokens"), ("chat_completions", "max_tokens")):
+            with self.subTest(protocol=protocol):
+                _, body = Conversation(protocol, "model", "prompt", [], "default", output_tokens=1234).request()
+                self.assertEqual(body[key], 1234)
+        _, body = Conversation("ollama", "model", "prompt", [], "default", output_tokens=1234).request()
+        self.assertEqual(body["options"]["num_predict"], 1234)
+        _, body = Conversation("anthropic", "claude-sonnet", "prompt", [], "default", output_tokens=1234).request()
+        self.assertEqual(body["max_tokens"], 1234)
+        # Vendors cap their own maximum: never exceed the historical envelope.
+        _, body = Conversation("anthropic", "claude-opus", "prompt", [], "default", output_tokens=32000).request()
+        self.assertEqual(body["max_tokens"], 4096)
+
 
 if __name__ == "__main__":
     unittest.main()

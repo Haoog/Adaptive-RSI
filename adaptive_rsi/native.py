@@ -648,8 +648,9 @@ def execute_tools(tools, calls):
 
 
 class Conversation:
-    def __init__(self, protocol, model, prompt, tools, effort):
+    def __init__(self, protocol, model, prompt, tools, effort, output_tokens=None):
         self.protocol, self.model, self.tools, self.effort = protocol, model, tools, effort
+        self.output_tokens = output_tokens
         self.history = [{"role": "user", "content": prompt}]
         if protocol == "gemini":
             self.history = [{"role": "user", "parts": [{"text": prompt}]}]
@@ -661,6 +662,8 @@ class Conversation:
         if p == "responses":
             body = {"model": self.model, "input": self.history, "store": False,
                     "tools": [{"type": "function", "name": n, "description": d, "parameters": s} for n, d, s in self.tools]}
+            if self.output_tokens:
+                body["max_output_tokens"] = self.output_tokens
             if self.effort != "default":
                 body["reasoning"] = {"effort": self.effort}
                 body["include"] = ["reasoning.encrypted_content"]
@@ -668,13 +671,18 @@ class Conversation:
         if p in ["chat_completions", "ollama"]:
             body = {"model": self.model, "messages": self.history,
                     "tools": [{"type": "function", "function": {"name": n, "description": d, "parameters": s}} for n, d, s in self.tools]}
+            if self.output_tokens:
+                body["max_tokens"] = self.output_tokens
             if self.effort != "default":
                 body["reasoning_effort"] = self.effort
             if p == "ollama":
                 body["stream"] = False
+                if self.output_tokens:
+                    body["options"] = {"num_predict": self.output_tokens}
             return ("/api/chat" if p == "ollama" else "/chat/completions"), body
         if p == "anthropic":
-            max_tokens = 4096 if "opus" in self.model.lower() or "claude-2" in self.model.lower() else 8192
+            max_tokens = min(self.output_tokens or 8192,
+                             4096 if "opus" in self.model.lower() or "claude-2" in self.model.lower() else 8192)
             return "/messages", {"model": self.model, "messages": self.history, "max_tokens": max_tokens,
                 "tools": [{"name": n, "description": d, "input_schema": s} for n, d, s in self.tools]}
         if p == "gemini":
@@ -795,10 +803,11 @@ class NativeAgent:
                 if not isinstance(scope, list) or not scope:
                     raise RuntimeError("Approved native tool scope is invalid")
                 tools.scope = [relative_path(value) for value in scope]
-        conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
+        capabilities = model_capabilities(route["model"], protocol)
+        conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"],
+                                    output_tokens=capabilities["max_output_tokens"])
         began = time.monotonic()
         tools.deadline = began + config["limits"]["command_seconds"]
-        capabilities = model_capabilities(route["model"], protocol)
         max_bytes = min(config["limits"]["max_output_mb"] * 1024 * 1024,
                         capabilities["max_output_tokens"] * 4)
         context_bytes = min(64 * 1024 * 1024, capabilities["context_tokens"] * 4)

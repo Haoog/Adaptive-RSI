@@ -4,7 +4,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     sync::{Mutex, MutexGuard},
@@ -330,22 +330,42 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             .map(|h| std::path::PathBuf::from(h).join("Downloads"))
             .unwrap_or_else(std::env::temp_dir);
         let path = download_dir.join(format!("adaptive-rsi-{}-macos-{}-adhoc.dmg", version, arch));
-        let mut staged = match tempfile::Builder::new().prefix(".adaptive-rsi-").tempfile_in(&download_dir) {
+        let part = download_dir.join(format!(".adaptive-rsi-{}-macos-{}.dmg.part", version, arch));
+        let mut staged = match std::fs::OpenOptions::new().create(true).read(true).write(true).open(&part) {
             Ok(file) => file,
             Err(_) => { fail("Cannot write download".into(), ""); return; }
         };
+        let mut offset = staged.metadata().map(|meta| meta.len()).unwrap_or(0);
         let outcome = (|| -> Result<(), String> {
-            let mut response = client
+            let mut request = client
                 .get(&url)
-                .header("User-Agent", "Adaptive-RSI-updater")
-                .send()
-                .map_err(|_| "Download failed".to_string())?;
+                .header("User-Agent", "Adaptive-RSI-updater");
+            if offset > 0 {
+                request = request.header("Range", format!("bytes={}-", offset));
+            }
+            let mut response = request.send().map_err(|_| "Download failed".to_string())?;
+            let resumed = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                // The local part already covers the artifact; verification decides.
+                return Ok(());
+            }
             if !response.status().is_success() {
                 return Err("Download failed".into());
             }
-            let total = response.content_length().unwrap_or(0);
+            if offset > 0 && !resumed {
+                // The server ignored Range: appending would corrupt the artifact.
+                staged.set_len(0).map_err(|_| "Cannot write download".to_string())?;
+                staged.seek(SeekFrom::Start(0)).map_err(|_| "Cannot write download".to_string())?;
+                offset = 0;
+            } else if resumed {
+                staged.seek(SeekFrom::Start(offset)).map_err(|_| "Cannot write download".to_string())?;
+            } else {
+                staged.seek(SeekFrom::Start(0)).map_err(|_| "Cannot write download".to_string())?;
+            }
+            let remaining = response.content_length().unwrap_or(0);
+            let total = if resumed { offset.saturating_add(remaining) } else { remaining };
             if total > 512 * 1024 * 1024 { return Err("Download exceeds size limit".into()); }
-            let mut downloaded: u64 = 0;
+            let mut downloaded: u64 = offset;
             let mut buffer = [0u8; 65536];
             loop {
                 let read = response
@@ -370,6 +390,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
                     }
                 }
             }
+            staged.flush().map_err(|_| "Cannot write download".to_string())?;
             Ok(())
         })();
         if let Err(message) = outcome {
@@ -379,7 +400,7 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
         let digest = Command::new("/usr/bin/shasum")
             .arg("-a")
             .arg("256")
-            .arg(staged.path())
+            .arg(&part)
             .output()
             .ok()
             .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -393,10 +414,16 @@ fn start_desktop_download(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
         if digest.is_empty() || digest != expected {
+            // A corrupt part must not be resumed on the next attempt.
+            let _ = std::fs::remove_file(&part);
             fail("Checksum verification failed".into(), "checksum");
             return;
         }
-        if staged.persist_noclobber(&path).is_err() {
+        if path.exists() {
+            fail("A download with this name already exists".into(), "");
+            return;
+        }
+        if std::fs::rename(&part, &path).is_err() {
             fail("A download with this name already exists".into(), "");
             return;
         }
