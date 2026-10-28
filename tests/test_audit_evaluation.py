@@ -1,5 +1,6 @@
 """Offline acceptance for audit evaluation changes; no model calls."""
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +33,7 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertTrue(tools['python3']['version'])
         self.assertTrue(tools['python3']['binary_sha256'])
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'Requires macOS Seatbelt; ordinary Linux jobs have no cached sandbox image')
     def test_fixed_controls_must_be_detected_by_the_real_gate(self):
         from adaptive_rsi.evaluator import Evaluator
         from adaptive_rsi.config import merge, DEFAULTS

@@ -185,6 +185,7 @@ jobs:
         run: |
           python3 -m unittest -v \
             tests.test_comprehensive_audit.AuditRegressionTest.test_command_cannot_write_outside_host_plan_scope \
+            tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate \
             tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project \
             tests.test_model_center.ModelCenterTest.test_real_keychain_round_trip_and_no_plaintext_database_key \
             tests.test_audit_boundaries.CodexExecutableTest.test_symlinked_codex_can_start_itself_inside_permissions \
