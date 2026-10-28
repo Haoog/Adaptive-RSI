@@ -76,7 +76,7 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 68 | Pending | Publish a tested platform asset matrix | — | — |
 | 69 | Pending | Offer download bandwidth limits | — | — |
 | 70 | Pending | Explain update progress by stage | — | — |
-| 71 | Pending | Estimate space from actual assets | — | — |
+| 71 | Implemented | Estimate space from actual assets | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) <br> [scripts/package_desktop.py](../../scripts/package_desktop.py) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 72 | Pending | Make desktop lifecycle preferences explicit | — | — |
 | 73 | Partial | Offer opt-in crash diagnostics | [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py) | `python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_diagnostic_preview_export_is_explicit_and_contains_no_user_text` |
 | 74 | Partial | Scope navigation preferences to runtime instances | [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) <br> [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) | `node tests/browser_frontend_remaining.cjs` |

@@ -6,7 +6,7 @@ Current continuation: the user has authorized work to continue. Read the [curren
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 115 implemented with targeted acceptance, 55 partial, and 31 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 116 implemented with targeted acceptance, 55 partial, and 30 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -125,7 +125,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 68. **pending** — Publish a tested platform asset matrix
 69. **pending** — Offer download bandwidth limits
 70. **pending** — Explain update progress by stage
-71. **pending** — Estimate space from actual assets
+71. **implemented** — Estimate space from actual assets
 72. **pending** — Make desktop lifecycle preferences explicit
 73. **partial** — Offer opt-in crash diagnostics
 74. **partial** — Scope navigation preferences to runtime instances

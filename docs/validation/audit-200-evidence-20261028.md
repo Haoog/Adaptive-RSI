@@ -76,7 +76,7 @@
 | 68 | 待做 | 建立明确的平台资产支持矩阵 | — | — |
 | 69 | 待做 | 为后台下载提供可选带宽限制 | — | — |
 | 70 | 待做 | 更新进度区分速度、校验及替换阶段 | — | — |
-| 71 | 待做 | 空间需求按实际资产估算 | — | — |
+| 71 | 已实现 | 空间需求按实际资产估算 | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) <br> [scripts/package_desktop.py](../../scripts/package_desktop.py) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 72 | 待做 | 允许用户选择关窗、后台驻留和登录启动行为 | — | — |
 | 73 | 部分完成 | 增加用户主动启用的崩溃诊断包 | [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py) | `python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_diagnostic_preview_export_is_explicit_and_contains_no_user_text` |
 | 74 | 部分完成 | 按运行实例保存导航和视图偏好 | [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) <br> [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) | `node tests/browser_frontend_remaining.cjs` |
