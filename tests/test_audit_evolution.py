@@ -57,6 +57,16 @@ class AuditEvolutionTest(unittest.TestCase):
                                (split, 'p', split, split, encode(spec), holdout_uses if split == 'holdout' else 0, 1))
         return {'id': 'p'}, repo, self.root / 'run', {'id': 'run', 'task': 'task', 'config': encode(self.config)}
 
+    def test_malformed_case_specs_are_skipped_without_blocking_the_proposal(self):
+        args = self.setup_proposal()
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('broken-case', 'p', 'broken', 'validation', '{broken', 0, 5))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('partial-case', 'p', 'partial', 'validation', encode({'task': 'x'}), 0, 6))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertIn('status', result)
+        self.assertEqual(self.calls['proposal'], 1)
+
     def test_manifest_failure_leaves_no_holdout_reservation(self):
         args = self.setup_proposal()
         with patch('adaptive_rsi.evolution.git', side_effect=RuntimeError('repository unavailable')):

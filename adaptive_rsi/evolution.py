@@ -42,10 +42,19 @@ def paired_summary(trials):
     return summary
 
 
+def case_spec(case):
+    """Decode a stored case spec; a malformed row is skipped, never fatal."""
+    try:
+        spec = json.loads(case["spec"])
+    except (TypeError, ValueError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
 def case_stratum(case):
-    spec = json.loads(case["spec"])
-    length = len(spec["task"])
-    return (spec["source"], "small" if length < 1000 else "medium" if length < 10000 else "large")
+    spec = case_spec(case) or {}
+    length = len(spec.get("task", ""))
+    return (spec.get("source", "unknown"), "small" if length < 1000 else "medium" if length < 10000 else "large")
 
 
 def select_cases(cases, count, seed):
@@ -276,8 +285,14 @@ class Evolution:
         limit = config["evolution"]["max_holdout_uses"]
         available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
                                      "ORDER BY created,id", (project["id"],))
-        cases = [case for case in available if case["uses"] < limit and
-                 json.loads(case["spec"]).get("available", True) and json.loads(case["spec"]).get("active", True)]
+        cases = []
+        for case in available:
+            spec = case_spec(case)
+            if (case["uses"] < limit and spec is not None and
+                    spec.get("available", True) and spec.get("active", True) and
+                    isinstance(spec.get("task"), str) and
+                    isinstance(spec.get("repository"), str) and isinstance(spec.get("base"), str)):
+                cases.append(case)
         minimum = config["evolution"]["min_cases_per_split"]
         if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
             # 曝光耗尽的样本仍在案例表中；若只报“样本不足”，界面会同时显示样本数量，
@@ -298,11 +313,14 @@ class Evolution:
         reservation = uid()
         manifest = []
         for case in cases:
-            spec = json.loads(case["spec"])
-            manifest.append({"case": case["id"], "split": case["split"], "source": spec["source"],
-                             "signature": spec["signature"],
-                             "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
-                             "checks": fingerprint(spec["checks"]), "family": case["family"],
+            spec = case_spec(case) or {}
+            repository, base = spec.get("repository"), spec.get("base")
+            if not isinstance(repository, str) or not isinstance(base, str) or not isinstance(spec.get("task"), str):
+                continue
+            manifest.append({"case": case["id"], "split": case["split"], "source": spec.get("source", "unknown"),
+                             "signature": spec.get("signature", ""),
+                             "tree": git(repository, "rev-parse", base + "^{tree}"),
+                             "checks": fingerprint(spec.get("checks", [])), "family": case["family"],
                              "task": fingerprint(spec["task"]), "spec": fingerprint(spec),
                              "overlay": self.overlay_digest(spec.get("overlay")),
                              "environment": fingerprint(config["environment"])})
@@ -387,9 +405,11 @@ class Evolution:
             for split in ["validation", "holdout"]:
                 selected = selection[split]
                 for case in selected:
+                    spec = case_spec(case)
+                    if spec is None:
+                        continue
                     for repetition in range(config["evolution"]["repeats"]):
-                        spec = json.loads(case["spec"])
-                        trial = {"case": case["id"], "split": split, "source": spec["source"], "family": case["family"], "stratum": case_stratum(case), "repetition": repetition}
+                        trial = {"case": case["id"], "split": split, "source": spec.get("source", "unknown"), "family": case["family"], "stratum": case_stratum(case), "repetition": repetition}
                         order = ["stable", "candidate"] if len(evidence["trials"]) % 2 == 0 else ["candidate", "stable"]
                         trial["order"] = order
                         for variant in order:
