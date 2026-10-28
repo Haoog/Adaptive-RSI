@@ -969,10 +969,13 @@ class Evaluator:
             results["candidate_full"] = list(results.get("candidate", []))
         elif "candidate_full" in results:
             # Keep full_checks order: reused checks come from the candidate
-            # stage, supplement checks from this stage.
-            own = {row["name"]: row for row in results["candidate_full"]}
-            previous = {row["name"]: row for row in results.get("candidate", [])}
-            merged = [own.get(check["name"]) or previous.get(check["name"]) for check in full_checks]
+            # stage, supplement checks from this stage. Names repeat across
+            # nested modules, so pair them with argv and cwd.
+            def identity(row):
+                return (row["name"], tuple(row["argv"]), row.get("cwd", "."))
+            own = {identity(row): row for row in results["candidate_full"]}
+            previous = {identity(row): row for row in results.get("candidate", [])}
+            merged = [own.get(identity(check)) or previous.get(identity(check)) for check in full_checks]
             results["candidate_full"] = [row for row in merged if row]
         if cached_baseline is None and "baseline" in results:
             self._cache_put(cache_scope, baseline_key, results["baseline"])

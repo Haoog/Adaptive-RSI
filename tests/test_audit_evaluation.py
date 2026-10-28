@@ -82,6 +82,30 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual([name for stage, name in calls if stage != 'baseline'], ['fixed', 'detected'])
             self.assertEqual(len(result['checks']['candidate_full']), 2)
 
+    def test_same_check_name_in_two_modules_keeps_both_results(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            configured = [{'name': 'module', 'argv': ['python3', '-c', 'print(1)'], 'timeout_seconds': 1}]
+            detected = [{'name': 'module', 'argv': ['python3', '-c', 'print(2)'], 'timeout_seconds': 2, 'cwd': 'nested'}]
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'cwd': check.get('cwd', '.'),
+                        'exit_code': 1 if check['argv'][-1] == 'print(2)' else 0,
+                        'stdout': '', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': detected}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state')).evaluate(
+                    source, source, configured, root / 'evaluation', merge(DEFAULTS, {}), changed_files=[])
+            rows = result['checks']['candidate_full']
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({(row['argv'][-1], row['passed']) for row in rows},
+                             {('print(1)', True), ('print(2)', False)})
+
     def test_exact_host_tool_versions_are_recorded_without_cache_authorization(self):
         tools = evaluator.host_tool_versions([{'argv': ['python3', '-m', 'unittest']}])
         self.assertIn('python3', tools)
