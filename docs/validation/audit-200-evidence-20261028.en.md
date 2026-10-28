@@ -23,7 +23,7 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 15 | Partial | Remote connection rejects API v2 | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | — |
 | 16 | Implemented | Contract CI uses a handwritten sample | [scripts/check_api_contract.py](../../scripts/check_api_contract.py) | `python3 -B scripts/check_api_contract.py` |
 | 17 | Implemented | Malformed global JSON breaks its repair response | [adaptive_rsi/server.py](../../adaptive_rsi/server.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_malformed_global_configuration_still_has_a_repair_response` |
-| 18 | Partial | Input context is capped by output capacity | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | — |
+| 18 | Implemented | Input context is capped by output capacity | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | `python3 -B -m unittest tests.test_protocols.NativeProtocolsTest.test_conversation_sends_the_model_output_limit` |
 | 19 | Implemented | Task-duration samples measure SQL | [adaptive_rsi/store.py](../../adaptive_rsi/store.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_task_duration_model_uses_actual_runs` |
 | 20 | Implemented | Desktop abort leaves transport running | [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) <br> [desktop/src-tauri/src/transport.rs](../../desktop/src-tauri/src/transport.rs) | `node --test tests/web_desktop_transport.cjs` <br> `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 21 | Implemented | Failed checks delay retries for six hours | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
@@ -69,7 +69,7 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 61 | Implemented | Unify desktop and engine update policy semantics | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
 | 62 | Pending | Add pausable staged rollout | — | — |
 | 63 | Pending | Respect network and power preferences | — | — |
-| 64 | Partial | Persist verified update downloads | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | — |
+| 64 | Partial | Persist verified update downloads | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 65 | Partial | Separate update transport deadlines | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop updater_feed_wait_can_be_cancelled_before_transport_deadline` |
 | 66 | Pending | Exercise updater key rotation | — | — |
 | 67 | Pending | Explain update compatibility requirements | — | — |

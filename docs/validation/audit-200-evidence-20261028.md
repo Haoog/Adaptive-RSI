@@ -23,7 +23,7 @@
 | 15 | 部分完成 | 桌面远程入口拒绝当前 API v2 服务 | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | — |
 | 16 | 已实现 | 契约 CI 验证的是手写样本 | [scripts/check_api_contract.py](../../scripts/check_api_contract.py) | `python3 -B scripts/check_api_contract.py` |
 | 17 | 已实现 | 全局坏 JSON 的错误回包再次读取坏 JSON | [adaptive_rsi/server.py](../../adaptive_rsi/server.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_malformed_global_configuration_still_has_a_repair_response` |
-| 18 | 部分完成 | 输入上下文预算错误绑定输出上限 | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | — |
+| 18 | 已实现 | 输入上下文预算错误绑定输出上限 | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | `python3 -B -m unittest tests.test_protocols.NativeProtocolsTest.test_conversation_sends_the_model_output_limit` |
 | 19 | 已实现 | 名为任务耗时的模型实际采集 SQL 耗时 | [adaptive_rsi/store.py](../../adaptive_rsi/store.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_task_duration_model_uses_actual_runs` |
 | 20 | 已实现 | 桌面请求取消只结束网页等待 | [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) <br> [desktop/src-tauri/src/transport.rs](../../desktop/src-tauri/src/transport.rs) | `node --test tests/web_desktop_transport.cjs` <br> `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 21 | 已实现 | 检查失败也会推迟下一次自动更新六小时 | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
@@ -69,7 +69,7 @@
 | 61 | 已实现 | 桌面和引擎更新策略采用同一套版本范围语义 | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
 | 62 | 待做 | 稳定版增加可暂停的分批更新机制 | — | — |
 | 63 | 待做 | 下载策略可考虑网络和电源状态 | — | — |
-| 64 | 部分完成 | 已签名更新包持久化缓存与断点续传 | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | — |
+| 64 | 部分完成 | 已签名更新包持久化缓存与断点续传 | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 65 | 部分完成 | 拆分更新请求连接及数据传输时限 | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop updater_feed_wait_can_be_cancelled_before_transport_deadline` |
 | 66 | 待做 | 建立更新签名公钥轮换流程 | — | — |
 | 67 | 待做 | 更新前显示操作系统和架构兼容性 | — | — |
