@@ -1425,9 +1425,17 @@
       },
       "source": "adaptive_rsi/resources.py",
       "acceptance": "竞争测试证明优先级生效，低优先级有等待上界且指标与事件一致。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/resources.py",
+        "adaptive_rsi/agent.py",
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/storage_tools.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_resource_priority tests.test_comprehensive_audit tests.test_audit_round6"
+      ],
+      "residual": "Named priorities and FIFO aging affect real reservations. Aged requests cannot be indefinitely overtaken by younger arrivals, but running reservations are not preempted and kernel-blocked work has no absolute completion bound. Bounded diagnostic wait samples and opaque receipts include cancellation."
     },
     {
       "id": 92,

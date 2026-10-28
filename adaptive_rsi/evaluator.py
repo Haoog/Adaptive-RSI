@@ -589,7 +589,7 @@ class Evaluator:
                  environment_digest=None, test_first=False, test_first_kind="behavior", changed_files=None):
         from .resources import execution_resources
         exclusive = acceptance and acceptance.get("change_kind") == "performance"
-        with execution_resources.acquire(exclusive=True, cancel=cancel) if exclusive else contextlib.nullcontext():
+        with execution_resources.acquire(exclusive=True, cancel=cancel, priority="benchmark") if exclusive else contextlib.nullcontext():
             return self._evaluate(baseline, candidate, checks, directory, config, cancel, overlay, seeds,
                                   acceptance, acceptance_baseline, cache_scope, cache_base,
                                   environment_digest, test_first, test_first_kind, changed_files)

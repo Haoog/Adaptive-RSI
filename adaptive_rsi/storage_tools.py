@@ -528,14 +528,17 @@ def overview(store, refresh=False):
 
 def diagnostics(store):
     from . import __version__
+    from .resources import execution_resources
     return {"version": __version__, "created": time.time(),
             "included": ["version", "state_counts", "failure_codes", "storage_bytes", "database_metrics",
-                         "query_fingerprints_and_opaque_context", "schema_migrations", "relationship_identifiers"],
+                         "query_fingerprints_and_opaque_context", "schema_migrations", "relationship_identifiers",
+                         "execution_resource_waits"],
             "tasks": store.query("SELECT state,count(*) AS count FROM tasks GROUP BY state"),
             "runs": store.query("SELECT state,count(*) AS count FROM runs GROUP BY state"),
             "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
             "invalid_evidence": store.one("SELECT count(*) AS count FROM runs WHERE NOT json_valid(result)")["count"],
             "database": store.metrics(integrity=True),
+            "execution_resources": execution_resources.status(),
             "wal": store.wal_diagnostics(),
             "schema_migrations": store.schema_migrations(),
             "relationship_audit": store.relationship_audit(),

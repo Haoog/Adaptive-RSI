@@ -225,7 +225,7 @@ class CodexAgent:
 
     def _invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
         from .resources import execution_resources
-        with execution_resources.acquire(cancel=cancel):
+        with execution_resources.acquire(cancel=cancel, priority="model"):
             return self._invoke_with_resources(role, prompt, workspace, project, run, config, cancel, protected)
 
     def _invoke_with_resources(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):

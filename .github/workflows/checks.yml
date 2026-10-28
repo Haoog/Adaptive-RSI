@@ -117,7 +117,7 @@ jobs:
             modules: tests.test_delivery_loop
           - name: 发布与数据
             os: ubuntu-latest
-            modules: tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
+            modules: tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
             modules: tests.test_model_center tests.test_reliability tests.test_recovery

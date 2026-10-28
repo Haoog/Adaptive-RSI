@@ -154,3 +154,5 @@ Settings include redacted change history and safe undo. Only the latest change w
 Deployment supports consecutive-success gates and multiple health endpoints. A round counts only when every endpoint confirms the same commit; rollout and rollback use the same rules.
 
 Automatic deployment rollback also requires an explicit backward-data-compatibility declaration; otherwise rollback is blocked and maintainer-provided manual recovery steps are shown.
+
+Execution resources queue model calls, commands and exclusive benchmarks by priority. Requests waiting at least 30 seconds take FIFO precedence; diagnostics include bounded wait samples and cancellation receipts.

@@ -344,3 +344,5 @@ adaptive-rsi recover-diagnostics /PATH/TO/STATE/state.sqlite3 --timeout 10 --max
 部署健康策略：`delivery.deploy.health_attempts` 为总轮数（1–10），`health_consecutive_successes` 为要求连续成功轮数（1–总轮数，默认 1），`health_interval_seconds` 为轮次间隔（1–300 秒），`health_warmup_seconds` 为预热（0–900 秒）。`health_url` 是主端点，`health_urls` 最多增加 7 个不同 HTTPS 地址，不允许账号、查询参数或片段。每一轮共享 15 秒总时限，所有端点必须确认目标完整 SHA；失败会清零连续成功计数，耗尽轮数也未满足连续成功要求时判为健康门禁失败。观察记录持久化，重启继续，回滚同样适用。一次健康采样成功不等于连续观察门禁通过。
 
 数据迁移回滚保护：`delivery.deploy.rollback_data_policy` 默认 `manual`，包括升级前没有该字段的配置；仅 `backward_compatible` 表示维护者确认旧程序可以读取已迁移数据。即使开启 `automatic_rollback`，未明确兼容仍会阻止新派发旧版本。`rollback_recovery_notes` 可保存最多 2000 字符的人工恢复步骤；失败详情会显示这些原始说明。请描述数据库备份位置、迁移逆向步骤和兼容程序版本，不要填入凭据。该声明不能代替真实迁移兼容验证；已在远端派发的回滚仍继续核对结果，系统不会假装撤回已发生的副作用。
+
+执行资源排队：模型调用优先级为 10，普通命令为 20，独占性能评估为 30，数值较小者优先，同级 FIFO。等待至少 30 秒的请求进入按先后顺序优先处理的队列，避免持续出现的新请求无限超越旧请求；这不意味着能抢占已执行的任务，也不承诺阻塞内核调用的结束时间。独占评估只有在既有共享执行退出后进入。诊断导出包含最近 256 次排队结束样本（包括取消）、nearest-rank p95、等待数、最老等待时长和最近 64 条仅含序号/优先级/耗时/结果的回执。取消不会保留队列占位。

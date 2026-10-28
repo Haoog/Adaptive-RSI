@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 86 implemented with targeted acceptance, 26 partial, and 89 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 87 implemented with targeted acceptance, 26 partial, and 88 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -143,7 +143,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 88. **implemented** — Support splitting failed task groups
 89. **pending** — Estimate queue time from actual execution
 90. **partial** — Evaluate rolling resource-based fairness
-91. **pending** — Implement resource priority and wait accounting
+91. **implemented** — Implement resource priority and wait accounting
 92. **pending** — Add disk and memory pressure admission
 93. **pending** — Consider deadline-driven scheduling
 94. **pending** — Explain graceful shutdown progress
@@ -277,3 +277,5 @@ Configuration audit and safe undo (112): 9 targeted and 138 related Python check
 Deployment observation (171/172): 6 targeted and 122 related Python checks, 339 Node checks and the real Chromium multi-endpoint/consecutive-policy save, reload and bilingual flow passed. Both read-only review axes found no remaining confirmed issue. Total rounds, per-round shared deadline and retained observations are bounded. Forward deployment and rollback use the same consecutive gate and post-probe authorization/ownership checks. These local checks do not attest a real production deployment.
 
 Rollback migration compatibility (173): 9 targeted checks and 60 related release/backend checks passed, along with 339 Node checks and Chromium policy/notes persistence. The first combined run exposed an incomplete test authorization fixture, now corrected and rerun. Both review axes confirmed no remaining issue. Undeclared data compatibility prevents new rollback dispatch and displays manual instructions; already-issued rollback remains tracked.
+
+Execution priority (91): 5 real-thread contention cases and 101 related Python checks passed. Priority/FIFO ordering, aging against younger requests, exclusive isolation, cancellation cleanup and receipt accounting are covered. Both review axes found no remaining confirmed issue. Diagnostics retain 256 wait samples and 64 opaque receipts. Aging does not preempt running or blocked kernel work.
