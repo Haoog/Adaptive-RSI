@@ -245,6 +245,8 @@ jobs:
       - run: node --check adaptive_rsi/web/sw.js
       - run: python3 scripts/check_i18n.py
       - run: python3 scripts/check_api_contract.py
+      - run: npm ci --ignore-scripts
+      - run: node scripts/check_i18n_ast.cjs
       - run: node --test tests/web_*.cjs
 
   browser:

@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 90 implemented with targeted acceptance, 26 partial, and 85 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 91 implemented with targeted acceptance, 26 partial, and 84 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -250,7 +250,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 195. **implemented** — Track flaky failures without hiding them
 196. **implemented** — Extend soak coverage to runtime interactions
 197. **pending** — Inject crashes at side-effect receipt boundaries
-198. **pending** — Check dynamic localization structurally
+198. **implemented** — Check dynamic localization structurally
 199. **partial** — Generate a dependency-complete SBOM
 200. **pending** — Link audit completion to verifiable evidence
 201. **partial** — Layered validation, slow-test diagnosis, parallel release verification and release queue coordination
@@ -285,3 +285,5 @@ Resource-pressure admission (92): 6 targeted and 122 related Python checks, 339 
 Mobile diff reading (189): new 390px/2300-line Chromium cases, the existing experience browser flow and 339 Node checks passed. Search expands lazily loaded files and locates wrapped text. Review found an inherited 420px child-pre cap; clearing it and a long-first-file/non-overlap regression resolved the issue. Ambiguous legacy textarea selectors now use accessible names. No remaining confirmed review finding.
 
 History budgets (107): 4 targeted tests passed. The fixed 50000-task/100000-run local fixture measured task-page p95 113.92ms, workflow metrics 435.20ms and quality summary 164.61ms; all responses were below 8MiB. The [report](history-performance-20261028.json) records environment and fixture identity. CI enforces the smaller 10000-task fixture once per full validation. Both review axes found no remaining confirmed issue. These synthetic figures do not establish production or HTTP throughput.
+
+Structural localization (198): 8 mutation tests, the repository AST check, all 347 Node tests and 12 workflow/planning checks passed. Reviews found and fixed template-expression recursion and loop/switch shadowing omissions. Both axes confirmed no remaining issue within declared static coverage. Acorn is pinned and installed before ordinary and final-release JavaScript checks; Python duplicate-key checks remain. Runtime value propagation and paired-doc semantic equivalence are explicitly outside automated proof.

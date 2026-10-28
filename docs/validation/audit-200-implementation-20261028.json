@@ -2995,9 +2995,21 @@
       },
       "source": "scripts/check_i18n.py",
       "acceptance": "故意加入未翻译动态文案后检查失败，中英文文档对应内容有可审查差异。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_i18n_ast.cjs",
+        "package.json",
+        "package-lock.json",
+        ".github/workflows/checks.yml",
+        ".github/workflows/release-verify.yml"
+      ],
+      "validation": [
+        "node scripts/check_i18n_ast.cjs",
+        "node --test tests/web_i18n_ast.cjs",
+        "node --test tests/web_*.cjs",
+        "python3 -B -m unittest tests.test_release.WorkflowConfigurationTest tests.test_validation_planning"
+      ],
+      "residual": "AST checks literals, templates/conditionals and initialized aliases/dictionaries with lexical scope. Eight mutation tests include missing dynamic messages, Unicode, template expressions and loop/switch shadowing. Reassignments, destructuring, for-of value propagation and arbitrary runtime/server text remain outside static coverage. Paired document semantic equivalence still requires review."
     },
     {
       "id": 199,
