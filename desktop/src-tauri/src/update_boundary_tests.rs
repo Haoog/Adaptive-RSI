@@ -59,3 +59,10 @@ fn extraction_volume_matches_the_updaters_same_device_selection() {
     assert_eq!(native_update::extraction_root(&executable, folder.path()).unwrap(), folder.path());
     assert_eq!(native_update::extraction_root(&executable, &folder.path().join("missing")).unwrap(), folder.path());
 }
+
+#[test]
+fn announced_package_size_bounds_preflight_and_falls_back_when_unknown() {
+    assert_eq!(native_update::announced_size(&serde_json::json!({"size": 1024})), 1024);
+    assert_eq!(native_update::announced_size(&serde_json::json!({"size": 0})), native_update::MAX_PACKAGE as u64);
+    assert_eq!(native_update::announced_size(&serde_json::json!({})), native_update::MAX_PACKAGE as u64);
+}

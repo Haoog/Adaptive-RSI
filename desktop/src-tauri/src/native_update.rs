@@ -4,7 +4,7 @@ use std::{fs::File, path::{Path, PathBuf}};
 use tauri_plugin_updater::UpdaterExt;
 
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
-const MAX_PACKAGE: usize = 512 * 1024 * 1024;
+pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
 
 pub(super) fn require_same_artifact(approved: &Value, current: Option<&Value>) -> Result<(), String> {
     if current == Some(approved) { Ok(()) } else { Err("update_target_changed".into()) }
@@ -29,12 +29,20 @@ where F: FnMut(&Path) -> std::io::Result<u64> {
     Ok(())
 }
 
-fn preflight_space(cache: &Path) -> Result<(), String> {
+fn preflight_space(cache: &Path, package: u64) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
     let temporary = std::env::temp_dir();
     let extraction = extraction_root(&executable, &temporary)?;
     require_space(&[cache, executable.parent().ok_or("update_disk_unavailable")?, &extraction],
-                  (MAX_PACKAGE as u64) * 3, |path| available_space(path))
+                  package.saturating_mul(3), |path| available_space(path))
+}
+
+/// Use the size announced by the feed; an unknown size keeps the conservative bound.
+pub(super) fn announced_size(feed: &Value) -> u64 {
+    feed.get("size")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0)
+        .unwrap_or(MAX_PACKAGE as u64)
 }
 
 #[cfg(unix)]
@@ -248,7 +256,7 @@ async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Va
         }
         *updater.staged.lock().unwrap() = None;
         if !download { return Ok(snapshot(&app)); }
-        preflight_space(&cache)?;
+        preflight_space(&cache, announced_size(&update.raw_json))?;
         let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(600)).build().map_err(|_| "update_check_failed")?;
         if update.download_url.scheme() != "https" { return Err("invalid_update_feed".into()); }
@@ -369,7 +377,7 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
         require_window(&window)?;
         if owned.is_none() { revalidate(&app, &approved)?; }
         let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
-        preflight_space(&cache)?;
+        preflight_space(&cache, announced_size(&approved))?;
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
         updater.set(json!({"state":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.

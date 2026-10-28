@@ -575,7 +575,10 @@ def advance(runtime, project, run, outcome, cancel=None):
         if not policy.get("enabled") and not data:
             continue
         try:
-            feedback = outcome.get("feedback") or {}
+            feedback = outcome.get("feedback")
+            if not isinstance(feedback, dict):
+                # A malformed historical receipt cannot prove verification.
+                feedback = {}
             verified = feedback.get("state") == "verified"
             # A later mainline commit passing its own checks cannot certify the merge
             # commit that will actually be built and released. Older verified receipts
@@ -676,6 +679,16 @@ def advance(runtime, project, run, outcome, cancel=None):
     return result
 
 
+def verified_feedback(run):
+    """Only a well-formed verified receipt can unlock a retry."""
+    try:
+        outcome = json.loads(run["result"] or "{}")
+    except (TypeError, ValueError):
+        return {}
+    feedback = outcome.get("feedback") if isinstance(outcome, dict) else None
+    return feedback if isinstance(feedback, dict) else {}
+
+
 def retry(runtime, project_id, run_id, kind):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
@@ -690,7 +703,7 @@ def retry(runtime, project_id, run_id, kind):
             owner = deployment_owner(runtime, project_id, repo, policy)
             if owner and owner["run"] != run_id:
                 raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
-        if json.loads(run["result"]).get("feedback", {}).get("state") != "verified":
+        if verified_feedback(run).get("state") != "verified":
             raise ValueError("Post-merge verification must pass before retrying delivery")
         data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":

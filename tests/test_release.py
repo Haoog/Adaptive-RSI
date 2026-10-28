@@ -571,6 +571,12 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
 
 
 class VerifiedArtifactReuseTest(unittest.TestCase):
+    def test_malformed_receipt_cannot_unlock_retry(self):
+        from adaptive_rsi import release
+        self.assertEqual(release.verified_feedback({"result": "{"}), {})
+        self.assertEqual(release.verified_feedback({"result": '{"feedback":"bad"}'}), {})
+        self.assertEqual(release.verified_feedback({"result": '{"feedback":{"state":"verified"}}'})["state"], "verified")
+
     def test_only_successful_release_verify_artifacts_from_main_are_reused(self):
         from scripts import release as module
         tree = "a" * 40

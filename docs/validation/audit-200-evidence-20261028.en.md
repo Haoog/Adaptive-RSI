@@ -23,7 +23,7 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 15 | Partial | Remote connection rejects API v2 | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | — |
 | 16 | Implemented | Contract CI uses a handwritten sample | [scripts/check_api_contract.py](../../scripts/check_api_contract.py) | `python3 -B scripts/check_api_contract.py` |
 | 17 | Implemented | Malformed global JSON breaks its repair response | [adaptive_rsi/server.py](../../adaptive_rsi/server.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_malformed_global_configuration_still_has_a_repair_response` |
-| 18 | Partial | Input context is capped by output capacity | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | — |
+| 18 | Implemented | Input context is capped by output capacity | [adaptive_rsi/native.py](../../adaptive_rsi/native.py) | `python3 -B -m unittest tests.test_protocols.NativeProtocolsTest.test_conversation_sends_the_model_output_limit` |
 | 19 | Implemented | Task-duration samples measure SQL | [adaptive_rsi/store.py](../../adaptive_rsi/store.py) | `python3 -B -m unittest tests.test_audit_round6.AuditRound6Test.test_task_duration_model_uses_actual_runs` |
 | 20 | Implemented | Desktop abort leaves transport running | [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) <br> [desktop/src-tauri/src/transport.rs](../../desktop/src-tauri/src/transport.rs) | `node --test tests/web_desktop_transport.cjs` <br> `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 21 | Implemented | Failed checks delay retries for six hours | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
@@ -69,14 +69,14 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 61 | Implemented | Unify desktop and engine update policy semantics | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
 | 62 | Pending | Add pausable staged rollout | — | — |
 | 63 | Pending | Respect network and power preferences | — | — |
-| 64 | Partial | Persist verified update downloads | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | — |
+| 64 | Partial | Persist verified update downloads | [desktop/src-tauri/src/main.rs](../../desktop/src-tauri/src/main.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 65 | Partial | Separate update transport deadlines | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop updater_feed_wait_can_be_cancelled_before_transport_deadline` |
 | 66 | Pending | Exercise updater key rotation | — | — |
 | 67 | Pending | Explain update compatibility requirements | — | — |
 | 68 | Pending | Publish a tested platform asset matrix | — | — |
 | 69 | Pending | Offer download bandwidth limits | — | — |
 | 70 | Pending | Explain update progress by stage | — | — |
-| 71 | Pending | Estimate space from actual assets | — | — |
+| 71 | Implemented | Estimate space from actual assets | [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs) <br> [scripts/package_desktop.py](../../scripts/package_desktop.py) | `cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop` |
 | 72 | Pending | Make desktop lifecycle preferences explicit | — | — |
 | 73 | Partial | Offer opt-in crash diagnostics | [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py) | `python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_diagnostic_preview_export_is_explicit_and_contains_no_user_text` |
 | 74 | Partial | Scope navigation preferences to runtime instances | [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) <br> [adaptive_rsi/web/desktop.js](../../adaptive_rsi/web/desktop.js) | `node tests/browser_frontend_remaining.cjs` |
@@ -84,7 +84,7 @@ Generated from the JSON ledger. Commands are replay entry points, not proof they
 | 76 | Pending | Diagnose proxy and certificate configuration | — | — |
 | 77 | Partial | Explain which components an update affects | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | — |
 | 78 | Implemented | Add update maintenance windows | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) | `node --test tests/web_native_update.cjs` |
-| 79 | Pending | Export upgrade receipts | — | — |
+| 79 | Implemented | Export upgrade receipts | [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js) <br> [adaptive_rsi/web/i18n.js](../../adaptive_rsi/web/i18n.js) | `node --test tests/web_native_update_receipt.cjs` |
 | 80 | Partial | Negotiate feature capabilities | [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) <br> [adaptive_rsi/contracts.py](../../adaptive_rsi/contracts.py) | `node tests/browser_frontend_remaining.cjs` |
 | 81 | Implemented | Support bounded dependency DAGs | [adaptive_rsi/task_dependencies.py](../../adaptive_rsi/task_dependencies.py) <br> [adaptive_rsi/migrations/006_dependency_dag.sql](../../adaptive_rsi/migrations/006_dependency_dag.sql) <br> [adaptive_rsi/store.py](../../adaptive_rsi/store.py) <br> [adaptive_rsi/web/experience.js](../../adaptive_rsi/web/experience.js) | `python3 -B -m unittest tests.test_dependency_dag` <br> `node tests/browser_dependency_dag.cjs` <br> `node --test tests/web_*.cjs` |
 | 82 | Implemented | Preview dependency cancellation effects | [adaptive_rsi/task_lifecycle.py](../../adaptive_rsi/task_lifecycle.py) <br> [adaptive_rsi/runtime.py](../../adaptive_rsi/runtime.py) <br> [adaptive_rsi/server.py](../../adaptive_rsi/server.py) <br> [adaptive_rsi/web/app.js](../../adaptive_rsi/web/app.js) | `python3 -B -m unittest tests.test_task_lifecycle` <br> `node tests/browser_task_detail.cjs` <br> `node tests/browser_revision_flow.cjs` |

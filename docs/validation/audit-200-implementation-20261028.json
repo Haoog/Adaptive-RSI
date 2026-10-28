@@ -283,12 +283,13 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "分别计算输入上下文与响应限制；合法长输入可用，超上下文输入有明确诊断。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/native.py"
       ],
-      "validation": [],
-      "residual": "Context/output separated; metadata accuracy remains."
+      "validation": [
+        "python3 -B -m unittest tests.test_protocols.NativeProtocolsTest.test_conversation_sends_the_model_output_limit"
+      ]
     },
     {
       "id": 19,
@@ -1068,10 +1069,12 @@
       "acceptance": "在下载及就绪阶段重启应用，安全恢复下载或使用已验证缓存，损坏缓存必须重下。",
       "status": "partial",
       "implementation": [
-        "desktop/src-tauri/src/native_update.rs"
+        "desktop/src-tauri/src/main.rs"
       ],
-      "validation": [],
-      "residual": "Verified complete packages persist; partial resume not implemented."
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ],
+      "residual": "Range resume keeps a .part file across restarts, ignores a server that drops Range and deletes corrupt parts; real interrupted-transfer restart evidence remains."
     },
     {
       "id": 65,
@@ -1158,9 +1161,14 @@
       },
       "source": "desktop/src-tauri/src/native_update.rs",
       "acceptance": "小包和大包的空间边界测试均通过，未知体积时保守拒绝并说明依据。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs",
+        "scripts/package_desktop.py"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ]
     },
     {
       "id": 72,
@@ -1272,9 +1280,14 @@
       },
       "source": "desktop/src-tauri/src/native_update.rs",
       "acceptance": "成功、取消及恢复均有明确记录，回执不含用户认证信息。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/web/native-update.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "node --test tests/web_native_update_receipt.cjs"
+      ]
     },
     {
       "id": 80,

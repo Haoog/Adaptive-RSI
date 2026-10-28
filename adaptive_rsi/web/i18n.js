@@ -212,6 +212,7 @@ const english = {
  "备份未完成，请重试。": "Backup did not complete. Please retry.",
  "备份已完成": "Backup completed",
  "手动下载安装包": "Download an installer manually",
+ "导出升级回执": "Export update receipt",
  "新版本已准备好": "The update is ready",
  "等待当前任务结束后更新": "Waiting for current tasks before updating",
  "正在安装更新": "Installing the update",
