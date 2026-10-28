@@ -669,11 +669,10 @@ class Handler(BaseHTTPRequestHandler):
             # Record only the route shape, never query values, bodies, headers or errors.
             if urlparse(self.path).path.startswith("/api/"):
                 try:
-                    self.server.runtime.store.execute(
-                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
-                        (request_id, "GET", urlparse(self.path).path[:300],
+                    self.server.runtime.store.record_request(
+                        request_id, "GET", urlparse(self.path).path[:300],
                          getattr(self, "_response_status", 500), started, time.time(),
-                         getattr(self, "_response_error_code", error_code)[:100]))
+                         getattr(self, "_response_error_code", error_code)[:100])
                 except Exception:
                     pass
 
@@ -853,9 +852,8 @@ class Handler(BaseHTTPRequestHandler):
             if urlparse(self.path).path.startswith("/api/"):
                 try:
                     status = getattr(self, "_response_status", 500)
-                    self.server.runtime.store.execute(
-                        "INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
-                        (self._request_id, "POST", urlparse(self.path).path[:300], status,
-                         started, time.time(), getattr(self, "_response_error_code", "internal_error")))
+                    self.server.runtime.store.record_request(
+                        self._request_id, "POST", urlparse(self.path).path[:300], status,
+                         started, time.time(), getattr(self, "_response_error_code", "internal_error"))
                 except Exception:
                     pass

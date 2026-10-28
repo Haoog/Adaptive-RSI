@@ -82,6 +82,9 @@ class Store:
         self._query_samples = deque(maxlen=128)
         self._wait_samples = deque(maxlen=512)
         self._slow_queries = deque(maxlen=20)
+        self._active_snapshots = {}
+        self._poll_log_windows = {}
+        self._request_log_counts = {"observed": 0, "persisted": 0, "sampled_out": 0, "failed": 0}
         with self.connect() as db:
             if db.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("Database schema is newer than this runtime")
@@ -378,10 +381,59 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN")
             self._read_snapshot.connection = db
+            token = uuid.uuid4().hex
+            with self._metrics_lock:
+                self._active_snapshots[token] = time.monotonic()
             try:
                 yield
             finally:
+                with self._metrics_lock:
+                    self._active_snapshots.pop(token, None)
                 self._read_snapshot.connection = None
+
+    def wal_diagnostics(self, checkpoint=False):
+        """A passive checkpoint never waits for readers or truncates their WAL."""
+        now = time.monotonic()
+        with self._metrics_lock:
+            ages = [max(0, now - started) for started in self._active_snapshots.values()]
+        result = {"active_snapshots": len(ages), "oldest_snapshot_seconds": max(ages, default=0),
+                  "snapshot_scope": "this_process", "checked_at": time.time()}
+        if checkpoint:
+            with self.connect() as db:
+                busy, pages, copied = db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                result.update(busy=bool(busy), wal_pages=pages, checkpointed_pages=copied,
+                              pending_pages=max(0, pages - copied), mode="passive")
+            self._wal_snapshot = result
+        else:
+            previous = getattr(self, "_wal_snapshot", {})
+            result.update({key: value for key, value in previous.items()
+                           if key not in ("active_snapshots", "oldest_snapshot_seconds", "checked_at", "snapshot_scope")})
+            result["checkpoint_checked_at"] = previous.get("checked_at")
+        return result
+
+    def record_request(self, request, method, path, status, started, ended, error_code=""):
+        polls = {"/api/state", "/api/events", "/api/usage", "/api/auth/status", "/api/operation"}
+        sampled = method == "GET" and path in polls and 200 <= status < 400
+        window = int(time.monotonic() // 60)
+        with self._metrics_lock:
+            self._request_log_counts["observed"] += 1
+            if sampled:
+                if self._poll_log_windows.get(path) == window:
+                    self._request_log_counts["sampled_out"] += 1
+                    return False
+                self._poll_log_windows[path] = window
+        try:
+            self.execute("INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
+                         (request, method, path[:300], status, started, ended, error_code[:100]))
+        except Exception:
+            with self._metrics_lock:
+                self._request_log_counts["failed"] += 1
+                if sampled and self._poll_log_windows.get(path) == window:
+                    self._poll_log_windows.pop(path, None)
+            raise
+        with self._metrics_lock:
+            self._request_log_counts["persisted"] += 1
+        return True
 
     def metrics(self, integrity=False):
         with self._metrics_lock:
@@ -391,6 +443,8 @@ class Store:
             values.update(wait_p50_seconds=waits[len(waits) // 2] if waits else 0,
                           wait_p95_seconds=waits[min(len(waits) - 1, int(len(waits) * .95))] if waits else 0,
                           slow_queries=list(self._slow_queries))
+            values["request_logging"] = {**self._request_log_counts, "poll_sample_seconds": 60,
+                                         "counter_scope": "this_process", "errors_and_writes": "all"}
         with self.connect() as db:
             values.update({
                 "database_bytes": self.path.stat().st_size if self.path.exists() else 0,

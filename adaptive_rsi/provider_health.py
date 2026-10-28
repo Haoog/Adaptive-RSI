@@ -184,12 +184,14 @@ class ProviderHealth:
     def require(self, config, provider, project, model=None):
         key = self.key(config, provider, project)
         now = time.time()
-        attempt = {"id": uuid.uuid4().hex, "started": now}
+        attempt = {"id": uuid.uuid4().hex, "started": now, "key": key,
+                   "account_key": "provider-account-health:" + provider + ":" + key.rsplit(":", 1)[-1],
+                   "detail_key": key + ":" + fingerprint({"model": model}) if model else None}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             state = json.loads(row[0]) if row else {"paused": False}
-            shared = db.execute("SELECT value FROM settings WHERE key=?", (self.account_key(config, provider),)).fetchone()
+            shared = db.execute("SELECT value FROM settings WHERE key=?", (attempt["account_key"],)).fetchone()
             if shared:
                 retry_at = json.loads(shared[0]).get("retry_at", 0)
                 if retry_at > state.get("retry_at", 0):
@@ -217,57 +219,83 @@ class ProviderHealth:
             error.local_admission = True
             raise error
         values = getattr(self._attempts, "values", {})
-        values[key] = attempt
+        values[(project, provider, model)] = attempt
         self._attempts.values = values
         return attempt
 
-    def record(self, config, provider, project, error=None, model=None, attempt=None):
-        code = error_code(error) if error else None
-        if getattr(error, "local_admission", False):
+    def release(self, attempt):
+        """Release only this attempt's recovery lease, including cancellation/tool failures."""
+        if not attempt or not attempt.get("key"):
             return
-        if error and code not in ["auth", "rate_limit", "timeout", "connection"]:
-            return
-        key = self.key(config, provider, project)
-        if attempt is None:
-            attempt = getattr(self._attempts, "values", {}).pop(key, None)
-        # 多项目执行线程的计数更新必须在同一事务内完成。
-        import json
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            old = json.loads(row[0]) if row else {}
-            if not error:
-                # A late success from an older attempt cannot clear a newer failure.
-                if (attempt is not None and (attempt.get("generation") != old.get("generation", 0) or
-                        old.get("half_open_owner") not in (None, attempt["id"]))) or (
-                        attempt is None and (old.get("paused") or old.get("retry_at", 0) > time.time())):
-                    value = None
+            row = db.execute("SELECT value FROM settings WHERE key=?", (attempt["key"],)).fetchone()
+            value = json.loads(row[0]) if row else {}
+            if value.get("half_open_owner") == attempt["id"]:
+                value.pop("half_open_owner", None)
+                value.pop("half_open_until", None)
+                db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), attempt["key"]))
+
+    def record(self, config, provider, project, error=None, model=None, attempt=None):
+        values = getattr(self._attempts, "values", {})
+        identity = (project, provider, model)
+        if attempt is None:
+            attempt = values.pop(identity, None)
+        elif values.get(identity, {}).get("id") == attempt.get("id"):
+            values.pop(identity, None)
+        key = attempt.get("key") if attempt else None
+        key = key or self.key(config, provider, project)
+        code = error_code(error) if error else None
+        try:
+            if getattr(error, "local_admission", False):
+                return
+            if error and code not in ["auth", "rate_limit", "timeout", "connection"]:
+                return
+            # 多项目执行线程的计数更新必须在同一事务内完成。
+            import json
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                old = json.loads(row[0]) if row else {}
+                if not error:
+                    # A late success from an older attempt cannot clear a newer failure.
+                    if (attempt is not None and (attempt.get("generation") != old.get("generation", 0) or
+                            old.get("half_open_owner") not in (None, attempt["id"]))) or (
+                            attempt is None and (old.get("paused") or old.get("retry_at", 0) > time.time())):
+                        value = None
+                    else:
+                        value = {"failures": 0, "paused": False, "code": None, "at": time.time(),
+                                 "generation": old.get("generation", 0)}
                 else:
-                    value = {"failures": 0, "paused": False, "code": None, "at": time.time(),
-                             "generation": old.get("generation", 0)}
-            else:
-                failures = old.get("failures", 0) + 1
-                value = {"failures": failures,
-                         "paused": old.get("paused", False) or failures >= 3,
-                         "code": code, "at": time.time(), "generation": old.get("generation", 0) + 1}
-            if value is not None and error and getattr(error, "retry_after", 0):
-                value["retry_at"] = time.time() + error.retry_after
-            if value is not None:
-                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
-                if code == "rate_limit" and value.get("retry_at"):
-                    shared_key = self.account_key(config, provider)
-                    prior = db.execute("SELECT value FROM settings WHERE key=?", (shared_key,)).fetchone()
-                    retry_at = max(value["retry_at"], json.loads(prior[0]).get("retry_at", 0) if prior else 0)
-                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                               (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
-        if model and value is not None:
-            detail_key = self.key(config, provider, project, model)
-            detail = self.store.setting(detail_key, {})
-            detail.update(value)
-            detail["model"] = model
-            # Detail writes are diagnostic only; the connection row above is the
-            # sole admission control and must not be overwritten after commit.
-            self.store.put_setting(detail_key, detail)
+                    failures = old.get("failures", 0) + 1
+                    value = {"failures": failures,
+                             "paused": old.get("paused", False) or failures >= 3,
+                             "code": code, "at": time.time(), "generation": old.get("generation", 0) + 1}
+                if value is not None and error and getattr(error, "retry_after", 0):
+                    value["retry_at"] = time.time() + error.retry_after
+                if value is not None:
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+                    if code == "rate_limit" and value.get("retry_at"):
+                        shared_key = attempt.get("account_key") if attempt else self.account_key(config, provider)
+                        prior = db.execute("SELECT value FROM settings WHERE key=?", (shared_key,)).fetchone()
+                        retry_at = max(value["retry_at"], json.loads(prior[0]).get("retry_at", 0) if prior else 0)
+                        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                   (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
+            if model and value is not None:
+                detail_key = (attempt.get("detail_key") if attempt else None) or key + ":" + fingerprint({"model": model})
+                detail = self.store.setting(detail_key, {})
+                detail.update(value)
+                detail["model"] = model
+                # Detail writes are diagnostic only; the connection row above is the
+                # sole admission control and must not be overwritten after commit.
+                self.store.put_setting(detail_key, detail)
+
+        finally:
+            try:
+                self.release(attempt)
+            except Exception as cleanup_error:
+                import logging
+                logging.getLogger(__name__).warning("Provider lease cleanup failed (%s)", type(cleanup_error).__name__)
 
     def reset(self, config, provider, project, model=None):
         self.store.put_setting(self.key(config, provider, project), {"failures": 0, "paused": False})

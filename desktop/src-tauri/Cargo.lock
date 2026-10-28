@@ -7,6 +7,7 @@ name = "adaptive-rsi-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "fs2",
  "minisign-verify",
  "reqwest 0.12.28",

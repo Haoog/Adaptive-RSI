@@ -12,11 +12,14 @@ def main():
         if not raw.strip():
             raise ValueError("Empty transport payload")
         response = post_json(*json.loads(raw))
-        result = {"ok": True, "response": response}
+        result = {"ok": True, "response": response,
+                  "request_id": getattr(response, "provider_request_id", None)}
     except Exception as exc:
         result = {"ok": False, "error": str(exc), "code": getattr(exc, "code", "execution"),
                   "unavailable": isinstance(exc, ProviderUnavailable),
-                  "retry_after": getattr(exc, "retry_after", 0)}
+                  "retry_after": getattr(exc, "retry_after", 0),
+                  "request_id": getattr(exc, "provider_request_id", None),
+                  "stop_reason": getattr(exc, "stop_reason", None)}
     print(json.dumps(result, ensure_ascii=False))
 
 

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -79,11 +80,28 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            for section in ("core", "core,analytics", "core,candidates"):
-                request = urllib.request.Request(server.local_origin + "/api/state?sections=" + section,
-                    headers={"Cookie": server.cookie + "=" + server.token})
+            def validate(query):
+                request = urllib.request.Request(server.local_origin + "/api/state?" + query,
+                                                 headers={"Cookie": server.cookie + "=" + server.token})
                 with urllib.request.urlopen(request, timeout=5) as response:
                     errors.extend(check_keys(json.load(response), schema, schema))
+            validate("sections=core")
+            store = runtime.store
+            for project in ("one", "two"):
+                store.execute("INSERT INTO projects VALUES (?,?,?,'{}',1,?)",
+                              (project, project, str(Path(directory) / project), time.time()))
+            for index, state in enumerate(("queued", "blocked", "completed")):
+                task = store.add_task("one", "goal", str(index), "Contract " + state)
+                store.execute("UPDATE tasks SET state=? WHERE id=?", (state, task))
+                if state != "queued":
+                    store.execute("INSERT INTO runs(id,project,task,state,result,started,ended) VALUES (?,?,?,?,?,?,?)",
+                                  ("run-" + str(index), "one", task, state,
+                                   '{' if state == "blocked" else json.dumps({"summary": "done"}),
+                                   time.time(), time.time()))
+            for query in ("project=one&sections=core", "project=one&sections=core,analytics",
+                          "project=one&sections=core,candidates", "project=one&limit=1&offset=1",
+                          "project=one&filter=history", "project=two&sections=core"):
+                validate(query)
             request = urllib.request.Request(server.local_origin + "/api/contract",
                 headers={"Cookie": server.cookie + "=" + server.token})
             with urllib.request.urlopen(request, timeout=5) as response:

@@ -154,6 +154,15 @@ def main(argv=None):
     restore_parser.add_argument("file", type=Path)
     archive_parser = sub.add_parser("archive", help="Export a private compressed database snapshot")
     archive_parser.add_argument("--max-mb", type=int, default=1024)
+    archive_parser.add_argument("--compression", type=int, choices=range(10), default=6)
+    archive_parser.add_argument("--timeout", type=int, default=300)
+    verify_archive_parser = sub.add_parser("verify-archive", help="Verify a private database archive and manifest")
+    verify_archive_parser.add_argument("file", type=Path)
+    verify_archive_parser.add_argument("--timeout", type=int, default=60)
+    recovery_parser = sub.add_parser("recover-diagnostics", help="Inspect an offline database copy without modifying the source")
+    recovery_parser.add_argument("file", type=Path)
+    recovery_parser.add_argument("--timeout", type=int, default=10)
+    recovery_parser.add_argument("--max-mb", type=int, default=1024)
     for command in ["pause", "resume", "inspect", "issues", "evolve"]:
         p = sub.add_parser(command)
         p.add_argument("project")
@@ -181,11 +190,19 @@ def main(argv=None):
             print(json.dumps(doctor(), indent=2, ensure_ascii=False))
             return
         root = args.state_dir.expanduser().resolve()
+        if args.command == "recover-diagnostics":
+            from .recovery_diagnostics import inspect_database
+            print(json.dumps(inspect_database(args.file, timeout=args.timeout, max_mb=args.max_mb)))
+            return
+        if args.command == "verify-archive":
+            from .storage_tools import verify_archive
+            print(json.dumps(verify_archive(args.file, timeout=args.timeout)))
+            return
         if args.command == "archive":
             from .storage_tools import archive
             store = Store(root)
             try:
-                print(json.dumps(archive(store, args.max_mb)))
+                print(json.dumps(archive(store, args.max_mb, compression=args.compression, timeout=args.timeout)))
             finally:
                 store.close()
             return

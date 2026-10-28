@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 48 implemented with targeted acceptance, 37 partial, and 116 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. Implementation commits and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 57 implemented with targeted acceptance, 38 partial, and 106 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -29,6 +29,18 @@ Automatic eligibility defaults to patch releases, with optional minor-within-maj
 
 Existing `v0.5.124` release assets must not be overwritten with different rebuilt bytes. A later release requires a new version, a normal PR and final validation.
 
+## Second Implementation Batch and Review
+
+- 92 targeted model-diagnostic, storage, scheduling, protocol and recovery regressions passed, as did all 338 JavaScript tests and 13 Rust desktop tests. Full Python regression is still running; these results do not replace CI on the final exact commit.
+- The API contract check uses isolated HTTP responses for empty/populated projects, pagination, history filters, sections and malformed historical evidence.
+- Successful poll logging is sampled once per route per minute; writes and errors remain complete. The real `/api/operation` GET route has regression coverage.
+- Archives add compression levels, a shared total deadline, cancellation, manifests and isolated verification. Maintenance verifies at most one due archive per cycle; damaged archives or manifests are not accepted as valid recovery points.
+- The [synthetic compression comparison](archive-budgets-20261028.json) verifies recovery at levels 0/1/6/9. This small sample shows time/size tradeoffs, not production throughput.
+- Offline recovery inspection checks a disposable database/WAL copy; source bytes and modification times remain unchanged. Cooperative budgets cannot interrupt an individual blocked filesystem call; a source changing during copying is not declared a consistent snapshot.
+- Native stop reasons and provider request IDs survive final diagnostics, including interrupted chunked responses, without cookies, authentication headers or complete response headers.
+- Scheduling adds 24-hour worker-occupancy accounting and priority for continuously waiting projects. Mixed-duration regressions pass; production waiting quantiles still require observations.
+- Read-only review findings about final-publication cancellation, the poll route, Ollama stop reasons and truncated response classification were fixed with regressions. No real application replacement, push, PR merge, formal release or local installation update has occurred.
+
 ## Original Items and Current Status
 
 1. **implemented** — Free diagnostics calls a missing method
@@ -46,7 +58,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 13. **implemented** — Wheel omits the API schema resource
 14. **implemented** — Update polling replaces active controls
 15. **partial** — Remote connection rejects API v2
-16. **pending** — Contract CI uses a handwritten sample
+16. **implemented** — Contract CI uses a handwritten sample
 17. **implemented** — Malformed global JSON breaks its repair response
 18. **partial** — Input context is capped by output capacity
 19. **implemented** — Task-duration samples measure SQL
@@ -87,7 +99,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 54. **partial** — Host file tools need path-race verification
 55. **partial** — Long searches need cooperative cancellation
 56. **partial** — Database initialization precedes runtime ownership
-57. **pending** — Polling logs may amplify database writes
+57. **implemented** — Polling logs may amplify database writes
 58. **partial** — Restored cases retain old absolute paths
 59. **partial** — Expired auth cleanup may retain an outer lock
 60. **implemented** — Deployment ownership is not shared across projects
@@ -120,7 +132,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 87. **partial** — Make batch receipts searchable and exportable
 88. **pending** — Support splitting failed task groups
 89. **pending** — Estimate queue time from actual execution
-90. **pending** — Evaluate rolling resource-based fairness
+90. **partial** — Evaluate rolling resource-based fairness
 91. **pending** — Implement resource priority and wait accounting
 92. **pending** — Add disk and memory pressure admission
 93. **pending** — Consider deadline-driven scheduling
@@ -132,16 +144,16 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 99. **partial** — Add archive restoration and relocation
 100. **pending** — Explain requirement revisions and rerun impact
 101. **pending** — Stabilize pagination under mutation
-102. **pending** — Define operation and batch receipt retention
+102. **implemented** — Define operation and batch receipt retention
 103. **implemented** — Hash backup manifests with bounded memory
 104. **implemented** — Cache or incrementally index storage usage
-105. **pending** — Budget archive compression resources
-106. **pending** — Diagnose WAL checkpoint pressure
+105. **implemented** — Budget archive compression resources
+106. **implemented** — Diagnose WAL checkpoint pressure
 107. **pending** — Set large-history performance budgets
 108. **pending** — Expand relational constraint coverage
 109. **partial** — Extend relationship auditing beyond stages
 110. **pending** — Execute migrations once per version
-111. **pending** — Add a read-only database recovery mode
+111. **implemented** — Add a read-only database recovery mode
 112. **pending** — Explain configuration changes and safe undo
 113. **pending** — Type and version settings namespaces
 114. **partial** — Trace slow SQL without sensitive parameters
@@ -149,7 +161,7 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 116. **partial** — Separate full integrity scans from live metrics
 117. **partial** — Bound backup duration and space consumption
 118. **pending** — Offer previewable reversible cleanup
-119. **pending** — Verify archive content integrity
+119. **implemented** — Verify archive content integrity
 120. **pending** — Rehearse business-level restoration
 121. **pending** — Version capability metadata with provenance
 122. **pending** — Budget and paginate tool results independently
@@ -161,10 +173,10 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 128. **pending** — Add scoped search options
 129. **pending** — Reference large tool output as artifacts
 130. **pending** — Classify retry safety for paid requests
-131. **pending** — Correlate provider request identifiers
+131. **implemented** — Correlate provider request identifiers
 132. **pending** — Add native streaming progress
 133. **pending** — Persist redacted tool traces
-134. **pending** — Preserve provider stop reasons end to end
+134. **implemented** — Preserve provider stop reasons end to end
 135. **pending** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
 137. **pending** — Price input, output and cache usage separately

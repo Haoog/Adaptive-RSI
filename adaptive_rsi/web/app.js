@@ -748,7 +748,8 @@ async function renderCapabilities(){
 const readinessNames={checks:'项目检查命令',worker:'模型执行环境',sandbox:'独立运行环境',dependencies:'项目依赖',tools:'执行工具',model:'模型连接配置',budget:'模型服务用量'};
 const failureMessages={checks:'代码检查没有通过，请查看运行与效果检查。',review:'代码评审发现了需要修改的问题，请查看评审建议。',improvement:'修改后的检查通过了，但还缺少解决问题的前后对照证据。',budget:'模型服务暂未提供本次运行所需的用量，请检查连接后重试。',credentials:'模型认证失效，请检查模型连接设置。',provider:'模型服务暂不可用，请稍后重试。',environment:'运行条件不完整，请查看运行准备检查。',baseline:'项目内容已更新，请基于最新版本重新执行。',execution:'这次执行没有完成，请展开运行详情查看原因。'};
 const failureNext={checks:'先查看失败的检查项，修正代码或补充验收条件后重试。',review:'先处理评审指出的问题，再让系统重新检查和评审。',improvement:'补充能实际运行、能证明问题已解决的验收检查。',budget:'检查模型连接和用量设置，恢复后再重试。',credentials:'检查模型连接或刷新登录凭据。',provider:'稍后重试；如果是持续故障，请切换备用模型。',environment:'检查项目依赖、执行工具和独立运行环境。',baseline:'基于最新主线重新执行，不要继续使用旧候选。',execution:'展开原始运行记录，按失败步骤修正后重试。'};
-function failureCopy(problem){return t(failureMessages[problem.code]||failureMessages.execution);}
+const stopMessages={output_limit:'模型输出达到上限，请检查输出限制后重试。',safety:'模型服务的安全策略中止了响应，请查看原始诊断并核对请求。',refusal:'模型拒绝了本次请求，请查看诊断并核对模型能力与服务策略。',paused:'模型暂停了本次响应，请查看运行诊断。',stop_sequence:'响应被停止序列提前截断，请检查模型设置。',text_only:'模型只返回了文本，未返回所需工具调用，请检查模型的工具能力。'};
+function failureCopy(problem){return t(stopMessages[problem.stop_reason]||failureMessages[problem.code]||failureMessages.execution);}
 function readinessDetail(item){
  const missing=Array.isArray(item.missing)?item.missing:[],model=item.provider&&item.model?item.provider+' / '+item.model+' · '+(item.effort||'default')+t('：'):'';
  const compatibility=String(item.reason||'').match(/^opencode_incompatible_(\d+\.\d+\.\d+)$/);

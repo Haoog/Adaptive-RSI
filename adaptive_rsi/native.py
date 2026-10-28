@@ -2,7 +2,9 @@
 import json
 import contextlib
 import concurrent.futures
+import http.client
 import os
+import re
 import stat
 import uuid
 import sys
@@ -34,10 +36,53 @@ class ProviderInterrupted(ModelFailure):
                          error_code(cause))
         self.retry_after = getattr(cause, "retry_after", 0)
         self.provider_id = getattr(cause, "provider_id", None)
+        self.provider_request_id = getattr(cause, "provider_request_id", None)
+
+
+def response_stop_reason(protocol, response):
+    """Normalize only known stop signals; never persist provider-generated prose."""
+    raw = response.get("stop_reason") or response.get("finishReason") or response.get("done_reason")
+    choices = response.get("choices") or response.get("candidates")
+    first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    raw = raw or first.get("finish_reason") or first.get("finishReason")
+    if protocol == "responses":
+        detail = response.get("incomplete_details")
+        raw = (detail.get("reason") if isinstance(detail, dict) else None) or raw or response.get("status")
+        output = response.get("output")
+        for item in output if isinstance(output, list) else []:
+            content = item.get("content") if isinstance(item, dict) else None
+            if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "refusal" for part in content):
+                return "refusal"
+    feedback = response.get("promptFeedback")
+    if isinstance(feedback, dict) and feedback.get("blockReason"):
+        return "safety"
+    message = first.get("message")
+    if isinstance(message, dict) and message.get("refusal"):
+        return "refusal"
+    if not isinstance(raw, str):
+        return "text_only"
+    return {"max_tokens": "output_limit", "max_output_tokens": "output_limit", "length": "output_limit",
+            "MAX_TOKENS": "output_limit", "content_filter": "safety", "SAFETY": "safety",
+            "RECITATION": "safety", "BLOCKLIST": "safety", "PROHIBITED_CONTENT": "safety",
+            "refusal": "refusal", "pause_turn": "paused", "stop_sequence": "stop_sequence",
+            "end_turn": "text_only", "stop": "text_only", "STOP": "text_only",
+            "completed": "text_only"}.get(raw, "unknown")
 
 
 class ArgumentsError(ValueError):
     """Arguments of one tool call could not be parsed; reported back to the model instead of failing the run."""
+
+
+class ModelResponse(dict):
+    provider_request_id = None
+
+
+def provider_request_id(headers):
+    for key in ("x-request-id", "request-id", "x-goog-request-id", "x-amzn-requestid"):
+        value = headers.get(key) if headers else None
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            return value
+    return None
 
 
 def parse_arguments(name, raw):
@@ -82,22 +127,46 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
                        if envelope.get("unavailable") else
                        ModelFailure(envelope.get("error", "Model failure"), envelope.get("code")))
             problem.retry_after = envelope.get("retry_after", 0)
+            problem.provider_request_id = provider_request_id({"x-request-id": envelope.get("request_id")})
+            stop_reason = envelope.get("stop_reason")
+            if isinstance(stop_reason, str) and stop_reason in {"output_limit", "safety", "refusal", "paused", "stop_sequence", "text_only", "unknown"}:
+                problem.stop_reason = stop_reason
             raise problem
-        return envelope["response"]
+        value = envelope["response"]
+        if not isinstance(value, dict):
+            problem = ModelFailure("Model API response must be an object", "tool_format")
+            problem.provider_request_id = provider_request_id({"x-request-id": envelope.get("request_id")})
+            raise problem
+        value = ModelResponse(value)
+        value.provider_request_id = provider_request_id({"x-request-id": envelope.get("request_id")})
+        return value
     request = urllib.request.Request(url, json.dumps(payload).encode(),
                                      {"Content-Type": "application/json", **headers})
+    request_id = None
     try:
         with urllib.request.build_opener(NoRedirect).open(request, timeout=timeout) as response:
+            request_id = provider_request_id(response.headers)
             raw = response.read(max_bytes + 1)
         if len(raw) > max_bytes:
-            raise RuntimeError("Model response exceeds output limit")
-        return json.loads(raw)
+            problem = ModelFailure("Model response exceeds output limit", "tool_format")
+            problem.stop_reason = "output_limit"
+            problem.provider_request_id = request_id
+            raise problem
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            problem = ModelFailure("Model API response must be an object", "tool_format")
+            problem.provider_request_id = request_id
+            raise problem
+        value = ModelResponse(value)
+        value.provider_request_id = request_id
+        return value
     except urllib.error.HTTPError as exc:
         # Provider error bodies may echo authentication headers or private prompts.
         error = "Model API HTTP " + str(exc.code)
         problem = http_failure(error + "; check endpoint, credentials and model capabilities", exc.code)
         if exc.code in [404, 429, 502, 503, 504]:
             problem = ProviderUnavailable(error, problem.code)
+        problem.provider_request_id = provider_request_id(exc.headers)
         from email.utils import parsedate_to_datetime
         retry = exc.headers.get("Retry-After", "") if exc.headers else ""
         try:
@@ -111,13 +180,23 @@ def post_json(url, payload, headers, timeout, max_bytes, cancel=None):
             pass
         raise problem from None
     except (TimeoutError, ):
-        raise ProviderUnavailable("Model API connection timed out", "timeout") from None
+        problem = ProviderUnavailable("Model API connection timed out", "timeout")
+        problem.provider_request_id = request_id
+        raise problem from None
+    except http.client.HTTPException:
+        problem = ProviderUnavailable("Model API response connection was interrupted", "connection")
+        problem.provider_request_id = request_id
+        raise problem from None
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         code = "timeout" if isinstance(reason, TimeoutError) else "connection"
-        raise ProviderUnavailable("Model API connection failed or timed out", code) from None
+        problem = ProviderUnavailable("Model API connection failed or timed out", code)
+        problem.provider_request_id = request_id
+        raise problem from None
     except ValueError:
-        raise RuntimeError("Model API did not return valid JSON") from None
+        problem = ModelFailure("Model API did not return valid JSON", "tool_format")
+        problem.provider_request_id = request_id
+        raise problem from None
 
 
 def tools_for(role):
@@ -558,23 +637,29 @@ class NativeAgent:
             call = self.store.reserve_call(project, run, role, route, config)
             started = time.monotonic()
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
+            response = None
             try:
                 request_args = (provider["base_url"].rstrip("/") + suffix, payload, headers, min(timeout, remaining), max_bytes)
                 response = post_json(*request_args, **({"cancel": cancel} if cancel is not None else {}))
+                request_id = getattr(response, "provider_request_id", None)
+                if request_id:
+                    self.store.event("model_response", "Model provider response received", project, run,
+                                     {"call": call, "provider_request_id": request_id})
                 # A malformed/blocked response can still contain billable usage.
                 from .usage import native_usage
                 self.store.record_usage(call, run, native_usage(protocol, response), time.monotonic() - started)
-                calls, tokens = conversation.receive(response)
+                reason = response_stop_reason(protocol, response)
+                try:
+                    calls, tokens = conversation.receive(response)
+                except RuntimeError as exc:
+                    exc.stop_reason = reason
+                    raise
                 if tokens < 0:
                     raise ValueError("Invalid token usage")
                 if cancel and cancel():
                     raise Cancelled("Cancelled after model response")
                 tools.remaining()
                 if not calls:
-                    stop_reason = (response.get("stop_reason") or response.get("finishReason") or
-                                   (response.get("choices") or [{}])[0].get("finish_reason") or
-                                   (response.get("candidates") or [{}])[0].get("finishReason"))
-                    reason = "text_only" if not stop_reason else str(stop_reason)[:80]
                     error = RuntimeError("Model did not return supported tool calls; text-only models cannot execute this role")
                     error.code = "tool_format"
                     error.stop_reason = reason
@@ -622,11 +707,16 @@ class NativeAgent:
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             except ProviderUnavailable as exc:
+                if getattr(exc, "provider_request_id", None):
+                    self.store.event("model_response", "Model provider request failed", project, run,
+                                     {"call": call, "provider_request_id": exc.provider_request_id})
                 self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
                 if tools.changed:
                     raise ProviderInterrupted(exc) from None
                 raise
             except Exception as exc:
+                if getattr(response, "provider_request_id", None):
+                    exc.provider_request_id = response.provider_request_id
                 if not getattr(exc, "failure_code", None) and not isinstance(exc, Cancelled):
                     exc.failure_code = "execution"
                     exc.code = "tool_format"

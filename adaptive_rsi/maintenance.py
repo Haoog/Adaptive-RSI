@@ -1,7 +1,9 @@
 """Background artifact retention and bounded state maintenance."""
 import json
+import sqlite3
 import threading
 import time
+import zlib
 from pathlib import Path
 
 
@@ -178,4 +180,20 @@ class Maintenance:
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))
+        # Passive checkpoint yields to readers; archive checks are capped per cycle.
+        self.store.wal_diagnostics(checkpoint=True)
+        from .storage_tools import verify_archive
+        for path in sorted((self.store.root / "archives").glob("*.sqlite3.gz")):
+            if path.is_symlink():
+                continue
+            key = "archive-verification:" + path.name
+            previous = self.store.setting(key, {})
+            if isinstance(previous, dict) and now - previous.get("checked_at", 0) < 7 * 86400:
+                continue
+            try:
+                report = verify_archive(path, timeout=5)
+            except (OSError, ValueError, TimeoutError, sqlite3.Error, EOFError, zlib.error) as exc:
+                report = {"valid": False, "checked_at": now, "error_type": type(exc).__name__}
+            self.store.put_setting(key, report)
+            break
         self.store.put_setting("maintenance-last", now)

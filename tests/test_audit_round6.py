@@ -516,3 +516,502 @@ class AuditRound6Test(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 future.result(timeout=3)
             self.assertTrue(closed.wait(2))
+
+    def test_rotated_credentials_do_not_receive_old_inflight_failures(self):
+        credentials = Credentials(self.store.root)
+        provider = {"id": "gateway", "credential": "session", "secret_ref": "c" * 32}
+        config = copy.deepcopy(DEFAULTS)
+        config["providers"] = [provider]
+        health = ProviderHealth(self.store)
+        for code in ("auth", "rate_limit"):
+            credentials.put(provider["secret_ref"], "session", "old-fixture-key")
+            attempt = health.require(config, "gateway", "p", "model")
+            credentials.put(provider["secret_ref"], "session", "fresh-fixture-key")
+            error = ModelFailure("fixture failure", code)
+            error.retry_after = 100 if code == "rate_limit" else 0
+            health.record(config, "gateway", "p", error, "model", attempt=attempt)
+            self.assertEqual(health.status(config, "gateway", "p")["failures"], 0)
+            self.assertTrue(health.admission(config, "gateway", "p")["ready"])
+            self.assertEqual(self.store.setting(attempt["key"])["code"], code)
+
+    def test_recovery_lease_is_released_after_nonprovider_failures_and_cancellation(self):
+        from adaptive_rsi.agent import CodexAgent
+        from adaptive_rsi.process import Cancelled
+        config = copy.deepcopy(DEFAULTS)
+        config["recovery"]["provider_retry_minutes"] = 1
+        key = ProviderHealth(self.store).key(config, "openai", "p")
+        for error in (ModelFailure("missing", "model_missing"), ModelFailure("format", "tool_format"), Cancelled("fixture cancelled")):
+            self.store.put_setting(key, {"paused": True, "failures": 3, "code": "timeout", "at": time.time() - 120})
+            with patch.object(CodexAgent, "_invoke", side_effect=error):
+                with self.assertRaises(type(error)):
+                    CodexAgent(self.store).invoke("analysis", "fixture", self.root, "p", "unused", config)
+            health = ProviderHealth(self.store)
+            self.assertTrue(health.admission(config, "openai", "p")["ready"])
+            state = health.status(config, "openai", "p")
+            self.assertNotIn("half_open_owner", state)
+            self.assertEqual(state["failures"], 3)
+
+    def test_model_preferences_survive_credential_rotation_without_old_verification(self):
+        center = self.runtime.model_center
+        provider = {"id": "gateway", "credential": "session", "secret_ref": "d" * 32}
+        center.credentials.put(provider["secret_ref"], "session", "first-fixture-key")
+        with patch.object(center, "provider", return_value=provider):
+            center.edit_model("gateway", {"id": "manual-model", "name": "Personal model", "manual": True,
+                                         "favorite": True, "unit_price": 2.5}, "p")
+        old_key = center.key(provider, "p")
+        directory = center.directory(provider, "p")
+        directory["models"][0]["verified"] = {"at": time.time()}
+        center._save_directory(old_key, provider, "p", directory)
+        center.credentials.put(provider["secret_ref"], "session", "second-fixture-key")
+        models = center.directory(provider, "p")["models"]
+        self.assertEqual(len(models), 1)
+        self.assertEqual((models[0]["name"], models[0]["favorite"], models[0]["unit_price"]), ("Personal model", True, 2.5))
+        self.assertNotIn("verified", models[0])
+        self.assertTrue(self.store.setting(old_key)["models"][0]["verified"])
+
+    def test_global_repair_invalidates_old_global_and_inherited_project_revisions(self):
+        self.store.put_setting("config", {"unsupported": True})
+        global_before, project_before = self.store.config_revision(), self.store.config_revision("p")
+        self.runtime.repair_global_config("reset-invalid-global-config")
+        self.assertGreater(self.store.config_revision(), global_before)
+        self.assertGreater(self.store.config_revision("p"), project_before)
+        for project, revision in ((None, global_before), ("p", project_before)):
+            with self.assertRaisesRegex(ValueError, "changed in another window"):
+                self.runtime.configure({"schedule": {"weight": 2}}, project, expected_revision=revision)
+
+    def test_health_cleanup_faults_do_not_replace_user_cancellation(self):
+        from adaptive_rsi.agent import CodexAgent
+        from adaptive_rsi.process import Cancelled
+        for operation in ("record", "release"):
+            with patch.object(CodexAgent, "_invoke", side_effect=Cancelled("user cancelled")), patch.object(
+                    ProviderHealth, operation, side_effect=sqlite3.OperationalError("injected unavailable database")):
+                with self.assertLogs(level="WARNING"), self.assertRaises(Cancelled):
+                    CodexAgent(self.store).invoke("analysis", "fixture", self.root, "p", "unused", DEFAULTS)
+
+
+class AuditStorageBudgetsTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.store = Store(Path(temporary.name) / 'state')
+        self.addCleanup(self.store.close)
+
+    def test_archive_manifest_verifies_and_detects_corruption(self):
+        from adaptive_rsi.storage_tools import archive, verify_archive
+        self.store.event('audit', 'preserved evidence')
+        report = archive(self.store, compression=1)
+        path = Path(report['path'])
+        self.assertTrue(verify_archive(path)['valid'])
+        self.assertEqual(report['compression'], 1)
+        self.assertGreaterEqual(report['seconds'], 0)
+        self.assertEqual(Path(report['manifest']).stat().st_mode & 0o777, 0o600)
+        with path.open('r+b') as stream:
+            stream.seek(20)
+            original = stream.read(1)
+            stream.seek(20)
+            stream.write(bytes([original[0] ^ 1]))
+        with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+            verify_archive(path)
+        self.assertEqual(self.store.one('SELECT message FROM events')['message'], 'preserved evidence')
+
+    def test_cancelled_archive_does_not_publish_or_delete_history(self):
+        from adaptive_rsi.process import Cancelled
+        from adaptive_rsi.storage_tools import archive
+        calls = []
+        def cancelled():
+            calls.append(1)
+            return len(calls) > 2
+        with self.assertRaises(Cancelled):
+            archive(self.store, cancel=cancelled)
+        self.assertEqual(list((self.store.root / 'archives').glob('*.gz')), [])
+        self.assertEqual(list((self.store.root / 'archives').glob('*.manifest.json')), [])
+        self.assertEqual(list((self.store.root / 'archives').glob('.archive-*')), [])
+
+    def test_manifest_size_and_expansion_budget_are_enforced(self):
+        from adaptive_rsi.storage_tools import archive, verify_archive
+        report = archive(self.store)
+        manifest = Path(report['manifest'])
+        data = json.loads(manifest.read_text())
+        data['source_bytes'] = 1
+        manifest.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'expanded size'):
+            verify_archive(report['path'])
+        manifest.write_text(' ' * 16385)
+        with self.assertRaisesRegex(ValueError, 'too large'):
+            verify_archive(report['path'])
+
+    def test_archive_publication_failure_preserves_existing_manifest(self):
+        from adaptive_rsi.storage_tools import archive, backup
+        snapshot = backup(self.store)
+        manifest = self.store.root / 'archives' / (snapshot['id'] + '.sqlite3.gz.manifest.json')
+        manifest.parent.mkdir()
+        manifest.write_text('existing evidence')
+        with patch('adaptive_rsi.storage_tools.backup', return_value=snapshot):
+            with self.assertRaises(FileExistsError):
+                archive(self.store)
+        self.assertEqual(manifest.read_text(), 'existing evidence')
+
+    def test_cancellation_during_manifest_sync_prevents_publication(self):
+        from adaptive_rsi.storage_tools import archive
+        from adaptive_rsi.process import Cancelled
+        cancelled = threading.Event()
+        fsync = os.fsync
+        calls = []
+        def sync(fd):
+            fsync(fd)
+            calls.append(fd)
+            if len(calls) == 2:
+                cancelled.set()
+        with patch('adaptive_rsi.storage_tools.os.fsync', side_effect=sync):
+            with self.assertRaises(Cancelled):
+                archive(self.store, cancel=cancelled.is_set)
+        self.assertEqual(list((self.store.root / 'archives').iterdir()), [])
+
+    def test_passive_checkpoint_reports_reader_pin_without_waiting(self):
+        self.store.event('before', 'first')
+        self.store.wal_diagnostics(checkpoint=True)
+        with self.store.snapshot():
+            self.store.query('SELECT * FROM events')
+            worker = threading.Thread(target=lambda: self.store.event('after', 'second'))
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            report = self.store.wal_diagnostics(checkpoint=True)
+            self.assertEqual(report['active_snapshots'], 1)
+            self.assertGreater(report['pending_pages'], 0)
+            self.assertEqual(report['mode'], 'passive')
+        report = self.store.wal_diagnostics(checkpoint=True)
+        self.assertEqual(report['active_snapshots'], 0)
+        self.assertEqual(report['pending_pages'], 0)
+
+
+class AuditModelDiagnosticsTest(unittest.TestCase):
+    def test_stop_reason_matrix_survives_recovery_and_is_not_provider_prose(self):
+        from adaptive_rsi.native import response_stop_reason
+        from adaptive_rsi.recovery import failure
+        samples = [
+            ('anthropic', {'stop_reason': 'max_tokens'}, 'output_limit'),
+            ('chat_completions', {'choices': [{'finish_reason': 'length'}]}, 'output_limit'),
+            ('responses', {'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'}}, 'output_limit'),
+            ('responses', {'output': [{'content': [{'type': 'refusal', 'refusal': 'private text'}]}]}, 'refusal'),
+            ('gemini', {'promptFeedback': {'blockReason': 'SAFETY'}}, 'safety'),
+            ('gemini', {'candidates': [{'finishReason': 'MAX_TOKENS'}]}, 'output_limit'),
+            ('chat_completions', {'choices': [{'message': {'refusal': 'private text'}}]}, 'refusal'),
+            ('ollama', {'message': {'content': 'plain'}}, 'text_only'),
+            ('ollama', {'done_reason': 'length', 'message': {'content': 'partial'}}, 'output_limit'),
+            ('anthropic', {'stop_reason': 'private unexpected provider text'}, 'unknown'),
+            ('gemini', {'candidates': [None]}, 'text_only'),
+        ]
+        for protocol, response, expected in samples:
+            with self.subTest(protocol=protocol, response=response):
+                error = RuntimeError('No valid tool calls')
+                error.stop_reason = response_stop_reason(protocol, response)
+                result = failure(error)
+                self.assertEqual(result['stop_reason'], expected)
+                self.assertNotIn('private', json.dumps(result))
+
+    def test_native_failure_keeps_stop_reason_through_actual_adapter(self):
+        from types import SimpleNamespace
+        from adaptive_rsi.native import NativeAgent
+        from adaptive_rsi.recovery import failure
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = SimpleNamespace(root=root, reserve_call=lambda *a: 'c', record_usage=lambda *a: None,
+                                   event=lambda *a: None, execute=lambda *a: None)
+            with patch('adaptive_rsi.native.Credentials') as credentials, patch('adaptive_rsi.native.post_json',
+                    return_value={'choices': [{'finish_reason': 'length', 'message': {'content': 'partial'}}]}):
+                credentials.return_value.get.return_value = None
+                with self.assertRaises(RuntimeError) as raised:
+                    NativeAgent(fake).invoke('planning', 'test', root, 'p', 'r',
+                        {'limits': {'max_output_mb': 1, 'command_seconds': 60}},
+                        {'model': 'test', 'effort': 'default'},
+                        {'id': 'test', 'protocol': 'chat_completions', 'base_url': 'https://invalid.example'})
+                self.assertEqual(failure(raised.exception)['action'], 'adjust_output_limit')
+
+    def test_request_id_survives_real_http_and_worker_envelope(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from adaptive_rsi.native import post_json, ProviderUnavailable
+        from adaptive_rsi.recovery import failure
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                self.send_response(429 if self.path == '/limited' else 200)
+                self.send_header('x-request-id', 'request-123')
+                self.send_header('Set-Cookie', 'private-cookie')
+                if self.path == '/truncated':
+                    self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                if self.path == '/truncated':
+                    self.wfile.write(b'4\r\nab')
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.wfile.write({'/list': b'[]', '/null': b'null', '/bad': b'{',
+                                  '/large': b' ' * 1025}.get(self.path, b'{}'))
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = 'http://127.0.0.1:' + str(server.server_port)
+            for cancel in (None, lambda: False):
+                response = post_json(url, {}, {}, 5, 1024, cancel=cancel)
+                self.assertEqual(response.provider_request_id, 'request-123')
+                self.assertEqual(dict(response), {})
+                with self.assertRaises(ProviderUnavailable) as raised:
+                    post_json(url + '/limited', {}, {}, 5, 1024, cancel=cancel)
+                evidence = failure(raised.exception)
+                self.assertEqual(evidence['provider_request_id'], 'request-123')
+                self.assertNotIn('private-cookie', json.dumps(evidence))
+                with self.assertRaises(ProviderUnavailable) as interrupted:
+                    post_json(url + '/truncated', {}, {}, 5, 1024, cancel=cancel)
+                self.assertEqual(interrupted.exception.code, 'connection')
+                self.assertEqual(interrupted.exception.provider_request_id, 'request-123')
+                for path in ('/list', '/null', '/bad', '/large'):
+                    with self.assertRaises(RuntimeError) as invalid:
+                        post_json(url + path, {}, {}, 5, 1024, cancel=cancel)
+                    evidence = failure(invalid.exception)
+                    self.assertEqual(evidence['provider_request_id'], 'request-123')
+                    self.assertNotIn('private-cookie', json.dumps(evidence))
+                    if path == '/large':
+                        self.assertEqual(evidence['stop_reason'], 'output_limit')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+
+class AuditRequestSamplingTest(unittest.TestCase):
+    def test_operation_polling_uses_the_real_get_route(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        runtime = Runtime(Store(temporary.name), agent=object())
+        self.addCleanup(runtime.close)
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        def close():
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+        self.addCleanup(close)
+        with patch.object(runtime.operations, 'get', return_value={'state': 'running'}):
+            for _ in range(10):
+                request = urllib.request.Request(server.local_origin + '/api/operation?id=private-id',
+                    headers={'Cookie': server.cookie + '=' + server.token})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    json.load(response)
+        deadline = time.monotonic() + 2
+        while runtime.store.metrics()['request_logging']['observed'] < 10 and time.monotonic() < deadline:
+            time.sleep(.01)
+        rows = runtime.store.query('SELECT path FROM request_log')
+        self.assertEqual(rows, [{'path': '/api/operation'}])
+
+    def test_poll_sampling_reduces_writes_and_keeps_all_errors_and_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                with patch('adaptive_rsi.store.time.monotonic', return_value=60):
+                    for index in range(100):
+                        store.record_request(str(index), 'GET', '/api/state', 200, 1, 2)
+                    for index, method, status in ((100, 'GET', 500), (101, 'POST', 200), (102, 'GET', 429)):
+                        store.record_request(str(index), method, '/api/state', status, 1, 2, 'test_error')
+                self.assertEqual(store.one('SELECT count(*) AS n FROM request_log')['n'], 4)
+                with patch('adaptive_rsi.store.time.monotonic', return_value=121):
+                    self.assertTrue(store.record_request('next', 'GET', '/api/state', 200, 1, 2))
+                counters = store.metrics()['request_logging']
+                self.assertEqual(counters['observed'], 104)
+                self.assertEqual(counters['sampled_out'], 99)
+                self.assertEqual(counters['persisted'], 5)
+            finally:
+                store.close()
+
+    def test_failed_log_write_does_not_suppress_next_poll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                with patch.object(store, 'execute', side_effect=sqlite3.OperationalError('disk full')):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        store.record_request('failed', 'GET', '/api/state', 200, 1, 2)
+                self.assertTrue(store.record_request('retry', 'GET', '/api/state', 200, 1, 2))
+                self.assertEqual(store.metrics()['request_logging']['failed'], 1)
+            finally:
+                store.close()
+
+
+class AuditMaintenanceRetentionTest(unittest.TestCase):
+    def test_old_finished_receipts_expire_but_unknown_and_active_survive(self):
+        import contextlib
+        from types import SimpleNamespace
+        from adaptive_rsi.maintenance import Maintenance
+        from adaptive_rsi.storage_tools import archive
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            try:
+                old = time.time() - 100 * 86400
+                store.execute('CREATE TABLE operations(id TEXT,state TEXT,ended REAL)')
+                for name, state in [('finished', 'completed'), ('unknown', 'unknown'), ('active', 'running')]:
+                    store.execute('INSERT INTO operations VALUES (?,?,?)', (name, state, old))
+                    store.put_setting('batch:p:' + name, {'created': old, 'complete': state == 'completed'})
+                    store.put_setting('batch:p:' + name + ':item', {'state': state})
+                report = archive(store)
+                fake = SimpleNamespace(store=store, dispatch_lock=threading.RLock(),
+                    scheduler_scope=lambda *a, **k: contextlib.nullcontext(), config=lambda p: {'providers': []},
+                    model_center=SimpleNamespace(cleanup_credentials=lambda: None, key=lambda *a: 'unused'))
+                Maintenance.maintenance(fake)
+                self.assertIsNone(store.setting('batch:p:finished'))
+                self.assertIsNone(store.setting('batch:p:finished:item'))
+                for name in ('unknown', 'active'):
+                    self.assertIsNotNone(store.setting('batch:p:' + name))
+                    self.assertIsNotNone(store.one('SELECT id FROM operations WHERE id=?', (name,)))
+                self.assertIsNone(store.one("SELECT id FROM operations WHERE id='finished'"))
+                check = store.setting('archive-verification:' + Path(report['path']).name)
+                self.assertTrue(check['valid'])
+                self.assertEqual(store.wal_diagnostics()['mode'], 'passive')
+            finally:
+                store.close()
+
+
+class AuditResourceFairnessTest(unittest.TestCase):
+    setUp = AuditRound6Test.setUp
+
+    def test_dispatch_accounts_for_recent_duration_not_attempt_count(self):
+        import concurrent.futures
+        now = time.time()
+        self.store.execute("INSERT INTO projects VALUES ('q','other',?,'{}',0,?)",
+                           (str(self.root / 'other'), now))
+        for project in ('p', 'q'):
+            self.runtime.pause(project, False)
+            self.runtime.goal(project, 'work')
+        self.runtime.configure({'limits': {'concurrency': 1}})
+        for project, seconds in (('p', 600), ('q', 10)):
+            task = self.store.add_task(project, 'goal', 'historic', 'finished')
+            self.store.execute('INSERT INTO runs(id,project,task,state,started,ended) VALUES (?,?,?,\'completed\',?,?)',
+                               ('old-' + project, project, task, now - seconds, now))
+        selected = []
+        class Pool:
+            def submit(_, fn, run):
+                selected.append(run['project'])
+                return concurrent.futures.Future()
+        eligible = [(self.runtime.project(p), self.runtime.config(p)) for p in ('p', 'q')]
+        with patch.object(self.runtime, 'pool', Pool()):
+            self.runtime.dispatch(eligible)
+        self.assertEqual(selected, ['q'])
+        accounting = self.store.setting('fair-accounting')
+        self.assertEqual(accounting['window_seconds'], 86400)
+        self.assertEqual({row['project']: row['seconds'] for row in accounting['projects']}, {'p': 600, 'q': 10})
+
+    def test_continuously_waiting_project_is_not_hidden_by_resource_debt(self):
+        import concurrent.futures
+        now = time.time()
+        self.store.execute("INSERT INTO projects VALUES ('q','other',?,'{}',0,?)",
+                           (str(self.root / 'other'), now))
+        for project in ('p', 'q'):
+            self.runtime.pause(project, False)
+            self.runtime.goal(project, 'work')
+        self.runtime.configure({'limits': {'concurrency': 1}})
+        self.store.put_setting('fair-waiting', {'p': now - 4000, 'q': now})
+        old = self.store.add_task('p', 'goal', 'historic', 'finished')
+        self.store.execute("INSERT INTO runs(id,project,task,state,started,ended) VALUES ('cost','p',?,'completed',?,?)",
+                           (old, now - 20000, now))
+        selected = []
+        class Pool:
+            def submit(_, fn, run):
+                selected.append(run['project'])
+                return concurrent.futures.Future()
+        with patch.object(self.runtime, 'pool', Pool()):
+            self.runtime.dispatch([(self.runtime.project(p), self.runtime.config(p)) for p in ('p', 'q')])
+        self.assertEqual(selected, ['p'])
+
+
+class AuditResourceWorkloadTest(unittest.TestCase):
+    setUp = AuditRound6Test.setUp
+
+    def test_long_and_short_jobs_receive_weighted_worker_time(self):
+        import concurrent.futures
+        now = time.time()
+        self.store.execute("INSERT INTO projects VALUES ('q','short',?,'{}',0,?)",
+                           (str(self.root / 'other'), now))
+        self.runtime.configure({'limits': {'concurrency': 1}})
+        for project, weight in (('p', 1), ('q', 3)):
+            self.runtime.pause(project, False)
+            self.runtime.configure({'schedule': {'weight': weight}}, project)
+            for index in range(80):
+                self.runtime.goal(project, 'job ' + str(index))
+        used = {'p': 0, 'q': 0}
+        class Pool:
+            def submit(_, fn, run):
+                seconds = 30 if run['project'] == 'p' else 2
+                used[run['project']] += seconds
+                self.store.transition(run['id'], 'completed', {}, True)
+                self.store.execute('UPDATE runs SET started=?,ended=? WHERE id=?',
+                                   (now - seconds, now, run['id']))
+                future = concurrent.futures.Future()
+                future.set_result(None)
+                return future
+        eligible = [(self.runtime.project(p), self.runtime.config(p)) for p in ('p', 'q')]
+        with patch.object(self.runtime, 'pool', Pool()):
+            for _ in range(80):
+                self.runtime.futures.clear()
+                self.runtime.dispatch(eligible)
+        self.assertGreater(used['p'], 0)
+        self.assertGreater(used['q'], used['p'])
+        self.assertLessEqual(abs(used['p'] - used['q'] / 3), 30)
+
+
+class AuditOfflineRecoveryTest(unittest.TestCase):
+    def test_readonly_and_damaged_sources_are_not_modified(self):
+        from adaptive_rsi.recovery_diagnostics import inspect_database
+        from adaptive_rsi.storage_tools import file_digest
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'state')
+            store.put_setting('private-key', 'SECRET-CONTENT-DO-NOT-EXPORT')
+            path = store.path
+            store.close()
+            os.chmod(path, 0o400)
+            before = (file_digest(path), path.stat().st_mtime_ns)
+            report = inspect_database(path)
+            self.assertEqual(report['integrity'], 'ok')
+            self.assertEqual(before, (file_digest(path), path.stat().st_mtime_ns))
+            self.assertFalse(report['source_modified'])
+            self.assertNotIn('SECRET-CONTENT', json.dumps(report))
+            self.assertTrue(any(table.get('table') == 'settings' and table.get('rows') for table in report['tables']))
+            damaged = Path(directory) / 'damaged.sqlite3'
+            damaged.write_bytes(b'not a database at all')
+            before = file_digest(damaged)
+            report = inspect_database(damaged)
+            self.assertTrue(report['errors'])
+            self.assertEqual(file_digest(damaged), before)
+
+    def test_recovery_copy_includes_wal_without_creating_source_sidecars(self):
+        from adaptive_rsi.recovery_diagnostics import inspect_database
+        from adaptive_rsi.storage_tools import file_digest
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / 'state')
+            try:
+                store.event('wal-evidence', 'private payload')
+                paths = list(store.root.glob('state.sqlite3*'))
+                before = {path.name: (file_digest(path), path.stat().st_mtime_ns) for path in paths}
+                report = inspect_database(store.path)
+                self.assertTrue(report['consistent_source'])
+                self.assertEqual(report['integrity'], 'ok')
+                self.assertEqual(next(row['rows'] for row in report['tables'] if row['table'] == 'events'), 1)
+                after = {path.name: (file_digest(path), path.stat().st_mtime_ns)
+                         for path in store.root.glob('state.sqlite3*')}
+                self.assertEqual(before, after)
+                self.assertNotIn('private payload', json.dumps(report))
+            finally:
+                store.close()
+
+    def test_recovery_inspection_rejects_links_and_oversized_sources(self):
+        from adaptive_rsi.recovery_diagnostics import inspect_database
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source'
+            source.write_bytes(b'x' * (1024 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, 'capacity'):
+                inspect_database(source, max_mb=1)
+            link = Path(directory) / 'link'
+            link.symlink_to(source)
+            with self.assertRaises(OSError):
+                inspect_database(link)

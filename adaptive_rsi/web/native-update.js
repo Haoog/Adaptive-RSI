@@ -1,8 +1,9 @@
 'use strict';
 window.RSINativeUpdate=(()=>{
  const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
- const errors={updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。'};
- let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false;
+ const errors={update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。'};
+ let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0;
+ const failureCounts={};
  let policy=localRead('rsi-native-update-policy')||'download';
  let versionScope=localRead('rsi-native-update-scope')||'patch',installWindow=localRead('rsi-native-update-window')||'any';
  const enabled=()=>!!window.RSIDesktop;
@@ -18,7 +19,7 @@ window.RSINativeUpdate=(()=>{
    const option=el('option');option.value=value;select.append(option);options.push([option,text]);
   }
   select.value=policy;
-  select.onchange=()=>{policy=select.value;storageError=false;persist('rsi-native-update-policy',policy);render();};
+  select.onchange=()=>{policy=select.value;if(policy==='manual'&&busy)window.RSIDesktop.invoke('native_update',{action:'cancel'}).catch(()=>{});storageError=false;persist('rsi-native-update-policy',policy);render();};
   label.append(labelText,select);
   const scopeLabel=el('label'),scopeText=el('span'),scopeSelect=el('select'),scopeOptions=[];
   for(const [value,text] of [['patch','仅补丁版本'],['minor','同主版本内更新'],['stable','所有稳定版本']]){const option=el('option');option.value=value;scopeSelect.append(option);scopeOptions.push([option,text]);}
@@ -73,29 +74,37 @@ window.RSINativeUpdate=(()=>{
   date=date||new Date();
   return installWindow==='night'?(date.getHours()>=22||date.getHours()<6):installWindow==='weekend'?[0,6].includes(date.getDay()):false;
  }
- async function run(action){
+ async function run(action,automatic=false){
   if(busy)return;busy=true;render();
   try{
-   snapshot=await window.RSIDesktop.invoke('native_update',{action});
+   snapshot=await window.RSIDesktop.invoke('native_update',{action,installationWindow:action==='install'?(automatic?installWindow:'any'):null});
    if(snapshot.state==='error')throw Error(snapshot.error_code||'update_check_failed');
+   if(action==='install'){failureCounts.install=0;installRetryAt=0;}
    if(['check','download'].includes(action)){
-    failures=0;retryAt=0;persist('rsi-native-update-checked',String(Date.now()));
+    failureCounts[action]=0;if(snapshot.state==='ready')failureCounts.download=0;failures=Object.values(failureCounts).reduce((sum,value)=>sum+value,0);retryAt=0;persist('rsi-native-update-checked',String(Date.now()));
    }
   }catch(error){
    snapshot={state:'error',error_code:String(error)};
-   failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));
+   failureCounts[action]=(failureCounts[action]||0)+1;failures=failureCounts[action];const next=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));if(action==='install')installRetryAt=next;else retryAt=next;
   }finally{busy=false;render();}
  }
  async function tick(){
-  if(checking||!enabled()||Date.now()<retryAt)return;checking=true;
+  if(polling||!enabled())return;polling=true;
+  try{snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});render();}
+  catch(error){failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));return;}
+  finally{polling=false;}
+  if(checking||busy||Date.now()<retryAt)return;checking=true;
   try{
-   snapshot=await window.RSIDesktop.invoke('native_update',{action:'status'});render();
    const last=Number(localRead('rsi-native-update-checked')||0);
-   if(!busy&&preference()!=='manual'&&(failures>0||Date.now()-last>6*3600000)){await run('check');if(snapshot.state==='available'&&eligible(snapshot.current_version,snapshot.version))await run('download');}
-   if(!busy&&snapshot.state==='ready'&&preference()==='automatic'&&!snapshot.error_code&&eligible(snapshot.current_version,snapshot.version)&&withinWindow())await run('install');
-  }catch(error){failures++;retryAt=Date.now()+Math.min(300000,5000*2**Math.min(failures-1,6));}
-  finally{checking=false;}
+   if(preference()!=='manual'&&((failureCounts.check||0)+(failureCounts.download||0)>0||Date.now()-last>6*3600000)){
+    await run('check');
+    if(preference()!=='manual'&&snapshot.state==='available'&&eligible(snapshot.current_version,snapshot.version))await run('download');
+    else if(snapshot.state!=='error'){failureCounts.download=0;failures=Object.values(failureCounts).reduce((sum,value)=>sum+value,0);}
+   }
+   if(!busy&&Date.now()>=installRetryAt&&snapshot.state==='ready'&&preference()==='automatic'&&(!snapshot.error_code||snapshot.error_code==='update_window_closed')&&eligible(snapshot.current_version,snapshot.version)&&withinWindow())await run('install',true);
+  }finally{checking=false;}
  }
+
  document.addEventListener('DOMContentLoaded',()=>{if(!enabled())return;render();setTimeout(()=>safe(tick),5000);setInterval(()=>safe(tick),1000);});
  return {render,run,tick,eligible,withinWindow};
 })();

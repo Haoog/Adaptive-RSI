@@ -2,6 +2,8 @@
 window.RSIBatch=(()=>{
  const selected=new Map(),pending=new Set();
  let historyBox=null;
+ const actionLabels={group:'合并任务',ungroup:'拆分任务',retry:'重试',cancel:'取消任务',approve:'批准交付'};
+ const stateLabels={accepted:'已受理',unknown:'结果待核对',executing:'正在处理',grouped:'已合并',restored:'已恢复',failed:'操作失败',skipped:'已跳过'};
  async function history(){
   if(historyBox?.open)return;
   const project=projectId,data=await api('tasks/batches?project='+encodeURIComponent(project));
@@ -12,7 +14,7 @@ window.RSIBatch=(()=>{
   function renderRows(){
    rows.replaceChildren();
    for(const report of data.batches.filter(report=>JSON.stringify(report).toLowerCase().includes(filter.value.toLowerCase()))){
-    const card=el('section'),title=el('p',report.action+' · '+(report.request_id||'')+' · '+(report.receipts||[]).map(item=>item.state).join(', '));
+    const card=el('section'),title=el('p',t(actionLabels[report.action]||'未知操作')+' · '+(report.request_id||'')+' · '+(report.receipts||[]).map(item=>t(stateLabels[item.state]||'结果待核对')).join(', '));
     card.append(title,el('p',report.tasks.map(task=>task.title).join(' / ')));
     if(!report.complete&&report.request_id){
      const retry=el('button',t('继续并核对批次'),'button');retry.type='button';

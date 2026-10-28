@@ -1,0 +1,39 @@
+{
+  "purpose": "Synthetic local compression comparison, not production throughput or model improvement",
+  "python": "3.14.6",
+  "platform": "Darwin",
+  "results": [
+    {
+      "compression": 0,
+      "bytes": 2343475,
+      "source_bytes": 2342912,
+      "seconds": 0.012405625078827143,
+      "cpu_seconds": 0.010683834000000003,
+      "verified": true
+    },
+    {
+      "compression": 1,
+      "bytes": 625950,
+      "source_bytes": 2342912,
+      "seconds": 0.021253708051517606,
+      "cpu_seconds": 0.019776040999999994,
+      "verified": true
+    },
+    {
+      "compression": 6,
+      "bytes": 606993,
+      "source_bytes": 2342912,
+      "seconds": 0.04586116690188646,
+      "cpu_seconds": 0.044907375,
+      "verified": true
+    },
+    {
+      "compression": 9,
+      "bytes": 606563,
+      "source_bytes": 2342912,
+      "seconds": 0.0500925830565393,
+      "cpu_seconds": 0.049057374999999986,
+      "verified": true
+    }
+  ]
+}

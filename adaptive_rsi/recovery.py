@@ -1,5 +1,6 @@
 """Stable failure codes and stage artifacts for safe retries."""
 import json
+import re
 import time
 
 from .config import fingerprint
@@ -45,7 +46,18 @@ def failure(exc):
         code, action = "baseline", "retry_new_baseline"
     else:
         code, action = "execution", "inspect_details"
-    return {"code": code, "action": action, "detail": text}
+    result = {"code": code, "action": action, "detail": text}
+    request_id = getattr(exc, "provider_request_id", None)
+    if isinstance(request_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id):
+        result["provider_request_id"] = request_id
+    stop = getattr(exc, "stop_reason", None)
+    if isinstance(stop, str) and stop in {"output_limit", "safety", "refusal", "paused", "stop_sequence", "text_only", "unknown"}:
+        result["stop_reason"] = stop
+        result["action"] = {"output_limit": "adjust_output_limit", "safety": "review_provider_policy",
+                            "refusal": "review_provider_policy", "paused": "inspect_details",
+                            "stop_sequence": "check_model_settings", "text_only": "check_tool_support",
+                            "unknown": "inspect_details"}[stop]
+    return result
 
 
 def save(runtime, run, stage, data, signature):

@@ -985,7 +985,7 @@ async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|_| "Request interrupted".to_string())?
 }
 #[tauri::command]
-async fn native_update(app: tauri::AppHandle, action: String) -> Result<Value, String> {
+async fn native_update(app: tauri::AppHandle, action: String, installation_window: Option<String>) -> Result<Value, String> {
     match action.as_str() {
         "status" => Ok(native_update::snapshot(&app)),
         "check" => native_update::check(app, false).await,
@@ -994,7 +994,7 @@ async fn native_update(app: tauri::AppHandle, action: String) -> Result<Value, S
         "install" => {
             let eligibility = native_update::check(app.clone(), false).await?;
             if eligibility["state"] != "ready" { return Err("update_not_downloaded".into()); }
-            tauri::async_runtime::spawn_blocking(move || native_update::install(app))
+            tauri::async_runtime::spawn_blocking(move || native_update::install(app, installation_window.unwrap_or_else(|| "any".into())))
                 .await.map_err(|_| "update_worker_failed".to_string())??;
             Ok(json!({"state":"restarting"}))
         },

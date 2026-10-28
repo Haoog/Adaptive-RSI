@@ -177,7 +177,23 @@ pub fn cancel(app: &tauri::AppHandle) {
     app.state::<NativeUpdater>().cancel.store(true, Ordering::SeqCst);
 }
 
-pub fn install(app: tauri::AppHandle) -> Result<(), String> {
+fn authorized_window(window: &str, weekday: u32, hour: u32) -> bool {
+    match window {
+        "any" => true,
+        "night" => hour >= 22 || hour < 6,
+        "weekend" => weekday >= 6,
+        _ => false,
+    }
+}
+
+fn require_window(window: &str) -> Result<(), String> {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    if authorized_window(window, now.weekday().number_from_monday(), now.hour()) { Ok(()) }
+    else { Err("update_window_closed".into()) }
+}
+
+pub fn install(app: tauri::AppHandle, window: String) -> Result<(), String> {
     let updater = app.state::<NativeUpdater>();
     if updater.busy.swap(true, Ordering::SeqCst) {
         return Err("update_busy".into());
@@ -185,7 +201,9 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
     updater.cancel.store(false, Ordering::SeqCst);
     let local = app.state::<RuntimeState>().local.lock().unwrap().clone();
     let mut lease = Value::Null;
+    let mut engine_stopped = false;
     let result: Result<(), String> = (|| {
+        require_window(&window)?;
         let version = updater.staged.lock().unwrap().as_ref().map(|(update, _)| update.version.clone())
             .ok_or("update_not_downloaded")?;
         let runtime = app.state::<RuntimeState>();
@@ -197,6 +215,7 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
             lease = ready["barrier"]["lease"].clone();
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
             while ready["ready"] != true {
+                require_window(&window)?;
                 updater.set(json!({"state":"waiting_idle","version":version,"reasons":ready["reasons"]}));
                 if updater.cancel.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
                     let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
@@ -208,10 +227,12 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
                 ready = serde_json::from_str(&reply.body).map_err(|_| "update_drain_failed")?;
                 if ready["barrier"]["lease"] != lease { return Err("update_lease_expired".into()); }
             }
+            require_window(&window)?;
             let reply = call(connection, "desktop-update", Some(json!({"action":"commit","lease":lease})))?;
             if reply.status != 200 { return Err("update_drain_failed".into()); }
         }
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
+        require_window(&window)?;
         updater.set(json!({"state":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.
         let child = runtime.child.lock().unwrap().take();
@@ -221,22 +242,27 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
                 *runtime.child.lock().unwrap() = Some(child);
                 return Err("update_runtime_shutdown_failed".into());
             }
+            engine_stopped = true;
         }
+        require_window(&window)?;
         let staged = updater.staged.lock().unwrap().take().ok_or("update_not_downloaded")?;
-        let installation = read_package(&staged.1).and_then(|bytes|
-            staged.0.install(&bytes).map_err(|_| "update_install_failed".to_string()));
+        let installation = read_package(&staged.1).and_then(|bytes| {
+            require_window(&window)?;
+            staged.0.install(&bytes).map_err(|_| "update_install_failed".to_string())
+        });
         if installation.is_err() {
             *updater.staged.lock().unwrap() = Some(staged);
             if let Some(connection) = owned {
                 let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
             }
-            let _ = bootstrap(&app);
-            return Err("update_install_failed".into());
+            return installation;
         }
         app.restart();
     })();
     if let Err(ref error) = result {
-        if let Some(connection) = local.as_ref().filter(|connection| connection.owned) {
+        if engine_stopped { let _ = bootstrap(&app); }
+        let recovery = app.state::<RuntimeState>().local.lock().unwrap().clone();
+        if let Some(connection) = recovery.as_ref().or(local.as_ref()).filter(|connection| connection.owned) {
             if lease.is_string() {
                 let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
             }
@@ -250,4 +276,18 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
     }
     updater.busy.store(false, Ordering::SeqCst);
     result
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    #[test]
+    fn gates_are_checked_again_after_drain_crosses_a_boundary() {
+        assert!(authorized_window("night", 2, 5));
+        assert!(!authorized_window("night", 2, 6));
+        assert!(authorized_window("night", 2, 22));
+        assert!(authorized_window("weekend", 7, 23));
+        assert!(!authorized_window("weekend", 1, 0));
+        assert!(!authorized_window("unknown", 7, 23));
+    }
 }

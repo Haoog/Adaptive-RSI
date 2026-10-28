@@ -185,16 +185,21 @@ class CodexAgent:
                             if role == "implementation" and len(routes) > 1 else None)
         for index, route in enumerate(routes):
             provider_id = route.get("provider", "openai")
+            attempt = None
             try:
-                health.require(config, provider_id, project, route["model"])
+                attempt = health.require(config, provider_id, project, route["model"])
                 effective = {**config, "models": {**config["models"], role: {**route, "fallback": None}}}
                 result = self._invoke(role, prompt, workspace, project, run, effective, cancel, protected)
             except Exception as exc:
                 exc.provider_id = provider_id
                 exc.role = role
+                try:
+                    health.record(config, provider_id, project, exc, route["model"], attempt=attempt)
+                except Exception as health_error:
+                    import logging
+                    logging.getLogger(__name__).warning("Provider failure recording failed (%s)", type(health_error).__name__)
                 if isinstance(exc, Cancelled):
                     raise
-                health.record(config, provider_id, project, exc, route["model"])
                 # 仅不可用且未修改工作区的路由允许备用；原生执行器负责拦截半成品。
                 # 仅旧适配器无代码的 CLI 自身诊断允许文本兼容；明确的 execution
                 # 或认证/额度故障绝不被消息中的 timeout 等关键词覆盖。
@@ -215,7 +220,7 @@ class CodexAgent:
                     self.store.event("fallback", "Primary provider unavailable; using configured fallback", project, run)
                     continue
                 raise
-            health.record(config, provider_id, project, model=route["model"])
+            health.record(config, provider_id, project, model=route["model"], attempt=attempt)
             return result
 
     def _invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):

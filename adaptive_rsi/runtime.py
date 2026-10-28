@@ -339,6 +339,11 @@ class Runtime(Maintenance):
                            (backup_key, encode({"raw": text, "sha256": digest,
                                                 "reason": reason, "created": time.time()})))
                 db.execute("DELETE FROM settings WHERE key='config'")
+                for scope in ["global", *[row["id"] for row in db.execute("SELECT id FROM projects")]]:
+                    key = "config-revision:" + scope
+                    revision = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                    previous = int(revision["value"]) if revision and str(revision["value"]).isdigit() else 0
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, str(previous + 1)))
                 # Global reset must not silently make project overrides valid.
                 db.execute("UPDATE projects SET paused=1")
                 db.execute("INSERT INTO events(project,run,kind,message,data,created) "
@@ -983,8 +988,9 @@ class Runtime(Maintenance):
                 if task and task["oldest"] is not None:
                     ready.append((project, config))
                     counts[project["id"]] = self.store.one(
-                        "SELECT count(*) AS n,coalesce(sum(max(0,coalesce(ended,?)-started)),0) AS seconds "
-                        "FROM runs WHERE project=? AND ended IS NOT NULL", (now, project["id"]))["seconds"]
+                        "SELECT coalesce(sum(max(1,min(ended,?)-max(started,?))),0) AS seconds "
+                        "FROM runs WHERE project=? AND ended IS NOT NULL AND ended>?",
+                        (now, now - 86400, project["id"], now - 86400))["seconds"]
             if not ready:
                 return
             services = self.store.setting("fair-service", {})
@@ -997,12 +1003,19 @@ class Runtime(Maintenance):
                     services[key] = clock
                 else:
                     services[key] = min(clock + 2, max(clock - 2, services.get(key, clock)))
-                while services[key] < clock:
-                    spend = min(1, counts[key] / 3600) / max(1, next(c for p, c in ready if p["id"] == key)["schedule"]["weight"])
-                    services[key] += max(0.01, spend)
                 waiting.setdefault(key, now)
-            project, config = min(ready, key=lambda pair: services[pair[0]["id"]] -
-                                  min(2, (now - waiting[pair[0]["id"]]) / 3600))
+            def rank(pair):
+                key = pair[0]["id"]
+                age = max(0, now - waiting[key])
+                if age >= 3600:
+                    return (0, -age, services[key])
+                return (1, counts[key] / max(1, pair[1]["schedule"]["weight"]), services[key])
+            project, config = min(ready, key=rank)
+            self.store.put_setting("fair-accounting", {"at": now, "window_seconds": 86400,
+                "unit": "worker_elapsed_seconds", "minimum_run_seconds": 1,
+                "projects": [{"project": p["id"], "seconds": counts[p["id"]],
+                              "weight": c["schedule"]["weight"],
+                              "waiting_seconds": max(0, now - waiting[p["id"]])} for p, c in ready]})
             with self.dispatch_lock:
                 if self.import_in_progress:
                     return

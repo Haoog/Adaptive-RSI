@@ -249,9 +249,14 @@
       },
       "source": "scripts/check_api_contract.py",
       "acceptance": "用隔离 HTTP 服务生成多种响应再验证；删除真实必需字段时 CI 应失败。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "scripts/check_api_contract.py"
+      ],
+      "validation": [
+        "python3 -B scripts/check_api_contract.py"
+      ],
+      "residual": "Live isolated HTTP now covers empty/populated projects, bad historical evidence, sections, filters and pagination; no model calls."
     },
     {
       "id": 17,
@@ -872,9 +877,15 @@
       },
       "source": "adaptive_rsi/server.py",
       "acceptance": "对照关闭和开启请求日志的多窗口负载；按结果决定采样、聚合或批量落库。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/server.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditRequestSamplingTest"
+      ],
+      "residual": "Successful poll requests are sampled once per route per minute; all writes/errors remain individually logged; process-local counters are retained."
     },
     {
       "id": 58,
@@ -1298,9 +1309,14 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "长短任务混合模拟中报告等待分位数和权重兑现程度，再选择策略。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/runtime.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditResourceFairnessTest tests.test_audit_round6.AuditResourceWorkloadTest"
+      ],
+      "residual": "Rolling worker-time accounting and starvation priority implemented; synthetic mixed-duration workload covered, production waiting quantiles and resource-pressure admission remain separate."
     },
     {
       "id": 91,
@@ -1445,9 +1461,14 @@
       },
       "source": "adaptive_rsi/operations.py",
       "acceptance": "生成大量终态回执后按规则清理，活动和未知结果回执不被提前删除。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditMaintenanceRetentionTest"
+      ],
+      "residual": "Bounded cleanup removes old terminal operations and completed batch receipts while preserving unknown/active receipts."
     },
     {
       "id": 103,
@@ -1489,9 +1510,15 @@
       },
       "source": "adaptive_rsi/storage_tools.py",
       "acceptance": "报告 CPU、耗时及体积对比，取消不发布不完整归档。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/cli.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest"
+      ],
+      "residual": "Configurable compression, shared deadline, cancellation checks and per-thread CPU/wall/size receipts; final publication rechecks cancellation."
     },
     {
       "id": 106,
@@ -1501,9 +1528,15 @@
       },
       "source": "adaptive_rsi/store.py",
       "acceptance": "持有长读事务压测时准确解释 WAL 增长，维护不阻塞正常任务。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest.test_passive_checkpoint_reports_reader_pin_without_waiting"
+      ],
+      "residual": "Passive checkpoint plus local snapshot ages; other-process reader identities cannot be observed."
     },
     {
       "id": 107,
@@ -1564,9 +1597,15 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "模拟只读及部分损坏数据库，修复模式不修改原库且能导出有效诊断。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/recovery_diagnostics.py",
+        "adaptive_rsi/cli.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditOfflineRecoveryTest"
+      ],
+      "residual": "Offline CLI inspects a bounded temporary database/WAL copy without opening the source through SQLite; damaged sources return partial diagnostics, not repaired data."
     },
     {
       "id": 112,
@@ -1672,9 +1711,15 @@
       },
       "source": "adaptive_rsi/storage_tools.py",
       "acceptance": "故意破坏一个归档字节，校验能定位损坏且不把它当作有效恢复点。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/maintenance.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditStorageBudgetsTest tests.test_audit_round6.AuditMaintenanceRetentionTest"
+      ],
+      "residual": "Checksummed database-only manifest, bounded isolated decompression and periodic verification; legacy archives without manifests fail explicitly, not silently trusted."
     },
     {
       "id": 120,
@@ -1828,9 +1873,16 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "请求 ID 可跨错误路径保留，认证和 cookie 头不被记录。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/recovery.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditModelDiagnosticsTest"
+      ],
+      "residual": "Allowlisted header request IDs survive success, HTTP errors, malformed JSON/non-object, oversized body and truncated chunked transport; cookies/headers are excluded."
     },
     {
       "id": 132,
@@ -1864,9 +1916,19 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "各协议模拟不同停止原因，最终 UI 和诊断包保持原因一致。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/native.py",
+        "adaptive_rsi/native_transport.py",
+        "adaptive_rsi/recovery.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_audit_round6.AuditModelDiagnosticsTest",
+        "python3 -B scripts/check_i18n.py"
+      ],
+      "residual": "Normalized stop reasons persist through failure reporting and bilingual UI; includes Ollama done_reason and safety/refusal/limits."
     },
     {
       "id": 135,
@@ -2723,5 +2785,8 @@
   ],
   "release_ready": false,
   "implementation_commit": null,
-  "ci_evidence": []
+  "ci_evidence": [],
+  "checkpoint_commits": [
+    "cd6e614"
+  ]
 }

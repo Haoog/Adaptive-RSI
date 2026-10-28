@@ -1,6 +1,20 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "模型输出达到上限，请检查输出限制后重试。": "The model reached its output limit. Check the output limit before retrying.",
+ "模型服务的安全策略中止了响应，请查看原始诊断并核对请求。": "The provider safety policy stopped the response. Review the diagnostics and request.",
+ "模型拒绝了本次请求，请查看诊断并核对模型能力与服务策略。": "The model refused this request. Review the diagnostics, model capabilities and provider policy.",
+ "模型暂停了本次响应，请查看运行诊断。": "The model paused this response. Review the run diagnostics.",
+ "响应被停止序列提前截断，请检查模型设置。": "A stop sequence ended the response early. Check the model settings.",
+ "模型只返回了文本，未返回所需工具调用，请检查模型的工具能力。": "The model returned text without the required tool calls. Check its tool capabilities.",
+ "拆分任务": "Ungroup tasks",
+ "未知操作": "Unknown operation",
+ "已跳过": "Skipped",
+ "已恢复": "Restored",
+ "正在处理": "Processing",
+ "结果待核对": "Result requires reconciliation",
+ "已受理": "Accepted",
+ "安装窗口已结束，下一次允许的空闲窗口会重新尝试。": "The installation window closed. Automatic installation will retry in the next eligible idle window.",
  "选择文件": "Choose a file",
  "跳转到文件": "Jump to file",
  "下一个变更块": "Next hunk",

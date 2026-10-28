@@ -36,3 +36,37 @@ test('automatic install windows cover midnight and weekends in local time',()=>{
  select.value='weekend';select.onchange();
  for(const day of [0,1,5,6])assert.equal(f.api.withinWindow({getDay:()=>day}),day===0||day===6);
 });
+test('successful preflight checks do not erase consecutive download backoff',async()=>{
+ const f=fixture();
+ f.context.window.RSIDesktop.invoke=async(_,{action})=>{f.calls.push(action);if(action==='download')throw Error('download failed');if(action==='check')return {state:'available',current_version:'1.2.3',version:'1.2.4'};return{state:'idle'};};
+ await f.api.tick();assert.equal(f.calls.filter(action=>action==='download').length,1);
+ f.advance(5000);await f.api.tick();assert.equal(f.calls.filter(action=>action==='download').length,2);
+ f.advance(5000);await f.api.tick();assert.equal(f.calls.filter(action=>action==='download').length,2);
+ f.advance(5000);await f.api.tick();assert.equal(f.calls.filter(action=>action==='download').length,3);
+});
+test('switching to manual during a feed check prevents background download',async()=>{
+ const f=fixture();let complete,started;const waiting=new Promise(resolve=>{started=resolve;});
+ f.context.window.RSIDesktop.invoke=async(_,{action})=>{f.calls.push(action);if(action==='check'){started();return new Promise(resolve=>{complete=resolve;});}return{state:'idle'};};
+ const pending=f.api.tick();await waiting;f.select().value='manual';f.select().onchange();
+ complete({state:'available',current_version:'1.2.3',version:'1.2.4'});await pending;
+ assert.equal(f.calls.includes('download'),false);
+});
+test('status polling continues while a native download is pending',async()=>{
+ const f=fixture();let complete;
+ f.context.window.RSIDesktop.invoke=async(_,{action})=>{f.calls.push(action);if(action==='download')return new Promise(resolve=>{complete=resolve;});return{state:'downloading',bytes:1024};};
+ const download=f.api.run('download');await f.api.tick();assert.ok(f.calls.includes('status'));
+ complete({state:'ready'});await download;
+});
+test('automatic installs forward the window while manual installs explicitly override it',async()=>{
+ const f=fixture(),received=[];f.api.render();f.selects()[2].value='night';f.selects()[2].onchange();
+ f.context.window.RSIDesktop.invoke=async(_,args)=>{received.push(args);return {state:'ready'};};
+ await f.api.run('install',true);await f.api.run('install');
+ assert.deepEqual(received.map(args=>args.installationWindow),['night','any']);
+});
+test('install failures do not force repeated feed checks after a successful check',async()=>{
+ const f=fixture();f.saved.set('rsi-native-update-checked','100000000');
+ f.context.window.RSIDesktop.invoke=async(_,{action})=>{f.calls.push(action);if(action==='install')throw Error('update_window_closed');return{state:action==='status'?'ready':'latest',current_version:'1.2.3',version:'1.2.4'};};
+ await f.api.run('install');f.advance(5000);
+ for(let i=0;i<3;i++){await f.api.tick();f.advance(1000);}
+ assert.equal(f.calls.includes('check'),false);
+});

@@ -9,16 +9,29 @@ import tempfile
 import time
 import copy
 import shutil
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from .store import Store, uid
 
 
-def archive(store, max_mb=1024):
+@contextmanager
+def _regular_reader(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Archive source must be a regular file")
+        yield stream
+
+
+def archive(store, max_mb=1024, compression=6, timeout=300, cancel=None):
     """Export a private compressed consistent snapshot within an archive capacity budget."""
     if type(max_mb) is not int or not 1 <= max_mb <= 102400:
         raise ValueError("Archive capacity must be 1..102400 MiB")
+    if type(compression) is not int or not 0 <= compression <= 9:
+        raise ValueError("Archive compression must be 0..9")
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 3600:
+        raise ValueError("Archive timeout must be 1..3600 seconds")
     import fcntl
     fd = os.open(store.root / "archive.lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     with os.fdopen(fd, "wb") as lock:
@@ -28,26 +41,44 @@ def archive(store, max_mb=1024):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ValueError("Another archive is in progress") from None
-        return _archive(store, max_mb)
+        return _archive(store, max_mb, compression, timeout, cancel)
 
 
-def _archive(store, max_mb):
+def _archive(store, max_mb, compression=6, timeout=300, cancel=None):
+    started = time.monotonic()
+    cpu_started = time.thread_time()
+    deadline = started + timeout
+    def check_budget():
+        if cancel and cancel():
+            from .process import Cancelled
+            raise Cancelled("Archive cancelled")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Archive deadline exceeded")
+    check_budget()
     folder = store.root / "archives"
     folder.mkdir(mode=0o700, exist_ok=True)
     capacity = max_mb * 1024 * 1024
-    used = sum(info.st_size for _, info in _file_info(folder.iterdir()))
+    used = 0
+    for _, info in _file_info(folder.iterdir()):
+        check_budget()
+        used += info.st_size
     if used >= capacity:
         raise ValueError("Archive capacity reached; move existing archives before retrying")
-    snapshot = backup(store)
+    snapshot = backup(store, timeout=timeout, cancel=cancel, deadline=deadline)
     source = store.root / "backups" / (snapshot["id"] + ".sqlite3")
     staging = None
+    manifest = None
+    manifest_owned = False
+    published = False
     try:
         fd, name = tempfile.mkstemp(prefix=".archive-", dir=folder)
         staging = Path(name)
         with os.fdopen(fd, "wb") as output:
-            with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0) as compressed:
+            with gzip.GzipFile(fileobj=output, mode="wb", filename="", mtime=0,
+                               compresslevel=compression) as compressed:
                 with source.open("rb") as raw:
                     while True:
+                        check_budget()
                         block = raw.read(65536)
                         if not block:
                             break
@@ -60,21 +91,94 @@ def _archive(store, max_mb):
             output.flush()
             os.fsync(output.fileno())
         target = folder / (snapshot["id"] + ".sqlite3.gz")
+        check_budget()
+        inventory = {"format": 1, "id": snapshot["id"], "created": time.time(),
+                     "compression": compression, "archive_bytes": staging.stat().st_size,
+                     "archive_sha256": file_digest(staging, check_budget), "source_bytes": source.stat().st_size,
+                     "source_sha256": file_digest(source, check_budget), "contents": ["state.sqlite3"],
+                     "scope": "database_only"}
+        encoded = json.dumps(inventory, sort_keys=True).encode()
+        if staging.stat().st_size + len(encoded) + used > capacity:
+            raise ValueError("Archive capacity reached; move existing archives before retrying")
+        check_budget()
+        manifest = target.with_suffix(target.suffix + ".manifest.json")
+        with manifest.open("xb") as output:
+            manifest_owned = True
+            os.chmod(manifest, 0o600)
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        check_budget()
         os.link(staging, target)
+        published = True
         return {"id": snapshot["id"], "path": str(target), "bytes": target.stat().st_size,
-                "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False}
+                "capacity_bytes": capacity, "source_bytes": snapshot["bytes"], "history_deleted": False,
+                "manifest": str(manifest), "compression": compression,
+                "seconds": time.monotonic() - started, "cpu_seconds": time.thread_time() - cpu_started}
     finally:
+        if manifest_owned and not published:
+            manifest.unlink(missing_ok=True)
         if staging is not None:
             staging.unlink(missing_ok=True)
         source.unlink(missing_ok=True)
 
 
-def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 1024 * 1024):
+def verify_archive(path, timeout=60, max_source_mb=102400):
+    """Verify compressed bytes and restored SQLite without touching the active database."""
+    path = Path(path).absolute()
+    manifest = path.with_suffix(path.suffix + ".manifest.json")
+    if path.is_symlink() or manifest.is_symlink() or not path.is_file() or not manifest.is_file():
+        raise ValueError("Archive and manifest must be regular files")
+    if type(timeout) not in (int, float) or not 1 <= timeout <= 3600:
+        raise ValueError("Archive timeout must be 1..3600 seconds")
+    if type(max_source_mb) is not int or not 1 <= max_source_mb <= 102400:
+        raise ValueError("Invalid archive verification capacity")
+    with _regular_reader(manifest) as stream:
+        content = stream.read(16385)
+    if len(content) > 16384:
+        raise ValueError("Archive manifest is too large")
+    metadata = json.loads(content)
+    if (not isinstance(metadata, dict) or metadata.get("format") != 1 or
+            type(metadata.get("source_bytes")) is not int or
+            not 0 < metadata["source_bytes"] <= max_source_mb * 1024 * 1024):
+        raise ValueError("Invalid archive manifest")
+    deadline = time.monotonic() + timeout
+    def check():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Archive verification deadline exceeded")
+    digest = hashlib.sha256()
+    with _regular_reader(path) as raw:
+        for block in iter(lambda: raw.read(65536), b""):
+            check()
+            digest.update(block)
+    if path.stat().st_size != metadata.get("archive_bytes") or digest.hexdigest() != metadata.get("archive_sha256"):
+        raise ValueError("Archive compressed content checksum mismatch")
+    with tempfile.TemporaryDirectory(prefix="rsi-archive-verify-") as directory:
+        if shutil.disk_usage(directory).free < metadata["source_bytes"] + 16 * 1024 * 1024:
+            raise ValueError("Insufficient disk space to verify archive")
+        restored = Path(directory) / "state.sqlite3"
+        digest, size = hashlib.sha256(), 0
+        with _regular_reader(path) as compressed, gzip.GzipFile(fileobj=compressed, mode="rb") as raw, restored.open("wb") as output:
+            for block in iter(lambda: raw.read(65536), b""):
+                check()
+                size += len(block)
+                if size > metadata["source_bytes"]:
+                    raise ValueError("Archive expanded size exceeds manifest")
+                digest.update(block)
+                output.write(block)
+        if size != metadata["source_bytes"] or digest.hexdigest() != metadata.get("source_sha256"):
+            raise ValueError("Archive source checksum mismatch")
+        check()
+        result = verify_backup(restored, deadline=deadline)
+    return {**result, "archive": path.name, "checked_at": time.time(), "scope": "database_only"}
+
+
+def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 1024 * 1024, deadline=None):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
     if not 1 <= timeout <= 3600 or reserve_bytes < 0:
         raise ValueError("Invalid backup resource budget")
-    deadline = time.monotonic() + timeout
+    deadline = min(deadline, time.monotonic() + timeout) if deadline is not None else time.monotonic() + timeout
     if shutil.disk_usage(folder).free < store.path.stat().st_size + reserve_bytes:
         raise ValueError("Insufficient disk space for a consistent backup")
     path = folder / (uid() + ".sqlite3")
@@ -105,12 +209,14 @@ def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 10
             Path(str(staging) + suffix).unlink(missing_ok=True)
 
 
-def verify_backup(path):
+def verify_backup(path, deadline=None):
     """Open a backup in read-only mode and prove it is a usable state snapshot."""
     path = Path(path).expanduser().absolute()
     if not path.is_file() or path.is_symlink():
         raise ValueError("Backup must be a regular file")
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+        if deadline is not None:
+            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -378,13 +484,15 @@ def _approval_candidates(store):
     return pending, delivering, delivered
 
 
-def file_digest(path):
+def file_digest(path, check=None):
     digest = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("Manifest source must be a regular file")
         for block in iter(lambda: stream.read(1024 * 1024), b""):
+            if check:
+                check()
             digest.update(block)
     return digest.hexdigest()
 
@@ -427,6 +535,7 @@ def diagnostics(store):
             "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
             "invalid_evidence": store.one("SELECT count(*) AS count FROM runs WHERE NOT json_valid(result)")["count"],
             "database": store.metrics(integrity=True),
+            "wal": store.wal_diagnostics(),
             "schema_migrations": store.schema_migrations(),
             "relationship_audit": store.relationship_audit(),
             "quarantined_orphans": store.one("SELECT count(*) AS count FROM relationship_quarantine")
