@@ -133,7 +133,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 78. **implemented** — Add update maintenance windows
 79. **pending** — Export upgrade receipts
 80. **pending** — Negotiate feature capabilities
-81. **pending** — Support bounded dependency DAGs
+81. **implemented** — Support bounded dependency DAGs
 82. **implemented** — Preview dependency cancellation effects
 83. **pending** — Map grouped acceptance to individual evidence
 84. **pending** — Size task groups by verification cost
@@ -233,7 +233,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 178. **pending** — Check GitHub capabilities without test writes
 179. **pending** — Expose ambiguous dispatch reconciliation
 180. **pending** — Plan explicit GitHub Enterprise support
-181. **pending** — Add navigation within long logs
+181. **implemented** — Add navigation within long logs
 182. **partial** — Lazily construct large evidence views
 183. **implemented** — Improve navigation inside diffs
 184. **pending** — Explain chains of blocking causes
@@ -263,3 +263,5 @@ Items 37–41/87/88 now have targeted evidence. Failed/cancelled groups restore 
 Installer admission recovery: seven targeted tests pass, including an actual process termination and transactional audit failure. Related audit regressions total 107 passing tests. A living installer remains protected beyond drain expiry. Legacy recovery and full app/data rollback boundaries remain explicit in the ledger.
 
 Rust explicitly passes the native desktop owner PID, independent of the PyInstaller onefile bootloader parent. Seven admission and 107 related Python tests pass; 13 Rust tests pass. This does not replace signed replacement E2E evidence.
+
+Bounded dependency DAGs (81): nine targeted tests cover diamonds, cycles through a second parent, missing/cross-project nodes, cancelled parents, combined ancestry budgets and legacy migration rollback. Chromium validates two-parent selection, bilingual draft preservation, save and reload. All 339 Node tests pass. Invalid legacy self-edges block migration without silently deleting evidence; missing historical parents block admission. Two-axis review found no remaining confirmed issue.

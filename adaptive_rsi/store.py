@@ -649,8 +649,8 @@ class Store:
     @staticmethod
     def ready_clause():
         return ("state='queued' AND available<=? AND NOT EXISTS "
-                "(SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.dependency "
-                "WHERE d.task=tasks.id AND p.state<>'merged')")
+                "(SELECT 1 FROM task_dependencies d LEFT JOIN tasks p ON p.id=d.dependency "
+                "WHERE d.task=tasks.id AND (p.id IS NULL OR p.state<>'merged'))")
 
     def claim(self, project, config):
         now = time.time()

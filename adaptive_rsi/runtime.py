@@ -605,41 +605,8 @@ class Runtime(Maintenance):
         self.wake.set()
 
     def set_dependency(self, task, dependency=None, urgency=0, reason=None):
-        from .task_lifecycle import intervention_reason
-        intervention_reason(reason)
-        if urgency not in [0, 1]:
-            raise ValueError("Urgency must be 0 or 1")
-        with self.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
-            if not row or row["state"] not in ["queued", "deferred", "blocked"]:
-                raise ValueError("Only waiting tasks can be scheduled")
-            previous_dependency = db.execute("SELECT dependency FROM task_dependencies WHERE task=?", (task,)).fetchone()
-            if dependency:
-                parent = db.execute("SELECT * FROM tasks WHERE id=?", (dependency,)).fetchone()
-                if not parent or parent["project"] != row["project"] or dependency == task or parent["source"].startswith("system_"):
-                    raise ValueError("Dependency must be another task in the same project")
-                if parent["state"] in DEAD_DEPENDENCY_STATES:
-                    raise ValueError("Dependency task cannot reach merge; retry or choose another task")
-                seen = {task}
-                current = dependency
-                while current:
-                    if current in seen:
-                        raise ValueError("Task dependency cycle")
-                    seen.add(current)
-                    link = db.execute("SELECT dependency FROM task_dependencies WHERE task=?", (current,)).fetchone()
-                    current = link["dependency"] if link else None
-                db.execute("INSERT OR REPLACE INTO task_dependencies VALUES (?,?)", (task, dependency))
-            else:
-                db.execute("DELETE FROM task_dependencies WHERE task=?", (task,))
-            db.execute("UPDATE tasks SET urgency=?,updated=? WHERE id=?", (urgency, time.time(), task))
-            db.execute("INSERT INTO events(project,run,kind,message,data,created) "
-                       "VALUES (?,NULL,'queue_settings','Queue dependency or urgency changed',?,?)",
-                       (row["project"], encode({"task": task, "dependency": dependency, "urgency": urgency, "reason": reason,
-                        "before": {"dependency": previous_dependency[0] if previous_dependency else None, "urgency": row["urgency"]},
-                        "after": {"dependency": dependency, "urgency": urgency}}),
-                        time.time()))
-        self.wake.set()
+        from .task_dependencies import save
+        save(self, task, dependency, urgency, reason)
 
     def resume_provider_tasks(self, provider, project=None):
         from .provider_health import ProviderHealth, connection_key
@@ -903,13 +870,13 @@ class Runtime(Maintenance):
                     (row["task"], row["dependency"], *DEAD_DEPENDENCY_STATES)).fetchone()
                 if not link:
                     continue
-                db.execute("DELETE FROM task_dependencies WHERE task=?", (row["task"],))
+                db.execute("DELETE FROM task_dependencies WHERE task=? AND dependency=?", (row["task"], row["dependency"]))
                 db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state IN ('queued','deferred')",
                            (time.time(), row["task"]))
-            self.store.event("dependency_released",
-                             "Dependency will not merge; waiting released and the task needs manual review",
-                             row["project"], data={"task": row["task"], "dependency": row["dependency"],
-                                                   "dependency_state": link["dep_state"]})
+                db.execute("INSERT INTO events(project,kind,message,data,created) VALUES "
+                           "(?,'dependency_released','Dependency will not merge; task needs manual review',?,?)",
+                           (row["project"], encode({"task": row["task"], "dependency": row["dependency"],
+                                                   "dependency_state": link["dep_state"]}), time.time()))
             released = True
         if released:
             self.wake.set()

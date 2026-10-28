@@ -1246,9 +1246,18 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "菱形依赖、循环、取消和缺失节点均有明确调度结果。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_dependencies.py",
+        "adaptive_rsi/migrations/006_dependency_dag.sql",
+        "adaptive_rsi/store.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_dependency_dag",
+        "node tests/browser_dependency_dag.cjs",
+        "node --test tests/web_*.cjs"
+      ]
     },
     {
       "id": 82,
@@ -2891,6 +2900,7 @@
     "022d5ce",
     "5a70142",
     "2354f4a",
-    "ffdca68"
+    "ffdca68",
+    "7a391e4"
   ]
 }

@@ -36,6 +36,8 @@ const apiErrors={
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
  "Split retry preview changed; inspect it again":"任务组或原任务已变化，请重新查看拆分预览。",
+ "Dependencies require up to 100 unique task IDs":"前置任务最多选择 100 个，不能重复。",
+ "Dependency graph exceeds 1000 ancestors":"前置任务链超过 1000 个节点，请拆分安排。",
  "Only a stopped failed or cancelled group can be split for retry":"请选择一个已停止的失败或已取消任务组。",
  "Select one failed group to split for retry":"每次请选择一个失败任务组来拆分重做。",
  "Cancellation impact exceeds 1000 tasks; split the operation":"取消影响超过 1000 个任务，请分批处理。",

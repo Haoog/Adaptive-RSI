@@ -85,6 +85,10 @@ def main():
             runtime.process(runtime.store.claim(project, runtime.config(project)))
             runtime.pause(project, True)
             other = runtime.add_project(fixture(root / "other"), "另一个独立项目")
+            if os.environ.get("RSI_BROWSER_DAG"):
+                for title in ("前置甲", "前置乙", "等待两个前置任务"):
+                    task_id = runtime.goal(project, title)
+                    runtime.store.execute("UPDATE tasks SET priority=200 WHERE id=?", (task_id,))
             if os.environ.get("RSI_BROWSER_FAILED_GROUP"):
                 from adaptive_rsi.batching import execute as batch_execute
                 originals = [runtime.goal(project, title) for title in ("拆分来源一", "拆分来源二")]

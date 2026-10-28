@@ -87,16 +87,17 @@ def queue_status(store, project):
     rows = store.query("SELECT * FROM tasks WHERE project=? AND state='queued' ORDER BY " + store.queue_order(), (project, now))
     # 一次 JOIN 取回全部排队任务的依赖，避免逐条查询。
     dependencies = {}
-    for row in store.query("SELECT d.task AS task,p.id AS id,p.state AS state,p.title AS title FROM task_dependencies d "
-                           "JOIN tasks p ON p.id=d.dependency WHERE d.task IN "
+    for row in store.query("SELECT d.task AS task,d.dependency AS id,p.state AS state,p.title AS title FROM task_dependencies d "
+                           "LEFT JOIN tasks p ON p.id=d.dependency WHERE d.task IN "
                            "(SELECT id FROM tasks WHERE project=? AND state='queued')", (project,)):
-        dependencies[row["task"]] = {"id": row["id"], "state": row["state"], "title": row["title"]}
+        dependencies.setdefault(row["task"], []).append({"id": row["id"], "state": row["state"], "title": row["title"]})
     ready = 0
     for row in rows:
-        dependency = dependencies.get(row["id"])
+        parents = dependencies.get(row["id"], [])
+        dependency = next((parent for parent in parents if parent["state"] != "merged"), parents[0] if parents else None)
         reason = "dependency" if dependency and dependency["state"] != "merged" else "backoff" if row["available"] > now else "paused" if paused and paused["paused"] else "running" if busy else "ready"
         if reason in ["running", "ready"]:
             ready += 1
         row.update(wait_reason=reason, queue_position=ready if reason in ["running", "ready"] else None,
-                   dependency=dependency)
+                   dependency=dependency, dependencies=parents)
     return rows

@@ -27,12 +27,16 @@ function browser(savedSession = new Map()) {
   let created = 0, nextTimer = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
-      id, value: '', dataset: {}, handlers: {}, options: [], children: [], disabled: false,
+      id, _value: '',
+      get value() {return this.tagName === 'SELECT' ? this.children.find(option=>option.selected)?.value || '' : this._value;},
+      set value(value) {this._value=value;if(this.tagName === 'SELECT')for(const option of this.children)option.selected=option.value===value;},
+      get selectedOptions() {return this.children.filter(option=>option.selected);},
+      dataset: {}, handlers: {}, options: [], children: [], disabled: false,
       attributes: {}, classList: {toggle() {}, add() {}, remove() {}}, isConnected: true,
       addEventListener(type, handler) { this.handlers[type] = handler; },
       closest() { return this.id.endsWith('-form') ? this : this.form; },
       replaceChildren(...children) { this.options = children; this.children = children; },
-      append(...children) { this.children.push(...children); },
+      append(...children) { this.children.push(...children); if(this.tagName === 'SELECT')this.options=this.children; },
       prepend(...children) { this.children.unshift(...children); },
       remove() { this.isConnected=false;nodes.delete(this.id); },
       insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
@@ -1688,18 +1692,6 @@ function experiencePage({navigation = false} = {}) {
   vm.runInContext(experienceSource, page.context);
   if (navigation) ready[0]();
   page.notify = task => windowEvents.get('rsi-notification-open')({detail: task});
-  const create = page.document.createElement;
-  page.document.createElement = tag => {
-    const node = create(tag);
-    if (tag === 'select') {
-      let value = '';
-      Object.defineProperty(node, 'value', {
-        get: () => value,
-        set: next => { value = node.children.some(option => option.value === next) ? next : ''; }
-      });
-    }
-    return node;
-  };
   page.context.refresh = async () => {};
   return page;
 }
@@ -3197,4 +3189,25 @@ test('an available desktop update starts polling only after its download begins'
   assert.equal(page.desktop.downloads.length, 1, 'the download is requested once');
   assert.ok(vm.runInContext('desktopUpdateTimer', page.context), 'polling starts once the download begins');
   assert.equal(page.node('desktop-update').disabled, true);
+});
+
+test('multiple predecessors survive language rebuild and save as one dependency set', async () => {
+  const page = experiencePage(), task = fixtureTask('child', 'queued'), posts = [];
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {posts.push(JSON.parse(options.body));return response({saved:true});}
+    if (url.includes('/task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({tasks:[fixtureTask('first'),fixtureTask('second')]});
+    if (url.includes('id=first&')) return response(fixtureTask('first'));
+    if (url.includes('id=second&')) return response(fixtureTask('second'));
+    return response({...task,dependencies:[],urgency:0});
+  };
+  await openExperienceTask(page,task);
+  let form=queueForm(page), select=form.children[0].children[0];
+  for(const option of select.children)option.selected=['first','second'].includes(option.value);
+  await changeDetailLanguage(page);
+  await new Promise(setImmediate);
+  form=queueForm(page);select=form.children[0].children[0];
+  assert.deepEqual(select.selectedOptions.map(option=>option.value).sort(),['first','second']);
+  form.onsubmit({preventDefault(){}});await page.context.lastAction;
+  assert.deepEqual(posts,[{task:'child',dependencies:['first','second'],urgency:0}]);
 });

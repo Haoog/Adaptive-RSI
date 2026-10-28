@@ -41,7 +41,7 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     queue = {row["id"]: row for row in queue_status(store, project)} if project else {}
     for task in tasks:
         if task["id"] in queue:
-            task.update({k: queue[task["id"]][k] for k in ["wait_reason", "queue_position", "dependency"]})
+            task.update({k: queue[task["id"]][k] for k in ["wait_reason", "queue_position", "dependency", "dependencies"]})
     base_args = (project,) if project else ()
     # Include the latest attempt for every visible task, even if it is older than the history window.
     task_ids = [t["id"] for t in tasks]

@@ -477,11 +477,14 @@ window.RSIExperience = (() => {
         select = el("select"),
         none = el("option", t("无前置任务"));
       none.value = "";
+      select.multiple = true;select.size = 6;
       select.append(none);
+      const selection = () => [...select.selectedOptions].map(option => option.value).filter(Boolean).sort();
+      const choose = values => {for (const option of select.options) option.selected = values.includes(option.value);};
       if (!editor.baseline || (!queueSaves.has(editor.key) && editor.version === baselineVersion))
-        editor.baseline = {dependency: metadata.dependency?.dependency || "", urgency: !!metadata.urgency};
+        editor.baseline = {dependencies: (metadata.dependencies || (metadata.dependency ? [metadata.dependency] : [])).map(parent => parent.dependency).sort(), urgency: !!metadata.urgency};
       queueDraft = readQueueDraft();
-      const dependency = editor.baseline.dependency;
+      const dependencies = editor.baseline.dependencies;
       const pager = el("div", undefined, "task-pagination"),
         pageNote = el("span");
       pageNote.setAttribute("aria-live", "polite");
@@ -505,9 +508,9 @@ window.RSIExperience = (() => {
           );
           if (!current()) return;
           // Read at response time so edits made while a page loads remain selected.
-          const selected = select.value || "", pinned = new Map();
+          const selected = selection(), pinned = new Map();
           for (const option of select.children)
-            if (option.value && [dependency, selected].includes(option.value))
+            if (option.value && [...dependencies, ...selected].includes(option.value))
               pinned.set(option.value, {id: option.value, title: option.textContent});
           const choices = new Map(pinned);
           for (const other of candidates.tasks || [])
@@ -518,7 +521,7 @@ window.RSIExperience = (() => {
             option.value = other.id;
             select.append(option);
           }
-          select.value = selected;
+          choose(selected);
           offset = requestedOffset;
           hasMore = !!candidates.pagination?.has_more;
           pageNote.textContent = t("前置任务候选页") + " " + (offset / 200 + 1);
@@ -528,13 +531,13 @@ window.RSIExperience = (() => {
         }
       }
       // Seed saved/draft selections before loading, including an off-page parent.
-      for (const id of new Set([dependency, queueDraft?.dependency])) {
+      for (const id of new Set([...dependencies, ...(queueDraft?.dependencies || (queueDraft?.dependency ? [queueDraft.dependency] : []))])) {
         if (!id) continue;
         const option = el("option", id);
         option.value = id;
         select.append(option);
       }
-      select.value = queueDraft?.dependency ?? dependency;
+      choose(queueDraft?.dependencies || (queueDraft?.dependency ? [queueDraft.dependency] : dependencies));
       // Resolve seed titles once; subsequent pages pin only the saved and selected parent.
       for (const option of [...select.children]) {
         if (!option.value) continue;
@@ -549,24 +552,24 @@ window.RSIExperience = (() => {
         urgency = el("input");
       urgency.type = "checkbox";
       urgency.checked = queueDraft?.urgency ?? editor.baseline.urgency;
-      editor.read = () => ({dependency: select.value, urgency: urgency.checked});
+      editor.read = () => ({dependencies: selection(), urgency: urgency.checked});
       urgencyLabel.prepend(urgency);
       const submit = el("button", t("保存排队设置"), "button");
       submit.type = "submit";
       editor.submit = submit;
       submit.disabled = queueSaves.has(editor.key);
-      form.append(label, urgencyLabel, submit, pager);
+      form.append(label, urgencyLabel, submit, pager, el("p", t("可选择多个前置任务；全部合并后再开始。")));
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
           if (!current() || queueSaves.has(editor.key)) return;
-          const submitted = {task: task.id, dependency: select.value || null, urgency: urgency.checked ? 1 : 0};
+          const parents = selection(), submitted = {task: task.id, ...(parents.length > 1 ? {dependencies: parents} : {dependency: parents[0] || null}), urgency: urgency.checked ? 1 : 0};
           queueSaves.set(editor.key, submitted);
           submit.disabled = true;
           try {
             await api("task/schedule", submitted);
             // Rebase even if this form was rebuilt. Its editor still owns newer edits.
-            editor.baseline = {dependency: submitted.dependency || "", urgency: !!submitted.urgency};
+            editor.baseline = {dependencies: parents, urgency: !!submitted.urgency};
             editor.version++;
             if (!queueEditorCurrent(editor)) return;
             await refresh();
@@ -729,7 +732,7 @@ window.RSIExperience = (() => {
     const values = queueEditor.read?.();
     if (!values) return queueEditor.draft;
     if (queueSaves.has(queueEditor.key)) return values;
-    return Object.fromEntries(Object.entries(values).filter(([key, value]) => value !== queueEditor.baseline[key]));
+    return Object.fromEntries(Object.entries(values).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(queueEditor.baseline[key])));
   }
   function taskOpened(task, queueDraft) {
     const key = queueKey(task);

@@ -24,6 +24,8 @@ authorization_failed device_auth_unavailable auth_container_unavailable auth_wor
 
 # 精确匹配固定业务校验文案；不使用前缀匹配，也不携带用户提交的字段或值。
 SAFE_VALIDATION_MESSAGES = frozenset("""
+Dependencies require up to 100 unique task IDs
+Dependency graph exceeds 1000 ancestors
 Cancellation impact exceeds 1000 tasks; split the operation
 Cancellation impact is truncated; cancel only the current task
 Cascade cancellation must be a boolean

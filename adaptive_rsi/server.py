@@ -467,7 +467,8 @@ class Handler(BaseHTTPRequestHandler):
                 task.update(revisions=revisions["revisions"], revisions_has_more=revisions["has_more"],
                             revisions_next_before=revisions["next_before"])
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
-                task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
+                task["dependencies"] = store.query("SELECT dependency FROM task_dependencies WHERE task=? ORDER BY dependency", (task["id"],))
+                task["dependency"] = task["dependencies"][0] if task["dependencies"] else None
                 from .task_groups import lineage
                 task["group_lineage"] = lineage(store, task["id"], task["project"])
                 self.respond(task)
@@ -856,7 +857,7 @@ class Handler(BaseHTTPRequestHandler):
                                      body.get("request_id"), preview=body.get("preview", True) is not False,
                                      expected=body.get("revision"))
                 elif path == "/api/task/schedule":
-                    runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0), body.get("reason"))
+                    runtime.set_dependency(body["task"], body.get("dependencies", body.get("dependency")), body.get("urgency", 0), body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/backup":
                     from .storage_tools import backup
