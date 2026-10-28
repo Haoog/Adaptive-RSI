@@ -270,7 +270,7 @@ class ServerHardeningTest(unittest.TestCase):
 
     def test_configuration_validation_retains_fixed_guidance_without_echoing_inputs(self):
         from adaptive_rsi.config import validate
-        self.runtime.configure = lambda values, *_: validate(values)
+        self.runtime.configure = lambda values, *_, **__: validate(values)
         invalid = [
             ({"schedule": {"working_hours": [20, 20]}}, "working_hours requires different start/end hours in 0..24; start must be below 24"),
             ({"github": {"repository": "invalid"}}, "Repository must be owner/name"),
