@@ -1685,9 +1685,17 @@
       },
       "source": "adaptive_rsi/telemetry.py",
       "acceptance": "基准数据固定且可重放，超过预算时 CI 或性能报告明确告警。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "scripts/benchmark_history.py",
+        ".github/workflows/checks.yml"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_history_budget",
+        "python3 -B scripts/benchmark_history.py --tasks 50000 --samples 3 --enforce --output docs/validation/history-performance-20261028.json",
+        "docs/validation/history-performance-20261028.json"
+      ],
+      "residual": "Fixed synthetic history measures read-model construction plus JSON bytes, query wrapper calls and nearest-rank p95. Ordinary CI enforces one 10000-task/20000-run fixture and retains its report. Local 50000-task/100000-run report passed; it does not establish HTTP, cold-disk or concurrent production performance."
     },
     {
       "id": 108,

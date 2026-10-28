@@ -64,3 +64,5 @@ CI 会先区分文档改动和代码改动。纯文档改动检查本地链接�
 提交代码即表示同意按仓库的 MIT 许可证提供该贡献。
 
 纯机械版本 PR 只有在六个改动文件逐字匹配独立重建的发布补丁时，普通 CI 才走版本元数据检查；源码、工作流、分类器或生成脚本有变化均走完整普通 CI。该路径减少重复源码检查，自动合并版本 PR 仍必须通过 `release-verify.yml` 对最终提交的全量 Python、浏览器、桌面构建、smoke 和 provenance 门禁。耗时缓存只影响工作线程分配；无效记录回退完整发现，缓存不能跳过测试。
+
+历史规模性能基准：`python3 -B scripts/benchmark_history.py --tasks 10000 --samples 3 --enforce --output /tmp/rsi-history-performance.json`。固定四项目、每任务两次运行、2023 年锚点和稳定序号分布；每种读取及 JSON 序列化的 p95 上限 5000 ms，单响应 8 MiB。脚本仅替换指标模块的时钟以重放固定窗口，不调用模型。可用 `--tasks 50000` 本地加压，普通 CI 只运行一次万任务基准；报告包含 Python/SQLite/平台及数据集摘要，超预算明确失败并保留 artifact。它不测 HTTP 网络、真实磁盘冷缓存或生产并发负载。

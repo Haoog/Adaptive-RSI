@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 89 implemented with targeted acceptance, 26 partial, and 86 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 90 implemented with targeted acceptance, 26 partial, and 85 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -159,7 +159,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 104. **implemented** — Cache or incrementally index storage usage
 105. **implemented** — Budget archive compression resources
 106. **implemented** — Diagnose WAL checkpoint pressure
-107. **pending** — Set large-history performance budgets
+107. **implemented** — Set large-history performance budgets
 108. **pending** — Expand relational constraint coverage
 109. **implemented** — Extend relationship auditing beyond stages
 110. **partial** — Execute migrations once per version
@@ -283,3 +283,5 @@ Execution priority (91): 5 real-thread contention cases and 101 related Python c
 Resource-pressure admission (92): 6 targeted and 122 related Python checks, 339 Node checks and Chromium queue-reason/threshold-save/bilingual checks passed. Both review axes found no remaining confirmed issue. Disabled defaults preserve existing behavior. Controlled pressure blocks claims without failed attempts and clears on recovery; unsupported configured measurements defer conservatively. Memory basis and cache age are explicit; this is not a resource reservation.
 
 Mobile diff reading (189): new 390px/2300-line Chromium cases, the existing experience browser flow and 339 Node checks passed. Search expands lazily loaded files and locates wrapped text. Review found an inherited 420px child-pre cap; clearing it and a long-first-file/non-overlap regression resolved the issue. Ambiguous legacy textarea selectors now use accessible names. No remaining confirmed review finding.
+
+History budgets (107): 4 targeted tests passed. The fixed 50000-task/100000-run local fixture measured task-page p95 113.92ms, workflow metrics 435.20ms and quality summary 164.61ms; all responses were below 8MiB. The [report](history-performance-20261028.json) records environment and fixture identity. CI enforces the smaller 10000-task fixture once per full validation. Both review axes found no remaining confirmed issue. These synthetic figures do not establish production or HTTP throughput.
