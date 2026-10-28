@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.agent import CodexAgent
+from adaptive_rsi.agent import CodexAgent, model_capabilities
 from adaptive_rsi.config import validate
 from adaptive_rsi.gitops import git
 from adaptive_rsi.native import Conversation, NativeAgent, WorkspaceTools, tools_for
@@ -268,6 +268,9 @@ class NativeProtocolsTest(unittest.TestCase):
             with self.subTest(protocol=protocol):
                 _, body = Conversation(protocol, "model", "prompt", [], "default", output_tokens=1234).request()
                 self.assertEqual(body[key], 1234)
+        _, body = Conversation("chat_completions", "o3", "prompt", [], "default", output_tokens=1234).request()
+        self.assertEqual(body["max_completion_tokens"], 1234)
+        self.assertNotIn("max_tokens", body)
         _, body = Conversation("ollama", "model", "prompt", [], "default", output_tokens=1234).request()
         self.assertEqual(body["options"]["num_predict"], 1234)
         _, body = Conversation("anthropic", "claude-sonnet", "prompt", [], "default", output_tokens=1234).request()
@@ -275,6 +278,12 @@ class NativeProtocolsTest(unittest.TestCase):
         # Vendors cap their own maximum: never exceed the historical envelope.
         _, body = Conversation("anthropic", "claude-opus", "prompt", [], "default", output_tokens=32000).request()
         self.assertEqual(body["max_tokens"], 4096)
+
+    def test_known_gpt_families_use_documented_output_ceilings(self):
+        self.assertEqual(model_capabilities("gpt-4o", "chat_completions")["max_output_tokens"], 16384)
+        self.assertEqual(model_capabilities("gpt-4.1", "responses")["max_output_tokens"], 32768)
+        self.assertEqual(model_capabilities("o3", "responses")["max_output_tokens"], 100000)
+        self.assertEqual(model_capabilities("gpt-future", "responses")["max_output_tokens"], 16384)
 
 
 if __name__ == "__main__":

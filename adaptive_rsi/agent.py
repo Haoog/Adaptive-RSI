@@ -86,7 +86,17 @@ def model_capabilities(model, protocol="", override=None):
         result.update(context_tokens=1000000, max_output_tokens=65536,
                       efforts=["default"], source="known_family", confidence="known")
     elif re.search(r"gpt-[0-9]|\bo[134]\b", value):
-        result.update(context_tokens=200000, max_output_tokens=32768,
+        # Documented per-family output ceilings; the generic GPT ceiling is the
+        # conservative 16k used by gpt-4o, never an optimistic 32k.
+        if re.search(r"\bo[134]\b", value):
+            output_tokens = 100000
+        elif re.search(r"gpt-5", value):
+            output_tokens = 128000
+        elif re.search(r"gpt-4\.1", value):
+            output_tokens = 32768
+        else:
+            output_tokens = 16384
+        result.update(context_tokens=200000, max_output_tokens=output_tokens,
                       efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family", confidence="known")
     if "luna" in value:
         result.update(max_output_tokens=min(result["max_output_tokens"], 32768),

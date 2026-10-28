@@ -672,7 +672,10 @@ class Conversation:
             body = {"model": self.model, "messages": self.history,
                     "tools": [{"type": "function", "function": {"name": n, "description": d, "parameters": s}} for n, d, s in self.tools]}
             if self.output_tokens:
-                body["max_tokens"] = self.output_tokens
+                # o-series rejects max_tokens on Chat Completions.
+                key = ("max_completion_tokens" if re.search(r"\bo[134]\b", self.model.lower())
+                       else "max_tokens")
+                body[key] = self.output_tokens
             if self.effort != "default":
                 body["reasoning_effort"] = self.effort
             if p == "ollama":
