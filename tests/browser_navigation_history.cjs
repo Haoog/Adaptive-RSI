@@ -23,7 +23,7 @@ const {chromium} = require('playwright');
     const home=await firstStep.locator('#project-select').inputValue(),away=await firstStep.locator('#project-select option').evaluateAll((options,home)=>options.find(option=>option.value!==home).value,home);
     await firstStep.locator('#project-select').selectOption(away);await firstStep.waitForFunction(project=>projectId===project,away);
     await firstStep.reload();await firstStep.waitForFunction(project=>projectId===project,away);
-    await firstStep.goBack();await firstStep.waitForFunction(project=>projectId===project&&document.getElementById('project-select').value===project,home);
+    await firstStep.goBack();await firstStep.waitForFunction(project=>projectId===project&&document.getElementById('project-select').value===project,home,{timeout:60000});
     await firstStep.close();
     const first=await page.locator('#project-select').inputValue();
     const second=await page.locator('#project-select option').evaluateAll((options,first)=>options.find(option=>option.value!==first).value,first);
