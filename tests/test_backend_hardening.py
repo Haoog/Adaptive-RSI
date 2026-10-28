@@ -164,7 +164,7 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.repo = fixture(self.root / "project")
         self.project = self.runtime.add_project(self.repo, enabled=True)
         self.server = Server(self.runtime)
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.server_thread.start()
 
     def tearDown(self):
@@ -285,7 +285,7 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.server.server_close()
         self.server_thread.join(3)
         self.server = Server(self.runtime, public_url="https://rsi.example.com")
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.server_thread.start()
         self.assertNotEqual(self.server.origin, self.server.local_origin)
         status, _ = self.post("/api/pause", {"project": self.project, "paused": True})

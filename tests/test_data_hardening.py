@@ -27,7 +27,7 @@ class DataHardeningTest(unittest.TestCase):
         self.runtime = Runtime(Store(self.root / "state"), FakeAgent())
         self.project = self.runtime.add_project(fixture(self.root / "project"))
         self.server = Server(self.runtime)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.headers = {"Cookie": self.server.cookie + "=" + self.server.token}
 

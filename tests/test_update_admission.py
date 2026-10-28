@@ -87,6 +87,24 @@ class UpdateAdmissionTest(unittest.TestCase):
             self.assertEqual(barrier(self.runtime)['owner_pid'], os.getpid())
             self.assertEqual(barrier(self.runtime)['lease'], state['lease'])
 
+    def test_inflight_model_catalog_blocks_commit_until_it_finishes(self):
+        self.runtime.model_center.catalog_inflight.add(('global', 'openai'))
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')
+        self.assertFalse(prepared['ready'])
+        self.assertIn('model_catalog', prepared['reasons'])
+        with self.assertRaisesRegex(ValueError, 'active operations'):
+            readiness(self.runtime, 'commit', lease=prepared['barrier']['lease'])
+        self.runtime.model_center.catalog_inflight.clear()
+        committed = readiness(self.runtime, 'commit', lease=prepared['barrier']['lease'])
+        self.assertEqual(committed['barrier']['phase'], 'installing')
+
+    def test_catalog_fetch_refuses_during_update_and_releases_registration(self):
+        from adaptive_rsi.model_center import CenterError
+        with patch.object(self.runtime.updates, 'is_busy', return_value=True):
+            with self.assertRaises(CenterError):
+                self.runtime.model_center.fetch('openai')
+        self.assertFalse(self.runtime.model_center.catalog_inflight)
+
     def test_native_owner_environment_is_bounded_and_observable(self):
         from adaptive_rsi.desktop import installer_owner
         for value in ('', '-1', '1', '2147483648', '9' * 10000, '１２３'):

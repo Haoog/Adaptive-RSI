@@ -33,6 +33,28 @@ class UsageReportTest(unittest.TestCase):
         self.assertAlmostEqual(result['summary']['estimated_usd'],.00032)
         self.assertEqual(result['summary']['unpriced_calls'],1)
 
+    def test_all_report_reads_share_one_snapshot(self):
+        original_query, original_stream = self.store.query, self.store.stream
+        connections = []
+
+        def query(sql, args=()):
+            connections.append(getattr(self.store._read_snapshot, 'connection', None))
+            return original_query(sql, args)
+
+        def stream(sql, args=()):
+            connections.append(getattr(self.store._read_snapshot, 'connection', None))
+            yield from original_stream(sql, args)
+
+        self.store.query, self.store.stream = query, stream
+        try:
+            result = self.query(project='a', task='a')
+        finally:
+            self.store.query, self.store.stream = original_query, original_stream
+        self.assertTrue(connections)
+        self.assertTrue(all(connection is not None for connection in connections))
+        self.assertEqual(len({id(connection) for connection in connections}), 1)
+        self.assertEqual(result['summary']['calls'], result['call_total'])
+
     def test_task_detail_isolated_and_paginated(self):
         result=self.query(project='a',task='a',limit=1,offset=1)
         self.assertEqual(result['call_total'],3)

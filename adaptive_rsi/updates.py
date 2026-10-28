@@ -357,6 +357,7 @@ class UpdateManager:
                 (getattr(self.runtime, "operations", None) and self.runtime.operations.busy()) or
                 self.store.one("SELECT 1 FROM runs WHERE ended IS NULL") or
                 getattr(getattr(self.runtime, "model_center", None), "busy", 0) or
+                len(getattr(getattr(self.runtime, "model_center", None), "catalog_inflight", ())) or
                 getattr(getattr(self.runtime, "auth_sessions", None), "busy", 0))
 
     @staticmethod

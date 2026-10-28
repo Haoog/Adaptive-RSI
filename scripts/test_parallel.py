@@ -86,6 +86,17 @@ def stop_workers(processes):
 def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
     if not groups or len(groups) > MAX_WORKERS or any(not group for group in groups):
         raise ValueError("Expected one to four nonempty test groups")
+    # A worker must never start a runner for a module it is already executing:
+    # that selector re-enters the runner once per generation and each generation
+    # detaches into its own session, so it survives its parent being killed.
+    # Workers may still run other modules (release isolation fixtures do).
+    running = {name for name in os.environ.get("RSI_TEST_RUNNING", "").split(",") if name}
+    if running and not hasattr(subprocess.Popen, "mock_calls"):
+        for group in groups:
+            for selector in group:
+                module = ".".join(selector.split(".")[:2])
+                if module in running:
+                    raise ValueError("Nested test runner refused: {} is already running".format(module))
     processes = []
     failed = False
     began, offsets, recent = {}, {}, {}
@@ -95,15 +106,21 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
         try:
             pending = []
             for index, selectors in enumerate(groups, 1):
-                log = stack.enter_context(tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace"))
+                output = stack.enter_context(tempfile.NamedTemporaryFile(mode="w+b"))
+                # A duplicated descriptor shares its seek position with the
+                # child. Open a separate reader so polling cannot rewind and
+                # overwrite output that is still being written by the worker.
+                log = stack.enter_context(open(output.name, encoding="utf-8", errors="replace"))
                 timings = None
                 if durations_file:
                     timings = stack.enter_context(tempfile.NamedTemporaryFile(suffix=".json"))
                 argv = ([sys.executable, "-u", "-m", "scripts.test_worker", "--timings", timings.name, *selectors]
                         if timings else [sys.executable, "-u", "-m", "unittest", "-v", *selectors])
                 print("[group {}] {}".format(index, " ".join(selectors)), flush=True)
-                process = subprocess.Popen(argv, cwd=root, shell=False, stdout=log,
-                                           stderr=subprocess.STDOUT, start_new_session=True)
+                environment = dict(os.environ, RSI_TEST_ACTIVE="1")
+                process = subprocess.Popen(argv, cwd=root, shell=False, stdout=output,
+                                           stderr=subprocess.STDOUT, start_new_session=True,
+                                           env=environment)
                 processes.append(process)
                 pending.append((index, process, log, timings))
                 began[index] = recent[index] = time.monotonic()

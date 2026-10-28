@@ -26,6 +26,76 @@ class AuditEvolutionTest(unittest.TestCase):
         self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)',
                            ('c', 'p', 'strategy', 'stable', encode({'guidance': 'new', 'triggers': []}), encode(evidence or {}), 1))
 
+    def setup_proposal(self, holdout_uses=0):
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.gitops import git
+        import threading
+        repo = fixture(self.root / 'repo')
+        self.config = merge(DEFAULTS, {'evolution': {'min_cases_per_split': 1, 'repeats': 2}})
+        self.calls = {'proposal': 0, 'trial': 0}
+        self.prompts = []
+        def invoke(stage, prompt, workspace, run):
+            self.calls['proposal'] += 1
+            self.prompts.append(prompt)
+            return {'kind': 'strategy', 'guidance': 'small improvement', 'triggers': []}
+        def execute(*args, **kwargs):
+            self.calls['trial'] += 1
+            return {'decision': 'pass' if args[7] else 'fail'}
+        runtime = self.evolution.runtime
+        runtime.invoke = invoke
+        runtime.active_strategies = lambda project: []
+        runtime.execute_candidate = execute
+        runtime.is_cancelled = lambda run: False
+        runtime.dispatch_lock = threading.RLock()
+        for split in ('validation', 'holdout'):
+            spec = {'task': split + ' secret task', 'base': git(repo, 'rev-parse', 'HEAD'),
+                    'checks': CHECKS, 'source': 'real', 'signature': split,
+                    'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (split, 'p', split, split, encode(spec), holdout_uses if split == 'holdout' else 0, 1))
+        return {'id': 'p'}, repo, self.root / 'run', {'id': 'run', 'task': 'task', 'config': encode(self.config)}
+
+    @unittest.skip("待实现：付费前要求全新 holdout 与现有 max_holdout_uses 复用契约冲突")
+    def test_no_fresh_holdout_stops_before_any_paid_call(self):
+        args = self.setup_proposal(holdout_uses=1)
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+        self.assertIn('fresh', result['reason'].lower())
+
+    def test_reserved_holdout_blocks_concurrent_proposal_and_survives_failure(self):
+        args = self.setup_proposal()
+        def interrupted(*unused):
+            other = Evolution(self.evolution.runtime)
+            second = other.propose_and_evaluate(*args[:-1], {**args[-1], 'id': 'second'})
+            self.assertEqual(second['status'], 'insufficient_evidence')
+            raise RuntimeError('proposal transport failed')
+        self.evolution.runtime.invoke = interrupted
+        with self.assertRaisesRegex(RuntimeError, 'transport failed'):
+            self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.store.one("SELECT uses FROM cases WHERE id='holdout'")['uses'], 0)
+        records = self.store.query("SELECT * FROM candidates WHERE status='insufficient_evidence'")
+        reservation = [json.loads(row['evidence']) for row in records if 'reservation' in json.loads(row['evidence'])]
+        self.assertEqual(len(reservation), 1)
+        self.assertEqual(reservation[0]['reservation']['holdout'], ['holdout'])
+        self.assertIn('transport failed', reservation[0]['reason'])
+
+    def test_inactive_development_is_filtered_before_limit_and_holdout_never_proposed(self):
+        args = self.setup_proposal()
+        for index in range(11):
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('dev' + str(index), 'p', 'dev' + str(index), 'development',
+                                encode({'task': 'retired secret', 'active': False}), 0, index))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('active', 'p', 'active', 'development', encode({'task': 'active example'}), 0, 20))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls, {'proposal': 1, 'trial': 8})
+        self.assertNotIn('retired secret', self.prompts[0])
+        self.assertNotIn('holdout secret task', self.prompts[0])
+        self.assertIn('active example', self.prompts[0])
+        self.assertEqual(result['status'], 'insufficient_evidence')
+
     def test_long_term_failure_is_detected_after_initial_window(self):
         self.candidate({'monitor': {'passed': 1, 'failed': 0, 'runs': ['old']}})
         self.store.execute('INSERT INTO runs(id,project,strategy,config) VALUES (?,?,?,?)', ('late', 'p', encode([{'id': 'c'}]), encode({})))

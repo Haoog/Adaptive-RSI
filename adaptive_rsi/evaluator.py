@@ -472,6 +472,30 @@ def _changed_files(candidate):
     return sorted({path for path in (tracked + "\0" + untracked).split("\0") if path})
 
 
+def _committed_changes(baseline, candidate):
+    """Files committed on top of the baseline tree, even when the worktree is clean."""
+    try:
+        base = git(baseline, "rev-parse", "HEAD")
+        head = git(candidate, "rev-parse", "HEAD")
+        if base == head:
+            return []
+        return sorted({path for path in git(candidate, "diff", "--name-only", "-z", base, head, "--").split("\0") if path})
+    except RuntimeError:
+        return None
+
+
+def _harness_differs(baseline, candidate, checks):
+    """True when a file executed by a configured check differs between trees."""
+    for relative in configured_check_files(baseline, checks):
+        left, right = Path(baseline) / relative, Path(candidate) / relative
+        try:
+            if not left.is_file() or not right.is_file() or left.read_bytes() != right.read_bytes():
+                return True
+        except OSError:
+            return True
+    return False
+
+
 def _harness_path(path):
     name = Path(path).name.lower()
     parts = Path(path).parts
@@ -665,7 +689,7 @@ class Evaluator:
         restore(seeds, target, config)
 
     def _standard_stage(self, label, source, baseline, candidate, checks, directory, config, cancel,
-                        overlay, seeds, hidden, test_first_files=(), test_first_check=None):
+                        overlay, seeds, hidden, test_first_files=(), test_first_check=None, run_checks=None):
         target = copy_source(source, Path(directory) / label)
         self._seed_target(target, seeds, config, clear=True)
         harness = candidate if label == "candidate_full" else baseline
@@ -702,6 +726,10 @@ class Evaluator:
                 if not any(row["argv"] == check["argv"] and row.get("cwd", ".") == check.get("cwd", ".")
                            for row in effective_checks):
                     effective_checks.append(check)
+        if run_checks is not None:
+            # The supplementary stage executes only checks that the candidate
+            # stage did not run; the configured checks are reused from there.
+            effective_checks = [check for check in effective_checks if check in run_checks]
         rows = []
         for check in effective_checks:
             result = sandbox.check(check, target, cancel, protected, hidden)
@@ -821,6 +849,13 @@ class Evaluator:
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
         if changed_files is None:
             changed_files = _changed_files(candidate)
+        elif not changed_files:
+            # A clean snapshot reports no working-tree delta even when the
+            # candidate committed test or harness edits; compare committed
+            # history so frozen regression evidence cannot be reused.
+            committed = _committed_changes(baseline, candidate)
+            if committed:
+                changed_files = committed
         added_tests = _added_test_files(candidate) if test_first else []
         existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
@@ -834,6 +869,11 @@ class Evaluator:
                        for row in full_checks):
                 full_checks.append(check)
         changed_harness = _changed_harness(changed_files or [], full_checks, baseline, added_tests)
+        # Without a repository the harness comparison cannot prove that the
+        # candidate did not rewrite tests, so compare the files that the
+        # configured checks actually execute.
+        additions = (full_checks if changed_harness or _harness_differs(baseline, candidate, full_checks) else
+                     [check for check in full_checks if check not in checks])
         if test_first and changed_harness:
             return {"decision": "insufficient_evidence",
                     "reason": "Test-first proof cannot modify the existing test harness", "checks": []}
@@ -899,8 +939,8 @@ class Evaluator:
             seeds, hidden, added_tests if test_first else (), test_first_check)
         if not reuse_full:
             stages["candidate_full"] = lambda: self._standard_stage(
-                "candidate_full", candidate, baseline, candidate, checks, directory, execution_config, cancel,
-                overlay, seeds, hidden, added_tests if test_first else ())
+                "candidate_full", candidate, baseline, candidate, full_checks, directory, execution_config, cancel,
+                overlay, seeds, hidden, added_tests if test_first else (), run_checks=additions)
         if acceptance:
             stages["acceptance_candidate"] = lambda: self._acceptance_stage(
                 "acceptance_candidate", candidate, baseline, acceptance, directory, execution_config, cancel,
@@ -927,6 +967,16 @@ class Evaluator:
                 results["test_first_" + label] = outcome["test_first_rows"]
         if reuse_full:
             results["candidate_full"] = list(results.get("candidate", []))
+        elif "candidate_full" in results:
+            # Keep full_checks order: reused checks come from the candidate
+            # stage, supplement checks from this stage. Names repeat across
+            # nested modules, so pair them with argv and cwd.
+            def identity(row):
+                return (row["name"], tuple(row["argv"]), row.get("cwd", "."))
+            own = {identity(row): row for row in results["candidate_full"]}
+            previous = {identity(row): row for row in results.get("candidate", [])}
+            merged = [own.get(identity(check)) or previous.get(identity(check)) for check in full_checks]
+            results["candidate_full"] = [row for row in merged if row]
         if cached_baseline is None and "baseline" in results:
             self._cache_put(cache_scope, baseline_key, results["baseline"])
         if acceptance and "acceptance_baseline" in outcomes:

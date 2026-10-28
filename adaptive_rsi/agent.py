@@ -1,6 +1,7 @@
 import json
 import os
 import platform
+import re
 import shutil
 import time
 from pathlib import Path
@@ -71,24 +72,38 @@ def validate_output(value, schema):
             validate_output(item, schema["items"])
 
 
-def model_capabilities(model, protocol=""):
+def model_capabilities(model, protocol="", override=None):
     """Return conservative routing metadata; unknown models never inherit premium limits."""
     value = str(model or "").lower()
     result = {"id": model, "context_tokens": 128000, "max_output_tokens": 16384,
               "efforts": ["default"], "tools": True, "streaming": protocol in ("responses", "anthropic", "chat_completions", "gemini"),
-              "source": "conservative_default"}
+              "streaming_implemented": False, "metadata_version": 1, "updated_at": None,
+              "source": "conservative_default", "confidence": "heuristic"}
     if "claude" in value:
         result.update(context_tokens=200000, max_output_tokens=32000,
-                      efforts=["low", "medium", "high", "max"], source="known_family")
+                      efforts=["low", "medium", "high", "max"], source="known_family", confidence="known")
     elif "gemini" in value:
         result.update(context_tokens=1000000, max_output_tokens=65536,
-                      efforts=["default"], source="known_family")
-    elif any(item in value for item in ("gpt-", "o1", "o3", "o4")):
+                      efforts=["default"], source="known_family", confidence="known")
+    elif re.search(r"gpt-[0-9]|\bo[134]\b", value):
         result.update(context_tokens=200000, max_output_tokens=32768,
-                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family")
+                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family", confidence="known")
     if "luna" in value:
         result.update(max_output_tokens=min(result["max_output_tokens"], 32768),
-                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family")
+                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family", confidence="known")
+    if override is not None:
+        if not isinstance(override, dict):
+            raise ValueError("Model capability override must be an object")
+        limits = {name: override.get(name) for name in ("context_tokens", "max_output_tokens")}
+        for name, limit in limits.items():
+            if limit is not None and (type(limit) is not int or limit <= 0):
+                raise ValueError("Model capability {} must be a positive integer".format(name))
+        if limits["context_tokens"] and limits["max_output_tokens"] and \
+                limits["max_output_tokens"] > limits["context_tokens"]:
+            raise ValueError("max_output_tokens cannot exceed context_tokens")
+        result.update({name: limit for name, limit in limits.items() if limit is not None},
+                      source="manual", confidence="manual",
+                      updated_at=override.get("updated_at"))
     return result
 
 

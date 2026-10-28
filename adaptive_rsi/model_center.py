@@ -318,10 +318,16 @@ class ModelCenter:
 
     def fetch(self, provider_id, project=None):
         key = (project, provider_id)
-        with self.lock:
-            if key in self.catalog_inflight:
-                raise CenterError("catalog_busy")
-            self.catalog_inflight.add(key)
+        # Register in-flight work and check update admission in the same critical
+        # section, so a directory request cannot start after the barrier was
+        # declared idle, nor look idle while the request is running.
+        with self.runtime.dispatch_lock:
+            if self.runtime.updates.is_busy():
+                raise CenterError("update_in_progress")
+            with self.lock:
+                if key in self.catalog_inflight or len(self.catalog_inflight) >= 4:
+                    raise CenterError("catalog_busy")
+                self.catalog_inflight.add(key)
         try:
             return self._fetch(provider_id, project)
         finally:

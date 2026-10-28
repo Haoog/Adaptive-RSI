@@ -303,6 +303,17 @@ class AuditUsageBoundariesTest(unittest.TestCase):
 
 
 class AuditProcessBoundariesTest(unittest.TestCase):
+    def test_completed_commands_do_not_wait_for_a_fixed_polling_sleep(self):
+        process = Mock(returncode=0)
+        process.poll.side_effect = [None, 0]
+        process.wait.return_value = 0
+        with patch("adaptive_rsi.process.subprocess.Popen", return_value=process), \
+                patch("adaptive_rsi.process.os.killpg"), \
+                patch("adaptive_rsi.process.time.sleep", side_effect=AssertionError("Completed commands must wake the waiter")):
+            result = run_process(["completed-command"])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIsNone(result["error"])
+
     @staticmethod
     def mounts(argv):
         return [next(csv.reader(io.StringIO(argv[i + 1]))) for i, value in enumerate(argv) if value == "--mount"]

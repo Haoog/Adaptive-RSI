@@ -31,6 +31,25 @@ class BaselineAndCleanupTest(unittest.TestCase):
     setUp = recovery_tests.DeliveryRecoveryTest.setUp
     publish = recovery_tests.DeliveryRecoveryTest.publish
 
+    def test_committed_changes_are_read_between_clean_snapshots(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'app.py').write_text('VALUE = 0\n')
+            (root / 'tests').mkdir()
+            (root / 'tests/test_app.py').write_text('assert True\n')
+            git(root, 'init', '-q')
+            git(root, 'add', '.')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=t@localhost', 'commit', '-qm', 'base')
+            start = git(root, 'rev-parse', 'HEAD')
+            (root / 'tests/test_app.py').write_text('assert False\n')
+            git(root, 'add', '.')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=t@localhost', 'commit', '-qm', 'change test')
+            end = git(root, 'rev-parse', 'HEAD')
+            self.assertEqual(delivery.committed_changes(root, start, end), ['tests/test_app.py'])
+            self.assertEqual(delivery.committed_changes(root, end, end), [])
+
     def test_diverged_baseline_is_explained_without_overwriting_any_ref(self):
         old = self.run['base']
         candidate = self.head
@@ -139,6 +158,20 @@ class RemoteTimingTest(unittest.TestCase):
 
 
 class AuthorizationReceiptTest(unittest.TestCase):
+    def test_later_verified_head_cannot_authorize_failed_merge(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            outcome = {'merged_sha': MERGED, 'feedback': {'state': 'verified', 'head': 'd' * 40,
+                       'evaluation': {'decision': 'pass'}}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
+            self.assertEqual(data['release']['state'], 'blocked_verification')
+            self.assertFalse(any(method == 'POST' for _, method, _ in case.commands))
+        finally:
+            case.tearDown()
+
     def test_receipt_binds_exact_dispatch_inputs_and_target_policy(self):
         from tests.test_release import ReleaseAutomationTest
         case = ReleaseAutomationTest()

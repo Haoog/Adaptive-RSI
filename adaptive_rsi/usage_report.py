@@ -1,5 +1,6 @@
 """按真实调用记录归集任务用量，失败重试和未知用量均保留。"""
 import datetime
+import functools
 import math
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +19,21 @@ coalesce(sum(c.unit_price IS NULL OR c.usage_known=0),0) AS unpriced_calls"""
 JOIN = " FROM calls c LEFT JOIN runs r ON r.id=c.run LEFT JOIN tasks t ON t.id=r.task "
 
 
+def one_snapshot(function):
+    """Serve every read in a report from the same SQLite snapshot.
+
+    Summary, trends, groups and call details are derived from one transaction so a
+    concurrent write can never make the response contradict its own totals. Nested
+    snapshots reuse the outer transaction.
+    """
+    @functools.wraps(function)
+    def wrapped(store, params):
+        with store.snapshot():
+            return function(store, params)
+    return wrapped
+
+
+@one_snapshot
 def report(store, params):
     def value(key, default=None):
         return params.get(key, [default])[0]

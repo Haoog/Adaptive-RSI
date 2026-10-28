@@ -8,15 +8,32 @@ Report bugs and propose improvements through Issues, or contribute through a Pul
 
 Requires Python 3.9+. Execution uses macOS Seatbelt or Linux Docker. Models can use Codex, OpenCode CLI or tool-capable native APIs. GitHub import, sync and approved delivery use authenticated `gh`. Routine tests substitute the model interface and require no paid model calls.
 
-You do not need the full suite (~8 minutes) for every local change. Run only the affected group the same way CI splits them, for example `python3 -m unittest tests.test_runtime.RuntimeTest` or `python3 -m unittest tests.test_store`; CI runs the full set in parallel after you push.
+Start each local change with the specific test or affected modules, then run the full checks once the batch is ready. CI retains platform compatibility, isolation and release gates after a push. Avoid reinstalling dependencies, rebuilding the desktop application or rerunning every browser scenario after each small edit.
 
 ```sh
-python3 -m unittest discover -v
+# Run a failing test or one module directly
+python3 -B -m unittest tests.test_store -q
+# Independent modules use at most four processes; timings only balance later runs
+python3 -B scripts/test_selected.py --durations .ci/selected-durations.json tests.test_validation_planning tests.test_release_parallel
+# Inspect the browser selection before running it; hardening groups are selectable
+npm run test:browser -- --list browser_task_detail.cjs
+npm run test:browser -- browser_task_detail.cjs
+npm run test:browser -- browser_hardening.cjs:routes
+```
+
+For shared frontend request, state or rendering changes, run `node --test tests/web_*.cjs` and the relevant real-browser scenarios. For shared backend runtime, storage or isolation changes, expand to the related modules and run the full suite before delivery. Documentation changes use `python3 -B scripts/check_docs.py`. Dependency installation (`npm ci --ignore-scripts`) and browser installation are needed for initial setup or lockfile changes.
+
+Selectors are expanded into concrete tests before any process starts: choosing a class together with one of its methods, choosing selectors that contain each other, or choosing nothing is rejected instead of launching a worker. Workers may not start another runner (`RSI_TEST_ACTIVE`), and a worker exits when its parent disappears. These are hard boundaries that keep test recursion from exhausting the machine; do not bypass them to make a single test run — split the batch explicitly instead.
+
+Use the following complete local checks after the batch is ready. Full Python discovery is distributed across at most four processes, using test counts without a cache and actual module timings on later runs. Serial discovery remains available for investigating order-dependent failures.
+
+```sh
+python3 -B scripts/test_parallel.py --durations .ci/test-durations.json
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 node --check adaptive_rsi/web/model-center.js
 node --check adaptive_rsi/web/auth.js
-node --test tests/web_requests.cjs
+node --test tests/web_*.cjs
 npm ci --ignore-scripts
 npx playwright install chromium
 npm run test:browser

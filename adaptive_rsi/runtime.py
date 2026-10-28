@@ -1139,7 +1139,8 @@ class Runtime(Maintenance):
             return self._drain_postprocess(run_id)
 
     def _drain_postprocess(self, run_id=None):
-        rows = self.store.query("SELECT key,value FROM settings WHERE key LIKE 'postprocess:%' " +
+        rows = self.store.query("SELECT key,value FROM settings WHERE key LIKE 'postprocess:%' "
+                                "AND (NOT json_valid(value) OR json_extract(value,'$.state')='pending') " +
                                 (' AND key=?' if run_id else ''), ('postprocess:' + run_id,) if run_id else ())
         for item in rows:
             identifier = item['key'].split(':', 1)[1]
@@ -1203,13 +1204,34 @@ class Runtime(Maintenance):
             result.append(item)
         return result
 
+    @staticmethod
+    def begin_phase(run, stage):
+        if stage not in ('preparation', 'model', 'evaluation'):
+            raise ValueError('Unknown execution phase')
+        run['_explicit_phase'] = stage
+        run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
+
+    def new_trial_context(self, parent):
+        """Start an experiment clock that never inherits the parent's elapsed time."""
+        trial = {key: value for key, value in parent.items()
+                 if key not in ('_model_started', '_deadline_started', '_deadline_stage',
+                                '_timed_out_stage', '_explicit_phase')}
+        self.begin_phase(trial, 'preparation')
+        return trial
+
+    @staticmethod
+    def propagate_deadline(parent, trial):
+        if trial.get('_timed_out_stage'):
+            parent['_timed_out_stage'] = trial['_timed_out_stage']
+
     def is_cancelled(self, run):
         if self.stop.is_set():
             return True
         if '_deadline_started' in run:
             state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
             stage = ('model' if run.get('_model_started') is not None else
-                     'evaluation' if state and state['state'] == 'evaluating' else 'preparation')
+                     run.get('_explicit_phase') or
+                     ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
             if run.get('_deadline_stage') != stage:
                 run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
             limits = merge(DEFAULTS['deadlines'], json.loads(run['config']).get('deadlines', {}))

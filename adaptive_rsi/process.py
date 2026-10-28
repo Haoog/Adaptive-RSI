@@ -139,7 +139,12 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                 except ProcessLookupError:
                     pass
                 break
-            time.sleep(0.08)
+            # A short command should wake us as soon as it exits. Keep the same
+            # upper bound between cancellation, timeout and output-limit checks.
+            try:
+                process.wait(timeout=0.08)
+            except subprocess.TimeoutExpired:
+                pass
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:

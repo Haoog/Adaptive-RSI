@@ -69,6 +69,7 @@ def readiness(runtime, action="status", version=None, lease=None):
         runs = runtime.store.query("SELECT id,project,state FROM runs WHERE ended IS NULL")
         reasons = ["running_tasks"] if runs else []
         for name, busy in (("model_probe", getattr(runtime.model_center, "busy", 0)),
+                           ("model_catalog", len(getattr(runtime.model_center, "catalog_inflight", ()))),
                            ("authentication", getattr(runtime.auth_sessions, "busy", 0)),
                            ("project_import", runtime.import_in_progress),
                            ("maintenance", runtime.maintenance_lock.locked())):

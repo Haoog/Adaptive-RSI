@@ -98,9 +98,13 @@ window.RSINativeUpdate=(()=>{
    const last=Number(localRead('rsi-native-update-checked')||0);
    if(preference()!=='manual'&&((failureCounts.check||0)+(failureCounts.download||0)>0||Date.now()-last>6*3600000)){
     await run('check');
-    if(preference()!=='manual'&&snapshot.state==='available'&&eligible(snapshot.current_version,snapshot.version))await run('download');
-    else if(snapshot.state!=='error'){failureCounts.download=0;failures=Object.values(failureCounts).reduce((sum,value)=>sum+value,0);}
    }
+   // A known available version must be downloaded even when the periodic check
+   // is not due, e.g. after reopening the page or switching to download policy.
+   const pendingDownload=!busy&&preference()!=='manual'&&snapshot.state==='available'&&eligible(snapshot.current_version,snapshot.version);
+   // A successful feed check must not erase an active download backoff.
+   if(snapshot.state!=='error'&&!pendingDownload){failureCounts.download=0;failures=Object.values(failureCounts).reduce((sum,value)=>sum+value,0);}
+   if(pendingDownload)await run('download');
    if(!busy&&Date.now()>=installRetryAt&&snapshot.state==='ready'&&preference()==='automatic'&&(!snapshot.error_code||snapshot.error_code==='update_window_closed')&&eligible(snapshot.current_version,snapshot.version)&&withinWindow())await run('install',true);
   }finally{checking=false;}
  }

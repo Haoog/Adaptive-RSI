@@ -110,8 +110,8 @@ window.RSIAuth = (() => {
     if(backend==='opencode'){
       box.append(text('p','OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。','mc-secondary'));
       const guide=external('https://opencode.ai/v2/docs/console/go/','OpenCode Go 官方说明');if(guide)box.append(guide);
-      const label=text('label','先选择 OpenCode 供应商'),select=el('select');select.id='mc-auth-provider';select.setAttribute('aria-label',t('OpenCode 供应商'));
-      const search=el('input');search.type='search';search.id='mc-auth-provider-search';search.value=providerQuery;
+      const label=text('label','先选择 OpenCode 供应商'),select=el('select');select.id='mc-auth-provider';select.setAttribute('aria-label',t('OpenCode 供应商'));select.dataset.authField='provider';
+      const search=el('input');search.type='search';search.id='mc-auth-provider-search';search.value=providerQuery;search.dataset.authField='provider-query';
       search.placeholder=t('搜索供应商');search.setAttribute('aria-label',t('搜索供应商'));
       const fill=()=>{const query=providerQuery.trim().toLocaleLowerCase();const first=text('option','选择供应商');first.value='';select.replaceChildren(first);
         for(const provider of (providers||[]).filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||item.id.toLocaleLowerCase().includes(query))){

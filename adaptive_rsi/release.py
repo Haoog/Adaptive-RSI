@@ -575,9 +575,18 @@ def advance(runtime, project, run, outcome, cancel=None):
         if not policy.get("enabled") and not data:
             continue
         try:
-            if (not data or data.get("state") in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}) and outcome.get("feedback", {}).get("state") != "verified":
-                state = "waiting_verification" if not outcome.get("feedback") else "blocked_verification"
-                data = {"state": state, "error": "Post-merge verification must pass before release/deploy"}
+            feedback = outcome.get("feedback") or {}
+            verified = feedback.get("state") == "verified"
+            # A later mainline commit passing its own checks cannot certify the merge
+            # commit that will actually be built and released. Older verified receipts
+            # without a head are treated as referring to the merge commit itself.
+            covers_dispatch = feedback.get("head", outcome.get("merged_sha")) == outcome.get("merged_sha")
+            if (not data or data.get("state") in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}) and not (verified and covers_dispatch):
+                state = "waiting_verification" if not feedback else "blocked_verification"
+                error = ("Post-merge verification covers a later mainline commit, not the merge commit to release"
+                         if verified and not covers_dispatch else
+                         "Post-merge verification must pass before release/deploy")
+                data = {"state": state, "error": error}
                 result[kind] = persist(runtime, run, kind, data)
                 continue
             if data and data.get("state") in {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}:

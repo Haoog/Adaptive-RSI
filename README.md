@@ -126,8 +126,10 @@ python3 scripts/rsi doctor
 
 ## 开发与验证
 
+日常修改先运行受影响模块和浏览器场景，见[分层验证命令](CONTRIBUTING.md#本地开发)。一批改动完成后运行完整检查：
+
 ```sh
-python3 -m unittest discover -v
+python3 -B scripts/test_parallel.py --durations .ci/test-durations.json
 node --check adaptive_rsi/web/app.js
 node --check adaptive_rsi/web/i18n.js
 npm run test:browser

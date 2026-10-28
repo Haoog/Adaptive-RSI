@@ -373,14 +373,19 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
         updater.set(json!({"state":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.
-        let child = runtime.child.lock().unwrap().take();
-        if let Some(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() { let _ = stdin.flush(); }
-            if !wait_for_child(&mut child, Duration::from_secs(30)) {
-                *runtime.child.lock().unwrap() = Some(child);
-                return Err("update_runtime_shutdown_failed".into());
+        // A stop request is irreversible: never treat a child whose stdin was already
+        // closed as a usable connection, even if it has not exited within the grace period.
+        if runtime.child.lock().unwrap().is_some() {
+            match super::shutdown_runtime(runtime.inner(), Duration::from_secs(30)) {
+                Ok(mut exiting) => {
+                    if !super::wait_for_child(&mut exiting, Duration::from_secs(10)) {
+                        *runtime.child.lock().unwrap() = Some(exiting);
+                        return Err("update_runtime_shutdown_failed".into());
+                    }
+                    engine_stopped = true;
+                }
+                Err(error) => return Err(error),
             }
-            engine_stopped = true;
         }
         require_window(&window)?;
         let staged = updater.staged.lock().unwrap().take().ok_or("update_not_downloaded")?;
@@ -400,6 +405,33 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
     })();
     if let Err(ref error) = result {
         if engine_stopped { let _ = bootstrap(&app); }
+        let runtime_state = app.state::<RuntimeState>();
+        if runtime_state.recovering.load(Ordering::SeqCst) {
+            // The old service may still be exiting after the grace period. Watch for
+            // its real exit, then restore a fresh owned runtime instead of exposing
+            // a stale connection or reopening the update barrier.
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(180);
+                loop {
+                    let state = handle.state::<RuntimeState>();
+                    let exited = {
+                        let mut guard = state.child.lock().unwrap();
+                        match guard.as_mut() {
+                            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+                            None => true,
+                        }
+                    };
+                    if exited {
+                        *state.child.lock().unwrap() = None;
+                        let _ = bootstrap(&handle);
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline { break; }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        }
         let recovery = app.state::<RuntimeState>().local.lock().unwrap().clone();
         if let Some(connection) = recovery.as_ref().or(local.as_ref()).filter(|connection| connection.owned) {
             if lease.is_string() {
