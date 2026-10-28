@@ -33,6 +33,10 @@ const draftStore=(()=>{
 })();
 window.RSIDraftStore=draftStore;
 const apiErrors={
+ "Cancellation impact exceeds 1000 tasks; split the operation":"取消影响超过 1000 个任务，请分批处理。",
+ "Preview dependent cancellations before confirming":"请先查看后继任务的取消预览，再确认操作。",
+ "Cancellation preview changed; review it again":"任务或依赖已变化，请重新查看取消预览。",
+ "Intervention reason must be at most 2000 characters":"干预原因最多填写 2000 个字符。",
  "Wait for the active run to finish stopping before retrying or supplementing this task":"任务仍在停止中，请等当前运行结束后再重试或补充需求。",
  "Restart plan is missing; inspect installations before admitting work":"缺少重启计划，请检查安装记录，确认当前版本后重新启动服务。",
  "Update check interrupted; retry is safe":"上次检查更新被中断，未更改任何内容，可直接重新检查。",
@@ -460,6 +464,12 @@ function valueReport(value,reason,scope){
  if(value.evidence?.length){const details=el('details'),list=el('ul');details.append(el('summary',t('判断证据')));for(const item of value.evidence)list.append(el('li',item));details.append(list);report.append(details);}}
  if(scope?.length)report.append(el('p',t('计划范围')+' · '+scope.join(', '),'muted'));return report;
 }
+async function confirmCandidateApproval(data){
+ const content=el('div'),reason=el('textarea'),label=el('label',t('干预原因（可选，保留原文）'));
+ reason.maxLength=2000;reason.rows=2;label.append(reason);
+ const summary=window.RSIProduct?.approval(data);if(summary)content.append(summary);content.append(label);
+ return await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),content)?{reason:reason.value}:null;
+}
 function writeNavigation(name){
  if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');const target=location.pathname+location.search+'#'+navigation;if(target!==location.pathname+location.search+location.hash)history.pushState(null,'',target);}
 }
@@ -564,7 +574,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
   if(data.result.files){delivery.append(action(t('阅读代码差异'),()=>window.RSIExperience?.showDiff(run.id),'text-button'));if(!window.RSIDesktop){const link=el('a',t('查看具体代码修改 ↗'));link.href='/api/patch?id='+run.id;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
-  let delivering=false;if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async(evt)=>{if(delivering)return;if(!(await uiConfirm(t('这会把待验证改动分支推送到关联 GitHub 仓库，并创建 PR。确认批准？'),window.RSIProduct?.approval(data))))return;delivering=true;if(evt?.target)evt.target.disabled=true;try{await api('deliver',{run:run.id});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}finally{delivering=false;if(evt?.target)evt.target.disabled=false;}}));
+  let delivering=false;if(run.state==='awaiting_approval')delivery.append(action(t('批准推送并创建 PR'),async(evt)=>{if(delivering)return;const approval=await confirmCandidateApproval(data);if(!approval)return;delivering=true;if(evt?.target)evt.target.disabled=true;try{await api('deliver',{run:run.id,...approval});toast(currentProject()?.paused?t('交付任务已加入；启用项目后执行'):t('交付任务已加入'));$('detail-dialog').close();await refresh();}finally{delivering=false;if(evt?.target)evt.target.disabled=false;}}));
   if(data.result.pr){run.pr=data.result.pr;const link=el('a',t('打开 GitHub PR ↗'));if(/^https:\/\/github\.com\//.test(run.pr)){link.href=run.pr;link.target='_blank';link.rel='noreferrer';delivery.append(link);}}
   if(['pr_open','merged'].includes(run.state))delivery.append(action(t('撤销这次修改（先检查再提交）'),async()=>{await api('revert-code',{run:run.id});toast(t('恢复旧版本任务已加入；通过检查后才可交付'));$('detail-dialog').close();await refresh();}));
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
@@ -586,8 +596,15 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  // 与 runtime.cancel_task 的 cancellable 状态保持一致；待批准的候选取消前需确认后果。
  if(['queued','planning','executing','evaluating','blocked','waiting_budget','deferred','insufficient_evidence','failed','interrupted','awaiting_approval'].includes(task.state))body.append(action(t('取消任务'),async()=>{
   if(ticket!==detailSequence||projectId!==project)return;
-  if(task.state==='awaiting_approval'&&!(await uiConfirm(t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？'))))return;
-  await api('cancel',{task:task.id});$('detail-dialog').close();await refresh();}));
+  const plan=await api('task-cancel-preview?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
+  if(ticket!==detailSequence||projectId!==project)return;
+  const preview=el('div'),cascade=el('input'),reason=el('textarea');cascade.type='checkbox';reason.maxLength=2000;reason.rows=2;
+  preview.append(el('p',t('取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？')));
+  if(plan.affected.length){preview.append(el('p',t('以下后继任务依赖本任务；默认只取消当前任务。')));for(const item of plan.affected)preview.append(el('p',item.title+' · '+t(statusNames[item.state]||item.state)));if(!plan.truncated){const label=el('label',t('同时取消可取消的后继任务'));label.prepend(cascade);preview.append(label);}}
+  if(plan.truncated)preview.append(el('p',t('后继过多，预览仅展示前 999 项；本次只能取消当前任务。')));
+  const reasonLabel=el('label',t('干预原因（可选，保留原文）'));reasonLabel.append(reason);preview.append(reasonLabel);
+  if(!(await uiConfirm(t('确认取消任务及所选后继？'),preview)))return;
+  await api('cancel',{task:task.id,cascade:cascade.checked,revision:plan.revision,reason:reason.value});$('detail-dialog').close();await refresh();}));
  restoreView?.(body);
  if(stillCurrent()&&!$('detail-dialog').open)$('detail-dialog').showModal();}
 const evolutionReasons={

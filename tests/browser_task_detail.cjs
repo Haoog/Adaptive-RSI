@@ -93,15 +93,22 @@ async function checkTaskDetail(browser, url, errors) {
     assert.ok(confirmText.includes('撤销'), 'confirm copy mentions candidate revocation');
     assert.ok(confirmText.includes('重新验证'), 'confirm copy mentions fresh verification');
     assert.ok(confirmText.includes('PR'), 'confirm copy mentions existing PRs unaffected');
+    assert.ok(confirmText.includes('等待待交付任务的后继'), 'preview lists the affected downstream task');
+    assert.equal(await confirmBox.getByLabel('同时取消可取消的后继任务', {exact: true}).isChecked(), false);
     // 先拒绝一次：不应触发取消请求。
     await confirmBox.locator('button', { hasText: '取消' }).first().click();
     await page.waitForTimeout(400);
     assert.equal(cancelPosts, 0, 'dismissing the confirm dialog must not cancel');
     await cancelButton.click();
     await page.locator('dialog.confirm-dialog[open]').waitFor({ timeout: 5000 });
+    await page.locator('dialog.confirm-dialog').getByLabel('同时取消可取消的后继任务', {exact: true}).check();
+    await page.locator('dialog.confirm-dialog').getByLabel('干预原因（可选，保留原文）', {exact: true}).fill('取消整个相关范围');
     await page.locator('dialog.confirm-dialog button', { hasText: '确认' }).click();
     const cancelled = await cancelRequest;
     assert.equal(cancelled.status(), 200, await cancelled.text());
+    const cancellation = await cancelled.json();
+    assert.equal(cancellation.cascade, true);
+    assert.equal(cancellation.receipts.filter(item => item.state === 'cancelled').length, 2);
     const cancelTaskId = cancelled.request().postDataJSON().task;
     await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 5000 });
     await page.locator('[data-task-filter="history"]').click();

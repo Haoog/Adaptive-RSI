@@ -52,6 +52,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 
 The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
 
+Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
+
 ## Quick Start
 
 ### Desktop app (recommended)

@@ -1222,9 +1222,19 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "取消多层依赖时预览与最终逐项回执一致，不隐式扩大取消范围。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_lifecycle.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Preview-bound transactional cancellation; explicit cascade only, finished/cross-project tasks protected, large impact disclosed and root-only cancellation remains available."
     },
     {
       "id": 83,
@@ -1410,9 +1420,19 @@
       },
       "source": "adaptive_rsi/telemetry.py",
       "acceptance": "导出可关联干预前后状态，用户原文保留且不强制填写。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_lifecycle.py",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Optional verbatim reasons, before/after effects, candidate/publication identity, stable history pagination and explicitly partial exports; older events may lack structured fields."
     },
     {
       "id": 98,
@@ -1449,9 +1469,20 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "连续修订后可重建最终需求并追溯每次重跑的依据。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/task_revisions.py",
+        "adaptive_rsi/migrations/004_revision_snapshots.sql",
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_task_lifecycle",
+        "node tests/browser_task_detail.cjs",
+        "node tests/browser_revision_flow.cjs"
+      ],
+      "residual": "Atomic exact after snapshots and invalidation effects, lazy diffs and cursor history beyond 100 edits. Legacy missing snapshots are not inferred; retention still applies."
     },
     {
       "id": 101,
@@ -2808,6 +2839,7 @@
   "checkpoint_commits": [
     "cd6e614",
     "de75578",
-    "022d5ce"
+    "022d5ce",
+    "5a70142"
   ]
 }

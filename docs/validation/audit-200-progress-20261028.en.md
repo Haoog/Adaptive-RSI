@@ -4,7 +4,7 @@
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 59 implemented with targeted acceptance, 38 partial, and 104 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 62 implemented with targeted acceptance, 38 partial, and 101 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -44,6 +44,12 @@ Existing `v0.5.124` release assets must not be overwritten with different rebuil
 Background receipt review fixed successful business results being replaced by failures after transient dual-write faults, and unnecessary file rewrites during receipt replay. Business execution occurs once; persistence retries retain the original result. Five fault regressions passed. See the [timing record](validation-timing-20261028.json) for observed group loads and the next grouping estimate; predictions are not measured CI speedup.
 
 Migration review: legacy `[1,2]` history upgrades to `[1,2,3]` while compatibility format stays v2; both old and new implementations reopened it successfully. SQL bytes are checked and failed DDL/history roll back together; legacy identifier hashes and transaction-external bootstrap DDL remain limits. Related checks passed (54 tests); a built wheel installed in isolation included migration resources and initialized a new database successfully.
+
+## Cancellation, Revisions and Intervention Records
+
+Items 82/97/100 are implemented and reviewed against standards and requirements. Cancellation uses preview revisions and transactional per-item audit. Truncated graphs forbid cascading while retaining root-only cancellation. Additive maintenance migration 004 retains compatibility format v2 and stores exact revision snapshots, diffs and invalidation effects, with cursor history beyond 100 edits. Approval commits publication changes, optional reasons, candidate identity and effects in one transaction.
+
+Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delivery-loop, workflow and server-execution regressions passed with two existing environment-dependent skips. All 338 JavaScript tests passed. Real Chromium checks cover default no-cascade, explicit downstream cancellation receipts, dismissed confirmations, revision diffs and intervention JSON downloads. Review findings about approval atomicity, truncated revision history and missing paired documentation were fixed.
 
 ## Original Items and Current Status
 
@@ -128,7 +134,7 @@ Migration review: legacy `[1,2]` history upgrades to `[1,2,3]` while compatibili
 79. **pending** — Export upgrade receipts
 80. **pending** — Negotiate feature capabilities
 81. **pending** — Support bounded dependency DAGs
-82. **pending** — Preview dependency cancellation effects
+82. **implemented** — Preview dependency cancellation effects
 83. **pending** — Map grouped acceptance to individual evidence
 84. **pending** — Size task groups by verification cost
 85. **pending** — Preview grouping benefits and rework costs
@@ -143,10 +149,10 @@ Migration review: legacy `[1,2]` history upgrades to `[1,2,3]` while compatibili
 94. **pending** — Explain graceful shutdown progress
 95. **pending** — Use stage-specific deadlines
 96. **pending** — Reuse sealed read-only checkpoints
-97. **pending** — Capture intervention reasons and outcomes
+97. **implemented** — Capture intervention reasons and outcomes
 98. **pending** — Clarify timezone-aware task scheduling
 99. **partial** — Add archive restoration and relocation
-100. **pending** — Explain requirement revisions and rerun impact
+100. **implemented** — Explain requirement revisions and rerun impact
 101. **pending** — Stabilize pagination under mutation
 102. **implemented** — Define operation and batch receipt retention
 103. **implemented** — Hash backup manifests with bounded memory

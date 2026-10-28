@@ -444,9 +444,11 @@ window.RSIExperience = (() => {
         input.value = draftStore.get('task-supplement', task.id) || '';
         input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
+      const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
+      reason.rows = 2;reason.maxLength = 2000;reasonLabel.append(reason);
       const submit = el("button", t("保存补充并重新评估"), "button");
       submit.type = "submit";
-      form.append(label, submit);
+      form.append(label, reasonLabel, submit);
       form.onsubmit = (event) => {
         event.preventDefault();
         safe(async () => {
@@ -458,6 +460,7 @@ window.RSIExperience = (() => {
             await api("task/revise", {
               task: task.id,
               supplement: value,
+              reason: reason.value,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
             await refreshTaskDetail();
@@ -615,12 +618,80 @@ window.RSIExperience = (() => {
     if (metadata.revisions?.length) {
       const revisions = el("details");
       revisions.append(el("summary", t("需求修订记录")));
-      for (const revision of metadata.revisions)
-        revisions.append(
-          el("p", stamp(revision.created) + " · " + revision.supplement),
-        );
+      function appendRevisions(items) {
+      for (const revision of items) {
+        const item = el("details");
+        item.append(el("summary", stamp(revision.created) + " · " + revision.supplement));
+        let loaded = false, loading = false;
+        item.addEventListener("toggle", () => {
+          if (!item.open || loaded || loading) return;
+          loading = true;
+          safe(async () => {
+            try {
+              const detail = await api("task-revision?id=" + encodeURIComponent(revision.id) + "&project=" + encodeURIComponent(task.project));
+              if (!current()) return;
+              if (!detail.snapshot_available) item.append(el("p", t("旧修订缺少修改后快照，保留原始补充记录。")));
+              else {
+                item.append(el("p", t("旧候选已失效，后续运行将重新验证。")));
+                if (detail.diff !== null) item.append(el("pre", detail.diff));
+                else item.append(el("p", t("差异行数较多，请对照完整的修改前后内容。")));
+                for (const [label, value] of [["修改前需求", detail.previous_body], ["修改后需求", detail.after_body]]) {
+                  const raw = el("details");raw.append(el("summary", t(label)), el("pre", value));item.append(raw);
+                }
+              }
+              loaded = true;
+            } finally { loading = false; }
+          });
+        });
+        revisions.append(item);
+      }
+      }
+      appendRevisions(metadata.revisions);
+      let revisionBefore = metadata.revisions_next_before, revisionsLoading = false;
+      const moreRevisions = el("button", t("加载更多修订"), "text-button");moreRevisions.type = "button";
+      moreRevisions.hidden = !metadata.revisions_has_more;
+      moreRevisions.onclick = () => safe(async () => {
+        if (revisionsLoading || !revisionBefore || !current()) return;
+        revisionsLoading = true;moreRevisions.disabled = true;
+        try {
+          const data = await api("task-revisions?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + "&before=" + revisionBefore);
+          if (!current()) return;
+          appendRevisions(data.revisions);revisionBefore = data.next_before;
+          moreRevisions.hidden = !data.has_more;revisions.append(moreRevisions);
+        } finally {revisionsLoading = false;moreRevisions.disabled = false;}
+      });
+      revisions.append(moreRevisions);
       controls.append(revisions);
     }
+    const interventions = el("details"), entries = [], historyRows = el("div"),
+      more = el("button", t("加载更多"), "text-button"), download = el("button", t("导出已加载的干预记录"), "text-button");
+    interventions.append(el("summary", t("人工干预记录")), historyRows, more, download);
+    more.type = download.type = "button";more.hidden = true;download.disabled = true;
+    let historyLoading = false, historyLoaded = false, historyBefore = null, historyMore = false;
+    async function loadInterventions() {
+      if (historyLoading || !current()) return;
+      historyLoading = true;more.disabled = true;
+      try {
+        const data = await api("task-interventions?id=" + encodeURIComponent(task.id) + "&project=" + encodeURIComponent(task.project) + (historyBefore ? "&before=" + historyBefore : ""));
+        if (!current()) return;
+        entries.push(...data.entries);historyBefore = data.next_before;historyMore = data.has_more;historyLoaded = true;
+        for (const event of data.entries) {
+          const names = {manual_retry: t("重试"), cancelled: t("取消任务"), requirements_revised: t("补充需求（保留在当前任务）"), queue_settings: t("保存排队设置"), delivery_approved: t("批准推送并创建 PR")};
+          const row = el("details");row.append(el("summary", stamp(event.created) + " · " + (names[event.kind] || event.kind)));
+          if (typeof event.data.reason === "string" && event.data.reason) row.append(el("p", event.data.reason));
+          row.append(el("pre", JSON.stringify(event.data, null, 2)));historyRows.append(row);
+        }
+        more.hidden = !historyMore;download.disabled = false;
+      } finally {historyLoading = false;more.disabled = false;}
+    }
+    interventions.addEventListener("toggle", () => {if (interventions.open && !historyLoaded) safe(loadInterventions);});
+    more.onclick = () => safe(loadInterventions);
+    download.onclick = () => {
+      const data = {format: 1, task: task.id, project: task.project, entries, complete: !historyMore, next_before: historyBefore},
+        url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], {type: "application/json"})), link = el("a");
+      link.href = url;link.download = "adaptive-rsi-interventions.json";link.click();setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    controls.append(interventions);
     body.append(controls);
   }
   function readQueueDraft() {

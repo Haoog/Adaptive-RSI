@@ -147,6 +147,8 @@ def main():
                          started, started + 60, json.dumps(result)))
                 approval_task = runtime.store.add_task(project, "goal", "detail-approval", "待交付详情任务")
                 runtime.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (approval_task,))
+                dependent_task = runtime.store.add_task(project, "goal", "detail-dependent", "等待待交付任务的后继")
+                runtime.set_dependency(dependent_task, approval_task)
                 runtime.store.execute(
                     "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
                     "VALUES ('detail-appr',?,?,'awaiting_approval',?,'basemain',NULL,3,1200,?,?,?)",

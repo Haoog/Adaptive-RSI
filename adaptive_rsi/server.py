@@ -416,11 +416,42 @@ class Handler(BaseHTTPRequestHandler):
                                     "AND json_extract(value,'$.signature') IS NOT NULL "
                                     "ORDER BY json_extract(value,'$.created') DESC,key DESC LIMIT 50", (prefix + "%",))
                 self.respond({"batches": [decode_object(row["value"]) for row in found], "limit": 50})
+            elif parsed.path == "/api/task-interventions":
+                from .task_lifecycle import intervention_history
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid event pagination") from None
+                self.respond(intervention_history(store, params.get("id", [""])[0],
+                                                   params.get("project", [""])[0], before))
+            elif parsed.path == "/api/task-revisions":
+                from .task_revisions import revision_page
+                try:
+                    before = int(params.get("before", [str(2**63 - 1)])[0])
+                except (TypeError, ValueError):
+                    raise RequestError("Invalid revision pagination") from None
+                self.respond(revision_page(store, params.get("id", [""])[0], params.get("project", [""])[0], before))
+            elif parsed.path == "/api/task-revision":
+                from .task_revisions import revision_detail
+                self.respond(revision_detail(store, params.get("id", [""])[0], params.get("project", [""])[0]))
+            elif parsed.path == "/api/task-cancel-preview":
+                from .task_lifecycle import cancellation_preview
+                task_id = params.get("id", [""])[0]
+                if not store.one("SELECT 1 FROM tasks WHERE id=? AND project=?",
+                                 (task_id, params.get("project", [""])[0])):
+                    raise RequestError("Task not found")
+                with store.connect() as db:
+                    db.execute("BEGIN")
+                    preview = cancellation_preview(db, task_id)
+                self.respond(preview)
             elif parsed.path == "/api/task":
                 task = store.one("SELECT * FROM tasks WHERE id=? AND project=?", (params.get("id", [""])[0], params.get("project", [""])[0]))
                 if not task:
                     raise RequestError("Task not found")
-                task["revisions"] = store.query("SELECT id,supplement,created FROM task_revisions WHERE task=? ORDER BY id DESC LIMIT 100", (task["id"],))
+                from .task_revisions import revision_page
+                revisions = revision_page(store, task["id"], task["project"])
+                task.update(revisions=revisions["revisions"], revisions_has_more=revisions["has_more"],
+                            revisions_next_before=revisions["next_before"])
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
                 task["dependency"] = store.one("SELECT dependency FROM task_dependencies WHERE task=?", (task["id"],))
                 self.respond(task)
@@ -801,7 +832,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"), body.get("request_id"))}
                 elif path == "/api/task/revise":
-                    runtime.revise_task(body["task"], body["supplement"])
+                    runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/tasks/batch":
                     from .batching import execute
@@ -809,7 +840,7 @@ class Handler(BaseHTTPRequestHandler):
                                      body.get("request_id"), preview=body.get("preview", True) is not False,
                                      expected=body.get("revision"))
                 elif path == "/api/task/schedule":
-                    runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0))
+                    runtime.set_dependency(body["task"], body.get("dependency"), body.get("urgency", 0), body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/backup":
                     from .storage_tools import backup
@@ -820,13 +851,12 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"])
+                    runtime.retry(body["task"], body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/cancel":
-                    runtime.cancel_task(body["task"])
-                    result = {"saved": True}
+                    result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))
                 elif path == "/api/deliver":
-                    result = {"id": runtime.deliver(body["run"])}
+                    result = {"id": runtime.deliver(body["run"], reason=body.get("reason"))}
                 elif path == "/api/rollback":
                     runtime.rollback_strategy(body["candidate"])
                     result = {"saved": True}

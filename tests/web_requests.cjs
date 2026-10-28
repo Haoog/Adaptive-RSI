@@ -52,7 +52,7 @@ function browser(savedSession = new Map()) {
     querySelector: () => null,
     activeElement: null,
     addEventListener(type, handler) { listeners.set(type, handler); },
-    createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase()}),
+    createElement: tag => Object.assign(node('element-' + ++created), {tagName: tag.toUpperCase(), ...(tag === 'input' ? {checked: false} : {})}),
     createTextNode: text => ({textContent: text})
   };
   const storage = values => ({
@@ -812,6 +812,7 @@ test('live task details rerender when synced input changes but keep unchanged po
 
 test('out-of-order task details cannot attach cancellation for the previous task', async () => {
   const page = browser(), cancellations = [];
+  page.context.uiConfirm = async () => true;
   const task = id => ({id, project: 'a', title: 'Task ' + id, body: '', evidence: '[]', state: 'executing'});
   const a = task('a'), b = task('b');
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}, {id: 'rb', task: 'b', project: 'a'}];
@@ -822,6 +823,7 @@ test('out-of-order task details cannot attach cancellation for the previous task
     if (url.includes('task-runs?task=b')) return response([{id:'rb',task:'b',project:'a'}]);
     if (url.includes('run?id=ra')) return new Promise(resolve => { finishA = () => resolve(response(detail)); });
     if (url.includes('run?id=rb')) return response(detail);
+    if (url.includes('task-cancel-preview?')) return response({affected: [], revision: 'preview-b'});
     if (url.endsWith('/cancel')) { cancellations.push(JSON.parse(options.body)); return response({saved: true}); }
     return response(snapshot());
   };
@@ -833,7 +835,7 @@ test('out-of-order task details cannot attach cancellation for the previous task
   const buttons = page.node('detail-body').children.filter(node => node.textContent === '取消任务');
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
-  assert.deepEqual(cancellations, [{task: 'b'}]);
+  assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
 });
 
 test('closing task details while a response waits keeps the dialog closed', async () => {

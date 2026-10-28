@@ -524,7 +524,9 @@ class Runtime(Maintenance):
         self.wake.set()
         return task
 
-    def retry(self, task):
+    def retry(self, task, reason=None):
+        from .task_lifecycle import intervention_reason
+        intervention_reason(reason)
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
@@ -545,10 +547,14 @@ class Runtime(Maintenance):
             db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (now, task))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'manual_retry','User requested fresh verification',?,?)",
-                       (row["project"], encode({"task": task}), now))
+                       (row["project"], encode({"task": task, "reason": reason,
+                        "before": {"state": row["state"], "attempts": row["attempts"], "available": row["available"]},
+                        "after": {"state": "queued", "attempts": 0, "available": 0}}), now))
         self.wake.set()
 
-    def revise_task(self, task, supplement):
+    def revise_task(self, task, supplement, reason=None):
+        from .task_lifecycle import intervention_reason
+        intervention_reason(reason)
         if not isinstance(supplement, str) or not supplement.strip() or len(supplement) > 10000:
             raise ValueError("Supplement must contain 1..10000 characters")
         with self.store.connect() as db:
@@ -576,8 +582,14 @@ class Runtime(Maintenance):
             if len(body) > 30000:
                 raise ValueError("Combined requirements exceed 30000 characters")
             now = time.time()
-            db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
-                       (task, row["body"], supplement.strip(), now))
+            revision = db.execute("INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
+                                  (task, row["body"], supplement.strip(), now)).lastrowid
+            candidates = [item[0] for item in db.execute(
+                "SELECT id FROM runs WHERE task=? AND state='awaiting_approval'", (task,))]
+            db.execute("INSERT INTO task_revision_snapshots VALUES (?,?,?)",
+                       (revision, body, encode({"previous_state": row["state"],
+                        "invalidated_candidates": candidates, "fresh_verification_required": True,
+                        "before_hash": fingerprint(row["body"]), "after_hash": fingerprint(body), "reason": reason})))
             # 需求变化撤销旧候选的批准资格；只取消尚未领取的发布任务，保留已交付历史。
             db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE project=? "
                        "AND source='system_publish' AND state='queued' AND body IN "
@@ -587,10 +599,14 @@ class Runtime(Maintenance):
             db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'requirements_revised','Requirements supplemented; fresh verification required',?,?)",
-                       (row["project"], encode({"task": task}), now))
+                       (row["project"], encode({"task": task, "revision": revision, "reason": reason,
+                        "before": {"state": row["state"], "body_hash": fingerprint(row["body"])},
+                        "after": {"state": "queued", "body_hash": fingerprint(body)}}), now))
         self.wake.set()
 
-    def set_dependency(self, task, dependency=None, urgency=0):
+    def set_dependency(self, task, dependency=None, urgency=0, reason=None):
+        from .task_lifecycle import intervention_reason
+        intervention_reason(reason)
         if urgency not in [0, 1]:
             raise ValueError("Urgency must be 0 or 1")
         with self.store.connect() as db:
@@ -598,6 +614,7 @@ class Runtime(Maintenance):
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
             if not row or row["state"] not in ["queued", "deferred", "blocked"]:
                 raise ValueError("Only waiting tasks can be scheduled")
+            previous_dependency = db.execute("SELECT dependency FROM task_dependencies WHERE task=?", (task,)).fetchone()
             if dependency:
                 parent = db.execute("SELECT * FROM tasks WHERE id=?", (dependency,)).fetchone()
                 if not parent or parent["project"] != row["project"] or dependency == task or parent["source"].startswith("system_"):
@@ -618,7 +635,9 @@ class Runtime(Maintenance):
             db.execute("UPDATE tasks SET urgency=?,updated=? WHERE id=?", (urgency, time.time(), task))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'queue_settings','Queue dependency or urgency changed',?,?)",
-                       (row["project"], encode({"task": task, "dependency": dependency, "urgency": urgency}),
+                       (row["project"], encode({"task": task, "dependency": dependency, "urgency": urgency, "reason": reason,
+                        "before": {"dependency": previous_dependency[0] if previous_dependency else None, "urgency": row["urgency"]},
+                        "after": {"dependency": dependency, "urgency": urgency}}),
                         time.time()))
         self.wake.set()
 
@@ -642,52 +661,52 @@ class Runtime(Maintenance):
         self.wake.set()
         return count
 
-    def cancel_task(self, task):
-        row = self.store.one("SELECT * FROM tasks WHERE id=?", (task,))
-        if not row:
-            raise ValueError("Task not found")
-        # 终态（已合并、PR 已创建、已发布等）承载历史与复发判定，取消不能改写它们。
-        cancellable = ["queued", "planning", "executing", "evaluating", "blocked", "waiting_budget",
-                       "deferred", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]
-        if row["state"] not in cancellable:
-            raise ValueError("This task has finished and can no longer be cancelled")
-        # worker 可在上面的读取后完成；写入时再次检查，不能覆盖新提交的终态。
-        placeholders = ",".join("?" * len(cancellable))
+    def cancel_task(self, task, cascade=False, expected=None, reason=None):
+        from .task_lifecycle import cancel
+        return cancel(self, task, cascade, expected, reason)
+
+    def deliver(self, run_id, automatic=False, reason=None):
+        with self.dispatch_lock:
+            return self._deliver(run_id, automatic, reason)
+
+    def _deliver(self, run_id, automatic=False, reason=None):
+        from .task_lifecycle import intervention_reason
+        intervention_reason(reason)
+        now = time.time()
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            changed = db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=? AND state IN (" + placeholders + ")",
-                                 (time.time(), task, *cancellable)).rowcount
-            if not changed:
-                raise ValueError("This task has finished and can no longer be cancelled")
-            db.execute("INSERT INTO events(project,run,kind,message,data,created) "
-                       "VALUES (?,NULL,'cancelled','Cancellation requested',?,?)",
-                       (row["project"], encode({"task": task}), time.time()))
-
-    def deliver(self, run_id, automatic=False):
-        with self.dispatch_lock:
-            return self._deliver(run_id, automatic)
-
-    def _deliver(self, run_id, automatic=False):
-        original = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
-        if not original or original["state"] != "awaiting_approval":
-            raise ValueError("Only a verified candidate awaiting approval can be delivered")
-        result = json.loads(original["result"])
-        if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
-            raise ValueError("Independent gates have not passed")
-        if not automatic:
-            self.store.event("delivery_approved", "Candidate approved by user", original["project"], run_id, {"task": original["task"]})
-        evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
-        prior = self.store.one("SELECT * FROM tasks WHERE project=? AND fingerprint=?", (original["project"], "publish:" + run_id))
-        if prior:
-            task = prior["id"]
-            if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
-                self.store.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
-                                   (encode(evidence), time.time(), task))
-            elif not automatic and prior["state"] == "queued":
-                self.store.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?", (encode(evidence), time.time(), task))
-        else:
-            task = self.store.add_task(original["project"], "system_publish", "publish:" + run_id,
-                                       "Publish approved candidate", run_id, evidence=evidence, priority=100)
+            original = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+            if not original or original["state"] != "awaiting_approval":
+                raise ValueError("Only a verified candidate awaiting approval can be delivered")
+            if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + original["project"],)).fetchone():
+                raise ValueError("Project is archived; restore it before starting work")
+            result = json.loads(original["result"])
+            if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
+                raise ValueError("Independent gates have not passed")
+            evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
+            prior = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint=?",
+                               (original["project"], "publish:" + run_id)).fetchone()
+            if prior:
+                task = prior["id"]
+                if prior["state"] not in ["queued", "planning", "executing", "evaluating"]:
+                    db.execute("UPDATE tasks SET state='queued',available=0,evidence=?,updated=? WHERE id=?",
+                               (encode(evidence), now, task))
+                elif not automatic and prior["state"] == "queued":
+                    db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?", (encode(evidence), now, task))
+            else:
+                task = uid()
+                db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,"
+                           "priority,overrides,created,updated) VALUES (?,?,?,?,?,?,?,'[]','queued',100,'{}',?,?)",
+                           (task, original["project"], "system_publish", "publish:" + run_id,
+                            "Publish approved candidate", run_id, encode(evidence), now, now))
+            if not automatic:
+                publication = db.execute("SELECT state FROM tasks WHERE id=?", (task,)).fetchone()
+                data = {"task": original["task"], "candidate": run_id, "reason": reason,
+                        "before": {"candidate_state": original["state"]},
+                        "after": {"publication_task": task, "publication_state": publication["state"]}}
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) "
+                           "VALUES (?,?,'delivery_approved','Candidate approved by user',?,?)",
+                           (original["project"], run_id, encode(data), now))
         self.wake.set()
         return task
 
