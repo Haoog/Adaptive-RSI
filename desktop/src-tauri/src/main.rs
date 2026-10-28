@@ -635,6 +635,7 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     );
     let health_deadline = std::time::Instant::now() + Duration::from_secs(60);
     let child = command
+        .env("ADAPTIVE_RSI_DESKTOP_OWNER_PID", std::process::id().to_string())
         .arg("desktop-runtime")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

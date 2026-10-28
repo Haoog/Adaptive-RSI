@@ -79,3 +79,5 @@ Cancellation, revision and approval can include an optional reason, retained ver
 **Export loaded intervention records** exports only records already loaded. The JSON `complete` and `next_before` fields disclose remaining pages; load more before exporting when needed. Pagination follows stable record IDs backward so newly arriving operations do not displace older pages being inspected.
 
 Task groups: failed or cancelled groups can be split for fresh verification. The confirmation lists restored originals and discloses any separate task retaining the complete revised specification. Revised unstarted groups cannot be directly ungrouped, preventing lost supplements. Group lineage and outcomes retain failed runs and source relationships, with pagination for older history.
+
+During desktop replacement, admission stays closed while the installer process is alive, regardless of elapsed time. If the owned installer exits before stopping the service, admission recovers with an audit record and tasks remain intact. Unknown process status keeps the barrier closed; legacy barriers recover through the owned desktop restart or explicit lease cancellation.

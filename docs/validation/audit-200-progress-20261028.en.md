@@ -83,7 +83,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 28. **implemented** — Background failure receipts may also fail
 29. **implemented** — Re-adding archived paths may remain invisible
 30. **implemented** — Drain leases can expire during long work
-31. **pending** — Installing barriers need crash recovery proof
+31. **implemented** — Installing barriers need crash recovery proof
 32. **partial** — Staged updates can create memory peaks
 33. **partial** — Disk checks may inspect the wrong volume
 34. **pending** — Native update recovery needs startup-failure evidence
@@ -259,3 +259,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 ## Group lineage and failed group retry
 
 Items 37–41/87/88 now have targeted evidence. Failed/cancelled groups restore originals for fresh verification; revised specifications become separate tasks without losing supplements. Whole-group outcomes retain explicit scope, and lineage uses stable pagination. Repeated old-group restores cannot reclaim members of newer groups. User reservations remain in effect. An exact-ID receipt lookup reconciles lost responses before repeat writes. Seventeen Python tests cover transaction/crash windows, reopen, provenance, scheduling and normalized path overlaps; real Chromium covers double clicks, response loss, reload, search and JSON export. The basic grouping browser regression and 338 JavaScript tests pass. Full final-commit CI remains outstanding.
+
+Installer admission recovery: seven targeted tests pass, including an actual process termination and transactional audit failure. Related audit regressions total 107 passing tests. A living installer remains protected beyond drain expiry. Legacy recovery and full app/data rollback boundaries remain explicit in the ledger.
+
+Rust explicitly passes the native desktop owner PID, independent of the PyInstaller onefile bootloader parent. Seven admission and 107 related Python tests pass; 13 Rust tests pass. This does not replace signed replacement E2E evidence.

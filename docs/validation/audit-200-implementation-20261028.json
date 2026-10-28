@@ -497,9 +497,17 @@
       },
       "source": "adaptive_rsi/lifecycle.py",
       "acceptance": "在 commit 后逐点终止进程；旧版恢复后可明确解除屏障且不丢任务。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/lifecycle.py",
+        "adaptive_rsi/desktop.py",
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_update_admission tests.test_desktop_runtime tests.test_audit_round5 tests.test_audit_round6",
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ],
+      "residual": "Legacy barriers without installer ownership require the existing owned-desktop startup or explicit matching-lease cancellation; unknown liveness remains blocked. This is admission recovery, not full signed app/data rollback proof (34/192)."
     },
     {
       "id": 32,
@@ -2882,6 +2890,7 @@
     "de75578",
     "022d5ce",
     "5a70142",
-    "2354f4a"
+    "2354f4a",
+    "ffdca68"
   ]
 }
