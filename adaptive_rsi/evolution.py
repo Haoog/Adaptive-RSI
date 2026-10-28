@@ -10,6 +10,62 @@ from .process import Cancelled, scrub_tree
 from .store import encode, uid
 
 
+def paired_summary(trials):
+    families = {}
+    for trial in trials:
+        if trial.get("case"):
+            families.setdefault(trial["case"], []).append(trial)
+    wins = losses = ties = 0
+    cohorts = {}
+    for family, rows in families.items():
+        complete = [row for row in rows if "stable" in row and "candidate" in row]
+        if not complete:
+            continue
+        lost = any(row["stable"]["pass"] and not row["candidate"]["pass"] for row in complete)
+        won = not lost and any(not row["stable"]["pass"] and row["candidate"]["pass"] for row in complete)
+        wins += won
+        losses += lost
+        ties += not won and not lost
+        cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
+                           "outcome": "loss" if lost else "win" if won else "tie", "repetitions": len(complete)}
+    n = wins + losses
+    summary = {"wins": wins, "losses": losses, "ties": ties, "unit": "independent_case_family",
+               "unknown_identity_trials": sum(not trial.get("case") for trial in trials),
+               "estimate": wins / n if n else None, "cohorts": cohorts}
+    if n:
+        z = 1.959963984540054
+        p = wins / n
+        divisor = 1 + z * z / n
+        center = (p + z * z / (2 * n)) / divisor
+        half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / divisor
+        summary["wilson_95"] = [max(0, center - half), min(1, center + half)]
+    return summary
+
+
+def case_stratum(case):
+    spec = json.loads(case["spec"])
+    length = len(spec["task"])
+    return (spec["source"], "small" if length < 1000 else "medium" if length < 10000 else "large")
+
+
+def select_cases(cases, count, seed):
+    strata = {}
+    for case in cases:
+        strata.setdefault(case_stratum(case), []).append(case)
+    groups = []
+    for stratum in sorted(strata, key=lambda value: fingerprint({"stratum": value, "seed": seed})):
+        groups.append(sorted(strata[stratum], key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed}))))
+    selected = []
+    while groups and len(selected) < count:
+        for group in groups[:]:
+            selected.append(group.pop(0))
+            if not group:
+                groups.remove(group)
+            if len(selected) == count:
+                break
+    return selected
+
+
 class Evolution:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -49,8 +105,15 @@ class Evolution:
                     "source": manifest["source"], "signature": signature,
                     "repository": str(directory / "repository"),
                     "overlay": str(directory / "overlay") if overlay else None}
-            self.store.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?)",
-                               (case, project, manifest["family"], manifest["split"], encode(spec), 0, time.time()))
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                duplicate = db.execute("SELECT 1 FROM cases WHERE project=? AND (family=? OR "
+                                       "(json_valid(spec) AND json_extract(spec,'$.signature')=?))",
+                                       (project, manifest["family"], signature)).fetchone()
+                if duplicate:
+                    raise ValueError("Same task/defect family cannot enter multiple splits")
+                db.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?)",
+                           (case, project, manifest["family"], manifest["split"], encode(spec), 0, time.time()))
         except Exception:
             shutil.rmtree(directory)
             raise
@@ -63,7 +126,8 @@ class Evolution:
         limit = config["evolution"]["max_holdout_uses"]
         available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
                                      "ORDER BY created,id", (project["id"],))
-        cases = [case for case in available if case["uses"] < limit]
+        cases = [case for case in available if case["uses"] < limit and
+                 json.loads(case["spec"]).get("available", True) and json.loads(case["spec"]).get("active", True)]
         minimum = config["evolution"]["min_cases_per_split"]
         if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
             # 曝光耗尽的样本仍在案例表中；若只报“样本不足”，界面会同时显示样本数量，
@@ -82,8 +146,10 @@ class Evolution:
             spec = json.loads(case["spec"])
             manifest.append({"case": case["id"], "split": case["split"], "source": spec["source"],
                              "signature": spec["signature"],
-                             "tree": fingerprint({"task": spec["task"], "base": spec["base"]}),
-                             "checks": fingerprint(spec["checks"])})
+                             "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
+                             "checks": fingerprint(spec["checks"]), "family": case["family"],
+                             "overlay": self.overlay_digest(spec.get("overlay")),
+                             "environment": fingerprint(config["environment"])})
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
                                         "ORDER BY created DESC LIMIT 10", (project["id"],))
         failures = []
@@ -124,21 +190,24 @@ class Evolution:
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
             "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
+        selection = {split: select_cases([case for case in cases if case["split"] == split], minimum, run["id"])
+                     for split in ("validation", "holdout")}
+        plan = {"version": 1, "created": time.time(), "repeats": config["evolution"]["repeats"],
+                "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
+                "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
+                "samples": [{"id": case["id"], "split": split, "stratum": case_stratum(case), "prior_uses": case["uses"]}
+                            for split, rows in selection.items() for case in rows],
+                "proposal_hash": fingerprint(proposal), "baseline_hash": fingerprint(current),
+                "configuration_hash": fingerprint(config)}
+        evidence["preregistered_plan"] = {"data": plan, "sha256": fingerprint(plan)}
+        self.save(candidate, "evaluating", evidence)
         try:
             for split in ["validation", "holdout"]:
-                candidates = [c for c in cases if c["split"] == split]
-                # Deterministically rotate balanced strata before taking the minimum;
-                # a stable tail of the case list must not be the only samples exposed.
-                candidates.sort(key=lambda item: (
-                    fingerprint({"split": split, "source": json.loads(item["spec"])["source"],
-                                 "family": item["family"], "run": run["id"]}), item["id"]))
-                selected = candidates[:minimum]
+                selected = selection[split]
                 for case in selected:
-                    # Exposure is charged just before first use; untouched holdouts stay protected.
-                    self.store.execute("UPDATE cases SET uses=uses+1 WHERE id=?", (case["id"],))
                     for repetition in range(config["evolution"]["repeats"]):
                         spec = json.loads(case["spec"])
-                        trial = {"case": case["id"], "split": split, "source": spec["source"], "repetition": repetition}
+                        trial = {"case": case["id"], "split": split, "source": spec["source"], "family": case["family"], "stratum": case_stratum(case), "repetition": repetition}
                         order = ["stable", "candidate"] if len(evidence["trials"]) % 2 == 0 else ["candidate", "stable"]
                         trial["order"] = order
                         for variant in order:
@@ -148,10 +217,11 @@ class Evolution:
                             trial_dir = directory / "experiments" / (case["id"] + "-" + str(repetition)) / variant
                             trial_dir.mkdir(parents=True)
                             worker = snapshot(spec["repository"], trial_dir / "workspace", spec["base"])
-                            before = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
+                            before = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
                             started = time.monotonic()
                             trial_config = merge(config, {"checks": spec["checks"]})
-                            trial_run = {**run, "config": encode(trial_config)}
+                            trial_run = {**run, "config": encode(trial_config),
+                                         "_case_exposure": {"case": case["id"], "experiment": candidate, "limit": limit}}
                             trial_task = {"id": run["task"], "title": spec["task"].splitlines()[0], "body": spec["task"],
                                           "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
                             outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
@@ -164,10 +234,11 @@ class Evolution:
                                     lambda: self.runtime.is_cancelled(run), overlay=spec["overlay"])
                                 if overlay_result["decision"] != "pass":
                                     outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
-                            after = self.store.one("SELECT coalesce(sum(tokens),0) AS n FROM calls WHERE run=?", (run["id"],))["n"]
+                            after = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
                             trial[variant] = {"pass": bool(outcome and outcome.get("decision") == "pass"),
                                 "review": (outcome or {}).get("review", {}), "reason": (outcome or {}).get("reason", "No change"),
-                                "seconds": time.monotonic() - started, "tokens": after - before,
+                                "seconds": time.monotonic() - started, "tokens": after["n"] - before["n"],
+                                "usage_known": after["calls"] > before["calls"] and after["unknown"] == before["unknown"],
                                 "report": str(trial_dir / "evaluation" / "report.json")}
                         evidence["trials"].append(trial)
                         self.save(candidate, "evaluating", evidence)
@@ -181,18 +252,7 @@ class Evolution:
             if "sign_test_p" in evidence:
                 evidence["selection_adjusted_p"] = min(1, evidence["sign_test_p"] * evidence["selection_attempts"])
                 evidence["selection_warning"] = "Adaptive reuse and candidate selection limit generalization; adjusted p is a conservative attempt-count diagnostic, not independent replication"
-            wins = evidence.get("consistent_family_wins", 0)
-            losses = sum(1 for trial in evidence["trials"]
-                         if trial["stable"]["pass"] and not trial["candidate"]["pass"])
-            # Wilson score interval for each paired outcome; it is diagnostic, not a
-            # replacement for fresh independent holdout evidence.
-            n = wins + losses
-            if n:
-                center = (wins + 1.96 ** 2 / 2) / (n + 1.96 ** 2)
-                margin = 1.96 * math.sqrt((center * (1 - center)) / (n + 1.96 ** 2))
-                evidence["win_rate"] = {"wins": wins, "losses": losses,
-                                        "estimate": wins / n,
-                                        "wilson_95": [max(0, center - margin), min(1, center + margin)]}
+            evidence["win_rate"] = paired_summary(evidence["trials"])
             state = evidence["decision"]
             if state == "pass" and config["evolution"]["auto_promote"]:
                 with self.runtime.dispatch_lock:
@@ -321,17 +381,42 @@ class Evolution:
         candidate_tokens = sum(trial["candidate"].get("tokens", 0) for trial in trials)
         stable_seconds = sum(trial["stable"].get("seconds", 0) for trial in trials)
         candidate_seconds = sum(trial["candidate"].get("seconds", 0) for trial in trials)
-        cost_ratio = candidate_tokens / stable_tokens if stable_tokens else None
+        cost_known = all(trial[variant].get("usage_known", trial[variant].get("tokens", 0) > 0)
+                         for trial in trials for variant in ("stable", "candidate"))
+        cost_ratio = candidate_tokens / stable_tokens if stable_tokens and cost_known else None
         latency_ratio = candidate_seconds / stable_seconds if stable_seconds else None
         if cost_ratio is not None and cost_ratio > config["evolution"]["max_cost_ratio"]:
             return {"decision": "insufficient_evidence", "reason": "Candidate exceeds the configured token cost ratio",
                     "cost_ratio": cost_ratio, "latency_ratio": latency_ratio}
-        result = {**result, "cost_ratio": cost_ratio, "latency_ratio": latency_ratio}
+        result = {**result, "cost_ratio": cost_ratio, "latency_ratio": latency_ratio,
+                  "cost_comparable": cost_ratio is not None,
+                  "cost_state": "known" if cost_ratio is not None else "zero_baseline" if cost_known else "unknown_usage",
+                  "cost_warning": "" if cost_ratio is not None else "Token cost cannot be compared; quality evidence does not establish lower cost"}
         return {**result, "consistent_family_wins": wins, "sign_test_p": probability,
                 "reason": "Repeated paired improvement on both splits without observed regressions"}
 
     def save(self, candidate, status, evidence):
+        evidence["win_rate"] = paired_summary(evidence.get("trials", []))
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))
+
+    @staticmethod
+    def overlay_digest(directory):
+        if not directory:
+            return None
+        import hashlib
+        digest = hashlib.sha256()
+        root = Path(directory)
+        scrub_tree(root)
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                import os
+                digest.update(encode({"path": path.relative_to(root).as_posix(), "link": os.readlink(path)}).encode())
+            if path.is_file():
+                digest.update(encode({"path": path.relative_to(root).as_posix(), "size": path.stat().st_size}).encode())
+                with path.open("rb") as source:
+                    for block in iter(lambda: source.read(65536), b""):
+                        digest.update(block)
+        return digest.hexdigest()
 
     def monitor(self, project, passed, run=None, attributable=False):
         config = self.runtime.config(project)

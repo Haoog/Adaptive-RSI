@@ -5,6 +5,8 @@ on:
       - 'desktop/**'
       - 'adaptive_rsi/**'
       - 'pyproject.toml'
+      - 'rust-toolchain.toml'
+      - 'requirements-build.txt'
       - 'scripts/package.py'
       - 'scripts/package_desktop.py'
       - '.github/workflows/release.yml'
@@ -73,7 +75,7 @@ jobs:
         env:
           MODE: ${{ needs.changes.outputs.mode }}
         run: |
-          rustup default stable
+          rustup default 1.99.1
           if [ "$MODE" = full ]; then
             npm ci --prefix desktop
           fi

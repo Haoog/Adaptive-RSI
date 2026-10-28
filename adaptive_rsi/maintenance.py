@@ -90,6 +90,15 @@ class Maintenance:
         # 数据保留：清理过期技能、已结束运行的派生数据及其 settings 键；
         # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
         stale = now - 90 * 86400
+        if self.store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"):
+            self.store.execute("DELETE FROM operations WHERE id IN (SELECT id FROM operations WHERE ended<? "
+                               "AND state IN ('completed','failed','cancelled') LIMIT 500)", (stale,))
+        for row in self.store.query("SELECT key FROM settings WHERE key LIKE 'batch:%' AND json_valid(value) "
+                                    "AND json_extract(value,'$.complete')=1 AND json_extract(value,'$.created')<? LIMIT 100", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=? OR (key>=? AND key<?)",
+                               (row["key"], row["key"] + ":", row["key"] + ";"))
+        self.store.execute("DELETE FROM settings WHERE key LIKE 'provider-account-health:%' AND json_valid(value) "
+                           "AND json_extract(value,'$.retry_at')<?", (now - 7 * 86400,))
         self.store.execute("DELETE FROM skills WHERE expires<?", (now - 30 * 86400,))
         self.store.execute("DELETE FROM request_log WHERE started<?", (now - 7 * 86400,))
         self.store.execute("DELETE FROM phase_times WHERE id IN (SELECT id FROM phase_times WHERE ended IS NOT NULL AND ended<? AND run IN "

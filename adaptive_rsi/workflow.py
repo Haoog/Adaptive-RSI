@@ -229,8 +229,12 @@ def change_kind(task, plan=None):
     # Only explicit behavior-preserving requests can use the preservation contract.
     title = (task["title"] + "\n" + task.get("body", "")).lower()
     declared = (plan or {}).get("change_kind")
-    if declared == "performance":
+    if declared == "performance" or any(word in title for word in
+            ["benchmark", "latency", "throughput", "speedup", "性能", "提速", "耗时", "吞吐", "延迟"]):
         return "performance"
+    if declared in ["documentation", "configuration", "ui"] and not any(
+            word in title for word in ["bug", "broken", "incorrect", "修复", "缺陷", "失效", "异常"]):
+        return declared
     if any(word in title for word in ["performance", "benchmark", "optimize", "optimized", "optimization",
                                       "optimise", "optimised", "latency", "throughput", "speedup", "faster",
                                       "性能", "优化", "提速", "耗时", "吞吐"]):

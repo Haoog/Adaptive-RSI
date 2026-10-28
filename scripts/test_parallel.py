@@ -81,22 +81,27 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
     failed = False
     began, offsets, recent = {}, {}, {}
     observed = {}
+    failures = []
     with ExitStack() as stack:
         try:
             pending = []
             for index, selectors in enumerate(groups, 1):
                 log = stack.enter_context(tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace"))
-                argv = [sys.executable, "-u", "-m", "unittest", "-v", *selectors]
+                timings = None
+                if durations_file:
+                    timings = stack.enter_context(tempfile.NamedTemporaryFile(suffix=".json"))
+                argv = ([sys.executable, "-u", "-m", "scripts.test_worker", "--timings", timings.name, *selectors]
+                        if timings else [sys.executable, "-u", "-m", "unittest", "-v", *selectors])
                 print("[group {}] {}".format(index, " ".join(selectors)), flush=True)
                 process = subprocess.Popen(argv, cwd=root, shell=False, stdout=log,
                                            stderr=subprocess.STDOUT, start_new_session=True)
                 processes.append(process)
-                pending.append((index, process, log))
+                pending.append((index, process, log, timings))
                 began[index] = recent[index] = time.monotonic()
                 offsets[index] = 0
             while pending:
                 for item in pending[:]:
-                    index, process, log = item
+                    index, process, log, timings = item
                     result = process.poll()
                     log.seek(offsets[index])
                     for line in log:
@@ -118,9 +123,21 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
                     print("[group {}] exit {}".format(index, result), flush=True)
                     failed = failed or result != 0
                     pending.remove(item)
-                    if result == 0:
-                        share = (now - began[index]) / len(groups[index - 1])
-                        observed.update({module: share for module in groups[index - 1]})
+                    if timings:
+                        receipt = Path(timings.name).with_suffix(".failures.json")
+                        try:
+                            failures.extend(json.loads(receipt.read_text()))
+                        except (OSError, ValueError):
+                            pass
+                        finally:
+                            receipt.unlink(missing_ok=True)
+                        try:
+                            values = json.loads(Path(timings.name).read_text())
+                            observed.update({selector: seconds for selector, seconds in values.items()
+                                             if selector in groups[index - 1] and type(seconds) in (int, float)
+                                             and 0 < seconds <= timeout})
+                        except (OSError, ValueError, AttributeError):
+                            pass
                 if pending:
                     time.sleep(0.1)
         finally:
@@ -134,6 +151,13 @@ def run_groups(groups, root=ROOT, timeout=900, durations_file=None):
         previous.update(observed)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(previous, sort_keys=True, indent=2) + "\n")
+    if durations_file and failures:
+        target = Path(durations_file).with_suffix(".failures.json")
+        try:
+            previous = json.loads(target.read_text())
+        except (OSError, ValueError):
+            previous = []
+        target.write_text(json.dumps((previous + failures)[-2000:], sort_keys=True, indent=2) + "\n")
     return int(failed)
 
 

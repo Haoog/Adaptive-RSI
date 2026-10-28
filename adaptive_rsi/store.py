@@ -1,6 +1,9 @@
 import contextlib
+from collections import deque
+import hashlib
 import json
 import queue
+import re
 import sqlite3
 import statistics
 import threading
@@ -76,7 +79,9 @@ class Store:
         self._metrics_lock = threading.Lock()
         self._metrics = {"opened": 0, "borrowed": 0, "waiting": 0, "peak": 0}
         self._read_snapshot = threading.local()
-        self._task_samples = threading.local()
+        self._query_samples = deque(maxlen=128)
+        self._wait_samples = deque(maxlen=512)
+        self._slow_queries = deque(maxlen=20)
         with self.connect() as db:
             if db.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("Database schema is newer than this runtime")
@@ -205,7 +210,7 @@ class Store:
                 raise RuntimeError("Database migration checksum mismatch")
             db.execute("INSERT OR IGNORE INTO schema_migrations VALUES (1,?,?)", (checksum, time.time()))
             # Version 2 adds read-only observability tables and indexes.
-            db.execute("CREATE INDEX IF NOT EXISTS request_log_created ON request_log(started DESC)")
+            db.execute("DROP INDEX IF EXISTS request_log_created")
             checksum = self._migration_checksum(2)
             migration = db.execute("SELECT checksum FROM schema_migrations WHERE version=2").fetchone()
             if migration and migration["checksum"] != checksum:
@@ -229,8 +234,12 @@ class Store:
         # WAL 持久保存在数据库文件中，busy timeout 由 connect(timeout=15) 设置；
         # 借出期间连接由单线程独占，check_same_thread=False 因此是安全的。
         db = sqlite3.connect(str(self.path), timeout=15, check_same_thread=False, factory=PooledConnection)
-        db.identity = self._file_identity()
-        db.execute("PRAGMA journal_mode=WAL")
+        try:
+            db.identity = self._file_identity()
+            db.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            db.close()
+            raise
         return db
 
     @staticmethod
@@ -242,64 +251,68 @@ class Store:
 
     @contextlib.contextmanager
     def connect(self):
+        waiting_since = time.monotonic()
         with self._metrics_lock:
             self._metrics["waiting"] += 1
         if not self._connection_capacity.acquire(timeout=15):
             with self._metrics_lock:
                 self._metrics["waiting"] -= 1
+                self._metrics["timeouts"] = self._metrics.get("timeouts", 0) + 1
             raise sqlite3.OperationalError("Database connection capacity exhausted")
         with self._metrics_lock:
             self._metrics["waiting"] -= 1
             self._metrics["borrowed"] += 1
             self._metrics["peak"] = max(self._metrics["peak"], self._metrics["borrowed"])
-        with self._pool_lock:
-            generation = self._pool_generation
-            try:
-                db = self._pool.get_nowait()
-            except queue.Empty:
-                db = None
-        if db is not None and db.identity != self._file_identity():
-            # 升级回滚会整体替换 state.sqlite3（连同 -wal/-shm）；指向旧文件的
-            # 池连接必须弃用，否则轻则 I/O 错误，重则读到替换前的数据。
-            db.close()
-            db = None
-        if db is None:
-            db = self._new_connection()
-            with self._metrics_lock:
-                self._metrics["opened"] += 1
+            waited = time.monotonic() - waiting_since
+            self._metrics["wait_seconds"] = self._metrics.get("wait_seconds", 0) + waited
+            self._wait_samples.append(waited)
+        db = None
         try:
-            self._prepare(db)
-        except sqlite3.Error:
-            # 借出瞬间文件仍可能被替换；首条语句失败的连接直接重建一次。
-            db.close()
-            db = self._new_connection()
-            self._prepare(db)
-        try:
-            try:
-                yield db
-                db.commit()
-            except BaseException:
-                # 异常退出（包括 stream 被中途放弃）的连接可能持有坏状态：
-                # 回滚后直接关闭，绝不归还回池。
+            with self._pool_lock:
+                generation = self._pool_generation
                 try:
-                    db.rollback()
-                except sqlite3.Error:
+                    db = self._pool.get_nowait()
+                except queue.Empty:
                     pass
+            if db is not None and db.identity != self._file_identity():
                 db.close()
-                raise
-            else:
-                with self._pool_lock:
-                    if generation != self._pool_generation:
-                        db.close()
-                    else:
-                        try:
-                            self._pool.put_nowait(db)
-                        except queue.Full:
-                            db.close()
+                db = None
+            if db is None:
+                db = self._new_connection()
+                with self._metrics_lock:
+                    self._metrics["opened"] += 1
+            try:
+                self._prepare(db)
+            except sqlite3.Error:
+                db.close()
+                db = None
+                db = self._new_connection()
+                self._prepare(db)
+            yield db
+            db.commit()
+            with self._pool_lock:
+                if generation == self._pool_generation:
+                    try:
+                        self._pool.put_nowait(db)
+                        db = None
+                    except queue.Full:
+                        pass
         finally:
-            with self._metrics_lock:
-                self._metrics["borrowed"] -= 1
-            self._connection_capacity.release()
+            try:
+                if db is not None:
+                    try:
+                        db.rollback()
+                    except sqlite3.Error:
+                        pass
+                    try:
+                        db.close()
+                    except sqlite3.Error:
+                        with self._metrics_lock:
+                            self._metrics["close_failures"] = self._metrics.get("close_failures", 0) + 1
+            finally:
+                with self._metrics_lock:
+                    self._metrics["borrowed"] -= 1
+                self._connection_capacity.release()
 
     def close(self):
         """关闭池中空闲连接；已借出的连接由各自的 with 块负责关闭。"""
@@ -316,16 +329,22 @@ class Store:
                     pass
 
     def query(self, sql, args=()):
-        active = getattr(self._read_snapshot, "connection", None)
-        if active is not None:
-            return [dict(row) for row in active.execute(sql, args).fetchall()]
-        with self.connect() as db:
-            started = time.monotonic()
-            result = [dict(row) for row in db.execute(sql, args).fetchall()]
-            if "FROM tasks" in sql:
-                self._task_samples.history = [*getattr(self._task_samples, "history", [])[-127:],
-                                              time.monotonic() - started]
-            return result
+        started = time.monotonic()
+        try:
+            active = getattr(self._read_snapshot, "connection", None)
+            if active is not None:
+                return [dict(row) for row in active.execute(sql, args).fetchall()]
+            with self.connect() as db:
+                return [dict(row) for row in db.execute(sql, args).fetchall()]
+        finally:
+            elapsed = time.monotonic() - started
+            with self._metrics_lock:
+                self._metrics["queries"] = self._metrics.get("queries", 0) + 1
+                self._query_samples.append(elapsed)
+                if elapsed > 0.1:
+                    normalized = re.sub(r"'(?:''|[^'])*'", "?", " ".join(sql.split()))
+                    self._slow_queries.append({"fingerprint": hashlib.sha256(normalized.encode()).hexdigest()[:16],
+                                               "seconds": elapsed, "at": time.time()})
 
     def stream(self, sql, args=()):
         """Yield rows without materializing an unbounded result set."""
@@ -364,10 +383,14 @@ class Store:
             finally:
                 self._read_snapshot.connection = None
 
-    def metrics(self):
+    def metrics(self, integrity=False):
         with self._metrics_lock:
             borrowed = self._metrics["borrowed"]
             values = dict(self._metrics)
+            waits = sorted(self._wait_samples)
+            values.update(wait_p50_seconds=waits[len(waits) // 2] if waits else 0,
+                          wait_p95_seconds=waits[min(len(waits) - 1, int(len(waits) * .95))] if waits else 0,
+                          slow_queries=list(self._slow_queries))
         with self.connect() as db:
             values.update({
                 "database_bytes": self.path.stat().st_size if self.path.exists() else 0,
@@ -376,14 +399,30 @@ class Store:
                 "page_count": db.execute("PRAGMA page_count").fetchone()[0],
                 "page_size": db.execute("PRAGMA page_size").fetchone()[0],
                 "busy_timeout_ms": db.execute("PRAGMA busy_timeout").fetchone()[0],
-                "foreign_key_violations": len(db.execute("PRAGMA foreign_key_check").fetchall()),
             })
+            if integrity:
+                deadline = time.monotonic() + 2
+                db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                try:
+                    rows = db.execute("PRAGMA foreign_key_check").fetchmany(101)
+                    self._integrity_snapshot = {"foreign_key_violations": len(rows),
+                        "foreign_key_truncated": len(rows) > 100, "foreign_key_checked_at": time.time()}
+                except sqlite3.OperationalError:
+                    self._integrity_snapshot = {"foreign_key_violations": None,
+                        "foreign_key_check": "budget_exceeded", "foreign_key_checked_at": time.time()}
+                finally:
+                    db.set_progress_handler(None, 0)
+        values.update(getattr(self, "_integrity_snapshot", {"foreign_key_violations": None,
+                                                          "foreign_key_check": "not_requested"}))
         values.update(idle=self._pool.qsize(), borrowed=borrowed, limit=MAX_CONNECTIONS + POOL_SIZE)
         return values
 
     def task_duration_model(self):
-        samples = getattr(self._task_samples, "history", [])
-        return {"samples": len(samples), "median_seconds": statistics.median(samples) if samples else 0.0}
+        rows = self.query("SELECT max(0,ended-started) AS seconds FROM runs "
+                          "WHERE ended IS NOT NULL AND started IS NOT NULL ORDER BY ended DESC LIMIT 128")
+        samples = [row["seconds"] for row in rows]
+        return {"samples": len(samples), "median_seconds": statistics.median(samples) if samples else 0.0,
+                "source": "completed_runs", "window": 128}
 
     def schema_migrations(self):
         return self.query("SELECT version,checksum,applied FROM schema_migrations ORDER BY version")
@@ -391,7 +430,14 @@ class Store:
     def relationship_audit(self, limit=100):
         checks = {
             "run_project_mismatch": "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project<>t.project",
+            "runs_without_task": "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.task IS NOT NULL AND t.id IS NULL",
+            "events_without_project": "SELECT e.seq FROM events e LEFT JOIN projects p ON p.id=e.project WHERE e.project IS NOT NULL AND p.id IS NULL",
+            "candidates_without_project": "SELECT c.id FROM candidates c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "cases_without_project": "SELECT c.id FROM cases c LEFT JOIN projects p ON p.id=c.project WHERE p.id IS NULL",
+            "calls_without_run": "SELECT c.id FROM calls c LEFT JOIN runs r ON r.id=c.run WHERE c.run IS NOT NULL AND c.run NOT LIKE 'model-test-%' AND r.id IS NULL",
         }
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Relationship audit limit must be 1..1000")
         result = {}
         for name, sql in checks.items():
             result[name] = [row[next(iter(row))] for row in self.query(sql + " LIMIT ?", (limit,))]
@@ -436,6 +482,19 @@ class Store:
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
 
+    def reserve_case_exposure(self, project, case, experiment, limit):
+        key = "case-exposure:" + experiment + ":" + case
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM settings WHERE key=?", (key,)).fetchone():
+                return key
+            if db.execute("UPDATE cases SET uses=uses+1 WHERE id=? AND project=? AND uses<?",
+                          (case, project, limit)).rowcount != 1:
+                raise ValueError("Evaluation case exposure is unavailable or exhausted")
+            db.execute("INSERT INTO settings VALUES (?,?)", (key, encode({"state": "possible_exposure",
+                "case": case, "experiment": experiment, "created": time.time()})))
+        return key
+
     def event(self, kind, message, project=None, run=None, data=None):
         self.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
                      (project, run, kind, message, encode(data or {}), time.time()))
@@ -446,6 +505,8 @@ class Store:
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone():
+                raise ValueError("Project is archived; restore it before starting work")
             if request_id:
                 prior = db.execute("SELECT * FROM submissions WHERE project=? AND request=?", (project, request_id)).fetchone()
                 if prior:
@@ -536,7 +597,8 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
             busy = db.execute("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project,)).fetchone()
-            if not p or p["paused"] or busy:
+            archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
+            if not p or p["paused"] or busy or archived:
                 return None
             from .config import merge, validate
             task = None

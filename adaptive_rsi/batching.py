@@ -1,9 +1,41 @@
 """Explicit task batching with conflict previews and per-item receipts."""
 import json
 import time
+import posixpath
+import unicodedata
 
 from .config import fingerprint
 from .store import encode, uid
+
+
+def normalized_scope(path):
+    if not path or path.startswith(("/", "\\")) or ".." in path.replace("\\", "/").split("/"):
+        return None
+    return unicodedata.normalize("NFC", posixpath.normpath(path.replace("\\", "/"))).casefold().rstrip("/")
+
+
+def overlapping_scopes(first, second):
+    return sorted({a if len(a) >= len(b) else b for a in first for b in second
+                   if a == b or a.startswith(b + "/") or b.startswith(a + "/") or a == "." or b == "."})
+
+
+def reconcile_receipt(runtime, task, action, receipt, candidate=None):
+    row = runtime.store.one("SELECT state,attempts,available FROM tasks WHERE id=?", (task,))
+    accepted = bool(row and action == "cancel" and row["state"] == "cancelled")
+    if row and action == "retry" and row["state"] == "queued" and row["attempts"] == 0 and not row["available"]:
+        event = runtime.store.one("SELECT 1 FROM events WHERE kind='manual_retry' AND created>=? "
+                                  "AND json_valid(data) AND json_extract(data,'$.task')=?",
+                                  (receipt.get("started", float("inf")), task))
+        accepted = bool(event)
+    if action == "approve" and candidate and candidate.get("run"):
+        accepted = bool(runtime.store.one("SELECT 1 FROM tasks WHERE fingerprint=? AND project="
+                                          "(SELECT project FROM tasks WHERE id=?) AND state NOT IN ('cancelled','obsolete')",
+                                          ("publish:" + candidate["run"], task)) and runtime.store.one(
+                                              "SELECT 1 FROM events WHERE kind='delivery_approved' AND run=? AND created>=?",
+                                              (candidate["run"], receipt.get("started", float("inf")))))
+    return {"id": task, "state": "accepted" if accepted else "unknown", "reconciled": accepted,
+            **({"started": receipt["started"]} if "started" in receipt else {}),
+            **({} if accepted else {"error_code": "batch_result_unknown"})}
 
 
 def preserve_acceptance(task, plan):
@@ -25,7 +57,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
         raise ValueError("Batch requires 1..100 unique task IDs")
     if action not in ("retry", "cancel", "approve", "group", "ungroup"):
         raise ValueError("Unknown batch action")
-    runtime.project(project)
+    runtime.require_active_project(project)
     with runtime.dispatch_lock:
         rows = [runtime.store.one("SELECT * FROM tasks WHERE id=? AND project=?", (task, project)) for task in tasks]
         if any(row is None for row in rows):
@@ -35,14 +67,18 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
             paths = set()
             try:
                 for evidence in json.loads(row["evidence"] or "[]"):
-                    if isinstance(evidence, dict) and isinstance(evidence.get("path"), str):
-                        paths.add(evidence["path"])
+                    if isinstance(evidence, dict):
+                        for key in ("path", "old_path", "new_path"):
+                            value = evidence.get(key)
+                            path = normalized_scope(value) if isinstance(value, str) else None
+                            if path is not None:
+                                paths.add(path)
             except (ValueError, TypeError):
                 pass
             scopes[row["id"]] = paths
         for index, row in enumerate(rows):
             for other in rows[index + 1:]:
-                shared = scopes[row["id"]] & scopes[other["id"]]
+                shared = overlapping_scopes(scopes[row["id"]], scopes[other["id"]])
                 if shared:
                     conflicts.append({"tasks": [row["id"], other["id"]], "paths": sorted(shared)})
         signature = fingerprint({"action": action, "tasks": sorted(tasks), "project": project})
@@ -71,6 +107,8 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
         if not isinstance(request, str) or not 1 <= len(request) <= 100:
             raise ValueError("Batch requires a request ID")
         key = "batch:" + project + ":" + request
+        report["request_id"] = request
+        report["created"] = time.time()
         prior = runtime.store.setting(key)
         if prior:
             if prior["signature"] != signature:
@@ -131,15 +169,16 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
             now = time.time()
             with runtime.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,overrides,created,updated) "
-                           "VALUES (?,?,?,?,?,?,?,?,'queued',100,?,?,?)",
+                db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,overrides,created,updated,available,urgency) "
+                           "VALUES (?,?,?,?,?,?,?,?,'queued',?,?,?,?,?,?)",
                            (group, project, "goal", "batch:" + request, rows[0]["title"], body,
                             encode([{"batch_tasks": tasks, "conflicts": conflicts,
                                      "originals": [{"id": row["id"], "source": row["source"],
                                                     "evidence": json.loads(row["evidence"] or "[]"),
                                                     "acceptance": json.loads(row["acceptance"] or "[]")}
                                                    for row in rows]}]), encode(acceptance),
-                            encode(overrides[0]), now, now))
+                            min(row["priority"] for row in rows), encode(overrides[0]), now, now,
+                            max(row["available"] for row in rows), max(row["urgency"] for row in rows)))
                 for row in rows:
                     changed = db.execute("UPDATE tasks SET state='superseded',updated=? WHERE id=? AND state='queued'", (now, row["id"]))
                     if changed.rowcount != 1:
@@ -156,10 +195,12 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
             for row in rows:
                 receipt_key = key + ":" + row["id"]
                 receipt = runtime.store.setting(receipt_key)
-                if receipt and receipt.get("state") == "executing":
-                    receipt = {"id": row["id"], "state": "unknown", "error_code": "batch_result_unknown"}
+                if receipt and receipt.get("state") in ("executing", "unknown"):
+                    candidate = next((item for item in report.get("candidates", []) if item["task"] == row["id"]), None)
+                    receipt = reconcile_receipt(runtime, row["id"], action, receipt, candidate)
+                    runtime.store.put_setting(receipt_key, receipt)
                 if receipt is None:
-                    runtime.store.put_setting(receipt_key, {"id": row["id"], "state": "executing"})
+                    runtime.store.put_setting(receipt_key, {"id": row["id"], "state": "executing", "started": time.time()})
                     try:
                         if action == "retry":
                             runtime.retry(row["id"])
@@ -176,7 +217,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                     runtime.store.put_setting(receipt_key, receipt)
                 report["receipts"].append(receipt)
                 runtime.store.put_setting(key, report)
-            report["complete"] = True
+            report["complete"] = all(receipt["state"] != "unknown" for receipt in report["receipts"])
             runtime.store.put_setting(key, report)
         runtime.wake.set()
         return report

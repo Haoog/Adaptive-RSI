@@ -38,7 +38,7 @@ DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 
 def structured_test_summary(text):
-    count = 0
+    outcomes = {}
     detected = False
     for line in text.splitlines():
         if not line.startswith("{"):
@@ -49,26 +49,36 @@ def structured_test_summary(text):
             continue
         if isinstance(event, dict) and event.get("Action") in ("pass", "fail", "skip") and "Package" in event:
             detected = True
-            count += bool(event.get("Test") and event["Action"] in ("pass", "fail"))
-    return {"format": "go_test_json", "executed": count} if detected else None
+            if isinstance(event.get("Test"), str) and isinstance(event["Package"], str):
+                outcomes[(event["Package"], event["Test"])] = event["Action"]
+    return {"format": "go_test_json", "counting": "top_level_tests",
+            "executed": sum("/" not in name and action in ("pass", "fail") for (_, name), action in outcomes.items()),
+            "subtests": sum("/" in name and action in ("pass", "fail") for (_, name), action in outcomes.items()),
+            "skipped": sum(action == "skip" for action in outcomes.values())} if detected else None
 
 
 def junit_test_summary(text):
     """Read bounded JUnit XML from stdout without trusting it for gate decisions."""
     from xml.etree import ElementTree
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith(("<testsuite", "<?xml")):
+    start = text.find("<testsuite")
+    if start < 0 or len(text) > 4 * 1024 * 1024:
+        return None
+    for ending in ("</testsuites>", "</testsuite>", "/>"):
+        end = text.rfind(ending)
+        if end < start:
             continue
         try:
-            root = ElementTree.fromstring(line)
+            root = ElementTree.fromstring(text[start:end + len(ending)])
         except ElementTree.ParseError:
             continue
-        tests = root if root.tag == "testsuite" else root.find("testsuite")
-        if tests is None:
+        suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+        if not suites:
             continue
         try:
-            values = {name: int(tests.attrib.get(name, 0)) for name in ("tests", "failures", "errors", "skipped")}
+            values = {name: sum(int(suite.attrib.get(name, 0)) for suite in suites)
+                      for name in ("tests", "failures", "errors", "skipped")}
+            if any(value < 0 for value in values.values()):
+                return None
         except ValueError:
             continue
         return {"format": "junit", "executed": values["tests"], **values}

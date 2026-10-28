@@ -1,6 +1,28 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "选择文件": "Choose a file",
+ "跳转到文件": "Jump to file",
+ "下一个变更块": "Next hunk",
+ "下一个匹配": "Next match",
+ "上一个匹配": "Previous match",
+ "自动换行": "Wrap lines",
+ "没有匹配结果": "No matches",
+ "行": "Line",
+ "在差异中搜索": "Search the diff",
+ "仅补丁版本": "Patch versions only",
+ "同主版本内更新": "Minor and patch versions",
+ "所有稳定版本": "All stable versions",
+ "任意空闲时间": "Any idle time",
+ "本地夜间 22:00–06:00": "Local night 22:00–06:00",
+ "本地周末": "Local weekends",
+ "自动更新版本范围": "Automatic update version range",
+ "自动安装时间": "Automatic installation window",
+
+ "设置冲突：保留的本地修改": "Settings conflicts: preserved local edits",
+ "服务端值": "Server value",
+ "使用本地修改": "Use local edit",
+ "采用服务端值": "Keep server value",
  "发现新版本": "Update available",
  "已选择任务": "Selected tasks",
  "合并任务": "Group tasks",
@@ -11,6 +33,7 @@ const english = {
  "归档当前项目": "Archive current project",
  "归档会停止调度并隐藏此项目，但保留任务、运行记录和审计历史。确认归档？": "Archiving stops scheduling and hides this project while retaining tasks, runs and audit history. Archive it?",
  "项目已归档；历史记录仍保留。": "Project archived. History is retained.",
+ "该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？": "This project is archived. Restore it paused without restarting cancelled tasks?",
  "验证恢复点": "Verify restore point",
  "恢复点验证通过。": "Restore point verification passed.",
  "恢复点验证未通过。": "Restore point verification failed.",
@@ -1547,7 +1570,14 @@ const english = {
   "OpenCode Go 官方说明":"Official OpenCode Go documentation",
   "从 OpenCode 官方控制台复制当前 Go API 地址与密钥。模型 ID 和剩余额度以官方控制台为准；保存和获取目录不代表推理成功。":"Copy the current Go API endpoint and key from the official OpenCode console. Model IDs and remaining allowance come from that console. Saving and fetching models do not establish successful inference.",
   "运行记录加载失败。":"Failed to load run records.",
-  "取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？":"Cancelling revokes the pending candidate. A fresh verification is required before it can be delivered again; existing PRs are not affected. Cancel this task?"
+  "取消后待批准的候选将被撤销，需要重新验证才能再次交付；已创建的 PR 不受影响。确认取消？":"Cancelling revokes the pending candidate. A fresh verification is required before it can be delivered again; existing PRs are not affected. Cancel this task?",
+ "更新本机客户端；仅自有本机服务会排空任务，远端服务不受影响。": "Updates this client. Only an owned local runtime drains its tasks; remote services are unaffected.",
+ "偏好未保存到磁盘，本次会话已生效。": "The preference could not be saved to disk; it applies to this session.",
+ "批次记录": "Batch history",
+ "搜索批次记录": "Search batch history",
+ "继续并核对批次": "Continue and reconcile batch",
+ "导出批次记录": "Export batch history",
+ "部分结果待核对，请打开批次记录。": "Some outcomes need reconciliation. Open batch history."
 };
 let language = (()=>{try{return localStorage.getItem('rsi-language') === 'en' ? 'en' : 'zh-CN';}catch{return 'zh-CN';}})();
 function t(text){ return language === 'en' ? (english[text] ?? text) : text; }

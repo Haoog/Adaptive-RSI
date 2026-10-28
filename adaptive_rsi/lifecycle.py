@@ -34,7 +34,9 @@ def readiness(runtime, action="status", version=None, lease=None):
                 raise ValueError("Another desktop update owns admission")
             if not state:
                 state = {"version": version, "lease": secrets.token_hex(24), "phase": "draining", "expires": time.time() + 3600}
-                runtime.store.put_setting(KEY, state)
+            elif state["phase"] == "draining":
+                state = {**state, "expires": time.time() + 3600}
+            runtime.store.put_setting(KEY, state)
         elif action in ("cancel", "complete") and state:
             if not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
                 raise ValueError("Desktop update lease changed")

@@ -34,6 +34,7 @@ function browser(savedSession = new Map()) {
       replaceChildren(...children) { this.options = children; this.children = children; },
       append(...children) { this.children.push(...children); },
       prepend(...children) { this.children.unshift(...children); },
+      remove() { this.isConnected=false;nodes.delete(this.id); },
       insertBefore(child, sibling) { this.children.splice(this.children.indexOf(sibling), 0, child); },
       querySelectorAll() { return []; },
       querySelector(selector) { return selector==='[data-form-error]'?this.children.find(child=>child.dataset?.formError!==undefined):null; },
@@ -196,7 +197,7 @@ function productionSettingsPage(scope) {
   const config = JSON.parse(require('node:child_process').execFileSync(process.env.PYTHON || 'python3', ['-B', '-c', 'import json; from adaptive_rsi.config import DEFAULTS; print(json.dumps(DEFAULTS))'], {cwd: path.join(__dirname, '..'), encoding: 'utf8'}));
   page.context.initialState.config = structuredClone(config);
   page.context.initialState.projects.forEach(project => { project.config = structuredClone(config); project.overrides = {}; });
-  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}}, language: 'zh-CN'});
+  Object.assign(page.context, {URL, navigator: {}, history: {replaceState() {}, pushState() {}}, language: 'zh-CN'});
   page.context.window.addEventListener = () => {}; page.context.window.scrollTo = () => {};
   vm.runInContext(experienceSource, page.context);
   // Keep production renderSettings, refresh, draft restoration and dirty status.
@@ -1671,7 +1672,7 @@ test('revision and backoff messages are mapped and localized for both console la
 function experiencePage({navigation = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
-    URL, navigator: {}, history: {replaceState() {}},
+    URL, navigator: {}, history: {replaceState() {}, pushState() {}},
     location: {origin: 'http://fixture.test', href: 'http://fixture.test/', pathname: '/', search: ''}
   });
   page.context.window.addEventListener = (type, handler) => windowEvents.set(type, handler);

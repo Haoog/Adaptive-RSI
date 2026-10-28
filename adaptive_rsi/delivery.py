@@ -198,6 +198,8 @@ def publish(runtime, project, task, run, workspace, config):
         existing_pr = pr_view(repo, url)
         if existing_pr["headRefOid"] != sha or existing_pr.get("baseRefName") != identity["branch"]:
             raise RuntimeError("Existing PR head or target differs from evaluated candidate")
+        if existing_pr.get("state") == "CLOSED":
+            raise RuntimeError("Existing PR is closed without merging; explicitly reopen it before retrying delivery")
         # Recover an observed remote fact before any later cancellation can discard it.
         # This path performs no remote write, so fresh publishing authorization is unnecessary.
         with store.connect() as db:

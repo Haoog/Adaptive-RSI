@@ -755,7 +755,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
         steps = workflow["jobs"]["verify"]["steps"]
         attest = next(step for step in steps if step.get("id") == "attest")
         self.assertTrue(attest["continue-on-error"])
-        upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact"))
+        upload = next(step for step in steps if str(step.get("uses", "")).startswith("actions/upload-artifact") and step.get("with", {}).get("name", "").startswith("release-verified-"))
         self.assertIn("steps.attest.outcome", upload["if"])
         text = (self.ROOT / ".github/workflows/release-verify.yml").read_text()
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
@@ -784,6 +784,7 @@ class WorkflowConfigurationTest(unittest.TestCase):
 
     def test_manual_caches_only_store_public_build_inputs(self):
         allowed_paths = {
+            ".ci/test-durations.json",
             "~/.cache/ms-playwright",
             "~/.cache/pip",
             "~/Library/Caches/ms-playwright",

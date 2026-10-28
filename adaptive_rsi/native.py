@@ -1,7 +1,10 @@
 """Native API adapters with a host-controlled, workspace-only tool loop."""
 import json
+import contextlib
+import concurrent.futures
 import os
 import stat
+import uuid
 import sys
 import time
 import urllib.error
@@ -157,9 +160,30 @@ class WorkspaceTools:
             raise ProviderUnavailable("Native conversation timed out", "timeout")
         return remaining
 
-    @staticmethod
-    def read_source(path, maximum):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    @contextlib.contextmanager
+    def parent_descriptor(self, path, create=False):
+        parts = path.relative_to(self.workspace).parts
+        if not parts:
+            raise ValueError("Source must be a file")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(self.workspace, flags)
+        try:
+            for part in parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(part, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                following = os.open(part, flags, dir_fd=fd)
+                os.close(fd)
+                fd = following
+            yield fd, parts[-1]
+        finally:
+            os.close(fd)
+
+    def read_source(self, path, maximum):
+        with self.parent_descriptor(path) as (parent, leaf):
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
         with os.fdopen(fd, "rb") as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError("Source must be a regular file")
@@ -167,6 +191,36 @@ class WorkspaceTools:
             if len(data) > maximum:
                 raise ValueError("Source file is too large")
             return data.decode("utf-8")
+
+    def write_source(self, path, text):
+        with self.parent_descriptor(path, create=True) as (parent, leaf):
+            temporary = ".rsi-write-" + uuid.uuid4().hex
+            try:
+                old = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISREG(old.st_mode):
+                    raise ValueError("Source must be a regular file")
+                mode = stat.S_IMODE(old.st_mode)
+            except FileNotFoundError:
+                mode = 0o644
+            fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, mode, dir_fd=parent)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(text.encode("utf-8"))
+                    output.flush()
+                    os.fsync(output.fileno())
+                    os.fchmod(output.fileno(), mode)
+                self.remaining()
+                os.replace(temporary, leaf, src_dir_fd=parent, dst_dir_fd=parent)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+
+    def check_cancelled(self):
+        self.remaining()
+        if self.cancel and self.cancel():
+            raise Cancelled("Cancelled during source inspection")
 
     def path(self, value):
         relative_path(value)
@@ -183,6 +237,7 @@ class WorkspaceTools:
             return self._file_cache
         result = []
         for root, dirs, files in os.walk(self.workspace, followlinks=False):
+            self.check_cancelled()
             dirs[:] = sorted(d for d in dirs if d != ".git" and not d.startswith(".rsi-")
                              and d not in ["node_modules", "__pycache__", ".venv"] and not (Path(root) / d).is_symlink())
             for name in sorted(files):
@@ -215,15 +270,30 @@ class WorkspaceTools:
             if not 1 <= start <= end <= start + 499:
                 raise ValueError("Read requires 1-based range of at most 500 lines")
             path = self.path(args["path"])
-            if path.stat().st_size > 2 * 1024 * 1024:
-                raise ValueError("Source file is too large")
-            return "\n".join(f"{i}: {line}" for i, line in enumerate(self.read_source(path, 2 * 1024 * 1024).splitlines(), 1) if start <= i <= end)
+            rows, scanned = [], 0
+            with self.parent_descriptor(path) as (parent, leaf):
+                fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError("Source must be a regular file")
+                for number in range(1, end + 1):
+                    self.check_cancelled()
+                    line = source.readline(1024 * 1024 + 1)
+                    if not line:
+                        break
+                    scanned += len(line)
+                    if len(line) > 1024 * 1024 or scanned > 32 * 1024 * 1024:
+                        raise ValueError("Source read exceeds scan budget; narrow the range")
+                    if number >= start:
+                        rows.append(str(number) + ": " + line.decode("utf-8").rstrip("\r\n"))
+            return "\n".join(rows)
         if name == "search":
             if not args["text"] or len(args["text"]) > 1000:
                 raise ValueError("Search requires 1..1000 characters")
             result = []
             remaining = 12 * 1024 * 1024
             for file in self.files():
+                self.check_cancelled()
                 path = self.path(file)
                 if path.stat().st_size > 1024 * 1024:
                     continue
@@ -265,8 +335,7 @@ class WorkspaceTools:
                 text = args["content"]
             if len(text.encode()) > 1024 * 1024:
                 raise ValueError("Source write exceeds 1 MiB")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
+            self.write_source(path, text)
             self.changed = True
             self._file_cache = None
             self._text_cache.clear()
@@ -293,6 +362,37 @@ class WorkspaceTools:
             scrub_tree(self.workspace)
             return {k: result[k] for k in ["exit_code", "stdout", "stderr", "error"]}
         raise ValueError("Unknown tool")
+
+
+def execute_tools(tools, calls):
+    def execute(call, isolated=False):
+        call_id, name, args = call
+        tools.check_cancelled()
+        if isinstance(args, ArgumentsError):
+            return call_id, name, {"error": str(args)}
+        worker = tools
+        if isolated:
+            worker = WorkspaceTools(tools.workspace, tools.role, tools.state, tools.config,
+                                    tools.cancel, tools.protected)
+            worker.deadline, worker.scope = tools.deadline, tools.scope
+            worker._file_cache = tools._file_cache
+        try:
+            value = worker.execute(name, args)
+            if len(json.dumps(value).encode()) > 128000:
+                if isinstance(value, dict) and "exit_code" in value:
+                    value = {**value, "stdout": value.get("stdout", "")[-24000:],
+                             "stderr": value.get("stderr", "")[-24000:], "truncated": True}
+                else:
+                    value = {"error": "Tool output exceeds limit; narrow the request"}
+        except (ValueError, OSError, UnicodeError) as error:
+            value = {"error": str(error)}
+        tools.check_cancelled()
+        return call_id, name, value
+    if len(calls) > 1 and tools.remaining() > 5 and all(
+            name in {"read_file", "search", "list_files"} for _, name, _ in calls):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(calls)), thread_name_prefix="rsi-read") as pool:
+            return list(pool.map(lambda call: execute(call, True), calls))
+    return [execute(call) for call in calls]
 
 
 class Conversation:
@@ -365,7 +465,9 @@ class Conversation:
         if not isinstance(response, dict):
             raise RuntimeError("Model API response must be an object")
         try:
-            return self._receive(response)
+            from .usage import native_usage
+            details = native_usage(self.protocol, response)
+            return self._receive(response), details["tokens"] if details else 0
         except (KeyError, IndexError, TypeError, AttributeError, ValueError):
             raise RuntimeError("Model API returned an invalid tool response structure") from None
 
@@ -374,24 +476,20 @@ class Conversation:
         if p == "responses":
             output = response.get("output", [])
             self.history.extend(output)
-            usage = response.get("usage") or {}
             calls = [(x["call_id"], x["name"], parse_arguments(x["name"], x.get("arguments"))) for x in output if x.get("type") == "function_call"]
-            return calls, int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
+            return calls
         if p in ["chat_completions", "ollama"]:
             message = response["message"] if p == "ollama" else response["choices"][0]["message"]
             # Keep reasoning_content returned by gateways that require it on subsequent turns.
             self.history.append(message)
-            usage = response.get("usage") or {}
             calls = [(x.get("id", str(i)), x["function"]["name"], parse_arguments(x["function"]["name"], x["function"].get("arguments")))
                      for i, x in enumerate(message.get("tool_calls", []))]
-            tokens = int(response.get("prompt_eval_count") or 0) + int(response.get("eval_count") or 0) if p == "ollama" else int(usage.get("total_tokens") or 0)
-            return calls, tokens
+            return calls
         if p == "anthropic":
             content = response.get("content", [])
             self.history.append({"role": "assistant", "content": content})
-            usage = response.get("usage") or {}
             calls = [(x["id"], x["name"], parse_arguments(x["name"], x.get("input"))) for x in content if x.get("type") == "tool_use"]
-            return calls, sum(int(usage.get(k) or 0) for k in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"])
+            return calls
         candidates = response.get("candidates") or []
         if not candidates:
             # prompt 被安全策略拦截时 candidates 为空；按可诊断错误处理而不是裸 IndexError。
@@ -401,7 +499,7 @@ class Conversation:
         calls = [(x["functionCall"].get("id", str(i)), x["functionCall"]["name"],
                   parse_arguments(x["functionCall"]["name"], x["functionCall"].get("args", {})))
                  for i, x in enumerate(content["parts"]) if "functionCall" in x]
-        return calls, int((response.get("usageMetadata") or {}).get("totalTokenCount") or 0)
+        return calls
 
     def results(self, results):
         if self.protocol == "responses":
@@ -439,8 +537,10 @@ class NativeAgent:
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"])
         began = time.monotonic()
         tools.deadline = began + config["limits"]["command_seconds"]
+        capabilities = model_capabilities(route["model"], protocol)
         max_bytes = min(config["limits"]["max_output_mb"] * 1024 * 1024,
-                        model_capabilities(route["model"], protocol)["max_output_tokens"] * 4)
+                        capabilities["max_output_tokens"] * 4)
+        context_bytes = min(64 * 1024 * 1024, capabilities["context_tokens"] * 4)
         # Probe calls answer quickly; other roles may reason for minutes on non-streaming APIs.
         # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
         timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
@@ -451,10 +551,10 @@ class NativeAgent:
                 raise ProviderUnavailable("Native conversation timed out", "timeout")
             if cancel and cancel():
                 raise Cancelled("Model call cancelled")
-            conversation.trim_history(max_bytes)
+            conversation.trim_history(context_bytes)
             suffix, payload = conversation.request()
-            if len(json.dumps(payload).encode()) > max_bytes:
-                raise RuntimeError("Native model context exceeds output limit")
+            if len(json.dumps(payload).encode()) > context_bytes:
+                raise RuntimeError("Native model input exceeds context capacity")
             call = self.store.reserve_call(project, run, role, route, config)
             started = time.monotonic()
             self.store.event("model", role + ": " + provider["id"] + " / " + route["model"], project, run)
@@ -518,24 +618,7 @@ class NativeAgent:
                     conversation.results([(call_id, name, {"error": error})])
                     self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                     continue
-                results = []
-                for call_id, name, args in calls:
-                    tools.remaining()
-                    if isinstance(args, ArgumentsError):
-                        results.append((call_id, name, {"error": str(args)}))
-                        continue
-                    try:
-                        value = tools.execute(name, args)
-                        if len(json.dumps(value).encode()) > 128000:
-                            if isinstance(value, dict) and "exit_code" in value:
-                                value = {**value, "stdout": value.get("stdout", "")[-24000:],
-                                         "stderr": value.get("stderr", "")[-24000:], "truncated": True}
-                            else:
-                                value = {"error": "Tool output exceeds limit; narrow the request"}
-                    except (ValueError, OSError, UnicodeError) as exc:
-                        value = {"error": str(exc)}
-                    results.append((call_id, name, value))
-                    tools.remaining()
+                results = execute_tools(tools, calls)
                 conversation.results(results)
                 self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             except ProviderUnavailable as exc:

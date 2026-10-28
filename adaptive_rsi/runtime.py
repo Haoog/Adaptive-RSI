@@ -53,6 +53,28 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
 
 
 class Runtime(Maintenance):
+    @classmethod
+    def open(cls, root, agent=None):
+        """Claim service ownership before any schema or operation initialization."""
+        from .store import Store
+        root = Path(root).expanduser().resolve()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock = (root / "runtime.lock").open("a+")
+        store = None
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            store = Store(root)
+            runtime = cls(store, agent=agent)
+            runtime.lockfile = lock
+            return runtime
+        except BaseException as error:
+            if store is not None:
+                store.close()
+            lock.close()
+            if isinstance(error, BlockingIOError):
+                raise RuntimeError("Another runtime already owns this state directory") from None
+            raise
+
     def __init__(self, store, agent=None):
         self.store = store
         self.agent = agent or CodexAgent(store)
@@ -109,6 +131,12 @@ class Runtime(Maintenance):
             raise ValueError("Project not found")
         return row
 
+    def require_active_project(self, project):
+        row = self.project(project)
+        if self.store.setting("project-archived:" + project):
+            raise ValueError("Project is archived; restore it before starting work")
+        return row
+
     def baseline_lock_for(self, project):
         # 用一把短锁保护 dict 创建，避免并发首次获取时的竞态；锁本身按项目隔离。
         with self._baseline_locks_guard:
@@ -156,6 +184,22 @@ class Runtime(Maintenance):
         # 空名称或纯空格回退到目录名，避免选择器和标题出现空白项。
         return name.strip() if isinstance(name, str) and name.strip() else Path(path).name
 
+    def restore_project(self, project, confirmation):
+        if confirmation != "restore-project":
+            raise ValueError("Explicit confirmation is required to restore a project")
+        with self.dispatch_lock:
+            row = self.project(project)
+            repository(row["path"])
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM settings WHERE key=?", ("project-archived:" + project,))
+                db.execute("UPDATE projects SET paused=1 WHERE id=?", (project,))
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) "
+                           "VALUES (?,NULL,'project_restored','Project restored paused; cancelled tasks retained',?,?)",
+                           (project, encode({"project": project}), time.time()))
+            self.wake.set()
+            return {"project": project, "archived": False, "paused": True, "name": row["name"]}
+
     def _add_project(self, path, name=None, enabled=False):
         root = repository(path)
         if self.store.root == root or self.store.root in root.parents or root in self.store.root.parents:
@@ -165,7 +209,8 @@ class Runtime(Maintenance):
             # 已接入路径不重复注册，也不静默改变已有名称或启用状态。
             return {"id": existing["id"], "existing": True,
                     "name": self.project_name(existing["name"], existing["path"]),
-                    "path": existing["path"], "paused": bool(existing["paused"])}
+                    "path": existing["path"], "paused": bool(existing["paused"]),
+                    "archived": bool(self.store.setting("project-archived:" + existing["id"]))}
         if self.store.one("SELECT 1 FROM runs WHERE ended IS NULL"):
             raise ValueError("Wait until active runs finish before registering projects so every worker uses the same isolation boundaries")
         for item in self.store.query("SELECT path FROM projects"):
@@ -277,19 +322,21 @@ class Runtime(Maintenance):
         if confirmation != "reset-invalid-global-config":
             raise ValueError("Explicit confirmation is required to reset invalid global settings")
         with self.dispatch_lock:
-            raw = self.store.setting("config", {})
+            saved = self.store.one("SELECT value FROM settings WHERE key='config'")
+            text = saved["value"] if saved else "{}"
             try:
+                raw = json.loads(text)
                 validate(merge(DEFAULTS, raw))
             except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
                 reason = str(exc)[:300] or "Invalid global configuration"
             else:
                 raise ValueError("Global configuration is valid; reset is unavailable")
             backup_key = "global-config-repair-backup:" + uid()
-            digest = fingerprint(raw)
+            digest = hashlib.sha256(text.encode()).hexdigest()
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                           (backup_key, encode({"raw": raw, "sha256": digest,
+                           (backup_key, encode({"raw": text, "sha256": digest,
                                                 "reason": reason, "created": time.time()})))
                 db.execute("DELETE FROM settings WHERE key='config'")
                 # Global reset must not silently make project overrides valid.
@@ -353,6 +400,11 @@ class Runtime(Maintenance):
                 db.execute("INSERT OR REPLACE INTO settings VALUES ('config',?)", (encode(updated),))
             next_revision = current_revision + 1
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (revision_key, str(next_revision)))
+            if not project:
+                for row in projects:
+                    key = "config-revision:" + row["id"]
+                    db.execute("INSERT INTO settings VALUES (?, '1') ON CONFLICT(key) "
+                               "DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)", (key,))
             revision_data = {"before": previous, "after": updated, "revision": next_revision}
         # Keep the historical post-commit audit failure observable; callers already
         # perform a compensating cleanup and must not mistake an audit error for a
@@ -378,6 +430,7 @@ class Runtime(Maintenance):
         with self.dispatch_lock:
             self.project(project)
             if not paused:
+                self.require_active_project(project)
                 self.config(project)
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
@@ -408,7 +461,7 @@ class Runtime(Maintenance):
         return authorize_workflow(self, project, kind, workflow)
 
     def goal(self, project, text, overrides=None, request_id=None):
-        self.project(project)
+        self.require_active_project(project)
         if not isinstance(text, str) or not text.strip() or len(text) > 30000:
             raise ValueError("Goal must contain 1..30000 characters")
         if "delivery" in (overrides or {}):
@@ -575,8 +628,8 @@ class Runtime(Maintenance):
             problem = json.loads(run["result"]).get("failure", {}) if run else {}
             if problem.get("code") != "provider" or problem.get("action") != "retry_later" or problem.get("recoverable") is not True:
                 continue
-            current = connection_key(self.config(task["project"]), provider, task["project"])
-            if problem.get("connection") != current or current != connection_key(resumed_config, provider, task["project"]):
+            current = connection_key(self.config(task["project"]), provider, task["project"], root=self.store.root)
+            if problem.get("connection") != current or current != connection_key(resumed_config, provider, task["project"], root=self.store.root):
                 continue
             ProviderHealth(self.store).reset(self.config(task["project"]), provider, task["project"])
             self.store.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,updated=? WHERE id=? AND state='blocked'", (time.time(), task["id"]))
@@ -646,12 +699,14 @@ class Runtime(Maintenance):
         return task
 
     def start(self, paused=False):
-        self.lockfile = (self.store.root / "runtime.lock").open("a+")
-        try:
-            fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.lockfile.close()
-            raise RuntimeError("Another runtime already owns this state directory")
+        if self.lockfile is None or self.lockfile.closed:
+            self.lockfile = (self.store.root / "runtime.lock").open("a+")
+            try:
+                fcntl.flock(self.lockfile.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.lockfile.close()
+                self.lockfile = None
+                raise RuntimeError("Another runtime already owns this state directory")
         try:
             self.operations.recover()
             if paused:
@@ -1042,8 +1097,16 @@ class Runtime(Maintenance):
                      patch.decode("utf-8", "replace") + "\n```")
         self.store.phase(run["id"], role)
         try:
-            return self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
-                                     config, lambda: self.is_cancelled(run), protected)
+            exposure = run.get("_case_exposure")
+            key = self.store.reserve_case_exposure(run["project"], exposure["case"], exposure["experiment"],
+                                                  exposure["limit"]) if exposure else None
+            result = self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
+                                       config, lambda: self.is_cancelled(run), protected)
+            if key:
+                value = self.store.setting(key)
+                value.update(state="response_observed", adapter=type(self.agent).__name__, last_role=role)
+                self.store.put_setting(key, value)
+            return result
         finally:
             self.store.phase(run["id"], "preparation")
 
@@ -1208,7 +1271,7 @@ class Runtime(Maintenance):
                 config = json.loads(run["config"])
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
                 provider = getattr(exc, "provider_id", None) or (call["provider"] if call else config["models"]["planning"]["provider"])
-                problem["connection"] = connection_key(config, provider, run["project"])
+                problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
                 transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
                 circuit = ProviderHealth(self.store).status(config, provider, run["project"])
                 problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]

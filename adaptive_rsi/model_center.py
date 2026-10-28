@@ -46,15 +46,27 @@ class ModelCenter:
             raise CenterError("unknown_provider")
         return provider
 
-    @staticmethod
-    def signature(provider):
-        return fingerprint({k: v for k, v in provider.items() if k != "name"})
+    def signature(self, provider):
+        fields = {k: v for k, v in provider.items() if k != "name"}
+        generation = self.credentials.epoch(provider)
+        if generation:
+            fields["credential_generation"] = generation
+        return fingerprint(fields)
 
     def key(self, provider, project=None):
         return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + self.signature(provider)
 
     def directory(self, provider, project=None):
         value = self.store.setting(self.key(provider, project))
+        if value is None:
+            legacy = fingerprint({k: v for k, v in provider.items() if k != "name"})
+            old = self.store.setting("model-center:" + (project or "global") + ":" + provider["id"] + ":" + legacy)
+            if old:
+                value = copy.deepcopy(old)
+                value["fetched"] = None
+                for model in value.get("models", []):
+                    for key in ("verified", "probes", "last_attempt"):
+                        model.pop(key, None)
         if value is None and project:
             global_provider = next((p for p in [*BUILTINS, *self.runtime.config()["providers"]] if p["id"] == provider["id"]), None)
             if global_provider and self.signature(global_provider) == self.signature(provider):

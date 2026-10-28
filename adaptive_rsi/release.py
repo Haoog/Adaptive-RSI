@@ -2,8 +2,10 @@
 import base64
 import json
 import re
+import sys
 import time
 import urllib.request
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from .config import DEFAULTS, fingerprint, merge
@@ -199,13 +201,19 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
-def save(runtime, run, kind, data, expected=_UNCONDITIONAL):
+def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if expected is not _UNCONDITIONAL:
             current = db.execute("SELECT value FROM settings WHERE key=?", (key(run["id"], kind),)).fetchone()
             if (current["value"] if current else None) != expected:
                 raise _AutomationChanged("Automation changed during reconciliation")
+        if ownership is not None:
+            owner_name, previous, owner = ownership
+            current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
+            if (json.loads(current["value"]) if current else None) != previous:
+                raise _AutomationChanged("Deployment ownership changed during reconciliation")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (owner_name, encode(owner)))
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
@@ -283,7 +291,24 @@ def reconcile(runtime, run, kind, data, persist=True):
     return save(runtime, run, kind, data) if persist else data
 
 
-def health_check(url, sha):
+def health_check(url, sha, timeout=15):
+    from .process import checked
+    argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "adaptive_rsi.health_transport"])
+    try:
+        result = json.loads(checked([*argv, url, sha, str(timeout)],
+                                    cwd=Path(__file__).resolve().parents[1], timeout=timeout))
+        if not isinstance(result, dict) or result.get("sha") != sha:
+            raise ValueError("Invalid health transport result")
+        return result
+    except Cancelled:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False,
+                "error": "Health transport failed or exceeded its total deadline"}
+
+
+def direct_health_check(url, sha, timeout=15):
     class SameOrigin(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
             original, target = urlsplit(url), urlsplit(newurl)
@@ -292,10 +317,10 @@ def health_check(url, sha):
                 raise ValueError("Deployment health redirect changed the authorized origin")
             return super().redirect_request(request, fp, code, msg, headers, newurl)
     result = {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False}
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + timeout
     try:
         request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Adaptive-RSI-health"})
-        with urllib.request.build_opener(SameOrigin()).open(request, timeout=10) as response:
+        with urllib.request.build_opener(SameOrigin()).open(request, timeout=min(10, timeout)) as response:
             body = bytearray()
             while len(body) <= 65536:
                 if time.monotonic() >= deadline:
@@ -321,8 +346,46 @@ def stable_key(project, repo, url):
 
 
 def owner_key(project, repo, policy):
-    return "deployment-owner:" + fingerprint({"project": project, "repository": repo,
-                                              "target": policy.get("health_url") or policy["workflow"]})
+    url = policy.get("health_url")
+    if url:
+        parsed = urlsplit(url)
+        target = {"origin": parsed.hostname.lower(), "port": parsed.port or 443,
+                  "path": parsed.path or "/", "query": parsed.query}
+    else:
+        target = {"repository": repo.lower(), "workflow": policy["workflow"]}
+    return "deployment-owner:" + fingerprint(target)
+
+
+def deployment_owner(runtime, project, repo, policy):
+    name = owner_key(project, repo, policy)
+    with runtime.dispatch_lock:
+        current = runtime.store.setting(name)
+        if current:
+            return current
+        legacy = []
+        for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
+            try:
+                receipt = json.loads(row["value"])
+                run = runtime.store.one("SELECT project,config,started FROM runs WHERE id=?", (receipt["run"],))
+                if not run:
+                    continue
+                config = json.loads(run["config"])
+                previous_policy = config["delivery"]["deploy"]
+                previous_repo = config["github"]["repository"]
+                old_name = "deployment-owner:" + fingerprint({"project": run["project"], "repository": previous_repo,
+                    "target": previous_policy.get("health_url") or previous_policy["workflow"]})
+                if row["key"] == old_name and owner_key(run["project"], previous_repo, previous_policy) == name:
+                    state = runtime.store.setting(key(receipt["run"], "deploy"), {})
+                    legacy.append((not deployment_terminal(state, previous_policy), run["started"], receipt))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+        if not legacy:
+            return None
+        if sum(active for active, _, _ in legacy) > 1:
+            raise ValueError("Multiple legacy deployments own this target; reconcile them before deploying")
+        receipt = max(legacy, key=lambda item: (item[0], item[1]))[2]
+        runtime.store.put_setting(name, receipt)
+        return receipt
 
 
 def deployment_terminal(data, policy):
@@ -336,7 +399,7 @@ def deployment_terminal(data, policy):
 def deployment_health(runtime, project, run, data, policy, cancel, persist=save):
     if not policy.get("health_url"):
         return data
-    owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
+    owner = deployment_owner(runtime, project["id"], data["repository"], policy)
     if owner and owner["run"] != run["id"]:
         data.update(state="superseded", error="A newer deployment owns this target; no stale rollback will be issued")
         return data
@@ -350,7 +413,7 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
         report = health_check(policy["health_url"], data["sha"])
         with runtime.dispatch_lock:
             authorized(runtime, project, run, "deploy", policy, cancel)
-            current_owner = runtime.store.setting(owner_key(project["id"], data["repository"], policy))
+            current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; old health evidence was discarded")
                 return data
@@ -375,7 +438,7 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
         validate_pin(repo, policy)
         with runtime.dispatch_lock:
             authorized(runtime, project, run, "deploy", policy, cancel)
-            current_owner = runtime.store.setting(owner_key(project["id"], repo, policy))
+            current_owner = deployment_owner(runtime, project["id"], repo, policy)
             if current_owner and current_owner["run"] != run["id"]:
                 data.update(state="superseded", error="A newer deployment owns this target; rollback was cancelled")
                 return data
@@ -429,9 +492,9 @@ def advance(runtime, project, run, outcome, cancel=None):
         data = runtime.store.setting(key(run["id"], kind))
         expected = encode(data) if data is not None else None
 
-        def persist(runtime, run, kind, value):
+        def persist(runtime, run, kind, value, ownership=None):
             nonlocal expected
-            saved = save(runtime, run, kind, value, expected=expected)
+            saved = save(runtime, run, kind, value, expected=expected, **({"ownership": ownership} if ownership else {}))
             expected = encode(saved)
             return saved
 
@@ -461,7 +524,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             repo = authorized(runtime, project, run, kind, policy, cancel)
             expected_owner = None
             if kind == "deploy":
-                owner = runtime.store.setting(owner_key(project["id"], repo, policy))
+                owner = deployment_owner(runtime, project["id"], repo, policy)
                 expected_owner = owner
                 if owner and owner["run"] != run["id"]:
                     previous = runtime.store.setting(key(owner["run"], "deploy"), {})
@@ -475,7 +538,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             validate_pin(repo, policy)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy, cancel)
-                if kind == "deploy" and runtime.store.setting(owner_key(project["id"], repo, policy)) != expected_owner:
+                if kind == "deploy" and deployment_owner(runtime, project["id"], repo, policy) != expected_owner:
                     result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Deployment ownership changed during validation"})
                     continue
                 if not data or not data.get("operation_id"):
@@ -486,9 +549,9 @@ def advance(runtime, project, run, outcome, cancel=None):
                             "operation_id": operation, "created_at": time.time(), "attempt": 0}
                 # Persist the write intent first. Ambiguous failures are reconciled, never re-dispatched.
                 data.update(state="dispatching", error="")
-                persist(runtime, run, kind, data)
-                if kind == "deploy":
-                    runtime.store.put_setting(owner_key(project["id"], repo, policy), {"run": run["id"], "sha": data["sha"]})
+                ownership = ((owner_key(project["id"], repo, policy), expected_owner,
+                              {"run": run["id"], "sha": data["sha"]}) if kind == "deploy" else None)
+                persist(runtime, run, kind, data, ownership=ownership)
             try:
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
@@ -535,7 +598,7 @@ def retry(runtime, project_id, run_id, kind):
         project = runtime.project(project_id)
         repo = authorized(runtime, project, run, kind, policy)
         if kind == "deploy":
-            owner = runtime.store.setting(owner_key(project_id, repo, policy))
+            owner = deployment_owner(runtime, project_id, repo, policy)
             if owner and owner["run"] != run_id:
                 raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         if json.loads(run["result"]).get("feedback", {}).get("state") != "verified":
@@ -563,7 +626,7 @@ def retry(runtime, project_id, run_id, kind):
                 if require_authorization:
                     authorized(runtime, project, run, kind, policy)
                 if require_authorization and kind == "deploy":
-                    owner = runtime.store.setting(owner_key(project_id, repo, policy))
+                    owner = deployment_owner(runtime, project_id, repo, policy)
                     if owner and owner["run"] != run_id:
                         raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
                 save(runtime, run, kind, data, expected=expected)

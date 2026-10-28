@@ -748,23 +748,39 @@ window.RSIExperience = (() => {
       summary.className += " diff-files";
       box.append(summary);
     }
-    if (patch.split("\n").length > 2000) {
-      box.append(
-        el("p", t("差异超过 2000 行，已折叠为纯文本。"), "muted"),
-        el("pre", patch, "readable-diff"),
-      );
-      return;
+    const lines=patch.split("\n"),large=lines.length>2000;
+    const controls=el("div",undefined,"task-actions"),search=el("input"),position=el("span",undefined,"muted");
+    search.type="search";search.placeholder=t("在差异中搜索");search.setAttribute("aria-label",t("在差异中搜索"));
+    const pre=el("pre",large?patch:undefined,"readable-diff");
+    pre.style.maxHeight="65vh";
+    const lineNodes=[];
+    if(!large)for(const line of lines){const row=el("div",line);row.tabIndex=-1;
+      if(line.startsWith("+"))row.className="diff-add";else if(line.startsWith("-"))row.className="diff-remove";else if(line.startsWith("@@"))row.className="diff-location";
+      lineNodes.push(row);pre.append(row);
     }
-    const pre = el("pre", undefined, "readable-diff");
-    for (const line of patch.split("\n")) {
-      const row = el("div", line);
-      if (line.startsWith("+")) row.className = "diff-add";
-      else if (line.startsWith("-")) row.className = "diff-remove";
-      else if (line.startsWith("@@")) row.className = "diff-location";
-      pre.append(row);
+    let selected=-1,previous=null;
+    const jump=line=>{if(line<0)return;previous?.classList.remove("diff-selected");selected=line;position.textContent=t("行")+" "+(line+1)+" / "+lines.length;
+      if(large){const height=parseFloat(getComputedStyle(pre).lineHeight)||18;pre.scrollTop=line*height;}
+      else{previous=lineNodes[line];previous.classList.add("diff-selected");previous.scrollIntoView({block:"nearest"});previous.focus({preventScroll:true});}
+    };
+    const find=direction=>{const needle=search.value.toLocaleLowerCase();if(!needle)return;
+      for(let offset=1;offset<=lines.length;offset++){const line=(Math.max(selected,0)+direction*offset+lines.length)%lines.length;if(lines[line].toLocaleLowerCase().includes(needle)){jump(line);return;}}
+      position.textContent=t("没有匹配结果");
+    };
+    search.addEventListener("keydown",event=>{if(event.key==="Enter"){event.preventDefault();find(event.shiftKey?-1:1);}});
+    const nextHunk=()=>{for(let offset=1;offset<=lines.length;offset++){const line=(Math.max(selected,0)+offset)%lines.length;if(lines[line].startsWith("@@")){jump(line);return;}}};
+    const wrap=el("label"),checkbox=el("input");checkbox.type="checkbox";
+    checkbox.onchange=()=>pre.classList.toggle("diff-wrap",checkbox.checked);wrap.append(checkbox,document.createTextNode(t("自动换行")));
+    controls.append(search,action(t("上一个匹配"),()=>find(-1),"text-button"),action(t("下一个匹配"),()=>find(1),"text-button"),action(t("下一个变更块"),nextHunk,"text-button"),wrap,position);
+    if(files.length){const label=el("label"),select=el("select");label.append(document.createTextNode(t("跳转到文件")),select);
+      const first=el("option",t("选择文件"));first.value="";select.append(first);
+      for(const file of files){const option=el("option",file.path);option.value=file.path;select.append(option);}
+      select.onchange=()=>{const file=files.find(file=>file.path===select.value);const line=Number.isInteger(file?.line)?file.line-1:lines.findIndex(value=>value.startsWith("diff --git ")&&value.includes(select.value));jump(line);};controls.prepend(label);
     }
-    box.append(pre);
+    if(large)box.append(el("p",t("差异超过 2000 行，已折叠为纯文本。"),"muted"));
+    box.append(controls,pre);
   }
+
   async function mobile() {
     const data = await api("mobile"),
       box = dialog("手机安装");

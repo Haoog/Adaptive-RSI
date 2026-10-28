@@ -1,5 +1,7 @@
 """Bounded, inspectable background operations with durable terminal receipts."""
 import concurrent.futures
+import json
+import logging
 import threading
 import time
 
@@ -18,7 +20,37 @@ class Operations:
 
     def recover(self):
         # Called only after the runtime owns the state directory lock.
+        for path in (self.store.root / "operation-receipts").glob("*.json"):
+            try:
+                if path.is_symlink() or path.stat().st_size > 4 * 1024 * 1024:
+                    continue
+                receipt = json.loads(path.read_text())
+                self._save_terminal(path.stem, receipt["state"], receipt["result"], receipt["ended"])
+            except (OSError, ValueError, KeyError, TypeError):
+                logging.getLogger(__name__).warning("Invalid operation receipt: %s", path.name)
         self.store.execute("UPDATE operations SET state='interrupted',ended=? WHERE ended IS NULL", (time.time(),))
+
+    def _save_terminal(self, operation, state, result, ended=None):
+        from .store import encode
+        from .updates import atomic_json
+        ended = time.time() if ended is None else ended
+        folder = self.store.root / "operation-receipts"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        path = folder / (operation + ".json")
+        atomic_json(path, {"state": state, "result": result, "ended": ended})
+        try:
+            self.store.execute("UPDATE operations SET state=?,result=?,ended=? WHERE id=? AND ended IS NULL",
+                               (state, encode(result), ended, operation))
+        except Exception as error:
+            logging.getLogger(__name__).error("Operation receipt awaits database recovery: %s (%s)", operation, type(error).__name__)
+        else:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _observe(future):
+        error = future.exception()
+        if error is not None:
+            logging.getLogger(__name__).error("Background worker failed outside its result handler (%s)", type(error).__name__)
 
     def busy(self):
         with self.lock:
@@ -39,7 +71,7 @@ class Operations:
                                (operation, kind, "queued", time.time()))
             self.active[operation] = stop
             try:
-                self.pool.submit(self._run, operation, kind, parameters, stop)
+                self.pool.submit(self._run, operation, kind, parameters, stop).add_done_callback(self._observe)
             except BaseException:
                 self.active.pop(operation)
                 self.store.execute("UPDATE operations SET state='interrupted',ended=? WHERE id=?", (time.time(), operation))
@@ -76,15 +108,13 @@ class Operations:
                 result = verify_backup(self.store.root / "backups" / (identifier + ".sqlite3"))
             else:
                 result = {"id": self.runtime.import_project(parameters["url"], parameters.get("directory"))}
-            self.store.execute("UPDATE operations SET state='completed',result=?,ended=? WHERE id=?",
-                               (encode(result), time.time(), operation))
+            self._save_terminal(operation, "completed", result)
         except Exception as error:
             from .process import Cancelled
             from .server_validation import SAFE_ERROR_CODES
             code = getattr(error, "code", "operation_failed")
-            self.store.execute("UPDATE operations SET state=?,result=?,ended=? WHERE id=?",
-                ("cancelled" if isinstance(error, Cancelled) else "failed",
-                 encode({"error_code": code if isinstance(code, str) and code in SAFE_ERROR_CODES else "operation_failed"}), time.time(), operation))
+            self._save_terminal(operation, "cancelled" if isinstance(error, Cancelled) else "failed",
+                {"error_code": code if isinstance(code, str) and code in SAFE_ERROR_CODES else "operation_failed"})
         finally:
             with self.lock:
                 self.active.pop(operation, None)

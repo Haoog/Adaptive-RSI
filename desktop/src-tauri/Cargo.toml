@@ -20,7 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 tauri-plugin-updater = "2"
 fs2 = "0.4"
 tempfile = "3"
-tokio = { version = "1", features = ["time", "macros", "rt"] }
+tokio = { version = "1", features = ["time", "macros", "rt", "sync"] }
 minisign-verify = "0.3"
 base64 = "0.22"
 

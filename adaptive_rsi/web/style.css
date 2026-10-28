@@ -846,3 +846,5 @@ input:disabled,select:disabled {
  footer{color:#7d8c7c}
  #toast{box-shadow:0 5px 30px #00000066}
 }
+
+.readable-diff.diff-wrap{white-space:pre-wrap!important;overflow-wrap:anywhere}.diff-selected{outline:2px solid currentColor;outline-offset:-2px}.task-actions label:has(input[type=checkbox]){display:inline-flex;align-items:center;gap:6px}.task-actions input[type=checkbox]{width:auto}

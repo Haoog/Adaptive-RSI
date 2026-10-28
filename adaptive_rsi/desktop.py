@@ -57,7 +57,7 @@ def run(root):
             except (OSError, ValueError):
                 pass
         return
-    runtime = Runtime(Store(root))
+    runtime = Runtime.open(root)
     runtime.updates.desktop_managed = True
     server = None
     try:

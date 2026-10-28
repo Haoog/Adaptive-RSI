@@ -457,6 +457,17 @@ async function checkQueueEditor(page, evidence) {
       .getByRole("button", { name: "阅读代码差异", exact: true })
       .click();
     await page.locator(".readable-diff .diff-add").first().waitFor();
+    const diffDialog=page.locator('.experience-dialog');
+    await diffDialog.getByRole('searchbox',{name:'在差异中搜索',exact:true}).fill('return');
+    await diffDialog.getByRole('button',{name:'下一个匹配',exact:true}).click();
+    assert.ok(await diffDialog.locator('.diff-selected').count());
+    await diffDialog.getByRole('button',{name:'下一个变更块',exact:true}).click();
+    assert.match(await diffDialog.locator('.diff-selected').innerText(),/^@@/);
+    await diffDialog.getByLabel('自动换行',{exact:true}).check();
+    assert.equal(await diffDialog.locator('.readable-diff').evaluate(node=>node.classList.contains('diff-wrap')),true);
+    const jump=diffDialog.getByLabel('跳转到文件',{exact:true});
+    if(await jump.count()){await jump.selectOption({index:1});assert.match(await diffDialog.locator('.diff-selected').innerText(),/^diff --git /);}
+
     await page
       .locator(".experience-dialog")
       .getByRole("button", { name: "关闭", exact: true })

@@ -5,6 +5,14 @@ from pathlib import Path
 from .process import ProcessError, checked, scrub_tree
 
 
+def diff_path(value):
+    """Decode Git's C-quoted UTF-8 path without interpreting it as shell input."""
+    if value.startswith('"') and value.endswith('"'):
+        import codecs
+        value = codecs.escape_decode(value[1:-1].encode("utf-8"))[0].decode("utf-8", errors="replace")
+    return value[2:] if value.startswith(("a/", "b/")) else value
+
+
 def git(root, *args, timeout=60):
     environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                    "GIT_TERMINAL_PROMPT": "0"}

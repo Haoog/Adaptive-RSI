@@ -7,6 +7,8 @@ import sqlite3
 import stat
 import tempfile
 import time
+import copy
+import shutil
 from contextlib import closing
 from pathlib import Path
 
@@ -67,9 +69,14 @@ def _archive(store, max_mb):
         source.unlink(missing_ok=True)
 
 
-def backup(store, cancel=None, progress=None):
+def backup(store, cancel=None, progress=None, timeout=300, reserve_bytes=16 * 1024 * 1024):
     folder = store.root / "backups"
     folder.mkdir(mode=0o700, exist_ok=True)
+    if not 1 <= timeout <= 3600 or reserve_bytes < 0:
+        raise ValueError("Invalid backup resource budget")
+    deadline = time.monotonic() + timeout
+    if shutil.disk_usage(folder).free < store.path.stat().st_size + reserve_bytes:
+        raise ValueError("Insufficient disk space for a consistent backup")
     path = folder / (uid() + ".sqlite3")
     fd, name = tempfile.mkstemp(prefix=".backup-", suffix=".tmp", dir=folder)
     staging = Path(name)
@@ -80,16 +87,18 @@ def backup(store, cancel=None, progress=None):
                 if cancel and cancel():
                     from .process import Cancelled
                     raise Cancelled("Backup cancelled")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Backup exceeded its total deadline")
+                if shutil.disk_usage(folder).free < reserve_bytes:
+                    raise ValueError("Backup stopped to preserve disk reserve")
                 if progress:
                     progress(total - remaining, total)
-            if cancel or progress:
-                source.backup(target, pages=128, progress=advance)
-            else:
-                source.backup(target)
+            source.backup(target, pages=128, progress=advance)
             # A portable snapshot must not require adjacent WAL/SHM files on restore.
             target.execute("PRAGMA journal_mode=DELETE")
         # Publish only the closed snapshot; a name collision must preserve the old backup.
         os.link(staging, path)
+        store._storage_snapshot = None
         return {"id": path.stem, "bytes": path.stat().st_size, "created": time.time()}
     finally:
         for suffix in ("", "-wal", "-shm", "-journal"):
@@ -98,10 +107,10 @@ def backup(store, cancel=None, progress=None):
 
 def verify_backup(path):
     """Open a backup in read-only mode and prove it is a usable state snapshot."""
-    path = Path(path).expanduser().resolve()
+    path = Path(path).expanduser().absolute()
     if not path.is_file() or path.is_symlink():
         raise ValueError("Backup must be a regular file")
-    with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -126,12 +135,28 @@ def retain_backups(store, max_count=20, max_age_days=90, now=None):
                     if path.is_file() and not path.is_symlink()),
                    key=lambda path: path.stat().st_mtime, reverse=True)
     removed = []
+    protected = None
+    invalid = []
+    for path in paths:
+        try:
+            verify_backup(path)
+        except (ValueError, OSError, sqlite3.Error):
+            invalid.append(path.name)
+        else:
+            protected = path
+            break
+    if paths and protected is None:
+        return {"kept": len(paths), "removed": [], "invalid": invalid,
+                "reason": "no_verified_recovery_point"}
     for index, path in enumerate(paths):
+        if path == protected or path.name in invalid:
+            continue
         if index < max_count and now - path.stat().st_mtime <= max_age_days * 86400:
             continue
         path.unlink()
         removed.append(path.name)
-    return {"kept": len(paths) - len(removed), "removed": removed}
+    return {"kept": len(paths) - len(removed), "removed": removed, "invalid": invalid,
+            "protected": protected.name if protected else None}
 
 
 def _create_directories(destination):
@@ -192,7 +217,7 @@ def restore(source, destination):
         raise ValueError("Restore requires a new state directory; existing state is never overwritten")
     # Normalize existing ancestors only; the final component must be claimed without following links.
     destination = destination.parent.resolve() / destination.name
-    with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
         if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise ValueError("Backup integrity check failed")
         version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -214,7 +239,7 @@ def restore(source, destination):
             raise ValueError("Restore requires a new state directory; existing state is never overwritten")
         try:
             target = destination / "state.sqlite3"
-            with sqlite3.connect(str(target)) as out:
+            with closing(sqlite3.connect(str(target))) as out:
                 db.backup(out)
             target.chmod(0o600)
         except BaseException:
@@ -241,6 +266,15 @@ def restore(source, destination):
                                (json.dumps(result), row["id"]))
                 # Only the database was copied. Never retain access to the source state's files.
                 db.execute("UPDATE runs SET path=NULL")
+                for case in db.execute("SELECT id,spec FROM cases").fetchall():
+                    try:
+                        spec = json.loads(case["spec"])
+                        spec.update(repository=str(destination / "suites" / case["id"] / "repository"),
+                                    overlay=None, available=False,
+                                    restore_invalidation="case_files_not_in_database_backup")
+                        db.execute("UPDATE cases SET spec=? WHERE id=?", (json.dumps(spec), case["id"]))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
                 for row in db.execute("SELECT id,result FROM runs WHERE state IN ('pr_open','merged')").fetchall():
                     result = json.loads(row["result"])
                     result["feedback"] = unavailable_feedback(result.get("feedback", {}))
@@ -344,7 +378,23 @@ def _approval_candidates(store):
     return pending, delivering, delivered
 
 
-def overview(store):
+def file_digest(path):
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("Manifest source must be a regular file")
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def overview(store, refresh=False):
+    cached = getattr(store, "_storage_snapshot", None)
+    if not refresh and cached and time.monotonic() - cached["clock"] < 10:
+        result = copy.deepcopy(cached["data"])
+        result["expiring"], result["delivering"], result["delivered"] = _approval_candidates(store)
+        return result
     categories = {}
     for label, directory in [("runs", store.root / "runs"), ("backups", store.root / "backups"),
                              ("suites", store.root / "suites"), ("archives", store.root / "archives"),
@@ -354,15 +404,18 @@ def overview(store):
             paths = (p for p in paths if not p.name.startswith(".backup-"))
         categories[label] = sum(info.st_size for _, info in _file_info(paths))
     categories["database"] = sum(info.st_size for _, info in _file_info(store.root.glob("state.sqlite3*"), True))
-    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3"), True),
+    backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3")),
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
     manifest = [{"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
-                 "modified": info.st_mtime, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                 "modified": info.st_mtime, "sha256": file_digest(p)}
                 for p, info in backups[:20]]
-    return {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
+    result = {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
             for p, info in backups[:20]], "backup_manifest": manifest,
-            "expiring": expiring, "delivering": delivering, "delivered": delivered}
+            "expiring": expiring, "delivering": delivering, "delivered": delivered,
+            "scanned_at": time.time(), "cache_seconds": 10}
+    store._storage_snapshot = {"clock": time.monotonic(), "data": copy.deepcopy(result)}
+    return result
 
 
 def diagnostics(store):
@@ -373,7 +426,7 @@ def diagnostics(store):
             "runs": store.query("SELECT state,count(*) AS count FROM runs GROUP BY state"),
             "failures": store.query("SELECT json_extract(result,'$.failure.code') AS code,count(*) AS count FROM runs WHERE json_valid(result) AND json_extract(result,'$.failure.code') IS NOT NULL GROUP BY code"),
             "invalid_evidence": store.one("SELECT count(*) AS count FROM runs WHERE NOT json_valid(result)")["count"],
-            "database": store.metrics(),
+            "database": store.metrics(integrity=True),
             "schema_migrations": store.schema_migrations(),
             "relationship_audit": store.relationship_audit(),
             "quarantined_orphans": store.one("SELECT count(*) AS count FROM relationship_quarantine")

@@ -530,6 +530,16 @@ async function main() {
       server.once('exit', code => {clearTimeout(timeout); reject(Error('Console exited: ' + code));});
     });
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
+    const group=process.env.RSI_BROWSER_HARDENING_GROUP;
+    if(group){
+      const steps={core:[()=>checkReadiness(browser,url,false,errors),()=>checkReadiness(browser,url,true,errors),()=>checkReadinessInstallAction(browser,url,errors),()=>checkRunProgress(browser,url,errors),()=>checkModelForms(browser,url,errors)],
+       providers:[()=>checkProviderSaveRace(browser,url,errors),()=>checkProviderSaveRace(browser,url,errors,true)],
+       routes:[()=>checkRouteSaveRace(browser,url,errors)],updates:[()=>checkUpdatePending(browser,url,errors),()=>checkUpdateRateLimit(browser,url,errors)],
+       settings:[()=>checkPendingSettingsDraft(browser,url,errors)],recovery:[()=>checkDraftRecovery(browser,url,errors),()=>checkInvalidConfigRepair(browser,url,errors)]};
+      assert.ok(steps[group],'Unknown hardening test group');
+      for(const [index,step] of steps[group].entries()){const began=Date.now();await step();console.log('Hardening '+group+' step '+(index+1)+': '+((Date.now()-began)/1000)+'s');}
+      assert.deepEqual(errors,[]);return;
+    }
     if(process.env.RSI_BROWSER_SETTINGS_ONLY){await checkPendingSettingsDraft(browser,url,errors);assert.deepEqual(errors,[]);return;}
     if(process.env.RSI_BROWSER_OBSOLETE_ONLY){await checkObsoleteActions(browser,url,errors);return;}
     if(process.env.RSI_BROWSER_PROVIDERS_ONLY){await checkProviderSaveRace(browser,url,errors);await checkProviderSaveRace(browser,url,errors,true);assert.deepEqual(errors,[]);console.log('Provider creation acknowledgement checks passed.');return;}

@@ -118,6 +118,9 @@ def main(argv=None):
     if arguments == ["internal-native-transport"]:
         from .native_transport import main as transport_main
         return transport_main()
+    if arguments[:1] == ["internal-health-check"]:
+        from .health_transport import main as health_main
+        return health_main(arguments[1:])
     parser = argparse.ArgumentParser(prog="adaptive-rsi", description="Adaptive RSI local autonomous improvement runtime")
     parser.add_argument("--state-dir", type=Path, default=default_state())
     parser.add_argument("--version", action="version", version=__version__)
@@ -199,15 +202,14 @@ def main(argv=None):
             supervise_restart(root)
             return
         if args.command == "serve":
-            store = Store(root)
-            runtime = Runtime(store)
-            session = None
-            if args.restart_session:
-                session = json.loads((root / "restart-session.json").read_text())
-                (root / "restart-session.json").unlink()
-                runtime.updates.restore_startup()
-            runtime.start()
+            runtime = Runtime.open(root)
             try:
+                session = None
+                if args.restart_session:
+                    session = json.loads((root / "restart-session.json").read_text())
+                    (root / "restart-session.json").unlink()
+                    runtime.updates.restore_startup()
+                runtime.start()
                 server = Server(runtime, args.port, session=session, public_url=args.public_url)
                 session = {"origin": server.origin, "local_origin": server.local_origin, "public_url": server.origin if server.origin != server.local_origin else None, "cookie": server.cookie, "token": server.token, "csrf": server.csrf, "url": server.url, "pid": os.getpid()}
                 from .updates import atomic_json

@@ -1,6 +1,8 @@
 """按项目和连接版本记录供应商故障，避免反复请求故障服务。"""
 import json
+import threading
 import time
+import uuid
 
 from .config import fingerprint
 
@@ -114,9 +116,15 @@ def cli_failure(backend, result):
     return None
 
 
-def connection_key(config, provider_id, project, model=None):
+def connection_key(config, provider_id, project, model=None, root=None):
     provider = next((p for p in config["providers"] if p["id"] == provider_id), {"id": provider_id})
-    signature = fingerprint({k: v for k, v in provider.items() if k != "name"})
+    fields = {k: v for k, v in provider.items() if k != "name"}
+    if root is not None:
+        from .credentials import Credentials
+        generation = Credentials(root).epoch(provider)
+        if generation:
+            fields["credential_generation"] = generation
+    signature = fingerprint(fields)
     key = "provider-health:" + str(project or "global") + ":" + provider_id + ":" + signature
     return key + ":" + fingerprint({"model": model}) if model else key
 
@@ -129,10 +137,29 @@ class ProviderPaused(RuntimeError):
 class ProviderHealth:
     def __init__(self, store):
         self.store = store
+        self._attempts = threading.local()
+
+    def key(self, config, provider, project, model=None):
+        return connection_key(config, provider, project, model, self.store.root)
+
+    def account_key(self, config, provider):
+        return "provider-account-health:" + self.key(config, provider, "shared").split(":", 2)[-1]
 
     def status(self, config, provider, project, model=None):
-        key = connection_key(config, provider, project)
-        return self.store.setting(key, {"failures": 0, "paused": False})
+        key = self.key(config, provider, project)
+        value = self.store.setting(key, {"failures": 0, "paused": False})
+        shared = self.store.setting(self.account_key(config, provider), {})
+        if shared.get("retry_at", 0) > value.get("retry_at", 0):
+            value = {**value, "retry_at": shared["retry_at"], "cooldown_scope": "account"}
+        return value
+
+    def diagnostics(self, config, provider, project, model=None):
+        state = self.status(config, provider, project, model)
+        now = time.time()
+        return {**{key: value for key, value in state.items() if key != "half_open_owner"},
+                "admission": self.admission(config, provider, project, model),
+                "cooldown_seconds": max(0, state.get("retry_at", 0) - now),
+                "recovery_in_flight": state.get("half_open_until", 0) > now}
 
     @staticmethod
     def _half_open_ready(config, state, now):
@@ -151,42 +178,58 @@ class ProviderHealth:
         now = time.time()
         state = self.status(config, provider, project, model)
         half_open = self._half_open_ready(config, state, now)
-        return {"ready": not state.get("paused") or half_open, "half_open": half_open}
+        return {"ready": (not state.get("paused") or half_open) and state.get("retry_at", 0) <= now,
+                "half_open": half_open}
 
     def require(self, config, provider, project, model=None):
-        key = connection_key(config, provider, project)
+        key = self.key(config, provider, project)
         now = time.time()
+        attempt = {"id": uuid.uuid4().hex, "started": now}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             state = json.loads(row[0]) if row else {"paused": False}
+            shared = db.execute("SELECT value FROM settings WHERE key=?", (self.account_key(config, provider),)).fetchone()
+            if shared:
+                retry_at = json.loads(shared[0]).get("retry_at", 0)
+                if retry_at > state.get("retry_at", 0):
+                    state["retry_at"] = retry_at
             if state.get("retry_at", 0) > now:
                 error = ModelFailure("Provider Retry-After cooldown is pending", "rate_limit")
                 error.retry_after = state["retry_at"] - now
                 error.provider_id = provider
                 error.model = model
+                error.local_admission = True
                 raise error
+            attempt["generation"] = state.get("generation", 0)
             if self._half_open_ready(config, state, now):
                 # Lease the recovered connection for the current bounded role, not
                 # the entire command budget, so later stages can continue.
-                state["half_open_until"] = now + min(config["limits"]["command_seconds"], 30)
+                state["half_open_until"] = now + config["limits"]["command_seconds"] + 30
+                state["half_open_owner"] = attempt["id"]
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(state), key))
-                return
-            if (state.get("paused") and state.get("half_open_until", 0) > now and
-                    state["half_open_until"] - now <= min(config["limits"]["command_seconds"], 30)):
-                # The role that acquired the lease can perform its one recovery call.
-                return
-        if state.get("paused"):
+            elif state.get("paused"):
+                attempt = None
+        if attempt is None:
             error = ProviderPaused("Provider paused after repeated connection failures; resume in Model Center")
             error.provider_id = provider
             error.model = model
+            error.local_admission = True
             raise error
+        values = getattr(self._attempts, "values", {})
+        values[key] = attempt
+        self._attempts.values = values
+        return attempt
 
-    def record(self, config, provider, project, error=None, model=None):
+    def record(self, config, provider, project, error=None, model=None, attempt=None):
         code = error_code(error) if error else None
+        if getattr(error, "local_admission", False):
+            return
         if error and code not in ["auth", "rate_limit", "timeout", "connection"]:
             return
-        key = connection_key(config, provider, project)
+        key = self.key(config, provider, project)
+        if attempt is None:
+            attempt = getattr(self._attempts, "values", {}).pop(key, None)
         # 多项目执行线程的计数更新必须在同一事务内完成。
         import json
         with self.store.connect() as db:
@@ -195,21 +238,30 @@ class ProviderHealth:
             old = json.loads(row[0]) if row else {}
             if not error:
                 # A late success from an older attempt cannot clear a newer failure.
-                if old.get("paused") and not old.get("half_open_until"):
+                if (attempt is not None and (attempt.get("generation") != old.get("generation", 0) or
+                        old.get("half_open_owner") not in (None, attempt["id"]))) or (
+                        attempt is None and (old.get("paused") or old.get("retry_at", 0) > time.time())):
                     value = None
                 else:
-                    value = {"failures": 0, "paused": False, "code": None, "at": time.time()}
+                    value = {"failures": 0, "paused": False, "code": None, "at": time.time(),
+                             "generation": old.get("generation", 0)}
             else:
                 failures = old.get("failures", 0) + 1
                 value = {"failures": failures,
                          "paused": old.get("paused", False) or failures >= 3,
-                         "code": code, "at": time.time()}
+                         "code": code, "at": time.time(), "generation": old.get("generation", 0) + 1}
             if value is not None and error and getattr(error, "retry_after", 0):
                 value["retry_at"] = time.time() + error.retry_after
             if value is not None:
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, json.dumps(value)))
+                if code == "rate_limit" and value.get("retry_at"):
+                    shared_key = self.account_key(config, provider)
+                    prior = db.execute("SELECT value FROM settings WHERE key=?", (shared_key,)).fetchone()
+                    retry_at = max(value["retry_at"], json.loads(prior[0]).get("retry_at", 0) if prior else 0)
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                               (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
         if model and value is not None:
-            detail_key = connection_key(config, provider, project, model)
+            detail_key = self.key(config, provider, project, model)
             detail = self.store.setting(detail_key, {})
             detail.update(value)
             detail["model"] = model
@@ -218,4 +270,5 @@ class ProviderHealth:
             self.store.put_setting(detail_key, detail)
 
     def reset(self, config, provider, project, model=None):
-        self.store.put_setting(connection_key(config, provider, project), {"failures": 0, "paused": False})
+        self.store.put_setting(self.key(config, provider, project), {"failures": 0, "paused": False})
+        self.store.execute("DELETE FROM settings WHERE key=?", (self.account_key(config, provider),))

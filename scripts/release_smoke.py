@@ -122,6 +122,29 @@ def main():
         if previous:
             code += "; from adaptive_rsi.store import Store; assert Store('wheel-state').setting('smoke-sentinel') == {'preserved': True}"
         command(python, "-I", "-c", code, cwd=temp)
+        command(python, "-I", "-c", '''
+import json, tempfile, threading, urllib.request
+from pathlib import Path
+from adaptive_rsi.store import Store
+from adaptive_rsi.runtime import Runtime
+from adaptive_rsi.server import Server
+with tempfile.TemporaryDirectory() as folder:
+    runtime = Runtime(Store(Path(folder) / "state"), agent=object())
+    server = Server(runtime)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        request = urllib.request.Request(server.local_origin + "/api/contract",
+            headers={"Cookie": server.cookie + "=" + server.token})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            assert response.status == 200
+            assert json.load(response)["state_schema"]["type"] == "object"
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(5)
+        runtime.close()
+''', cwd=temp)
         command(python, "-m", "adaptive_rsi", "--help", cwd=temp)
         state = temp / "service-state"
         store = Store(state)

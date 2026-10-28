@@ -1,5 +1,6 @@
 use super::*;
 use fs2::available_space;
+use std::{fs::File, path::{Path, PathBuf}};
 use tauri_plugin_updater::UpdaterExt;
 
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
@@ -9,7 +10,7 @@ pub struct NativeUpdater {
     pub state: Mutex<Value>,
     busy: AtomicBool,
     cancel: AtomicBool,
-    staged: Mutex<Option<(tauri_plugin_updater::Update, Vec<u8>)>>,
+    staged: Mutex<Option<(tauri_plugin_updater::Update, PathBuf)>>,
 }
 
 impl Default for NativeUpdater {
@@ -22,6 +23,44 @@ impl Default for NativeUpdater {
 impl NativeUpdater {
     fn set(&self, value: Value) {
         *self.state.lock().unwrap() = value;
+    }
+}
+
+fn read_package(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "update_cache_unavailable")?;
+    if !metadata.is_file() || metadata.len() > MAX_PACKAGE as u64 {
+        return Err("update_size_limit".into());
+    }
+    let mut file = File::open(path).map_err(|_| "update_cache_unavailable")?;
+    if file.metadata().map_err(|_| "update_cache_unavailable")?.len() != metadata.len() {
+        return Err("update_cache_unavailable".into());
+    }
+    let mut bytes = vec![0; metadata.len() as usize];
+    file.read_exact(&mut bytes).map_err(|_| "update_cache_unavailable")?;
+    if file.read(&mut [0u8; 1]).map_err(|_| "update_cache_unavailable")? != 0 {
+        return Err("update_cache_unavailable".into());
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    #[test]
+    fn package_cache_is_bounded_and_rejects_links() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("package");
+        std::fs::write(&path, b"signed fixture").unwrap();
+        assert_eq!(read_package(&path).unwrap(), b"signed fixture");
+        File::options().write(true).open(&path).unwrap().set_len(MAX_PACKAGE as u64 + 1).unwrap();
+        assert_eq!(read_package(&path).unwrap_err(), "update_size_limit");
+        #[cfg(unix)] {
+            let link = folder.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(read_package(&link).is_err());
+        }
     }
 }
 
@@ -40,7 +79,9 @@ fn configured(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, S
 }
 
 pub fn snapshot(app: &tauri::AppHandle) -> Value {
-    app.state::<NativeUpdater>().state.lock().unwrap().clone()
+    let mut state = app.state::<NativeUpdater>().state.lock().unwrap().clone();
+    state["current_version"] = json!(app.package_info().version.to_string());
+    state
 }
 
 pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, String> {
@@ -50,12 +91,10 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
     }
     updater.cancel.store(false, Ordering::SeqCst);
     let outcome = async {
-        if updater.staged.lock().unwrap().is_some() {
-            return Ok(snapshot(&app));
-        }
         updater.set(json!({"state":"checking"}));
         let update = configured(&app)?.check().await.map_err(|_| "update_check_failed")?;
         let Some(update) = update else {
+            *updater.staged.lock().unwrap() = None;
             updater.set(json!({"state":"latest"}));
             return Ok(snapshot(&app));
         };
@@ -65,41 +104,65 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
         let version = update.version.clone();
         let notes = update.body.clone().unwrap_or_default();
         updater.set(json!({"state":"available","version":version,"notes":notes}));
-        if !download {
-            return Ok(snapshot(&app));
-        }
         let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
         std::fs::create_dir_all(&cache).map_err(|_| "update_cache_unavailable")?;
-        if available_space(&cache).map_err(|_| "update_disk_unavailable")? < (MAX_PACKAGE as u64) * 3 {
-            return Err("update_disk_space".into());
+        let cached = cache.join("staged-update.bin");
+        // A fresh feed and signature check are required even when using a persisted package.
+        if let Ok(bytes) = read_package(&cached) {
+            if update.verify(&bytes).is_ok() {
+                *updater.staged.lock().unwrap() = Some((update.clone(), cached));
+                updater.set(json!({"state":"ready","version":version,"notes":notes}));
+                return Ok(snapshot(&app));
+            }
         }
-        let bytes = AtomicU64::new(0);
-        let future = update.download(|chunk, total| {
-            let count = bytes.fetch_add(chunk as u64, Ordering::SeqCst) + chunk as u64;
-            if count > MAX_PACKAGE as u64 || total.is_some_and(|size| size > MAX_PACKAGE as u64) {
-                updater.cancel.store(true, Ordering::SeqCst);
+        *updater.staged.lock().unwrap() = None;
+        if !download { return Ok(snapshot(&app)); }
+        let executable = std::env::current_exe().map_err(|_| "update_disk_unavailable")?;
+        for volume in [cache.as_path(), executable.parent().ok_or("update_disk_unavailable")?] {
+            if available_space(volume).map_err(|_| "update_disk_unavailable")? < (MAX_PACKAGE as u64) * 3 {
+                return Err("update_disk_space".into());
             }
-            updater.set(json!({"state":"downloading","version":version,"notes":notes,
-                               "bytes":count,"total":total}));
-        }, || {});
-        let mut future = std::pin::pin!(future);
-        let downloaded = loop {
-            if updater.cancel.load(Ordering::SeqCst) {
-                return Err(if bytes.load(Ordering::SeqCst) > MAX_PACKAGE as u64 { "update_size_limit" } else { "update_cancelled" }.into());
-            }
-            match tokio::select! {
-                    value = &mut future => Some(value),
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => None,
-                } {
-                Some(value) => break value.map_err(|_| "update_download_or_signature_failed")?,
-                None => continue,
+        }
+        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(600)).build().map_err(|_| "update_check_failed")?;
+        if update.download_url.scheme() != "https" { return Err("invalid_update_feed".into()); }
+        let send = client.get(update.download_url.clone()).headers(update.headers.clone()).send();
+        tokio::pin!(send);
+        let mut response = loop {
+            if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+            tokio::select! {
+                value = &mut send => break value.map_err(|_| "update_connection_failed")?,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         };
-        if downloaded.len() > MAX_PACKAGE {
-            return Err("update_size_limit".into());
+        if !response.status().is_success() { return Err("update_download_or_signature_failed".into()); }
+        let total = response.content_length();
+        if total.is_some_and(|size| size > MAX_PACKAGE as u64) { return Err("update_size_limit".into()); }
+        let mut output = tempfile::NamedTempFile::new_in(&cache).map_err(|_| "update_cache_unavailable")?;
+        let mut count = 0u64;
+        loop {
+            let receive = tokio::time::timeout(Duration::from_secs(30), response.chunk());
+            tokio::pin!(receive);
+            let chunk = loop {
+                if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+                tokio::select! {
+                    value = &mut receive => break value.map_err(|_| "update_transfer_stalled")?
+                        .map_err(|_| "update_download_or_signature_failed")?,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            };
+            let Some(chunk) = chunk else { break; };
+            count += chunk.len() as u64;
+            if count > MAX_PACKAGE as u64 { return Err("update_size_limit".into()); }
+            output.write_all(&chunk).map_err(|_| "update_cache_unavailable")?;
+            updater.set(json!({"state":"downloading","version":version,"notes":notes,"bytes":count,"total":total}));
         }
-        drop(future);
-        *updater.staged.lock().unwrap() = Some((update.clone(), downloaded));
+        output.as_file().sync_all().map_err(|_| "update_cache_unavailable")?;
+        let bytes = read_package(output.path())?;
+        update.verify(&bytes).map_err(|_| "update_download_or_signature_failed")?;
+        drop(bytes);
+        output.persist(&cached).map_err(|_| "update_cache_unavailable")?;
+        *updater.staged.lock().unwrap() = Some((update.clone(), cached));
         updater.set(json!({"state":"ready","version":version,"notes":notes}));
         Ok(snapshot(&app))
     }.await;
@@ -140,7 +203,7 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
                     return Err("update_wait_cancelled".into());
                 }
                 std::thread::sleep(Duration::from_secs(1));
-                let reply = call(connection, "desktop-update", Some(json!({"action":"status"})))?;
+                let reply = call(connection, "desktop-update", Some(json!({"action":"prepare","version":version,"lease":lease})))?;
                 if reply.status != 200 { return Err("update_drain_failed".into()); }
                 ready = serde_json::from_str(&reply.body).map_err(|_| "update_drain_failed")?;
                 if ready["barrier"]["lease"] != lease { return Err("update_lease_expired".into()); }
@@ -160,7 +223,9 @@ pub fn install(app: tauri::AppHandle) -> Result<(), String> {
             }
         }
         let staged = updater.staged.lock().unwrap().take().ok_or("update_not_downloaded")?;
-        if staged.0.install(&staged.1).is_err() {
+        let installation = read_package(&staged.1).and_then(|bytes|
+            staged.0.install(&bytes).map_err(|_| "update_install_failed".to_string()));
+        if installation.is_err() {
             *updater.staged.lock().unwrap() = Some(staged);
             if let Some(connection) = owned {
                 let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));

@@ -460,12 +460,15 @@ function valueReport(value,reason,scope){
  if(value.evidence?.length){const details=el('details'),list=el('ul');details.append(el('summary',t('判断证据')));for(const item of value.evidence)list.append(el('li',item));details.append(list);report.append(details);}}
  if(scope?.length)report.append(el('p',t('计划范围')+' · '+scope.join(', '),'muted'));return report;
 }
+function writeNavigation(name){
+ if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');const target=location.pathname+location.search+'#'+navigation;if(target!==location.pathname+location.search+location.hash)history.pushState(null,'',target);}
+}
 function showView(name){
  if(!state){toast(t('正在连接本地服务，请稍候再提交。'));return;}
  if(!['overview','tasks','evolution','settings','models','usage'].includes(name))return;
  const models=name==='models';name=name==='tasks'?'overview':models?'settings':name;
  navigationSequence++;view=name;if(models)window.RSIModelCenter?.connections();document.querySelectorAll('.view').forEach(node=>node.hidden=node.id!=='view-'+name);
- if(location.hash!==undefined&&location.pathname!==undefined){const navigation=new URLSearchParams(String(location.hash||'').replace(/^#/,''));navigation.set('view',models?'models':name);if(projectId)navigation.set('project',projectId);else navigation.delete('project');history.replaceState(null,'',location.pathname+location.search+'#'+navigation);}
+ writeNavigation(models?'models':name);
  render();if(['overview','evolution'].includes(name))safe(refresh);if(name==='settings')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null,true);window.scrollTo(0,0);
  if(name==='usage')window.RSIUsage?.show();
  if(models)$('view-models').scrollIntoView({block:'start'});
@@ -479,7 +482,7 @@ function showView(name){
 })();
 typeof window.addEventListener==='function'&&window.addEventListener('hashchange',()=>{
  if(!state)return;const route=new URLSearchParams(String(location.hash||'').replace(/^#/,'')),requested=route.get('view'),project=route.get('project');
- if(project&&state.projects.some(item=>item.id===project)&&project!==projectId){projectId=project;localWrite('rsi-project',projectId);}
+ if(project&&state.projects.some(item=>item.id===project)&&project!==projectId){stashSettings();stashGoalDraft();closeTaskDetail();projectId=project;taskOffset=0;settingsBaseline=null;restoreGoalDraft();localWrite('rsi-project',projectId);}
  if(requested&&['overview','tasks','evolution','settings','models','usage'].includes(requested))showView(requested);
 });
 function renderTasks(){
@@ -556,7 +559,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
    for(const finding of review.findings||[]){const card=el('div',undefined,'provider-card');card.append(el('strong',t(reviewNames[finding.severity]||finding.severity)+' · '+finding.title),el('p',finding.path+':'+finding.line),el('p',finding.reason),el('p',t('修改建议')+t('：')+finding.suggestion));report.append(card);}
    section.append(report);
   }
-  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=el('details');detail.append(el('summary',t(evaluationNames[label]||label)+' · '+rows.filter(r=>r.passed).length+'/'+rows.length),el('pre',JSON.stringify(rows,null,2)));report.append(detail);}section.append(report);}
+  if(data.result.evaluation){const report=el('details',undefined,'review-report');report.append(el('summary',t('运行与效果检查')),badge(data.result.evaluation.decision));for(const [label,rows] of Object.entries(data.result.evaluation.checks||{})){if(!Array.isArray(rows))continue;const detail=el('details');detail.append(el('summary',t(evaluationNames[label]||label)+' · '+rows.filter(r=>r.passed).length+'/'+rows.length),el('pre'));detail.addEventListener('toggle',()=>{if(detail.open&&!detail.dataset.loaded){detail.dataset.loaded='true';detail.querySelector('pre').textContent=JSON.stringify(rows,null,2);}});report.append(detail);}section.append(report);}
   if(data.result.delivery_status)section.append(el('p',t('交付状态')+' · '+t(deliveryNames[data.result.delivery_status]||data.result.delivery_status)));
   if(data.result.feedback){section.append(el('h3',t('合并后收益反馈')),badge(data.result.feedback.state),el('p',stamp(data.result.feedback.checked_at)+' · '+data.result.feedback.head));}
   const delivery=el('div',undefined,'task-actions');
@@ -659,20 +662,35 @@ function stashSettings(){
  writePersistentSettingsDraft(settingsContext,persistentSettingsValues(),settingsBaseline,mode);
 }
 function restoreSettingsDraft(){
- const key=settingsKey(),memory=settingsDrafts.get(key),persisted=memory?null:draftStore.get('settings',key),draft=memory||persisted;if(!draft)return;
- const currentMode=settingsModes.get(settingsBaseline),restored=[];let conflicts=0;
+ const key=settingsKey(),memory=settingsDrafts.get(key),persisted=memory?null:draftStore.get('settings',key),draft=memory||persisted;if(!draft){renderSettingsConflicts(key);return;}
+ const currentMode=settingsModes.get(settingsBaseline),restored=[],conflicting=[];let conflicts=0;
  for(const saved of draft.values||[]){const node=saved.id?$(saved.id):$('settings-form').querySelector('[data-path="'+saved.path+'"]');if(!node)continue;
   const oldBase=memory?draft.baselineValues?.[saved.path||saved.id]:saved.baselineValue,currentBase=settingBaselineValue(saved,settingsBaseline,currentMode);
   // A navigation GET can observe this save before its POST acknowledgement.
   // Accept only the submitted baseline for this field; unrelated changes still conflict.
   const pending=memory&&pendingSettingsSaves.get(key);
-  if(!sameValue(oldBase,currentBase)&&!(pending&&sameValue(currentBase,settingBaselineValue(saved,pending.config,pending.mode)))){conflicts++;continue;}
+  if(!sameValue(oldBase,currentBase)&&!(pending&&sameValue(currentBase,settingBaselineValue(saved,pending.config,pending.mode)))){conflicts++;if(persistableDraftEntry(saved))conflicting.push({local:saved,server:currentBase});continue;}
   node.value=saved.value;node.checked=saved.checked;if(saved.unit&&saved.path){const unit=document.querySelector('[data-unit-for="'+saved.path+'"]');if(unit){unit.value=saved.unit;unit.dataset.previous=saved.unit;}}restored.push(saved);
  }
  document.querySelectorAll('[data-unit-for]').forEach(unit=>{unit.dataset.previous=unit.value;const node=document.querySelector('[data-path="'+unit.dataset.unitFor+'"]');node.min=5/Number(unit.value);node.max=525600/Number(unit.value);});
  if(restored.length){const values=settingsValues(),mode=$('schedule-mode').value,baselineValues=Object.fromEntries(values.map(entry=>[entry.path||entry.id,settingBaselineValue(entry,settingsBaseline,mode)]));settingsDrafts.set(key,{baseline:structuredClone(settingsBaseline),baselineValues,mode,values});writePersistentSettingsDraft(key,persistentSettingsValues(),settingsBaseline,mode);}
  else if(persisted)draftStore.remove('settings',key);
+ if(conflicting.length)draftStore.set('settings-conflicts',key,conflicting);
+ renderSettingsConflicts(key);
  if(conflicts)toast(t('服务器设置已变化，冲突字段未从旧草稿恢复。'),true);
+}
+function renderSettingsConflicts(key){
+ $('settings-conflicts')?.remove();
+ const entries=draftStore.get('settings-conflicts',key)||[];
+ if(!Array.isArray(entries)||!entries.length)return;
+ const panel=el('details',undefined,'review-report');panel.id='settings-conflicts';panel.open=true;
+ panel.append(el('summary',t('设置冲突：保留的本地修改')));
+ const resolve=(entry,local)=>{if(settingsKey()!==key)return;
+  {const saved=local?entry.local:acknowledgedSettingsValues([entry.local],settingsBaseline,settingsModes.get(settingsBaseline))[0],node=saved.id?$(saved.id):$('settings-form').querySelector('[data-path="'+saved.path+'"]');if(!node)return;node.value=saved.value;node.checked=saved.checked;if(saved.unit&&saved.path){const unit=document.querySelector('[data-unit-for="'+saved.path+'"]');if(unit){unit.value=saved.unit;unit.dataset.previous=saved.unit;}}stashSettings();}
+  const remaining=entries.filter(item=>item!==entry);if(remaining.length)draftStore.set('settings-conflicts',key,remaining);else draftStore.remove('settings-conflicts',key);renderSettingsConflicts(key);
+ };
+ for(const entry of entries){const row=el('div',undefined,'provider-card');row.append(el('strong',entry.local.path||entry.local.id),el('p',t('服务端值')+t('：')+JSON.stringify(settingBaselineValue(entry.local,settingsBaseline,settingsModes.get(settingsBaseline)))),el('pre',JSON.stringify(entry.local,null,2)),action(t('使用本地修改'),()=>resolve(entry,true),'text-button'),action(t('采用服务端值'),()=>resolve(entry,false),'text-button'));panel.append(row);}
+ $('settings-form').prepend(panel);
 }
 function durationUnit(node){return node.dataset.duration?Number(document.querySelector('[data-unit-for="'+node.dataset.duration+'"]').value):1;}
 function fieldValue(node){
@@ -803,7 +821,7 @@ $('attention-open').addEventListener('click',()=>{$('show-system-tasks').checked
 document.querySelectorAll('[data-unit-for]').forEach(unit=>unit.addEventListener('change',()=>{const node=document.querySelector('[data-path="'+unit.dataset.unitFor+'"]');const previous=Number(unit.dataset.previous||durationUnit(node));node.value=Number(node.value)*previous/Number(unit.value);unit.dataset.previous=unit.value;node.min=5/Number(unit.value);node.max=525600/Number(unit.value);}));
 $('delivery-choice').addEventListener('change',()=>{if($('delivery-choice').value==='custom')return;document.querySelector('[data-path="delivery.mode"]').value=$('delivery-choice').value==='local'?'local':'pr';document.querySelector('[data-path="delivery.auto_merge"]').checked=$('delivery-choice').value==='auto';syncDelivery();});
 $('goal-text').addEventListener('input',()=>{goalDraftRevisions.set(projectId,(goalDraftRevisions.get(projectId)||0)+1);stashGoalDraft();});
-$('project-select').addEventListener('change',()=>{stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;render();safe(refresh);});
+$('project-select').addEventListener('change',()=>{stashSettings();stashGoalDraft();closeTaskDetail();projectId=$('project-select').value;restoreGoalDraft();goalDraftRestoredProject=projectId;localWrite('rsi-project',projectId);settingsBaseline=null;if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);taskOffset=0;writeNavigation(view);render();safe(refresh);});
 var offerGlobalConfigRepair=function(raw){
  const dialog=el('dialog','','confirm-dialog');dialog.setAttribute('aria-labelledby','global-config-repair-title');
  const title=el('h2',t('通用配置损坏'));title.id='global-config-repair-title';
@@ -833,7 +851,12 @@ $('project-form').addEventListener('submit',event=>{event.preventDefault();safe(
    const added=await api('projects',{path:$('project-path').value,name:$('project-name').value||null,enabled:$('project-enabled').checked});addedProject=added.id;
    if(added.existing)existingProject=added;
   }
-  if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
+  if(existingProject?.archived){
+   if(!(await uiConfirm(t('该项目已归档。恢复后保持暂停，不会重新执行已取消的任务。确认恢复？'))))return;
+   await api('project/restore',{project:existingProject.id,confirmation:'restore-project'});
+   existingProject.archived=false;existingProject.paused=true;
+  }
+  if(unchanged()){stashSettings();closeTaskDetail();projectId=addedProject;localWrite('rsi-project',projectId);writeNavigation(view);settingsBaseline=null;$('project-dialog').close();$('project-form').reset();$('project-source').dispatchEvent(new Event('change'));$('import-status').textContent='';}
   await refresh();
   if(existingProject)toast(t('该路径已接入')+t('：')+(existingProject.name||t('未命名项目'))+' · '+t(existingProject.paused?'已暂停':'运行中')+' · '+t('未修改名称或启用状态'));
   else toast(t('项目已接入'));
