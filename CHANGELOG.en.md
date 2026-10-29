@@ -9,6 +9,13 @@
 <!-- adaptive-rsi-release:0.5.130;base:a88f620de576d405758a1aedf94856d3a410d915 -->
 
 - Release verified mainline improvements from commit `a88f620de576d405758a1aedf94856d3a410d915`.
+- Backup verification and restore share one eligibility check, so rotation never drops the only recoverable point.
+- Initial release, retry and rerun bind the exact target SHA; legacy receipts are pinned at the exact commit before publication and failures write nothing remote.
+- Acceptance is layered by the actual patch, and `validation.controls` runs maintainer counterexamples against the repaired candidate.
+- Fresh holdout availability is decided before proposal, and failed or inconclusive identical experiments are not repeated automatically.
+- Input, output, cache-read and cache-write prices freeze per call; unknown usage stays unpriced, and usage details show historical ranges from comparable samples.
+- Task details summarize changes, checks, usage, reused stages and the delivery commit, with optional value feedback.
+- Desktop update settings changes revoke a waiting install; native checks require the exact revision plus stored policy and window, and the persisted receipt settles only after version and health confirmation.
 
 ## 0.5.129
 
