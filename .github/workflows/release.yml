@@ -2,6 +2,9 @@ name: 稳定批次版本 PR 与正式发布
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: ['版本 PR 精确提交检查']
+    types: [completed]
   workflow_dispatch:
     inputs:
       prepare_release:
@@ -24,6 +27,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/release-verify.yml')
     runs-on: ubuntu-latest
     permissions:
       contents: write

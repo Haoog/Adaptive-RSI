@@ -227,6 +227,20 @@ class ParallelReleaseTest(unittest.TestCase):
         self.assertEqual(workflow["concurrency"]["group"], "adaptive-rsi-release")
         self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
 
+    def test_bot_merge_continues_only_after_verification_run_completes(self):
+        from tests.test_release import WorkflowConfigurationTest
+        parser = WorkflowConfigurationTest()
+        workflow = parser.workflow('release.yml')
+        trigger = workflow.get('on', workflow.get(True, workflow.get('true', {}))).get('workflow_run', {})
+        self.assertEqual(trigger.get('workflows'), ['版本 PR 精确提交检查'])
+        self.assertEqual(trigger.get('types'), ['completed'])
+        prepare = workflow['jobs']['prepare']
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", prepare.get('if', ''))
+        self.assertIn("github.event.workflow_run.path == '.github/workflows/release-verify.yml'", prepare['if'])
+        merge_commands = '\n'.join(step.get('run', '') for step in parser.workflow('release-verify.yml')['jobs']['merge']['steps'])
+        self.assertNotIn('gh workflow run release.yml', merge_commands,
+                         'Dispatching before this run completes makes its attested assets unavailable for reuse')
+
     def test_fallback_gates_run_independently_and_publish_requires_every_result(self):
         from tests.test_release import WorkflowConfigurationTest
         jobs = WorkflowConfigurationTest().workflow("release.yml")["jobs"]
