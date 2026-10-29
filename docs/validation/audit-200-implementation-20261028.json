@@ -1079,7 +1079,7 @@
       "validation": [
         "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
       ],
-      "residual": "Persisted staged-update.part, Range resume, Range-ignored restart, 416/corrupt deletion and verify-before-cache hand-off are covered by boundary tests. A real signed update interrupted across an application restart remains unverified."
+      "residual": "Persisted staged-update.part is bound to the exact version and URL, Range resume, Range-ignored restart, 416 completion recovery, corrupt/length deletion and verify-before-cache hand-off are covered by boundary tests. A real signed update interrupted across an application restart remains unverified."
     },
     {
       "id": 65,
@@ -1337,7 +1337,7 @@
       },
       "source": "adaptive_rsi/contracts.py",
       "acceptance": "新客户端接旧服务时可用功能继续工作，不支持操作有明确提示。",
-      "status": "implemented",
+      "status": "partial",
       "implementation": [
         "adaptive_rsi/web/app.js",
         "adaptive_rsi/web/index.html",
@@ -1346,7 +1346,8 @@
       "validation": [
         "node tests/browser_frontend_remaining.cjs",
         "node tests/browser_desktop_closeout.cjs"
-      ]
+      ],
+      "residual": "Capability negotiation and the degraded notice are covered with a simulated old contract only; a real new-client/old-server pairing remains unverified."
     },
     {
       "id": 81,

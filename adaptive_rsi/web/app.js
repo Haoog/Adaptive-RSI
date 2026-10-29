@@ -201,6 +201,8 @@ function featureForPath(path){
  if(/^(?:tasks\/batch(?:es)?|task-batch(?:\/.*)?)$/.test(route))return 'task-batch';
  if(/^(?:operations?|operations\/.*)$/.test(route))return 'operations';
  if(route==='config-history'||route==='config/undo')return 'config-history';
+ if(route==='diagnostics/preview'||route==='diagnostics/export')return 'diagnostics-preview';
+ if(route==='shutdown-status')return 'shutdown-progress';
  // Configuration repair predates capability descriptors and remains a baseline operation.
  return null;
 }
@@ -215,7 +217,7 @@ async function negotiateCapabilities(){
  if(!serviceContractPromise)serviceContractPromise=(async()=>{
   const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
   try{const response=await fetch('/api/contract',{signal:controller.signal});if(!response.ok){if([404,405].includes(response.status)){serviceCapabilities=new Set();updateCapabilityNotice(serviceCapabilities);return serviceCapabilities;}throw Error('contract unavailable');}const contract=await response.json();serviceCapabilities=new Set(Array.isArray(contract.descriptor?.capabilities)?contract.descriptor.capabilities:[]);updateCapabilityNotice(serviceCapabilities);return serviceCapabilities;}
-  catch{updateCapabilityNotice(null);return null;}
+  catch{return null;}
   finally{clearTimeout(timeout);serviceContractPromise=null;}
  })();
  return serviceContractPromise;

@@ -26,6 +26,12 @@ async function main(){
   });
   assert.match(degraded.shown,/部分功能不可用/);
   assert.equal(degraded.hiddenAfterRestore,true);
+  const capabilityRoutes=await page.evaluate(()=>({
+   preview:featureForPath('diagnostics/preview'),
+   export:featureForPath('diagnostics/export'),
+   shutdown:featureForPath('shutdown-status')
+  }));
+  assert.deepEqual(capabilityRoutes,{preview:'diagnostics-preview',export:'diagnostics-preview',shutdown:'shutdown-progress'});
 
   await page.click('#storage-tools');
   await page.locator('dialog[open] h2').filter({hasText:'数据与诊断'}).waitFor();

@@ -54,6 +54,9 @@ test('incompatible platform error is explained and existing error codes are kept
  assert.equal(api.errorText('update_disk_space'),'磁盘可用空间不足，请清理后重试。');
  assert.equal(api.errorText('update_wait_cancelled'),'已取消等待更新，当前任务继续运行。');
  assert.equal(api.errorText('update_install_failed'),'安装未完成，请重试或手动安装。');
+ assert.equal(api.errorText('update_cache_unavailable'),'更新缓存不可用，请检查磁盘权限或空间后重试。');
+ assert.equal(api.errorText('update_size_limit'),'更新包超过允许的大小上限，已停止。当前版本继续可用。');
+ assert.equal(api.errorText('update_unsupported_platform'),'当前平台不支持应用内更新，请手动安装。');
  assert.equal(api.errorText('something_new'),'更新未完成，请重试或手动安装。');
 });
 
