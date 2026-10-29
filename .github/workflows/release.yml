@@ -2,6 +2,9 @@ name: 稳定批次版本 PR 与正式发布
 on:
   push:
     branches: [main]
+  workflow_run:
+    workflows: ['版本 PR 精确提交检查']
+    types: [completed]
   workflow_dispatch:
     inputs:
       prepare_release:
@@ -24,16 +27,20 @@ concurrency:
   cancel-in-progress: false
 jobs:
   prepare:
+    if: github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.path == '.github/workflows/release-verify.yml')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
       actions: write
+      checks: write
     outputs:
       mode: ${{ steps.prepare.outputs.mode }}
       sha: ${{ steps.prepare.outputs.sha }}
       artifact_run_id: ${{ steps.prepare.outputs.artifact_run_id }}
       artifact_name: ${{ steps.prepare.outputs.artifact_name }}
+      release_path: ${{ steps.prepare.outputs.release_path }}
+      artifact_reuse_reason: ${{ steps.prepare.outputs.artifact_reuse_reason }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -48,15 +55,8 @@ jobs:
           RELEASE_LEVEL: ${{ inputs.release_level }}
           NEW_PRODUCT_STAGE: ${{ inputs.new_product_stage }}
         run: python3 scripts/release.py prepare
-      - name: 显式触发版本 PR 的精确 SHA 检查
-        if: steps.prepare.outputs.mode == 'verify'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.prepare.outputs.pr }}
-          PR_SHA: ${{ steps.prepare.outputs.sha }}
-        run: gh workflow run release-verify.yml --ref main -f pr="$PR_NUMBER" -f sha="$PR_SHA"
       - name: 阻断需要人工处理的版本 PR
-        if: steps.prepare.outputs.mode == 'blocked'
+        if: steps.prepare.outputs.mode == 'blocked' || steps.prepare.outputs.verification_state == 'failed' || steps.prepare.outputs.verification_state == 'dispatch_unknown'
         run: exit 1
   reuse:
     if: needs.prepare.outputs.mode == 'publish' && needs.prepare.outputs.artifact_run_id != ''
@@ -107,11 +107,95 @@ jobs:
         run: python3 scripts/release_smoke.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-${{ needs.prepare.outputs.sha }}
+          name: release-reused-${{ needs.prepare.outputs.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+  tests:
+    needs: [prepare, reuse]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ci/test-durations.json
+          key: test-timings-${{ runner.os }}-${{ hashFiles('tests/test_*.py', 'scripts/test_worker.py') }}-${{ github.run_id }}
+          restore-keys: test-timings-${{ runner.os }}-
+      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: timing-${{ github.run_id }}
+          path: |
+            .ci/test-durations.json
+            .ci/test-durations.failures.json
+          if-no-files-found: ignore
+  node:
+    needs: [prepare, reuse]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js && node --check adaptive_rsi/web/auth.js && node --check adaptive_rsi/web/experience.js && node --check adaptive_rsi/web/install.js && node --check adaptive_rsi/web/sw.js
+      - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
+      - run: npm ci --ignore-scripts
+      - run: node scripts/check_i18n_ast.cjs
+      - run: node --test tests/web_*.cjs
+      - run: python3 scripts/check_i18n.py
+      - run: python3 scripts/check_api_contract.py
+  browser:
+    needs: [prepare, reuse]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')
+    runs-on: macos-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install chromium
+      - run: npm run test:browser
   build:
     needs: [prepare, reuse]
     if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')
@@ -156,19 +240,6 @@ jobs:
           path: ~/Library/Caches/pip
           key: pip-build-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: pip-build-${{ runner.os }}-
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: .ci/test-durations.json
-          key: test-timings-${{ runner.os }}-${{ hashFiles('tests/test_*.py', 'scripts/test_worker.py') }}-${{ github.run_id }}
-          restore-keys: test-timings-${{ runner.os }}-
-      - run: python3 scripts/test_parallel.py --durations .ci/test-durations.json
-      - run: node --check adaptive_rsi/web/app.js && node --check adaptive_rsi/web/i18n.js && node --check adaptive_rsi/web/model-center.js
-      - run: node --check adaptive_rsi/web/auth.js
-      - run: node --check adaptive_rsi/web/native-update.js && node --check adaptive_rsi/web/batch.js
-      - run: node --test tests/web_requests.cjs
-      - run: npm ci --ignore-scripts
-      - run: npx playwright install chromium
-      - run: npm run test:browser
       - run: python3 scripts/package.py
       - run: python3 -m pip install --disable-pip-version-check -r requirements-build.txt
       - run: python3 -m build --wheel
@@ -214,14 +285,14 @@ jobs:
           subject-path: dist/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-${{ needs.prepare.outputs.sha }}
+          name: release-built-${{ needs.prepare.outputs.sha }}
           path: dist/*
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
   publish:
-    needs: [prepare, reuse, build]
-    if: always() && needs.prepare.result == 'success' && (needs.reuse.result == 'success' || needs.build.result == 'success')
+    needs: [prepare, reuse, tests, node, browser, build]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.mode == 'publish' && (needs.reuse.result == 'success' || (needs.tests.result == 'success' && needs.node.result == 'success' && needs.browser.result == 'success' && needs.build.result == 'success'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -233,9 +304,38 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release-${{ needs.prepare.outputs.sha }}
+          name: ${{ needs.reuse.result == 'success' && format('release-reused-{0}', needs.prepare.outputs.sha) || format('release-built-{0}', needs.prepare.outputs.sha) }}
           path: dist
       - name: 发布精确已验证提交的不可变资产
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release.py publish
+  timings:
+    if: always()
+    continue-on-error: true
+    needs: [prepare, reuse, tests, node, browser, build, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: 记录发布路径和各门禁实际耗时
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PATH: ${{ needs.reuse.result == 'success' && 'reuse' || needs.build.result == 'success' && 'rebuild' || needs.build.result == 'failure' && 'rebuild_failed' || needs.prepare.outputs.mode }}
+          REUSE_REASON: ${{ needs.reuse.result == 'failure' && 'validation_failed' || needs.reuse.result == 'cancelled' && 'validation_cancelled' || needs.prepare.outputs.artifact_reuse_reason }}
+        run: python3 -B scripts/ci_metrics.py --output .ci/release-metrics.json --release-path "$RELEASE_PATH" --reuse-reason "$REUSE_REASON"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-timing-${{ github.run_id }}
+          path: .ci/release-metrics.json
+          if-no-files-found: error
+          retention-days: 14

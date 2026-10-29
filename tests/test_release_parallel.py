@@ -227,10 +227,119 @@ class ParallelReleaseTest(unittest.TestCase):
         self.assertEqual(workflow["concurrency"]["group"], "adaptive-rsi-release")
         self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
 
+    def test_bot_merge_continues_only_after_verification_run_completes(self):
+        from tests.test_release import WorkflowConfigurationTest
+        parser = WorkflowConfigurationTest()
+        workflow = parser.workflow('release.yml')
+        trigger = workflow.get('on', workflow.get(True, workflow.get('true', {}))).get('workflow_run', {})
+        self.assertEqual(trigger.get('workflows'), ['版本 PR 精确提交检查'])
+        self.assertEqual(trigger.get('types'), ['completed'])
+        prepare = workflow['jobs']['prepare']
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", prepare.get('if', ''))
+        self.assertIn("github.event.workflow_run.path == '.github/workflows/release-verify.yml'", prepare['if'])
+        merge_commands = '\n'.join(step.get('run', '') for step in parser.workflow('release-verify.yml')['jobs']['merge']['steps'])
+        self.assertNotIn('gh workflow run release.yml', merge_commands,
+                         'Dispatching before this run completes makes its attested assets unavailable for reuse')
+
+    def test_fallback_gates_run_independently_and_publish_requires_every_result(self):
+        from tests.test_release import WorkflowConfigurationTest
+        jobs = WorkflowConfigurationTest().workflow("release.yml")["jobs"]
+        fallback = {"tests", "node", "browser", "build"}
+        self.assertTrue(fallback <= set(jobs), "fallback gates must be separate jobs")
+        condition = ("always() && needs.prepare.result == 'success' && "
+                     "needs.prepare.outputs.mode == 'publish' && "
+                     "(needs.prepare.outputs.artifact_run_id == '' || needs.reuse.result != 'success')")
+        for name in sorted(fallback):
+            with self.subTest(job=name):
+                self.assertEqual(jobs[name]["needs"], ["prepare", "reuse"])
+                self.assertEqual(jobs[name]["if"], condition)
+                self.assertFalse(jobs[name].get("continue-on-error", False))
+                checkout = jobs[name]["steps"][0]
+                self.assertEqual(checkout["with"]["ref"], "${{ needs.prepare.outputs.sha }}")
+                self.assertIs(checkout["with"]["persist-credentials"], False)
+        publish = jobs["publish"]
+        self.assertEqual(set(publish["needs"]), {"prepare", "reuse"} | fallback)
+        # Evaluate the actual GitHub boolean condition across success, failure,
+        # cancellation and skipped results; no subprocess or runner is invoked.
+        from itertools import product
+        from types import SimpleNamespace
+        def evaluate(expression, needs):
+            expression = expression.replace("&&", " and ").replace("||", " or ")
+            return eval(expression, {"__builtins__": {}}, {"always": lambda: True, "needs": needs})
+        for mode in ["publish", "verify", "idle", "blocked"]:
+            for prepare_result in ["success", "failure", "cancelled", "skipped"]:
+                for results in product(["success", "failure", "cancelled", "skipped"], repeat=5):
+                    reuse_result, *gate_results = results
+                    needs = SimpleNamespace(
+                        prepare=SimpleNamespace(result=prepare_result, outputs=SimpleNamespace(mode=mode)),
+                        reuse=SimpleNamespace(result=reuse_result),
+                        **{name: SimpleNamespace(result=result)
+                           for name, result in zip(sorted(fallback), gate_results)})
+                    expected = (prepare_result == "success" and mode == "publish" and
+                                (reuse_result == "success" or all(result == "success" for result in gate_results)))
+                    self.assertEqual(evaluate(publish["if"], needs), expected,
+                                     (mode, prepare_result, results))
+        self.assertEqual(publish["if"],
+                         "always() && needs.prepare.result == 'success' && "
+                         "needs.prepare.outputs.mode == 'publish' && "
+                         "(needs.reuse.result == 'success' || "
+                         "(needs.tests.result == 'success' && needs.node.result == 'success' && "
+                         "needs.browser.result == 'success' && needs.build.result == 'success'))")
+
+    def test_release_parallel_gates_preserve_checks_and_permission_boundaries(self):
+        from tests.test_release import WorkflowConfigurationTest
+        parser = WorkflowConfigurationTest()
+        jobs = parser.workflow("release.yml")["jobs"]
+        commands = lambda job: "\n".join(step.get("run", "") for step in jobs[job]["steps"])
+        self.assertIn("node --test tests/web_*.cjs", commands("node"))
+        for command in ["node scripts/check_i18n_ast.cjs", "scripts/check_i18n.py", "scripts/check_api_contract.py"]:
+            self.assertIn(command, commands("node"))
+        self.assertIn("npm run test:browser", commands("browser"))
+        self.assertNotIn("scripts/test_parallel.py", commands("build"))
+        self.assertNotIn("npm run test:browser", commands("build"))
+        for name in ["tests", "node", "browser"]:
+            self.assertEqual(jobs[name]["permissions"], {"contents": "read"})
+        self.assertEqual(jobs["reuse"]["permissions"], {"contents": "read", "actions": "read"})
+        self.assertEqual(jobs["build"]["permissions"], {
+            "contents": "read", "id-token": "write", "attestations": "write"})
+        self.assertEqual(jobs["publish"]["permissions"], {"contents": "write"})
+        self.assertEqual(jobs["prepare"]["permissions"]["actions"], "write")
+        self.assertNotIn("gh workflow run release-verify.yml", commands("prepare"))
+        for command in ["validate-verified", "--signer-workflow", "--source-ref refs/heads/main",
+                        "--source-digest", "--deny-self-hosted-runners", "verify-dmg", "scripts/release_smoke.py"]:
+            self.assertIn(command, commands("reuse"))
+        for command in ["scripts/test_updater_signing.py", "codesign --verify --deep --strict",
+                        "verify-dmg", "scripts/release_smoke.py"]:
+            self.assertIn(command, commands("build"))
+        verified = parser.workflow("release-verify.yml")["jobs"]
+        for name in ["tests", "browser", "verify"]:
+            self.assertEqual(verified[name]["needs"], "gate")
+        self.assertTrue({"tests", "browser", "verify", "report"} <= set(verified["merge"]["needs"]))
+        merge = "\n".join(step.get("run", "") for step in verified["merge"]["steps"])
+        self.assertIn('--squash --match-head-commit "$PR_SHA"', merge)
+        self.assertNotIn("--admin", merge)
+
+    def test_release_report_uses_actual_path_and_artifacts_have_separate_sources(self):
+        from tests.test_release import WorkflowConfigurationTest
+        jobs = WorkflowConfigurationTest().workflow('release.yml')['jobs']
+        report = next(step for step in jobs['timings']['steps']
+                      if 'scripts/ci_metrics.py' in step.get('run', ''))
+        self.assertIn("needs.build.result == 'success' && 'rebuild'", report['env']['RELEASE_PATH'])
+        self.assertIn("needs.reuse.result == 'failure' && 'validation_failed'", report['env']['REUSE_REASON'])
+        names = {}
+        for source in ('reuse', 'build'):
+            upload = next(step for step in jobs[source]['steps']
+                          if step.get('uses', '').startswith('actions/upload-artifact@'))
+            names[source] = upload['with']['name']
+        self.assertNotEqual(names['reuse'], names['build'])
+        download = next(step for step in jobs['publish']['steps']
+                        if step.get('uses', '').startswith('actions/download-artifact@'))
+        self.assertIn('needs.reuse.result', download['with']['name'])
+
     def test_release_paths_keep_full_parallel_gate_on_macos_python312(self):
         from tests.test_release import WorkflowConfigurationTest
         parser = WorkflowConfigurationTest()
-        for name, job in [("release-verify.yml", "tests"), ("release.yml", "build")]:
+        for name, job in [("release-verify.yml", "tests"), ("release.yml", "tests")]:
             workflow = parser.workflow(name)
             config = workflow["jobs"][job]
             with self.subTest(workflow=name):

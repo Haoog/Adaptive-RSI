@@ -328,6 +328,7 @@ jobs:
         run: bash -n scripts/install-server.sh
 
   verify:
+    name: ${{ needs.changes.outputs.verification_mode == 'version' && 'version_metadata_summary' || 'verify' }}
     if: always()
     needs: [changes, docs, version_metadata, quick_python, python, macos_sandbox_core, macos_sandbox_flows, javascript, browser, package, linux]
     runs-on: ubuntu-latest

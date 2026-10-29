@@ -1,4 +1,5 @@
 name: 版本 PR 精确提交检查
+run-name: 'Release verification PR #${{ inputs.pr }} @${{ inputs.sha }}'
 on:
   workflow_dispatch:
     inputs:
@@ -211,7 +212,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -225,7 +225,3 @@ jobs:
         run: |
           python3 scripts/release.py gate --pr "$PR_NUMBER" --sha "$PR_SHA"
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash --match-head-commit "$PR_SHA"
-      - name: 显式继续正式发布（机器人合并不会触发 push 工作流）
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run release.yml --ref main

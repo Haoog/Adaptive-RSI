@@ -513,6 +513,10 @@ class ReleaseVersionPatchTest(unittest.TestCase):
             git(root, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "版本")
             head = git(root, "rev-parse", "HEAD")
             self.assertEqual(module.verify_generated(base, head), "1.3.0")
+            branch = 'chore/release-v1.3.0-' + base[:12]
+            self.assertEqual(module.desktop_mode(base, head, branch, 'pull_request'), 'skip')
+            self.assertEqual(module.desktop_mode(base, head, 'feature/version', 'pull_request'), 'full')
+            self.assertEqual(module.desktop_mode(base, head, branch, 'workflow_dispatch'), 'full')
             self.assertIn("## Unreleased\n\n## 1.3.0", result["CHANGELOG.md"])
             self.assertIn("中文功能", result["CHANGELOG.md"])
             (root / "manual.py").write_text("print('unreviewed')")
@@ -521,8 +525,160 @@ class ReleaseVersionPatchTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "independently reconstructed"):
                 module.verify_generated(base, git(root, "rev-parse", "HEAD"))
 
+class ReleaseVerificationDispatchTest(unittest.TestCase):
+    def test_local_cli_delegates_prepare_to_canonical_workflow(self):
+        from scripts import release as module
+        with patch.dict(os.environ, {'PREPARE_RELEASE': 'true', 'GITHUB_ACTIONS': 'false',
+                'RELEASE_LEVEL': 'minor', 'NEW_PRODUCT_STAGE': 'true',
+                'GITHUB_REPOSITORY': 'example/project'}, clear=True), \
+                patch.object(sys, 'argv', ['release.py', 'prepare']), \
+                patch.object(module, 'run', return_value='') as command, \
+                patch.object(module, 'prepare') as prepare, \
+                patch.object(module, 'ensure_release_verification') as ensure, \
+                patch.object(module, 'gh') as api, patch.object(module, 'output') as output:
+            module.main()
+        command.assert_called_once_with('gh', 'workflow', 'run', 'release.yml', '--repo',
+                'example/project', '--ref', 'main', '-f', 'prepare_release=true',
+                '-f', 'release_level=minor', '-f', 'new_product_stage=true')
+        prepare.assert_not_called()
+        ensure.assert_not_called()
+        api.assert_not_called()
+        self.assertEqual(output.call_args.kwargs['mode'], 'requested')
+
+    def test_local_cli_dispatch_failure_is_unknown_without_retry(self):
+        from scripts import release as module
+        for error in (subprocess.CalledProcessError(1, ['gh']), OSError('connection lost')):
+            with self.subTest(error=type(error).__name__), \
+                    patch.dict(os.environ, {'PREPARE_RELEASE': 'true',
+                        'GITHUB_REPOSITORY': 'example/project'}, clear=True), \
+                    patch.object(sys, 'argv', ['release.py', 'prepare']), \
+                    patch.object(module, 'run', side_effect=error) as command, \
+                    patch.object(module, 'prepare') as prepare, \
+                    patch.object(module, 'output') as output:
+                module.main()
+            command.assert_called_once_with('gh', 'workflow', 'run', 'release.yml', '--repo',
+                    'example/project', '--ref', 'main', '-f', 'prepare_release=true',
+                    '-f', 'release_level=patch', '-f', 'new_product_stage=false')
+            prepare.assert_not_called()
+            self.assertEqual(output.call_args.kwargs['mode'], 'dispatch_unknown')
+
+    def test_local_cli_validates_release_selection_before_dispatch(self):
+        from scripts import release as module
+        for level, stage in [('surprise', 'false'), ('minor', 'false'),
+                             ('major', 'false'), ('patch', 'invalid')]:
+            with self.subTest(level=level, stage=stage), \
+                    patch.dict(os.environ, {'PREPARE_RELEASE': 'true',
+                        'RELEASE_LEVEL': level, 'NEW_PRODUCT_STAGE': stage}, clear=True), \
+                    patch.object(sys, 'argv', ['release.py', 'prepare']), \
+                    patch.object(module, 'run') as command, \
+                    patch.object(module, 'prepare') as prepare:
+                with self.assertRaises(ValueError):
+                    module.main()
+            command.assert_not_called()
+            prepare.assert_not_called()
+
+    def test_remote_and_unrequested_cli_keep_prepare_path(self):
+        from scripts import release as module
+        for env in ({'GITHUB_ACTIONS': 'true', 'PREPARE_RELEASE': 'true'}, {}):
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True), \
+                    patch.object(sys, 'argv', ['release.py', 'prepare']), \
+                    patch.object(module, 'run') as command, \
+                    patch.object(module, 'prepare') as prepare:
+                module.main()
+            prepare.assert_called_once_with()
+            command.assert_not_called()
+
+    def test_dispatch_ignores_other_sha_and_verifies_saved_receipt(self):
+        from scripts import release as module
+        sha = 'c' * 40
+        receipt, posts = {}, []
+        def api(endpoint, method='GET', **fields):
+            if endpoint.startswith('actions/workflows/release-verify.yml/runs?'):
+                return {'workflow_runs': [{'id': 99, 'path': '.github/workflows/release-verify.yml',
+                        'event': 'workflow_dispatch', 'head_branch': 'main', 'status': 'completed',
+                        'conclusion': 'success', 'display_title': module.release_verification_title(9, 'd' * 40)}]}
+            if endpoint.startswith('commits/'):
+                return {'check_runs': [receipt] if receipt else []}
+            if endpoint == 'check-runs':
+                receipt.update(fields, id=17)
+                return receipt
+            if endpoint == 'check-runs/17':
+                return receipt
+            posts.append((endpoint, method, fields))
+            return {}
+        with patch.object(module, 'gh', side_effect=api) as calls:
+            result = module.ensure_release_verification(9, sha)
+        self.assertEqual(result['verification_state'], 'dispatched')
+        self.assertTrue(any(call.args == ('check-runs/17',) for call in calls.call_args_list))
+        self.assertEqual(len(posts), 1)
+
+    def test_receipt_identity_readback_failure_blocks_dispatch(self):
+        from scripts import release as module
+        with patch.object(module, 'gh', side_effect=[{'workflow_runs': []},
+                {'check_runs': []}, {'id': 17}, {'name': 'wrong'}]) as api:
+            with self.assertRaisesRegex(ValueError, 'receipt identity'):
+                module.ensure_release_verification(9, 'c' * 40)
+        self.assertEqual(api.call_count, 4)
+        self.assertFalse(any(call.args[0].endswith('/dispatches') for call in api.call_args_list))
+
+    def test_unknown_or_incomplete_run_listing_cannot_authorize_dispatch(self):
+        from scripts import release as module
+        with patch.object(module, 'gh', return_value={}) as api:
+            with self.assertRaisesRegex(ValueError, 'listing'):
+                module.ensure_release_verification(9, 'c' * 40)
+        self.assertEqual(api.call_count, 1)
+
+    def test_exact_sha_active_success_and_failed_runs_never_redispatch(self):
+        from scripts import release as module
+        sha = 'c' * 40
+        for status, conclusion, expected in [('queued', None, 'active'),
+                ('in_progress', None, 'active'), ('completed', 'success', 'success'),
+                ('completed', 'failure', 'failed'), ('completed', 'cancelled', 'failed')]:
+            with self.subTest(status=status, conclusion=conclusion):
+                item = {'id': 42, 'path': '.github/workflows/release-verify.yml',
+                        'event': 'workflow_dispatch', 'head_branch': 'main', 'status': status,
+                        'conclusion': conclusion, 'display_title': module.release_verification_title(9, sha)}
+                with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
+                        patch.object(module, 'gh', return_value={'workflow_runs': [item]}) as api:
+                    result = module.ensure_release_verification(9, sha)
+                self.assertEqual(result['verification_state'], expected)
+                self.assertEqual(api.call_count, 1)
+                if expected == 'failed':
+                    self.assertEqual(result['verification_retry'], 'gh run rerun 42 --repo example/project')
+
+    def test_prepare_dispatches_once_and_keeps_unknown_receipt_across_retries(self):
+        from scripts import release as module
+        sha = 'c' * 40
+        receipts, dispatches = [], []
+        def api(endpoint, method='GET', **fields):
+            if endpoint.startswith('actions/workflows/release-verify.yml/runs?'):
+                return {'workflow_runs': []}
+            if endpoint.startswith('commits/' + sha + '/check-runs?'):
+                return {'check_runs': receipts}
+            if endpoint == 'check-runs' and method == 'POST':
+                receipts.append(dict(fields, id=17))
+                return receipts[-1]
+            if endpoint == 'check-runs/17':
+                return receipts[-1]
+            if endpoint.endswith('/dispatches'):
+                dispatches.append(fields)
+                raise subprocess.CalledProcessError(1, ['gh'])
+            raise AssertionError((endpoint, method, fields))
+        with patch.dict(os.environ, {'GITHUB_REPOSITORY': 'example/project'}), \
+                patch.object(module, 'gh', side_effect=api):
+            first = module.ensure_release_verification(9, sha)
+            second = module.ensure_release_verification(9, sha)
+        self.assertEqual(first['verification_state'], 'dispatch_unknown')
+        self.assertEqual(second['verification_state'], 'dispatch_unknown')
+        self.assertEqual(dispatches, [{'ref': 'main', 'inputs[pr]': '9', 'inputs[sha]': sha}])
+        self.assertEqual(receipts[0]['head_sha'], sha)
+        self.assertEqual(receipts[0]['status'], 'completed')
+        self.assertEqual(receipts[0]['conclusion'], 'neutral')
+        self.assertEqual(receipts[0]['external_id'], module.release_verification_title(9, sha))
+
+
 class ReleaseBatchCadenceTest(unittest.TestCase):
-    def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False, new_stage='false'):
+    def prepare(self, requested='false', notes='## Unreleased\n', level='patch', generated=False, new_stage='false', artifact_error=None):
         from scripts import release as module
         head='b'*40
         def command(*args, **kwargs):
@@ -531,12 +687,16 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
             if args[:3]==('gh','pr','list'):
                 return '[]' if 'open' in args else json.dumps([{'number':9,'state':'OPEN','headRefOid':'c'*40}])
             raise AssertionError('Unexpected side effect: '+repr(args))
-        def api(endpoint):
+        def api(endpoint, method='GET', **fields):
+            if endpoint.startswith('actions/workflows/release-verify.yml/runs?'):
+                return {'workflow_runs': [{'id': 42, 'path': '.github/workflows/release-verify.yml',
+                        'event': 'workflow_dispatch', 'head_branch': 'main', 'status': 'queued',
+                        'display_title': module.release_verification_title(9, 'c' * 40)}]}
             return {'default_branch':'main'} if not endpoint else {'sha':head}
         def read(sha,name):
             return '__version__ = "1.2.3"\n' if name.endswith('__init__.py') else notes
         with patch.dict(os.environ,{'PREPARE_RELEASE':requested,'RELEASE_LEVEL':level,
-                                    'NEW_PRODUCT_STAGE':new_stage,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'tree_at',return_value='d'*40),patch.object(module,'find_verified_artifact',return_value={'run_id':17,'name':'release-verified-'+('d'*40)}),patch.object(module,'output') as output:
+                                    'NEW_PRODUCT_STAGE':new_stage,'GITHUB_REPOSITORY':'example/project'}),patch.object(module,'run',side_effect=command) as calls,patch.object(module,'gh',side_effect=api),patch.object(module,'read_at',side_effect=read),patch.object(module,'verify_generated',side_effect=None if generated else ValueError('not mechanical')),patch.object(module,'tree_at',return_value='d'*40),patch.object(module,'find_verified_artifact',side_effect=artifact_error,return_value={'run_id':17,'name':'release-verified-'+('d'*40)}),patch.object(module,'output') as output:
             module.prepare()
             return output.call_args.kwargs,calls.call_args_list
 
@@ -544,6 +704,15 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         result,calls=self.prepare()
         self.assertEqual(result['mode'],'idle')
         self.assertEqual(len(calls),1)
+
+    def test_prepare_owns_verification_dispatch(self):
+        from scripts import release as module
+        with patch.object(module, 'ensure_release_verification', return_value={
+                'verification_state': 'active', 'verification_run_id': 42}) as dispatch:
+            result, _ = self.prepare(requested='true')
+        dispatch.assert_called_once_with(9, 'c' * 40)
+        self.assertEqual(result['verification_state'], 'active')
+        self.assertEqual(result['verification_run_id'], 42)
 
     def test_explicit_stable_batch_reuses_existing_version_pr(self):
         result,calls=self.prepare(requested='true')
@@ -557,6 +726,24 @@ class ReleaseBatchCadenceTest(unittest.TestCase):
         result,calls=self.prepare(requested='true',level='minor',new_stage='true')
         self.assertEqual(result['mode'],'verify')
         self.assertTrue(any('chore/release-v1.3.0-' in str(call) for call in calls))
+
+    def test_prepare_reports_artifact_path_in_summary(self):
+        from scripts import release as module
+        notes = '<!-- adaptive-rsi-release:1.2.3;base:' + ('a' * 40) + ' -->'
+        with tempfile.TemporaryDirectory() as temp:
+            summary = Path(temp) / 'summary.md'
+            with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}):
+                result, _ = self.prepare(notes=notes, generated=True)
+            self.assertEqual(result['release_path'], 'reuse_candidate')
+            self.assertEqual(result['artifact_reuse_reason'], 'available')
+            self.assertIn('reuse_candidate', summary.read_text())
+            self.assertIn('available', summary.read_text())
+            with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}):
+                result, _ = self.prepare(notes=notes, generated=True,
+                                         artifact_error=subprocess.CalledProcessError(1, ['gh']))
+            self.assertEqual(result['release_path'], 'rebuild')
+            self.assertEqual(result['artifact_reuse_reason'], 'lookup_error')
+            self.assertIn('lookup_error', summary.read_text())
 
     def test_mechanical_version_commit_still_publishes_without_new_batch(self):
         result,_=self.prepare(notes='<!-- adaptive-rsi-release:1.2.3;base:'+('a'*40)+' -->',generated=True)
@@ -598,6 +785,24 @@ class VerifiedArtifactReuseTest(unittest.TestCase):
             return runs[endpoint.rsplit("/", 1)[-1]]
         with patch.object(module, "gh", side_effect=api):
             self.assertEqual(module.find_verified_artifact(tree, "main"), {"run_id": 30, "name": name})
+
+    def test_artifact_lookup_reports_missing_expired_untrusted_and_available(self):
+        from scripts import release as module
+        tree = 'a' * 40
+        name = 'release-verified-' + tree
+        for artifacts, run_info, expected in [
+                ([], {}, 'missing'),
+                ([{'id': 1, 'name': name, 'expired': True}], {}, 'expired'),
+                ([{'id': 1, 'name': name, 'workflow_run': {'id': 17}}],
+                 {'path': '.github/workflows/checks.yml'}, 'untrusted'),
+                ([{'id': 1, 'name': name, 'workflow_run': {'id': 17}}],
+                 {'path': '.github/workflows/release-verify.yml', 'event': 'workflow_dispatch',
+                  'status': 'completed', 'conclusion': 'success', 'head_branch': 'main'}, 'available')]:
+            with self.subTest(expected=expected), patch.object(module, 'gh', side_effect=[
+                    {'artifacts': artifacts}, run_info]):
+                details = {}
+                module.find_verified_artifact(tree, 'main', details)
+                self.assertEqual(details['artifact_reuse_reason'], expected)
 
     def test_failed_or_untrusted_artifact_lookup_returns_no_reuse(self):
         from scripts import release as module
@@ -754,6 +959,18 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
         self.assertIn("cache-dependency-glob: pyproject.toml", text)
 
+    def test_version_metadata_cannot_supply_required_release_verify_check(self):
+        checks = self.workflow('checks.yml')['jobs']['verify']
+        self.assertEqual(checks.get('name'), "${{ needs.changes.outputs.verification_mode == 'version' && 'version_metadata_summary' || 'verify' }}")
+        workflow = self.workflow('release-verify.yml')
+        report = workflow['jobs']['report']
+        self.assertEqual(set(report['needs']), {'gate', 'tests', 'browser', 'verify'})
+        script = report['steps'][0]['run']
+        self.assertIn('-f name=verify', script)
+        self.assertIn('-f head_sha="$PR_SHA"', script)
+        self.assertEqual(report['steps'][0]['env']['PR_SHA'], '${{ needs.gate.outputs.sha }}')
+        self.assertEqual(set(workflow['jobs']['merge']['needs']), {'gate', 'tests', 'browser', 'verify', 'report'})
+
     def test_release_verification_attests_and_uploads_exact_tree_artifacts(self):
         workflow = self.workflow("release-verify.yml")
         permissions = workflow["jobs"]["verify"]["permissions"]
@@ -771,6 +988,18 @@ class WorkflowConfigurationTest(unittest.TestCase):
         self.assertIn("RSI_WORKFLOW_SOURCE_SHA", text)
         self.assertIn("hashFiles('package-lock.json')", text)
         self.assertIn("hashFiles('desktop/src-tauri/Cargo.lock')", text)
+
+    def test_canonical_prepare_serializes_requests_with_check_write_permission(self):
+        workflow = self.workflow('release.yml')
+        self.assertEqual(workflow['concurrency'], {
+            'group': 'adaptive-rsi-release', 'cancel-in-progress': False})
+        prepare = workflow['jobs']['prepare']
+        for permission in ('contents', 'pull-requests', 'actions', 'checks'):
+            self.assertEqual(prepare['permissions'][permission], 'write')
+        step = next(item for item in prepare['steps'] if item.get('id') == 'prepare')
+        self.assertEqual(step['run'], 'python3 scripts/release.py prepare')
+        self.assertEqual(step['env']['GH_TOKEN'], '${{ github.token }}')
+        self.assertEqual(step['env']['PREPARE_RELEASE'], '${{ inputs.prepare_release }}')
 
     def test_formal_release_prefers_attested_reuse_and_falls_back_to_rebuild(self):
         workflow = self.workflow("release.yml")
