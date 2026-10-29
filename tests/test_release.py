@@ -797,7 +797,12 @@ class VerifiedArtifactReuseTest(unittest.TestCase):
                  {'path': '.github/workflows/checks.yml'}, 'untrusted'),
                 ([{'id': 1, 'name': name, 'workflow_run': {'id': 17}}],
                  {'path': '.github/workflows/release-verify.yml', 'event': 'workflow_dispatch',
-                  'status': 'completed', 'conclusion': 'success', 'head_branch': 'main'}, 'available')]:
+                  'status': 'completed', 'conclusion': 'success', 'head_branch': 'main'}, 'available'),
+                # The merge job may continue publication while the producer run
+                # is still finishing, as long as its artifact was uploaded.
+                ([{'id': 1, 'name': name, 'workflow_run': {'id': 17}}],
+                 {'path': '.github/workflows/release-verify.yml', 'event': 'workflow_dispatch',
+                  'status': 'in_progress', 'conclusion': None, 'head_branch': 'main'}, 'available')]:
             with self.subTest(expected=expected), patch.object(module, 'gh', side_effect=[
                     {'artifacts': artifacts}, run_info]):
                 details = {}
