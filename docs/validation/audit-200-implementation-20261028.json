@@ -237,10 +237,14 @@
       "acceptance": "按受支持版本及能力协商；0.5.124 对接当前服务必须成功。",
       "status": "partial",
       "implementation": [
-        "desktop/src-tauri/src/main.rs"
+        "desktop/src-tauri/src/main.rs",
+        "adaptive_rsi/web/desktop.js",
+        "adaptive_rsi/web/i18n.js"
       ],
-      "validation": [],
-      "residual": "v1/v2 accepted; real remote compatibility and capability negotiation remain."
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop remote_runtime_accepts_only_supported_api_versions"
+      ],
+      "residual": "Remote connections accept API v1/v2, retain advertised capabilities and show a legacy-API notice; real new-client/remote-v2 compatibility and capability negotiation remain unverified."
     },
     {
       "id": 16,
@@ -1069,12 +1073,13 @@
       "acceptance": "在下载及就绪阶段重启应用，安全恢复下载或使用已验证缓存，损坏缓存必须重下。",
       "status": "partial",
       "implementation": [
-        "desktop/src-tauri/src/main.rs"
+        "desktop/src-tauri/src/native_update.rs",
+        "desktop/src-tauri/src/update_boundary_tests.rs"
       ],
       "validation": [
         "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
       ],
-      "residual": "Range resume keeps a .part file across restarts, ignores a server that drops Range and deletes corrupt parts; real interrupted-transfer restart evidence remains."
+      "residual": "Persisted staged-update.part, Range resume, Range-ignored restart, 416/corrupt deletion and verify-before-cache hand-off are covered by boundary tests. A real signed update interrupted across an application restart remains unverified."
     },
     {
       "id": 65,
@@ -1086,12 +1091,13 @@
       "acceptance": "注入 DNS、连接及慢响应故障，各阶段有可解释的时限且可取消。",
       "status": "partial",
       "implementation": [
-        "desktop/src-tauri/src/native_update.rs"
+        "desktop/src-tauri/src/native_update.rs",
+        "desktop/src-tauri/src/update_boundary_tests.rs"
       ],
       "validation": [
-        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop updater_feed_wait_can_be_cancelled_before_transport_deadline"
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
       ],
-      "residual": "Feed cancellation and separate transport budgets have helper tests; DNS/connect/slow-body fault matrix and real signed update remain unverified."
+      "residual": "Connect, response-header, body-idle and total deadlines have separate bounded constants, error codes and cancellation tests; a real DNS/connect/slow-body fault matrix against a signed release remains unverified."
     },
     {
       "id": 66,
@@ -1113,9 +1119,17 @@
       },
       "source": "desktop/src-tauri/src/native_update.rs",
       "acceptance": "以不兼容测试资产验证提前解释原因，当前安装保持可用。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs",
+        "desktop/src-tauri/src/update_boundary_tests.rs",
+        "adaptive_rsi/web/native-update.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop asset_target_is_preflighted_before_download",
+        "node --test tests/web_native_update_progress.cjs"
+      ]
     },
     {
       "id": 68,
@@ -1125,9 +1139,16 @@
       },
       "source": "scripts/package_desktop.py",
       "acceptance": "每个宣称支持的组合都有构建、安装及更新证据，未支持组合明确提示。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "scripts/package_desktop.py",
+        "tests/test_desktop_platform_matrix.py",
+        "RELEASING.md",
+        "RELEASING.en.md"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_desktop_platform_matrix"
+      ]
     },
     {
       "id": 69,
@@ -1149,9 +1170,17 @@
       },
       "source": "adaptive_rsi/web/native-update.js",
       "acceptance": "未知总大小不显示虚假百分比；慢速及校验阶段均有准确状态。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "desktop/src-tauri/src/native_update.rs",
+        "desktop/src-tauri/src/update_boundary_tests.rs",
+        "adaptive_rsi/web/native-update.js",
+        "adaptive_rsi/web/i18n.js"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop progress_is_throttled_and_rates_are_derived",
+        "node --test tests/web_native_update_progress.cjs"
+      ]
     },
     {
       "id": 71,
@@ -1190,14 +1219,17 @@
       },
       "source": "adaptive_rsi/storage_tools.py",
       "acceptance": "导出前可预览内容，凭据和用户源码不进入默认诊断包。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/storage_tools.py"
+        "adaptive_rsi/storage_tools.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/i18n.js"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_storage_acceptance.StorageAcceptanceTest.test_diagnostic_preview_export_is_explicit_and_contains_no_user_text"
-      ],
-      "residual": "Minimal allowlisted preview and explicit-consent export API are tested; no user-facing UI integration or full crash package workflow."
+        "python3 -B -m unittest tests.test_server_hardening.ServerHardeningTest.test_diagnostic_export_requires_consent_and_recomputes_allowlisted_preview",
+        "node tests/browser_desktop_closeout.cjs"
+      ]
     },
     {
       "id": 74,
@@ -1225,9 +1257,14 @@
       },
       "source": "desktop/src-tauri/src/main.rs",
       "acceptance": "在 macOS 菜单和键盘上完成常用流程，快捷键不干扰文本输入。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "desktop/src-tauri/src/main.rs"
+      ],
+      "validation": [
+        "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
+      ],
+      "residual": "Native menu items and non-conflicting Cmd+Shift shortcuts compile and are wired to check-update, diagnostics and graceful quit; manual macOS menu/keyboard acceptance remains."
     },
     {
       "id": 76,
@@ -1249,12 +1286,15 @@
       },
       "source": "adaptive_rsi/web/native-update.js",
       "acceptance": "本机自有、已有本机服务和远端三种模式分别显示准确影响。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/web/native-update.js"
+        "adaptive_rsi/web/native-update.js",
+        "adaptive_rsi/web/i18n.js"
       ],
-      "validation": [],
-      "residual": "Scope text implemented; three-mode browser proof remains."
+      "validation": [
+        "node --test tests/web_native_update_progress.cjs",
+        "node tests/browser_desktop_closeout.cjs"
+      ]
     },
     {
       "id": 78,
@@ -1297,15 +1337,16 @@
       },
       "source": "adaptive_rsi/contracts.py",
       "acceptance": "新客户端接旧服务时可用功能继续工作，不支持操作有明确提示。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/web/app.js",
-        "adaptive_rsi/contracts.py"
+        "adaptive_rsi/web/index.html",
+        "adaptive_rsi/web/i18n.js"
       ],
       "validation": [
-        "node tests/browser_frontend_remaining.cjs"
-      ],
-      "residual": "Feature capability negotiation/degradation is exercised with simulated capability responses; real new-client/old-server compatibility remains unverified."
+        "node tests/browser_frontend_remaining.cjs",
+        "node tests/browser_desktop_closeout.cjs"
+      ]
     },
     {
       "id": 81,
@@ -1568,16 +1609,20 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "注入慢子进程和维护任务，关闭状态始终可解释且最终有明确结果。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/runtime.py",
-        "adaptive_rsi/operations.py"
+        "desktop/src-tauri/src/main.rs",
+        "adaptive_rsi/desktop.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/i18n.js",
+        "adaptive_rsi/web/style.css"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_shutdown_progress_is_readable_while_worker_drains",
-        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_shutdown_rejects_new_worker_admission"
-      ],
-      "residual": "Shutdown progress API reports phases and remaining workers/operations while a worker drains; full slow-maintenance/subprocess matrix and user-facing status integration remain incomplete."
+        "python3 -B -m unittest tests.test_server_hardening.ServerHardeningTest.test_shutdown_status_exposes_phase_and_remaining_work",
+        "python3 -B -m unittest tests.test_desktop_runtime.DesktopShutdownOrderTest",
+        "node tests/browser_desktop_closeout.cjs"
+      ]
     },
     {
       "id": 95,
@@ -3436,14 +3481,16 @@
       "implementation": [
         ".github/workflows/release-verify.yml",
         ".github/workflows/checks.yml",
+        ".github/workflows/ci-metrics.yml",
         "scripts/classify_changes.py",
         "scripts/release.py",
-        "scripts/test_parallel.py"
+        "scripts/test_parallel.py",
+        "scripts/ci_metrics.py"
       ],
       "validation": [
         "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
       ],
-      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback and strict mechanical-metadata ordinary-CI path implemented. Final exact-head full release verification remains mandatory. Remote timing comparison and final release queue behavior remain unverified."
+      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback, strict mechanical-metadata ordinary-CI path and read-only timing collection are implemented. Remote timing comparison and reuse behavior on the next real signed release remain unverified."
     }
   ],
   "release_ready": false,

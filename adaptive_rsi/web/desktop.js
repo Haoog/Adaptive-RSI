@@ -20,14 +20,16 @@ if(window.__TAURI_INTERNALS__){
   const title=document.createElement('h2');title.textContent=t('运行机器');
   const hint=document.createElement('p');hint.textContent=t('连接服务器时粘贴 HTTPS 认证地址。账号和项目保留在运行机器，关闭客户端不会停止服务器任务。');
   const ownership=document.createElement('p');ownership.className='muted';ownership.hidden=info.kind!=='local'||info.owned;
+  const compatibility=document.createElement('p');compatibility.className='muted';compatibility.hidden=true;
   const input=document.createElement('input');input.type='password';input.autocomplete='off';input.placeholder='https://rsi.example.com/?token=…';input.setAttribute('aria-label',t('服务器认证地址'));
   const error=document.createElement('p');error.className='form-error';error.hidden=true;
   const connect=document.createElement('button');connect.type='submit';connect.className='button primary';connect.textContent=t('连接服务器');
   const local=document.createElement('button');local.type='button';local.className='button';local.textContent=t('使用本机');
   const close=document.createElement('button');close.type='button';close.className='text-button';close.textContent=t('关闭');close.onclick=()=>dialog.close();
-  form.append(title,hint,ownership,input,error,connect,local,close);dialog.append(form);document.body.append(dialog);
+  form.append(title,hint,ownership,compatibility,input,error,connect,local,close);dialog.append(form);document.body.append(dialog);
   async function change(url){connect.disabled=local.disabled=true;error.hidden=true;try{await invoke('connect',{url});input.value='';location.reload();}catch(e){error.textContent=String(e);error.hidden=false;}finally{connect.disabled=local.disabled=false;}}
   form.onsubmit=e=>{e.preventDefault();change(input.value.trim());};local.onclick=()=>change(null);machine.onclick=()=>dialog.showModal();
+  if(info.kind==='remote'&&info.api_version===1){compatibility.hidden=false;compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');}
   if(!info.connected){error.textContent=info.error;error.hidden=false;dialog.showModal();}
   const folder=document.createElement('button');folder.type='button';folder.className='button';folder.textContent=t('选择文件夹');
   folder.onclick=()=>safe(async()=>{if(info.kind!=='local')throw Error(t('远端项目请填写服务器上的路径。'));const path=await invoke('choose_folder');if(path)document.getElementById('project-path').value=path;});
@@ -36,6 +38,7 @@ if(window.__TAURI_INTERNALS__){
    machine.textContent=t(info.name||'连接运行机器');title.textContent=t('运行机器');
    hint.textContent=t('连接服务器时粘贴 HTTPS 认证地址。账号和项目保留在运行机器，关闭客户端不会停止服务器任务。');
    ownership.textContent=t('当前连接已有本机服务，退出软件不会停止它。');
+   compatibility.textContent=t('远端服务为旧版 API。基础功能可继续使用；不支持的操作会提示升级服务。');
    input.setAttribute('aria-label',t('服务器认证地址'));connect.textContent=t('连接服务器');local.textContent=t('使用本机');close.textContent=t('关闭');folder.textContent=t('选择文件夹');
   };
   window.RSIDesktop.translate();

@@ -852,3 +852,9 @@ input:disabled,select:disabled {
 .readable-diff .diff-file{margin:0 0 8px;min-width:0}.readable-diff .diff-file>summary{white-space:normal;overflow-wrap:anywhere;position:sticky;top:0;background:#f2f5ef;padding:10px;cursor:pointer}.readable-diff .diff-file>pre{max-height:none;white-space:pre;overflow:visible;margin:0;padding:8px}.readable-diff.diff-wrap .diff-file>pre{white-space:pre-wrap;overflow-wrap:anywhere}.readable-diff .diff-file>pre>div{min-height:1.5em}
 
 .readable-diff .diff-file>pre>div{scroll-margin-top:64px}
+
+/* 安全关闭进度覆盖层；阶段与剩余工作来自 /api/shutdown-status。 */
+.shutdown-overlay{position:fixed;inset:0;z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:24px;text-align:center;background:#0c120de6;color:#e7efe6}
+.shutdown-overlay h2{margin:0;font-size:1.1rem}
+.shutdown-overlay p{margin:0;color:#a9b8a6}
+#capability-notice{margin:0 0 12px}

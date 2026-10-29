@@ -70,6 +70,47 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), {"started": False, "update": pending})
 
+    def test_diagnostic_export_requires_consent_and_recomputes_allowlisted_preview(self):
+        secret = "private-key-and-source-text"
+        self.store.execute("INSERT INTO runs(id,project,state,result) VALUES ('r','p',?,?)",
+                           (secret, json.dumps({"failure": {"code": secret}})))
+        self.store.put_setting("secret", secret)
+        status, _, payload = self.request("/api/diagnostics/preview")
+        self.assertEqual(status, 200)
+        preview = json.loads(payload)
+        self.assertEqual(set(preview), {"format", "version", "created", "included",
+                                        "row_counts", "invalid_evidence_count", "sqlite_version"})
+        self.assertNotIn(secret, payload.decode())
+        status, _, payload = self.request("/api/diagnostics/export", "POST", {"consent": False})
+        self.assertEqual(status, 400)
+        self.assertNotIn(secret, payload.decode())
+        status, _, payload = self.request("/api/diagnostics/export", "POST",
+                                          {"consent": True, "preview": {"secret": secret}})
+        self.assertEqual(status, 400)
+        status, _, payload = self.request("/api/diagnostics/export", "POST", {"consent": True})
+        self.assertEqual(status, 200)
+        exported = json.loads(payload)
+        self.assertEqual(exported["filename"], "adaptive-rsi-diagnostics.json")
+        body = json.loads(exported["body"])
+        self.assertEqual(set(body), set(preview))
+        self.assertNotIn(secret, exported["body"])
+
+    def test_shutdown_status_exposes_phase_and_remaining_work(self):
+        self.runtime.shutdown_status = lambda: {"phase": "workers", "started": 1.0, "ended": None,
+                                                "remaining_workers": 2, "remaining_operations": 1,
+                                                "maintenance_running": False}
+        status, _, payload = self.request("/api/shutdown-status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"phase": "workers", "started": 1.0, "ended": None,
+                                               "remaining_workers": 2, "remaining_operations": 1,
+                                               "maintenance_running": False})
+        # The probe must remain readable after the runtime closes its store,
+        # because the overlay keeps polling until the process exits.
+        self.store.close()
+        status, _, payload = self.request("/api/shutdown-status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["phase"], "workers")
+
     def test_rotation_is_private_atomic_and_preserves_cookie_contract(self):
         old_token = self.server.token
         status, headers, payload = self.request("/api/session/rotate", "POST")

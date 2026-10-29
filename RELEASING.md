@@ -78,3 +78,17 @@ Codex 已加载的插件元数据仍需刷新 marketplace 并重启 Codex。成�
 可选 `updates.require_provenance=true` 会在安装前额外核对 GitHub attestation；默认关闭，详见 [本批加固与配置说明](docs/audit-hardening.md)。桌面 Developer ID 和公证通路需要真实 Apple 凭据；缺少凭据时仍为 ad-hoc 产物。
 
 纯机械版本 PR 只有在六个改动文件逐字匹配独立重建的发布补丁时，普通 CI 才走版本元数据检查；源码、工作流、分类器或生成脚本有变化均走完整普通 CI。该路径减少重复源码检查，自动合并版本 PR 仍必须通过 `release-verify.yml` 对最终提交的全量 Python、浏览器、桌面构建、smoke 和 provenance 门禁。耗时缓存只影响工作线程分配；无效记录回退完整发现，缓存不能跳过测试。
+
+## 桌面平台支持矩阵
+
+`scripts/package_desktop.py` 中的 `SUPPORTED_TARGETS` 是唯一来源；`python3 -B scripts/package_desktop.py --print-support-matrix` 输出同一矩阵的 JSON 且不触发构建。打包入口按当前 `system`/`machine` 校验目标，未支持的组合以清晰错误退出（退出码 2 或 `ValueError`），不会静默产出资产。表中「已验证」表示存在可复核的构建或校验证据，「部分」表示只覆盖部分环节，仍需人工确认。
+
+| 平台组合 | 状态 | 签名 | 构建证据 | 安装证据 | 更新证据 |
+| --- | --- | --- | --- | --- | --- |
+| macOS arm64（`Darwin` + `arm64`/`aarch64`） | 支持 | ad-hoc | 已验证：CI 构建 DMG，并校验磁盘映像、应用签名与包内 engine | 部分：已校验 DMG 挂载、签名与包内 engine；拖入「应用程序」后的首次启动仍需人工确认 | 部分：签名更新归档与 `desktop-latest.json` 已校验；旧桌面版本迁移仍需手动安装一次 |
+| macOS x86_64（`Darwin` + `x86_64`） | 不支持 | 无 | 不支持 | 不支持 | 不支持 |
+| Windows（`Windows` + `x86_64`/`arm64`） | 不支持 | 无 | 不支持 | 不支持 | 不支持 |
+| Linux（`Linux` + `x86_64`/`arm64`） | 不支持 | 无 | 不支持 | 不支持 | 不支持 |
+| 其他未识别组合 | 不支持 | 无 | 不支持 | 不支持 | 不支持 |
+
+未支持组合的原因一致：当前没有该平台的构建、签名和更新端到端证据。Windows 与 Linux 目前不支持，不得据此宣称已支持；ad-hoc 签名也不等于 Developer ID 签名或公证。

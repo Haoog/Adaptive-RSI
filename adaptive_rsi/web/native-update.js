@@ -1,14 +1,75 @@
 'use strict';
 window.RSINativeUpdate=(()=>{
- const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
- const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。'};
+ const labels={checking:'正在检查更新',latest:'已是最新稳定版',available:'发现新版本',downloading:'正在下载新版本…',verifying:'正在校验签名',replacing:'正在替换应用',ready:'新版本已准备好',waiting_idle:'等待当前任务结束后更新',installing:'正在安装更新',restarting:'正在重启应用',error:'更新未完成'};
+ const errors={update_target_changed:'更新目标已变化或撤回，请重新检查并确认。',update_window_closed:'安装窗口已结束，下一次允许的空闲窗口会重新尝试。',updater_key_missing:'当前安装包尚未配置更新签名，请手动安装支持自动更新的版本。',update_disk_space:'磁盘可用空间不足，请清理后重试。',update_download_or_signature_failed:'下载或签名验证失败，当前版本继续可用。',update_wait_cancelled:'已取消等待更新，当前任务继续运行。',update_install_failed:'安装未完成，请重试或手动安装。',update_incompatible_platform:'此更新包与当前系统或架构不兼容，当前版本继续可用。',update_connect_timeout:'连接更新服务器超时，当前版本继续可用。请检查网络后重试。',update_response_timeout:'更新服务器响应超时，当前版本继续可用。',update_download_timeout:'下载新版本超过总时限，已停止。当前版本继续可用。',update_transfer_stalled:'下载长时间没有数据，已停止。当前版本继续可用。',update_connection_failed:'无法连接更新服务器，当前版本继续可用。',update_download_incomplete:'更新包下载不完整，已保留进度，可重试续传。',update_range_rejected:'服务器拒绝续传分段，已删除分段；请重试重新下载。'};
  let snapshot={},busy=false,checking=false,nodes=null,failures=0,retryAt=0,storageError=false,polling=false,installRetryAt=0,automaticInstall=false;
+ let runtimeInfo=null,lastSample=null,currentSpeed=0;
  const failureCounts={};
  let policy=localRead('rsi-native-update-policy')||'download';
  let versionScope=localRead('rsi-native-update-scope')||'patch',installWindow=localRead('rsi-native-update-window')||'any';
  const enabled=()=>!!window.RSIDesktop;
  const preference=()=>policy;
  function persist(key,value){try{localStorage.setItem(key,value);return true;}catch{storageError=true;return false;}}
+ function formatBytes(value){
+  const size=Number(value);
+  if(!Number.isFinite(size)||size<0)return '';
+  if(size<1024)return size+' B';
+  const units=['KB','MB','GB','TB'],index=Math.min(units.length-1,Math.floor(Math.log(size)/Math.log(1024))-1);
+  return (size/1024**(index+1)).toFixed(index?1:0)+' '+units[index];
+ }
+ function speedText(value){
+  const rate=Number(value);
+  return Number.isFinite(rate)&&rate>0?formatBytes(rate)+'/s':'';
+ }
+ function phaseOf(snapshot){
+  snapshot=snapshot||{};
+  if(snapshot.state==='verifying')return 'verifying';
+  if(snapshot.state==='downloading'){
+   const total=Number(snapshot.total)||0,bytes=Number(snapshot.bytes)||0;
+   // A fully transferred stream with a known size is waiting on signature
+   // verification, even before the backend publishes the explicit stage.
+   return snapshot.stage==='verifying'||snapshot.verifying===true||total>0&&bytes>=total?'verifying':'downloading';
+  }
+  return snapshot.state==='installing'||snapshot.state==='replacing'?'replacing':String(snapshot.state||'');
+ }
+ function progressText(snapshot){
+  snapshot=snapshot||{};
+  if(phaseOf(snapshot)!=='downloading')return '';
+  const total=Number(snapshot.total),known=Number.isFinite(total)&&total>0,bytes=Number(snapshot.bytes)||0,parts=[];
+  // An unknown or empty total must never produce a percentage or a guessed size.
+  if(known)parts.push(Math.min(100,Math.round(bytes/total*100))+'%');
+  parts.push(formatBytes(bytes)+(known?' / '+formatBytes(total):''));
+  const speed=speedText(snapshot.speed!=null?snapshot.speed:snapshot.bytes_per_second);
+  if(speed)parts.push(speed);
+  return parts.join(' · ');
+ }
+ function reasonCount(reasons){
+  if(Array.isArray(reasons))return reasons.length;
+  const count=Number(reasons);
+  return Number.isFinite(count)&&count>0?Math.floor(count):0;
+ }
+ function statusText(snapshot){
+  snapshot=snapshot||{};
+  const phase=phaseOf(snapshot);
+  if(phase==='waiting_idle'){
+   const count=reasonCount(snapshot.reasons);
+   return count?t('等待 {count} 项本机任务结束后更新').replace('{count}',String(count)):t('等待当前任务结束后更新');
+  }
+  return t(labels[phase]||'桌面应用');
+ }
+ function scopeText(info){
+  const neutral='更新本机客户端；当前无法判断服务影响范围。';
+  if(!info||typeof info!=='object'||typeof info.kind!=='string')return neutral;
+  if(info.kind==='remote')return '只更新本机客户端，远端服务不受影响。';
+  if(info.kind==='local')return info.owned===true?'更新本机客户端并先排空自有服务任务。':'只更新本机客户端，不停止已有本机服务。';
+  return neutral;
+ }
+ function errorText(code){return t(errors[code]||'更新未完成，请重试或手动安装。');}
+ function sampleSpeed(previous,current,elapsed){
+  const before=Number(previous),after=Number(current),ms=Number(elapsed);
+  if(!Number.isFinite(before)||!Number.isFinite(after)||!Number.isFinite(ms)||ms<=0||after<before)return 0;
+  return (after-before)*1000/ms;
+ }
  function ensurePanel(){
   if(nodes)return;
   const panel=el('section',undefined,'native-update-panel');panel.id='native-update-panel';
@@ -39,15 +100,29 @@ window.RSINativeUpdate=(()=>{
   panel.append(status,progress,error,details,label,scopeLabel,windowLabel,scope,...Object.values(buttons).map(row=>row[0]),manual,receipt,saved);
   $('update-status').after(panel);
   nodes={panel,status,progress,error,details,summary,notes,labelText,select,options,buttons,manual,receipt,scope,saved,scopeText,scopeSelect,scopeOptions,windowText,windowSelect,windowOptions};
+  bindRuntime();
+ }
+ function bindRuntime(){
+  let source;try{source=window.RSIDesktop&&window.RSIDesktop.ready;}catch{source=null;}
+  if(!source||typeof source.then!=='function')return;
+  // Scope text must come from the live runtime_info; never infer ownership.
+  source.then(info=>{runtimeInfo=info&&typeof info==='object'?info:null;render();},()=>{});
+ }
+ function observe(next){
+  const now=Date.now(),bytes=Number(next&&next.bytes)||0,same=lastSample&&lastSample.version===(next&&next.version);
+  currentSpeed=same?sampleSpeed(lastSample.bytes,bytes,now-lastSample.time):0;
+  lastSample=next&&next.state==='downloading'?{version:next.version,bytes,time:now}:null;
+  return currentSpeed;
  }
  function render(){
   if(!enabled())return;
   ensurePanel();
-  const n=nodes;
-  n.status.textContent=t(labels[snapshot.state]||'桌面应用')+(snapshot.version?' · '+snapshot.version:'');
-  n.progress.hidden=snapshot.state!=='downloading';
-  n.progress.textContent=Math.round((snapshot.bytes||0)/1048576)+' MB'+(snapshot.total?' / '+Math.round(snapshot.total/1048576)+' MB':'');
-  n.error.hidden=!snapshot.error_code;n.error.textContent=snapshot.error_code?t(errors[snapshot.error_code]||'更新未完成，请重试或手动安装。'):'';
+  const n=nodes,phase=phaseOf(snapshot);
+  observe(snapshot);
+  n.status.textContent=statusText(snapshot)+(snapshot.version?' · '+snapshot.version:'');
+  n.progress.hidden=phase!=='downloading';
+  n.progress.textContent=progressText(Object.assign({},snapshot,{speed:Number(snapshot.bytes_per_second)>0?snapshot.bytes_per_second:currentSpeed}));
+  n.error.hidden=!snapshot.error_code;n.error.textContent=snapshot.error_code?errorText(snapshot.error_code):'';
   n.details.hidden=!snapshot.notes;n.summary.textContent=t('这个版本更新了什么');
   if(n.notes.textContent!==(snapshot.notes||''))n.notes.textContent=snapshot.notes||'';
   n.labelText.textContent=t('桌面更新策略');n.select.setAttribute('aria-label',t('桌面更新策略'));
@@ -56,7 +131,7 @@ window.RSINativeUpdate=(()=>{
   n.windowText.textContent=t('自动安装时间');n.windowSelect.setAttribute('aria-label',t('自动安装时间'));
   for(const [option,text] of [...n.scopeOptions,...n.windowOptions])option.textContent=t(text);
   if(document.activeElement!==n.select)n.select.value=policy;
-  n.scope.textContent=t('更新本机客户端；仅自有本机服务会排空任务，远端服务不受影响。');
+  n.scope.textContent=t(scopeText(runtimeInfo));
   for(const [action,[button,text]] of Object.entries(n.buttons)){
    button.textContent=t(text);button.disabled=action!=='cancel'&&busy;
    button.hidden=action==='download'?snapshot.state!=='available':action==='install'?snapshot.state!=='ready':action==='cancel'?!['downloading','waiting_idle'].includes(snapshot.state):false;
@@ -123,5 +198,5 @@ window.RSINativeUpdate=(()=>{
  }
 
  document.addEventListener('DOMContentLoaded',()=>{if(!enabled())return;render();setTimeout(()=>safe(tick),5000);setInterval(()=>safe(tick),1000);});
- return {render,run,tick,eligible,withinWindow};
+ return {render,run,tick,eligible,withinWindow,phaseOf,statusText,progressText,formatBytes,speedText,sampleSpeed,scopeText,errorText};
 })();

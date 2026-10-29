@@ -78,3 +78,17 @@ Already loaded Codex plugin metadata still requires a marketplace refresh and Co
 Optional `updates.require_provenance=true` additionally verifies GitHub attestations before installation; it defaults to off. See [batch hardening and configuration](docs/audit-hardening.en.md). The desktop Developer ID and notarization path needs real Apple credentials; builds without them remain ad-hoc.
 
 Mechanical version PRs take a metadata-only path in ordinary CI only when their six changed files exactly match an independently reconstructed release patch. Any source, workflow, classifier or generator change requires the full ordinary CI path. This removes duplicate source checks; automatic release merge still requires the exact-head full Python, browser, desktop build, smoke and provenance gate in `release-verify.yml`. Timing caches affect worker distribution only. Invalid entries fall back to complete discovery, and cached timings never skip tests.
+
+## Desktop platform support matrix
+
+`SUPPORTED_TARGETS` in `scripts/package_desktop.py` is the single source of truth. `python3 -B scripts/package_desktop.py --print-support-matrix` prints the same matrix as JSON without building anything. The packaging entry point checks the current `system`/`machine`, and unsupported combinations exit with a clear error (exit code 2 or `ValueError`) instead of silently producing an asset. In the table, “Verified” means reviewable build or verification evidence exists, and “Partial” means only part of the path is covered and manual confirmation is still required.
+
+| Platform combination | Status | Signing | Build evidence | Install evidence | Update evidence |
+| --- | --- | --- | --- | --- | --- |
+| macOS arm64 (`Darwin` + `arm64`/`aarch64`) | Supported | ad-hoc | Verified: CI builds the DMG and verifies the disk image, the app signature and the bundled engine | Partial: the DMG mount, signature and bundled engine are verified; the first launch after dragging the app into Applications still needs manual confirmation | Partial: the signed updater archive and `desktop-latest.json` are verified; moving an older desktop install still needs one manual installation |
+| macOS x86_64 (`Darwin` + `x86_64`) | Unsupported | none | Unsupported | Unsupported | Unsupported |
+| Windows (`Windows` + `x86_64`/`arm64`) | Unsupported | none | Unsupported | Unsupported | Unsupported |
+| Linux (`Linux` + `x86_64`/`arm64`) | Unsupported | none | Unsupported | Unsupported | Unsupported |
+| Any other unrecognized combination | Unsupported | none | Unsupported | Unsupported | Unsupported |
+
+Every unsupported combination has the same reason: there is no build, signing or updater end-to-end evidence for that platform. Windows and Linux are not supported, and nothing here may be read as claiming otherwise; ad-hoc signing is also not Developer ID signing or notarization.

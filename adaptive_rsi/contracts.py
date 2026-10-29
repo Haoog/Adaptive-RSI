@@ -11,6 +11,8 @@ CAPABILITIES = {
     "config-revisions": "optimistic concurrency for settings changes",
     "state-snapshot": "related state fields read from one database snapshot",
     "documented-state": "JSON schema for the state response",
+    "diagnostics-preview": "minimal allowlisted diagnostic preview with explicit-consent export",
+    "shutdown-progress": "readable graceful shutdown phase and remaining work",
 }
 
 ERRORS = {

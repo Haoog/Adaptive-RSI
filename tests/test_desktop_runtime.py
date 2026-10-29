@@ -11,8 +11,40 @@ from unittest.mock import Mock
 import urllib.request
 from pathlib import Path
 
-from adaptive_rsi.desktop import existing_session
+from adaptive_rsi.desktop import drain_before_shutdown, existing_session
 from adaptive_rsi.store import Store
+
+
+class DesktopShutdownOrderTest(unittest.TestCase):
+    def test_runtime_drains_before_the_listening_server_stops(self):
+        events = []
+
+        class Runtime:
+            def close(self):
+                events.append("runtime.close")
+
+        class Server:
+            def shutdown(self):
+                events.append("server.shutdown")
+
+        drain_before_shutdown(Runtime(), Server())
+        self.assertEqual(events, ["runtime.close", "server.shutdown"])
+
+    def test_server_still_stops_when_runtime_close_raises(self):
+        events = []
+
+        class Runtime:
+            def close(self):
+                events.append("runtime.close")
+                raise RuntimeError("drain failed")
+
+        class Server:
+            def shutdown(self):
+                events.append("server.shutdown")
+
+        with self.assertRaisesRegex(RuntimeError, "drain failed"):
+            drain_before_shutdown(Runtime(), Server())
+        self.assertEqual(events, ["runtime.close", "server.shutdown"])
 
 
 class DesktopRuntimeTest(unittest.TestCase):

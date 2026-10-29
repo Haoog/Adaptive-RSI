@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, Submenu},
     tray::TrayIconBuilder,
     Manager,
 };
@@ -46,6 +46,7 @@ struct RuntimeState {
     generation: AtomicU64,
     pid: AtomicU32,
     recovering: AtomicBool,
+    remote_meta: Mutex<Value>,
 }
 
 ///桌面应用自身的更新状态；percent 存百分比×100，避免浮点原子。
@@ -84,6 +85,13 @@ static BACKUP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BACKUP_CANCEL: AtomicBool = AtomicBool::new(false);
 static BACKUP_BYTES: AtomicU64 = AtomicU64::new(0);
 static BACKUP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Remote runtimes may expose API v1 or v2; the bundled local runtime must
+/// match the client and provide the v2 capability contract.
+fn supported_remote_api(version: u64) -> bool {
+    matches!(version, 1 | 2)
+}
 
 fn update_client() -> Result<Client, String> {
     // 资产下载会经过 GitHub 的 https 重定向；只跟随 https，且限制跳数。
@@ -1018,17 +1026,82 @@ fn cancel_request(state: tauri::State<RuntimeState>, id: String) {
 }
 #[tauri::command]
 fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
+    let meta = state.remote_meta.lock().unwrap().clone();
     match state.target.lock().unwrap().as_ref() {
         Some(c) => {
-            json!({"name":c.name,"scope":c.origin,"connected":true,"kind":if c.origin.starts_with("http://127.0.0.1:"){"local"}else{"remote"},"owned":c.owned})
+            json!({"name":c.name,"scope":c.origin,"connected":true,"kind":if c.origin.starts_with("http://127.0.0.1:"){"local"}else{"remote"},"owned":c.owned,
+                   "api_version":meta.get("api_version").cloned().unwrap_or(Value::Null),
+                   "capabilities":meta.get("capabilities").cloned().unwrap_or_else(|| json!([]))})
         }
         None => json!({"connected":false,"error":state.error.lock().unwrap().clone()}),
     }
 }
 #[tauri::command]
+fn set_native_language(app: tauri::AppHandle, language: String) {
+    let english = language.to_ascii_lowercase().starts_with("en");
+    let Some(menu) = app.menu() else { return };
+    let Some(commands_item) = menu.get("commands") else { return };
+    let Some(commands) = commands_item.as_submenu() else { return };
+    for (id, zh, en) in [
+        ("app-open", "打开主窗口", "Open Main Window"),
+        ("app-check-update", "检查更新", "Check for Updates"),
+        ("app-diagnostics", "导出诊断包", "Export Diagnostics"),
+    ] {
+        if let Some(item) = commands.get(id) {
+            if let Some(item) = item.as_menuitem() {
+                let _ = item.set_text(if english { en } else { zh });
+            }
+        }
+    }
+    let _ = commands.set_text(if english { "Commands" } else { "命令" });
+    let Ok(items) = menu.items() else { return };
+    if let Some(app_menu) = items.first().and_then(|item| item.as_submenu()) {
+        if let Some(quit_item) = app_menu.get("app-quit") {
+            if let Some(quit) = quit_item.as_menuitem() {
+                let _ = quit.set_text(if english { "Quit Adaptive RSI" } else { "退出 Adaptive RSI" });
+            }
+        }
+    }
+}
+#[tauri::command]
+fn quit_gracefully(app: tauri::AppHandle) -> Result<(), String> {
+    if QUITTING.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    if app.state::<RuntimeState>().child.lock().unwrap().is_none() {
+        app.exit(0);
+        return Ok(());
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.eval(
+            "window.dispatchEvent(new CustomEvent('rsi-app-shutdown'))",
+        );
+    }
+    std::thread::spawn(move || {
+        // Give the webview one frame to render the shutdown overlay before the
+        // runtime starts draining. The overlay polls /api/shutdown-status while
+        // this thread waits for the child, then the app exits.
+        std::thread::sleep(Duration::from_millis(350));
+        let state = app.state::<RuntimeState>();
+        let mut child = state.child.lock().unwrap().take();
+        if let Some(child) = child.as_mut() {
+            let _ = child.stdin.take();
+            if !wait_for_child(child, Duration::from_secs(30)) {
+                let _ = child.kill();
+                let _ = wait_for_child(child, Duration::from_secs(2));
+            }
+        }
+        app.exit(0);
+    });
+    Ok(())
+}
+#[tauri::command]
 async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, String> {
     let state = app.state::<RuntimeState>();
     state.transport.cancel_all();
+    *state.remote_meta.lock().unwrap() = Value::Null;
     let _connection_change = state.transport.gate.write().await;
     if url.as_deref().unwrap_or("").is_empty() {
         let handle = app.clone();
@@ -1041,6 +1114,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
                 .clone()
                 .ok_or("Local runtime is unavailable")?;
             *state.target.lock().unwrap() = Some(local);
+            *state.remote_meta.lock().unwrap() = Value::Null;
             Ok(runtime_info(state.clone()))
         })
         .await
@@ -1064,6 +1138,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         return Err("Enter the authenticated HTTPS server root URL with its token".into());
     }
     let origin = parsed.origin().ascii_serialization();
+    let app_handle = app.clone();
     let connection = tauri::async_runtime::spawn_blocking(move || {
         let (client, transport) = transport::clients()?;
         let response = client
@@ -1086,9 +1161,13 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         let health = call(&c, "health", None)?;
         let value: Value =
             serde_json::from_str(&health.body).map_err(|_| "Invalid runtime handshake")?;
-        if health.status != 200 || !matches!(value.get("api_version").and_then(Value::as_u64), Some(1 | 2)) {
+        if health.status != 200 || !value.get("api_version").and_then(Value::as_u64).is_some_and(supported_remote_api) {
             return Err("Update the remote runtime before connecting".into());
         }
+        *app_handle.state::<RuntimeState>().remote_meta.lock().unwrap() = json!({
+            "api_version": value.get("api_version").cloned().unwrap_or(Value::Null),
+            "capabilities": value.get("capabilities").cloned().unwrap_or_else(|| json!([])),
+        });
         let response = call(&c, "state?sections=core", None)?;
         let value: Value =
             serde_json::from_str(&response.body).map_err(|_| "Invalid runtime state")?;
@@ -1217,6 +1296,8 @@ fn main() {
             ,native_update
             ,download_backup
             ,backup_download_status
+            ,quit_gracefully
+            ,set_native_language
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1244,6 +1325,47 @@ fn main() {
                 }
             })?;
             let open = MenuItem::with_id(app, "open", "打开 Adaptive RSI", true, None::<&str>)?;
+            let app_open = MenuItem::with_id(app, "app-open", "打开主窗口", true, Some("CmdOrCtrl+Shift+O"))?;
+            let app_update = MenuItem::with_id(app, "app-check-update", "检查更新", true, Some("CmdOrCtrl+Shift+U"))?;
+            let app_diagnostics = MenuItem::with_id(app, "app-diagnostics", "导出诊断包", true, Some("CmdOrCtrl+Shift+D"))?;
+            let app_quit = MenuItem::with_id(app, "app-quit", "退出 Adaptive RSI", true, Some("CmdOrCtrl+Q"))?;
+            let commands = Submenu::with_id_and_items(app, "commands", "命令", true,
+                &[&app_open, &app_update, &app_diagnostics])?;
+            // Keep the platform default menus (Edit/Window/Help and text-editing
+            // shortcuts) and replace only the app menu's quit entry with the
+            // draining quit command.
+            let menu = Menu::default(app.handle())?;
+            if let Some(app_submenu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
+                let count = app_submenu.items()?.len();
+                if count > 0 { let _ = app_submenu.remove_at(count - 1); }
+                app_submenu.append(&app_quit)?;
+            }
+            menu.insert(&commands, 1)?;
+            app.set_menu(menu)?;
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "app-open" => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                    }
+                }
+                "app-check-update" => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                        let _ = w.eval("window.dispatchEvent(new CustomEvent('rsi-native-command',{detail:{command:'check-update'}}))");
+                    }
+                }
+                "app-diagnostics" => {
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.show();
+                        let _ = w.set_focus();
+                        let _ = w.eval("window.dispatchEvent(new CustomEvent('rsi-native-command',{detail:{command:'export-diagnostics'}}))");
+                    }
+                }
+                "app-quit" => { let _ = quit_gracefully(app.clone()); }
+                _ => {}
+            });
             let quit = MenuItem::with_id(app, "quit", "退出 Adaptive RSI", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
             let mut tray =
@@ -1256,7 +1378,7 @@ fn main() {
                                 let _ = w.set_focus();
                             }
                         }
-                        "quit" => app.exit(0),
+                        "quit" => { let _ = quit_gracefully(app.clone()); }
                         _ => {}
                     });
             if let Some(icon) = app.default_window_icon() {
@@ -1292,7 +1414,14 @@ mod regression_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::valid_api_path;
+    use super::{supported_remote_api, valid_api_path};
+    #[test]
+    fn remote_runtime_accepts_only_supported_api_versions() {
+        assert!(supported_remote_api(1));
+        assert!(supported_remote_api(2));
+        assert!(!supported_remote_api(0));
+        assert!(!supported_remote_api(3));
+    }
     #[test]
     fn api_paths_cannot_escape_authenticated_origin() {
         for path in [
