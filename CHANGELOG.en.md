@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.131
+
+<!-- adaptive-rsi-release:0.5.131;base:5059592abd76fdf7e43f136411e26422aa7ebcc7 -->
+
 - Automatic retention respects run and project legal holds and safely removes expired read-only dependency copies.
 - Cancellation revokes candidate approval and unstarted delivery jobs; archived projects reject retries and requirement revisions.
 - Catalog and call pricing share connection-version identity; price edits submit only changed fields.
