@@ -3490,7 +3490,7 @@
       "validation": [
         "python3 -B -m unittest tests.test_validation_planning tests.test_release_parallel tests.test_release"
       ],
-      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback, strict mechanical-metadata ordinary-CI path and read-only timing collection are implemented. Remote timing comparison and reuse behavior on the next real signed release remain unverified."
+      "residual": "Independent release jobs, measured selector timing, malformed-cache fallback, strict mechanical-metadata ordinary-CI path and read-only timing collection are implemented. The v0.5.128 formal release reused the verified artifact end to end and skipped fallback gates. A full fallback rebuild release, remote timing comparison and final release queue behavior remain unverified."
     }
   ],
   "release_ready": false,
