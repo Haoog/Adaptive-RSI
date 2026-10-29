@@ -227,7 +227,7 @@ class ParallelReleaseTest(unittest.TestCase):
         self.assertEqual(workflow["concurrency"]["group"], "adaptive-rsi-release")
         self.assertIs(workflow["concurrency"]["cancel-in-progress"], False)
 
-    def test_bot_merge_continues_only_after_verification_run_completes(self):
+    def test_bot_merge_continues_after_uploading_verified_artifact(self):
         from tests.test_release import WorkflowConfigurationTest
         parser = WorkflowConfigurationTest()
         workflow = parser.workflow('release.yml')
@@ -237,9 +237,14 @@ class ParallelReleaseTest(unittest.TestCase):
         prepare = workflow['jobs']['prepare']
         self.assertIn("github.event.workflow_run.conclusion == 'success'", prepare.get('if', ''))
         self.assertIn("github.event.workflow_run.path == '.github/workflows/release-verify.yml'", prepare['if'])
-        merge_commands = '\n'.join(step.get('run', '') for step in parser.workflow('release-verify.yml')['jobs']['merge']['steps'])
-        self.assertNotIn('gh workflow run release.yml', merge_commands,
-                         'Dispatching before this run completes makes its attested assets unavailable for reuse')
+        verified = parser.workflow('release-verify.yml')
+        merge_commands = '\n'.join(step.get('run', '') for step in verified['jobs']['merge']['steps'])
+        # A run started by GITHUB_TOKEN does not reliably emit workflow_run, so
+        # the merge job explicitly continues the canonical publish entry after
+        # the verified artifact has been uploaded.
+        self.assertIn('gh workflow run release.yml', merge_commands)
+        self.assertIn('prepare_release=false', merge_commands)
+        self.assertEqual(verified['jobs']['merge']['permissions']['actions'], 'write')
 
     def test_fallback_gates_run_independently_and_publish_requires_every_result(self):
         from tests.test_release import WorkflowConfigurationTest

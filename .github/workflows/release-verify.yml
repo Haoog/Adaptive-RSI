@@ -212,6 +212,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -225,3 +226,28 @@ jobs:
         run: |
           python3 scripts/release.py gate --pr "$PR_NUMBER" --sha "$PR_SHA"
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash --match-head-commit "$PR_SHA"
+      - name: 合并后继续正式发布
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr }}
+        run: |
+          # A workflow started by GITHUB_TOKEN does not reliably emit a
+          # workflow_run event. Wait until main visibly points at the merge
+          # commit, then dispatch the canonical publish entry. The verified
+          # artifact from this run is already uploaded by the verify job.
+          MAIN=""
+          MERGED=""
+          for attempt in $(seq 1 30); do
+            MAIN=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+            MERGED=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json mergeCommit --jq .mergeCommit.oid)
+            if [ -n "$MERGED" ] && [ "$MAIN" = "$MERGED" ]; then
+              break
+            fi
+            sleep 2
+          done
+          test -n "$MERGED"
+          test "$MAIN" = "$MERGED"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f prepare_release=false

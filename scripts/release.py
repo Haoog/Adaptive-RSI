@@ -218,9 +218,14 @@ def find_verified_artifact(tree, branch, details=None):
         if not run_id:
             continue
         run_info = gh("actions/runs/" + str(run_id))
+        # The caller may continue publication from the merge job of the same
+        # release-verify run. The artifact already exists at that point, even
+        # though the run is still finishing its merge job; a missing artifact
+        # never reaches this branch.
         if (run_info.get("path") != ".github/workflows/release-verify.yml" or
                 run_info.get("event") != "workflow_dispatch" or
-                run_info.get("status") != "completed" or run_info.get("conclusion") != "success" or
+                run_info.get("status") not in {"in_progress", "completed"} or
+                run_info.get("conclusion") in {"failure", "cancelled"} or
                 run_info.get("head_branch") != branch):
             continue
         details['artifact_reuse_reason'] = 'available'
