@@ -694,7 +694,7 @@ function valueFeedback(data){
  select.value=draft?draft.rating:(data.evidence_summary.value_feedback?.rating||'');note.value=draft?draft.note:(data.evidence_summary.value_feedback?.note||'');note.rows=2;note.maxLength=2000;
  label.append(select);noteLabel.append(note);status.setAttribute('role','status');
  // 详情会因状态或证据变化重建；未提交的评价草稿按运行保存在内存中，重建后继续显示。
- const remember=()=>{if(select.value||note.value)valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});else valueFeedbackDrafts.delete(key);};
+ const remember=()=>{valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});};
  select.addEventListener('change',remember);note.addEventListener('input',remember);
  const button=el('button',t('保存评价'),'text-button');button.type='submit';
  form.append(heading,hint,label,noteLabel,button,status);

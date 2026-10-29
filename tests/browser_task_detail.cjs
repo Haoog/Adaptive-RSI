@@ -106,11 +106,31 @@ async function checkTaskDetail(browser, url, errors) {
     await liveStatus.getByRole('button', {name: '重试', exact: true}).click();
     await liveStatus.waitFor({state: 'hidden', timeout: 15000});
     assert.equal(await page.locator('#live-task-outcome .value-feedback textarea').inputValue(), '尚未保存的草稿');
+    // 清空已保存评价同样是未提交草稿，不能被另一个窗口的评价或轮询重建覆盖。
+    await page.locator('#live-task-outcome .value-feedback select').selectOption('');
+    await page.locator('#live-task-outcome .value-feedback textarea').fill('');
+    liveSummary = '清空评价后的实时结果';
+    await page.locator('#live-task-outcome').filter({hasText: liveSummary}).waitFor({timeout: 15000});
+    assert.equal(await page.locator('#live-task-outcome .value-feedback select').inputValue(), '',
+      'rebuilding the detail must preserve an explicitly cleared rating');
+    assert.equal(await page.locator('#live-task-outcome .value-feedback textarea').inputValue(), '',
+      'rebuilding the detail must preserve an explicitly cleared note');
     await page.unroute(/\/api\/run\?id=detail-h3$/, runRoute);
+    const clearedFeedback = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/task/value-feedback' && response.request().method() === 'POST');
+    await page.locator('#live-task-outcome .value-feedback').getByRole('button', {name: '保存评价', exact: true}).click();
+    const clearResponse = await clearedFeedback;
+    assert.equal(clearResponse.status(), 200);
+    assert.equal(clearResponse.request().postDataJSON().rating, null);
+    assert.equal(clearResponse.request().postDataJSON().note, '');
+    const clearedRun = await page.evaluate(async () => (await fetch('/api/run?id=detail-h3')).json());
+    assert.equal(clearedRun.evidence_summary.value_feedback, null, 'saving the empty draft removes persisted feedback');
     // 注入的元数据/运行响应已经撤销；重开详情，让后续运行历史用例从服务端真实状态开始。
     await closeDetail(page);
     await openDetail(page, '详情历史任务', 'attention');
     await page.locator('#live-task-outcome').waitFor();
+    assert.equal(await page.locator('#live-task-outcome .value-feedback select').inputValue(), '');
+    assert.equal(await page.locator('#live-task-outcome .value-feedback textarea').inputValue(), '');
     const sections = page.locator('#detail-body > details.detail-section[data-run]');
     assert.equal(await sections.count(), 3, 'three run history sections');
     // 首个运行已随详情加载；中间与更早的运行懒加载。
