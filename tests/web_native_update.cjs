@@ -17,7 +17,9 @@ test('failed checks retry after short backoff without recording success',async()
  const f=fixture();await f.api.tick();assert.equal(f.saved.has('rsi-native-update-checked'),false);f.advance(10000);await f.api.tick();assert.equal(f.calls.filter(action=>action==='check').length,2);
 });
 test('manual preference survives disabled browser storage for this session',async()=>{
- const f=fixture(true);f.api.render();f.select().value='manual';f.select().onchange();await f.api.tick();assert.deepEqual(f.calls,['status']);assert.equal(f.select().value,'manual');
+ const f=fixture(true);f.api.render();f.select().value='manual';f.select().onchange();
+ for(let i=0;i<20&&!f.calls.includes('authorize');i++)await new Promise(resolve=>setImmediate(resolve));
+ await f.api.tick();assert.deepEqual(f.calls,['authorize','status']);assert.equal(f.select().value,'manual');
 });
 
 test('automatic eligibility respects exact patch/minor/stable boundaries',()=>{

@@ -40,12 +40,14 @@ const {chromium}=require('playwright');
    const detail=new URL(route.request().url()).searchParams.has('task');
    if(detail&&holdDetail){startedDetail();await new Promise(resolve=>{resolveDetail=resolve;});}
    const data={summary:totals,daily:[],roles:[],tasks:[{task:'unknown',title:background?'System: light':'未知用量验证',background,tokens:totals.tokens,unknown_calls:totals.unknown_calls,model_seconds:1,attempts:1,state:'failed'}],total:1};
-   if(detail)Object.assign(data,{call_total:1,calls:[{role:'planning',model:'fixture',provider:'fixture',effort:'high',state:'failed',created:100,usage_known:false,tokens:0,input_tokens:0,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0,seconds:1,unit:'unknown'}]});
+   if(detail)Object.assign(data,{references:{groups:[{role:'planning',model:'fixture',history:{status:'ok',samples:8,denominator:8,tokens:{p25:100,p75:400},seconds:{p25:1,p75:4}}}],min_samples:8},runs:[{id:'fixture-run',tokens:0,unknown_calls:1,model_seconds:1,retry_calls:1,recovered_stages:1}],call_total:1,calls:[{role:'planning',model:'fixture',provider:'fixture',effort:'high',state:'failed',created:100,usage_known:false,tokens:0,input_tokens:0,output_tokens:0,cache_read_tokens:0,cache_write_tokens:0,seconds:1,unit:'unknown'}]});
    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(data)});
   });
   await page.locator('#usage-refresh').click();await page.getByRole('button',{name:'查看用量明细',exact:true}).click();
   assert.equal(await page.locator('#usage-totals strong').first().textContent(),'用量未知');
   assert.equal(await page.locator('#usage-detail-content h2').textContent(),'未知用量验证');
+  await page.locator('#usage-detail-content .usage-reference').filter({hasText:'100–400 tokens'}).waitFor();
+  await page.locator('#usage-detail-content .usage-run').filter({hasText:'fixture-run'}).waitFor();
   await page.locator('#usage-detail-content p').filter({hasText:'输入 未知 / 输出 未知 / 缓存读取 未知 / 缓存写入 未知'}).waitFor();
   await page.locator('#usage-detail .close-dialog').click();background=true;
   await page.locator('#usage-refresh').click();

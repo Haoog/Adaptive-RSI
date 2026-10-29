@@ -37,6 +37,19 @@ UNAVAILABLE_OUTPUT = re.compile(
 DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 
+def validation_controls(config):
+    """Host-provided counterexamples are opt-in; models never synthesize them."""
+    validation = config.get("validation")
+    if validation is None:
+        return []
+    if not isinstance(validation, dict):
+        raise ValueError("Validation settings must be an object")
+    controls = validation.get("controls") or []
+    if not isinstance(controls, list):
+        raise ValueError("Validation controls must be a list")
+    return controls
+
+
 def host_tool_versions(checks):
     """Probe only known host tools, never execute candidate-provided binaries."""
     import hashlib
@@ -535,7 +548,7 @@ class Evaluator:
     def __init__(self, store):
         self.store = store
 
-    def validate_controls(self, source, checks, controls, directory, config, cancel=None):
+    def validate_controls(self, source, checks, controls, directory, config, cancel=None, seeds=None):
         """Execute host-owned criterion counterexamples through the same sandbox gate."""
         from .config import relative_path
         if not controls or len(controls) > 32 or not checks:
@@ -544,6 +557,7 @@ class Evaluator:
         root.mkdir(parents=True, exist_ok=False)
         sandbox = Sandbox(self.store.root, config)
         def execute(target):
+            self._seed_target(target, seeds, config)
             rows = []
             for setup in config["environment"]["setup"]:
                 result = sandbox.check(setup, target, cancel)
@@ -1021,6 +1035,30 @@ class Evaluator:
                             reason="Checks passed but the new regression test did not prove the planned change")
         if unavailable:
             data["reason"] = "Required check executable is unavailable; candidate remains unverified"
+        try:
+            controls = validation_controls(execution_config)
+        except ValueError as exc:
+            data["controls"] = {"decision": "insufficient_evidence", "reason": str(exc), "controls": []}
+            data.update(decision="insufficient_evidence", reason="Invalid host validation controls: " + str(exc))
+            controls = []
+        if controls:
+            if data["decision"] == "pass":
+                control_dir = Path(directory) / "controls"
+                if control_dir.exists():
+                    control_dir = Path(directory) / ("controls-" + str(time.time_ns()))
+                try:
+                    outcome = self.validate_controls(candidate, checks, controls, control_dir,
+                                                     execution_config, cancel, seeds=seeds)
+                except ValueError as exc:
+                    outcome = {"decision": "insufficient_evidence", "reason": str(exc), "controls": []}
+                data["controls"] = outcome
+                if outcome["decision"] != "pass":
+                    data.update(decision="insufficient_evidence",
+                                reason="Host counterexample controls were not detected: " +
+                                       (outcome.get("reason") or "control validation failed"))
+            else:
+                data["controls"] = {"decision": "not_run", "reason": "Candidate checks did not pass",
+                                    "controls": []}
         Path(directory).mkdir(parents=True, exist_ok=True)
         (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return data

@@ -867,13 +867,26 @@ class Store:
         if directory is None:
             directory = self.setting(prefix + "global:" + provider_id + ":" + signature, {})
         price = next((m.get("unit_price") for m in directory.get("models", []) if m["id"] == route["model"]), None)
+        if isinstance(price, (int, float)) and not isinstance(price, bool):
+            price = float(price)
+            if not math.isfinite(price) or not 0 <= price <= 1000000:
+                price = None
+        else:
+            price = None
+        from .usage import unit_prices
+        entry = next((m for m in directory.get("models", []) if m["id"] == route["model"]), {})
+        prices = unit_prices(entry.get("prices"))
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             call = uid()
-            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price,unit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price,unit,"
+                       "input_price,output_price,cache_read_price,cache_write_price,price_basis) "
+                       "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (call, project, run, role, route["model"], route["effort"], "reserved", now, provider_id, price,
                         "opencode_session" if provider.get("protocol") == "opencode" else
-                        "codex_session" if provider.get("protocol", "codex") in ["codex", "codex_login"] else "http_request"))
+                        "codex_session" if provider.get("protocol", "codex") in ["codex", "codex_login"] else "http_request",
+                        prices.get("input"), prices.get("output"), prices.get("cache_read"),
+                        prices.get("cache_write"), None))
             db.execute("UPDATE runs SET calls=calls+1 WHERE id=?", (run,))
         return call
 
@@ -881,12 +894,17 @@ class Store:
         values = details or {"tokens": 0, "input_tokens": 0, "output_tokens": 0,
                              "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_known": False}
         fields = ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]
+        from .usage import PRICE_FIELDS, estimate, unit_prices
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute("SELECT tokens,run FROM calls WHERE id=?", (call,)).fetchone()
+            previous = db.execute("SELECT tokens,run,unit_price,input_price,output_price,"
+                                  "cache_read_price,cache_write_price FROM calls WHERE id=?", (call,)).fetchone()
             if previous is None or previous["run"] != run:
                 raise ValueError("Usage call does not belong to run")
-            db.execute("UPDATE calls SET " + ",".join(field + "=?" for field in fields) + ",seconds=? WHERE id=?",
-                       (*[values[field] for field in fields], seconds, call))
+            prices = unit_prices({field: previous[field + "_price"] for field in PRICE_FIELDS})
+            _, basis = estimate(values, prices, previous["unit_price"])
+            db.execute("UPDATE calls SET " + ",".join(field + "=?" for field in fields) +
+                       ",seconds=?,price_basis=? WHERE id=?",
+                       (*[values[field] for field in fields], seconds, basis, call))
             db.execute("UPDATE runs SET tokens=max(0,tokens+?) WHERE id=?",
                        (values["tokens"] - previous["tokens"], run))

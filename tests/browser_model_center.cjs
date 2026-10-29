@@ -44,6 +44,18 @@ async function main() {
     assert.equal(await page.locator('#mc-credential-status').innerText(), '无需密钥');
     assert.equal(await step('mc-step-account').getAttribute('data-state'), 'done');
     assert.equal(await step('mc-step-models').getAttribute('data-state'), 'done');
+    await page.locator('#mc-model-list .model-more').first().locator('summary').click();
+    await page.locator('#mc-model-list').getByRole('button', {name: '估算价格', exact: true}).first().click();
+    await page.getByLabel('输入价格 / USD').fill('1.2');
+    await page.getByLabel('输出价格 / USD').fill('3.4');
+    await page.getByLabel('缓存读取价格 / USD').fill('0.2');
+    await page.getByLabel('缓存写入价格 / USD').fill('1.5');
+    const priced = page.waitForResponse(response => response.url().endsWith('/api/model-center/model') && response.request().method() === 'POST');
+    await page.locator('#mc-price-form button[type=submit]').click();
+    const priceResponse = await priced;
+    assert.equal(priceResponse.status(), 200);
+    assert.deepEqual(priceResponse.request().postDataJSON().model.prices, {input:1.2,output:3.4,cache_read:0.2,cache_write:1.5});
+    await page.locator('#mc-price-dialog').waitFor({state:'hidden'});
     // 文件密钥连接已获取目录：第 2 步完成。
     await pick('引用中转');
     assert.equal(await page.locator('#mc-credential-status').innerText(), '密钥已保存到本机私有文件');

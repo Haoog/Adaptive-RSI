@@ -1,6 +1,7 @@
 """Evidence integrity and dataset lifecycle acceptance without external models."""
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,7 @@ class AuditEvolutionTest(unittest.TestCase):
             return {'kind': 'strategy', 'guidance': 'small improvement', 'triggers': []}
         def execute(*args, **kwargs):
             self.calls['trial'] += 1
+            assert kwargs.get('experiment') is True
             return {'decision': 'pass' if args[7] else 'fail'}
         runtime = self.evolution.runtime
         runtime.invoke = invoke
@@ -63,6 +65,8 @@ class AuditEvolutionTest(unittest.TestCase):
                            ('broken-case', 'p', 'broken', 'validation', '{broken', 0, 5))
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
                            ('partial-case', 'p', 'partial', 'validation', encode({'task': 'x'}), 0, 6))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('broken-development', 'p', 'broken-dev', 'development', '{broken', 0, 7))
         result = self.evolution.propose_and_evaluate(*args)
         self.assertIn('status', result)
         self.assertEqual(self.calls['proposal'], 1)
@@ -74,13 +78,117 @@ class AuditEvolutionTest(unittest.TestCase):
                 self.evolution.propose_and_evaluate(*args)
         self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
 
-    @unittest.skip("待实现：付费前要求全新 holdout 与现有 max_holdout_uses 复用契约冲突")
     def test_no_fresh_holdout_stops_before_any_paid_call(self):
         args = self.setup_proposal(holdout_uses=1)
         result = self.evolution.propose_and_evaluate(*args)
         self.assertEqual(result['status'], 'insufficient_evidence')
         self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+        self.assertEqual(self.store.query('SELECT * FROM calls'), [])
         self.assertIn('fresh', result['reason'].lower())
+
+    def test_identical_failed_experiment_is_not_repeated_without_force(self):
+        args = self.setup_proposal()
+        first = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(first['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls, {'proposal': 1, 'trial': 8})
+        candidates = self.store.query('SELECT id FROM candidates')
+        second = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(second['status'], 'insufficient_evidence')
+        self.assertIn('force', second['reason'].lower())
+        self.assertEqual(self.calls, {'proposal': 1, 'trial': 8})
+        self.assertEqual(len(self.store.query('SELECT id FROM candidates')), len(candidates))
+        forced = self.evolution.propose_and_evaluate(args[0], args[1], self.root / 'run-forced', args[3],
+                                                     force=True)
+        self.assertEqual(self.calls, {'proposal': 2, 'trial': 16})
+        self.assertNotEqual(forced['candidate'], first['candidate'])
+        self.assertEqual(len(self.store.query('SELECT id FROM candidates')), len(candidates) + 1)
+        first_trials = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?',
+                                                 (first['candidate'],))['evidence'])['trials']
+        forced_trials = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?',
+                                                  (forced['candidate'],))['evidence'])['trials']
+        # 每个 trial 覆盖一个独立案例家族的一次重复中的 stable/candidate 对照。
+        self.assertEqual(len(first_trials), 4)
+        self.assertEqual(len(forced_trials), 4)
+        self.assertIsNot(first_trials, forced_trials)
+        self.assertEqual(self.store.query('SELECT * FROM calls'), [])
+
+    def test_invalid_proposal_keeps_failure_evidence_and_releases_reservation(self):
+        args = self.setup_proposal()
+        self.evolution.runtime.invoke = lambda *unused, **kwargs: {'no_kind': True}
+        with self.assertRaisesRegex(RuntimeError, 'kind'):
+            self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+        failed = self.store.query("SELECT evidence FROM candidates WHERE status='insufficient_evidence'")
+        self.assertEqual(len(failed), 1)
+        self.assertIn('kind', json.loads(failed[0]['evidence'])['reason'])
+
+    def test_stale_reservation_expires_without_blocking_a_new_proposal(self):
+        args = self.setup_proposal()
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('stale', 'p', 'strategy', 'reserved', '{}', '{}', time.time() - 7200))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='stale'")['status'], 'interrupted')
+        self.assertEqual(self.calls['proposal'], 1)
+
+    def test_changed_policy_cases_or_strategies_rearm_the_failed_experiment(self):
+        args = self.setup_proposal()
+        self.evolution.propose_and_evaluate(*args)
+        config = json.loads(args[3]['config'])
+        self.assertFalse(self.evolution.attempt_due('p', config)[0])
+        policy = json.loads(json.dumps(config))
+        policy['triage']['policy'] = 'prefer different evidence'
+        self.assertTrue(self.evolution.attempt_due('p', policy)[0])
+        self.assertFalse(self.evolution.attempt_due('p', config)[0])
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('new-holdout', 'p', 'new-holdout', 'holdout',
+                            encode({'task': 'new fresh task', 'base': 'x', 'checks': [], 'source': 'real',
+                                    'repository': '/tmp', 'overlay': None}), 0, 50))
+        self.assertTrue(self.evolution.attempt_due('p', config)[0])
+        self.store.execute("DELETE FROM cases WHERE id='new-holdout'")
+        self.assertFalse(self.evolution.attempt_due('p', config)[0])
+        runtime = self.evolution.runtime
+        original = runtime.active_strategies
+        runtime.active_strategies = lambda project: [{'id': 'stable', 'kind': 'strategy',
+                                                      'content': {'guidance': 'new guidance'}}]
+        try:
+            self.assertTrue(self.evolution.attempt_due('p', config)[0])
+        finally:
+            runtime.active_strategies = original
+        self.assertFalse(self.evolution.attempt_due('p', config)[0])
+
+    def test_unknown_cost_quality_pass_keeps_explicit_warning(self):
+        trials = []
+        for family in range(5):
+            split = 'validation' if family % 2 else 'holdout'
+            for repetition in range(2):
+                trials.append({'case': 'case-' + str(family), 'split': split, 'repetition': repetition,
+                               'stable': {'pass': False, 'tokens': 0, 'usage_known': False},
+                               'candidate': {'pass': True, 'tokens': 0, 'usage_known': False}})
+        result = Evolution.decide(trials, {'evolution': {'repeats': 2, 'min_cases_per_split': 1,
+                                                         'max_cost_ratio': 1.25}})
+        self.assertEqual(result['decision'], 'pass')
+        self.assertFalse(result['cost_comparable'])
+        self.assertEqual(result['cost_state'], 'unknown_usage')
+        self.assertTrue(result['cost_warning'])
+
+    def test_repeat_identity_tracks_overlay_contents_and_execution_limits(self):
+        args = self.setup_proposal()
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('first')
+        row = self.store.one("SELECT spec FROM cases WHERE id='validation'")
+        spec = json.loads(row['spec'])
+        spec['overlay'] = str(overlay)
+        self.store.execute("UPDATE cases SET spec=? WHERE id='validation'", (encode(spec),))
+        first = self.evolution.input_signature('p', self.config)
+        (overlay / 'case.txt').write_text('second')
+        self.assertNotEqual(first, self.evolution.input_signature('p', self.config))
+        changed = json.loads(json.dumps(self.config))
+        changed['limits']['command_seconds'] += 1
+        self.assertNotEqual(self.evolution.input_signature('p', self.config),
+                            self.evolution.input_signature('p', changed))
 
     def test_reserved_holdout_blocks_concurrent_proposal_and_survives_failure(self):
         args = self.setup_proposal()

@@ -44,6 +44,7 @@ DEFAULTS = {
                             "health_consecutive_successes": 1, "health_urls": [],
                             "rollback_data_policy": "manual", "rollback_recovery_notes": ""}},
     "checks": [],
+    "validation": {"controls": []},
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
                   "min_cases_per_split": 3, "repeats": 2, "max_calls": 0,
@@ -83,6 +84,33 @@ def validate(config):
                 raise ValueError(path + key + " has the wrong type")
     shape(config, DEFAULTS)
     config = merge(DEFAULTS, config)
+    controls = config["validation"]["controls"]
+    if len(controls) > 32:
+        raise ValueError("At most 32 maintainer controls are allowed")
+    identifiers = set()
+    for control in controls:
+        if not isinstance(control, dict) or set(control) != {"id", "criterion", "source", "files"}:
+            raise ValueError("Controls require id, criterion, source and files")
+        for key in ("id", "criterion", "source"):
+            if not isinstance(control[key], str) or not control[key].strip() or len(control[key]) > 2000:
+                raise ValueError("Control identity and descriptions must be nonempty bounded text")
+        if control["id"] in identifiers:
+            raise ValueError("Controls require unique IDs")
+        identifiers.add(control["id"])
+        if not isinstance(control["files"], list) or not 1 <= len(control["files"]) <= 64:
+            raise ValueError("Controls require 1..64 fixture files")
+        total = 0
+        paths = set()
+        for item in control["files"]:
+            if not isinstance(item, dict) or set(item) != {"path", "content"} or not isinstance(item["content"], str):
+                raise ValueError("Control files require path and text content")
+            path = relative_path(item["path"])
+            if path in paths:
+                raise ValueError("Control file paths must be unique")
+            paths.add(path)
+            total += len(item["content"].encode("utf-8"))
+        if total > 1024 * 1024:
+            raise ValueError("Control fixture too large")
     if any(type(value) is not int or not 1 <= value <= 86400 for value in config['deadlines'].values()):
         raise ValueError('Stage deadlines must be 1..86400 seconds')
     if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
@@ -274,4 +302,7 @@ def fingerprint(value):
 
 
 def compatibility(config):
-    return fingerprint({key: config[key] for key in ["models", "providers", "review", "sandbox", "checks", "environment"]})
+    evidence = {key: config[key] for key in ["models", "providers", "review", "sandbox", "checks", "environment"]}
+    if config.get("validation", {}).get("controls"):
+        evidence["validation"] = config["validation"]
+    return fingerprint(evidence)

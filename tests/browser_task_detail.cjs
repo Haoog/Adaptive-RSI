@@ -36,6 +36,22 @@ async function checkTaskDetail(browser, url, errors) {
     // ---------- 1) 运行历史懒加载失败：区块内错误项 + 重试成功 ----------
     await openDetail(page, '详情历史任务', 'attention');
     await page.locator('#live-task-outcome').waitFor({ timeout: 5000 });
+    const valueBox = page.locator('#live-task-outcome .value-feedback');
+    await valueBox.getByLabel('价值评价').selectOption('helpful');
+    await valueBox.getByLabel('评价说明（可选）').fill('<script>original feedback</script>');
+    const feedbackSaved = page.waitForResponse(response =>
+      new URL(response.url()).pathname === '/api/task/value-feedback' && response.request().method() === 'POST');
+    await valueBox.getByRole('button', {name: '保存评价', exact: true}).click();
+    assert.equal((await feedbackSaved).status(), 200);
+    await valueBox.getByRole('status').filter({hasText: '评价已保存'}).waitFor();
+    const persisted = await page.evaluate(async () => (await fetch('/api/run?id=detail-h3')).json());
+    assert.equal(persisted.evidence_summary.value_feedback.rating, 'helpful');
+    assert.equal(persisted.evidence_summary.value_feedback.note, '<script>original feedback</script>');
+    assert.equal(await valueBox.locator('script').count(), 0);
+    await closeDetail(page);
+    await openDetail(page, '详情历史任务', 'attention');
+    await page.locator('#live-task-outcome .value-feedback').waitFor();
+    assert.equal(await page.locator('#live-task-outcome .value-feedback select').inputValue(), 'helpful');
     const sections = page.locator('#detail-body > details.detail-section[data-run]');
     assert.equal(await sections.count(), 3, 'three run history sections');
     // 首个运行已随详情加载；中间与更早的运行懒加载。

@@ -252,6 +252,43 @@ def change_kind(task, plan=None):
     return "behavior"
 
 
+DOCUMENTATION_DIRECTORIES = {"docs", "doc", "documentation"}
+DOCUMENTATION_SUFFIXES = {".md", ".mdx", ".markdown", ".rst", ".adoc"}
+DOCUMENTATION_NAMES = {"readme", "changelog", "changes", "contributing", "code_of_conduct", "security",
+                       "support", "license", "notice", "authors"}
+
+
+def documentation_path(path):
+    """Documentation is decided by clear path rules, never by parsing comments.
+
+    A source file whose only changed lines are comments remains a source file:
+    mixed patches must keep the normal acceptance gate instead of claiming a
+    documentation-only change.
+    """
+    from pathlib import PurePosixPath
+    value = str(path)
+    if "\\" in value:
+        # Git paths use '/', so a backslash is literal path text, not a separator.
+        return False
+    candidate = PurePosixPath(value)
+    if not value or candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        return False
+    parts = candidate.parts
+    if parts[0].lower() in DOCUMENTATION_DIRECTORIES:
+        return candidate.suffix.lower() in DOCUMENTATION_SUFFIXES | {".txt", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf"}
+    if candidate.suffix.lower() in DOCUMENTATION_SUFFIXES:
+        return True
+    if len(parts) == 1 and (candidate.name.lower() in DOCUMENTATION_NAMES or
+                            candidate.suffix.lower() == ".txt" and candidate.stem.lower() in DOCUMENTATION_NAMES):
+        return True
+    return False
+
+
+def documentation_only(files):
+    paths = list(files)
+    return bool(paths) and all(documentation_path(path) for path in paths)
+
+
 def improvement(results, acceptance):
     if not acceptance:
         return {"decision": "not_requested", "kind": "regression_only"}

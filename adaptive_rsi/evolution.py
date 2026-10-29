@@ -280,8 +280,86 @@ class Evolution:
                          data={"case": case, "split": manifest["split"], "source": manifest["source"]})
         return case
 
-    def propose_and_evaluate(self, project, workspace, directory, run):
+    def proposal_inputs(self, project):
+        """Read the local inputs shared by proposal prompting and repeat suppression."""
+        observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
+                                        "ORDER BY created DESC LIMIT 10", (project,))
+        failures = []
+        for row in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
+                                    "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
+                                    "ORDER BY r.started DESC LIMIT 5", (project,)):
+            try:
+                result = json.loads(row["result"]) if row["result"] else {}
+            except (ValueError, TypeError):
+                result = {}
+            failures.append({"state": row["state"], "reason": result.get("reason", "")[:1000]})
+        development = []
+        for row in self.store.query("SELECT spec FROM cases WHERE project=? AND split='development' "
+                                    "AND (NOT json_valid(spec) OR json_extract(spec,'$.active') IS NOT 0) "
+                                    "ORDER BY created DESC, id LIMIT 10", (project,)):
+            try:
+                task = json.loads(row["spec"])["task"]
+            except (TypeError, ValueError, KeyError):
+                continue
+            if isinstance(task, str):
+                development.append(task)
+        return {"observations": observations, "failures": failures, "development": development,
+                "current": self.runtime.active_strategies(project),
+                "archive": self.store.query("SELECT id,kind,content,status FROM candidates WHERE project=? "
+                                            "ORDER BY created DESC LIMIT 20", (project,)),
+                "cases": self.store.query("SELECT * FROM cases WHERE project=? ORDER BY id", (project,))}
+
+    def input_signature(self, project, config, inputs=None):
+        """Fingerprint the evidence, samples, policy and strategies that frame one experiment."""
+        from .build import BUILD_ID
+        inputs = inputs or self.proposal_inputs(project)
+        cases = []
+        for case in inputs["cases"]:
+            spec = case_spec(case)
+            cases.append({"id": case["id"], "split": case["split"], "family": case["family"],
+                          "spec": fingerprint(spec) if spec is not None else None,
+                          "overlay": self.overlay_digest(spec.get("overlay")) if spec else None,
+                          "active": spec.get("active", True) if spec else None,
+                          "available": spec.get("available", True) if spec else None})
+        return fingerprint({"build": BUILD_ID, "limits": config["limits"],
+            "observations": inputs["observations"], "failures": inputs["failures"],
+            "development": inputs["development"],
+            "strategies": [{"id": c["id"], "kind": c["kind"], "content": c["content"]} for c in inputs["current"]],
+            "cases": cases,
+            "policy": {"triage": config["triage"]["policy"],
+                       "compatibility": compatibility(config),
+                       "evolution": {key: config["evolution"][key] for key in
+                                     ("min_cases_per_split", "repeats", "max_holdout_uses", "max_cost_ratio")}}})
+
+    def attempt_due(self, project, config):
+        signature = self.input_signature(project, config)
+        attempt = self.store.setting("evolution-attempt:" + project, {})
+        return not (isinstance(attempt, dict) and attempt.get("signature") == signature), signature, attempt
+
+    def record_attempt(self, project, signature, status, candidate=None, reason=None):
+        self.store.put_setting("evolution-attempt:" + project, {
+            "signature": signature, "status": status, "candidate": candidate,
+            "reason": str(reason or "")[:1000], "at": time.time()})
+
+    def propose_and_evaluate(self, project, workspace, directory, run, force=False):
         config = json.loads(run["config"])
+        inputs = self.proposal_inputs(project["id"])
+        signature = self.input_signature(project["id"], config, inputs)
+        attempt = self.store.setting("evolution-attempt:" + project["id"], {})
+        started = attempt.get("at") if isinstance(attempt, dict) else None
+        in_flight = (isinstance(attempt, dict) and attempt.get("status") == "running"
+                     and isinstance(started, (int, float)) and time.time() - started <= 3600)
+        if not force and not in_flight and isinstance(attempt, dict) and attempt.get("signature") == signature:
+            reason = ("Identical experiment inputs were already evaluated with status "
+                      + str(attempt.get("status", "insufficient_evidence")) +
+                      "; change evidence, cases, policy or strategies, or retry explicitly with force")
+            self.store.event("evolution_not_repeated", reason, project["id"], run["id"],
+                             {"signature": signature, "previous": attempt.get("status")})
+            previous = attempt.get("status")
+            return {"reason": reason,
+                    "status": previous if previous in ("insufficient_evidence", "fail", "failed")
+                    else "insufficient_evidence", "repeated": True,
+                    "code": "evolution_inputs_unchanged"}
         limit = config["evolution"]["max_holdout_uses"]
         available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
                                      "ORDER BY created,id", (project["id"],))
@@ -294,22 +372,19 @@ class Evolution:
                     isinstance(spec.get("repository"), str) and isinstance(spec.get("base"), str)):
                 cases.append(case)
         minimum = config["evolution"]["min_cases_per_split"]
-        if any(sum(c["split"] == split for c in cases) < minimum for split in ["validation", "holdout"]):
-            # 曝光耗尽的样本仍在案例表中；若只报“样本不足”，界面会同时显示样本数量，
-            # 让人误以为导入没有生效。区分两种情况并给出可操作说明。
-            exhausted = any(case["uses"] >= limit for case in available)
-            reason = ("Validation or holdout exposure limit reached; import new cases or raise "
-                      "evolution.max_holdout_uses") if exhausted else \
-                     "Need independent validation/holdout cases before proposing"
-            candidate = uid()
-            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
-                (candidate, project["id"], "strategy", "insufficient_evidence", encode({"guidance": "", "triggers": []}),
-                 encode({"reason": reason}), time.time()))
-            return {"reason": reason, "candidate": candidate, "status": "insufficient_evidence"}
-        reserved = sorted(case["id"] for case in cases if case["split"] == "holdout")
-        if self.store.one("SELECT id FROM candidates WHERE project=? AND status='reserved' AND created>?",
-                          (project["id"], time.time() - 3600)):
-            return {"reason": "Another proposal currently reserves the holdout cases", "status": "insufficient_evidence"}
+        validation_cases = [case for case in cases if case["split"] == "validation"]
+        # 晋升要求未曝光的 holdout；先按用途过滤新鲜样本，再在新鲜样本内分层选择。
+        fresh_holdout = [case for case in cases if case["split"] == "holdout" and case["uses"] == 0]
+        if len(validation_cases) < minimum or len(fresh_holdout) < minimum:
+            # 复用过的样本即使仍在 max_holdout_uses 内也必然在最终审核失败，因此在
+            # 提案模型调用前直接跳过，不生成无用 candidate，也不消耗付费调用。
+            reason = ("Fresh holdout cases are required for promotion; import new, previously unused cases "
+                      "(raising evolution.max_holdout_uses cannot refresh exposed holdout cases)")
+            self.record_attempt(project["id"], signature, "insufficient_evidence", reason=reason)
+            return {"reason": reason, "status": "insufficient_evidence",
+                    "code": "evolution_fresh_holdout_required"}
+        cases = validation_cases + fresh_holdout
+        reserved = sorted(case["id"] for case in fresh_holdout)
         reservation = uid()
         manifest = []
         for case in cases:
@@ -324,29 +399,27 @@ class Evolution:
                              "task": fingerprint(spec["task"]), "spec": fingerprint(spec),
                              "overlay": self.overlay_digest(spec.get("overlay")),
                              "environment": fingerprint(config["environment"])})
-        observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
-                                        "ORDER BY created DESC LIMIT 10", (project["id"],))
-        failures = []
-        for r in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
-                                  "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
-                                  "ORDER BY r.started DESC LIMIT 5", (project["id"],)):
-            try:
-                res = json.loads(r["result"]) if r["result"] else {}
-            except (ValueError, TypeError):
-                res = {}
-            failures.append({"state": r["state"], "reason": res.get("reason", "")[:1000]})
-        development = [json.loads(row["spec"])["task"] for row in self.store.query(
-            "SELECT spec FROM cases WHERE project=? AND split='development' "
-            "AND (NOT json_valid(spec) OR json_extract(spec,'$.active') IS NOT 0) "
-            "ORDER BY created DESC, id LIMIT 10", (project["id"],))]
-        current = self.runtime.active_strategies(project["id"])
-        archive = self.store.query("SELECT id,kind,content,status FROM candidates WHERE project=? "
-                                   "ORDER BY created DESC LIMIT 20", (project["id"],))
-        # Reserve only for the paid call window: manifest or observation reads may
-        # fail and must not leave a blocking reservation behind.
-        self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
-            (reservation, project["id"], "strategy", "reserved", encode({"guidance": "", "triggers": []}),
-             encode({"reservation": {"holdout": reserved}, "reason": "reserved"}), time.time()))
+        # 本函数此前只读取本地状态；预留只覆盖即将开始的付费提案窗口。
+        observations = inputs["observations"]
+        failures = inputs["failures"]
+        development = inputs["development"]
+        current = inputs["current"]
+        archive = inputs["archive"]
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # 过期预留不得永久阻塞；一小时与旧有的阻塞窗口保持一致。
+            db.execute("UPDATE candidates SET status='interrupted' WHERE project=? AND status='reserved' AND created<=?",
+                       (project["id"], now - 3600))
+            if db.execute("SELECT 1 FROM candidates WHERE project=? AND status='reserved'",
+                          (project["id"],)).fetchone():
+                return {"reason": "Another proposal currently reserves the holdout cases",
+                        "status": "insufficient_evidence", "code": "evolution_reservation_busy"}
+            db.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,?,?,?,?)",
+                       (reservation, project["id"], "strategy", "reserved",
+                        encode({"guidance": "", "triggers": []}),
+                        encode({"reservation": {"holdout": reserved}, "reason": "reserved"}), now))
+        self.record_attempt(project["id"], signature, "running", reason="Proposal started")
         try:
             proposal = self.runtime.invoke("evolution", "Propose one small, testable improvement to agent execution, "
                                        "opportunity discovery/meta-planning, or toolchain/context adapter guidance. "
@@ -359,17 +432,27 @@ class Evolution:
         except Exception as exc:
             self.store.execute("UPDATE candidates SET status='insufficient_evidence', evidence=? WHERE id=?",
                 (encode({"reservation": {"holdout": reserved}, "reason": str(exc)}), reservation))
+            self.record_attempt(project["id"], signature, "insufficient_evidence", reason=str(exc))
             raise
-        self.store.execute("DELETE FROM candidates WHERE id=?", (reservation,))
         if not isinstance(proposal, dict) or "kind" not in proposal:
-            raise RuntimeError("Model proposal must be an object with kind and content")
+            reason = "Model proposal must be an object with kind and content"
+            self.store.execute("UPDATE candidates SET status='insufficient_evidence', evidence=? WHERE id=?",
+                (encode({"reservation": {"holdout": reserved}, "reason": reason}), reservation))
+            self.record_attempt(project["id"], signature, "insufficient_evidence", reason=reason)
+            raise RuntimeError(reason)
         candidate = uid()
         previous = self.store.one("SELECT id FROM candidates WHERE project=? AND kind=? AND status='stable' ORDER BY promoted DESC LIMIT 1",
                                   (project["id"], proposal["kind"]))
         parent = previous["id"] if previous else None
-        self.store.execute("INSERT INTO candidates(id,project,kind,parent,status,content,created) VALUES (?,?,?,?,?,?,?)",
-                           (candidate, project["id"], proposal["kind"], parent, "evaluating", encode(proposal), time.time()))
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # 删除预留与写入候选同一事务：支付成功后不留下阻塞后续提案的孤儿预留。
+            db.execute("DELETE FROM candidates WHERE id=?", (reservation,))
+            db.execute("INSERT INTO candidates(id,project,kind,parent,status,content,created) VALUES (?,?,?,?,?,?,?)",
+                       (candidate, project["id"], proposal["kind"], parent, "evaluating",
+                        encode(proposal), time.time()))
         evidence = {"run": run["id"], "config_hash": fingerprint(config), "compatibility": compatibility(config),
+                    "experiment_inputs": signature,
                     "dataset": {"version": 1, "manifest": sorted(manifest, key=lambda item: item["case"]),
                                 "holdout_hash": fingerprint([item for item in manifest if item["split"] == "holdout"])},
                     "trials": [], "monitor": {"passed": 0, "failed": 0}}
@@ -377,8 +460,9 @@ class Evolution:
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
             "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
-        selection = {split: select_cases([case for case in cases if case["split"] == split], minimum, run["id"])
-                     for split in ("validation", "holdout")}
+        # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。
+        selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
+                     "holdout": select_cases(fresh_holdout, minimum, run["id"])}
         plan = {"version": 1, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
@@ -453,6 +537,8 @@ class Evolution:
                     if validation["decision"] != "pass":
                         evidence.update(validation)
                         self.save(candidate, validation["decision"], evidence)
+                        self.record_attempt(project["id"], signature, validation["decision"],
+                                            candidate, evidence["reason"])
                         return {"reason": evidence["reason"], "candidate": candidate, "status": evidence["decision"]}
             evidence.update(self.decide(evidence["trials"], config))
             evidence["plan_verification"] = self.verify_plan(evidence["preregistered_plan"], evidence["trials"])
@@ -476,6 +562,7 @@ class Evolution:
                     if not live["evolution"]["auto_promote"] or compatibility(live) != evidence["compatibility"]:
                         evidence["reason"] = "Configuration changed; candidate retained for explicit revalidation"
                         self.save(candidate, "ready", evidence)
+                        self.record_attempt(project["id"], signature, "ready", candidate, evidence["reason"])
                         return {"reason": evidence["reason"], "candidate": candidate, "status": "ready"}
                     promoted = time.time()
                     with self.store.connect() as db:
@@ -488,10 +575,13 @@ class Evolution:
                 state = "stable"
             else:
                 self.save(candidate, "ready" if state == "pass" else state, evidence)
+            self.record_attempt(project["id"], signature, state, candidate, evidence["reason"])
             return {"reason": evidence["reason"], "candidate": candidate, "status": state}
         except Exception as exc:
             evidence.update(decision="insufficient_evidence", reason=str(exc))
-            self.save(candidate, "interrupted" if isinstance(exc, Cancelled) else "insufficient_evidence", evidence)
+            outcome = "interrupted" if isinstance(exc, Cancelled) else "insufficient_evidence"
+            self.save(candidate, outcome, evidence)
+            self.record_attempt(project["id"], signature, outcome, candidate, str(exc))
             raise
 
     @staticmethod

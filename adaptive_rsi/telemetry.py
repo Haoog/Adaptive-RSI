@@ -52,11 +52,20 @@ def workflow_metrics(store, project=None):
               "accepted_tokens": 0, "accepted_unknown_calls": 0, "stage_reused": 0,
               "delivered_tokens": 0, "delivered_unknown_calls": 0, "remote_wait_seconds": {}, "remote_wait_samples": 0,
               "to_pr_seconds": 0, "to_pr_samples": 0, "to_merge_seconds": 0, "to_merge_samples": 0,
-              "interventions": 0, "stale_rework": 0, "invalidations": {}}
+              "interventions": 0, "stale_rework": 0, "invalidations": {},
+              "postmerge_verified": 0, "postmerge_regressed": 0, "mainline_regressed": 0,
+              "value_feedback": {"helpful": 0, "unnecessary": 0, "false_positive": 0},
+              "rated_runs": 0, "unrated_runs": 0}
     runs_by_task = {}
     for run in store.query("SELECT * FROM runs WHERE task IN (" + scope + ") ORDER BY task,started,id", scope_args):
         runs_by_task.setdefault(run["task"], []).append(run)
     run_scope = "SELECT id FROM runs WHERE task IN (" + scope + ")"
+    ratings = {}
+    for row in store.query("SELECT substr(key,16) AS run,value FROM settings WHERE key>='value-feedback:' "
+                           "AND key<'value-feedback;' AND substr(key,16) IN (" + run_scope + ")", scope_args):
+        value = decode_object(row["value"])
+        if value.get("rating") in result["value_feedback"]:
+            ratings[row["run"]] = value["rating"]
     implemented = {row["run"] for row in store.query(
         "SELECT DISTINCT run FROM phase_times WHERE phase='implementation' AND run IN (" + run_scope + ")", scope_args)}
     implemented |= {row["run"] for row in store.query(
@@ -85,6 +94,21 @@ def workflow_metrics(store, project=None):
         pr_created = []
         for run in runs:
             evidence = decode_evidence(run["result"])
+            if run["ended"] is not None:
+                rating = ratings.get(run["id"])
+                if rating:
+                    result["rated_runs"] += 1
+                    result["value_feedback"][rating] += 1
+                else:
+                    result["unrated_runs"] += 1
+                feedback = evidence.get("feedback", {})
+                merge = feedback.get("merge", {})
+                merge = merge if isinstance(merge, dict) else {}
+                postmerge = merge.get("state") or (feedback.get("state") if
+                    feedback.get("head") == evidence.get("merged_sha") else None)
+                if postmerge in ("verified", "regressed"):
+                    result["postmerge_" + postmerge] += 1
+                result["mainline_regressed"] += feedback.get("state") == "regressed" and feedback.get("head") != merge.get("sha", evidence.get("merged_sha"))
             infrastructure = evidence.get("failure", {}).get("code") in ["provider", "credentials", "environment"]
             result["infrastructure_failures"] += infrastructure
             if not infrastructure and (run["id"] in implemented or evidence.get("evaluation")):

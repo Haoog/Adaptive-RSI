@@ -1,6 +1,7 @@
 """Shared, isolated candidate pipeline used by tasks and strategy experiments."""
 import concurrent.futures
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -105,10 +106,125 @@ def _review_evidence(evaluation, include_test_output=True):
     return evidence
 
 
+_TIMING_KEYS = {"seconds", "duration", "duration_seconds", "elapsed", "started", "finished",
+                "started_at", "finished_at", "at", "time", "timestamp"}
+
+
+def _without_timing(value):
+    """Strip observed durations so identical results can reuse a read-only review."""
+    if isinstance(value, dict):
+        return {key: _without_timing(item) for key, item in value.items() if key not in _TIMING_KEYS}
+    if isinstance(value, list):
+        return [_without_timing(item) for item in value]
+    return value
+
+
+def _artifact_identity(artifacts):
+    if not isinstance(artifacts, dict):
+        return artifacts
+    return {name: {key: row.get(key) for key in ["state", "reason", "bytes", "sha256"] if key in row}
+            for name, row in artifacts.items() if isinstance(row, dict)}
+
+
+def _review_identity(evaluation, run_id=None):
+    """Cache identity for a completed review: complete results, no wall-clock noise."""
+    evidence = _review_evidence(evaluation, include_test_output=False)
+    checks = {}
+    for label, rows in (evaluation.get("checks") or {}).items():
+        if not isinstance(rows, list):
+            continue
+        checks[label] = []
+        for row in rows:
+            item = {key: row.get(key) for key in
+                    ["name", "argv", "cwd", "passed", "exit_code", "error", "empty_tests", "test_summary"]
+                    if key in row}
+            if isinstance(row.get("test_identities"), dict):
+                identities = row["test_identities"]
+                item["test_identities"] = {
+                    "state": identities.get("state"),
+                    "executed": sorted(str(value) for value in identities.get("executed", [])),
+                    "skipped": _without_timing(identities.get("skipped", []))}
+            if "artifacts" in row:
+                item["artifacts"] = _artifact_identity(row["artifacts"])
+            diagnostics = {}
+            for key in ("stdout", "stderr"):
+                text = row.get(key)
+                if isinstance(text, str):
+                    if run_id:
+                        text = text.replace('/runs/' + run_id + '/', '/runs/<run>/')
+                    text = re.sub(r'(?m)^(Ran \d+ tests? in )[0-9.]+(s)$', r'\1<duration>\2', text)
+                diagnostics[key] = text
+            item["diagnostics"] = fingerprint(diagnostics)
+            checks[label].append(item)
+    evidence["checks"] = checks
+    evidence["execution_environment"] = evaluation.get("execution_environment")
+    evidence["host_tools"] = evaluation.get("host_tools")
+    controls = evaluation.get("controls")
+    if isinstance(controls, dict):
+        evidence["controls"] = {
+            "decision": controls.get("decision"), "reason": controls.get("reason"),
+            "positive": [{key: row.get(key) for key in ["name", "argv", "passed", "exit_code"] if key in row}
+                         for row in controls.get("positive", []) if isinstance(row, dict)],
+            "controls": [{key: row.get(key) for key in ["id", "source", "criterion", "fixture_hash", "detected"]
+                          if key in row}
+                         for row in controls.get("controls", []) if isinstance(row, dict)]}
+    return _without_timing(evidence)
+
+
+def _review_key(run, task, base, strategies, config, plan, evaluation, summary, patch):
+    from .recovery import signature
+    review_config, _ = _stage_config(config, "review")
+    return fingerprint({"inputs": signature(run, task, base, strategies, review_config), "plan": plan,
+                        "evaluation": _review_identity(evaluation, run.get("id")), "summary": summary,
+                        "patch_hash": fingerprint(patch)})
+
+
+def _approved_review(value):
+    return isinstance(value, dict) and value.get("decision") == "pass"
+
+
+def _touched_paths(workspace):
+    """All paths the staged patch touches, with rename sources spelled out."""
+    try:
+        raw = git(workspace, "diff", "--cached", "--no-renames", "--name-only", "-z")
+    except RuntimeError:
+        return set()
+    return {path for path in raw.split("\0") if path}
+
+
+def _prepare_environment(runtime, run, project, config, directory, workspace, checks):
+    """Seal selected dependency seeds once and restore a private copy per workspace."""
+    from .environment import capture, prepare_cached, restore
+    from .evaluator import host_tool_versions
+    source = Path(project["path"])
+    seeds = directory / "dependencies"
+    tools = host_tool_versions(checks) if config["environment"]["seed_paths"] else {}
+    if tools:
+        prepared = prepare_cached(source, runtime.store.root / "prepared-environments", config, tools)
+        frozen = prepared["inputs"]["seed"]
+        environment = {"bytes": frozen["bytes"], "sha256": frozen["sha256"],
+                       "cache": {"key": prepared["key"], "reused": prepared["reused"]}}
+        # Keep the run's own immutable evidence for later delivery verification
+        # and backups; cache eviction must not invalidate a completed candidate.
+        import shutil
+        shutil.copytree(prepared["path"], seeds, symlinks=True)
+        seed_source = seeds
+        message = "Sealed dependency preparation reused" if prepared["reused"] else \
+            "Sealed dependency preparation frozen"
+        restore(seed_source, workspace, config)
+    else:
+        environment = capture(source, seeds, config)
+        seed_source = seeds
+        message = "Dependency snapshot frozen"
+        restore(seed_source, workspace, config)
+    runtime.store.event("environment", message, project["id"], run["id"], environment)
+    return environment, seed_source
+
+
 def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False):
     """One production path for real tasks and paired experiments; experiments never deliver."""
     config = json.loads(run["config"])
-    from .workflow import change_kind, evidence_contract, supports_test_first
+    from .workflow import change_kind, documentation_only, evidence_contract, supports_test_first
     def transition(state, result=None, terminal=False, task_fields=None):
         if not experiment:
             runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal,
@@ -129,11 +245,13 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                    "failure": {"code": "environment",
                                "action": "check_readiness"}}, True)
         return {"decision": "insufficient_evidence", "reason": "Project readiness checks need attention", "readiness": check}
-    from .environment import capture, restore
+    from .environment import restore
     seeds = directory / "dependencies"
-    environment = capture(Path(project["path"]), seeds, config)
-    runtime.store.event("environment", "Dependency snapshot frozen", project["id"], run["id"], environment)
-    restore(seeds, workspace, config)
+    configured_checks = list(config["checks"] or [])
+    detected_checks = detect(workspace)["checks"]
+    checks = list(configured_checks or detected_checks)
+    identity_checks = configured_checks + [check for check in detected_checks if check not in configured_checks]
+    environment, seeds = _prepare_environment(runtime, run, project, config, directory, workspace, identity_checks)
     from .process import ProcessError, Sandbox
     for setup in config["environment"]["setup"]:
         prepared = Sandbox(runtime.store.root, config).check(setup, workspace, lambda: runtime.is_cancelled(run),
@@ -256,7 +374,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             raise RuntimeError("Plan must name narrower scope than the entire repository")
     original_scope = list(plan["scope"])
     change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
-    checks = config["checks"] or detect(workspace)["checks"]
     test_first_requested = _uses_test_first(change_type, plan["risk"])
     test_first = test_first_requested and supports_test_first(checks, workspace)
     regression_test_scope = None
@@ -382,6 +499,15 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not files and not experiment:
             transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
             return None
+        if change_type == "documentation" and not documentation_only(_touched_paths(workspace) or files):
+            # A declared documentation scope must not launder source edits past
+            # the normal acceptance gate.  Mixed patches are rejected instead
+            # of trying to infer comment-only source changes.
+            reason = ("Documentation change modified non-documentation files; source changes cannot use the "
+                      "documentation path to weaken acceptance")
+            transition("insufficient_evidence", {"reason": reason, "files": files,
+                       "failure": {"code": "improvement", "action": "inspect_evidence"}}, True)
+            return {"decision": "insufficient_evidence", "reason": reason} if experiment else None
         added_test_files = {path for path in git(workspace, "diff", "--cached", "--diff-filter=A", "--name-only", "-z").split("\0")
                             if path and test_path(path)}
         if test_first and not 1 <= len(added_test_files) <= 8:
@@ -428,13 +554,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if not experiment:
         save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
-    review_config, _ = _stage_config(config, "review")
-    review_key = fingerprint({"inputs": signature(run, task, base, strategies, review_config),
-                              "plan": plan, "evaluation": _review_evidence(evaluation, include_test_output=False),
-                              "summary": result["summary"], "patch_hash": fingerprint(patch)})
-    saved_review = None if experiment else cached(runtime, run, "review", review_key)
-    if saved_review and saved_review.get("decision") != "pass":
-        saved_review = None
+    review_key = _review_key(run, task, base, strategies, config, plan, evaluation, result["summary"], patch)
+    saved_review = None if experiment else cached(runtime, run, "review", review_key, accept=_approved_review)
     review = saved_review
     if review is None:
         review_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
@@ -445,9 +566,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     review = enforce_review(review, config)
     risk_review = None
     if risk_review_required(plan, review, files, patch):
-        risk_review = None if experiment else cached(runtime, run, "risk_review", review_key)
-        if risk_review and risk_review.get("decision") != "pass":
-            risk_review = None
+        risk_review = None if experiment else cached(runtime, run, "risk_review", review_key, accept=_approved_review)
         if risk_review is None:
             risk_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation)}
             if acceptance:

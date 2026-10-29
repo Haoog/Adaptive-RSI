@@ -109,7 +109,9 @@ Models must support tool calls and structured results. Protocol support does not
 - Code context is sent to the selected model provider under that provider's data policy.
 - Frozen checks, separate sessions, and operating-system sandboxes reduce risk but are not a formal security proof against arbitrary malicious code.
 
-Long-term capability improvement still requires real tasks and sustained experiments. Without protected evaluation cases, candidate strategies can be proposed and archived but cannot be promoted automatically.
+Long-term capability improvement still requires real tasks and sustained experiments. When fresh holdout cases are insufficient, proposal and trials are skipped before model calls and the stable strategy is retained.
+
+Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
 
 ## Documentation
 

@@ -913,3 +913,75 @@ class ModelCenterTest(unittest.TestCase):
             self.center.save_provider(fixture.provider, {"mode": "file", "value": "rotated-key"})
             self.assertFalse((self.runtime.store.root / "credentials" / shared).exists())
             self.assertEqual(credentials.get(self.center.provider("gateway")), "rotated-key")
+
+    def test_component_prices_are_validated_incrementally_and_all_null_clears(self):
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True,
+                                          "prices": {"input": 1, "output": 2, "cache_read": .5, "cache_write": 3}})
+        model = next(m for m in self.center.directory(self.center.provider("ollama"))["models"] if m["id"] == "coder-a")
+        self.assertEqual(model["prices"], {"input": 1, "output": 2, "cache_read": .5, "cache_write": 3})
+        self.center.edit_model("ollama", {"id": "coder-a", "prices": {"input": None}})
+        model = next(m for m in self.center.directory(self.center.provider("ollama"))["models"] if m["id"] == "coder-a")
+        self.assertEqual(model["prices"], {"output": 2, "cache_read": .5, "cache_write": 3})
+        self.center.edit_model("ollama", {"id": "coder-a",
+                                          "prices": {"input": None, "output": None,
+                                                     "cache_read": None, "cache_write": None}})
+        model = next(m for m in self.center.directory(self.center.provider("ollama"))["models"] if m["id"] == "coder-a")
+        self.assertNotIn("prices", model)
+        for invalid in [-1, True, float("nan"), float("inf"), "1", 2**53]:
+            with self.subTest(invalid=invalid), self.assertRaises(CenterError):
+                self.center.edit_model("ollama", {"id": "coder-a", "prices": {"input": invalid}})
+        for invalid in [{"unknown": 1}, [], "x", 3]:
+            with self.subTest(invalid=invalid), self.assertRaises(CenterError):
+                self.center.edit_model("ollama", {"id": "coder-a", "prices": invalid})
+
+    def test_component_prices_survive_catalog_refresh(self):
+        with DirectoryServer() as fixture:
+            self.save(fixture, "none", value="")
+            self.center.fetch("gateway")
+            self.center.edit_model("gateway", {"id": "coder-a",
+                                               "prices": {"input": 1, "output": 2, "cache_read": .5, "cache_write": 3}})
+            fixture.models = [{"id": "coder-a"}, {"id": "coder-b"}]
+            self.center.fetch("gateway")
+            model = next(m for m in self.center.directory(self.center.provider("gateway"))["models"] if m["id"] == "coder-a")
+            self.assertEqual(model["prices"], {"input": 1, "output": 2, "cache_read": .5, "cache_write": 3})
+
+    def test_prices_freeze_per_call_and_estimates_use_frozen_basis(self):
+        from adaptive_rsi.usage_report import report
+        store = self.runtime.store
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True, "unit_price": 4,
+                                          "prices": {"input": 1, "output": 2, "cache_read": .5, "cache_write": 3}})
+        route = {"provider": "ollama", "model": "coder-a", "effort": "default", "fallback": None}
+        first = store.reserve_call("model-center", "run-1", "analysis", route, self.runtime.config())
+        row = store.one("SELECT * FROM calls WHERE id=?", (first,))
+        self.assertEqual((row["unit_price"], row["input_price"], row["output_price"],
+                          row["cache_read_price"], row["cache_write_price"]), (4, 1, 2, .5, 3))
+        store.record_usage(first, "run-1", {"tokens": 200, "input_tokens": 100, "output_tokens": 50,
+                                            "cache_read_tokens": 30, "cache_write_tokens": 20,
+                                            "usage_known": True}, 2.5)
+        row = store.one("SELECT * FROM calls WHERE id=?", (first,))
+        self.assertEqual(row["price_basis"], "components")
+        summary = report(store, {"start": ["0"], "end": [str(time.time() + 60)]})["summary"]
+        self.assertEqual((summary["priced_calls"], summary["component_priced_calls"]), (1, 1))
+        self.assertAlmostEqual(summary["estimated_usd"], .000275)
+        self.center.edit_model("ollama", {"id": "coder-a", "prices": {"input": 9}})
+        second = store.reserve_call("model-center", "run-2", "analysis", route, self.runtime.config())
+        frozen = store.one("SELECT * FROM calls WHERE id=?", (first,))
+        current = store.one("SELECT * FROM calls WHERE id=?", (second,))
+        self.assertEqual((frozen["input_price"], frozen["output_price"]), (1, 2))
+        self.assertEqual((current["input_price"], current["output_price"]), (9, 2))
+        store.record_usage(second, "run-2", {"tokens": 200, "input_tokens": 100, "output_tokens": 50,
+                                             "cache_read_tokens": 30, "cache_write_tokens": 20,
+                                             "usage_known": True}, 2.5)
+        self.assertEqual(store.one("SELECT price_basis FROM calls WHERE id=?", (second,))["price_basis"], "components")
+        self.center.edit_model("ollama", {"id": "coder-a", "unit_price": 6,
+                                          "prices": {"input": None, "output": None,
+                                                     "cache_read": None, "cache_write": None}})
+        third = store.reserve_call("model-center", "run-3", "analysis", route, self.runtime.config())
+        store.record_usage(third, "run-3", {"tokens": 200, "input_tokens": 100, "output_tokens": 50,
+                                            "cache_read_tokens": 30, "cache_write_tokens": 20,
+                                            "usage_known": True}, 2.5)
+        self.assertEqual(store.one("SELECT price_basis FROM calls WHERE id=?", (third,))["price_basis"], "mixed")
+        summary = report(store, {"start": ["0"], "end": [str(time.time() + 60)]})["summary"]
+        self.assertEqual((summary["priced_calls"], summary["component_priced_calls"],
+                          summary["unit_price_priced_calls"]), (3, 2, 1))
+        self.assertAlmostEqual(summary["estimated_usd"], .000275 + .001075 + .0012)

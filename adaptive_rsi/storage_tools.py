@@ -241,6 +241,44 @@ def _validate_recovery_schema(db, version):
         db.execute("SELECT * FROM " + table + " LIMIT 0")
 
 
+def _validate_ownership(db):
+    """Reject cross-table ownership that SQLite foreign keys cannot express.
+
+    A run may reference an existing task in another project, and a run project
+    has no foreign key at all; restore therefore cannot rely on
+    ``foreign_key_check`` alone. Optional version-2 tables are checked only
+    when the snapshot actually contains them.
+    """
+    checks = (
+        ("projects", "SELECT r.id FROM runs r LEFT JOIN projects p ON p.id=r.project WHERE p.id IS NULL"),
+        ("tasks", "SELECT r.id FROM runs r JOIN tasks t ON t.id=r.task WHERE r.project IS NOT t.project"),
+        ("tasks", "SELECT r.id FROM runs r LEFT JOIN tasks t ON t.id=r.task WHERE r.task IS NOT NULL AND t.id IS NULL"),
+        ("submissions", "SELECT s.request FROM submissions s LEFT JOIN tasks t ON t.id=s.task "
+                        "WHERE t.id IS NULL OR s.project IS NOT t.project"),
+        ("task_completions", "SELECT c.task FROM task_completions c LEFT JOIN tasks t ON t.id=c.task "
+                             "WHERE t.id IS NULL OR c.project IS NOT t.project"),
+    )
+    for table, sql in checks:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            continue
+        if db.execute(sql + " LIMIT 1").fetchone():
+            raise ValueError("Backup contains invalid record ownership")
+
+
+def _validate_snapshot(db):
+    """Apply every recovery gate to one read-only snapshot."""
+    if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise ValueError("Backup integrity check failed")
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version > 2:
+        raise ValueError("Backup schema is newer than this runtime")
+    _validate_recovery_schema(db, version)
+    if db.execute("PRAGMA foreign_key_check").fetchone():
+        raise ValueError("Backup contains invalid relationships")
+    _validate_ownership(db)
+    return version
+
+
 def verify_backup(path, deadline=None):
     """Open a backup in read-only mode and prove it is a usable state snapshot."""
     path = Path(path).expanduser().absolute()
@@ -249,14 +287,7 @@ def verify_backup(path, deadline=None):
     with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
         if deadline is not None:
             db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
-        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ValueError("Backup integrity check failed")
-        version = db.execute("PRAGMA user_version").fetchone()[0]
-        if version > 2:
-            raise ValueError("Backup schema is newer than this runtime")
-        _validate_recovery_schema(db, version)
-        if db.execute("PRAGMA foreign_key_check").fetchone():
-            raise ValueError("Backup contains invalid relationships")
+        version = _validate_snapshot(db)
     return {"valid": True, "schema_version": version, "bytes": path.stat().st_size}
 
 
@@ -286,7 +317,9 @@ def retain_backups(store, max_count=20, max_age_days=90, now=None):
         return {"kept": len(paths), "removed": [], "invalid": invalid,
                 "reason": "no_verified_recovery_point"}
     for index, path in enumerate(paths):
-        if path == protected or path.name in invalid:
+        # `protected` passed the same full validation as restore. Never make it a
+        # removal candidate, so rotation cannot leave only unusable bytes behind.
+        if (protected is not None and path.name == protected.name) or path.name in invalid:
             continue
         if index < max_count and now - path.stat().st_mtime <= max_age_days * 86400:
             continue
@@ -355,15 +388,7 @@ def restore(source, destination):
     # Normalize existing ancestors only; the final component must be claimed without following links.
     destination = destination.parent.resolve() / destination.name
     with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as db:
-        if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise ValueError("Backup integrity check failed")
-        version = db.execute("PRAGMA user_version").fetchone()[0]
-        _validate_recovery_schema(db, version)
-        if db.execute("PRAGMA foreign_key_check").fetchone():
-            raise ValueError("Backup contains invalid relationships")
-        if db.execute("SELECT 1 FROM runs r LEFT JOIN tasks t ON t.id=r.task "
-                      "WHERE r.task IS NOT NULL AND (t.id IS NULL OR r.project<>t.project) LIMIT 1").fetchone():
-            raise ValueError("Backup contains invalid run ownership")
+        _validate_snapshot(db)
         created = _create_directories(destination)
         if destination not in created:  # Never write into a directory this process did not exclusively create.
             raise ValueError("Restore requires a new state directory; existing state is never overwritten")
@@ -558,6 +583,28 @@ def file_digest(path, check=None):
     return digest.hexdigest()
 
 
+def _cached_digests(store, entries, refresh):
+    """Digest regular files, reusing prior results only for the same file identity.
+
+    The cache is rebound to the files in the current manifest so removed or
+    rotated backups cannot accumulate; the manifest itself bounds the entry
+    count. ``refresh`` deliberately re-reads every file, matching the full
+    verification cost of an explicit refresh.
+    """
+    previous = {} if refresh else dict(getattr(store, "_storage_digests", {}) or {})
+    current, digests = {}, {}
+    for path, info in entries:
+        identity = (str(path), info.st_dev, info.st_ino, info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+        digest = None if refresh else previous.get(identity)
+        if digest is None:
+            digest = file_digest(path)
+        current[identity] = digest
+        digests[path] = digest
+    setattr(store, "_storage_digests", current)
+    return digests
+
+
 def overview(store, refresh=False):
     cached = getattr(store, "_storage_snapshot", None)
     if not refresh and cached and time.monotonic() - cached["clock"] < 10:
@@ -576,11 +623,13 @@ def overview(store, refresh=False):
     backups = sorted(_file_info((store.root / "backups").glob("*.sqlite3")),
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
+    selected = backups[:20]
+    digests = _cached_digests(store, selected, refresh)
     manifest = [{"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
-                 "modified": info.st_mtime, "sha256": file_digest(p)}
-                for p, info in backups[:20]]
+                 "modified": info.st_mtime, "sha256": digests[p]}
+                for p, info in selected]
     result = {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
-            for p, info in backups[:20]], "backup_manifest": manifest,
+            for p, info in selected], "backup_manifest": manifest,
             "expiring": expiring, "delivering": delivering, "delivered": delivered,
             "scanned_at": time.time(), "cache_seconds": 10}
     store._storage_snapshot = {"clock": time.monotonic(), "data": copy.deepcopy(result)}

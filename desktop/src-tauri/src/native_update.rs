@@ -156,18 +156,20 @@ pub(super) fn discards_segment(error: &str) -> bool {
 }
 
 #[cfg(unix)]
-fn single_link(metadata: &std::fs::Metadata) -> bool {
+pub(super) fn single_link(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink() == 1
 }
 #[cfg(not(unix))]
-fn single_link(_: &std::fs::Metadata) -> bool { true }
+pub(super) fn single_link(_: &std::fs::Metadata) -> bool { true }
 
 #[cfg(unix)]
-fn same_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+pub(super) fn same_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     before.dev() == after.dev() && before.ino() == after.ino()
 }
+#[cfg(not(unix))]
+pub(super) fn same_identity(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool { true }
 
 pub(super) fn part_bytes(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
@@ -428,19 +430,177 @@ pub struct NativeUpdater {
     busy: std::sync::Arc<AtomicBool>,
     cancel: std::sync::Arc<AtomicBool>,
     staged: Mutex<Option<(tauri_plugin_updater::Update, PathBuf)>>,
+    authorization: Mutex<Authorization>,
+    waiting: Mutex<Option<u64>>,
+    revoke: std::sync::Arc<AtomicBool>,
+}
+
+/// The user-visible update settings, versioned so an install can be bound to the
+/// exact authorization it was approved under.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct Authorization {
+    pub(super) revision: u64,
+    pub(super) policy: String,
+    pub(super) scope: String,
+    pub(super) window: String,
+}
+
+impl Default for Authorization {
+    fn default() -> Self {
+        Self { revision: 0, policy: "download".into(), scope: "patch".into(), window: "any".into() }
+    }
+}
+
+impl Authorization {
+    pub(super) fn parse(revision: u64, policy: &str, scope: &str, window: &str) -> Result<Self, String> {
+        let allowed = |value: &str, values: [&str; 3]| values.contains(&value);
+        if !allowed(policy, ["manual", "download", "automatic"])
+            || !allowed(scope, ["patch", "minor", "stable"])
+            || !allowed(window, ["any", "night", "weekend"])
+        {
+            return Err("update_authorization_invalid".into());
+        }
+        Ok(Self { revision, policy: policy.into(), scope: scope.into(), window: window.into() })
+    }
+}
+
+/// One install request exactly as the panel sent it. `revision` stays optional so
+/// a missing value can be rejected explicitly instead of borrowing the live one.
+pub(super) struct InstallRequest<'a> {
+    pub(super) revision: Option<u64>,
+    pub(super) automatic: bool,
+    pub(super) window: &'a str,
+    pub(super) current_version: &'a str,
+    pub(super) target_version: &'a str,
+}
+
+/// What one replacement is allowed to do, derived from the stored authorization.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct InstallPermit {
+    pub(super) revision: u64,
+    pub(super) window: String,
+}
+
+/// An install without an approved revision is refused: revision 0 means the panel
+/// never pushed settings, and borrowing the stored revision would let a caller
+/// that never consented replace the app.
+pub(super) fn required_revision(revision: Option<u64>) -> Result<u64, String> {
+    revision.filter(|value| *value > 0).ok_or_else(|| "update_authorization_invalid".into())
+}
+
+/// The same boundary the panel applies, re-derived natively: only a strictly
+/// newer target inside the stored scope may be installed automatically.
+pub(super) fn scope_allows(scope: &str, current: &str, target: &str) -> bool {
+    let (Some((major, minor, patch)), Some((next_major, next_minor, next_patch))) =
+        (parse_version(current), parse_version(target)) else { return false; };
+    if (next_major, next_minor, next_patch) <= (major, minor, patch) { return false; }
+    match scope {
+        "patch" => next_major == major && next_minor == minor,
+        "minor" => next_major == major,
+        "stable" => true,
+        _ => false,
+    }
+}
+
+/// The single decision point for a replacement. An automatic install runs only
+/// under the policy, window and scope the user stored: the forwarded window is
+/// compared against the stored one and never trusted on its own. A manual click
+/// is the user's own consent, so it may replace in any window, but it still needs
+/// the exact revision it was approved under.
+pub(super) fn install_permit(stored: &Authorization, request: &InstallRequest<'_>) -> Result<InstallPermit, String> {
+    let revision = required_revision(request.revision)?;
+    if stored.revision != revision { return Err("update_authorization_changed".into()); }
+    if !request.automatic {
+        return Ok(InstallPermit { revision, window: "any".into() });
+    }
+    if stored.policy != "automatic" || stored.window != request.window {
+        return Err("update_authorization_changed".into());
+    }
+    if !scope_allows(&stored.scope, request.current_version, request.target_version) {
+        return Err("update_target_changed".into());
+    }
+    Ok(InstallPermit { revision, window: stored.window.clone() })
+}
+
+impl NativeUpdater {
+    pub(super) fn authorization(&self) -> Authorization {
+        self.authorization.lock().unwrap().clone()
+    }
+
+    /// Accepts only a newer authorization. A revision that is equal or older is a
+    /// duplicate or an out-of-order call and must never roll back live settings.
+    pub(super) fn authorize(&self, next: Authorization) -> Result<bool, String> {
+        {
+            let mut current = self.authorization.lock().unwrap();
+            if next.revision <= current.revision {
+                return Ok(false);
+            }
+            *current = next.clone();
+        }
+        // A waiting install was approved under the previous revision; revoke it
+        // so the replacement is re-authorized instead of silently proceeding.
+        if let Some(waiting) = *self.waiting.lock().unwrap() {
+            if waiting != next.revision {
+                self.revoke.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn begin_waiting(&self, revision: u64) -> WaitingInstall<'_> {
+        *self.waiting.lock().unwrap() = Some(revision);
+        WaitingInstall { updater: self, revision }
+    }
+
+    pub(super) fn require_authorization(&self, revision: u64) -> Result<(), String> {
+        if self.revoke.load(Ordering::SeqCst) || self.authorization.lock().unwrap().revision != revision {
+            return Err("update_authorization_changed".into());
+        }
+        Ok(())
+    }
+
+    /// Re-derives the permit at a replacement boundary, so a changed policy,
+    /// scope or window withdraws the replacement even mid-drain.
+    pub(super) fn require_install_permit(&self, request: &InstallRequest<'_>) -> Result<InstallPermit, String> {
+        self.require_authorization(required_revision(request.revision)?)?;
+        install_permit(&self.authorization(), request)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+}
+
+pub(super) struct WaitingInstall<'a> {
+    updater: &'a NativeUpdater,
+    revision: u64,
+}
+
+impl Drop for WaitingInstall<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self.updater.waiting.lock().unwrap();
+        if *waiting == Some(self.revision) {
+            *waiting = None;
+        }
+    }
 }
 
 impl Default for NativeUpdater {
     fn default() -> Self {
         Self { state: Mutex::new(json!({"state":"idle"})), busy: Default::default(),
-               cancel: Default::default(), staged: Mutex::new(None) }
+               cancel: Default::default(), staged: Mutex::new(None),
+               authorization: Mutex::new(Authorization::default()),
+               waiting: Mutex::new(None), revoke: Default::default() }
     }
 }
 
 impl NativeUpdater {
-    fn begin(&self) -> Result<UpdateOperation, String> {
+    pub(super) fn begin(&self) -> Result<UpdateOperation, String> {
         if self.busy.swap(true, Ordering::SeqCst) { return Err("update_busy".into()); }
         self.cancel.store(false, Ordering::SeqCst);
+        self.revoke.store(false, Ordering::SeqCst);
+        *self.waiting.lock().unwrap() = None;
         Ok(UpdateOperation { busy: self.busy.clone(), cancel: self.cancel.clone() })
     }
 
@@ -450,7 +610,7 @@ impl NativeUpdater {
 }
 
 // Own the slot across async preflight and the blocking worker, including worker errors.
-struct UpdateOperation {
+pub(super) struct UpdateOperation {
     busy: std::sync::Arc<AtomicBool>,
     cancel: std::sync::Arc<AtomicBool>,
 }
@@ -557,9 +717,20 @@ fn configured(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, S
 }
 
 pub fn snapshot(app: &tauri::AppHandle) -> Value {
-    let mut state = app.state::<NativeUpdater>().state.lock().unwrap().clone();
+    let updater = app.state::<NativeUpdater>();
+    let mut state = updater.state.lock().unwrap().clone();
     describe_snapshot(&mut state, &app.package_info().version.to_string(), host_platform(), host_arch());
+    // The panel binds every install to this revision, so it must always be present.
+    state["authorization_revision"] = json!(updater.authorization().revision);
     state
+}
+
+/// Stores the user-visible settings under a newer revision. A changed revision
+/// revokes a waiting install instead of letting it replace under stale consent.
+pub fn authorize(app: &tauri::AppHandle, revision: u64, policy: &str, scope: &str, window: &str) -> Result<Value, String> {
+    let next = Authorization::parse(revision, policy, scope, window)?;
+    app.state::<NativeUpdater>().authorize(next)?;
+    Ok(snapshot(app))
 }
 
 pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, String> {
@@ -798,24 +969,47 @@ fn require_window(window: &str) -> Result<(), String> {
     else { Err("update_window_closed".into()) }
 }
 
-pub async fn install(app: tauri::AppHandle, window: String) -> Result<(), String> {
+pub async fn install(app: tauri::AppHandle, window: String, revision: u64, automatic: bool) -> Result<(), String> {
     let operation = app.state::<NativeUpdater>().begin()?;
+    let updater = app.state::<NativeUpdater>();
     let approved = staged_artifact(&app)?;
+    let target = approved.get("version").and_then(Value::as_str).ok_or("update_not_downloaded")?.to_string();
+    let current = app.package_info().version.to_string();
+    // Bind the whole replacement to the stored authorization. The revision is
+    // required: a missing one is refused instead of borrowing the live one, and
+    // the window is derived here rather than taken from the caller.
+    let request = InstallRequest { revision: Some(revision), automatic, window: &window,
+        current_version: &current, target_version: &target };
+    let permit = updater.require_install_permit(&request)?;
     let eligibility = check_in_operation(&app, false).await?;
     if eligibility["state"] != "ready" { return Err("update_not_downloaded".into()); }
     require_same_artifact(&approved, Some(&staged_artifact(&app)?))?;
+    updater.require_install_permit(&request)?;
     tauri::async_runtime::spawn_blocking(move || {
-        operation.run_install(|| install_in_operation(app, window, approved))
+        operation.run_install(|| install_in_operation(app, permit, automatic, approved, current, target))
     }).await.map_err(|_| "update_worker_failed".to_string())?
 }
 
-fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) -> Result<(), String> {
+fn install_in_operation(app: tauri::AppHandle, permit: InstallPermit, automatic: bool, approved: Value,
+                        current_version: String, target_version: String) -> Result<(), String> {
     let updater = app.state::<NativeUpdater>();
     let local = app.state::<RuntimeState>().local.lock().unwrap().clone();
+    let revision = permit.revision;
+    let window = permit.window;
+    let request = InstallRequest { revision: Some(revision), automatic, window: &window,
+        current_version: &current_version, target_version: &target_version };
+    // Every replacement boundary re-derives the permit from stored consent, so a
+    // changed revision, policy, window or scope withdraws it before any replace.
+    let boundary = || -> Result<(), String> {
+        require_window(&window)?;
+        updater.require_install_permit(&request).map(|_| ())
+    };
+    // Every exit path clears this, and a newer authorization revokes it.
+    let _waiting = updater.begin_waiting(revision);
     let mut lease = Value::Null;
     let mut engine_stopped = false;
     let result: Result<(), String> = (|| {
-        require_window(&window)?;
+        boundary()?;
         let version = updater.staged.lock().unwrap().as_ref().map(|(update, _)| update.version.clone())
             .ok_or("update_not_downloaded")?;
         require_same_artifact(&approved, Some(&staged_artifact(&app)?))?;
@@ -828,7 +1022,12 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
             lease = ready["barrier"]["lease"].clone();
             let deadline = std::time::Instant::now() + Duration::from_secs(3600);
             while ready["ready"] != true {
-                require_window(&window)?;
+                // A policy/scope/window change revokes this waiting install; the
+                // barrier lease is released so the runtime keeps running normally.
+                if let Err(error) = boundary() {
+                    let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
+                    return Err(error);
+                }
                 updater.set(json!({"state":"waiting_idle","version":version,"reasons":ready["reasons"]}));
                 if updater.cancel.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
                     let _ = call(connection, "desktop-update", Some(json!({"action":"cancel","lease":lease})));
@@ -840,13 +1039,14 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
                 ready = serde_json::from_str(&reply.body).map_err(|_| "update_drain_failed")?;
                 if ready["barrier"]["lease"] != lease { return Err("update_lease_expired".into()); }
             }
-            require_window(&window)?;
+            boundary()?;
             revalidate(&app, &approved)?;
+            boundary()?;
             let reply = call(connection, "desktop-update", Some(json!({"action":"commit","lease":lease})))?;
             if reply.status != 200 { return Err("update_drain_failed".into()); }
         }
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
-        require_window(&window)?;
+        boundary()?;
         if owned.is_none() { revalidate(&app, &approved)?; }
         let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
         preflight_space(&cache, announced_size(&approved))?;
@@ -867,12 +1067,41 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
                 Err(error) => return Err(error),
             }
         }
-        require_window(&window)?;
+        boundary()?;
         let staged = updater.staged.lock().unwrap().take().ok_or("update_not_downloaded")?;
         let installation = read_package(&staged.1).and_then(|bytes| {
-            require_window(&window)?;
+            boundary()?;
             if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
-            staged.0.install(&bytes).map_err(|_| "update_install_failed".to_string())
+            // Verify the exact bytes being installed so both the persisted receipt
+            // and the replacement decision come from a real signature check.
+            let verified = staged.0.verify(&bytes);
+            let receipt = update_receipt::prepare_app(&app)?;
+            update_receipt::begin_pending(&receipt, &update_receipt::Transaction {
+                operation_id: update_receipt::operation_id(),
+                from_version: app.package_info().version.to_string(),
+                to_version: staged.0.version.clone(),
+                artifact_sha256: update_receipt::sha256_hex(&bytes),
+                signature_sha256: update_receipt::sha256_hex(staged.0.signature.as_bytes()),
+                signature_verified: verified.is_ok(),
+                artifact_url: staged.0.download_url.as_str().to_string(),
+                authorization_revision: revision,
+                install_window: window.clone(),
+                platform: host_platform().into(),
+                arch: host_arch().into(),
+            })?;
+            if verified.is_err() {
+                // Keep the failed check as evidence; nothing was replaced.
+                let _ = update_receipt::transition(&receipt, "failed", Some("update_download_or_signature_failed"), None);
+                return Err("update_download_or_signature_failed".into());
+            }
+            if staged.0.install(&bytes).is_err() {
+                // Record the failed attempt, but keep the install error as the
+                // primary fact. If the record cannot be updated it stays pending
+                // and is settled by the next start; it is never read as applied.
+                let _ = update_receipt::transition(&receipt, "failed", Some("update_install_failed"), None);
+                return Err("update_install_failed".into());
+            }
+            Ok(())
         });
         if installation.is_err() {
             *updater.staged.lock().unwrap() = Some(staged);

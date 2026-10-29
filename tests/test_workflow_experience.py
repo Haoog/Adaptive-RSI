@@ -629,13 +629,13 @@ class ExperienceTest(unittest.TestCase):
         run, directory, outcome = self.artifact_run()
         destinations = []
         def snapshot(source, target, sha):
-            target.mkdir()
+            target.mkdir(parents=True)
             destinations.append(target)
             return target
         with patch("adaptive_rsi.delivery.time.time_ns", return_value=123), patch("adaptive_rsi.delivery.uid", side_effect=["first", "second"]), patch("adaptive_rsi.delivery.baseline", return_value=("fixture", "new-head", "main")), patch("adaptive_rsi.delivery.snapshot", side_effect=snapshot), patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}):
             for _ in range(2):
                 feedback(self.runtime, self.runtime.project(self.project), run, dict(outcome), self.runtime.config(self.project), time.time())
-        self.assertEqual({p.parent.name for p in destinations}, {"123-first", "123-second"})
+        self.assertEqual({p.relative_to(directory).parts[1] for p in destinations}, {"123-first", "123-second"})
         self.assertTrue(all(p.is_relative_to(directory) for p in destinations))
         output = directory / "feedback" / "123-first"
         (output / "marker").write_bytes(b"existing evidence")
@@ -689,6 +689,7 @@ class ExperienceTest(unittest.TestCase):
         for reason in ("same-head", "interval", "expired"):
             with self.subTest(reason=reason):
                 result = json.loads(json.dumps(outcome))
+                result["feedback"]["merge"] = {"sha": result["merged_sha"], "state": "verified"}
                 if reason == "interval":
                     result["feedback"]["checked_at"] = now
                     result["feedback"]["investigation_pending"] = True
