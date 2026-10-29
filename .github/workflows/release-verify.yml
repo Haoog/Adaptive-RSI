@@ -1,4 +1,5 @@
 name: 版本 PR 精确提交检查
+run-name: 'Release verification PR #${{ inputs.pr }} @${{ inputs.sha }}'
 on:
   workflow_dispatch:
     inputs:

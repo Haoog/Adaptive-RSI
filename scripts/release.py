@@ -104,6 +104,17 @@ def verify_generated(base, head):
     return target
 
 
+def desktop_mode(base, head, branch, event):
+    """Only an exact generated release identity can omit a redundant build."""
+    if event != 'pull_request' or not re.fullmatch(r'chore/release-v\d+\.\d+\.\d+-[a-f0-9]{12}', branch):
+        return 'full'
+    try:
+        target = verify_generated(base, head)
+    except (ValueError, subprocess.CalledProcessError):
+        return 'full'
+    return 'skip' if branch == f'chore/release-v{target}-{base[:12]}' else 'full'
+
+
 def release_assets(directory, target):
     files = {path.name: path for path in Path(directory).glob("*")
              if path.is_file() and not path.is_symlink()}
@@ -186,8 +197,10 @@ def validate_proof(directory, sha, allowed_workflows):
     return proof
 
 
-def find_verified_artifact(tree, branch):
+def find_verified_artifact(tree, branch, details=None):
     """Find an unexpired artifact from a successful trusted verification run."""
+    details = {} if details is None else details
+    details['artifact_reuse_reason'] = 'missing'
     if not re.fullmatch(r"[a-f0-9]{40}", tree or ""):
         raise ValueError("An exact source tree is required")
     name = "release-verified-" + tree
@@ -195,7 +208,14 @@ def find_verified_artifact(tree, branch):
     artifacts = sorted(listing.get("artifacts", []), key=lambda item: item.get("id", 0), reverse=True)
     for artifact in artifacts:
         run_id = (artifact.get("workflow_run") or {}).get("id")
-        if artifact.get("name") != name or artifact.get("expired") or not run_id:
+        if artifact.get('name') != name:
+            continue
+        if artifact.get('expired'):
+            if details['artifact_reuse_reason'] == 'missing':
+                details['artifact_reuse_reason'] = 'expired'
+            continue
+        details['artifact_reuse_reason'] = 'untrusted'
+        if not run_id:
             continue
         run_info = gh("actions/runs/" + str(run_id))
         if (run_info.get("path") != ".github/workflows/release-verify.yml" or
@@ -203,6 +223,7 @@ def find_verified_artifact(tree, branch):
                 run_info.get("status") != "completed" or run_info.get("conclusion") != "success" or
                 run_info.get("head_branch") != branch):
             continue
+        details['artifact_reuse_reason'] = 'available'
         return {"run_id": run_id, "name": name}
     return None
 
@@ -213,6 +234,74 @@ def output(**fields):
             for key, value in fields.items():
                 stream.write(key + "=" + str(value) + "\n")
     print(json.dumps(fields, ensure_ascii=False))
+
+
+def release_verification_title(pr, sha):
+    return f"Release verification PR #{int(pr)} @{sha}"
+
+
+def paged_items(endpoint, key):
+    items, page = [], 1
+    while True:
+        response = gh(endpoint + ('&' if '?' in endpoint else '?') + f'per_page=100&page={page}')
+        batch = response.get(key)
+        if not isinstance(batch, list):
+            raise ValueError('Incomplete GitHub listing; refusing an uncertain dispatch')
+        items.extend(batch)
+        if len(batch) < 100:
+            return items
+        page += 1
+
+
+def ensure_release_verification(pr, sha):
+    """Reserve dispatch durably before POST; ambiguity requires reconciliation."""
+    if not re.fullmatch(r'[a-f0-9]{40}', sha):
+        raise ValueError('Exact PR head SHA is required')
+    title = release_verification_title(pr, sha)
+    runs = paged_items('actions/workflows/release-verify.yml/runs?event=workflow_dispatch&branch=main', 'workflow_runs')
+    matching = [item for item in runs
+                if item.get('display_title') == title and item.get('event') == 'workflow_dispatch'
+                and item.get('head_branch') == 'main'
+                and item.get('path') == '.github/workflows/release-verify.yml']
+    reusable = [item for item in matching if item.get('status') != 'completed' or item.get('conclusion') == 'success']
+    if reusable:
+        item = max(reusable, key=lambda item: item['id'])
+        return {'verification_state': 'success' if item['status'] == 'completed' else 'active',
+                'verification_run_id': item['id']}
+    if matching:
+        item = max(matching, key=lambda item: item['id'])
+        # Retry the exact known run explicitly, never create a second uncertain dispatch.
+        return {'verification_state': 'failed', 'verification_run_id': item['id'],
+                'verification_retry': f"gh run rerun {item['id']} --repo {os.environ['GITHUB_REPOSITORY']}"}
+    receipts = paged_items(f'commits/{sha}/check-runs?filter=all', 'check_runs')
+    name = 'release-verification-dispatch-' + str(int(pr))
+    if any(item.get('name') == name and item.get('head_sha') == sha for item in receipts):
+        return {'verification_state': 'dispatch_unknown', 'verification_run_id': ''}
+    # This receipt is deliberately separate from verify: dispatch is not verification.
+    receipt = gh('check-runs', 'POST', name=name, head_sha=sha, status='completed', conclusion='neutral',
+                 external_id=title, **{'output[title]': 'Release verification dispatch reserved',
+                                     'output[summary]': 'Await exact-head trusted release verification; do not redispatch an uncertain request.'})
+    saved = gh('check-runs/' + str(receipt['id']))
+    if saved.get('name') != name or saved.get('head_sha') != sha or saved.get('external_id') != title:
+        raise ValueError('Dispatch receipt identity could not be verified')
+    try:
+        gh('actions/workflows/release-verify.yml/dispatches', 'POST', ref='main',
+           **{'inputs[pr]': str(int(pr)), 'inputs[sha]': sha})
+    except subprocess.CalledProcessError:
+        return {'verification_state': 'dispatch_unknown', 'verification_run_id': ''}
+    return {'verification_state': 'dispatched', 'verification_run_id': ''}
+
+
+def release_selection():
+    level = os.environ.get("RELEASE_LEVEL", "patch")
+    stage = os.environ.get("NEW_PRODUCT_STAGE", "false").lower()
+    if level not in ["major", "minor", "patch"]:
+        raise ValueError("Release level must be major, minor or patch")
+    if stage not in ("true", "false"):
+        raise ValueError("New product stage must be true or false")
+    if level != "patch" and stage != "true":
+        raise ValueError("Minor and major releases require an explicit new product stage")
+    return level, stage
 
 
 def prepare():
@@ -230,14 +319,22 @@ def prepare():
             pass
         else:
             tree = tree_at(head)
+            details = {}
             try:
-                artifact = find_verified_artifact(tree, branch)
+                artifact = find_verified_artifact(tree, branch, details)
             except (subprocess.CalledProcessError, ValueError) as exc:
                 print("Verified artifact lookup failed; formal release will rebuild: " + str(exc), file=sys.stderr)
                 artifact = None
+                details['artifact_reuse_reason'] = 'lookup_error'
+            reason = details.get('artifact_reuse_reason', 'available' if artifact else 'missing')
+            release_path = 'reuse_candidate' if artifact else 'rebuild'
+            if os.environ.get('GITHUB_STEP_SUMMARY'):
+                with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+                    stream.write(f'\nRelease path: `{release_path}`; artifact reuse reason: `{reason}`.\n')
             if not artifact:
                 print("No reusable attested artifact found for this source tree; formal release will rebuild", file=sys.stderr)
             output(mode="publish", sha=head, version=current, tree=tree,
+                   release_path=release_path, artifact_reuse_reason=reason,
                    artifact_run_id=(artifact or {}).get("run_id", ""),
                    artifact_name=(artifact or {}).get("name", ""))
             return
@@ -245,11 +342,7 @@ def prepare():
     if os.environ.get("PREPARE_RELEASE") != "true":
         output(mode="idle", reason="Changes accumulated; start a stable release batch explicitly")
         return
-    level = os.environ.get("RELEASE_LEVEL", "patch")
-    if level not in ["major", "minor", "patch"]:
-        raise ValueError("Release level must be major, minor or patch")
-    if level != "patch" and os.environ.get("NEW_PRODUCT_STAGE", "false").lower() != "true":
-        raise ValueError("Minor and major releases require an explicit new product stage")
+    level, _ = release_selection()
     # A single stable branch and all-state PR lookup prevent duplicate version PRs.
     major, minor, patch = map(int, current.split("."))
     target = f"{major + 1}.0.0" if level == "major" else f"{major}.{minor + 1}.0" if level == "minor" else f"{major}.{minor}.{patch + 1}"
@@ -270,7 +363,8 @@ def prepare():
     if existing:
         item = existing[0]
         if item["state"] == "OPEN":
-            output(mode="verify", pr=item["number"], sha=item["headRefOid"])
+            output(mode="verify", pr=item["number"], sha=item["headRefOid"],
+                   **ensure_release_verification(item["number"], item["headRefOid"]))
         else:
             output(mode="blocked", reason="Existing version PR is closed; inspect before preparing another version")
         return
@@ -287,7 +381,8 @@ def prepare():
         url = run("gh", "pr", "create", "--repo", os.environ["GITHUB_REPOSITORY"], "--base", branch, "--head", release_branch,
                   "--title", "准备正式版本 " + target, "--body-file", body.name)
     item = json.loads(run("gh", "pr", "view", url, "--json", "number,headRefOid"))
-    output(mode="verify", pr=item["number"], sha=item["headRefOid"])
+    output(mode="verify", pr=item["number"], sha=item["headRefOid"],
+                   **ensure_release_verification(item["number"], item["headRefOid"]))
 
 
 def gate(pr_number, expected_sha):
@@ -359,6 +454,18 @@ def main():
         proof = validate_proof(Path(args.directory), args.sha, {".github/workflows/release-verify.yml"})
         output(source_sha=proof["source_sha"], source_tree=proof["source_tree"],
                workflow_source_sha=proof["workflow_source_sha"])
+    elif (args.action == "prepare" and os.environ.get("PREPARE_RELEASE") == "true"
+          and os.environ.get("GITHUB_ACTIONS") != "true"):
+        level, stage = release_selection()
+        # Only the canonical workflow owns PR/check writes under its shared lock.
+        try:
+            run("gh", "workflow", "run", "release.yml", "--repo", os.environ["GITHUB_REPOSITORY"],
+                "--ref", "main", "-f", "prepare_release=true", "-f", "release_level=" + level,
+                "-f", "new_product_stage=" + stage)
+        except (subprocess.CalledProcessError, OSError):
+            output(mode="dispatch_unknown", reason="Inspect release.yml runs before requesting another batch")
+        else:
+            output(mode="requested")
     else:
         globals()[args.action]()
 

@@ -1,4 +1,7 @@
 import hashlib
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +13,77 @@ from scripts.release import release_assets
 
 
 class DesktopReleasePackageTest(unittest.TestCase):
+    def test_generated_version_desktop_mode_requires_matching_branch_and_exact_patch(self):
+        from scripts import release
+        base, head = 'a' * 40, 'b' * 40
+        branch = 'chore/release-v1.2.4-' + base[:12]
+        with patch.object(release, 'verify_generated', return_value='1.2.4') as verify:
+            self.assertEqual(release.desktop_mode(base, head, branch, 'pull_request'), 'skip')
+            verify.assert_called_once_with(base, head)
+            self.assertEqual(release.desktop_mode(base, head, branch, 'workflow_dispatch'), 'full')
+            self.assertEqual(release.desktop_mode(base, head, branch.replace('1.2.4', '1.2.5'), 'pull_request'), 'full')
+            self.assertEqual(release.desktop_mode(base, head, branch[:-1] + 'f', 'pull_request'), 'full')
+        with patch.object(release, 'verify_generated', side_effect=ValueError('extra source or mode change')):
+            self.assertEqual(release.desktop_mode(base, head, branch, 'pull_request'), 'full')
+
+    def test_workflow_classifies_generated_head_before_desktop_paths(self):
+        from tests.test_release import WorkflowConfigurationTest
+        workflow = WorkflowConfigurationTest().workflow('desktop.yml')
+        step = next(step for step in workflow['jobs']['changes']['steps'] if step.get('id') == 'classify')
+        self.assertIn('HEAD_SHA', step['env'])
+        self.assertIn('HEAD_REF', step['env'])
+        self.assertIn('scripts.classify_changes', step['run'])
+        self.assertIn('desktop_mode', step['run'])
+        self.assertIn('"$HEAD_SHA"', step['run'])
+        self.assertIn('"$base" "$HEAD_SHA"', step['run'])
+
+    def test_workflow_shell_uses_base_helpers_for_untrusted_head(self):
+        from scripts import release
+        from tests.test_release import WorkflowConfigurationTest, git
+        workflow = WorkflowConfigurationTest().workflow('desktop.yml')
+        script = next(step['run'] for step in workflow['jobs']['changes']['steps'] if step.get('id') == 'classify')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ['scripts/release.py', 'scripts/classify_changes.py', 'scripts/package_desktop.py',
+                         *release.RELEASE_FILES]:
+                destination = root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(release.ROOT / name, destination)
+            git(root, 'init', '-q')
+            git(root, 'add', '.')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'base')
+            base = git(root, 'rev-parse', 'HEAD')
+            with patch.object(release, 'ROOT', root):
+                version = release.get_version(release.read_at(base, 'adaptive_rsi/__init__.py'))
+                parts = version.split('.')
+                target = '.'.join(parts[:2] + [str(int(parts[2]) + 1)])
+                for name, content in release.bump_files(base, target).items():
+                    (root / name).write_text(content)
+            git(root, 'add', '.')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'release')
+            head = git(root, 'rev-parse', 'HEAD')
+            git(root, 'remote', 'add', 'origin', str(root))
+            git(root, 'checkout', '--detach', base)
+            env = dict(os.environ, EVENT_NAME='pull_request', BASE_SHA=base, BASE_REF='main',
+                       HEAD_SHA=head, HEAD_REF=f'chore/release-v{target}-{base[:12]}', GITHUB_OUTPUT=str(root / 'outputs'))
+            for expected in ['skip', 'full']:
+                if expected == 'full':
+                    git(root, 'checkout', '--detach', head)
+                    (root / 'scripts/classify_changes.py').write_text("raise RuntimeError('PR code must not run')\n")
+                    git(root, 'add', '.')
+                    git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'tamper')
+                    env['HEAD_SHA'] = git(root, 'rev-parse', 'HEAD')
+                    git(root, 'checkout', '--detach', base)
+                result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=root,
+                                        env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('Desktop build mode: ' + expected, result.stdout)
+            env['EVENT_NAME'] = 'workflow_dispatch'
+            result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', script], cwd=root,
+                                    env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('Desktop build mode: full', result.stdout)
+
     def test_path_classification_runs_full_build_only_for_desktop_packaging_inputs(self):
         self.assertEqual(desktop_build_mode(["adaptive_rsi/web/app.js"]), "smoke")
         for path in ["desktop/src-tauri/tauri.conf.json", "desktop/package-lock.json",

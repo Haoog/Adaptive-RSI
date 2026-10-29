@@ -28,12 +28,17 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
       - id: classify
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
+          mode=full
           if [ "$EVENT_NAME" = pull_request ]; then
             if [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
               base="$BASE_SHA"
@@ -41,11 +46,20 @@ jobs:
               git fetch --no-tags origin "$BASE_REF" --depth=1
               base="$(git rev-parse FETCH_HEAD)"
             fi
-            git diff --name-only "$base" HEAD > /tmp/rsi-desktop-paths
+            git fetch --no-tags origin "$HEAD_SHA"
+            git diff --name-only "$base" "$HEAD_SHA" > /tmp/rsi-desktop-paths
+            # Execute only base helpers; PR changes to classification cannot grant a skip.
+            metadata="$(python3 -m scripts.classify_changes "$base" "$HEAD_SHA")"
+            if [ "$metadata" = version ]; then
+              mode="$(python3 -c 'import sys; from scripts.release import desktop_mode; print(desktop_mode(*sys.argv[1:]))' "$base" "$HEAD_SHA" "$HEAD_REF" "$EVENT_NAME")"
+            elif [[ "$HEAD_REF" == chore/release-v* ]]; then
+              mode=full
+            else
+              mode="$(python3 scripts/package_desktop.py classify --event "$EVENT_NAME" < /tmp/rsi-desktop-paths)"
+            fi
           else
             : > /tmp/rsi-desktop-paths
           fi
-          mode="$(python3 scripts/package_desktop.py classify --event "$EVENT_NAME" < /tmp/rsi-desktop-paths)"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "Desktop build mode: $mode"
           cat /tmp/rsi-desktop-paths
