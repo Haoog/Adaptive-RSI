@@ -58,6 +58,28 @@ def cancellation_preview(db, task):
             "limit": 1000, "truncated": truncated}
 
 
+def revoke_approvals(db, task, project, now):
+    """Withdraw a cancelled task's candidates and their unclaimed publications.
+
+    Published history (pr_open/merged runs and their delivery receipts) is never
+    rewritten here; only authorization that has not been executed yet is closed.
+    """
+    candidates = [row["id"] for row in db.execute(
+        "SELECT id FROM runs WHERE task=? AND state='awaiting_approval' ORDER BY id", (task,))]
+    publications = []
+    if candidates:
+        marks = ",".join("?" * len(candidates))
+        publications = [row["id"] for row in db.execute(
+            "SELECT id FROM tasks WHERE project=? AND source='system_publish' AND state='queued' "
+            "AND body IN (" + marks + ") ORDER BY id", (project, *candidates))]
+        if publications:
+            db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE project=? "
+                       "AND source='system_publish' AND state='queued' AND body IN (" + marks + ")",
+                       (now, project, *candidates))
+        db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
+    return candidates, publications
+
+
 def cancel(runtime, task, cascade=False, expected=None, reason=None):
     intervention_reason(reason)
     if type(cascade) is not bool:
@@ -76,15 +98,20 @@ def cancel(runtime, task, cascade=False, expected=None, reason=None):
         for row in [plan["task"], *plan["affected"]]:
             selected = row["id"] == task or cascade and row["cancellable"]
             if not selected:
-                receipts.append({"id": row["id"], "state": "unchanged", "previous_state": row["state"]})
+                receipts.append({"id": row["id"], "state": "unchanged", "previous_state": row["state"],
+                                 "candidates": [], "publications": []})
                 continue
             db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE id=?", (now, row["id"]))
+            # 取消必须同事务收回待批准候选与尚未领取的发布任务，避免过期标签页继续批准。
+            candidates, publications = revoke_approvals(db, row["id"], plan["task"]["project"], now)
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'cancelled','Cancellation requested',?,?)",
                        (plan["task"]["project"], encode({"task": row["id"], "root": task,
                          "cascade": cascade, "preview_revision": plan["revision"], "reason": reason,
-                         "before": {"state": row["state"]}, "after": {"state": "cancelled"}}), now))
-            receipts.append({"id": row["id"], "state": "cancelled", "previous_state": row["state"]})
+                         "before": {"state": row["state"]}, "after": {"state": "cancelled"},
+                         "revoked": {"candidates": candidates, "publications": publications}}), now))
+            receipts.append({"id": row["id"], "state": "cancelled", "previous_state": row["state"],
+                             "candidates": candidates, "publications": publications})
     runtime.wake.set()
     return {"saved": True, "revision": plan["revision"], "cascade": cascade, "receipts": receipts,
             "impact_truncated": plan["truncated"]}

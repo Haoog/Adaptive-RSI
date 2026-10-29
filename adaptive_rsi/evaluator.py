@@ -856,7 +856,8 @@ class Evaluator:
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
-            return {"decision": "insufficient_evidence", "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": []}
+            return {"decision": "insufficient_evidence",
+                    "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}}
         results = {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
@@ -890,17 +891,17 @@ class Evaluator:
                      [check for check in full_checks if check not in checks])
         if test_first and changed_harness:
             return {"decision": "insufficient_evidence",
-                    "reason": "Test-first proof cannot modify the existing test harness", "checks": []}
+                    "reason": "Test-first proof cannot modify the existing test harness", "checks": {}}
         test_first_check = None
         if test_first:
             if not 1 <= len(added_tests) <= 8:
                 return {"decision": "insufficient_evidence",
-                        "reason": "Test-first proof requires 1..8 new regression test files", "checks": []}
+                        "reason": "Test-first proof requires 1..8 new regression test files", "checks": {}}
             test_first_check = [_isolated_test_check(checks, baseline, filename, regression_test_symbols) for filename in added_tests]
             if any(check is None for check in test_first_check):
                 return {"decision": "insufficient_evidence",
                         "reason": "Configured test runner cannot execute the new regression test in isolation",
-                        "checks": []}
+                        "checks": {}}
         reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
                       not changed_harness)
         baseline_key = None if test_first or overlay else self._cache_key(

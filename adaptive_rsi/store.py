@@ -38,26 +38,98 @@ def decode_object(value):
     return result if isinstance(result, dict) else {"evidence_error": "invalid_json_object"}
 
 
+EVIDENCE_OBJECTS = ("review", "evaluation", "feedback", "failure", "automation", "value", "monitor")
+
+
 def decode_evidence(value):
-    """Validate containers consumed by historical dashboards, preserving raw database evidence."""
+    """Validate containers consumed by historical dashboards, preserving raw database evidence.
+
+    只丢弃无法解释的字段并记录 evidence_error；其余顶层证据（summary、files、reason、
+    merged_sha 等）保留，避免一个坏字段让整份结果从读模型消失。历史生产者用空列表
+    表示“没有可执行检查”，它等价于空对象；非空列表仍视为无效证据。
+    """
     result = decode_object(value)
-    for field in ("review", "evaluation", "feedback", "failure", "automation", "value", "monitor"):
+    if "evidence_error" in result:
+        return result
+    errors = []
+    for field in EVIDENCE_OBJECTS:
         if field in result and not isinstance(result[field], dict):
-            return {"evidence_error": "invalid_evidence_shape:" + field}
-    review, evaluation = result.get("review", {}), result.get("evaluation", {})
-    findings, trials, checks = review.get("findings", []), result.get("trials", []), evaluation.get("checks", {})
-    for name, rows in (("findings", findings), ("trials", trials)):
-        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            return {"evidence_error": "invalid_evidence_shape:" + name}
-    if any("case" in row and not isinstance(row["case"], (str, type(None))) for row in trials):
-        return {"evidence_error": "invalid_evidence_shape:case"}
+            errors.append(field)
+            result.pop(field)
+    review, evaluation = result.get("review"), result.get("evaluation")
+    review = review if isinstance(review, dict) else {}
+    evaluation = evaluation if isinstance(evaluation, dict) else {}
+    findings, trials = review.get("findings", []), result.get("trials", [])
+    if not isinstance(findings, list) or any(not isinstance(row, dict) for row in findings):
+        errors.append("findings")
+        result.pop("review", None)
+    if not isinstance(trials, list) or any(not isinstance(row, dict) for row in trials):
+        errors.append("trials")
+        result.pop("trials", None)
+    elif any("case" in row and not isinstance(row["case"], (str, type(None))) for row in trials):
+        errors.append("case")
+        result.pop("trials", None)
+    checks = evaluation.get("checks", {})
+    empty_checks = isinstance(checks, list) and not checks
+    if empty_checks:
+        evaluation["checks"], checks = {}, {}
     if not isinstance(checks, dict) or any(not isinstance(rows, list) or
             any(not isinstance(row, dict) for row in rows) for rows in checks.values()):
-        return {"evidence_error": "invalid_evidence_shape:checks"}
+        errors.append("checks")
+        result.pop("evaluation", None)
+    elif empty_checks and evaluation.get("decision") == "pass":
+        # 空列表兼容只表示“没有可执行检查”，不构成验收证据；沿用 pass 会让
+        # 0 个检查的记录在质量/工作流读模型里被计成 passed/accepted。
+        evaluation["decision"] = "insufficient_evidence"
     if "merged_at" in result and (not isinstance(result["merged_at"], (int, float)) or
             not (0 <= result["merged_at"] < 2**63 - 1)):
-        return {"evidence_error": "invalid_evidence_shape:merged_at"}
+        errors.append("merged_at")
+        result.pop("merged_at")
+    if errors:
+        result["evidence_error"] = "invalid_evidence_shape:" + errors[0]
     return result
+
+
+def provider_identity(provider, generation=""):
+    """Stable provider identity used by the catalog and by call price freezing."""
+    from .config import fingerprint
+    fields = {key: value for key, value in provider.items() if key != "name"}
+    if generation:
+        fields["credential_generation"] = generation
+    return fingerprint(fields)
+
+
+def credential_generation(root, provider):
+    """Persisted generation for this provider's own credential; never returns a secret."""
+    try:
+        from .credentials import Credentials
+        generation = Credentials(root).epoch(provider)
+    except Exception:
+        # 价格解析失败不能阻断模型调用；退回不含代次的历史身份而不是猜测。
+        return ""
+    return generation if isinstance(generation, str) else ""
+
+
+def catalog_keys(project, provider_id, signature, legacy_signature):
+    """Settings keys that may hold a provider catalog, most specific first.
+
+    签名含凭据代次；不含代次的历史目录只作为最后回退。项目范围只在同一签名下
+    继承全局目录，且不继承不含连接身份的价格偏好，避免把另一连接的价格套过来。
+    """
+    scopes = [project, "global"] if project and project != "global" else ["global"]
+    keys, seen = [], set()
+    for index, scope in enumerate(scopes):
+        base = "model-center:" + scope + ":" + provider_id + ":"
+        candidates = [(base + signature, False)]
+        if index == 0:
+            candidates.append(("model-preferences:" + scope + ":" + provider_id, False))
+        if legacy_signature and legacy_signature != signature:
+            candidates.append((base + legacy_signature, True))
+        for key, legacy in candidates:
+            if key not in seen:
+                seen.add(key)
+                keys.append((key, legacy))
+    return keys
 
 
 class PooledConnection(sqlite3.Connection):
@@ -855,18 +927,28 @@ class Store:
         self.execute("UPDATE candidates SET status='interrupted' WHERE status IN ('proposing','evaluating')")
         return len(rows)
 
+    def catalog_entry(self, project, provider_id, signature, legacy_signature):
+        """First persisted catalog entry for an identity; returns (value, from_legacy_key)."""
+        for key, legacy in catalog_keys(project, provider_id, signature, legacy_signature):
+            value = self.setting(key)
+            if isinstance(value, dict):
+                return value, legacy
+        return None, False
+
     def reserve_call(self, project, run, role, route, config):
         now = time.time()
-        from .config import BUILTIN_PROVIDERS, fingerprint
+        from .config import BUILTIN_PROVIDERS
         provider_id = route.get("provider", "openai")
         provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
         provider = provider or next((p for p in BUILTIN_PROVIDERS if p["id"] == provider_id), {"id": provider_id})
-        signature = fingerprint({k: v for k, v in provider.items() if k != "name"})
-        prefix = "model-center:"
-        directory = self.setting(prefix + str(project) + ":" + provider_id + ":" + signature)
-        if directory is None:
-            directory = self.setting(prefix + "global:" + provider_id + ":" + signature, {})
-        price = next((m.get("unit_price") for m in directory.get("models", []) if m["id"] == route["model"]), None)
+        # 与模型中心目录使用同一身份（含该供应商自己的凭据代次）；冻结运行仍按
+        # 其封存配置里的供应商解析，不套用当前配置的代次。
+        signature = provider_identity(provider, credential_generation(self.root, provider))
+        directory, _ = self.catalog_entry(project, provider_id, signature, provider_identity(provider))
+        models = directory.get("models") if isinstance(directory, dict) else None
+        entry = next((item for item in (models if isinstance(models, list) else [])
+                      if isinstance(item, dict) and item.get("id") == route["model"]), {})
+        price = entry.get("unit_price")
         if isinstance(price, (int, float)) and not isinstance(price, bool):
             price = float(price)
             if not math.isfinite(price) or not 0 <= price <= 1000000:
@@ -874,7 +956,6 @@ class Store:
         else:
             price = None
         from .usage import unit_prices
-        entry = next((m for m in directory.get("models", []) if m["id"] == route["model"]), {})
         prices = unit_prices(entry.get("prices"))
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

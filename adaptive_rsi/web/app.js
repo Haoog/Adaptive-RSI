@@ -11,7 +11,7 @@ const statusNames = {expired:'候选已过期',releasing:'正在发布',deployin
 const sourceNames = {goal:'用户目标',inspection:'自主发现',issue:'GitHub Issue',system_light:'轻量检查',system_deep:'深度检查',system_issues:'GitHub 问题同步',system_evolve:'策略改进',system_delivery:'交付跟踪与复查',system_reassess:'暂缓任务复核',system_publish:'批准交付'};
 const reviewNames = {correctness:'正确性',security:'安全性',maintainability:'可维护性',architecture:'架构',tests:'测试',scope:'改动范围',critical:'致命',high:'高',medium:'中',low:'低'};
 const roleNames = {analysis:'项目理解 / 检查',planning:'规划',implementation:'代码实现 / 修复',review:'独立审查',evolution:'策略改进'};
-const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), settingsFieldRevisions=new Map(), goalDrafts=new Map(), goalDraftRevisions=new Map();
+const formRevisions=new WeakMap(), settingsDrafts=new Map(), settingsClean=new Map(), settingsModes=new WeakMap(), settingsFieldRevisions=new Map(), goalDrafts=new Map(), goalDraftRevisions=new Map(), valueFeedbackDrafts=new Map();
 let navigationSequence=0;
 let settingsContext='',settingsGeneration=0,goalDraftRestoredProject=null;
 let configurationRepairBusy=false;
@@ -536,7 +536,7 @@ function render(){
 function renderTelemetry(){
  const summary=$('quality-summary'),usage=$('usage-summary');summary.replaceChildren();usage.replaceChildren();if(loadedStateSections.analyticsProject!==(projectId||null)){summary.append(el('p',t('打开工作台查看运行统计。'),'muted'));usage.append(el('p',t('打开工作台查看用量统计。'),'muted'));return;}const quality=state.quality?.find(q=>q.project===projectId);
  const rate=(n,d)=>d?Math.round(n/d*100)+'% ('+n+'/'+d+')':t('暂无样本');
- for(const [label,value]of [['验收与评审通过率',rate(quality?.passed||0,quality?.evaluated||0)],['评审阻断率',rate(quality?.review_blocked||0,quality?.reviewed||0)],['重复失败任务',quality?.repeat_failures||0],['合并后验证通过',quality?.postmerge_verified||0],['合并后出现回归',quality?.postmerge_regressed||0]]){const card=el('div');card.append(el('small',t(label)),el('strong',String(value)));summary.append(card);}
+ for(const [label,value]of [['验收与评审通过率',rate(quality?.passed||0,quality?.evaluated||0)],['评审阻断率',rate(quality?.review_blocked||0,quality?.reviewed||0)],['重复失败任务',quality?.repeat_failures||0],['原合并版本验证通过',quality?.postmerge_verified||0],['原合并版本出现回归',quality?.postmerge_regressed||0],['后续主线出现回归',quality?.mainline_regressed??0]]){const card=el('div');card.append(el('small',t(label)),el('strong',String(value)));summary.append(card);}
  const usageScope=projectId||'model-center',rows=(state.model_usage||[]).filter(u=>u.project===usageScope);
  const total=(state.usage||[]).find(u=>u.project===usageScope);usage.append(el('p',t('近 24 小时')+' · '+(total?.calls||0)+' '+t('次调用')+' · '+Math.round(total?.seconds||0)+'s · '+(total?.tokens||0)+' tokens'));
  const estimate=total?.estimate==null?t('未知'):('$'+total.estimate.toFixed(4));usage.append(el('p',t('估算费用')+' · '+estimate+' USD · '+(total?.unpriced||0)+' '+t('次调用缺少价格'),'muted'));
@@ -657,7 +657,7 @@ function renderTasks(){
   let detailTask,detailSequence=0;
 const pendingDetailCloseEvents=[];
 function closeTaskDetail(){
- const closingTask=detailTask?.id;detailSequence++;detailTask=null;window.RSIExperience?.taskClosed();
+ const closingTask=detailTask?.id;detailSequence++;detailTask=null;valueFeedbackDrafts.clear();window.RSIExperience?.taskClosed();
  if($('detail-dialog').open){pendingDetailCloseEvents.push(true);$('detail-dialog').close();
   if(location.href&&closingTask){const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));if(route.get('task')===closingTask){route.delete('task');history.replaceState(history.state,'',location.pathname+location.search+(route.size?'#'+route:''));}}
  }
@@ -687,16 +687,20 @@ function taskOutcome(data){
  outcome.append(stageProgress(data));return outcome;
 }
 function valueFeedback(data){
+ const key=(data.project||'')+':'+(data.id||''),draft=valueFeedbackDrafts.get(key);
  const form=el('form',undefined,'value-feedback'),heading=el('h4',t('这次改进有帮助吗？')),hint=el('p',t('评价可选，仅用于观察，不会自动改变排序或策略。'),'muted'),select=el('select'),note=el('textarea'),status=el('p');
  const label=el('label',t('价值评价')),noteLabel=el('label',t('评价说明（可选）'));
  for(const [value,text] of [['','未评价'],['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']]){const option=el('option',t(text));option.value=value;select.append(option);}
- select.value=data.evidence_summary.value_feedback?.rating||'';note.value=data.evidence_summary.value_feedback?.note||'';note.rows=2;note.maxLength=2000;
+ select.value=draft?draft.rating:(data.evidence_summary.value_feedback?.rating||'');note.value=draft?draft.note:(data.evidence_summary.value_feedback?.note||'');note.rows=2;note.maxLength=2000;
  label.append(select);noteLabel.append(note);status.setAttribute('role','status');
+ // 详情会因状态或证据变化重建；未提交的评价草稿按运行保存在内存中，重建后继续显示。
+ const remember=()=>{if(select.value||note.value)valueFeedbackDrafts.set(key,{rating:select.value,note:note.value});else valueFeedbackDrafts.delete(key);};
+ select.addEventListener('change',remember);note.addEventListener('input',remember);
  const button=el('button',t('保存评价'),'text-button');button.type='submit';
  form.append(heading,hint,label,noteLabel,button,status);
  form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
   button.disabled=true;status.textContent='';
-  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});if(form.isConnected)status.textContent=t('评价已保存');}
+  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});valueFeedbackDrafts.delete(key);if(form.isConnected)status.textContent=t('评价已保存');}
   finally{button.disabled=false;}
  },form);});return form;
 }

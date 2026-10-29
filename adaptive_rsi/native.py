@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .agent import SCHEMAS, TEXT, model_capabilities, object_schema, validate_output
+from .agent import SCHEMAS, TEXT, model_capabilities, object_schema, request_output_budget, validate_output
 from .config import relative_path
 from .credentials import Credentials
 from .provider_health import ModelFailure, error_code, http_failure, provider_text_code
@@ -80,6 +80,11 @@ def response_stop_reason(protocol, response):
 
 class ArgumentsError(ValueError):
     """Arguments of one tool call could not be parsed; reported back to the model instead of failing the run."""
+
+
+# 输出上限截断后的 finish 修复次数上限，按一次 call 累计（不因中间的工具轮清零）；
+# 超过后明确失败并提示缩短/拆分结果，而不是在同一预算上反复请求、反复计费。
+MAX_OUTPUT_LIMIT_REPAIRS = 1
 
 
 class ModelResponse(dict):
@@ -648,12 +653,22 @@ def execute_tools(tools, calls):
 
 
 class Conversation:
-    def __init__(self, protocol, model, prompt, tools, effort, output_tokens=None):
+    def __init__(self, protocol, model, prompt, tools, effort, output_tokens=None, request_output_tokens=None):
         self.protocol, self.model, self.tools, self.effort = protocol, model, tools, effort
         self.output_tokens = output_tokens
+        self.request_output_tokens = request_output_tokens
         self.history = [{"role": "user", "content": prompt}]
         if protocol == "gemini":
             self.history = [{"role": "user", "parts": [{"text": prompt}]}]
+
+    def max_request_tokens(self):
+        """单次请求的输出预算：不超过模型能力，也不超过策略上限。"""
+        budget = self.request_output_tokens
+        if type(budget) is not int or budget <= 0:
+            budget = request_output_budget(self.model, "anthropic", self.output_tokens)
+        if self.output_tokens:
+            budget = min(budget, self.output_tokens)
+        return max(1, budget)
 
     def request(self):
         p = self.protocol
@@ -684,8 +699,7 @@ class Conversation:
                     body["options"] = {"num_predict": self.output_tokens}
             return ("/api/chat" if p == "ollama" else "/chat/completions"), body
         if p == "anthropic":
-            max_tokens = min(self.output_tokens or 8192,
-                             4096 if "opus" in self.model.lower() or "claude-2" in self.model.lower() else 8192)
+            max_tokens = self.max_request_tokens()
             return "/messages", {"model": self.model, "messages": self.history, "max_tokens": max_tokens,
                 "tools": [{"name": n, "description": d, "input_schema": s} for n, d, s in self.tools]}
         if p == "gemini":
@@ -808,7 +822,8 @@ class NativeAgent:
                 tools.scope = [relative_path(value) for value in scope]
         capabilities = model_capabilities(route["model"], protocol)
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"],
-                                    output_tokens=capabilities["max_output_tokens"])
+                                    output_tokens=capabilities["max_output_tokens"],
+                                    request_output_tokens=capabilities["request_output_tokens"])
         began = time.monotonic()
         tools.deadline = began + config["limits"]["command_seconds"]
         max_bytes = min(config["limits"]["max_output_mb"] * 1024 * 1024,
@@ -818,6 +833,8 @@ class NativeAgent:
         # 实现/评审常触发长推理，300 秒曾让这类调用必然超时中断。
         timeout = 30 if role == "probe" else (900 if role == "implementation" else 600)
         seen_calls = set()
+        # 命中输出上限的 finish 修复整次 call 只重试一次：同一上限下重复请求只会重复计费。
+        output_limit_repairs = 0
         for turn in range(200):
             remaining = config["limits"]["command_seconds"] - (time.monotonic() - began)
             if remaining <= 0:
@@ -894,6 +911,19 @@ class NativeAgent:
                     if error is None:
                         self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                         return args
+                    if reason == "output_limit":
+                        # 供应商明确说这次响应撞到输出上限：同样的预算再问一次只会再截断再计费。
+                        # 整次 call 只放行一次缩短后重试（中间的工具轮不清零），之后按执行失败结束
+                        # 并保留已记录的计费用量。
+                        output_limit_repairs += 1
+                        if output_limit_repairs > MAX_OUTPUT_LIMIT_REPAIRS:
+                            problem = ModelFailure(
+                                "Model output was truncated by the request output budget and the structured result stayed invalid; "
+                                "shorten the result or split the work across several smaller finish calls instead of repeating the same request",
+                                "tool_format")
+                            problem.stop_reason = "output_limit"
+                            raise problem
+                        error += " (the response hit the output token limit; shorten the result or split it)"
                     conversation.results([(call_id, name, {"error": error})])
                     self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                     continue

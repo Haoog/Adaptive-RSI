@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+- Automatic retention respects run and project legal holds and safely removes expired read-only dependency copies.
+- Cancellation revokes candidate approval and unstarted delivery jobs; archived projects reject retries and requirement revisions.
+- Catalog and call pricing share connection-version identity; price edits submit only changed fields.
+- Diagnostic persistence failures do not replace successful model results; Anthropic capability limits and request budgets are separate, and truncated responses fail explicitly while retaining usage.
+- Legacy empty checks preserve evidence; original-merge verification and later-mainline regressions are counted separately, and workflow metrics use one read snapshot.
+- Failed usage and task-detail refreshes identify stale data and the last successful update, retain unsaved drafts and offer retry.
+- Dependency-cache hits avoid repeated copies and scans, with directory locks preventing eviction during copying; backup manifests hash bounded chunks from the same file descriptor.
+- Desktop update feeds include the current version's Chinese and English release notes.
+- Fix project-selector text overflow at phone widths; see the [validation record](docs/validation/audit-reliability-20261030.en.md) for acceptance and measurement limits.
+
 ## 0.5.130
 
 <!-- adaptive-rsi-release:0.5.130;base:a88f620de576d405758a1aedf94856d3a410d915 -->

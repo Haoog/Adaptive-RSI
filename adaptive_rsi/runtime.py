@@ -550,16 +550,20 @@ class Runtime(Maintenance):
         intervention_reason(reason)
         if type(force) is not bool:
             raise ValueError("force must be a boolean")
-        with self.store.connect() as db:
+        with self.dispatch_lock, self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+            if not row:
+                raise ValueError("This task cannot be retried")
+            # 归档冻结与入队写入必须同事务判定，避免归档后留下隐藏队列。
+            self.require_active_project(row["project"])
             if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
-            if force and (not row or row["source"] != "system_evolve"):
+            if force and row["source"] != "system_evolve":
                 raise ValueError("A forced retry is only available for evolution tasks")
             # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
-            scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
-            if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
+            scheduled_retry = row["state"] == "queued" and row["available"] > time.time()
+            if not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
                 raise ValueError("This task cannot be retried")
             # 重试要求全新验证；同事务撤销旧候选与尚未领取的批准任务，保留已交付回执。
             now = time.time()
@@ -586,12 +590,16 @@ class Runtime(Maintenance):
         intervention_reason(reason)
         if not isinstance(supplement, str) or not supplement.strip() or len(supplement) > 10000:
             raise ValueError("Supplement must contain 1..10000 characters")
-        with self.store.connect() as db:
+        with self.dispatch_lock, self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
+            if not row:
+                raise ValueError("Pause or finish active work before supplementing this task")
+            # 归档项目不接受需求写入，恢复后才允许明确操作。
+            self.require_active_project(row["project"])
             if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
-            if not row or row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
+            if row["source"].startswith("system_") or row["state"] not in ["queued", "deferred", "blocked", "failed", "insufficient_evidence", "rejected", "interrupted", "expired", "cancelled", "obsolete"]:
                 raise ValueError("Pause or finish active work before supplementing this task")
             evidence = row["evidence"]
             body = row["body"] + "\n\n" + supplement.strip()
@@ -709,6 +717,10 @@ class Runtime(Maintenance):
                 raise ValueError("Only a verified candidate awaiting approval can be delivered")
             if db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + original["project"],)).fetchone():
                 raise ValueError("Project is archived; restore it before starting work")
+            source = db.execute("SELECT state FROM tasks WHERE id=?", (original["task"],)).fetchone()
+            if not source or source["state"] != "awaiting_approval":
+                # 历史数据或并发取消/重试后，候选的授权已失效；不得留下成功回执或发布任务。
+                raise ValueError("Source task is no longer awaiting approval; this candidate cannot be delivered")
             result = json.loads(original["result"])
             if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
                 raise ValueError("Independent gates have not passed")
@@ -1286,6 +1298,12 @@ class Runtime(Maintenance):
             record['state'] = 'obsolete'
             self.store.put_setting(key, record)
             return
+        if run['state'] == 'awaiting_approval' and not self.store.one(
+                "SELECT 1 FROM tasks WHERE id=? AND state='awaiting_approval'", (run['task'],)):
+            # 候选的源任务已取消/重试时，后处理直接退出，不能反复尝试已失效的批准。
+            record.update(state='obsolete', reason='Candidate approval is no longer valid', ended=time.time())
+            self.store.put_setting(key, record)
+            return
         outcome, config = json.loads(run['result']), json.loads(run['config'])
         for step in ('delivery', 'observation', 'monitor', 'evolution'):
             if step in record['steps']:
@@ -1483,9 +1501,10 @@ class Runtime(Maintenance):
                 if fingerprint(patch) != outcome.get("patch_hash"):
                     raise RuntimeError("Candidate changed after evaluation; delivery refused")
                 source_task = self.store.one("SELECT * FROM tasks WHERE id=?", (original["task"],))
-                if source_task and source_task["state"] in ["cancelled", "expired", "obsolete"]:
-                    # 批准之后、发布之前取消源任务时，授权不再成立。
-                    raise Cancelled("Source task is " + source_task["state"] + "; publishing stopped")
+                if not source_task or source_task["state"] != "awaiting_approval":
+                    # 批准之后、发布之前取消或重试源任务时，授权不再成立。
+                    raise Cancelled("Source task is " + (source_task["state"] if source_task else "missing") +
+                                    "; publishing stopped")
                 from .delivery import StaleCandidate
                 try:
                     url = self.publish(project, source_task, original, candidate, config)

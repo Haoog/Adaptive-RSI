@@ -1,6 +1,6 @@
 'use strict';
 window.RSIUsage=(()=>{
- let offset=0,sequence=0,detailSequence=0,report=null,renderedOffset=0,searchTimer=null,refreshTimer=null;
+ let offset=0,sequence=0,detailSequence=0,report=null,renderedOffset=0,searchTimer=null,refreshTimer=null,reportMeta=null,lastError=null,staleNotice=null;
  function clearTimers(){clearTimeout(searchTimer);clearTimeout(refreshTimer);searchTimer=refreshTimer=null;}
  function cancel(){clearTimers();sequence++;$('usage-refresh').disabled=false;pageBar();clearDetail();}
  function pageBar(){if(!report)return;offset=Math.min(offset,Math.max(0,Math.ceil(report.total/25)-1)*25);
@@ -13,17 +13,27 @@ window.RSIUsage=(()=>{
  function localDate(value,nextDay=false){const parts=String(value).split('-').map(Number);if(parts.length!==3||parts.some(n=>!Number.isInteger(n)))return NaN;return new Date(parts[0],parts[1]-1,parts[2]+(nextDay?1:0)).getTime();}
  function range(){const days=$('usage-period').value;if(days!=='custom')return {start:days==='all'?0:Date.now()/1000-Number(days)*86400,end:Date.now()/1000};const start=localDate($('usage-start').value)/1000,end=localDate($('usage-end').value,true)/1000;if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start)throw Error(t('请选择有效的日期范围。'));return {start,end};}
  function parameters(){return new URLSearchParams({...range(),project:$('usage-scope').value==='all'?'':projectId||'',q:$('usage-search').value,sort:$('usage-sort').value,timezone:Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC',offset,limit:25});}
+ function selection(){return {period:$('usage-period').value,start:($('usage-start')?.value)||'',end:($('usage-end')?.value)||'',scope:$('usage-scope').value,q:$('usage-search').value,projectName:state?.projects?.find(p=>p.id===projectId)?.name};}
+ function describeSelection(choice){const labels={'7':'最近 7 天','30':'最近 30 天',all:'全部时间'};const range=choice.period==='custom'?((choice.start||'?')+' – '+(choice.end||'?')):t(labels[choice.period]||choice.period);const scope=choice.scope==='all'?t('全部项目'):(choice.projectName||t('当前项目'));return [range,scope,choice.q?t('搜索')+' “'+choice.q+'”':''].filter(Boolean).join(' · ');}
+ function renderNotice(){
+  if(!staleNotice){staleNotice=el('p',undefined,'form-error');staleNotice.id='usage-stale';staleNotice.setAttribute('role','status');const totals=$('usage-totals');if(typeof totals?.before==='function')totals.before(staleNotice);else totals?.parentElement?.insertBefore(staleNotice,totals);}
+  if(!lastError){staleNotice.hidden=true;staleNotice.replaceChildren();return;}
+  const copy=reportMeta?t('用量刷新失败：当前显示「{range}」的数据（最后成功更新 {time}）。本次筛选尚未加载。').replace('{range}',describeSelection(reportMeta.choice)).replace('{time}',stamp(reportMeta.at/1000)):lastError.message?t('用量加载失败：{message}。当前没有可显示的数据，请重试。').replace('{message}',lastError.message):t('用量加载失败。当前没有可显示的数据，请重试。');
+  staleNotice.replaceChildren(document.createTextNode(copy),action(t('重试'),load,'text-button'));staleNotice.hidden=false;
+ }
  async function load(){
   if(view!=='usage')return;
   clearTimers();const ticket=++sequence,requested=offset;let unsupported=false;$('usage-refresh').disabled=$('usage-prev').disabled=$('usage-next').disabled=true;
-  try{const result=await api('usage?'+parameters());if(ticket!==sequence||view!=='usage')return;report=result;
+  const choice=selection();let params;
+  try{params=parameters();}catch(error){$('usage-refresh').disabled=false;pageBar();throw error;}
+  try{const result=await api('usage?'+params);if(ticket!==sequence||view!=='usage')return;report=result;reportMeta={choice,params:params.toString(),at:Date.now()};lastError=null;renderNotice();
    const last=Math.max(0,Math.ceil((report.total||0)/25)-1)*25;
    if(offset>last){offset=last;safe(load);return;}
    renderedOffset=requested;render();}
   catch(error){
    if(ticket!==sequence||view!=='usage')return;
-   if(error.status!==404){offset=renderedOffset;throw error;}
-   unsupported=true;report=null;
+   if(error.status!==404){offset=renderedOffset;lastError={message:error.message||''};renderNotice();return;}
+   unsupported=true;report=null;reportMeta=null;lastError=null;renderNotice();
    for(const id of ['usage-totals','usage-role-summary','usage-chart','usage-cost','usage-page'])$(id).replaceChildren();
    $('usage-tasks').replaceChildren(el('p',t('当前服务版本尚不支持用量页面，请先升级服务后再刷新。'),'muted'));
    $('usage-prev').disabled=$('usage-next').disabled=true;
@@ -37,7 +47,7 @@ window.RSIUsage=(()=>{
   const list=$('usage-tasks');list.replaceChildren();for(const row of report.tasks){const article=el('article',undefined,'usage-task'),title=el('div');title.append(el('strong',taskTitle(row)),el('small',(state.projects.find(p=>p.id===row.project)?.name||t('通用'))+' · '+t(statusNames[row.state]||row.state||'后台检查')));const metrics=el('div',undefined,'usage-task-numbers');metrics.append(el('strong',token(row)),el('small',seconds(row.model_seconds)+' · '+row.attempts+' '+t('轮尝试')));article.append(title,metrics);if(row.task)article.append(action(t('查看用量明细'),()=>detail(row.task,taskTitle(row)),'text-button'));else article.append(el('small',row.models||'','muted'));list.append(article);}if(!report.tasks.length)list.append(el('p',t('所选时间没有用量记录。'),'muted'));
   pageBar();
  }
- async function detail(task,title,page=0){const ticket=++detailSequence,params=parameters();params.set('task',task);params.set('offset',page);params.delete('q');const data=await api('usage?'+params);if(ticket!==detailSequence||view!=='usage')return;const dialog=$('usage-detail'),content=$('usage-detail-content');content.replaceChildren(el('h2',title||task),el('p',t('所选时间内累计，包含失败调用与所有重试。'),'muted'));
+ async function detail(task,title,page=0,meta=reportMeta){if(!meta)return;const ticket=++detailSequence,params=new URLSearchParams(meta.params);params.set('task',task);params.set('offset',page);params.delete('q');const data=await api('usage?'+params);if(ticket!==detailSequence||view!=='usage')return;const dialog=$('usage-detail'),content=$('usage-detail-content');content.replaceChildren(el('h2',title||task),el('p',t('所选时间内累计，包含失败调用与所有重试。'),'muted'),el('p',describeSelection(meta.choice)+' · '+stamp(meta.at/1000),'muted'));
   const roles=el('div',undefined,'usage-role-list');for(const row of data.roles){const line=el('div',undefined,'usage-task');line.append(el('span',t(usageRoleNames[row.role]||roleNames[row.role]||row.role)),el('small',row.provider+' / '+row.model+' · '+row.effort),el('strong',token(row)));roles.append(line);}content.append(roles);
   for(const row of data.runs||[]){const line=el('p',undefined,'usage-run');line.textContent=row.id+' · '+token(row)+' tokens · '+seconds(row.model_seconds)+' · '+t('阶段内额外调用')+' '+number(row.retry_calls)+' · '+t('复用已验证阶段')+' '+number(row.recovered_stages);content.append(line);}
   if(data.runs_truncated||data.stages_truncated||data.retries_truncated)content.append(el('p',t('分组明细已达到显示上限，汇总仍包含全部调用。'),'muted'));
@@ -46,7 +56,7 @@ window.RSIUsage=(()=>{
   if(data.references?.groups?.length)content.append(el('p',t('参考为窗口前同项目、任务类型、阶段与模型的每次调用中间一半范围，不是任务费用预测。'),'muted'));
   if(data.summary?.priced_calls!=null)content.append(el('p',t('已计价调用')+' '+number(data.summary.priced_calls)+' · '+t('未计价调用')+' '+number(data.summary.unpriced_calls),'muted'));
   for(const row of data.calls){const line=el('div',undefined,'usage-call');line.append(el('strong',t(usageRoleNames[row.role]||roleNames[row.role]||row.role)+' · '+row.model),el('small',stamp(row.created)+' · '+row.provider+' · '+row.effort+' · '+t(row.state==='done'?'已完成':row.state==='reserved'?'等待返回用量':statusNames[row.state]||row.state)),el('p',t('输入')+' '+(row.usage_known?number(row.input_tokens):t('未知'))+' / '+t('输出')+' '+(row.usage_known?number(row.output_tokens):t('未知'))+' / '+t('缓存读取')+' '+(row.usage_known?number(row.cache_read_tokens):t('未知'))+' / '+t('缓存写入')+' '+(row.usage_known?number(row.cache_write_tokens):t('未知'))),el('small',(row.usage_known?number(row.tokens):t('用量未知'))+' tokens · '+seconds(row.seconds)+' · '+t(({http_request:'API 请求',codex_session:'Codex 会话',opencode_session:'OpenCode 会话',unknown:'计量单位未知'})[row.unit]||row.unit)));content.append(line);}
-  const pages=el('div',undefined,'task-pagination');if(page)pages.append(action(t('上一页'),()=>detail(task,title,Math.max(0,page-25))));pages.append(el('span',number(data.call_total)+' '+t('次调用')));if(page+25<data.call_total)pages.append(action(t('下一页'),()=>detail(task,title,page+25)));content.append(pages);if(!dialog.open)dialog.showModal();
+  const pages=el('div',undefined,'task-pagination');if(page)pages.append(action(t('上一页'),()=>detail(task,title,Math.max(0,page-25),meta)));pages.append(el('span',number(data.call_total)+' '+t('次调用')));if(page+25<data.call_total)pages.append(action(t('下一页'),()=>detail(task,title,page+25,meta)));content.append(pages);if(!dialog.open)dialog.showModal();
  }
  function clearDetail(){detailSequence++;const dialog=$('usage-detail');if(dialog.open)dialog.close();}
  function show(){cancel();offset=0;safe(load);}
@@ -57,5 +67,5 @@ window.RSIUsage=(()=>{
   $('usage-refresh').onclick=()=>safe(load);$('usage-prev').onclick=()=>{offset=Math.max(0,offset-25);safe(load);};$('usage-next').onclick=()=>{offset+=25;safe(load);};
   $('project-select').addEventListener('change',()=>{if(view==='usage')show();else cancel();});
  });
- return {show,translate:()=>{render();clearDetail();}};
+ return {show,translate:()=>{render();renderNotice();clearDetail();}};
 })();

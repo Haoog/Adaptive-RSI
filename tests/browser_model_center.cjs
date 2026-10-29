@@ -48,14 +48,51 @@ async function main() {
     await page.locator('#mc-model-list').getByRole('button', {name: '估算价格', exact: true}).first().click();
     await page.getByLabel('输入价格 / USD').fill('1.2');
     await page.getByLabel('输出价格 / USD').fill('3.4');
-    await page.getByLabel('缓存读取价格 / USD').fill('0.2');
-    await page.getByLabel('缓存写入价格 / USD').fill('1.5');
     const priced = page.waitForResponse(response => response.url().endsWith('/api/model-center/model') && response.request().method() === 'POST');
     await page.locator('#mc-price-form button[type=submit]').click();
     const priceResponse = await priced;
     assert.equal(priceResponse.status(), 200);
-    assert.deepEqual(priceResponse.request().postDataJSON().model.prices, {input:1.2,output:3.4,cache_read:0.2,cache_write:1.5});
+    const pricePayload = priceResponse.request().postDataJSON().model;
+    assert.deepEqual(pricePayload.prices, {input:1.2,output:3.4}, 'only edited price fields are submitted');
+    assert.equal(Object.hasOwn(pricePayload, 'unit_price'), false, 'an untouched blended price must not overwrite the server value');
     await page.locator('#mc-price-dialog').waitFor({state:'hidden'});
+    // —— O04：两个窗口各自只提交自己改过的价格字段，先后保存不能覆盖对方未编辑的字段。
+    const other = await browser.newPage({viewport: {width: 1380, height: 1000}});
+    other.on('pageerror', error => errors.push(error.message));
+    const selectDirectoryProvider = async target => {
+      await target.goto(url);
+      await target.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
+      await target.locator('#project-settings').click();
+      await target.locator('[data-mc-tab="providers"]').click();
+      await target.locator('#mc-provider-list .mc-provider').filter({hasText: '本地目录服务'}).click();
+    };
+    const openPriceDialog = async target => {
+      const row = target.locator('#mc-model-list .mc-model-row').filter({hasText: 'fixture-pro'});
+      await row.locator('summary').click();
+      await row.getByRole('button', {name: '估算价格', exact: true}).click();
+      await target.locator('#mc-price-dialog').waitFor();
+    };
+    await selectDirectoryProvider(other);
+    await openPriceDialog(page);
+    await openPriceDialog(other);
+    await page.locator('#mc-price-form').getByLabel('输入价格 / USD').fill('0.7');
+    const firstSave = page.waitForResponse(response => response.url().endsWith('/api/model-center/model') && response.request().method() === 'POST');
+    await page.locator('#mc-price-form button[type=submit]').click();
+    const firstPayload = (await firstSave).request().postDataJSON().model;
+    assert.deepEqual(firstPayload.prices, {input:0.7}, 'the first window submits only its own edited field');
+    await other.locator('#mc-price-form').getByLabel('输出价格 / USD').fill('1.9');
+    const secondSave = other.waitForResponse(response => response.url().endsWith('/api/model-center/model') && response.request().method() === 'POST');
+    await other.locator('#mc-price-form button[type=submit]').click();
+    const secondPayload = (await secondSave).request().postDataJSON().model;
+    assert.deepEqual(secondPayload.prices, {output:1.9}, 'the second window must not resend the other window\'s untouched input price');
+    const project = await page.locator('#project-select').inputValue();
+    const merged = await page.evaluate(async projectId => {
+      const snapshot = await (await fetch('/api/model-center?project=' + encodeURIComponent(projectId))).json();
+      const provider = snapshot.providers.find(item => item.name === '本地目录服务');
+      return provider.catalog.models.find(model => model.id === 'fixture-pro').prices;
+    }, project);
+    assert.deepEqual(merged, {input:0.7,output:1.9}, 'both windows keep each other\'s edited price fields');
+    await other.close();
     // 文件密钥连接已获取目录：第 2 步完成。
     await pick('引用中转');
     assert.equal(await page.locator('#mc-credential-status').innerText(), '密钥已保存到本机私有文件');

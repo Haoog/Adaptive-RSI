@@ -13,6 +13,10 @@ window.RSIExperience = (() => {
   let liveTimer,
     liveBusy = false,
     lastDetail = "",
+    liveFailures = 0,
+    liveLastSuccess = 0,
+    liveEnded = false,
+    liveState = "",
     inboxBusy = false,
     inboxAt = 0;
   const queueSaves = new Map();
@@ -771,6 +775,11 @@ window.RSIExperience = (() => {
     clearTimeout(liveTimer);
     lastDetail = "";
     backoffRetry = null;
+    liveFailures = 0;
+    liveLastSuccess = Date.now();
+    liveEnded = false;
+    liveState = task.state || "";
+    liveNotice();
     if (location.href && typeof URL === "function") {
       const route = new URLSearchParams(String(location.hash || '').replace(/^#/, ''));
       route.set('project', task.project);route.set('task', task.id);route.set('view', view);
@@ -800,6 +809,44 @@ window.RSIExperience = (() => {
       }
     };
   }
+  function liveStatusNode() {
+    let node = document.getElementById("detail-live-status");
+    if (!node) {
+      node = el("p", undefined, "form-error");
+      node.id = "detail-live-status";
+      node.setAttribute("role", "status");
+      const dialog = document.getElementById("detail-dialog");
+      const body = document.getElementById("detail-body");
+      if (dialog && body) dialog.insertBefore(node, body);
+      else dialog?.append(node);
+    }
+    return node;
+  }
+  function liveNotice() {
+    const node = liveStatusNode();
+    if (!liveFailures) {
+      node.hidden = true;
+      node.replaceChildren();
+      return;
+    }
+    const copy = liveLastSuccess
+      ? t("实时刷新中断 · 上次成功更新 {time}。详情可能不是最新，可立即重试。").replace("{time}", stamp(liveLastSuccess / 1000))
+      : t("实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。");
+    node.replaceChildren(document.createTextNode(copy), action(t("重试"), () => {
+      liveFailures = 0;
+      liveNotice();
+      clearTimeout(liveTimer);
+      return liveDetail();
+    }, "text-button"));
+    node.hidden = false;
+  }
+  // 隐藏页面或连续失败时退避；已结束的稳定交付仍保留 10 秒轮询，交付状态与价值反馈可以继续变化。
+  function liveDelay() {
+    const hidden = document.visibilityState === "hidden";
+    if (liveFailures) return Math.min(120000, (hidden ? 60000 : 5000) * 2 ** Math.min(4, liveFailures - 1));
+    if (hidden) return 60000;
+    return liveEnded && ["merged", "completed", "verified", "regressed", "unverified_merge", "cancelled", "obsolete"].includes(liveState) ? 10000 : 5000;
+  }
   async function liveDetail() {
     if (liveBusy || !detailTask || !$("detail-dialog").open) return;
     liveBusy = true;
@@ -811,6 +858,7 @@ window.RSIExperience = (() => {
         "task?id=" + task.id + "&project=" + task.project,
       );
       if (!current()) return;
+      liveState = metadata.state || liveState;
       // Issue sync may revise title, body or evidence while the task stays queued.
       // Rebuild only when the visible input changed so unchanged polls keep drafts and DOM.
       if (backoffRetry && !(metadata.state === "queued" && Number(metadata.available) > Date.now() / 1000)) {
@@ -836,10 +884,12 @@ window.RSIExperience = (() => {
       if (latest) {
         const data = await api("run?id=" + latest.id);
         if (!current()) return;
+        liveEnded = data.ended != null;
         const signature = JSON.stringify([
           latest.id,
           data.state,
           data.result,
+          data.evidence_summary,
           data.stages,
           data.phases,
           data.phases?.some(phase => !phase.ended) ? Math.floor(Date.now() / 5000) : null,
@@ -859,12 +909,19 @@ window.RSIExperience = (() => {
           lastDetail = signature;
         }
       }
+      liveFailures = 0;
+      liveLastSuccess = Date.now();
+      liveNotice();
     } catch {
+      if (current()) {
+        liveFailures += 1;
+        liveNotice();
+      }
     } finally {
       liveBusy = false;
       if (detailTask && $("detail-dialog").open) {
         clearTimeout(liveTimer);
-        liveTimer = setTimeout(liveDetail, 5000);
+        liveTimer = setTimeout(liveDetail, liveDelay());
       }
     }
   }
@@ -1326,10 +1383,17 @@ window.RSIExperience = (() => {
       const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));route.delete('task');
       history.replaceState(null, "", location.pathname + location.search + (route.size?'#'+route:''));
     });
+    // 页面重新可见时立即补一次详情刷新，避免隐藏期间的长间隔延迟交付或反馈变化。
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && detailTask && $("detail-dialog").open) {
+        clearTimeout(liveTimer);
+        liveTimer = setTimeout(liveDetail, 0);
+      }
+    });
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
 })();
 
 'use strict';

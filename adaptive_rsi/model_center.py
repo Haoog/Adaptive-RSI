@@ -13,7 +13,7 @@ from .agent import CodexAgent, model_capabilities
 from .catalog import CatalogError, list_models
 from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
-from .store import encode, uid
+from .store import encode, provider_identity, uid
 from .usage import PRICE_FIELDS, unit_prices
 from .provider_health import ProviderHealth, error_code
 from . import __version__
@@ -48,11 +48,7 @@ class ModelCenter:
         return provider
 
     def signature(self, provider):
-        fields = {k: v for k, v in provider.items() if k != "name"}
-        generation = self.credentials.epoch(provider)
-        if generation:
-            fields["credential_generation"] = generation
-        return fingerprint(fields)
+        return provider_identity(provider, self.credentials.epoch(provider))
 
     def key(self, provider, project=None, signature=None):
         return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + (signature or self.signature(provider))
@@ -70,22 +66,16 @@ class ModelCenter:
 
     def directory(self, provider, project=None, cache_key=None):
         cache_key = cache_key or self.key(provider, project)
-        value = self.store.setting(cache_key)
-        if value is None:
-            value = self.store.setting("model-preferences:" + (project or "global") + ":" + provider["id"])
-        if value is None:
-            legacy = fingerprint({k: v for k, v in provider.items() if k != "name"})
-            old = self.store.setting("model-center:" + (project or "global") + ":" + provider["id"] + ":" + legacy)
-            if old:
-                value = copy.deepcopy(old)
-                value["fetched"] = None
-                for model in value.get("models", []):
-                    for key in ("verified", "probes", "last_attempt"):
-                        model.pop(key, None)
-        if value is None and project:
-            global_provider = next((p for p in [*BUILTINS, *self.runtime.config()["providers"]] if p["id"] == provider["id"]), None)
-            if global_provider and self.signature(global_provider) == cache_key.rsplit(":", 1)[-1]:
-                value = self.directory(global_provider)
+        # 与 reserve_call 共享同一解析顺序：本范围目录、偏好、历史无代次目录，
+        # 再到同签名的全局目录。历史目录不带探测结果，避免轮换后复用旧证据。
+        signature = cache_key.rsplit(":", 1)[-1]
+        value, legacy = self.store.catalog_entry(project, provider["id"], signature, provider_identity(provider))
+        if value is not None and legacy:
+            value = copy.deepcopy(value)
+            value["fetched"] = None
+            for model in value.get("models", []):
+                for key in ("verified", "probes", "last_attempt"):
+                    model.pop(key, None)
         return copy.deepcopy(value or {"models": [], "fetched": None, "truncated": False})
 
     def snapshot(self, project=None):

@@ -1199,7 +1199,7 @@ class StorageApprovalOverviewTest(unittest.TestCase):
         self.assertNotIn(approved, [row["id"] for row in snapshot["expiring"]])
         # Excluding an approved candidate from pending counts must not rewrite its history.
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (approved,))["state"], "awaiting_approval")
-        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (cancelled,))["state"], "awaiting_approval")
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (cancelled,))["state"], "superseded")
 
     def test_superseded_candidate_is_not_pending_approval(self):
         from adaptive_rsi.storage_tools import overview

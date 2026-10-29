@@ -1,6 +1,8 @@
 import concurrent.futures
 import datetime
 import json
+import os
+import stat
 import tempfile
 import threading
 import time
@@ -8,8 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from adaptive_rsi import maintenance as maintenance_module
+from adaptive_rsi import pipeline
 from adaptive_rsi.agent import CodexAgent
+from adaptive_rsi.config import DEFAULTS, merge
 from adaptive_rsi.delivery import schedule as schedule_delivery
+from adaptive_rsi.gitops import git
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 
@@ -276,6 +282,147 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertEqual(marker.read_text(), "must remain")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
         self.assertEqual(self.errors("maintenance_run")[0]["run"], run["id"])
+
+    def test_automatic_retention_honors_run_and_project_holds(self):
+        self.store.execute("INSERT INTO projects VALUES ('held','held project',?, '{}', 0, 9)",
+                           (str(self.root / "held"),))
+        held_run = self.historical_run("broken", "awaiting_approval")
+        held_project = self.historical_run("held", "awaiting_approval")
+        corrupt = self.historical_run("healthy", "awaiting_approval")
+        unheld = self.historical_run("healthy", "awaiting_approval")
+        cases = {"run": held_run, "project": held_project, "corrupt": corrupt}
+        markers = {}
+        for run in [*cases.values(), unheld]:
+            directory = Path(run["path"]) / "workspace"
+            directory.mkdir(parents=True)
+            markers[run["id"]] = directory / "keep.txt"
+            markers[run["id"]].write_text("retained evidence")
+        self.store.put_setting("legal-hold:" + held_run["id"], True)
+        self.store.put_setting("legal-hold-project:held", True)
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ("legal-hold:" + corrupt["id"], "not-json"))
+
+        self.runtime.maintenance()
+
+        for label, run in cases.items():
+            with self.subTest(hold=label):
+                self.assertEqual(markers[run["id"]].read_text(), "retained evidence")
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                                 "awaiting_approval")
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"],
+                                 "awaiting_approval")
+        self.assertFalse((Path(unheld["path"]) / "workspace").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (unheld["id"],))["state"], "expired")
+
+    def test_retention_hold_committed_after_the_precheck_blocks_every_deletion(self):
+        run = self.historical_run("healthy", "awaiting_approval")
+        directory = Path(run["path"])
+        for name in ("workspace", "candidate"):
+            (directory / name).mkdir(parents=True)
+            (directory / name / "keep.txt").write_text("retained evidence")
+        real = maintenance_module.retention_hold
+        prechecks = []
+
+        def stale_precheck(store, run_id, project):
+            # 预检读到无 hold 之后、删除事务取得写锁之前，另一连接提交 hold。
+            if not prechecks:
+                prechecks.append(run_id)
+                store.put_setting("legal-hold:" + run_id, True)
+                return None
+            return real(store, run_id, project)
+
+        with patch.object(maintenance_module, "retention_hold", side_effect=stale_precheck):
+            self.runtime.maintenance()
+
+        for name in ("workspace", "candidate"):
+            self.assertEqual((directory / name / "keep.txt").read_text(), "retained evidence")
+        self.assertTrue(self.store.setting("legal-hold:" + run["id"]))
+        self.assertEqual(self.errors("maintenance_run"), [])
+
+    def test_hold_written_while_an_artifact_is_deleted_waits_for_that_deletion(self):
+        run = self.historical_run("healthy", "awaiting_approval")
+        directory = Path(run["path"])
+        (directory / "workspace").mkdir(parents=True)
+        (directory / "workspace" / "keep.txt").write_text("retained evidence")
+        deleting, attempted, written = threading.Event(), threading.Event(), threading.Event()
+        outcome = {}
+        real = maintenance_module._remove_artifact
+
+        def observed_removal(parent, name):
+            deleting.set()
+            self.assertTrue(attempted.wait(5), "hold writer never started")
+            # 写线程已经发出 hold 写入；它必须阻塞在本删除事务的写锁之后。
+            outcome["committed_during_deletion"] = written.wait(0.5)
+            real(parent, name)
+
+        def write_hold():
+            try:
+                self.assertTrue(deleting.wait(5), "deletion never started")
+                attempted.set()
+                self.store.put_setting("legal-hold:" + run["id"], True)
+            except BaseException as error:
+                outcome["error"] = error
+            finally:
+                written.set()
+
+        writer = threading.Thread(target=write_hold, name="hold-writer")
+        writer.start()
+        try:
+            with patch.object(maintenance_module, "_remove_artifact", side_effect=observed_removal):
+                self.runtime.maintenance()
+        finally:
+            writer.join(5)
+        self.assertFalse(writer.is_alive())
+        self.assertNotIn("error", outcome)
+        self.assertIs(outcome.get("committed_during_deletion"), False,
+                      "hold committed before the in-flight deletion finished")
+        self.assertTrue(self.store.setting("legal-hold:" + run["id"]))
+        self.assertFalse((directory / "workspace").exists())
+
+    def test_automatic_retention_removes_read_only_prepared_dependencies(self):
+        source = self.root / "project"
+        source.mkdir()
+        git(source, "init", "-q")
+        (source / "deps").mkdir()
+        (source / "deps" / "fixture").write_text("Frozen dependency")
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("must remain")
+        outside.chmod(0o555)
+        config = merge(DEFAULTS, {"environment": {"seed_paths": ["deps"]},
+                                  "checks": [{"name": "fixture", "argv": ["python3", "--version"]}]})
+        task = self.task("healthy")
+        run = self.store.claim("healthy", config)
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        with patch("adaptive_rsi.evaluator.host_tool_versions", return_value={"python": "fixture-only"}):
+            pipeline._prepare_environment(self.runtime, run, {"id": "healthy", "path": str(source)},
+                                          config, directory, directory / "workspace", config["checks"])
+        dependencies = directory / "dependencies"
+        # 复现 B05 前提：真实准备入口把依赖副本冻结为只读。
+        self.assertFalse(os.access(dependencies / "deps", os.W_OK))
+        # 只读树内的链接必须在清理时只被解除；不得沿链接修改或删除外部目标。
+        (dependencies / "deps").chmod(0o755)
+        (dependencies / "deps" / "link").symlink_to(outside, target_is_directory=True)
+        (dependencies / "deps").chmod(0o555)
+        self.store.transition(run["id"], "completed", {}, True)
+        old = time.time() - 400 * 86400
+        self.store.execute("UPDATE runs SET path=?,started=?,ended=? WHERE id=?",
+                           (str(directory), old, old, run["id"]))
+
+        self.runtime.maintenance()
+
+        try:
+            self.assertFalse(dependencies.exists())
+            self.assertFalse((directory / "workspace").exists())
+            self.assertEqual(self.errors("maintenance_run"), [])
+            # 只读依赖内的符号链接只被解除，未被沿链接修改或删除外部目标。
+            self.assertEqual(sentinel.read_text(), "must remain")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o555)
+        finally:
+            outside.chmod(0o755)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "completed")
 
     def test_invalid_maintenance_project_does_not_block_other_project_cleanup(self):
         run = self.historical_run("healthy", "awaiting_approval")

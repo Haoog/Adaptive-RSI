@@ -1,4 +1,5 @@
 """Offline storage acceptance: no model, credential or remote operations."""
+from contextlib import closing
 import json
 import threading
 import time
@@ -30,7 +31,7 @@ class StorageAcceptanceTest(unittest.TestCase):
             with self.subTest(corruption=corruption):
                 bad = storage_tools.backup(self.store)
                 path = good_path.parent / (bad['id'] + '.sqlite3')
-                with sqlite3.connect(path) as db:
+                with closing(sqlite3.connect(path)) as db, db:
                     if corruption == 'future':
                         db.execute("INSERT INTO schema_migrations VALUES (999,'future',0)")
                     elif corruption == 'checksum':
@@ -255,6 +256,20 @@ class StorageAcceptanceTest(unittest.TestCase):
         directory.mkdir(parents=True)
         self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
         self.store.execute("INSERT INTO settings VALUES ('legal-hold:r','bad-json')")
+        with self.assertRaises(ValueError):
+            preview_cleanup(self.store, 'r')
+
+    def test_cleanup_preview_applies_project_hold_and_corrupt_value(self):
+        from adaptive_rsi.maintenance import preview_cleanup
+        directory = self.store.root / 'runs' / 'r'
+        (directory / 'workspace').mkdir(parents=True)
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
+        self.store.put_setting('legal-hold-project:p', True)
+        with self.assertRaises(ValueError):
+            preview_cleanup(self.store, 'r')
+        self.store.put_setting('legal-hold-project:p', False)
+        self.assertEqual([item['name'] for item in preview_cleanup(self.store, 'r')['objects']], ['workspace'])
+        self.store.execute("INSERT OR REPLACE INTO settings VALUES ('legal-hold-project:p','{')")
         with self.assertRaises(ValueError):
             preview_cleanup(self.store, 'r')
 

@@ -79,6 +79,29 @@ class DesktopInventoryBoundaryTest(unittest.TestCase):
             self.assertEqual(json.loads((output / "sbom.cdx.json").read_text())["metadata"]["timestamp"],
                              "1970-01-01T00:00:00Z")
 
+    def test_update_feed_contains_only_this_versions_bilingual_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bundle, output = root / "bundle", root / "output"
+            bundle.mkdir()
+            (bundle / "app.app.tar.gz").write_bytes(b"test archive")
+            (bundle / "app.app.tar.gz.sig").write_text("test signature")
+            for filename, note in [("CHANGELOG.md", "- 保留运行保护。"),
+                                   ("CHANGELOG.en.md", "- Preserve run holds.")]:
+                (root / filename).write_text(
+                    "# Changelog\n\n## Unreleased\n\n- future changes\n\n## 1.2.3\n\n"
+                    "<!-- adaptive-rsi-release:1.2.3;base:" + "a" * 40 + " -->\n\n" + note +
+                    "\n\n## 1.2.2\n\n- previous changes\n", encoding="utf-8")
+            with patch("scripts.package_desktop.ROOT", root), \
+                    patch("scripts.package_desktop.subprocess.run"), patch("scripts.sbom.components", return_value=[]):
+                package_updater(bundle, output, "1.2.3")
+            notes = json.loads((output / "desktop-latest.json").read_text())["notes"]
+            self.assertIn("保留运行保护", notes)
+            self.assertIn("Preserve run holds", notes)
+            self.assertNotIn("adaptive-rsi-release:", notes)
+            self.assertNotIn("future changes", notes)
+            self.assertNotIn("previous changes", notes)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 """按项目和连接版本记录供应商故障，避免反复请求故障服务。"""
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -282,13 +283,19 @@ class ProviderHealth:
                         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
                                    (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
             if model and value is not None:
-                detail_key = (attempt.get("detail_key") if attempt else None) or key + ":" + fingerprint({"model": model})
-                detail = self.store.setting(detail_key, {})
-                detail.update(value)
-                detail["model"] = model
-                # Detail writes are diagnostic only; the connection row above is the
-                # sole admission control and must not be overwritten after commit.
-                self.store.put_setting(detail_key, detail)
+                # 明细写入只是诊断视图：准入状态已在上面的事务里提交，这里失败既不能
+                # 丢掉已完成的模型结果，也不能改变调用前的暂停/冷却判定。
+                try:
+                    detail_key = (attempt.get("detail_key") if attempt else None) or key + ":" + fingerprint({"model": model})
+                    detail = self.store.setting(detail_key, {})
+                    detail.update(value)
+                    detail["model"] = model
+                    self.store.put_setting(detail_key, detail)
+                except (sqlite3.Error, OSError) as detail_error:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Provider health diagnostic detail write failed (%s); admission state is unchanged",
+                        type(detail_error).__name__)
 
         finally:
             try:

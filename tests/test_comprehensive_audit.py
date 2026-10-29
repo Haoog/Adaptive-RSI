@@ -1,4 +1,5 @@
 """Behavioral regressions from the October whole-project audit."""
+import contextlib
 import json
 import os
 import sys
@@ -49,7 +50,7 @@ class AuditRegressionTest(unittest.TestCase):
         self.assertEqual(Path(report["path"]).stat().st_mode & 0o777, 0o600)
         target = self.root / "archived.sqlite3"
         target.write_bytes(gzip.decompress(Path(report["path"]).read_bytes()))
-        with sqlite3.connect(target) as db:
+        with contextlib.closing(sqlite3.connect(target)) as db:
             self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertEqual(db.execute("SELECT message FROM events").fetchone()[0], "evidence")
         self.assertEqual(store.one("SELECT count(*) AS n FROM events")["n"], 1)
@@ -141,15 +142,29 @@ class AuditRegressionTest(unittest.TestCase):
         runtime.goal(project, "historical evidence")
         run = runtime.store.claim(project, runtime.config(project))
         runtime.store.transition(run["id"], "failed", {}, True)
-        for evidence in [{"review": None}, {"evaluation": {"checks": []}}, {"review": {"findings": [None]}}, {"trials": [None]}, {"trials": [{"case": []}]}]:
-            raw = json.dumps(evidence)
+        for evidence in [{"review": None}, {"evaluation": {"checks": [{"passed": True}]}},
+                         {"review": {"findings": [None]}}, {"trials": [None]}, {"trials": [{"case": []}]}]:
+            raw = json.dumps({**evidence, "summary": "retained evidence", "files": ["app.py"]})
             runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (raw, run["id"]))
-            self.assertIn("evidence_error", decode_evidence(raw))
+            decoded = decode_evidence(raw)
+            self.assertIn("evidence_error", decoded)
+            # 坏字段被隔离，其他证据不被整份丢弃。
+            self.assertEqual((decoded["summary"], decoded["files"]), ("retained evidence", ["app.py"]))
             data = records(runtime.store, project)
             self.assertTrue(data["runs"][0]["evidence_error"])
+            self.assertEqual(data["runs"][0]["summary"], "retained evidence")
             self.assertEqual(quality_summary(runtime.store, project)[0]["passed"], 0)
             self.assertEqual(workflow_metrics(runtime.store, project)["accepted"], 0)
             self.assertEqual(runtime.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"], raw)
+        # 合法空检查结果不再算坏证据，原因、摘要与文件都保留。
+        raw = json.dumps({"summary": "no executable checks", "files": ["app.py"],
+                          "evaluation": {"decision": "insufficient_evidence", "checks": []}})
+        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (raw, run["id"]))
+        decoded = decode_evidence(raw)
+        self.assertNotIn("evidence_error", decoded)
+        self.assertEqual((decoded["summary"], decoded["files"], decoded["evaluation"]["checks"]),
+                         ("no executable checks", ["app.py"], {}))
+        self.assertIsNone(records(runtime.store, project)["runs"][0]["evidence_error"])
 
     def test_referenced_retired_credentials_do_not_starve_later_cleanup(self):
         runtime = self.runtime()

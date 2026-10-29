@@ -632,6 +632,8 @@ input:disabled,select:disabled {
     flex:1;
     min-width:0;
     width:0;
+    overflow:hidden;
+    text-overflow:ellipsis;
   }
   .sidebar-projects .text-button {
     flex:none;

@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.agent import CodexAgent
 from adaptive_rsi.cli import doctor
+from adaptive_rsi.config import fingerprint
 from adaptive_rsi.model_center import CenterError
 from adaptive_rsi.native import ProviderUnavailable
 from adaptive_rsi.opencode import OpenCodeCapabilities, OpenCodeCompatibilityError
@@ -58,8 +60,10 @@ class OperabilityTest(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             list(pool.map(lambda _: health.record(config, "openai", "first", RuntimeError("HTTP 503")), range(3)))
         self.assertEqual(health.status(config, "openai", "first")["failures"], 3)
+        reopened = Store(self.store.root)
+        self.addCleanup(reopened.close)
         with self.assertRaises(ProviderPaused):
-            ProviderHealth(Store(self.store.root)).require(config, "openai", "first")
+            ProviderHealth(reopened).require(config, "openai", "first")
         health.require(config, "openai", "second")
         for reason in ["Model call budget exhausted", "Agent returned invalid structured output", "sandbox unavailable"]:
             health.record(config, "openai", "second", RuntimeError(reason))
@@ -412,3 +416,92 @@ class OperabilityTest(unittest.TestCase):
         self.assertEqual(result["tasks"], 1100)
         self.assertEqual(result["accepted"], 1100)
         self.assertEqual(result["accepted_tokens"], 11000)
+
+    @staticmethod
+    def diagnostic_keys(store, config, project, provider, model):
+        key = ProviderHealth(store).key(config, provider, project)
+        return key, key + ":" + fingerprint({"model": model})
+
+    def detail_failure(self, detail_key, attempted):
+        """只让健康明细（detail）写入失败，准入状态与用量写入照常。"""
+        original = Store.put_setting.__get__(self.store)
+
+        def put(setting_key, value, *args, **kwargs):
+            attempted.append(setting_key)
+            if setting_key == detail_key:
+                raise sqlite3.OperationalError("Injected diagnostic detail write failure")
+            return original(setting_key, value, *args, **kwargs)
+        return put
+
+    def test_diagnostic_detail_write_failure_keeps_successful_model_result(self):
+        # B06：健康明细只是诊断；调用用量已落盘后，明细写入失败不能丢弃成功结果。
+        self.runtime.configure({"recovery": {"provider_retry_minutes": 5}})
+        config = self.runtime.config()
+        config["models"]["analysis"] = {"provider": "openai", "model": "fixture-model", "effort": "default",
+                                        "fallback": {"provider": "openai", "model": "fallback-model", "effort": "default"}}
+        key, detail = self.diagnostic_keys(self.store, config, "diagnostic", "openai", "fixture-model")
+        now = time.time()
+        self.store.put_setting(key, {"failures": 3, "paused": True, "code": "rate_limit", "at": now - 3600,
+                                     "retry_at": 0, "generation": 1})
+        agent = CodexAgent(self.store)
+        invocations = []
+
+        def fake_invoke(role, prompt, workspace, project, run, effective, cancel=None, protected=()):
+            invocations.append(role)
+            call = self.store.reserve_call(project, run, role, effective["models"][role], effective)
+            self.store.record_usage(call, run, {"tokens": 15, "input_tokens": 10, "output_tokens": 5,
+                                                "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                                "usage_known": True}, 0.1)
+            self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
+            return {"summary": "Successful fake model output"}
+
+        attempted = []
+        with patch.object(self.store, "put_setting",
+                          side_effect=self.detail_failure(detail, attempted)), \
+                patch.object(agent, "_invoke", side_effect=fake_invoke), \
+                self.assertLogs("adaptive_rsi.provider_health", level="WARNING") as logs:
+            result = agent.invoke("analysis", "fixture prompt", Path(self.temp.name), "diagnostic", "run-1", config)
+        self.assertEqual(result, {"summary": "Successful fake model output"})
+        self.assertEqual(invocations, ["analysis"])
+        self.assertIn(detail, attempted)
+        self.assertIn("diagnostic", " ".join(logs.output).lower())
+        self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='fallback'"))
+        self.assertEqual(self.store.one("SELECT state,tokens FROM calls"), {"state": "completed", "tokens": 15})
+        status = ProviderHealth(self.store).status(config, "openai", "diagnostic")
+        self.assertEqual((status["failures"], status["paused"]), (0, False))
+        self.assertNotIn("half_open_owner", status)
+        self.assertNotIn("half_open_until", status)
+
+    def test_diagnostic_detail_failure_preserves_admission_and_provider_error(self):
+        # 失败路径：明细写入失败仍要留下准入状态、释放租约，并保持原始供应商错误。
+        self.runtime.configure({"recovery": {"provider_retry_minutes": 5}})
+        config = self.runtime.config()
+        config["models"]["analysis"] = {"provider": "openai", "model": "fixture-model", "effort": "default"}
+        key, detail = self.diagnostic_keys(self.store, config, "failed-diagnostic", "openai", "fixture-model")
+        now = time.time()
+        self.store.put_setting(key, {"failures": 3, "paused": True, "code": "rate_limit", "at": now - 3600,
+                                     "retry_at": 0, "generation": 1})
+        agent = CodexAgent(self.store)
+
+        def fail(*args, **kwargs):
+            raise ProviderUnavailable("Model API HTTP 401")
+
+        attempted = []
+        with patch.object(self.store, "put_setting",
+                          side_effect=self.detail_failure(detail, attempted)), \
+                patch.object(agent, "_invoke", side_effect=fail), \
+                self.assertLogs("adaptive_rsi.provider_health", level="WARNING"):
+            with self.assertRaises(ProviderUnavailable) as raised:
+                agent.invoke("analysis", "fixture prompt", Path(self.temp.name), "failed-diagnostic", "run-2", config)
+        self.assertIn(detail, attempted)
+        self.assertEqual(raised.exception.code, "auth")
+        status = ProviderHealth(self.store).status(config, "openai", "failed-diagnostic")
+        self.assertEqual((status["failures"], status["code"]), (4, "auth"))
+        self.assertNotIn("half_open_owner", status)
+
+    def test_admission_state_write_failure_is_not_hidden_by_diagnostic_isolation(self):
+        # 只有诊断明细可以隔离；准入状态本身写不进去时必须上抛，不能虚报已持久化。
+        config = self.runtime.config()
+        with patch.object(self.store, "connect", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                ProviderHealth(self.store).record(config, "openai", "db-failure")

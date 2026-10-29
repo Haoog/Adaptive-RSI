@@ -194,7 +194,7 @@ def _touched_paths(workspace):
 
 def _prepare_environment(runtime, run, project, config, directory, workspace, checks):
     """Seal selected dependency seeds once and restore a private copy per workspace."""
-    from .environment import capture, prepare_cached, restore
+    from .environment import capture, materialize, prepare_cached, restore
     from .evaluator import host_tool_versions
     source = Path(project["path"])
     seeds = directory / "dependencies"
@@ -206,8 +206,9 @@ def _prepare_environment(runtime, run, project, config, directory, workspace, ch
                        "cache": {"key": prepared["key"], "reused": prepared["reused"]}}
         # Keep the run's own immutable evidence for later delivery verification
         # and backups; cache eviction must not invalidate a completed candidate.
-        import shutil
-        shutil.copytree(prepared["path"], seeds, symlinks=True)
+        # The copy is verified while it is read, so a corrupt entry never reaches
+        # the workspace.
+        materialize(prepared, seeds)
         seed_source = seeds
         message = "Sealed dependency preparation reused" if prepared["reused"] else \
             "Sealed dependency preparation frozen"

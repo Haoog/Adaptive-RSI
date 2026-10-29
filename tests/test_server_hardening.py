@@ -1,6 +1,7 @@
 """服务会话、认证、异常及备份资源边界的真实 HTTP 回归。"""
 import base64
 import concurrent.futures
+import hashlib
 import http.client
 import io
 import json
@@ -226,6 +227,49 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertTrue(self.server._backup_gate.acquire(blocking=False))
         self.server._backup_gate.release()
         self.server._backup_gate.release()
+
+    def test_backup_manifest_hashes_bounded_chunks_from_the_open_descriptor(self):
+        content = b"manifest fixture" * 18000
+        self.backup.write_bytes(content)
+        handler = object.__new__(Handler)
+        handler.server = self.server
+        responses, reads = [], []
+        handler.respond = lambda data, code=200, content_type="application/json; charset=utf-8", headers=None: responses.append(data)
+        original = os.fdopen
+
+        class BoundedReader:
+            def __init__(self, descriptor, mode):
+                self.stream = original(descriptor, mode)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def fileno(self):
+                return self.stream.fileno()
+
+            def read(self, size=-1):
+                self_test.assertGreater(size, 0)
+                self_test.assertLessEqual(size, 64 * 1024)
+                reads.append(size)
+                return self.stream.read(size)
+
+        def verify(path):
+            # Reopening the path after verification would hash different bytes.
+            replacement = path.with_suffix('.replacement')
+            replacement.write_bytes(b"replacement content")
+            replacement.replace(path)
+            return {"bytes": len(content), "schema_version": 1}
+
+        self_test = self
+        with patch("adaptive_rsi.server.os.fdopen", side_effect=BoundedReader), \
+                patch("adaptive_rsi.storage_tools.verify_backup", side_effect=verify):
+            handler.backup(self.backup, {"format": ["manifest"]})
+        self.assertTrue(reads)
+        self.assertEqual(responses[0]["backup"]["sha256"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(responses[0]["backup"]["bytes"], len(content))
 
     def test_backup_total_deadline_closes_connection(self):
         self.backup.write_bytes(b"a" * 128000)
