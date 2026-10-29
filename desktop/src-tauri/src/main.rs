@@ -869,7 +869,12 @@ fn bootstrap(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let state = app.state::<RuntimeState>();
     *state.local.lock().unwrap() = Some(connection.clone());
-    *state.target.lock().unwrap() = Some(connection);
+    {
+        let mut target = state.target.lock().unwrap();
+        let mut meta = state.remote_meta.lock().unwrap();
+        *meta = Value::Null;
+        *target = Some(connection);
+    }
     let pid = child.get_mut().id();
     *state.child.lock().unwrap() = Some(child.take());
     let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1026,9 +1031,12 @@ fn cancel_request(state: tauri::State<RuntimeState>, id: String) {
 }
 #[tauri::command]
 fn runtime_info(state: tauri::State<RuntimeState>) -> Value {
-    let meta = state.remote_meta.lock().unwrap().clone();
-    match state.target.lock().unwrap().as_ref() {
+    // Always lock the target before its metadata; connect commits both under
+    // the same order so a reader never sees mismatched server capabilities.
+    let target = state.target.lock().unwrap();
+    match target.as_ref() {
         Some(c) => {
+            let meta = state.remote_meta.lock().unwrap();
             json!({"name":c.name,"scope":c.origin,"connected":true,"kind":if c.origin.starts_with("http://127.0.0.1:"){"local"}else{"remote"},"owned":c.owned,
                    "api_version":meta.get("api_version").cloned().unwrap_or(Value::Null),
                    "capabilities":meta.get("capabilities").cloned().unwrap_or_else(|| json!([]))})
@@ -1101,7 +1109,6 @@ fn quit_gracefully(app: tauri::AppHandle) -> Result<(), String> {
 async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, String> {
     let state = app.state::<RuntimeState>();
     state.transport.cancel_all();
-    *state.remote_meta.lock().unwrap() = Value::Null;
     let _connection_change = state.transport.gate.write().await;
     if url.as_deref().unwrap_or("").is_empty() {
         let handle = app.clone();
@@ -1113,8 +1120,12 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
                 .unwrap()
                 .clone()
                 .ok_or("Local runtime is unavailable")?;
-            *state.target.lock().unwrap() = Some(local);
-            *state.remote_meta.lock().unwrap() = Value::Null;
+            let mut target = state.target.lock().unwrap();
+            let mut remote = state.remote_meta.lock().unwrap();
+            *remote = Value::Null;
+            *target = Some(local);
+            drop(target);
+            drop(remote);
             Ok(runtime_info(state.clone()))
         })
         .await
@@ -1138,7 +1149,6 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         return Err("Enter the authenticated HTTPS server root URL with its token".into());
     }
     let origin = parsed.origin().ascii_serialization();
-    let app_handle = app.clone();
     let connection = tauri::async_runtime::spawn_blocking(move || {
         let (client, transport) = transport::clients()?;
         let response = client
@@ -1164,7 +1174,7 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
         if health.status != 200 || !value.get("api_version").and_then(Value::as_u64).is_some_and(supported_remote_api) {
             return Err("Update the remote runtime before connecting".into());
         }
-        *app_handle.state::<RuntimeState>().remote_meta.lock().unwrap() = json!({
+        let meta = json!({
             "api_version": value.get("api_version").cloned().unwrap_or(Value::Null),
             "capabilities": value.get("capabilities").cloned().unwrap_or_else(|| json!([])),
         });
@@ -1177,14 +1187,22 @@ async fn connect(app: tauri::AppHandle, url: Option<String>) -> Result<Value, St
             .ok_or("Missing runtime authentication")?
             .into();
         c.name = c.origin.clone();
-        Ok::<_, String>(c)
+        Ok::<_, String>((c, meta))
     })
     .await
     .map_err(|_| "Connection interrupted")??;
+    let (connection, meta) = connection;
     let handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let state = handle.state::<RuntimeState>();
-        *state.target.lock().unwrap() = Some(connection);
+        let mut target = state.target.lock().unwrap();
+        let mut remote = state.remote_meta.lock().unwrap();
+        // Commit the target and its metadata together so runtime_info cannot
+        // observe a new server with the previous server's capabilities.
+        *remote = meta;
+        *target = Some(connection);
+        drop(target);
+        drop(remote);
         runtime_info(state.clone())
     })
     .await
@@ -1328,17 +1346,20 @@ fn main() {
             let app_open = MenuItem::with_id(app, "app-open", "打开主窗口", true, Some("CmdOrCtrl+Shift+O"))?;
             let app_update = MenuItem::with_id(app, "app-check-update", "检查更新", true, Some("CmdOrCtrl+Shift+U"))?;
             let app_diagnostics = MenuItem::with_id(app, "app-diagnostics", "导出诊断包", true, Some("CmdOrCtrl+Shift+D"))?;
-            let app_quit = MenuItem::with_id(app, "app-quit", "退出 Adaptive RSI", true, Some("CmdOrCtrl+Q"))?;
             let commands = Submenu::with_id_and_items(app, "commands", "命令", true,
                 &[&app_open, &app_update, &app_diagnostics])?;
             // Keep the platform default menus (Edit/Window/Help and text-editing
-            // shortcuts) and replace only the app menu's quit entry with the
-            // draining quit command.
+            // shortcuts). Only macOS has the app submenu whose trailing Quit we
+            // may replace; other platforms must never lose Edit > Select All.
             let menu = Menu::default(app.handle())?;
-            if let Some(app_submenu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
-                let count = app_submenu.items()?.len();
-                if count > 0 { let _ = app_submenu.remove_at(count - 1); }
-                app_submenu.append(&app_quit)?;
+            #[cfg(target_os = "macos")]
+            {
+                let app_quit = MenuItem::with_id(app, "app-quit", "退出 Adaptive RSI", true, Some("CmdOrCtrl+Q"))?;
+                if let Some(app_submenu) = menu.items()?.first().and_then(|item| item.as_submenu()) {
+                    let count = app_submenu.items()?.len();
+                    if count > 0 { let _ = app_submenu.remove_at(count - 1); }
+                    app_submenu.append(&app_quit)?;
+                }
             }
             menu.insert(&commands, 1)?;
             app.set_menu(menu)?;

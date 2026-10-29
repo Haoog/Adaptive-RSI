@@ -10,6 +10,7 @@ pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
 /// renamed to `CACHED_NAME` only after the signature has been verified.
 pub(super) const PART_NAME: &str = "staged-update.part";
 pub(super) const CACHED_NAME: &str = "staged-update.bin";
+pub(super) const PART_META_NAME: &str = "staged-update.part.json";
 
 // Transfer deadlines are split so a stalled phase reports its own cause. They are
 // deliberately not loosened: total time stays at the previous 600s bound.
@@ -58,13 +59,18 @@ pub(super) fn announced_size(feed: &Value) -> u64 {
         .unwrap_or(MAX_PACKAGE as u64)
 }
 
-/// Bytes still missing after a resume, so the preflight never reserves space twice.
-pub(super) fn remaining_bytes(announced: u64, offset: u64) -> u64 {
-    announced.saturating_sub(offset)
-}
-
 pub(super) fn part_path(cache: &Path) -> PathBuf { cache.join(PART_NAME) }
 pub(super) fn cached_path(cache: &Path) -> PathBuf { cache.join(CACHED_NAME) }
+pub(super) fn part_meta_path(cache: &Path) -> PathBuf { cache.join(PART_META_NAME) }
+
+/// A segment belongs to one exact feed artifact, never just to a byte count.
+pub(super) fn part_identity(version: &str, url: &str) -> String {
+    format!("{version}\n{url}\n")
+}
+
+pub(super) fn identity_matches(stored: Option<&str>, version: &str, url: &str) -> bool {
+    stored.is_some_and(|value| value == part_identity(version, url))
+}
 
 /// Resume from the bytes already on disk, but never trust a segment that is
 /// larger than the package bound or larger than the size the server declares.
@@ -294,11 +300,20 @@ fn has_marker(text: &str, marker: &str) -> bool {
     false
 }
 
-/// Unknown markers stay `None` so an unlabelled asset is never rejected blindly.
+/// Unknown or ambiguous multi-target markers stay `None` so an unlabelled or
+/// universal asset is never rejected blindly.
 pub(super) fn detect_target(label: &str) -> (Option<Platform>, Option<Arch>) {
     let text = label.to_ascii_lowercase().replace('_', "-");
-    let platform = PLATFORM_MARKERS.iter().find(|(marker, _)| has_marker(&text, marker)).map(|(_, value)| *value);
-    let arch = ARCH_MARKERS.iter().find(|(marker, _)| has_marker(&text, marker)).map(|(_, value)| *value);
+    let mut platforms = Vec::new();
+    for (marker, value) in PLATFORM_MARKERS {
+        if has_marker(&text, marker) && !platforms.contains(&value) { platforms.push(value); }
+    }
+    let mut arches = Vec::new();
+    for (marker, value) in ARCH_MARKERS {
+        if has_marker(&text, marker) && !arches.contains(&value) { arches.push(value); }
+    }
+    let platform = if platforms.len() == 1 { platforms.first().copied() } else { None };
+    let arch = if arches.len() == 1 { arches.first().copied() } else { None };
     (platform, arch)
 }
 
@@ -556,6 +571,10 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
         };
         let status = response.status().as_u16();
         if status == 416 {
+            // An unsatisfiable range with a non-zero offset usually means the
+            // persisted segment already holds the complete package. Verify it
+            // before deciding to discard it.
+            if offset > 0 { return Ok(offset); }
             discard_part(part);
             return Err("update_range_rejected".into());
         }
@@ -626,7 +645,14 @@ async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update
             }
         }
         file.sync_all().map_err(|_| "update_cache_unavailable")?;
-        if total.is_some_and(|value| count < value) { return Err("update_download_incomplete".into()); }
+        if total.is_some_and(|value| count < value) {
+            // A transient truncation gets one more range request from the
+            // current offset; a deterministic truncation discards the segment
+            // so the next attempt can restart instead of looping forever.
+            if attempt < 2 { offset = count; continue; }
+            discard_part(part);
+            return Err("update_download_incomplete".into());
+        }
         return Ok(count);
     }
 }
@@ -635,9 +661,20 @@ async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater
                           cache: &Path, version: &str, notes: &str) -> Result<(), String> {
     let cached = cached_path(cache);
     let part = part_path(cache);
+    let meta = part_meta_path(cache);
     let announced = announced_size(&update.raw_json);
+    let url = update.download_url.as_str();
+    let stored = std::fs::read_to_string(&meta).ok();
+    if !identity_matches(stored.as_deref(), version, url) {
+        // Never append a new release to a segment left by another artifact.
+        discard_part(&part);
+        std::fs::write(&meta, part_identity(version, url))
+            .map_err(|_| "update_cache_unavailable")?;
+    }
     let offset = resume_offset(part_bytes(&part), (announced < MAX_PACKAGE as u64).then_some(announced));
-    preflight_space(cache, remaining_bytes(announced, offset))?;
+    // The cache, application and extraction volumes all need room for the
+    // complete package; checking only the remaining bytes under-reserved them.
+    preflight_space(cache, announced)?;
     let mut total = (announced < MAX_PACKAGE as u64).then_some(announced);
     let mut count = offset;
     // A segment that already holds the announced size needs no request at all.
@@ -659,6 +696,7 @@ async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater
         discard_part(&part);
         return Err("update_cache_unavailable".into());
     }
+    let _ = std::fs::remove_file(&meta);
     Ok(())
 }
 

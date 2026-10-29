@@ -76,8 +76,18 @@ fn resumed_segment_requests_only_the_missing_bytes() {
     assert_eq!(native_update::resume_offset(native_update::MAX_PACKAGE as u64 + 1, None), 0);
     assert_eq!(native_update::range_header(0), None);
     assert_eq!(native_update::range_header(4096).as_deref(), Some("bytes=4096-"));
-    assert_eq!(native_update::remaining_bytes(8192, 4096), 4096);
-    assert_eq!(native_update::remaining_bytes(100, 4096), 0);
+}
+
+#[test]
+fn segment_identity_is_bound_to_version_and_url() {
+    let folder = tempfile::tempdir().unwrap();
+    let meta = native_update::part_meta_path(folder.path());
+    assert_eq!(meta.file_name().unwrap(), "staged-update.part.json");
+    let current = native_update::part_identity("1.2.3", "https://example.test/a");
+    assert!(native_update::identity_matches(Some(&current), "1.2.3", "https://example.test/a"));
+    assert!(!native_update::identity_matches(Some(&current), "1.2.4", "https://example.test/a"));
+    assert!(!native_update::identity_matches(Some(&current), "1.2.3", "https://example.test/b"));
+    assert!(!native_update::identity_matches(None, "1.2.3", "https://example.test/a"));
 }
 
 #[test]
@@ -191,6 +201,12 @@ fn asset_target_is_preflighted_before_download() {
         "https://example.test/releases/download/v1.2.3/package.zip",
         Some("desktop-1.2.3-x86_64-unknown-linux-gnu.zip"),
         mac_arm).unwrap_err(), "update_incompatible_platform");
+    // A universal/multi-architecture label is ambiguous, so it is not rejected.
+    assert_eq!(detect_target("desktop-1.2.3-macos-arm64-x86_64.zip"),
+               (Some(Platform::Macos), None));
+    assert!(require_compatible_asset(
+        "https://example.test/releases/download/v1.2.3/desktop-1.2.3-macos-arm64-x86_64.zip",
+        None, mac_arm).is_ok());
     // Unlabelled assets and an unrecognised host stay eligible.
     assert!(require_compatible_asset(
         "https://example.test/releases/download/v1.2.3/desktop-latest.zip", None, mac_arm).is_ok());
