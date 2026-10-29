@@ -679,6 +679,92 @@ class ReliabilityTest(unittest.TestCase):
         self.assertTrue(any(anchor["line"] == 2 for anchor in mapping["files"][0]["anchors"]))
         self.assertLessEqual(len(terms("登录失败" * 6000)), 512)
 
+    def test_prepared_environment_is_reused_on_the_normal_pipeline_path(self):
+        (self.repo / "deps").mkdir()
+        (self.repo / "deps/value.txt").write_text("sealed dependency")
+        self.runtime.configure({"environment": {"seed_paths": ["deps"]}}, self.project)
+        task, run = self.claim("Fix addition")
+        with patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "pass", "reason": "Fixed checks passed", "checks": {}}) as evaluate:
+            self.runtime.process(run)
+            second_task, second_run = self.claim("Correct addition again")
+            self.runtime.process(second_run)
+        self.assertEqual(evaluate.call_count, 2)
+        messages = [row["message"] for row in self.store.query(
+            "SELECT message FROM events WHERE project=? AND kind='environment' ORDER BY seq", (self.project,))]
+        self.assertIn("Sealed dependency preparation frozen", messages)
+        self.assertIn("Sealed dependency preparation reused", messages)
+        self.assertEqual((Path(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"])
+                          / "workspace/deps/value.txt").read_text(), "sealed dependency")
+        self.assertEqual((Path(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"])
+                          / "dependencies/deps/value.txt").read_text(), "sealed dependency")
+
+    def test_cached_rejected_review_is_invalidated_without_reuse_event(self):
+        from types import SimpleNamespace
+        from adaptive_rsi.recovery import cached, save
+        task, _ = self.claim()
+        for identifier in ("prior-review-run", "next-review-run"):
+            self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                               "VALUES (?,?,?,'failed','{}',1,2)", (identifier, task, self.project))
+        runtime = SimpleNamespace(store=self.store)
+        save(runtime, {"id": "prior-review-run"}, "review", {"decision": "fail"}, "review-signature")
+        accept = lambda value: value.get("decision") == "pass"
+        self.assertIsNone(cached(runtime, {"id": "next-review-run", "task": task, "project": self.project},
+                                 "review", "review-signature", accept=accept))
+        events = self.store.query("SELECT kind,data FROM events WHERE run='next-review-run' ORDER BY seq")
+        self.assertNotIn("stage_reused", [row["kind"] for row in events])
+        invalid = [json.loads(row["data"]) for row in events if row["kind"] == "stage_invalidated"]
+        self.assertEqual(invalid[-1]["reason"], "result_requires_rework")
+        save(runtime, {"id": "prior-review-run"}, "review", {"decision": "pass"}, "review-signature")
+        self.assertEqual(cached(runtime, {"id": "next-review-run", "task": task, "project": self.project},
+                                "review", "review-signature", accept=accept)["decision"], "pass")
+
+    def test_documentation_plan_cannot_change_source_even_with_real_scope(self):
+        class Drift(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                if role == "planning":
+                    result = super().invoke(role, *args, **kwargs)
+                    result.update(change_kind="documentation", scope=["calculator.py", "docs"])
+                    return result
+                if role == "implementation":
+                    (args[1] / "docs").mkdir(exist_ok=True)
+                    (args[1] / "docs/guide.md").write_text("guide\n")
+                    (args[1] / "calculator.py").write_text("def add(a, b):\n    return a + b\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Drift()
+        task, run = self.claim("Update usage guide")
+        with patch.object(self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate) as evaluate:
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "insufficient_evidence")
+        self.assertIn("documentation", result["reason"].lower())
+        self.assertEqual(evaluate.call_count, 0)
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+
+    def test_documentation_change_still_runs_fixed_checks(self):
+        class Docs(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                if role == "planning":
+                    result = super().invoke(role, *args, **kwargs)
+                    result.update(change_kind="documentation", scope=["docs"])
+                    return result
+                if role == "implementation":
+                    (args[1] / "docs").mkdir(exist_ok=True)
+                    (args[1] / "docs/guide.md").write_text("guide\n")
+                    return {"summary": "Documented the arithmetic contract"}
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Docs()
+        task, run = self.claim("Update usage guide")
+        with patch.object(self.runtime.evaluator, "evaluate", return_value={
+                "decision": "pass", "reason": "Fixed checks passed", "checks": {}}) as evaluate:
+            self.runtime.process(run)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(evaluate.call_args.args[2], CHECKS)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                         "awaiting_approval")
+
     def test_stage_cache_keys_only_change_for_relevant_settings(self):
         config = self.runtime.config(self.project)
         before, _ = _stage_config(config, "planning")
@@ -763,6 +849,79 @@ class EvidenceContractTest(unittest.TestCase):
     def results(self, before, after, **extras):
         return {"acceptance_baseline": [{"passed": before, "error": "", "exit_code": 0 if before else 1, "stderr": "AssertionError", **extras}],
                 "acceptance_candidate": [{"passed": after}]}
+
+    def test_documentation_paths_are_explicit_and_mixed_source_is_not_documentation(self):
+        from adaptive_rsi.workflow import documentation_only
+        self.assertTrue(documentation_only(["docs/guide.txt", "docs/image.svg", "README.md",
+                                            "CHANGELOG.en.md", "LICENSE", "LICENSE.txt", "README"]))
+        self.assertFalse(documentation_only([]))
+        self.assertFalse(documentation_only(["calculator.py"]))
+        self.assertFalse(documentation_only(["docs/guide.md", "calculator.py"]))
+        self.assertFalse(documentation_only(["docs/../calculator.py"]))
+        self.assertFalse(documentation_only(["/docs/guide.md"]))
+        self.assertFalse(documentation_only(["docs\\calculator.py"]))
+        for path in ["docs/calculator.py", "docs/build.js", "docs/config.toml", "README.py", "docs/Makefile"]:
+            with self.subTest(path=path):
+                self.assertFalse(documentation_only([path]))
+
+    def test_documentation_boundary_sees_rename_source_paths(self):
+        from adaptive_rsi.pipeline import _touched_paths
+        from adaptive_rsi.workflow import documentation_only
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            git(repo, "init", "-q")
+            (repo / "calculator.py").write_text("VALUE = 1\n")
+            git(repo, "add", ".")
+            git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
+            (repo / "docs").mkdir()
+            git(repo, "mv", "calculator.py", "docs/calculator.py")
+            touched = _touched_paths(repo)
+            self.assertIn("calculator.py", touched)
+            self.assertIn("docs/calculator.py", touched)
+            self.assertFalse(documentation_only(touched))
+
+    def test_review_identity_excludes_timing_but_keeps_full_result_identity(self):
+        from adaptive_rsi.pipeline import _review_key
+        config = merge(DEFAULTS, {})
+        task = {"title": "Fix addition", "body": "", "source": "goal", "evidence": "[]", "acceptance": "[]"}
+        run = {"id": "review-run", "config": json.dumps(config)}
+        plan = {"scope": ["calculator.py"]}
+        def evaluation(seconds, executed):
+            return {"decision": "pass", "reason": "Checks passed", "harness_hash": "harness",
+                    "execution_environment": {"build": "build", "backend": "seatbelt"},
+                    "host_tools": {"python3": {"state": "available", "version": "3.14.0",
+                                               "binary_sha256": "binary"}},
+                    "checks": {"candidate": [{
+                        "name": "tests", "argv": ["python3", "-m", "unittest"], "cwd": ".",
+                        "passed": True, "exit_code": 0, "error": None, "seconds": seconds,
+                        "test_summary": {"format": "pytest_cli", "executed": 1},
+                        "test_identities": {"state": "reported", "executed": executed, "skipped": []},
+                        "artifacts": {"junit.xml": {"state": "collected", "bytes": 10,
+                                                    "sha256": "artifact"}}}]}}
+        first = _review_key(run, task, "base", [], config, plan,
+                            evaluation(0.1, ["tests.test_add"]), "summary", "diff")
+        second = _review_key(run, task, "base", [], config, plan,
+                             evaluation(9.9, ["tests.test_add"]), "summary", "diff")
+        self.assertEqual(first, second)
+        changed_tests = _review_key(run, task, "base", [], config, plan,
+                                    evaluation(0.1, ["tests.test_add", "tests.test_other"]),
+                                    "summary", "diff")
+        self.assertNotEqual(first, changed_tests)
+        changed_patch = _review_key(run, task, "base", [], config, plan,
+                                    evaluation(0.1, ["tests.test_add"]), "summary", "different")
+        self.assertNotEqual(first, changed_patch)
+        diagnostic = evaluation(0.1, ["tests.test_add"])
+        diagnostic["checks"]["candidate"][0]["stderr"] = "new diagnostic"
+        self.assertNotEqual(first, _review_key(run, task, "base", [], config, plan,
+                                             diagnostic, "summary", "diff"))
+
+    def test_rejected_review_cache_is_not_reusable(self):
+        from adaptive_rsi.pipeline import _approved_review
+        self.assertFalse(_approved_review(None))
+        self.assertFalse(_approved_review({"decision": "fail"}))
+        self.assertFalse(_approved_review({"decision": "insufficient_evidence"}))
+        self.assertTrue(_approved_review({"decision": "pass"}))
 
     def test_no_gain_and_environment_failure_are_not_improvements(self):
         self.assertEqual(improvement(self.results(True, True), {})["decision"], "not_requested")

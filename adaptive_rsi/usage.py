@@ -1,4 +1,57 @@
 """归一化用量；缺失数据保留未知状态，不把缓存重复计费。"""
+import math
+
+
+PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
+MAX_UNIT_PRICE = 1000000
+
+
+def unit_prices(value, strict=False):
+    """Normalize optional per-1M prices; strict callers reject unknown or invalid input."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        if strict:
+            raise ValueError("Invalid model prices")
+        return {}
+    result = {}
+    for key, price in value.items():
+        if key not in PRICE_FIELDS:
+            if strict:
+                raise ValueError("Invalid model prices")
+            continue
+        if price is None:
+            continue
+        if (not isinstance(price, (int, float)) or isinstance(price, bool)
+                or not math.isfinite(price) or price < 0 or price > MAX_UNIT_PRICE):
+            if strict:
+                raise ValueError("Invalid model prices")
+            continue
+        result[key] = float(price)
+    return result
+
+
+def estimate(details, prices=None, unit_price=None):
+    """Return (USD, basis) from frozen prices; missing components never count as zero."""
+    if not details or not details.get("usage_known"):
+        return None, "unknown"
+    tokens = details.get("tokens")
+    counts = {name: details.get(name, 0) for name in
+              ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")}
+    if type(tokens) is not int or tokens < 0 or any(type(count) is not int or count < 0
+                                                    for count in counts.values()):
+        return None, "unknown"
+    prices = prices or {}
+    # 分量口径只在归一化后的四类计数与 tokens 对账时使用，避免缓存重复或漏计。
+    if prices and sum(counts.values()) == tokens and all(
+            counts[field + "_tokens"] == 0 or field in prices for field in PRICE_FIELDS):
+        return sum(counts[field + "_tokens"] * prices.get(field, 0)
+                   for field in PRICE_FIELDS) / 1000000.0, "components"
+    if isinstance(unit_price, (int, float)) and not isinstance(unit_price, bool):
+        price = float(unit_price)
+        if math.isfinite(price) and price >= 0:
+            return tokens * price / 1000000.0, "mixed"
+    return None, "unknown"
 
 
 def count(value):

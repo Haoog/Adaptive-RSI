@@ -203,6 +203,7 @@ window.RSIModelCenter = (() => {
       if(status.length)copy.append(el('small',status.join(' · ')));
       if(model.probes)for(const proof of Object.values(model.probes)){if(proof.state==='pass'&&proof.effort!==model.verified?.effort)copy.append(el('small',t('基础能力测试通过')+' · '+proof.effort+' · '+stamp(proof.at)));}
       if(model.unit_price!=null)copy.append(el('small',t('估算价格')+' · $'+model.unit_price+' / 1M tokens'));
+      if(model.prices)for(const [key,label] of [['input','输入'],['output','输出'],['cache_read','缓存读取'],['cache_write','缓存写入']])if(model.prices[key]!=null)copy.append(el('small',t(label)+' · $'+model.prices[key]+' / 1M tokens'));
       const controls=el('div',undefined,'mc-model-actions'),label=el('label',undefined,'mc-enable'),checkbox=el('input');
       checkbox.type='checkbox';checkbox.checked=!!model.enabled;checkbox.disabled=!!model.kind;checkbox.setAttribute('aria-label',t('启用模型')+' '+model.name);
       label.title=t('此开关只控制模型选择列表；已有角色配置和正在运行的任务继续使用原来的模型。');
@@ -210,7 +211,7 @@ window.RSIModelCenter = (() => {
       label.append(checkbox,document.createTextNode(t('启用')));
       const test=action(t('测试模型'),()=>openProbe(provider,model),'mc-text-button');test.disabled=!!model.kind;test.setAttribute('aria-label',t('测试模型')+' '+model.name);
       const favorite=action(t(model.favorite?'取消收藏':'收藏'),async()=>{await request('model',{provider:provider.id,model:{id:model.id,favorite:!model.favorite}});await load();},'mc-text-button');
-      const price=action(t('估算价格'),()=>{priceTarget={project:scope,provider:provider.id,model:model.id};$('mc-price-target').textContent=provider.name+' / '+model.id;$('mc-price-input').value=model.unit_price??'';$('mc-price-error').textContent='';$('mc-price-dialog').showModal();},'mc-text-button');
+      const price=action(t('估算价格'),()=>{priceTarget={project:scope,provider:provider.id,model:model.id};$('mc-price-target').textContent=provider.name+' / '+model.id;$('mc-price-input').value=model.unit_price??'';for(const [key,id] of [['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']])$(id).value=model.prices?.[key]??'';$('mc-price-error').textContent='';$('mc-price-dialog').showModal();},'mc-text-button');
       const more=el('details',undefined,'model-more'),menu=el('div',undefined,'model-more-actions');more.append(el('summary',t('更多')));menu.append(favorite,test,price);more.append(menu);controls.append(label,more);row.append(copy,controls);list.append(row);
     }
     if(!matches.length)list.append(el('p',t(models.length?'没有匹配的模型。':'连接后点击「获取模型」，也可以添加自定义模型。'),'mc-empty'));
@@ -366,7 +367,7 @@ window.RSIModelCenter = (() => {
     $('mc-fallback-provider').addEventListener('change',()=>renderFallbackModels());$('mc-fallback-model').addEventListener('change',()=>renderFallbackEffort());
     $('mc-price-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
       const unchanged=unchangedForm(event.target),project=scope,target={...priceTarget},button=event.target.querySelector('button[type="submit"]');button.disabled=true;$('mc-price-error').textContent='';
-      try{await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,unit_price:$('mc-price-input').value===''?null:Number($('mc-price-input').value)}});if(unchanged()&&scope===project)$('mc-price-dialog').close();if(scope===project)await load();}
+      try{const prices={};for(const [key,id] of [['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']])prices[key]=$(id).value===''?null:Number($(id).value);await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,unit_price:$('mc-price-input').value===''?null:Number($('mc-price-input').value),prices}});if(unchanged()&&scope===project)$('mc-price-dialog').close();if(scope===project)await load();}
       catch(error){if(unchanged()&&scope===project)$('mc-price-error').textContent=message(error);else toast(t('先前的提交未成功。当前输入已保留，请回到原来的项目或设置范围检查。'),true);}
       finally{button.disabled=false;}
     },event.target);});$('mc-picker-search').addEventListener('input',()=>{pickerPage=0;renderPicker();});

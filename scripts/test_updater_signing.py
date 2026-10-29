@@ -2,6 +2,7 @@
 """Verify updater signatures with disposable local test keys, never release credentials."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -19,6 +20,41 @@ def run(argv, env, expect=0):
         raise RuntimeError("Updater signature test failed: " + result.stderr[-1000:])
 
 
+def cargo():
+    """Use an explicit cargo when the shell PATH does not include rustup."""
+    found = shutil.which("cargo") or str(Path.home() / ".cargo/bin/cargo")
+    if not Path(found).exists():
+        raise RuntimeError("cargo is required for updater signature verification")
+    return found
+
+
+def check_signed_cross_version_upgrade(folder, key, current, command, env):
+    """Sign both sides of a real N -> N+1 upgrade with one disposable test key.
+
+    The check is about the signature/version binding only: it proves a newer
+    artifact cannot be accepted as the old version, that the old signature does
+    not cover the new bytes, and that swapping payloads is rejected. It does not
+    install anything.
+    """
+    next_archive = folder / "app-next.tar.gz"
+    next_archive.write_bytes(b"test-only update artifact for the next version")
+    run([CLI, "signer", "sign", "-f", key, "-p", "", "--app-version", "1.2.4", next_archive], env)
+    next_command = [*command[:-2], next_archive, str(next_archive) + ".sig"]
+    run([*next_command, "1.2.4"], env)
+    for version in ("1.2.3", "1.2.5"):
+        run([*next_command, version], env, expect=1)
+    run([*command, "1.2.4"], env, expect=1)
+    # A payload swap keeps a valid signature file next to the wrong bytes.
+    swapped = folder / "app-swapped.tar.gz"
+    swapped.write_bytes(next_archive.read_bytes())
+    shutil.copyfile(str(current) + ".sig", str(swapped) + ".sig")
+    run([*command[:-2], swapped, str(swapped) + ".sig", "1.2.3"], env, expect=1)
+    # The two versions must not share an identical artifact, otherwise the test
+    # above would not prove anything about a real cross-version upgrade.
+    if current.read_bytes() == next_archive.read_bytes():
+        raise RuntimeError("cross-version fixtures are identical")
+
+
 def main():
     env = {key: value for key, value in os.environ.items() if not key.startswith("TAURI_SIGNING_")}
     with tempfile.TemporaryDirectory(prefix="rsi-signature-test-") as directory:
@@ -28,10 +64,11 @@ def main():
         run([CLI, "signer", "generate", "--ci", "-p", "", "-w", key], env)
         run([CLI, "signer", "sign", "-f", key, "-p", "", "--app-version", "1.2.3", archive], env)
         env["RSI_UPDATER_PUBLIC_KEY"] = (folder / "key.pub").read_text()
-        command = ["cargo", "run", "--quiet", "--locked", "--manifest-path", MANIFEST,
+        command = [cargo(), "run", "--quiet", "--locked", "--manifest-path", MANIFEST,
                    "--bin", "verify_updater", "--", archive, str(archive) + ".sig"]
         run([*command, "1.2.3"], env)
         run([*command, "1.2.4"], env, expect=1)
+        check_signed_cross_version_upgrade(folder, key, archive, command, env)
         archive.write_bytes(b"altered artifact")
         run([*command, "1.2.3"], env, expect=1)
     with tempfile.TemporaryDirectory(prefix="rsi-sbom-") as directory:

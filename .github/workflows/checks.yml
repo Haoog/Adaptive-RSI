@@ -102,7 +102,7 @@ jobs:
             modules: tests.test_comprehensive_audit tests.test_store tests.test_usage_report tests.test_updates_recovery tests.test_auth_sessions tests.test_server_hardening tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 控制、恢复与桌面
             os: ubuntu-latest
-            modules: tests.test_controls tests.test_updates_recovery tests.test_update_safety tests.test_launcher_regressions tests.test_desktop_runtime tests.test_desktop_release tests.test_desktop_platform_matrix
+            modules: tests.test_controls tests.test_updates_recovery tests.test_update_safety tests.test_launcher_regressions tests.test_desktop_runtime tests.test_desktop_release tests.test_desktop_platform_matrix tests.test_upgrade_harness
           - name: 运行时核心
             os: ubuntu-latest
             modules: tests.test_runtime.RuntimeTest
@@ -123,7 +123,7 @@ jobs:
             modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
-            modules: tests.test_model_center tests.test_reliability tests.test_recovery
+            modules: tests.test_model_center tests.test_reliability tests.test_recovery tests.test_task_value_feedback
           - name: 运营、发现与文档
             os: ubuntu-latest
             modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report

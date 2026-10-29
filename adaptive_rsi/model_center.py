@@ -14,6 +14,7 @@ from .catalog import CatalogError, list_models
 from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
 from .store import encode, uid
+from .usage import PRICE_FIELDS, unit_prices
 from .provider_health import ProviderHealth, error_code
 from . import __version__
 from .config import compatibility
@@ -57,7 +58,7 @@ class ModelCenter:
         return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + (signature or self.signature(provider))
 
     def _save_directory(self, key, provider, project, directory):
-        fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price"}
+        fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices"}
         preferences = {"models": [{name: value for name, value in model.items() if name in fields}
                                   for model in directory.get("models", [])],
                        "fetched": None, "truncated": directory.get("truncated", False)}
@@ -282,7 +283,7 @@ class ModelCenter:
             self._forget_credential(provider)
         if old and self.signature(old) != self.signature(provider):
             previous = self.directory(old, project)
-            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual", "favorite", "unit_price"]}
+            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices"]}
                            for model in previous["models"]]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
@@ -368,12 +369,12 @@ class ModelCenter:
                 models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT),
                                "manual": old.get("manual", False), "missing": False, "name_override": custom_name,
                                **({"name": old["name"]} if custom_name else {}),
-                               **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price"] if k in old}})
+                               **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price", "prices"] if k in old}})
             retained = sorted(before.values(), key=lambda model: not (model.get("manual") or model.get("favorite") or
-                              model.get("name_override") or model.get("unit_price") is not None))
+                              model.get("name_override") or model.get("unit_price") is not None or bool(model.get("prices"))))
             omitted = len(models) + len(retained) > 2000
             if omitted and any(m.get("manual") or m.get("favorite") or m.get("name_override") or m.get("unit_price") is not None
-                               for m in retained[max(0, 2000 - len(models)):]):
+                               or bool(m.get("prices")) for m in retained[max(0, 2000 - len(models)):]):
                 raise CenterError("too_many_models")
             models.extend({**model, "missing": not model.get("manual", False)} for model in retained[:max(0, 2000 - len(models))])
             directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"] or omitted}
@@ -381,7 +382,7 @@ class ModelCenter:
         return directory
 
     def edit_model(self, provider_id, data, project=None):
-        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual", "favorite", "unit_price"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
+        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual", "favorite", "unit_price", "prices"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
             raise CenterError("invalid_model")
         if "enabled" in data and type(data["enabled"]) is not bool or "manual" in data and type(data["manual"]) is not bool:
             raise CenterError("invalid_model")
@@ -392,6 +393,21 @@ class ModelCenter:
             raise CenterError("invalid_model")
         if "unit_price" in data and data["unit_price"] is not None and (type(data["unit_price"]) not in [int, float] or not 0 <= data["unit_price"] <= 1000000):
             raise CenterError("invalid_model")
+        prices_update = None
+        if "prices" in data:
+            raw = data["prices"]
+            if raw is None:
+                prices_update = {}
+            elif not isinstance(raw, dict) or set(raw) - set(PRICE_FIELDS):
+                raise CenterError("invalid_model")
+            else:
+                try:
+                    cleaned = unit_prices(raw, strict=True)
+                except ValueError:
+                    raise CenterError("invalid_model") from None
+                prices_update = ({} if not raw or
+                                 (set(raw) == set(PRICE_FIELDS) and all(value is None for value in raw.values()))
+                                 else {field: cleaned.get(field) for field in PRICE_FIELDS if field in raw})
         with self.lock:
             provider = self.provider(provider_id, project)
             key = self.key(provider, project)
@@ -408,6 +424,20 @@ class ModelCenter:
                 name = data["name"].strip()
                 model.update(name=name or data["id"], name_override=bool(name and name != data["id"]))
             model.update({k: v for k, v in data.items() if k in ["enabled", "favorite", "unit_price"]})
+            if prices_update is not None:
+                if not prices_update:
+                    model.pop("prices", None)
+                else:
+                    merged = dict(model["prices"]) if isinstance(model.get("prices"), dict) else {}
+                    for field, price in prices_update.items():
+                        if price is None:
+                            merged.pop(field, None)
+                        else:
+                            merged[field] = price
+                    if merged:
+                        model["prices"] = merged
+                    else:
+                        model.pop("prices", None)
             if data.get("manual"):
                 model.update(manual=True, missing=False)
             self._save_directory(key, provider, project, directory)

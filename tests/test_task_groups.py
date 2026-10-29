@@ -150,6 +150,8 @@ class TaskGroupsTest(unittest.TestCase):
     def test_legacy_group_members_are_backfilled_without_changing_original_states(self):
         self.store.execute('DROP TABLE task_group_members')
         self.store.execute('DELETE FROM schema_migrations WHERE version>=5')
+        for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
+            self.store.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
         reopened = Store(self.store.root)
         try:

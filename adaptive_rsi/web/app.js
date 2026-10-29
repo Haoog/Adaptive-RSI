@@ -643,7 +643,7 @@ function renderTasks(){
   const proof=[];if(latest?.evaluation_decision)proof.push(t('运行检查')+' '+t(statusNames[latest.evaluation_decision]||latest.evaluation_decision));if(latest?.review_decision)proof.push(t('代码评审')+' '+t(statusNames[latest.review_decision]||latest.review_decision));
   for(const [kind,label]of [['release','发布'],['deploy','部署']]){const operation=latest?.automation?.[kind];if(operation)proof.push(t(label)+' '+t(releaseStates[operation.state]||operation.state));}if(proof.length)title.append(el('p',proof.join(' · '),'task-meta'));
 
-  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
+  if(['waiting_budget','blocked','failed','interrupted','cancelled','insufficient_evidence','deferred','rejected','expired','obsolete'].includes(task.state))actions.append(action(t('重试'),async()=>{await api('retry',{task:task.id,force:task.source==='system_evolve'});await refresh();},'text-button'));
   // 仅自动退避（有未来 available）的排队任务可提前重试；普通排队任务没有可用操作。
   else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
@@ -674,7 +674,31 @@ function taskOutcome(data){
  const guidance={awaiting_approval:'修改保存在本机；确认后可推送并创建 PR。',pr_open:'可以打开 GitHub 查看合并进度。',merged:'修改已合并；合并后的运行情况会继续复查。',failed:'查看检查结果，解决问题后可以重试。',blocked:'按错误提示调整设置后重试。',insufficient_evidence:'需要补充能证明问题已解决的检查。'}[data.state];
  if(guidance)outcome.append(el('p',t(guidance),'muted'));
  if(result.failure){const target=['credentials','provider'].includes(result.failure.code)?'models':'settings';outcome.append(el('p',t(failureNext[result.failure.code]||failureNext.execution),'muted'));outcome.append(action(t(target==='models'?'修复模型连接':'检查项目设置'),()=>{closeTaskDetail();showView(target);},'text-button'));}
- if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}outcome.append(stageProgress(data));return outcome;
+ if(window.RSIProduct){outcome.append(window.RSIProduct.checkList(result.evaluation?.checks));if(data.state==='awaiting_approval')outcome.append(window.RSIProduct.approval(data));}
+ const evidence=data.evidence_summary;
+ if(evidence){
+  const metrics=el('p',t('运行证据汇总')+' · '+evidence.attempts+' '+t('轮尝试')+' · '+evidence.usage.tokens+' tokens · '+Math.round(evidence.usage.seconds)+'s','muted');
+  if(evidence.usage.unknown_calls)metrics.append(' · '+t('部分用量未知'));
+  outcome.append(metrics);
+  if(evidence.delivery_sha)outcome.append(el('p',t('交付提交')+' · '+evidence.delivery_sha,'muted'));
+  if(evidence.reused_stages?.length)outcome.append(el('p',t('复用阶段')+' · '+evidence.reused_stages.map(stage=>t(roleNames[stage]||stage)).join(', '),'muted'));
+  if(data.ended!=null)outcome.append(valueFeedback(data));
+ }
+ outcome.append(stageProgress(data));return outcome;
+}
+function valueFeedback(data){
+ const form=el('form',undefined,'value-feedback'),heading=el('h4',t('这次改进有帮助吗？')),hint=el('p',t('评价可选，仅用于观察，不会自动改变排序或策略。'),'muted'),select=el('select'),note=el('textarea'),status=el('p');
+ const label=el('label',t('价值评价')),noteLabel=el('label',t('评价说明（可选）'));
+ for(const [value,text] of [['','未评价'],['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']]){const option=el('option',t(text));option.value=value;select.append(option);}
+ select.value=data.evidence_summary.value_feedback?.rating||'';note.value=data.evidence_summary.value_feedback?.note||'';note.rows=2;note.maxLength=2000;
+ label.append(select);noteLabel.append(note);status.setAttribute('role','status');
+ const button=el('button',t('保存评价'),'text-button');button.type='submit';
+ form.append(heading,hint,label,noteLabel,button,status);
+ form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{
+  button.disabled=true;status.textContent='';
+  try{await api('task/value-feedback',{project:data.project,task:data.task,run:data.id,rating:select.value||null,note:note.value});if(form.isConnected)status.textContent=t('评价已保存');}
+  finally{button.disabled=false;}
+ },form);});return form;
 }
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  // A request can finish after the user closed the previous detail view.

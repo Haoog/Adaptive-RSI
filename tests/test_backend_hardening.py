@@ -470,7 +470,7 @@ class ReleaseDispatchRejectionTest(unittest.TestCase):
     def make_merged_run(self, title):
         task = self.runtime.goal(self.project, title)
         run = self.runtime.store.claim(self.project, self.runtime.config(self.project))
-        self.runtime.store.transition(run["id"], "merged", {"merged_sha": MERGED, "feedback": {"state": "verified"}}, True)
+        self.runtime.store.transition(run["id"], "merged", {"merged_sha": MERGED, "feedback": {"state": "verified", "head": MERGED}}, True)
         run = self.runtime.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
         self.runtime.store.put_setting("delivery:" + run["id"], {"repository": "example/project"})
         return run
@@ -501,7 +501,7 @@ class ReleaseDispatchRejectionTest(unittest.TestCase):
                 calls, api = self.api(ApiRejected("GitHub rejected dispatch", code))
                 with patch("adaptive_rsi.release.api", side_effect=api):
                     result = advance(self.runtime, self.runtime.project(self.project), run,
-                                     {"merged_sha": MERGED, "feedback": {"state": "verified"}})["release"]
+                                     {"merged_sha": MERGED, "feedback": {"state": "verified", "head": MERGED}})["release"]
                     self.assertEqual((result["state"], result["dispatch_receipt"], result["dispatch_http_status"]),
                                      ("failed", "rejected", code))
                     self.assertEqual(calls["dispatch"], 1)
@@ -522,7 +522,7 @@ class ReleaseDispatchRejectionTest(unittest.TestCase):
         calls, api = self.api(RuntimeError("network disconnected after request"))
         with patch("adaptive_rsi.release.api", side_effect=api):
             result = advance(self.runtime, self.runtime.project(self.project), self.run,
-                             {"merged_sha": MERGED, "feedback": {"state": "verified"}})["release"]
+                             {"merged_sha": MERGED, "feedback": {"state": "verified", "head": MERGED}})["release"]
             self.assertEqual((result["state"], result["dispatch_receipt"]), ("dispatch_unknown", "unknown"))
             with self.assertRaisesRegex(ValueError, "confirmed failed"):
                 retry(self.runtime, self.project, self.run["id"], "release")

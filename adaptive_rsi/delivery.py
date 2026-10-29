@@ -480,6 +480,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         outcome["merged_at"] = now
                         outcome["delivery_status"] = "merged"
                         store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (encode(outcome), run["id"]))
+                        run["state"] = "merged"
                         _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
                         if task["source"] == "rollback":
@@ -665,6 +666,17 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         missing_artifacts()
         return
     previous = outcome.get("feedback", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    merged_sha = outcome["merged_sha"]
+    merge_record = previous.get("merge")
+    # Every receipt needs an independent record for the commit release publishes,
+    # including historical receipts that already recorded a later mainline head.
+    # 'insufficient_evidence' is never settled: a check executable or artifact that
+    # was unavailable at the first poll is usually transient, so the next due poll
+    # re-evaluates the merge commit instead of freezing the run out of release.
+    merge_current = (isinstance(merge_record, dict) and merge_record.get("sha") == merged_sha and
+                     merge_record.get("state") in {"verified", "regressed"})
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
@@ -675,44 +687,89 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     source, head, branch = baseline(runtime, project, pinned)
     if branch != identity["branch"]:
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
-    if previous.get("head") == head:
+    if previous.get("head") == head and merge_current:
         outcome["feedback_polled_at"] = now
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     try:
         # Fetching can take time; recheck destinations before exclusively creating output.
         for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
-                     "evaluation", "evaluation/report.json"):
+                     "evaluation", "evaluation/report.json",
+                     "merge", "merge/baseline", "merge/baseline/.git/config",
+                     "merge/current", "merge/current/.git/config",
+                     "merge/evaluation", "merge/evaluation/report.json"):
             output_path(name)
         directory.parent.mkdir(exist_ok=True)
         directory.mkdir(mode=0o700)  # Exclusive: refuse collisions instead of overwriting evidence.
     except (ValueError, OSError, RuntimeError):
         missing_artifacts()
         return
-    baseline_tree = snapshot(source, output_path("baseline"), outcome["merged_sha"])
-    current_tree = snapshot(source, output_path("current"), head)
     from .adapters import detect
     if acceptance:
         acceptance["change_kind"] = "preservation"
-    checks = saved["checks"] or detect(baseline_tree)["checks"]
+    checks = saved["checks"]
     effective = {**config, "environment": saved["environment"]}
     output_path("evaluation/report.json")
-    # A clean snapshot has no working-tree diff, so compare the two committed SHAs
-    # explicitly; otherwise changed tests/harness in the later mainline are hidden.
-    try:
-        committed = committed_changes(source, outcome["merged_sha"], head)
-    except (RuntimeError, OSError, ValueError):
-        # Unreadable or non-repository history cannot prove which files changed.
-        # Fall back to the evaluator's own diff instead of claiming an empty set,
-        # which would let frozen regression evidence be reused.
-        committed = None
-    result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"), effective,
-                                       cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=committed)
+    reused = previous.get("evaluation") if previous.get("head") == head and isinstance(
+        previous.get("evaluation"), dict) else None
+    merge_result = None
+    if not merge_current:
+        if (head == merged_sha and reused is not None and
+                reused.get("decision") in {"pass", "fail"}):
+            # The existing receipt already evaluated this exact tree conclusively.
+            merge_result = reused
+        else:
+            # Re-run the merge commit's own fixed checks. An earlier
+            # 'insufficient_evidence' decision is deliberately not reused, so a
+            # transient failure can be cleared by the next due poll.
+            merge_root = "merge/" if head != merged_sha else ""
+            merge_baseline = snapshot(source, output_path(merge_root + "baseline"), merged_sha)
+            merge_candidate = snapshot(source, output_path(merge_root + "current"), merged_sha)
+            if not checks:
+                checks = detect(merge_baseline)["checks"]
+            merge_result = runtime.evaluator.evaluate(
+                merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
+                effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[])
+        merge_record = {"sha": merged_sha,
+                        "state": {"pass": "verified", "fail": "regressed"}.get(
+                            merge_result["decision"], "insufficient_evidence"),
+                        "checked_at": now, "decision": merge_result.get("decision")}
+    if head == merged_sha:
+        if merge_result is not None:
+            result = merge_result
+        else:
+            baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
+            current_tree = snapshot(source, output_path("current"), head)
+            if not checks:
+                checks = detect(baseline_tree)["checks"]
+            result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
+                                                effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
+                                                changed_files=[])
+    elif reused is not None:
+        result = reused
+    else:
+        baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
+        current_tree = snapshot(source, output_path("current"), head)
+        if not checks:
+            checks = detect(baseline_tree)["checks"]
+        # A clean snapshot has no working-tree diff, so compare the two committed SHAs
+        # explicitly; otherwise changed tests/harness in the later mainline are hidden.
+        try:
+            committed = committed_changes(source, merged_sha, head)
+        except (RuntimeError, OSError, ValueError):
+            # Unreadable or non-repository history cannot prove which files changed.
+            # Fall back to the evaluator's own diff instead of claiming an empty set,
+            # which would let frozen regression evidence be reused.
+            committed = None
+        result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
+                                            effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
+                                            changed_files=committed)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
-    outcome["feedback"] = {"state": state,
-                           "head": head, "checked_at": now, "evaluation": result,
-                           "attribution": failure_attribution(outcome["merged_sha"], head, result)}
+    outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
+                           "attribution": failure_attribution(merged_sha, head, result)}
+    if merge_record is not None:
+        outcome["feedback"]["merge"] = merge_record
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
         outcome["feedback"]["investigation_pending"] = True
     runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))

@@ -58,7 +58,7 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.runtime.configure({"github": {"repository": "example/project"}, "delivery": {"mode": "pr", "release": self.policy}}, self.project)
         task = self.runtime.goal(self.project, "Verified change")
         self.run = self.runtime.store.claim(self.project, self.runtime.config(self.project))
-        self.runtime.store.transition(self.run["id"], "merged", {"merged_sha": MERGED, "feedback": {"state": "verified"}}, True)
+        self.runtime.store.transition(self.run["id"], "merged", {"merged_sha": MERGED, "feedback": {"state": "verified", "head": MERGED}}, True)
         self.run = self.runtime.store.one("SELECT * FROM runs WHERE id=?", (self.run["id"],))
         self.runtime.store.put_setting("delivery:" + self.run["id"], {"repository": "example/project", "branch": "main", "head": "evaluated", "base": "baseline"})
         self.commands = []
@@ -110,7 +110,7 @@ class ReleaseAutomationTest(unittest.TestCase):
         raise AssertionError(endpoint)
 
     def tick(self):
-        return advance(self.runtime, self.runtime.project(self.project), self.run, {"merged_sha": MERGED, "feedback": {"state": "verified"}})
+        return advance(self.runtime, self.runtime.project(self.project), self.run, {"merged_sha": MERGED, "feedback": {"state": "verified", "head": MERGED}})
 
     def remote_run(self, data, state="completed", conclusion="success", attempt=1):
         return {"id": 17, "head_sha": TRUSTED, "display_title": data["operation_id"], "event": "workflow_dispatch",
@@ -290,6 +290,31 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertFalse(pending(self.runtime, self.run))
             retry(self.runtime, self.project, self.run["id"], "deploy")
             self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 2)
+
+    def test_rollback_retry_uses_known_healthy_receipt_instead_of_merge_verification(self):
+        from adaptive_rsi.release import save
+        self.setup_deployment(rollback=True)
+        result = json.loads(self.run["result"])
+        result["feedback"] = {"state": "regressed", "head": "d" * 40}
+        self.runtime.store.execute("UPDATE runs SET result=? WHERE id=?",
+                                   (encode(result), self.run["id"]))
+        self.run["result"] = encode(result)
+        rollback = {"sha": PREVIOUS, "operation_id": "rsi-operation-rollback",
+                    "state": "failed", "workflow_run_id": 17, "attempt": 1,
+                    "repository": "example/project", "workflow": self.policy["workflow"],
+                    "ref": self.policy["ref"], "workflow_sha": TRUSTED}
+        data = {"state": "rollback_failed", "operation_id": "rsi-operation", "sha": MERGED,
+                "repository": "example/project", "workflow": self.policy["workflow"],
+                "ref": self.policy["ref"], "workflow_sha": TRUSTED,
+                "rollback_target": {"sha": PREVIOUS, "run": "previous-run",
+                                    "health": {"healthy": True}},
+                "rollback": rollback}
+        save(self.runtime, self.run, "deploy", data)
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            self.remote = self.remote_run(rollback, conclusion="failure")
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["rollback"]["state"], "rerunning")
+        self.assertTrue(any(item[0].endswith("/rerun") for item in self.commands))
 
     def test_authorization_is_not_inherited_or_granted_by_task_overrides(self):
         with self.assertRaisesRegex(ValueError, "per project"):

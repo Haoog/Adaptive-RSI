@@ -615,9 +615,10 @@ Path(%r).write_text('allowed output')
         self.runtime.request(self.project, "evolve")
         run = self.store.claim(self.project, self.runtime.config(self.project))
         self.runtime.process(run)
-        candidates = self.store.query("SELECT * FROM candidates")
-        self.assertEqual(candidates[0]["status"], "insufficient_evidence")
+        self.assertEqual(self.store.query("SELECT * FROM candidates"), [])
         self.assertEqual(self.runtime.active_strategies(self.project), [])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"],
+                         "insufficient_evidence")
 
     def test_exhausted_holdout_exposure_gets_an_actionable_reason(self):
         self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 3,
@@ -631,10 +632,29 @@ Path(%r).write_text('allowed output')
         result = Evolution(self.runtime).propose_and_evaluate(
             project, self.root / "workspace", self.root / "experiments",
             {"id": "exhausted-run", "config": encode(self.runtime.config(self.project))})
-        reason = "Validation or holdout exposure limit reached; import new cases or raise evolution.max_holdout_uses"
-        self.assertEqual(result["reason"], reason)
         self.assertEqual(result["status"], "insufficient_evidence")
-        self.assertEqual(json.loads(self.store.one("SELECT evidence FROM candidates")["evidence"])["reason"], reason)
+        self.assertIn("fresh", result["reason"].lower())
+        self.assertIn("import", result["reason"].lower())
+        self.assertEqual(self.store.query("SELECT * FROM candidates"), [])
+        self.assertEqual(self.runtime.agent.roles, [])
+        self.assertEqual(self.store.query("SELECT * FROM calls"), [])
+
+    def test_evolution_requires_fresh_holdout_before_paid_proposal(self):
+        self.runtime.configure({"evolution": {"enabled": True, "min_cases_per_split": 1,
+                                              "max_holdout_uses": 3}}, self.project)
+        for split, uses in (("validation", 0), ("holdout", 1)):
+            spec = {"task": split + " task", "base": git(self.repo, "rev-parse", "HEAD"), "checks": CHECKS,
+                    "source": "real", "signature": split, "repository": str(self.repo), "overlay": None}
+            self.store.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?)",
+                               (split, self.project, split, split, encode(spec), uses, time.time()))
+        result = Evolution(self.runtime).propose_and_evaluate(
+            self.runtime.project(self.project), self.repo, self.root / "experiments",
+            {"id": "fresh-run", "config": encode(self.runtime.config(self.project))})
+        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertIn("fresh", result["reason"].lower())
+        self.assertEqual(self.runtime.agent.roles, [])
+        self.assertEqual(self.store.query("SELECT * FROM calls"), [])
+        self.assertEqual(self.store.query("SELECT * FROM candidates"), [])
 
     def test_case_families_cannot_leak_between_splits(self):
         manifest = {"family": "addition", "split": "validation", "repository": str(self.repo), "base": "HEAD",
@@ -918,6 +938,20 @@ Path(%r).write_text('allowed output')
         self.assertNotIn("Protected multiply acceptance task", proposal_prompts[0])
         self.assertEqual(len(json.loads(candidates[0]["evidence"])["trials"]), 12)
         self.assertEqual(len(self.runtime.memories(self.project, "add")), 1)
+        # Promotion requires previously unused holdout cases; importing fresh ones
+        # re-arms a second experiment without weakening the freshness contract.
+        for name, expression, expected in [("subtract", "a - b", "-1"), ("divide", "a / b", "2 / 3"),
+                                           ("maximum", "max(a, b)", "3")]:
+            repo = fixture(self.root / ("fresh-" + name))
+            (repo / "calculator.py").write_text("def " + name + "(a, b):\n    return " + expression + "\n")
+            (repo / "tests/test_calculator.py").write_text("import unittest\nfrom calculator import " + name +
+                "\nclass Regression(unittest.TestCase):\n    def test_operation(self):\n        self.assertEqual(" +
+                name + "(2, 3), " + expected + ")\n")
+            git(repo, "add", ".")
+            git(repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "fresh " + name)
+            Evolution(self.runtime).import_case(self.project, {"family": "fresh-" + name, "split": "holdout",
+                "repository": str(repo), "base": "HEAD", "task": "Fresh " + name,
+                "checks": CHECKS, "source": "synthetic"})
         self.runtime.agent.reject_reviews = True
         self.runtime.request(self.project, "evolve")
         rejected_run = self.store.claim(self.project, self.runtime.config(self.project))

@@ -556,6 +556,119 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
     return data
 
 
+def _feedback_layers(feedback):
+    """Walk restore/missing-artifact wrappers without hiding older evidence."""
+    while isinstance(feedback, dict):
+        yield feedback
+        feedback = feedback.get("previous")
+
+
+def feedback_target_status(outcome, target_sha):
+    """Return ``(eligible, legacy)`` for one exact publication target.
+
+    New receipts carry an independent merge record created by delivery
+    post-merge tracking. Historical receipts are accepted only when their
+    recorded head is the same commit; a verified receipt without any head is
+    reported as legacy so the caller can pin it locally at publication time.
+    """
+    if not isinstance(outcome, dict) or not target_sha:
+        return False, False
+    feedback = outcome.get("feedback")
+    if not isinstance(feedback, dict):
+        return False, False
+    verified = False
+    for layer in _feedback_layers(feedback):
+        merge = layer.get("merge")
+        if isinstance(merge, dict) and merge.get("sha"):
+            return merge.get("sha") == target_sha and merge.get("state") == "verified", False
+        head = layer.get("head")
+        if isinstance(head, str) and head:
+            return layer.get("state") == "verified" and head == target_sha, False
+        verified = verified or layer.get("state") == "verified"
+    # A verified receipt without a recorded head never qualifies on its own.
+    return False, bool(verified and target_sha == outcome.get("merged_sha"))
+
+
+def _pin_legacy_feedback(runtime, run, outcome, target_sha):
+    """Pin a historical verified receipt to the exact merge being published.
+
+    This runs immediately before the first publication write. It performs only
+    a deterministic local check against the persisted run and delivery receipt;
+    it never calls a model or writes to a remote service.
+    """
+    feedback = outcome.get("feedback")
+    if not isinstance(feedback, dict):
+        return False
+    target_layer = None
+    for layer in _feedback_layers(feedback):
+        if isinstance(layer.get("merge"), dict) and layer["merge"].get("sha"):
+            return False
+        if layer.get("state") == "regressed":
+            return False
+        if layer.get("state") == "verified" and not layer.get("head"):
+            target_layer = layer
+            break
+    if target_layer is None:
+        return False
+    if (not re.fullmatch(r"[a-f0-9]{40}", target_sha or "") or
+            target_sha != outcome.get("merged_sha") or run.get("state") != "merged"):
+        return False
+    receipt = runtime.store.setting("delivery:" + run["id"])
+    try:
+        repository = json.loads(run["config"])["github"]["repository"]
+    except (TypeError, ValueError, KeyError):
+        return False
+    if not isinstance(receipt, dict) or not repository or receipt.get("repository") != repository:
+        return False
+    import tempfile
+    from .adapters import detect
+    from .gitops import snapshot
+    from .storage_tools import run_artifact_path
+    config = json.loads(run["config"])
+    try:
+        source = runtime.project(run["project"])["path"]
+        with tempfile.TemporaryDirectory(prefix="legacy-release-", dir=runtime.store.root) as folder:
+            folder = Path(folder)
+            baseline = snapshot(source, folder / "baseline", target_sha)
+            candidate = snapshot(source, folder / "candidate", target_sha)
+            checks = config["checks"] or detect(baseline)["checks"]
+            seeds = run_artifact_path(runtime.store, run, "dependencies") if config["environment"]["seed_paths"] else None
+            evaluation = runtime.evaluator.evaluate(baseline, candidate, checks, folder / "evaluation", config,
+                                                    seeds=seeds, changed_files=[])
+            if evaluation.get("decision") != "pass":
+                return False
+    except (ValueError, OSError, RuntimeError):
+        return False
+    target_layer["head"] = target_sha
+    target_layer["head_pinned"] = {"at": time.time(), "basis": "exact_target_fixed_checks", "evaluation": evaluation}
+    runtime.store.execute("UPDATE runs SET result=? WHERE id=? AND project=?",
+                          (encode(outcome), run["id"], run["project"]))
+    return True
+
+
+def _rollback_retry_allowed(data, rollback):
+    """Preserve the known-healthy rollback contract instead of reusing merge evidence."""
+    sha = rollback.get("sha")
+    if not re.fullmatch(r"[a-f0-9]{40}", sha or ""):
+        return False
+    known = data.get("rollback_target")
+    if known is None:
+        # Legacy receipts may only rerun a workflow already dispatched from the
+        # known-healthy target; they can never authorize a fresh rollback dispatch.
+        return bool(rollback.get("workflow_run_id"))
+    return isinstance(known, dict) and known.get("sha") == sha
+
+
+def _retry_target_allowed(runtime, run, outcome, data, target):
+    """Apply exact-target qualification, or the known-healthy rollback contract."""
+    if target is not data:
+        return _rollback_retry_allowed(data, target)
+    eligible, legacy = feedback_target_status(outcome, target.get("sha"))
+    if legacy:
+        return _pin_legacy_feedback(runtime, run, outcome, target.get("sha"))
+    return eligible
+
+
 def advance(runtime, project, run, outcome, cancel=None):
     if not re.fullmatch(r"[a-f0-9]{40}", outcome.get("merged_sha", "")):
         return {}
@@ -579,15 +692,20 @@ def advance(runtime, project, run, outcome, cancel=None):
             if not isinstance(feedback, dict):
                 # A malformed historical receipt cannot prove verification.
                 feedback = {}
-            verified = feedback.get("state") == "verified"
-            # A later mainline commit passing its own checks cannot certify the merge
-            # commit that will actually be built and released. Older verified receipts
-            # without a head are treated as referring to the merge commit itself.
-            covers_dispatch = feedback.get("head", outcome.get("merged_sha")) == outcome.get("merged_sha")
-            if (not data or data.get("state") in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}) and not (verified and covers_dispatch):
+            waiting = (not data or data.get("state") in {"pending", "blocked", "waiting_verification",
+                                                         "blocked_verification", "waiting_target", "waiting_release"})
+            # Qualification is bound to the exact commit that will be dispatched.
+            # A later mainline pass cannot authorize this merge, and a legacy
+            # verified receipt without a head is pinned locally only here, right
+            # before a real publication attempt.
+            target_sha = data.get("sha") if isinstance(data, dict) and data.get("sha") else outcome["merged_sha"]
+            eligible, legacy = feedback_target_status(outcome, target_sha)
+            if waiting and legacy:
+                eligible = _pin_legacy_feedback(runtime, run, outcome, target_sha)
+            if waiting and not eligible:
                 state = "waiting_verification" if not feedback else "blocked_verification"
                 error = ("Post-merge verification covers a later mainline commit, not the merge commit to release"
-                         if verified and not covers_dispatch else
+                         if isinstance(feedback.get("head"), str) and feedback["head"] != outcome["merged_sha"] else
                          "Post-merge verification must pass before release/deploy")
                 data = {"state": state, "error": error}
                 result[kind] = persist(runtime, run, kind, data)
@@ -703,14 +821,20 @@ def retry(runtime, project_id, run_id, kind):
             owner = deployment_owner(runtime, project_id, repo, policy)
             if owner and owner["run"] != run_id:
                 raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
-        if verified_feedback(run).get("state") != "verified":
-            raise ValueError("Post-merge verification must pass before retrying delivery")
         data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
+        try:
+            outcome = json.loads(run["result"] or "{}")
+        except (TypeError, ValueError):
+            outcome = {}
+        if not isinstance(outcome, dict):
+            outcome = {}
         if kind == "deploy" and data.get("state") == "health_failed":
+            if not _retry_target_allowed(runtime, run, outcome, data, data):
+                raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
             expected_health = encode(data)
             data.update(state="workflow_succeeded", error="", health_attempts=0)
             for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate"):
@@ -741,10 +865,14 @@ def retry(runtime, project_id, run_id, kind):
                     rollback.get("state") in {"rerunning", "rerun_unknown"})):
             target = rollback
             if target.get("state") == "workflow_succeeded":
+                if not _retry_target_allowed(runtime, run, outcome, data, target):
+                    raise ValueError("Rollback retry requires known healthy target evidence")
                 data.update(state="rolling_back", error="")
                 persist_retry()
                 runtime.wake.set()
                 return data
+        if not _retry_target_allowed(runtime, run, outcome, data, target):
+            raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
         if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
                 not target.get("workflow_run_id")):
             validate_pin(repo, policy)

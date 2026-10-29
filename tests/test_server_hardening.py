@@ -37,6 +37,7 @@ class ServerHardeningTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(3)
+        self.store.close()
         self.temp.cleanup()
 
     def request(self, path="/api/health", method="GET", body=None, authenticated=True, headers=None):
@@ -302,7 +303,7 @@ class ServerHardeningTest(unittest.TestCase):
 
     def test_stopping_task_errors_retain_actionable_guidance(self):
         message = "Wait for the active run to finish stopping before retrying or supplementing this task"
-        def stopping(*args):
+        def stopping(*args, **kwargs):
             raise ValueError(message)
         self.runtime.retry = stopping
         status, _, body = self.request("/api/retry", "POST", {"task": "stopping-task"})

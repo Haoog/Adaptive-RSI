@@ -74,6 +74,46 @@ async function main(){
     await scopePage.close();
   }
 
+  const receiptPage = await browser.newPage();
+  receiptPage.on('pageerror', error => errors.push(error.message));
+  await receiptPage.addInitScript(() => {
+    window.__receiptBlobs = [];
+    window.__receiptCalls = [];
+    const create = URL.createObjectURL.bind(URL);
+    URL.createObjectURL = blob => { window.__receiptBlobs.push(blob); return create(blob); };
+    window.RSIDesktop = {
+      ready: Promise.resolve({kind: 'local', owned: true}),
+      invoke: async (command, args) => {
+        window.__receiptCalls.push(args || {});
+        if (args && args.action === 'receipt') {
+          return {available: true, receipt: {
+            receipt_version: 1, operation_id: 'fixture-operation', from_version: '0.5.126',
+            to_version: '0.5.127', artifact_sha256: 'a'.repeat(64), signature_sha256: 'b'.repeat(64),
+            signature_verified: true, state: 'succeeded', error_code: null,
+          }};
+        }
+        return {state: 'ready', current_version: '0.5.126', version: '0.5.127', authorization_revision: 1};
+      },
+    };
+  });
+  await receiptPage.goto(url);
+  // The update panel lives in the collapsed advanced section of the settings view.
+  await receiptPage.waitForFunction(() => Boolean(state));
+  await receiptPage.evaluate(() => { showView('settings'); document.getElementById('advanced-settings').open = true; });
+  await receiptPage.locator('#view-settings').waitFor({state: 'visible'});
+  await receiptPage.locator('#native-update-panel').getByRole('button', {name: '导出升级回执'}).click();
+  await receiptPage.waitForFunction(() => window.__receiptBlobs.length > 0);
+  const upgradeReceipt = await receiptPage.evaluate(async () => {
+    const text = await window.__receiptBlobs[0].text();
+    return {receipt: JSON.parse(text), calls: window.__receiptCalls.filter(args => args.action === 'receipt')};
+  });
+  assert.equal(upgradeReceipt.calls.length, 1, 'the receipt button must read the persisted transaction');
+  assert.equal(upgradeReceipt.receipt.receipt_version, 2);
+  assert.equal(upgradeReceipt.receipt.transaction.operation_id, 'fixture-operation');
+  assert.equal(upgradeReceipt.receipt.transaction.state, 'succeeded');
+  assert.equal(upgradeReceipt.receipt.transaction_error, null);
+  await receiptPage.close();
+
   const shutdown=await page.evaluate(async()=>{
    const original=window.fetch;let polls=0;
    window.fetch=async(url,options)=>{if(url==='/api/shutdown-status'){polls++;return new Response(JSON.stringify(polls===1?{phase:'workers',remaining_workers:2,remaining_operations:1}:{phase:'completed',remaining_workers:0,remaining_operations:0}),{status:200});}return original(url,options);};

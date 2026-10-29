@@ -100,7 +100,9 @@ class DependencyDAGTest(unittest.TestCase):
             db.execute('CREATE TABLE task_dependencies(task TEXT PRIMARY KEY,dependency TEXT)')
             db.execute('INSERT INTO task_dependencies VALUES (?,?)', (self.tasks[0], self.tasks[1]))
             db.execute('CREATE INDEX task_dependencies_dependency ON task_dependencies(dependency)')
-            db.execute('DELETE FROM schema_migrations WHERE version=6')
+            db.execute('DELETE FROM schema_migrations WHERE version>=6')
+            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
+                db.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
         reopened = Store(self.store.root)
         try:
@@ -117,7 +119,9 @@ class DependencyDAGTest(unittest.TestCase):
             db.execute('CREATE TABLE task_dependencies(task TEXT PRIMARY KEY,dependency TEXT)')
             db.execute('INSERT INTO task_dependencies VALUES (?,?)', (self.tasks[0], self.tasks[0]))
             db.execute('CREATE INDEX task_dependencies_dependency ON task_dependencies(dependency)')
-            db.execute('DELETE FROM schema_migrations WHERE version=6')
+            db.execute('DELETE FROM schema_migrations WHERE version>=6')
+            for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
+                db.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
         with self.assertRaises(sqlite3.IntegrityError):
             Store(self.store.root)

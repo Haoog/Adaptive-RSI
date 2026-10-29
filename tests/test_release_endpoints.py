@@ -240,7 +240,7 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                 config["delivery"].update(mode="pr", **{kind: policy})
                 config["github"]["repository"] = "example/project"
                 run = {"id": "run", "project": "project", "config": encode(config), "state": "merged",
-                       "result": encode({"merged_sha": "b" * 40, "feedback": {"state": "verified"}})}
+                       "result": encode({"merged_sha": "b" * 40, "feedback": {"state": "verified", "head": "b" * 40}})}
                 operation = {"state": "running", "repository": "example/project", "workflow": policy["workflow"],
                              "ref": "trusted", "workflow_sha": "a" * 40, "sha": "b" * 40,
                              "operation_id": "operation", "workflow_run_id": 17, "attempt": 1}
@@ -249,6 +249,8 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                 store.execute("INSERT INTO runs(id,project,state,config,result) VALUES (?,?,?,?,?)",
                               (run["id"], run["project"], run["state"], run["config"], run["result"]))
                 store.put_setting(release.key("run", kind), operation)
+                store.put_setting("delivery:run", {"head": "b" * 40, "base": "c" * 40,
+                                                   "branch": "main", "repository": "example/project"})
                 from types import SimpleNamespace
                 operation_lock = threading.RLock()
                 runtime = SimpleNamespace(store=store, dispatch_lock=threading.RLock(), stop=threading.Event(),

@@ -1,11 +1,13 @@
 """Offline contract regressions; these do not prove live GitHub acceptance."""
 import copy
 import json
+import time
 import unittest
 from unittest.mock import patch
 
 from adaptive_rsi import delivery, readiness, release
 from adaptive_rsi.config import DEFAULTS
+import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
 from adaptive_rsi.gitops import git
 
@@ -192,6 +194,315 @@ class AuthorizationReceiptTest(unittest.TestCase):
         self.assertEqual(result['reconciliation']['candidate_run_ids'], [1, 2])
         self.assertEqual(result['reconciliation']['state'], 'manual_inspection_required')
         command.assert_called_once()
+
+    def test_later_mainline_regression_does_not_block_release_of_verified_merge(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            outcome = {'merged_sha': MERGED, 'feedback': {
+                'state': 'regressed', 'head': 'd' * 40,
+                'merge': {'sha': MERGED, 'state': 'verified', 'checked_at': 1, 'decision': 'pass'}}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
+            self.assertEqual(data['release']['state'], 'submitted')
+            dispatch = [item for item in case.commands if '/dispatches' in item[0]]
+            self.assertEqual(len(dispatch), 1)
+            self.assertEqual(dispatch[0][2]['inputs[rsi_sha]'], MERGED)
+        finally:
+            case.tearDown()
+
+    def test_legacy_verified_receipt_without_head_is_locally_pinned_before_dispatch(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            (case.repo / 'calculator.py').write_text('def add(a,b):\n    return a+b\n')
+            git(case.repo, 'add', '.')
+            git(case.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost', 'commit', '-qm', 'fixed')
+            target = git(case.repo, 'rev-parse', 'HEAD')
+            outcome = {'merged_sha': target, 'feedback': {'state': 'verified'}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
+            self.assertEqual(data['release']['state'], 'submitted')
+            stored = json.loads(case.runtime.store.one('SELECT result FROM runs WHERE id=?',
+                                                        (case.run['id'],))['result'])
+            self.assertEqual(stored['feedback']['head'], target)
+            self.assertEqual(stored['feedback']['head_pinned']['basis'],
+                             'exact_target_fixed_checks')
+            self.assertEqual(stored['feedback']['head_pinned']['evaluation']['decision'], 'pass')
+            self.assertFalse(release.feedback_target_status(
+                {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}, MERGED)[0])
+            self.assertFalse(release.feedback_target_status(
+                {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}, 'c' * 40)[0])
+        finally:
+            case.tearDown()
+
+    def test_legacy_receipt_failing_exact_target_checks_has_no_remote_writes(self):
+        from tests.test_release import ReleaseAutomationTest
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            target = git(case.repo, 'rev-parse', 'HEAD')
+            outcome = {'merged_sha': target, 'feedback': {'state': 'verified'}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
+            self.assertEqual(data['release']['state'], 'blocked_verification')
+            self.assertNotIn('head', outcome['feedback'])
+            self.assertFalse(any(method != 'GET' for _, method, _ in case.commands))
+        finally:
+            case.tearDown()
+
+    def test_retry_rejects_verified_feedback_for_a_different_target(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED, TRUSTED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            result = json.loads(case.run['result'])
+            result['feedback'] = {'state': 'verified', 'head': 'd' * 40}
+            case.runtime.store.execute('UPDATE runs SET result=? WHERE id=?',
+                                       (json.dumps(result), case.run['id']))
+            case.runtime.store.put_setting(release.key(case.run['id'], 'release'), {
+                'state': 'failed', 'operation_id': 'rsi-operation', 'sha': MERGED,
+                'workflow_run_id': 17, 'attempt': 1, 'repository': 'example/project',
+                'workflow': case.policy['workflow'], 'workflow_sha': TRUSTED,
+                'ref': case.policy['ref']})
+            with patch.object(release, 'api', side_effect=case.api):
+                with self.assertRaisesRegex(ValueError, 'exact target'):
+                    release.retry(case.runtime, case.project, case.run['id'], 'release')
+            self.assertFalse(any(endpoint.endswith('/rerun') for endpoint, _, _ in case.commands))
+            self.assertFalse(any('/dispatches' in endpoint for endpoint, _, _ in case.commands))
+        finally:
+            case.tearDown()
+
+    def test_advance_checks_persisted_dispatch_target_not_only_merge_sha(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED, TRUSTED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            other = 'c' * 40
+            case.runtime.store.put_setting(release.key(case.run['id'], 'release'), {
+                'state': 'pending', 'operation_id': 'rsi-stale', 'sha': other,
+                'repository': 'example/project', 'workflow': case.policy['workflow'],
+                'ref': case.policy['ref'], 'workflow_sha': TRUSTED})
+            outcome = {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project),
+                                       case.run, outcome)
+            self.assertEqual(data['release']['state'], 'blocked_verification')
+            self.assertFalse(any('/dispatches' in endpoint for endpoint, _, _ in case.commands))
+        finally:
+            case.tearDown()
+
+    def test_legacy_verified_receipt_without_local_evidence_stays_blocked(self):
+        from tests.test_release import ReleaseAutomationTest, MERGED
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            case.runtime.store.execute("DELETE FROM settings WHERE key='delivery:' || ?",
+                                       (case.run['id'],))
+            outcome = {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}
+            with patch.object(release, 'api', side_effect=case.api):
+                data = release.advance(case.runtime, case.runtime.project(case.project),
+                                       case.run, outcome)
+            self.assertEqual(data['release']['state'], 'blocked_verification')
+            self.assertFalse(any('/dispatches' in endpoint for endpoint, _, _ in case.commands))
+        finally:
+            case.tearDown()
+
+    def test_missing_artifact_wrapper_does_not_hide_verified_merge_evidence(self):
+        from tests.test_release import MERGED
+        outcome = {'merged_sha': MERGED, 'feedback': {
+            'state': 'insufficient_evidence', 'reason': 'missing artifacts',
+            'previous': {'state': 'verified', 'head': MERGED,
+                         'merge': {'sha': MERGED, 'state': 'verified'}}}}
+        self.assertTrue(release.feedback_target_status(outcome, MERGED)[0])
+        later = {'merged_sha': MERGED, 'feedback': {
+            'state': 'insufficient_evidence', 'reason': 'missing artifacts',
+            'previous': {'state': 'verified', 'head': 'd' * 40,
+                         'merge': {'sha': MERGED, 'state': 'verified'}}}}
+        self.assertTrue(release.feedback_target_status(later, MERGED)[0])
+
+
+class PostmergeReleaseEvidenceTest(unittest.TestCase):
+    setUp = delivery_tests.DeliveryLoopTest.setUp
+    tearDown = delivery_tests.DeliveryLoopTest.tearDown
+    tracked_pr = delivery_tests.DeliveryLoopTest.tracked_pr
+
+    def test_merge_release_evidence_survives_later_mainline_regression(self):
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / 'runs' / run['id']
+        directory.mkdir(parents=True)
+        run['path'] = str(directory)
+        merged = git(self.repo, 'rev-parse', 'HEAD')
+        outcome = {'merged_sha': merged, 'merged_at': time.time()}
+        self.runtime.configure({'delivery': {'feedback_minutes': 5},
+                                'github': {'repository': 'example/project'}}, self.project)
+        passing = {'decision': 'pass', 'checks': {'candidate': [{'passed': True}]}}
+        failing = {'decision': 'fail', 'checks': {'baseline': [{'passed': True}],
+                                                  'candidate': [{'passed': False}]}}
+        now = time.time()
+        with patch('adaptive_rsi.delivery.baseline', return_value=(str(self.repo), merged, 'main')), \
+                patch.object(self.runtime.evaluator, 'evaluate',
+                             side_effect=[passing, failing]) as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), now)
+            self.assertEqual(outcome['feedback']['merge'], {
+                'sha': merged, 'state': 'verified', 'checked_at': now, 'decision': 'pass'})
+            self.assertEqual(outcome['feedback']['state'], 'verified')
+            (self.repo / 'calculator.py').write_text('def add(a,b):\n    return a-b\n')
+            git(self.repo, 'add', '.')
+            git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost',
+                'commit', '-qm', 'later mainline')
+            later = git(self.repo, 'rev-parse', 'HEAD')
+            with patch('adaptive_rsi.delivery.baseline', return_value=(str(self.repo), later, 'main')):
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                         self.runtime.config(self.project), now + 301)
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(outcome['feedback']['state'], 'regressed')
+        self.assertEqual(outcome['feedback']['head'], later)
+        self.assertEqual(outcome['feedback']['merge']['sha'], merged)
+        self.assertEqual(outcome['feedback']['merge']['state'], 'verified')
+
+    def test_legacy_receipt_with_recorded_head_gains_exact_merge_evidence(self):
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / 'runs' / run['id']
+        directory.mkdir(parents=True)
+        run['path'] = str(directory)
+        merged = git(self.repo, 'rev-parse', 'HEAD')
+        (self.repo / 'calculator.py').write_text('def add(a,b):\n    return a+b\n')
+        git(self.repo, 'add', '.')
+        git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost',
+            'commit', '-qm', 'later mainline')
+        later = git(self.repo, 'rev-parse', 'HEAD')
+        self.runtime.configure({'delivery': {'feedback_minutes': 5},
+                                'github': {'repository': 'example/project'}}, self.project)
+        passing = {'decision': 'pass', 'checks': {'candidate': [{'passed': True}]}}
+        now = time.time()
+        # Historical receipt: it already recorded a later mainline head and has no
+        # independent record for the merge commit that release must publish.
+        outcome = {'merged_sha': merged, 'merged_at': now - 600,
+                   'feedback': {'state': 'verified', 'head': later, 'checked_at': now - 600,
+                                'evaluation': passing}}
+        with patch('adaptive_rsi.delivery.baseline', return_value=(str(self.repo), later, 'main')), \
+                patch.object(self.runtime.evaluator, 'evaluate', return_value=passing) as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), now)
+        # Only the merge commit is re-read; the later mainline delta stays reused.
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(outcome['feedback']['head'], later)
+        self.assertEqual(outcome['feedback']['merge'], {
+            'sha': merged, 'state': 'verified', 'checked_at': now, 'decision': 'pass'})
+        self.assertTrue(release.feedback_target_status(outcome, merged)[0])
+        self.assertFalse(release.feedback_target_status(outcome, later)[0])
+        stored = json.loads(self.store.one('SELECT result FROM runs WHERE id=?',
+                                           (run['id'],))['result'])
+        self.assertEqual(stored['feedback']['merge']['sha'], merged)
+
+    def test_transient_merge_evidence_is_reverified_instead_of_staying_frozen(self):
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / 'runs' / run['id']
+        directory.mkdir(parents=True)
+        run['path'] = str(directory)
+        merged = git(self.repo, 'rev-parse', 'HEAD')
+        self.runtime.configure({'delivery': {'feedback_minutes': 5},
+                                'github': {'repository': 'example/project'}}, self.project)
+        passing = {'decision': 'pass', 'checks': {'candidate': [{'passed': True}]}}
+        failing = {'decision': 'fail', 'checks': {'baseline': [{'passed': True}],
+                                                  'candidate': [{'passed': False}]}}
+        unavailable = {'decision': 'insufficient_evidence', 'checks': {}}
+        now = time.time()
+        stale = now - 600
+        outcome = {'merged_sha': merged, 'merged_at': stale,
+                   'feedback': {'state': 'insufficient_evidence', 'head': merged,
+                                'checked_at': stale, 'evaluation': unavailable,
+                                'merge': {'sha': merged, 'state': 'insufficient_evidence',
+                                          'checked_at': stale,
+                                          'decision': 'insufficient_evidence'}}}
+        with patch('adaptive_rsi.delivery.baseline', return_value=(str(self.repo), merged, 'main')), \
+                patch.object(self.runtime.evaluator, 'evaluate',
+                             side_effect=[passing, failing]) as evaluate:
+            # A missing executable or artifact at the first poll must not freeze
+            # the run: the next poll re-evaluates the merge commit itself.
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), now)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertEqual(outcome['feedback']['merge']['state'], 'verified')
+            self.assertEqual(outcome['feedback']['state'], 'verified')
+            self.assertTrue(release.feedback_target_status(outcome, merged)[0])
+            (self.repo / 'calculator.py').write_text('def add(a,b):\n    return a-b\n')
+            git(self.repo, 'add', '.')
+            git(self.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost',
+                'commit', '-qm', 'later mainline')
+            later = git(self.repo, 'rev-parse', 'HEAD')
+            with patch('adaptive_rsi.delivery.baseline',
+                       return_value=(str(self.repo), later, 'main')):
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                         self.runtime.config(self.project), now + 601)
+        # The settled merge record is not re-evaluated; only the new delta is.
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(outcome['feedback']['head'], later)
+        self.assertEqual(outcome['feedback']['state'], 'regressed')
+        self.assertEqual(outcome['feedback']['merge']['state'], 'verified')
+        self.assertTrue(release.feedback_target_status(outcome, merged)[0])
+
+    def test_blocked_legacy_receipt_is_repairable_by_the_next_poll(self):
+        from tests.test_release import ReleaseAutomationTest
+        from adaptive_rsi.delivery import feedback
+        case = ReleaseAutomationTest()
+        case.setUp()
+        try:
+            (case.repo / 'calculator.py').write_text('def add(a,b):\n    return a+b\n')
+            git(case.repo, 'add', '.')
+            git(case.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost',
+                'commit', '-qm', 'merged')
+            merged = git(case.repo, 'rev-parse', 'HEAD')
+            (case.repo / 'notes.txt').write_text('later mainline\n')
+            git(case.repo, 'add', '.')
+            git(case.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost',
+                'commit', '-qm', 'later mainline')
+            later = git(case.repo, 'rev-parse', 'HEAD')
+            passing = {'decision': 'pass', 'checks': {'candidate': [{'passed': True}]}}
+            now = time.time()
+            outcome = {'merged_sha': merged, 'merged_at': now - 600,
+                       'feedback': {'state': 'verified', 'head': later, 'checked_at': now - 600,
+                                    'evaluation': passing}}
+            case.runtime.store.execute('UPDATE runs SET result=? WHERE id=?',
+                                       (json.dumps(outcome), case.run['id']))
+            with patch.object(release, 'api', side_effect=case.api):
+                blocked = release.advance(case.runtime, case.runtime.project(case.project),
+                                          case.run, outcome)
+            self.assertEqual(blocked['release']['state'], 'blocked_verification')
+            self.assertFalse(any('/dispatches' in endpoint for endpoint, _, _ in case.commands))
+            case.runtime.store.put_setting('run-baseline:' + case.run['id'],
+                                           {'repository': 'example/project', 'branch': 'main'})
+            directory = case.runtime.store.root / 'runs' / case.run['id']
+            directory.mkdir(parents=True)
+            run = case.runtime.store.one('SELECT * FROM runs WHERE id=?', (case.run['id'],))
+            run['path'] = str(directory)
+            case.runtime.configure({'delivery': {'feedback_minutes': 5},
+                                    'github': {'repository': 'example/project'}}, case.project)
+            with patch('adaptive_rsi.delivery.baseline',
+                       return_value=(str(case.repo), later, 'main')), \
+                    patch.object(case.runtime.evaluator, 'evaluate', return_value=passing):
+                feedback(case.runtime, case.runtime.project(case.project), run, outcome,
+                         case.runtime.config(case.project), now)
+            # The repaired receipt must survive a restart: reload it from the store.
+            stored = json.loads(case.runtime.store.one(
+                'SELECT result FROM runs WHERE id=?', (case.run['id'],))['result'])
+            self.assertEqual(stored['feedback']['merge']['sha'], merged)
+            with patch.object(release, 'api', side_effect=case.api):
+                repaired = release.advance(case.runtime, case.runtime.project(case.project),
+                                           case.run, stored)
+            self.assertEqual(repaired['release']['state'], 'submitted')
+            dispatch = [item for item in case.commands if '/dispatches' in item[0]]
+            self.assertEqual(len(dispatch), 1)
+            self.assertEqual(dispatch[0][2]['inputs[rsi_sha]'], merged)
+        finally:
+            case.tearDown()
 
 
 class RateLimitTest(unittest.TestCase):

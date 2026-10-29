@@ -1189,8 +1189,15 @@ window.RSIExperience = (() => {
       ["stage_reused", "阶段复用"],
       ["interventions", "用户介入次数"],
       ["stale_rework", "旧基线返工次数"],
+      ["postmerge_verified", "原合并版本验证通过"],
+      ["postmerge_regressed", "原合并版本出现回归"],
+      ["mainline_regressed", "后续主线出现回归"],
     ])
       box.append(el("p", t(label) + " · " + data[key]));
+    if(data.value_feedback){
+      for(const [key,label] of [['helpful','有帮助'],['unnecessary','没必要'],['false_positive','误报']])box.append(el('p',t(label)+' · '+data.value_feedback[key]));
+      box.append(el('p',t('未评价的运行')+' · '+data.unrated_runs+' · '+t('未评价不代表没有价值。'),'muted'));
+    }
     box.append(
       el(
         "p",

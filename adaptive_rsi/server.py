@@ -624,11 +624,11 @@ class Handler(BaseHTTPRequestHandler):
                             candidate["comparison"] = comparison(trials)
                         data["candidates"] = candidates
                     if include_analytics:
+                        from .task_feedback import dashboard_usage
                         data.update({
                             "cases": store.query("SELECT project,split,count(*) AS count,sum(uses) AS uses FROM cases GROUP BY project,split"),
                             "quality": quality_summary(store, selected),
-                            "usage": store.query("SELECT project,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project", (time.time() - 86400,)),
-                            "model_usage": store.query("SELECT project,provider,model,unit,count(*) AS calls,sum(tokens) AS tokens,sum(input_tokens) AS input_tokens,sum(output_tokens) AS output_tokens,sum(cache_read_tokens) AS cache_read_tokens,sum(cache_write_tokens) AS cache_write_tokens,sum(usage_known=0) AS unknown_usage,sum(seconds) AS seconds,sum(state='failed') AS failed,sum(CASE WHEN unit_price IS NOT NULL THEN tokens*unit_price/1000000 END) AS estimate,sum(unit_price IS NULL) AS unpriced FROM calls WHERE created>? GROUP BY project,provider,model,unit", (time.time() - 86400,))})
+                            **dashboard_usage(store)})
                     if not legacy:
                         data["sections"] = ["core", *sorted(requested - {"core"})]
                     self.respond(data)
@@ -703,6 +703,8 @@ class Handler(BaseHTTPRequestHandler):
                 run["config"] = decode_object(run["config"])
                 run["stages"] = store.query("SELECT stage,created,data FROM stages WHERE run=? ORDER BY created", (run["id"],))
                 run["phases"] = store.query("SELECT phase,started,ended FROM phase_times WHERE run=? ORDER BY id", (run["id"],))
+                from .task_feedback import summary as task_evidence_summary
+                run["evidence_summary"] = task_evidence_summary(store, run["id"])
                 for stage in run["stages"]:
                     stage["decision"] = decode_object(stage.pop("data")).get("decision")
                 self.respond(run)
@@ -921,6 +923,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/task/revise":
                     runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
                     result = {"saved": True}
+                elif path == "/api/task/value-feedback":
+                    from .task_feedback import save as save_value_feedback
+                    result = save_value_feedback(runtime.store, body.get("project"), body.get("task"),
+                                                 body.get("run"), body.get("rating"), body.get("note", ""))
                 elif path == "/api/tasks/batch":
                     from .batching import execute
                     result = execute(runtime, body.get("project"), body.get("tasks"), body.get("action"),
@@ -938,7 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                     runtime.pause(body["project"], body["paused"])
                     result = {"saved": True}
                 elif path == "/api/retry":
-                    runtime.retry(body["task"], body.get("reason"))
+                    runtime.retry(body["task"], body.get("reason"), force=body.get("force", False))
                     result = {"saved": True}
                 elif path == "/api/cancel":
                     result = runtime.cancel_task(body["task"], body.get("cascade", False), body.get("revision"), body.get("reason"))

@@ -295,3 +295,133 @@ fn transfer_deadlines_keep_their_previous_bounds() {
     assert_eq!(native_update::UPDATE_TOTAL_TIMEOUT, Duration::from_secs(600));
     assert_eq!(native_update::MAX_PACKAGE, 512 * 1024 * 1024);
 }
+
+#[test]
+fn authorization_revisions_only_move_forward_and_are_validated() {
+    use native_update::{Authorization, NativeUpdater};
+    assert_eq!(Authorization::parse(1, "sometimes", "patch", "any").unwrap_err(), "update_authorization_invalid");
+    assert_eq!(Authorization::parse(1, "download", "major", "any").unwrap_err(), "update_authorization_invalid");
+    assert_eq!(Authorization::parse(1, "download", "patch", "lunch").unwrap_err(), "update_authorization_invalid");
+    let updater = NativeUpdater::default();
+    assert_eq!(updater.authorization().revision, 0);
+    assert!(updater.authorize(Authorization::parse(1, "automatic", "minor", "night").unwrap()).unwrap());
+    assert_eq!(updater.authorization().window, "night");
+    // 重复或倒退的版本号来自并发/过期的前端调用，不能回滚已生效的授权。
+    assert!(!updater.authorize(Authorization::parse(1, "manual", "patch", "any").unwrap()).unwrap());
+    assert!(!updater.authorize(Authorization::parse(0, "manual", "patch", "any").unwrap()).unwrap());
+    assert_eq!(updater.authorization().policy, "automatic");
+    assert_eq!(updater.authorization().revision, 1);
+}
+
+#[test]
+fn superseding_a_waiting_install_revokes_it_without_cancelling_downloads() {
+    use native_update::{Authorization, NativeUpdater};
+    let updater = NativeUpdater::default();
+    updater.authorize(Authorization::parse(1, "automatic", "patch", "any").unwrap()).unwrap();
+    let waiting = updater.begin_waiting(1);
+    assert!(updater.require_authorization(1).is_ok());
+    assert!(updater.authorize(Authorization::parse(2, "download", "patch", "any").unwrap()).unwrap());
+    assert_eq!(updater.require_authorization(1).unwrap_err(), "update_authorization_changed");
+    // 撤销只针对旧的等待安装：正在进行的下载不因策略变化被中断。
+    assert!(!updater.cancelled());
+    drop(waiting);
+    let operation = updater.begin().unwrap();
+    assert!(updater.require_authorization(2).is_ok());
+    drop(operation);
+}
+
+#[test]
+fn install_is_bound_to_the_revision_it_was_approved_under() {
+    use native_update::{Authorization, NativeUpdater};
+    let updater = NativeUpdater::default();
+    updater.authorize(Authorization::parse(4, "download", "patch", "any").unwrap()).unwrap();
+    assert!(updater.require_authorization(4).is_ok());
+    assert_eq!(updater.require_authorization(3).unwrap_err(), "update_authorization_changed");
+    // 新操作开始时清除上一次撤销标记，但不会放宽版本比对。
+    let operation = updater.begin().unwrap();
+    updater.authorize(Authorization::parse(5, "automatic", "patch", "weekend").unwrap()).unwrap();
+    assert_eq!(updater.require_authorization(4).unwrap_err(), "update_authorization_changed");
+    assert!(updater.require_authorization(5).is_ok());
+    drop(operation);
+}
+
+/// The install contract comes from the stored authorization, never from the
+/// caller: a manual click may run in any window, an automatic install may not.
+#[test]
+fn install_needs_an_approved_revision_and_never_borrows_the_stored_one() {
+    use native_update::required_revision;
+    assert_eq!(required_revision(None).unwrap_err(), "update_authorization_invalid");
+    // Revision 0 is the "never authorized" default, so it is not an approval.
+    assert_eq!(required_revision(Some(0)).unwrap_err(), "update_authorization_invalid");
+    assert_eq!(required_revision(Some(3)).unwrap(), 3);
+}
+
+#[test]
+fn version_scope_admits_only_its_own_boundary() {
+    use native_update::scope_allows;
+    assert!(scope_allows("patch", "1.2.3", "1.2.4"));
+    assert!(!scope_allows("patch", "1.2.3", "1.3.0"));
+    assert!(scope_allows("minor", "1.2.3", "1.3.0"));
+    assert!(!scope_allows("minor", "1.2.3", "2.0.0"));
+    assert!(scope_allows("stable", "1.2.3", "2.0.0"));
+    // An equal, older or unparsable target is never an upgrade.
+    for target in ["1.2.3", "1.2.2", "1.2.4-beta", "bad"] {
+        assert!(!scope_allows("stable", "1.2.3", target), "{target}");
+    }
+    assert!(!scope_allows("major", "1.2.3", "2.0.0"));
+}
+
+#[test]
+fn automatic_install_uses_the_stored_policy_window_and_scope() {
+    use native_update::{install_permit, Authorization, InstallRequest};
+    let stored = Authorization::parse(3, "automatic", "patch", "night").unwrap();
+    let automatic = InstallRequest { revision: Some(3), automatic: true, window: "night",
+        current_version: "1.2.3", target_version: "1.2.4" };
+    let permit = install_permit(&stored, &automatic).unwrap();
+    assert_eq!((permit.revision, permit.window.as_str()), (3, "night"));
+    // The stored policy must really be automatic.
+    for policy in ["manual", "download"] {
+        let stored = Authorization::parse(3, policy, "patch", "night").unwrap();
+        assert_eq!(install_permit(&stored, &automatic).unwrap_err(), "update_authorization_changed");
+    }
+    // The caller may not present a window the user never stored.
+    let widened = InstallRequest { window: "any", ..automatic };
+    let narrowed = InstallRequest { window: "weekend", ..automatic };
+    assert_eq!(install_permit(&stored, &widened).unwrap_err(), "update_authorization_changed");
+    assert_eq!(install_permit(&stored, &narrowed).unwrap_err(), "update_authorization_changed");
+    // The staged target must sit inside the stored scope.
+    let minor = InstallRequest { target_version: "1.3.0", ..automatic };
+    assert_eq!(install_permit(&stored, &minor).unwrap_err(), "update_target_changed");
+    let stale = InstallRequest { revision: Some(2), ..automatic };
+    assert_eq!(install_permit(&stored, &stale).unwrap_err(), "update_authorization_changed");
+    // A stored minor/stable scope does admit the matching target.
+    let minor_stored = Authorization::parse(3, "automatic", "minor", "night").unwrap();
+    assert_eq!(install_permit(&minor_stored, &minor).unwrap().window, "night");
+}
+
+#[test]
+fn manual_install_overrides_the_window_but_still_needs_the_revision() {
+    use native_update::{install_permit, Authorization, InstallRequest};
+    let stored = Authorization::parse(4, "download", "patch", "weekend").unwrap();
+    let manual = InstallRequest { revision: Some(4), automatic: false, window: "any",
+        current_version: "1.2.3", target_version: "2.0.0" };
+    // An explicit click replaces now, outside the stored window and scope.
+    assert_eq!(install_permit(&stored, &manual).unwrap().window, "any");
+    let missing = InstallRequest { revision: None, ..manual };
+    assert_eq!(install_permit(&stored, &missing).unwrap_err(), "update_authorization_invalid");
+    let stale = InstallRequest { revision: Some(3), ..manual };
+    assert_eq!(install_permit(&stored, &stale).unwrap_err(), "update_authorization_changed");
+}
+
+#[test]
+fn changing_the_stored_authorization_stops_a_waiting_automatic_replacement() {
+    use native_update::{Authorization, InstallRequest, NativeUpdater};
+    let updater = NativeUpdater::default();
+    updater.authorize(Authorization::parse(1, "automatic", "patch", "night").unwrap()).unwrap();
+    let request = InstallRequest { revision: Some(1), automatic: true, window: "night",
+        current_version: "1.2.3", target_version: "1.2.4" };
+    assert_eq!(updater.require_install_permit(&request).unwrap().window, "night");
+    // Even a window-only change revokes: the stored window no longer matches.
+    updater.authorize(Authorization::parse(2, "automatic", "patch", "weekend").unwrap()).unwrap();
+    assert_eq!(updater.require_install_permit(&request).unwrap_err(), "update_authorization_changed");
+}

@@ -65,14 +65,19 @@ def save(runtime, run, stage, data, signature):
                           (run["id"], stage, signature, encode(data), time.time()))
 
 
-def cached(runtime, run, stage, signature):
+def cached(runtime, run, stage, signature, accept=None):
     row = runtime.store.one("SELECT s.data,s.run FROM stages s JOIN runs r ON s.run=r.id "
                             "WHERE r.task=? AND s.stage=? AND s.signature=? AND r.id<>? "
                             "ORDER BY s.created DESC LIMIT 1", (run["task"], stage, signature, run["id"]))
     if row:
+        data = json.loads(row["data"])
+        if accept is not None and not accept(data):
+            runtime.store.event("stage_invalidated", "Cached stage result requires rework", run["project"], run["id"],
+                                {"stage": stage, "reason": "result_requires_rework", "from_run": row["run"]})
+            return None
         runtime.store.event("stage_reused", "Reused verified stage inputs", run["project"], run["id"],
                             {"stage": stage, "from_run": row["run"]})
-        return json.loads(row["data"])
+        return data
     prior = runtime.store.one("SELECT s.run FROM stages s JOIN runs r ON r.id=s.run WHERE r.task=? AND s.stage=? AND r.id<>? ORDER BY s.created DESC LIMIT 1", (run["task"], stage, run["id"]))
     if prior:
         runtime.store.event("stage_invalidated", "Stage inputs changed; verification will run again", run["project"], run["id"],

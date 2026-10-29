@@ -39,6 +39,9 @@ BUDGET_WAIT_RETRIES = 3
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
 
+# 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度锁。
+POSTPROCESS_BATCH = 20
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -83,12 +86,18 @@ class Runtime(Maintenance):
         self._shutdown = {"phase": "running", "started": None, "ended": None}
         self._close_lock = threading.Lock()
         self._closed = False
+        # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
+        # 但从未启动的 run，也不会在关闭开始后继续领取新任务。
+        self._admission = threading.Lock()
+        self._closing = False
         self.stop = threading.Event()
         self.wake = threading.Event()
         self.thread = None
         self.lockfile = None
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi")
         self.futures = set()
+        self._futures_lock = threading.Lock()
+        self._future_runs = {}
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
         self._project_deadlines = {}
@@ -536,14 +545,18 @@ class Runtime(Maintenance):
         self.wake.set()
         return task
 
-    def retry(self, task, reason=None):
+    def retry(self, task, reason=None, force=False):
         from .task_lifecycle import intervention_reason
         intervention_reason(reason)
+        if type(force) is not bool:
+            raise ValueError("force must be a boolean")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE id=?", (task,)).fetchone()
             if db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (task,)).fetchone():
                 raise ValueError("Wait for the active run to finish stopping before retrying or supplementing this task")
+            if force and (not row or row["source"] != "system_evolve"):
+                raise ValueError("A forced retry is only available for evolution tasks")
             # 排队中的任务无论处于正常队列还是失败/额度退避期，都允许手动提前。
             scheduled_retry = row and row["state"] == "queued" and row["available"] > time.time()
             if not row or not scheduled_retry and row["state"] not in ["failed", "blocked", "waiting_budget", "interrupted", "cancelled", "insufficient_evidence", "deferred", "rejected", "expired", "obsolete"]:
@@ -557,11 +570,15 @@ class Runtime(Maintenance):
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
             db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (now, task))
+            if force:
+                # 明确的人工重试凭据：只被下一次实验读取一次，不能成为永久绕过去重的开关。
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("evolution-force:" + task, encode({"at": now, "reason": reason})))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'manual_retry','User requested fresh verification',?,?)",
                        (row["project"], encode({"task": task, "reason": reason,
                         "before": {"state": row["state"], "attempts": row["attempts"], "available": row["available"]},
-                        "after": {"state": "queued", "attempts": 0, "available": 0}}), now))
+                        "after": {"state": "queued", "attempts": 0, "available": 0}, "force": force}), now))
         self.wake.set()
 
     def revise_task(self, task, supplement, reason=None):
@@ -749,6 +766,8 @@ class Runtime(Maintenance):
                 self.store.execute("UPDATE projects SET paused=1")
             self.updates.restore_startup()
             self.store.recover()
+            # 旧版本没有待办索引；一次性为历史 pending 记录补索引，之后每轮只按索引领取。
+            self._index_postprocess_pending()
             self.store.execute("DELETE FROM settings WHERE key IN "
                                "(SELECT 'run-stop:' || id FROM runs WHERE ended IS NOT NULL)")
             # 只有已获授权的发布任务可续跑；普通任务保留中断证据，由用户手动重试。
@@ -771,6 +790,10 @@ class Runtime(Maintenance):
         with self._close_lock:
             if self._closed:
                 return
+            # 在公开关闭入口立即关闭领取准入，缩小与调度线程的竞态窗口；
+            # 已进入临界区的 claim+submit 仍由 _close 的 reconcile 收尾。
+            with self._admission:
+                self._closing = True
             self._shutdown.update(phase='stopping', started=time.time())
             try:
                 self._close()
@@ -793,9 +816,13 @@ class Runtime(Maintenance):
             self.thread.join()
         self._shutdown['phase'] = 'workers'
         try:
-            self.pool.shutdown(wait=True, cancel_futures=True)
-        except TypeError:
-            self.pool.shutdown(wait=True)
+            try:
+                self.pool.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                self.pool.shutdown(wait=True)
+        finally:
+            # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
+            self._reconcile_unstarted_workers()
         self._shutdown['phase'] = 'maintenance'
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
             self.maintenance_thread.join()
@@ -804,6 +831,28 @@ class Runtime(Maintenance):
         self.store.close()
         if self.lockfile:
             self.lockfile.close()
+
+    def _reconcile_unstarted_workers(self):
+        """Persist an interrupted run for each claimed worker cancelled before it started.
+
+        The task returns to the queue, but the store transition still resolves an
+        explicit cancellation or project pause first, so shutdown cannot revive
+        work the user has already stopped.
+        """
+        with self._futures_lock:
+            pending = list(self._future_runs.items())
+            self._future_runs.clear()
+            for future, _ in pending:
+                self.futures.discard(future)
+        for future, run in pending:
+            if not future.cancelled():
+                continue
+            try:
+                self.store.transition(run, "interrupted",
+                                      {"reason": "Runtime shut down before the worker started"}, True,
+                                      task_fields={"state": "queued"})
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to reconcile unstarted worker %s", run)
 
     def schedule(self, project, config, now=None):
         # 与保存共用 RLock：已开始的 tick 先完成，随后保存重排；等待中的
@@ -1011,7 +1060,9 @@ class Runtime(Maintenance):
                     self.drain_postprocess()
                 for future in tuple(self.futures):
                     if future.done():
-                        self.futures.remove(future)
+                        with self._futures_lock:
+                            self.futures.discard(future)
+                            self._future_runs.pop(future, None)
                         with self.scheduler_scope("worker_future"):
                             try:
                                 future.result()
@@ -1111,51 +1162,117 @@ class Runtime(Maintenance):
             with self.dispatch_lock:
                 if self.import_in_progress:
                     return
-                run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
-                if not run:
-                    return
-                services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
-                self.store.put_setting("fair-service", services)
-                self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
-                waiting[project["id"]] = now
-                self.store.put_setting("fair-waiting", waiting)
-                try:
-                    future = self.pool.submit(self.process, run)
-                except Exception:
-                    self.store.transition(run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
-                                          task_fields={"state": "queued"})
-                    raise
-                self.futures.add(future)
-                future.add_done_callback(lambda _: self.wake.set())
+                # 关闭与领取的最终共同边界：close 先取得同一把锁关闭准入，之后这里
+                # 不再 claim；已进入临界区的 claim+submit 由 shutdown 的 reconcile 收尾。
+                with self._admission:
+                    if self._closing or self.stop.is_set():
+                        return
+                    run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
+                    if not run:
+                        return
+                    services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
+                    self.store.put_setting("fair-service", services)
+                    self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
+                    waiting[project["id"]] = now
+                    self.store.put_setting("fair-waiting", waiting)
+                    try:
+                        future = self.pool.submit(self.process, run)
+                    except Exception:
+                        self.store.transition(run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
+                                              task_fields={"state": "queued"})
+                        raise
+                    with self._futures_lock:
+                        self.futures.add(future)
+                        self._future_runs[future] = run["id"]
+                    future.add_done_callback(lambda _: self.wake.set())
 
     def queue_postprocess(self, run):
         key = 'postprocess:' + run['id']
+        marker = 'postprocess-pending:' + run['id']
         with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',
                        (key, encode({'state': 'pending', 'steps': [], 'created': time.time()})))
+            # 待办索引与回执同一事务写入；回执继续保留在 postprocess: 命名空间作为历史证据。
+            db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',
+                       (marker, encode({'created': time.time()})))
 
     def drain_postprocess(self, run_id=None):
         with self.dispatch_lock:
             return self._drain_postprocess(run_id)
 
     def _drain_postprocess(self, run_id=None):
-        rows = self.store.query("SELECT key,value FROM settings WHERE key LIKE 'postprocess:%' "
-                                "AND (NOT json_valid(value) OR json_extract(value,'$.state')='pending') " +
-                                (' AND key=?' if run_id else ''), ('postprocess:' + run_id,) if run_id else ())
-        for item in rows:
-            identifier = item['key'].split(':', 1)[1]
-            with self.scheduler_scope('postprocess_run', run=identifier):
-                record = json.loads(item['value'])
-                if not isinstance(record, dict) or not isinstance(record.get('steps'), list):
-                    raise ValueError('Invalid postprocess record')
-                if record.get('state') != 'pending':
-                    continue
-                try:
-                    self._postprocess_run(item['key'], identifier, record)
-                except Exception as exc:
-                    record.update(last_error=str(exc), last_failed=time.time())
-                    self.store.put_setting(item['key'], record)
-                    raise
+        if run_id is not None:
+            key = 'postprocess:' + run_id
+            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+            if row:
+                self._drain_postprocess_record(key, run_id, row['value'],
+                                               'postprocess-pending:' + run_id)
+            return
+        # 待办索引使用主键范围（而不是 LIKE 全表扫描）并有界领取；已完成/obsolete
+        # 的历史回执继续留在 postprocess: 命名空间，但不会进入本轮的查询与解析。
+        cursor = self.store.setting('postprocess-pending-cursor', 'postprocess-pending:')
+        if not isinstance(cursor, str) or not cursor.startswith('postprocess-pending:'):
+            cursor = 'postprocess-pending:'
+        markers = self.store.query("SELECT key FROM settings WHERE key>? AND key<? "
+                                   "ORDER BY key LIMIT ?",
+                                   (cursor, 'postprocess-pending;', POSTPROCESS_BATCH))
+        if len(markers) < POSTPROCESS_BATCH:
+            markers += self.store.query("SELECT key FROM settings WHERE key>=? AND key<=? ORDER BY key LIMIT ?",
+                                        ('postprocess-pending:', cursor, POSTPROCESS_BATCH - len(markers)))
+        if markers:
+            self.store.put_setting('postprocess-pending-cursor', markers[-1]['key'])
+        for marker in markers:
+            identifier = marker['key'].split(':', 1)[1]
+            key = 'postprocess:' + identifier
+            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+            if not row:
+                self.store.execute('DELETE FROM settings WHERE key=?', (marker['key'],))
+                continue
+            self._drain_postprocess_record(key, identifier, row['value'], marker['key'])
+
+    def _drain_postprocess_record(self, key, identifier, value, marker=None):
+        with self.scheduler_scope('postprocess_run', run=identifier):
+            try:
+                record = json.loads(value)
+            except (TypeError, ValueError):
+                record = None
+            if not isinstance(record, dict) or not isinstance(record.get('steps'), list):
+                # 损坏回执原文保留，但不无限重试：退出待办索引，避免每轮占满有界批次。
+                if marker:
+                    self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                raise ValueError('Invalid postprocess record')
+            if record.get('state') != 'pending':
+                if marker:
+                    self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                return
+            try:
+                self._postprocess_run(key, identifier, record)
+            except Exception as exc:
+                record.update(last_error=str(exc), last_failed=time.time())
+                self.store.put_setting(key, record)
+                raise
+        # 成功/obsolete 后移除索引；瞬时失败仍保持 pending 与索引，下一轮重试。
+        if marker:
+            stored = self.store.setting(key)
+            if isinstance(stored, dict) and stored.get('state') in ('completed', 'obsolete'):
+                self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+
+    def _index_postprocess_pending(self):
+        """Build the pending index once for receipts left by a previous version."""
+        if self.store.setting('postprocess-pending-index') == 2:
+            return
+        rows = self.store.query("SELECT key FROM settings WHERE key>=? AND key<? "
+                                "AND (NOT json_valid(value) OR json_extract(value,'$.state')='pending')",
+                                ('postprocess:', 'postprocess;'))
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for row in rows:
+                db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)',
+                           ('postprocess-pending:' + row['key'].split(':', 1)[1],
+                            encode({'created': now, 'migrated': True})))
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('postprocess-pending-index', '2'))
 
     def _postprocess_run(self, key, identifier, record):
         run = self.store.one('SELECT * FROM runs WHERE id=?', (identifier,))
@@ -1417,8 +1534,18 @@ class Runtime(Maintenance):
                 return
             if task["source"] == "system_evolve":
                 from .evolution import Evolution
-                result = Evolution(self).propose_and_evaluate(project, workspace, directory, run)
-                self.store.transition(run["id"], "completed", result, True)
+                force_key = "evolution-force:" + task["id"]
+                force = bool(self.store.setting(force_key))
+                if force:
+                    # 一次性凭据：读取后删除，后续自动调度仍受相同输入去重约束。
+                    self.store.execute("DELETE FROM settings WHERE key=?", (force_key,))
+                result = Evolution(self).propose_and_evaluate(project, workspace, directory, run, force=force)
+                outcome = result.get("status")
+                state = ("completed" if outcome in ("stable", "ready", "pass") else
+                         "failed" if outcome in ("fail", "failed") else "insufficient_evidence")
+                # 没有晋升资格的实验以可重试状态收尾，让用户通过显式 force 重试；
+                # 自动调度仍由相同输入去重拦截，不会每轮重复付费。
+                self.store.transition(run["id"], state, result, True)
                 return
             if task["source"] == "issue" and not self.issue_still_open(project, task, config):
                 self.store.transition(run["id"], "obsolete", {"reason": "Issue is closed"}, True)
@@ -1854,9 +1981,20 @@ class Runtime(Maintenance):
         count = self.store.one("SELECT count(*) AS n FROM task_completions WHERE project=?", (project,))["n"]
         previous = self.store.setting("last-evolution:" + project, 0)
         interval = config["evolution"]["every_completed"]
-        if count // interval > previous // interval:
-            self.request(project, "evolve", priority=30)
-            self.store.put_setting("last-evolution:" + project, count)
+        if count // interval <= previous // interval:
+            return
+        self.store.put_setting("last-evolution:" + project, count)
+        from .evolution import Evolution
+        due, signature, attempt = Evolution(self).attempt_due(project, self.config(project))
+        if not due:
+            # 相同真实输入已经评估过且没有晋升；自动调度不再重复付费，直到证据、
+            # 样本、策略或策略参数变化，或用户显式 force 重试。
+            self.store.event("evolution_not_repeated",
+                             "Identical evolution inputs were already evaluated; automatic repetition suppressed",
+                             project, data={"signature": signature,
+                                            "previous": attempt.get("status") if isinstance(attempt, dict) else None})
+            return
+        self.request(project, "evolve", priority=30)
 
     def monitor_strategy(self, project, passed, run=None, attributable=False):
         from .evolution import Evolution

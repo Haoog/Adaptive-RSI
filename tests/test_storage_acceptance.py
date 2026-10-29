@@ -285,6 +285,93 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.assertFalse(writer.is_alive())
         self.assertEqual(errors, [])
 
+    def test_backup_validation_rejects_cross_project_run_ownership(self):
+        task = self.store.add_task('p', 'manual', 'owned-task', 'owned task')
+        self.store.execute("INSERT INTO projects VALUES ('q','other project','/other/source','{}',0,0)")
+        self.store.execute("INSERT INTO runs(id,task,project,state,result) VALUES ('cross',?, 'q','merged','{}')",
+                           (task,))
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+        with self.assertRaisesRegex(ValueError, 'ownership'):
+            storage_tools.verify_backup(source)
+        destination = self.root / 'cross-project-restore'
+        with self.assertRaisesRegex(ValueError, 'ownership'):
+            storage_tools.restore(source, destination)
+        self.assertFalse(destination.exists())
+        report = storage_tools.rehearse_restore(source)
+        self.assertFalse(report['valid'])
+        self.assertEqual(report['failure_stage'], 'snapshot_validation')
+
+    def test_backup_validation_rejects_run_without_project(self):
+        self.store.execute("INSERT INTO runs(id,project,state,result) VALUES ('ghost','missing','merged','{}')")
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+        with self.assertRaisesRegex(ValueError, 'ownership'):
+            storage_tools.verify_backup(source)
+        destination = self.root / 'ghost-restore'
+        with self.assertRaisesRegex(ValueError, 'ownership'):
+            storage_tools.restore(source, destination)
+        self.assertFalse(destination.exists())
+
+    def test_rotation_never_keeps_only_an_unrestorable_recovery_point(self):
+        import os
+        task = self.store.add_task('p', 'manual', 'rotation-task', 'owned task')
+        good = storage_tools.backup(self.store)
+        good_path = self.store.root / 'backups' / (good['id'] + '.sqlite3')
+        os.utime(good_path, (1, 1))
+        self.store.execute("INSERT INTO projects VALUES ('q','other project','/other/source','{}',0,0)")
+        self.store.execute("INSERT INTO runs(id,task,project,state,result) VALUES ('cross-rotation',?, 'q','merged','{}')",
+                           (task,))
+        bad = storage_tools.backup(self.store)
+        bad_path = self.store.root / 'backups' / (bad['id'] + '.sqlite3')
+        os.utime(bad_path, (time.time() + 10, time.time() + 10))
+        report = storage_tools.retain_backups(self.store, max_count=1, max_age_days=3650)
+        self.assertEqual(report['protected'], good_path.name)
+        self.assertIn(bad_path.name, report['invalid'])
+        self.assertTrue(good_path.exists())
+        self.assertTrue(storage_tools.verify_backup(good_path)['valid'])
+
+    def test_overview_reuses_digest_by_regular_file_identity_and_invalidates_change(self):
+        import os
+        first = storage_tools.backup(self.store)
+        storage_tools.backup(self.store)
+        files = {path.stem: path for path in (self.store.root / 'backups').glob('*.sqlite3')}
+        target = files[first['id']]
+
+        def sha(snapshot, path):
+            return next(item['sha256'] for item in snapshot['backup_manifest']
+                        if item['path'].endswith(path.name))
+
+        with patch('adaptive_rsi.storage_tools.file_digest', wraps=storage_tools.file_digest) as digest:
+            initial = storage_tools.overview(self.store, refresh=True)
+            self.assertEqual(digest.call_count, 2)
+            setattr(self.store, "_storage_snapshot", None)
+            cached = storage_tools.overview(self.store)
+            self.assertEqual(digest.call_count, 2)
+            self.assertEqual(cached['backup_manifest'], initial['backup_manifest'])
+            unchanged = sha(initial, target)
+            stat = target.stat()
+            os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            setattr(self.store, "_storage_snapshot", None)
+            touched = storage_tools.overview(self.store)
+            self.assertEqual(digest.call_count, 3)
+            self.assertEqual(sha(touched, target), unchanged)
+            target.write_bytes(target.read_bytes() + b'changed-content')
+            setattr(self.store, "_storage_snapshot", None)
+            changed = storage_tools.overview(self.store)
+            self.assertEqual(digest.call_count, 4)
+            self.assertNotEqual(sha(changed, target), unchanged)
+
+    def test_overview_digest_cache_drops_files_outside_the_current_manifest(self):
+        first = storage_tools.backup(self.store)
+        storage_tools.backup(self.store)
+        storage_tools.overview(self.store, refresh=True)
+        self.assertEqual(len(getattr(self.store, "_storage_digests")), 2)
+        (self.store.root / 'backups' / (first['id'] + '.sqlite3')).unlink()
+        setattr(self.store, "_storage_snapshot", None)
+        storage_tools.overview(self.store)
+        self.assertEqual(len(getattr(self.store, "_storage_digests")), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -10,13 +10,13 @@ The desktop app uses Tauri 2 and a bundled Python runtime. No separate Python in
 - Closing the window hides it to the menu bar. Already-started projects continue.
 - Choosing Quit stops only the app-owned service, preserving projects, settings and records. Reopening requires Start again.
 - An existing independent local service is attached without pausing projects or stopping it on app exit.
-- Use the runtime-machine button to paste an authenticated HTTPS server URL. Connections last for this app process only. Server tasks do not depend on the desktop window. The server must support API version 1.
+- Use the runtime-machine button to paste an authenticated HTTPS server URL. Connections last for this app process only. Server tasks do not depend on the desktop window. The current contract is API v2; capability negotiation retains supported operations with older services.
 
 State remains in `~/.local/share/adaptive-rsi`; `ADAPTIVE_RSI_HOME` selects a separate directory. Do not run different versions against the same directory simultaneously. Upgrade an older existing service first.
 
 ## Records and Usage
 
-Real call records are grouped by task, including failures and retries. Filter by project, dates, model/task search, and inspect details. Background checks and connection tests are identified separately. Missing usage is unknown, not zero; missing historical input/output/cache fields cannot be reconstructed. Model time is summed call duration, not task wall time. Daily buckets use UTC. Cost estimates include only priced calls, do not represent provider bills, and impose no call quota.
+Real call records are grouped by task, including failures and retries. Filter by project, dates, model/task search, and inspect details. Background checks and connection tests are identified separately. Missing usage is unknown, not zero; missing historical input/output/cache fields cannot be reconstructed. Model time is summed call duration, not task wall time. Daily buckets and date ranges follow the browser timezone. Estimates prefer frozen input, output and cache prices, falling back to blended pricing when components are incomplete. Unpriced calls are disclosed; estimates do not represent bills or impose quotas.
 
 ## Build
 
@@ -37,5 +37,9 @@ Builds use local ad-hoc signatures unless Apple Developer ID signing and notariz
 ## Software updates
 
 Desktop builds configured with an updater public key can check and download signed updates in the app. Choose “Restart and update” or enable automatic installation when tasks are idle. An owned runtime stops admitting new tasks and drains active work; the new app checks its bundled engine version before resuming. Download, wait, and installation errors are displayed alongside a manual installer link.
+
+Changing update mode, version scope, or install window increments the local authorization revision and revokes a waiting installation while it can still be cancelled. Stale authorization cannot cross the replacement boundary. Before installation, a transaction is persisted in a private directory with source and target versions, artifact and signature digests, authorization revision, and install window. After restart, `pending` becomes `succeeded` only when the app matches the target version, its bundled engine matches, and the local service is healthy. Version or health failures become `failed`. Exported `receipt_version:2` includes the persisted `transaction`, or an explicit `transaction_error` if unavailable.
+
+Run `python3 -B scripts/upgrade_harness.py --stage signing receipt authorization` for disposable-key signature, receipt, and authorization checks. `--stage isolation --app <built-artifact.app>` verifies a private copy and refuses an installed app. The harness currently covers `staging_only`: real signed N→N+1 replacement still needs a release environment. `--require-complete` exits nonzero until real replacement has been exercised.
 
 Publishers must configure the updater signing key and publish matching manifests and artifacts. Builds without a public key provide the manual download link. Existing desktop versions require one manual installation of an updater-enabled build. App replacement preserves the data directory; independent and remote runtimes are not replaced by the desktop updater. Real signing, notarization, and cross-version upgrades still require release-environment acceptance.

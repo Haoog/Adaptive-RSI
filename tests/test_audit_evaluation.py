@@ -130,6 +130,60 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(result['decision'], 'pass')
             self.assertEqual(result['controls'][0]['id'], 'wrong_value')
 
+    def test_configured_controls_run_in_production_evaluation_and_can_block(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            check = {'name': 'criterion', 'argv': ['python3', '-c', 'from value import VALUE; assert VALUE == 1']}
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                passed = 'VALUE = 1' in (Path(workspace) / 'value.py').read_text()
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0 if passed else 1,
+                        'stdout': 'Ran 1 test\n' if passed else '', 'stderr': '' if passed else 'AssertionError',
+                        'error': None, 'seconds': 0.1}
+            control = {'id': 'wrong_value', 'criterion': 'value remains one', 'source': 'host:fixture',
+                       'files': [{'path': 'value.py', 'content': 'VALUE = 2\n'}]}
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            runner = evaluator.Evaluator(store)
+            config = merge(DEFAULTS, {'validation': {'controls': [control]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = runner.evaluate(source, source, [check], root / 'evaluation', config, changed_files=[])
+            self.assertEqual(result['decision'], 'pass')
+            self.assertEqual(result['controls']['decision'], 'pass')
+            self.assertTrue(result['controls']['controls'][0]['detected'])
+
+            undetected = merge(DEFAULTS, {'validation': {'controls': [
+                {**control, 'files': [{'path': 'value.py', 'content': 'VALUE = 1\n'}]}]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                blocked = runner.evaluate(source, source, [check], root / 'blocked', undetected, changed_files=[])
+            self.assertEqual(blocked['decision'], 'insufficient_evidence')
+            self.assertIn('control', blocked['reason'].lower())
+            self.assertFalse(blocked['controls']['controls'][0]['detected'])
+            # A maintainer regression fixture can describe the behavior being
+            # repaired. Its positive control must execute on the fixed candidate.
+            candidate = root / 'fixed'
+            candidate.mkdir()
+            (source / 'value.py').write_text('VALUE = 2\n')
+            (candidate / 'value.py').write_text('VALUE = 1\n')
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                repaired = runner.evaluate(source, candidate, [check], root / 'repaired', config, changed_files=[])
+            self.assertEqual(repaired['decision'], 'pass')
+            self.assertTrue(repaired['controls']['controls'][0]['detected'])
+
+            with patch.object(evaluator.Evaluator, 'validate_controls') as validate, patch(
+                    'adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                runner.evaluate(source, source, [check], root / 'no-controls', merge(DEFAULTS, {}), changed_files=[])
+            validate.assert_not_called()
+
     def test_required_test_identity_cannot_be_satisfied_by_unrelated_tests(self):
         required = ['target.test_regression']
         unrelated = [{'test_identities': {'state': 'reported', 'executed': ['other.test_pass'], 'skipped': []}}]

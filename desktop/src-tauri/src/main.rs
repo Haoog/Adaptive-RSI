@@ -20,6 +20,7 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 
 mod native_update;
+mod update_receipt;
 #[cfg(test)]
 mod update_boundary_tests;
 mod transport;
@@ -1223,14 +1224,35 @@ async fn download_desktop_update(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|_| "Request interrupted".to_string())?
 }
 #[tauri::command]
-async fn native_update(app: tauri::AppHandle, action: String, installation_window: Option<String>) -> Result<Value, String> {
+async fn native_update(app: tauri::AppHandle, action: String, installation_window: Option<String>,
+                       policy: Option<String>, version_scope: Option<String>,
+                       revision: Option<u64>, automatic: Option<bool>) -> Result<Value, String> {
     match action.as_str() {
         "status" => Ok(native_update::snapshot(&app)),
         "check" => native_update::check(app, false).await,
         "download" => native_update::check(app, true).await,
         "cancel" => { native_update::cancel(&app); Ok(native_update::snapshot(&app)) },
+        // Settings are versioned so an approved install cannot replace under a
+        // policy, scope or window the user has since changed.
+        "authorize" => native_update::authorize(
+            &app,
+            revision.ok_or("update_authorization_invalid")?,
+            policy.as_deref().unwrap_or(""),
+            version_scope.as_deref().unwrap_or(""),
+            installation_window.as_deref().unwrap_or(""),
+        ),
+        // Exported receipts come from the persisted transaction, never from the panel.
+        "receipt" => Ok(update_receipt::export(&app)),
         "install" => {
-            native_update::install(app, installation_window.unwrap_or_else(|| "any".into())).await?;
+            // `automatic` is the panel's own background install; a manual click
+            // arrives with the explicit "any" window. The revision is required
+            // either way, so a call that never saw an authorization is refused.
+            native_update::install(
+                app,
+                installation_window.unwrap_or_else(|| "any".into()),
+                native_update::required_revision(revision)?,
+                automatic.unwrap_or(false),
+            ).await?;
             Ok(json!({"state":"restarting"}))
         },
         _ => Err("invalid_update_action".into()),
@@ -1406,9 +1428,15 @@ fn main() {
                 tray = tray.icon(icon.clone());
             }
             tray.build(app)?;
-            if let Err(error) = bootstrap(app.handle()) {
+            let started = bootstrap(app.handle());
+            let healthy = started.is_ok();
+            if let Err(error) = started {
                 *app.state::<RuntimeState>().error.lock().unwrap() = error;
             }
+            // A pending upgrade receipt is settled only by this process observing
+            // its own version and a healthy runtime. Anything else is recorded as
+            // a failed upgrade instead of being reported as applied.
+            let _ = update_receipt::reconcile_app(app.handle(), &app.package_info().version.to_string(), healthy);
             Ok(())
         })
         .build(tauri::generate_context!())
