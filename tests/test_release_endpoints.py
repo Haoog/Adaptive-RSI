@@ -219,8 +219,8 @@ class DeliveryRecoveryTest(unittest.TestCase):
                 self.assertIsNotNone(self.store.setting("delivery:" + self.run["id"]))
                 saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (self.run["id"],))
                 self.assertEqual(json.loads(saved["result"])["pr"], self.url)
-                self.assertEqual(saved["state"], "superseded" if change == "supersede" else "pr_open")
-                if change == "supersede":
+                self.assertEqual(saved["state"], "superseded" if change in ("supersede", "cancel") else "pr_open")
+                if change in ("supersede", "cancel"):
                     self.assertTrue(json.loads(saved["result"])["close_pending"])
                 if change == "cancel":
                     self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task["id"],))["state"], "cancelled")

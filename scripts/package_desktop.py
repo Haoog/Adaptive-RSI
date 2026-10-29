@@ -292,6 +292,24 @@ def package_updater(bundle_dir, output_dir, version, require_inventory=False):
     return feed
 
 
+def updater_notes(version):
+    sections = []
+    for filename, language in [("CHANGELOG.md", "简体中文"), ("CHANGELOG.en.md", "English")]:
+        path = ROOT / filename
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        heading = re.search(r"(?m)^## " + re.escape(version) + r"[ \t]*$", text)
+        if not heading:
+            continue
+        end = re.search(r"(?m)^## ", text[heading.end():])
+        body = text[heading.end():heading.end() + end.start()] if end else text[heading.end():]
+        body = re.sub(r"(?m)^<!-- adaptive-rsi-release:[^\n]*-->[ \t]*\n?", "", body).strip()
+        if body:
+            sections.append(language + "\n\n" + body[:7900])
+    return "\n\n".join(sections)
+
+
 def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     """Publish a manifest only when the complete signed updater artifact exists."""
     bundle_dir, output = Path(bundle_dir), Path(output_dir)
@@ -309,7 +327,7 @@ def _package_updater(bundle_dir, output_dir, version, require_inventory=False):
     subprocess.run(["cargo", "run", "--quiet", "--locked", "--manifest-path",
                     str(ROOT / "desktop/src-tauri/Cargo.toml"), "--bin", "verify_updater", "--",
                     str(output / name), str(output / (name + ".sig")), version], check=True, timeout=120)
-    feed = {"version": version, "notes": "", "size": (output / name).stat().st_size, "platforms": {"darwin-aarch64": {
+    feed = {"version": version, "notes": updater_notes(version), "size": (output / name).stat().st_size, "platforms": {"darwin-aarch64": {
         "signature": signed,
         "url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v" + version + "/" + name}}}
     (output / "desktop-latest.json").write_text(json.dumps(feed, indent=2) + "\n", encoding="utf-8")

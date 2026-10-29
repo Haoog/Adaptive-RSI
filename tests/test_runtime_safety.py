@@ -466,7 +466,9 @@ class RuntimeSafetyTest(unittest.TestCase):
             self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) "
                                "VALUES (?,?,?,?,?,1,2,?)",
                                (state, task, self.project, state, old["config"], encode({"pr": state})))
-        self.runtime.cancel_task(task)
+        # Legacy cancellations may have left pending approvals; retry must revoke
+        # those atomically even though new cancellations already revoke them.
+        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task,))
         self.store.execute("CREATE TRIGGER reject_retry BEFORE UPDATE OF state ON tasks "
                            "WHEN NEW.id='" + task + "' AND NEW.state='queued' "
                            "BEGIN SELECT RAISE(ABORT, 'Injected retry write failure'); END")
@@ -585,7 +587,9 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.store.transition(run["id"], "awaiting_approval", {
             "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
         queued = self.runtime.deliver(run["id"])
-        self.runtime.cancel_task(task)
+        # Keep an old pending candidate to exercise the revision transaction's
+        # rollback independently from the cancellation transaction.
+        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task,))
         self.store.execute("CREATE TRIGGER reject_revision BEFORE UPDATE OF body ON tasks "
                            "BEGIN SELECT RAISE(ABORT, 'Injected requirement write failure'); END")
         try:

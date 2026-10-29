@@ -16,7 +16,8 @@ class TaskLifecycleTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.store = Store(Path(temporary.name) / 'state')
+        self.root = Path(temporary.name)
+        self.store = Store(self.root / 'state')
         self.runtime = Runtime(self.store, agent=object())
         self.addCleanup(self.runtime.close)
         for project in ('p', 'q'):
@@ -25,6 +26,24 @@ class TaskLifecycleTest(unittest.TestCase):
 
     def task(self, name, project='p'):
         return self.store.add_task(project, 'goal', name, name, 'Original requirements')
+
+    def awaiting_candidate(self, name='candidate', project='p'):
+        """Real claim -> verified transition, the only state delivery may accept."""
+        self.store.execute('UPDATE projects SET paused=0 WHERE id=?', (project,))
+        task = self.task(name, project)
+        run = self.store.claim(project, self.runtime.config(project))
+        self.assertEqual(run['task'], task)
+        self.store.transition(run['id'], 'awaiting_approval',
+                              {'evaluation': {'decision': 'pass'}, 'review': {'decision': 'pass'}}, True)
+        return task, run['id']
+
+    def stale_candidate(self, task, name, config=None):
+        self.store.execute("INSERT INTO runs(id,project,task,state,config,result,started,ended) "
+                           "VALUES (?, 'p', ?, 'awaiting_approval', ?, ?, 1, 2)",
+                           (name, task, json.dumps(config or {}),
+                            json.dumps({'evaluation': {'decision': 'pass'},
+                                        'review': {'decision': 'pass'}})))
+        return name
 
     def preview(self, task):
         with self.store.connect() as db:
@@ -188,6 +207,7 @@ class TaskLifecycleTest(unittest.TestCase):
         self.store.execute("INSERT INTO runs(id,project,task,state,result,started,ended) "
                            "VALUES ('candidate','p',?,'awaiting_approval',?,?,?)",
                            (task, json.dumps(outcome), time.time(), time.time()))
+        self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (task,))
         publication = self.runtime.deliver('candidate', reason='人工核对通过')
         history = intervention_history(self.store, task, 'p')
         event = next(row for row in history['entries'] if row['kind'] == 'delivery_approved')
@@ -224,6 +244,7 @@ class TaskLifecycleTest(unittest.TestCase):
                 outcome = {'evaluation': {'decision': 'pass'}, 'review': {'decision': 'pass'}}
                 self.store.execute("INSERT INTO runs(id,project,task,state,result) VALUES (?,'p',?,'awaiting_approval',?)",
                                    (name, task, json.dumps(outcome)))
+                self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (task,))
                 publication = None
                 if previous:
                     publication = self.store.add_task('p', 'system_publish', 'publish:' + name, 'publish', name)
@@ -239,3 +260,94 @@ class TaskLifecycleTest(unittest.TestCase):
                 else:
                     self.assertIsNone(row)
                 self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='delivery_approved'")['n'], 0)
+
+    def test_cancelling_awaiting_candidate_withdraws_candidate_and_unclaimed_publication(self):
+        task, candidate = self.awaiting_candidate()
+        publication = self.runtime.deliver(candidate)
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (publication,))['state'], 'queued')
+        approvals = self.store.one("SELECT count(*) AS n FROM events WHERE kind='delivery_approved' AND run=?",
+                                   (candidate,))['n']
+        report = self.runtime.cancel_task(task)
+        receipt = next(row for row in report['receipts'] if row['id'] == task)
+        self.assertEqual((receipt['state'], receipt['candidates'], receipt['publications']),
+                         ('cancelled', [candidate], [publication]))
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (candidate,))['state'], 'superseded')
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (publication,))['state'], 'cancelled')
+        with self.assertRaisesRegex(ValueError, 'awaiting approval'):
+            self.runtime.deliver(candidate)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='delivery_approved' AND run=?",
+                                        (candidate,))['n'], approvals)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM tasks WHERE source='system_publish' AND body=?",
+                                        (candidate,))['n'], 1)
+
+    def test_cancellation_keeps_published_history_and_only_withdraws_unclaimed_work(self):
+        task, candidate = self.awaiting_candidate()
+        for state in ('pr_open', 'merged'):
+            self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) "
+                               "VALUES (?,?,'p',?,'{}',1,2,?)", (state, task, state, json.dumps({'pr': state})))
+            self.store.add_task('p', 'system_publish', 'publish:' + state, 'Previously delivered', body=state)
+        publication = self.runtime.deliver(candidate)
+        report = self.runtime.cancel_task(task)
+        receipt = next(row for row in report['receipts'] if row['id'] == task)
+        self.assertEqual((receipt['candidates'], receipt['publications']), ([candidate], [publication]))
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (candidate,))['state'], 'superseded')
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (publication,))['state'], 'cancelled')
+        for state in ('pr_open', 'merged'):
+            self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (state,))['state'], state)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE body=? AND source='system_publish'",
+                                            (state,))['state'], 'queued')
+
+    def test_legacy_historical_source_state_cannot_produce_an_approval_receipt(self):
+        for state in ('cancelled', 'expired', 'obsolete', 'queued'):
+            with self.subTest(state=state):
+                task = self.task('stale ' + state)
+                candidate = self.stale_candidate(task, 'stale-' + state)
+                self.store.execute('UPDATE tasks SET state=? WHERE id=?', (state, task))
+                with self.assertRaisesRegex(ValueError, 'awaiting approval'):
+                    self.runtime.deliver(candidate)
+                self.assertFalse(self.store.query("SELECT * FROM events WHERE kind='delivery_approved' AND run=?",
+                                                  (candidate,)))
+                self.assertFalse(self.store.query("SELECT * FROM tasks WHERE source='system_publish' AND body=?",
+                                                  (candidate,)))
+                self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (candidate,))['state'],
+                                 'awaiting_approval')
+
+    def test_legacy_cancelled_candidate_postprocess_retires_instead_of_repeating_delivery_errors(self):
+        task = self.task('legacy postprocess')
+        config = self.runtime.config('p')
+        config['delivery']['mode'] = 'pr'
+        self.runtime.configure({'delivery': {'mode': 'pr'}}, 'p')
+        candidate = self.stale_candidate(task, 'legacy-postprocess', config)
+        self.store.execute("UPDATE tasks SET state='cancelled' WHERE id=?", (task,))
+        self.runtime.queue_postprocess(self.store.one('SELECT * FROM runs WHERE id=?', (candidate,)))
+        self.runtime.drain_postprocess(candidate)
+        record = self.store.setting('postprocess:' + candidate)
+        self.assertEqual(record['state'], 'obsolete')
+        self.assertIn('approval', record['reason'])
+        self.assertFalse(self.store.query("SELECT * FROM tasks WHERE source='system_publish' AND body=?",
+                                          (candidate,)))
+
+    def test_archived_project_rejects_retry_and_revision_without_writing(self):
+        from tests.test_runtime import fixture
+        project = self.runtime.add_project(fixture(self.root / 'repo'))
+        task = self.store.add_task(project, 'goal', 'archived', 'Archived task', 'Original requirements')
+        self.store.execute("UPDATE tasks SET state='failed',attempts=2,available=123 WHERE id=?", (task,))
+        before = self.store.one('SELECT state,attempts,available,body FROM tasks WHERE id=?', (task,))
+        self.runtime.archive_project(project, 'archive-project')
+        events = self.store.one('SELECT count(*) AS n FROM events WHERE project=?', (project,))['n']
+        for attempt in (lambda: self.runtime.retry(task, reason='archived retry'),
+                        lambda: self.runtime.revise_task(task, 'Must not be stored')):
+            with self.assertRaisesRegex(ValueError, 'archived'):
+                attempt()
+        self.assertEqual(self.store.one('SELECT state,attempts,available,body FROM tasks WHERE id=?', (task,)), before)
+        self.assertEqual(self.store.one('SELECT count(*) AS n FROM task_revisions WHERE task=?', (task,))['n'], 0)
+        self.assertEqual(self.store.one('SELECT count(*) AS n FROM events WHERE project=?', (project,))['n'], events)
+        self.assertFalse(self.store.query('SELECT * FROM settings WHERE key=?', ('evolution-force:' + task,)))
+        self.runtime.restore_project(project, 'restore-project')
+        self.runtime.retry(task, reason='after restore')
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'queued')
+        self.runtime.revise_task(task, 'Restored supplement')
+        stored = self.store.one('SELECT state,body FROM tasks WHERE id=?', (task,))
+        self.assertEqual(stored['state'], 'queued')
+        self.assertTrue(stored['body'].endswith('Restored supplement'))
+        self.assertEqual(self.store.one('SELECT count(*) AS n FROM task_revisions WHERE task=?', (task,))['n'], 1)

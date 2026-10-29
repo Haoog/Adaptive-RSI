@@ -2848,7 +2848,7 @@ function usagePage() {
   vm.runInContext('view="usage"', page.context);
   page.context.fetch = url => new Promise(resolve => {
     requests.push({params: new URLSearchParams(url.split('?')[1]), finish(title, status = 200) {
-      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [],
+      resolve(response({summary: {tokens: 100, tasks: 1}, roles: [], daily: [], calls: [], call_total: 0,
         tasks: [{task: title, title, project: 'a', state: 'failed', tokens: 100, attempts: 1}], total: 60}, status));
     }});
   });
@@ -2891,6 +2891,22 @@ for (const timing of ['before-input', 'during-debounce', 'after-search']) {
     });
   }
 }
+
+test('usage details retain the visible report time window after a filter refresh fails', async () => {
+  const page = usagePage(), initial = page.show();
+  page.requests[0].finish('Initial'); await initial;
+  const originalEnd = page.requests[0].params.get('end');
+  page.node('usage-period').value = '7';
+  const failed = page.show();
+  page.requests[1].finish('Unavailable', 503); await failed;
+  page.node('usage-tasks').children[0].children.at(-1).handlers.click();
+  const detail = page.context.lastAction;
+  assert.equal(page.requests[2].params.get('task'), 'Initial');
+  assert.equal(page.requests[2].params.get('start'), '0');
+  assert.equal(page.requests[2].params.get('end'), originalEnd);
+  page.requests[2].finish('Details'); await detail;
+  assert.equal(page.node('usage-detail').open, true);
+});
 
 test('usage coalesces repeated input, resets pagination and refreshes the latest query', async () => {
   const page = usagePage(), initial = page.show();

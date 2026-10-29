@@ -1,11 +1,13 @@
 """Task feedback records observations without changing acceptance or ranking."""
 import copy
 import tempfile
+import time
 import unittest
 import json
 import threading
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS
 from adaptive_rsi.store import Store
@@ -149,13 +151,151 @@ class TaskValueFeedbackTest(unittest.TestCase):
         self.assertEqual(report["mainline_state"], "regressed")
         self.assertEqual(report["interventions"], 1)
 
-    def test_summary_accepts_a_no_checks_evaluation(self):
+    def test_real_evaluator_result_survives_persist_decode_and_summary(self):
+        # 生产者在没有可执行检查时返回空的检查容器；持久化后解码不能把
+        # summary/files/reason 一起丢掉，只应把检查计数当成空。
+        import copy
+        from adaptive_rsi.dashboard import records
+        from adaptive_rsi.evaluator import Evaluator
+        from adaptive_rsi.store import decode_evidence
+        root = Path(self.temp.name)
+        evaluation = Evaluator(self.store).evaluate(root, root, [], root / "checks", copy.deepcopy(DEFAULTS))
+        self.assertEqual(evaluation["checks"], {})
+        task = self.store.add_task("p", "manual", "no-checks", "No executable checks")
+        record = self.store.claim("p", copy.deepcopy(DEFAULTS))
+        self.store.transition(record["id"], "insufficient_evidence", {
+            "reason": evaluation["reason"], "summary": "No executable checks",
+            "files": ["app.py"], "evaluation": evaluation}, True)
+        raw = self.store.one("SELECT result FROM runs WHERE id=?", (record["id"],))["result"]
+        decoded = decode_evidence(raw)
+        self.assertNotIn("evidence_error", decoded)
+        self.assertIn("No executable acceptance checks", decoded["reason"])
+        report = task_feedback.summary(self.store, record["id"])
+        self.assertEqual((report["summary"], report["files"], report["checks"]),
+                         ("No executable checks", ["app.py"], {}))
+        row = next(item for item in records(self.store, "p")["runs"] if item["id"] == record["id"])
+        self.assertIsNone(row["evidence_error"])
+        self.assertEqual(row["summary"], "No executable checks")
+
+    def test_summary_accepts_a_legacy_empty_checks_list(self):
+        # 历史数据里合法的空列表仍表示“没有检查”，不能当成坏证据。
         self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps({
-            "evaluation": {"decision": "insufficient_evidence", "checks": []}}), self.record["id"]))
-        self.assertEqual(task_feedback.summary(self.store, self.record["id"])["checks"], {})
+            "reason": "No executable acceptance checks", "summary": "Legacy no-check run",
+            "files": ["legacy.py"], "evaluation": {"decision": "insufficient_evidence", "checks": []}}),
+            self.record["id"]))
+        report = task_feedback.summary(self.store, self.record["id"])
+        self.assertEqual((report["summary"], report["files"], report["checks"]),
+                         ("Legacy no-check run", ["legacy.py"], {}))
+
+    def test_empty_checks_pass_is_downgraded_in_every_read_model(self):
+        # 空列表兼容只说明“没有可执行检查”；同一形状上的 pass 没有可验证证据，
+        # 读模型必须降级为 insufficient_evidence，不能计成 passed/accepted。
+        from adaptive_rsi.store import decode_evidence
+        from adaptive_rsi.telemetry import quality_summary, workflow_metrics
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (self.task,))
+        self.store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (json.dumps({
+            "summary": "Legacy pass without checks", "files": ["legacy.py"], "reason": "historical",
+            "review": {"decision": "pass"},
+            "evaluation": {"decision": "pass", "checks": []}}), self.record["id"]))
+        raw = self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"]
+        decoded = decode_evidence(raw)
+        self.assertNotIn("evidence_error", decoded)
+        self.assertEqual((decoded["summary"], decoded["files"], decoded["reason"]),
+                         ("Legacy pass without checks", ["legacy.py"], "historical"))
+        self.assertEqual(decoded["evaluation"], {"decision": "insufficient_evidence", "checks": {}})
+        quality = quality_summary(self.store, "p")[0]
+        self.assertEqual((quality["passed"], quality["evaluated"], quality["reviewed"]), (0, 1, 1))
+        metrics = workflow_metrics(self.store, "p")
+        self.assertEqual((metrics["accepted"], metrics["first_pass"]), (0, 0))
+        report = task_feedback.summary(self.store, self.record["id"])
+        self.assertEqual((report["summary"], report["files"], report["checks"]),
+                         ("Legacy pass without checks", ["legacy.py"], {}))
+        self.assertEqual(self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"], raw)
+
+    def test_non_empty_checks_list_is_rejected_without_erasing_other_evidence(self):
+        from adaptive_rsi.store import decode_evidence
+        self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps({
+            "summary": "Corrupt checks", "files": ["app.py"],
+            "evaluation": {"decision": "pass", "checks": [{"passed": True}]}}), self.record["id"]))
+        decoded = decode_evidence(self.store.one("SELECT result FROM runs WHERE id=?", (self.record["id"],))["result"])
+        self.assertEqual(decoded["evidence_error"], "invalid_evidence_shape:checks")
+        self.assertNotIn("evaluation", decoded)
+        self.assertEqual((decoded["summary"], decoded["files"]), ("Corrupt checks", ["app.py"]))
+        report = task_feedback.summary(self.store, self.record["id"])
+        self.assertEqual((report["summary"], report["checks"]), ("Corrupt checks", {}))
 
     def test_malformed_historical_merge_record_does_not_break_metrics(self):
         from adaptive_rsi.telemetry import workflow_metrics
         self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps({
             "feedback": {"merge": "broken"}}), self.record["id"]))
         self.assertEqual(workflow_metrics(self.store, "p")["postmerge_verified"], 0)
+
+    def test_merge_attribution_agrees_across_quality_and_workflow_metrics(self):
+        # 原合并已验证、后续主线回归：各统计都必须按同一归属给出 1/0 与主线回归 1。
+        from adaptive_rsi.telemetry import quality_summary, workflow_metrics
+        self.store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (json.dumps({
+            "merged_sha": "a" * 40,
+            "feedback": {"state": "regressed", "head": "b" * 40,
+                         "merge": {"sha": "a" * 40, "state": "verified"}}}), self.record["id"]))
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (self.task,))
+        quality = quality_summary(self.store, "p")[0]
+        metrics = workflow_metrics(self.store, "p")
+        report = task_feedback.summary(self.store, self.record["id"])
+        self.assertEqual((quality["postmerge_verified"], quality["postmerge_regressed"]), (1, 0))
+        self.assertEqual((metrics["postmerge_verified"], metrics["postmerge_regressed"]), (1, 0))
+        self.assertEqual((quality["mainline_regressed"], metrics["mainline_regressed"]), (1, 1))
+        self.assertEqual((report["postmerge_state"], report["mainline_state"]), ("verified", "regressed"))
+
+    def test_legacy_feedback_is_only_about_the_original_merge_at_its_sha(self):
+        from adaptive_rsi.telemetry import quality_summary, workflow_metrics
+
+        def measure(result):
+            self.store.execute("UPDATE runs SET result=? WHERE id=?", (json.dumps(result), self.record["id"]))
+            quality = quality_summary(self.store, "p")[0]
+            metrics = workflow_metrics(self.store, "p")
+            return ((quality["postmerge_verified"], quality["postmerge_regressed"],
+                     quality["mainline_regressed"]),
+                    (metrics["postmerge_verified"], metrics["postmerge_regressed"],
+                     metrics["mainline_regressed"]))
+
+        # 历史记录 head 恰好是合并提交时仍归属原合并。
+        self.assertEqual(measure({"merged_sha": "a" * 40, "feedback": {"state": "verified", "head": "a" * 40}}),
+                         ((1, 0, 0), (1, 0, 0)))
+        # head 已在合并之后：只能算后续主线回归，不能归给原合并。
+        self.assertEqual(measure({"merged_sha": "a" * 40, "feedback": {"state": "regressed", "head": "b" * 40}}),
+                         ((0, 0, 1), (0, 0, 1)))
+
+    def test_workflow_metrics_reports_one_committed_snapshot(self):
+        # 在两次查询之间用独立事务原子写入任务与运行；响应必须对应某一已提交快照，
+        # 不能出现“新运行 + 旧任务”的混合值。
+        from adaptive_rsi.telemetry import workflow_metrics
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) VALUES ('q','Q','/q','{}',0,1)")
+        task = self.store.add_task("q", "manual", "snapshot", "Snapshot task")
+        before = workflow_metrics(self.store, "q")
+        self.assertEqual((before["tasks"], before["accepted"], before["delivered"]), (1, 0, 0))
+        original, writes = self.store.query, []
+
+        def interleaved(sql, args=()):
+            rows = original(sql, args)
+            if sql.startswith("SELECT * FROM tasks WHERE id IN") and not writes:
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("UPDATE tasks SET state='merged' WHERE id=?", (task,))
+                    db.execute("INSERT INTO runs(id,task,project,state,started,ended,result) "
+                               "VALUES ('q-run',?,?,?,?,?,?)",
+                               (task, "q", "merged", time.time(), time.time(), json.dumps({
+                                   "evaluation": {"decision": "pass", "checks": {}},
+                                   "review": {"decision": "pass"}})))
+                writes.append(True)
+            return rows
+
+        with patch.object(self.store, "query", side_effect=interleaved):
+            during = workflow_metrics(self.store, "q")
+        self.assertTrue(writes)
+        self.assertEqual((during["tasks"], during["accepted"], during["delivered"]), (1, 0, 0))
+        after = workflow_metrics(self.store, "q")
+        self.assertEqual((after["tasks"], after["accepted"], after["delivered"]), (1, 1, 1))
+        # 嵌套在已有快照内调用不会重新开事务，也不改变结果。
+        with self.store.snapshot():
+            nested = workflow_metrics(self.store, "q")
+        self.assertEqual((nested["accepted"], nested["delivered"]), (1, 1))

@@ -52,7 +52,7 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 
 The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
 
-Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
+Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Cancelling revokes approval eligibility for undelivered candidates. Restore an archived project before retrying tasks or revising requirements. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
 
 ## Quick Start
 
@@ -111,7 +111,7 @@ Models must support tool calls and structured results. Protocol support does not
 
 Long-term capability improvement still requires real tasks and sustained experiments. When fresh holdout cases are insufficient, proposal and trials are skipped before model calls and the stable strategy is retained.
 
-Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
+Task details collect changes, checks, usage, reused stages and the delivery commit, with optional Helpful, Unnecessary or False positive feedback. Ratings are observational and do not automatically change ranking or strategies; original-merge verification and later-mainline regressions are counted separately. Model pricing supports input, output and cache components with blended-price fallback; usage details provide historical ranges only when enough comparable samples exist. Missing usage and prices remain unknown. Failed usage or detail refreshes identify retained data and the last successful update. See the [reliable improvement loop](RELIABILITY.en.md) for execution and recovery rules.
 
 ## Documentation
 

@@ -72,6 +72,40 @@ def validate_output(value, schema):
             validate_output(item, schema["items"])
 
 
+# 单次请求的输出预算策略（按协议与已知型号家族），永远不超过能力上限。
+# 老 opus/claude-2、无版本号 opus 别名，以及最初的 claude-3-opus/sonnet/haiku（含日期后缀与
+# 供应商前缀）保持 4096 的历史保守值：这些型号的真实输出上限就是 4096，抬高只会变成 400。
+# 明确支持的 4.x opus/sonnet、haiku 4 与 3-5/3-7 家族只在各自上限内提高；其余（含未知型号）
+# 停在历史 8k 包络，绝不把整个 Claude 家族盲目放大到 32000。
+# 顺序即优先级：更具体的旧 3.0 型号必须排在前面的 claude-3 通配之前，否则会被抬到 8192。
+ANTHROPIC_REQUEST_OUTPUT = (
+    (r"claude-2|claude-instant", 4096),
+    (r"claude-(opus|sonnet)-4", 16384),
+    (r"claude-haiku-4", 8192),
+    (r"claude-3-(opus|sonnet|haiku)\b", 4096),
+    (r"claude-3", 8192),
+    (r"claude-opus", 4096),
+)
+ANTHROPIC_DEFAULT_REQUEST_OUTPUT = 8192
+
+
+def request_output_budget(model, protocol, max_output_tokens=None):
+    """单次请求的输出预算；永远不超过模型能力上限。
+
+    max_output_tokens 是“模型能产多少”的能力元数据，用于上下文/响应字节上限和界面展示；
+    每次请求下发的输出预算是另一件事：未知型号保持保守，已知家族只在能力之内提高。
+    Anthropic 必须在握手参数 max_tokens 中给出该预算，不能一律下发家族最大能力。
+    """
+    limit = max_output_tokens if type(max_output_tokens) is int and max_output_tokens > 0 else None
+    value = str(model or "").lower()
+    if protocol == "anthropic":
+        budget = next((size for pattern, size in ANTHROPIC_REQUEST_OUTPUT if re.search(pattern, value)),
+                      ANTHROPIC_DEFAULT_REQUEST_OUTPUT)
+    else:
+        budget = limit or 16384
+    return max(1, min(budget, limit)) if limit else max(1, budget)
+
+
 def model_capabilities(model, protocol="", override=None):
     """Return conservative routing metadata; unknown models never inherit premium limits."""
     value = str(model or "").lower()
@@ -114,6 +148,7 @@ def model_capabilities(model, protocol="", override=None):
         result.update({name: limit for name, limit in limits.items() if limit is not None},
                       source="manual", confidence="manual",
                       updated_at=override.get("updated_at"))
+    result["request_output_tokens"] = request_output_budget(result["id"], protocol, result["max_output_tokens"])
     return result
 
 

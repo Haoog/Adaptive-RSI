@@ -19,8 +19,7 @@ def preview_cleanup(store, run_id):
     run = store.one("SELECT * FROM runs WHERE id=?", (run_id,))
     if (not run or run['ended'] is None or run['state'] not in
             {'failed', 'cancelled', 'expired', 'rejected', 'obsolete', 'completed', 'verified'} or
-            _cleanup_hold(store, 'legal-hold:' + run_id) or
-            _cleanup_hold(store, 'legal-hold-project:' + run['project']) or
+            retention_hold(store, run_id, run['project']) or
             store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
                       "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
                       (run['project'], run_id))):
@@ -53,6 +52,18 @@ def _cleanup_hold(store, key):
         return json.loads(row['value']) is not False
     except (ValueError, TypeError):
         return True
+
+
+def retention_hold(store, run_id, project):
+    """Return the legal hold that protects a run from cleanup, or None.
+
+    Every removal entry point uses this check.  An unreadable value counts as a
+    hold, so a corrupt setting can never unlock deletion of retained evidence.
+    """
+    for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
+        if _cleanup_hold(store, key):
+            return key
+    return None
 
 
 def _sync_directory(path):
@@ -267,6 +278,100 @@ def undo_cleanup(store, identifier):
     return {'restored': [item['name'] for item in receipt['objects']], 'run': receipt['run']}
 
 
+def _remove_owned_tree(parent, name):
+    """Remove one entry beneath an open directory without following any link.
+
+    Dependency copies are sealed read-only by environment.prepare_cached, so the
+    directory owning each entry must be made writable before it can be emptied.
+    Directory descriptors pin the verified tree: a link swapped in later fails
+    O_NOFOLLOW, and unlink/rmdir always act on the recorded parent entry.
+    """
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent)
+        return
+    descriptor = os.open(name, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) |
+                         getattr(os, 'O_NOFOLLOW', 0), dir_fd=parent)
+    try:
+        mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+        if mode & stat.S_IRWXU != stat.S_IRWXU:
+            # Only directories inside the artifact being removed regain write access.
+            os.fchmod(descriptor, mode | stat.S_IRWXU)
+        with os.scandir(descriptor) as entries:
+            children = [entry.name for entry in entries]
+        for child in children:
+            _remove_owned_tree(descriptor, child)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent)
+
+
+def _remove_artifact(directory, name):
+    """Delete a finished run's own artifact, including read-only dependency copies.
+
+    The caller already proved the run directory is the controller-owned path; a
+    vanished artifact means a concurrent pass finished first and stays silent.
+    """
+    try:
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) |
+                             getattr(os, 'O_NOFOLLOW', 0))
+    except FileNotFoundError:
+        return
+    try:
+        _remove_owned_tree(descriptor, name)
+    finally:
+        os.close(descriptor)
+
+
+def _held_in_transaction(db, run_id, project):
+    """Read a run's legal holds on the connection that owns the write transaction.
+
+    Reading through the deleting connection keeps the check inside the same
+    serialisation domain as the deletion: a hold committed before BEGIN IMMEDIATE
+    is observed here, while one written concurrently cannot commit until this
+    transaction ends.  An unreadable value counts as a hold, exactly like
+    retention_hold, so a corrupt setting can never unlock retained evidence.
+    """
+    for key in ('legal-hold:' + run_id, 'legal-hold-project:' + project):
+        row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
+        if row is None:
+            continue
+        try:
+            if json.loads(row[0]) is not False:
+                return key
+        except (ValueError, TypeError):
+            return key
+    return None
+
+
+def _remove_run_artifacts(store, run_id, project, directory):
+    """Delete a finished run's own artifacts, one write transaction per artifact.
+
+    Re-reading the legal hold under BEGIN IMMEDIATE serialises the check with
+    the unlink/rmdir it authorises: a hold committed first stops the remaining
+    deletions, and a hold written during a deletion waits for that transaction
+    to finish.  Per-artifact transactions bound the write-lock span to a single
+    artifact instead of the whole multi-project cleanup pass.
+    """
+    for name in CLEANUP_NAMES:
+        target = directory / name
+        if target.is_symlink() or not target.is_dir():
+            continue
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if _held_in_transaction(db, run_id, project):
+                return False
+            # Re-check under the write lock: an entry swapped for a link after
+            # the caller's lexical check must not be removed as the artifact.
+            if target.is_symlink() or not target.is_dir():
+                continue
+            _remove_artifact(directory, name)
+    return True
+
+
 class Maintenance:
     def maintenance_async(self):
         # maintenance 里的批量删除可能耗时数秒，放到后台线程执行，避免阻塞调度循环；
@@ -292,7 +397,6 @@ class Maintenance:
             self.maintenance_lock.release()
 
     def maintenance(self):
-        import shutil
         if (self.store.root / 'recycle').exists():
             recover_cleanup(self.store)
         now = time.time()
@@ -315,6 +419,9 @@ class Maintenance:
                                                  (run["id"], cutoff))
                             if not run or not run["path"]:
                                 continue
+                            # 保留标记与手动清理共享同一判断；损坏值按已保留处理。
+                            if retention_hold(self.store, run["id"], project["id"]):
+                                continue
                             if (run["state"] == "pr_open" or run["state"] == "merged" and not json.loads(run["result"]).get("monitoring_completed") or
                                     self.store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
                                                    "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
@@ -334,11 +441,10 @@ class Maintenance:
                                     db.execute("UPDATE runs SET state='expired' WHERE id=?", (run["id"],))
                                     db.execute("UPDATE tasks SET state='expired' WHERE id=? AND state='awaiting_approval'", (run["task"],))
                         # Publication admission is now closed for this expired candidate.
-                        # Filesystem deletion does not hold the scheduler/configuration lock.
-                        for name in ["workspace", "candidate", "baseline", "evaluation", "experiments", "dependencies", "acceptance-design", "feedback"]:
-                            target = directory / name
-                            if target.is_dir() and not target.is_symlink():
-                                shutil.rmtree(target)
+                        # 删除仍不持有调度/配置锁，但每个工件在各自的 BEGIN IMMEDIATE 内
+                        # 用同一连接重查 hold：预检后提交的 hold 会阻止余下删除，删除期间
+                        # 的 hold 写入会等到该事务结束后才提交。
+                        _remove_run_artifacts(self.store, run["id"], project["id"], directory)
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")

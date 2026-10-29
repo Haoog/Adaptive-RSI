@@ -5,6 +5,32 @@ from .config import fingerprint
 from .store import decode_object, decode_evidence
 
 
+MERGE_STATES = ("verified", "regressed")
+
+
+def merge_attribution(evidence):
+    """Attribute post-merge feedback to the original merge or to the later mainline.
+
+    显式的 merge 子记录优先。没有它时，历史记录只有 head 恰好等于合并提交才
+    属于原合并；head 已在主线之后的结果只能算后续主线回归，不能归给原修复。
+    """
+    feedback = evidence.get("feedback") if isinstance(evidence, dict) else None
+    if not isinstance(feedback, dict):
+        feedback = {}
+    merge = feedback.get("merge")
+    if not isinstance(merge, dict):
+        merge = {}
+    merged_sha = evidence.get("merged_sha") if isinstance(evidence, dict) else None
+    original_sha = merge.get("sha") if isinstance(merge.get("sha"), str) else merged_sha
+    original = merge.get("state") if merge.get("state") in MERGE_STATES else None
+    head = feedback.get("head") if isinstance(feedback.get("head"), str) else None
+    if original is None and head and head == merged_sha:
+        original = feedback.get("state") if feedback.get("state") in MERGE_STATES else None
+    mainline = (feedback.get("state") if feedback.get("state") in MERGE_STATES and head
+                and head != original_sha else None)
+    return {"postmerge_state": original, "mainline_state": mainline}
+
+
 def quality_summary(store, project=None):
     projects = {}
     failures = {}
@@ -14,15 +40,19 @@ def quality_summary(store, project=None):
         if run["source"].startswith("system_"):
             continue
         item = projects.setdefault(run["project"], {"project": run["project"], "runs": 0, "passed": 0,
-                                                    "evaluated": 0, "reviewed": 0, "review_blocked": 0, "repeat_failures": 0, "postmerge_verified": 0, "postmerge_regressed": 0})
+                                                    "evaluated": 0, "reviewed": 0, "review_blocked": 0, "repeat_failures": 0,
+                                                    "postmerge_verified": 0, "postmerge_regressed": 0,
+                                                    "mainline_regressed": 0})
         item["runs"] += 1
         if run["state"] in ["failed", "blocked", "insufficient_evidence"]:
             key = (run["project"], run["task"])
             failures[key] = failures.get(key, 0) + 1
         result = decode_evidence(run["result"])
-        feedback = result.get("feedback", {}).get("state")
-        if feedback in ["verified", "regressed"]:
-            item["postmerge_" + feedback] += 1
+        attribution = merge_attribution(result)
+        if attribution["postmerge_state"]:
+            item["postmerge_" + attribution["postmerge_state"]] += 1
+        if attribution["mainline_state"] == "regressed":
+            item["mainline_regressed"] += 1
         if result.get("evaluation"):
             item["evaluated"] += 1
         if result.get("evaluation", {}).get("decision") == "pass" and result.get("review", {}).get("decision") == "pass":
@@ -40,7 +70,13 @@ def workflow_metrics(store, project=None):
     """Logical task outcomes; elapsed spans and model call durations remain separate.
 
     派生数据各用一条聚合查询取回，避免逐任务 N+1 查询；输出结构与逐任务版本一致。
+    全部读取共享一个只读事务，响应只能对应某一个已提交快照。
     """
+    with store.snapshot():
+        return _workflow_metrics(store, project)
+
+
+def _workflow_metrics(store, project):
     cutoff = time.time() - 30 * 86400
     scope = "SELECT id FROM tasks WHERE source NOT LIKE 'system_%' AND created>?" + (" AND project=?" if project else "")
     scope_args = (cutoff, project) if project else (cutoff,)
@@ -101,14 +137,10 @@ def workflow_metrics(store, project=None):
                     result["value_feedback"][rating] += 1
                 else:
                     result["unrated_runs"] += 1
-                feedback = evidence.get("feedback", {})
-                merge = feedback.get("merge", {})
-                merge = merge if isinstance(merge, dict) else {}
-                postmerge = merge.get("state") or (feedback.get("state") if
-                    feedback.get("head") == evidence.get("merged_sha") else None)
-                if postmerge in ("verified", "regressed"):
-                    result["postmerge_" + postmerge] += 1
-                result["mainline_regressed"] += feedback.get("state") == "regressed" and feedback.get("head") != merge.get("sha", evidence.get("merged_sha"))
+                attribution = merge_attribution(evidence)
+                if attribution["postmerge_state"]:
+                    result["postmerge_" + attribution["postmerge_state"]] += 1
+                result["mainline_regressed"] += attribution["mainline_state"] == "regressed"
             infrastructure = evidence.get("failure", {}).get("code") in ["provider", "credentials", "environment"]
             result["infrastructure_failures"] += infrastructure
             if not infrastructure and (run["id"] in implemented or evidence.get("evaluation")):

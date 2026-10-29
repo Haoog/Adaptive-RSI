@@ -224,11 +224,14 @@ class Handler(BaseHTTPRequestHandler):
                         verification = verify_backup(path)
                     except (ValueError, OSError, sqlite3.Error):
                         raise RequestError("Backup verification failed") from None
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                        digest.update(chunk)
                     self.respond({
                         "format": 1,
                         "backup": {"id": path.stem, "bytes": verification["bytes"],
                                    "schema_version": verification["schema_version"],
-                                   "sha256": hashlib.sha256(stream.read()).hexdigest()},
+                                   "sha256": digest.hexdigest()},
                         "restore": {"artifacts_restored": False, "projects_paused": True,
                                     "credentials_require_reconnect": True},
                         "instructions": "adaptive-rsi --state-dir /NEW/STATE restore /PATH/" + path.name,

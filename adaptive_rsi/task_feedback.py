@@ -4,6 +4,7 @@ import re
 import time
 
 from .store import decode_evidence, decode_object, encode
+from .telemetry import merge_attribution
 
 RATINGS = {"helpful", "unnecessary", "false_positive"}
 
@@ -82,10 +83,7 @@ def summary(store, run):
     check_totals = {key: {"passed": sum(item.get("passed") is True for item in rows if isinstance(item, dict)),
                           "total": len(rows)} for key, rows in checks.items() if isinstance(rows, list)}
     sha = result.get("merged_sha")
-    feedback = result.get("feedback", {})
-    merge = feedback.get("merge")
-    merge = merge if isinstance(merge, dict) else {}
-    postmerge = merge.get("state") or (feedback.get("state") if feedback.get("head") == sha and sha else None)
+    attribution = merge_attribution(result)
     value = decode_object(saved_feedback["value"]) if saved_feedback else None
     if not isinstance(value, dict) or value.get("rating") not in RATINGS:
         value = None
@@ -95,6 +93,6 @@ def summary(store, run):
             "reused_stages": sorted({data["stage"] for item in reused
                                       if isinstance((data := decode_object(item["data"])).get("stage"), str)}),
             "delivery_sha": sha if isinstance(sha, str) and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha) else None,
-            "postmerge_state": postmerge,
-            "mainline_state": feedback.get("state") if feedback.get("head") and feedback.get("head") != sha else None,
+            "postmerge_state": attribution["postmerge_state"],
+            "mainline_state": attribution["mainline_state"],
             "interventions": interventions["n"], "value_feedback": value}

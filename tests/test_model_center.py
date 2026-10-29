@@ -174,6 +174,38 @@ class ActiveRunCredentialTest(unittest.TestCase):
         finally:
             restarted.close()
 
+    def test_frozen_run_price_uses_its_own_credential_generation_after_rotation(self):
+        first = self.run_snapshot()
+        assert first is not None
+        sealed = json.loads(first["config"])
+        route = {"provider": "gateway", "model": "fixture", "effort": "default", "fallback": None}
+        store = self.runtime.store
+        self.center.edit_model("gateway", {"id": "fixture", "manual": True, "unit_price": 4,
+                                           "prices": {"input": 1, "output": 2}})
+        before = store.reserve_call("p", "r", "analysis", route, sealed)
+        self.assertEqual(store.one("SELECT unit_price,input_price,output_price FROM calls WHERE id=?", (before,)),
+                         {"unit_price": 4, "input_price": 1, "output_price": 2})
+        self.rotate()
+        current = self.center.provider("gateway")
+        self.assertNotEqual(current["secret_ref"], self.old["secret_ref"])
+        directory = self.center.directory(current)
+        model = {item["id"]: item for item in directory["models"]}["fixture"]
+        # 轮换保留用户价格偏好，但不复用上一代次的探测结果。
+        self.assertEqual((model["unit_price"], model["prices"]), (4, {"input": 1.0, "output": 2.0}))
+        self.assertFalse(any(item.get("verified") or item.get("probes") for item in directory["models"]))
+        # 冻结运行按自己的旧凭据代次解析价格，不套用当前代次。
+        frozen = store.reserve_call("p", "r", "analysis", route, sealed)
+        self.assertEqual(store.one("SELECT unit_price,input_price,output_price FROM calls WHERE id=?", (frozen,)),
+                         {"unit_price": 4, "input_price": 1, "output_price": 2})
+        self.center.edit_model("gateway", {"id": "fixture", "unit_price": 9,
+                                           "prices": {"input": 7, "output": 8}})
+        # 新代次的价格改动不会改写旧运行已冻结的值。
+        self.assertEqual(store.one("SELECT unit_price,input_price,output_price FROM calls WHERE id=?", (frozen,)),
+                         {"unit_price": 4, "input_price": 1, "output_price": 2})
+        current_call = store.reserve_call("p", "r-current", "analysis", route, self.runtime.config("p"))
+        self.assertEqual(store.one("SELECT unit_price,input_price,output_price FROM calls WHERE id=?", (current_call,)),
+                         {"unit_price": 9, "input_price": 7, "output_price": 8})
+
     def test_malformed_unfinished_snapshot_defers_cleanup_conservatively(self):
         self.run_snapshot()
         for raw in ["{", "null", "{}", '{"providers": null}', '{"providers": [null]}']:
@@ -985,3 +1017,62 @@ class ModelCenterTest(unittest.TestCase):
         self.assertEqual((summary["priced_calls"], summary["component_priced_calls"],
                           summary["unit_price_priced_calls"]), (3, 2, 1))
         self.assertAlmostEqual(summary["estimated_usd"], .000275 + .001075 + .0012)
+
+    def frozen(self, call):
+        return self.runtime.store.one("SELECT unit_price,input_price,output_price FROM calls WHERE id=?", (call,))
+
+    def test_credential_generation_prices_project_and_global_calls_once(self):
+        # 有凭据代次时目录键包含该代次；预留调用必须用同一身份解析价格，
+        # 否则界面上有价格、calls 冻结字段却全是 null。只替换代次计算，不读真实凭据。
+        project = self.runtime.add_project(fixture(self.root / "project-pricing"))
+        route = {"provider": "ollama", "model": "coder-a", "effort": "default", "fallback": None}
+        store = self.runtime.store
+        with patch.object(Credentials, "epoch", return_value="f" * 32):
+            self.center.edit_model("ollama", {"id": "coder-a", "manual": True, "unit_price": 4,
+                                              "prices": {"input": 1, "output": 2}})
+            self.assertEqual(self.frozen(store.reserve_call("model-center", "run-global", "analysis", route,
+                                                            self.runtime.config())),
+                             {"unit_price": 4, "input_price": 1, "output_price": 2})
+            # 项目没有自己的目录时回退到同身份的全局目录。
+            self.assertEqual(self.frozen(store.reserve_call(project, "run-project", "analysis", route,
+                                                            self.runtime.config(project))),
+                             {"unit_price": 4, "input_price": 1, "output_price": 2})
+            self.center.edit_model("ollama", {"id": "coder-a", "unit_price": 6, "prices": {"input": 5}}, project)
+            own = store.reserve_call(project, "run-project-2", "analysis", route, self.runtime.config(project))
+            later = store.reserve_call("model-center", "run-global-2", "analysis", route, self.runtime.config())
+            self.assertEqual(self.frozen(own), {"unit_price": 6, "input_price": 5, "output_price": 2})
+            self.assertEqual(self.frozen(later), {"unit_price": 4, "input_price": 1, "output_price": 2})
+            # 价格按调用冻结：后续编辑不会回填已经预留的调用。
+            self.center.edit_model("ollama", {"id": "coder-a", "unit_price": 9})
+            self.assertEqual(self.frozen(later), {"unit_price": 4, "input_price": 1, "output_price": 2})
+            self.assertEqual(self.frozen(store.reserve_call("model-center", "run-global-3", "analysis", route,
+                                                            self.runtime.config())),
+                             {"unit_price": 9, "input_price": 1, "output_price": 2})
+
+    def test_unpriced_calls_stay_unknown_instead_of_free(self):
+        from adaptive_rsi.usage_report import report
+        store = self.runtime.store
+        route = {"provider": "ollama", "model": "no-price-model", "effort": "default", "fallback": None}
+        with patch.object(Credentials, "epoch", return_value="f" * 32):
+            call = store.reserve_call("model-center", "run-unknown", "analysis", route, self.runtime.config())
+        self.assertEqual(self.frozen(call), {"unit_price": None, "input_price": None, "output_price": None})
+        store.record_usage(call, "run-unknown", {"tokens": 0, "input_tokens": 0, "output_tokens": 0,
+                                                 "cache_read_tokens": 0, "cache_write_tokens": 0,
+                                                 "usage_known": False}, 1.0)
+        summary = report(store, {"start": ["0"], "end": [str(time.time() + 60)]})["summary"]
+        self.assertEqual((summary["priced_calls"], summary["unpriced_calls"]), (0, 1))
+        self.assertIsNone(summary["estimated_usd"])
+        self.assertEqual(store.one("SELECT price_basis FROM calls WHERE id=?", (call,))["price_basis"], "unknown")
+
+    def test_project_connection_override_does_not_borrow_global_prices(self):
+        # 项目覆盖了连接时签名不同；不能把全局连接的价格偏好套到本项目的调用上。
+        project = self.runtime.add_project(fixture(self.root / "project-override"))
+        provider = {"id": "gateway", "name": "Gateway", "protocol": "chat_completions",
+                    "base_url": "https://global.invalid/v1", "env_key": "", "credential": "none"}
+        self.runtime.configure({"providers": [provider]})
+        self.center.edit_model("gateway", {"id": "coder-a", "manual": True, "unit_price": 4})
+        self.runtime.configure({"providers": [{**provider, "base_url": "https://project.invalid/v1"}]}, project)
+        route = {"provider": "gateway", "model": "coder-a", "effort": "default", "fallback": None}
+        call = self.runtime.store.reserve_call(project, "run-override", "analysis", route,
+                                               self.runtime.config(project))
+        self.assertEqual(self.frozen(call), {"unit_price": None, "input_price": None, "output_price": None})
