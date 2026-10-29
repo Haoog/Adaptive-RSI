@@ -78,6 +78,26 @@ fn resumed_segment_requests_only_the_missing_bytes() {
     assert_eq!(native_update::range_header(4096).as_deref(), Some("bytes=4096-"));
 }
 
+#[cfg(unix)]
+#[test]
+fn identity_file_never_writes_through_links() {
+    let folder = tempfile::tempdir().unwrap();
+    let target = folder.path().join("outside");
+    let meta = native_update::part_meta_path(folder.path());
+    std::fs::write(&target, b"outside").unwrap();
+    std::os::unix::fs::symlink(&target, &meta).unwrap();
+    native_update::write_part_identity(&meta, "identity").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+    assert_eq!(std::fs::read_to_string(&meta).unwrap(), "identity");
+    assert!(std::fs::symlink_metadata(&meta).unwrap().file_type().is_file());
+
+    std::fs::remove_file(&meta).unwrap();
+    std::fs::hard_link(&target, &meta).unwrap();
+    native_update::write_part_identity(&meta, "second").unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+    assert_eq!(std::fs::read_to_string(&meta).unwrap(), "second");
+}
+
 #[test]
 fn segment_identity_is_bound_to_version_and_url() {
     let folder = tempfile::tempdir().unwrap();

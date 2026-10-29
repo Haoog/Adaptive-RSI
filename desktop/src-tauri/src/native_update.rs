@@ -72,6 +72,40 @@ pub(super) fn identity_matches(stored: Option<&str>, version: &str, url: &str) -
     stored.is_some_and(|value| value == part_identity(version, url))
 }
 
+/// Replaces the identity file without following a planted symlink or writing
+/// through a hard link; the same link checks used for the segment apply here.
+pub(super) fn write_part_identity(path: &Path, value: &str) -> Result<(), String> {
+    let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|_| "update_cache_unavailable")?;
+        let opened = file.metadata().map_err(|_| "update_cache_unavailable")?;
+        let linked = std::fs::symlink_metadata(path).ok();
+        if !opened.is_file() || opened.nlink() != 1
+            || linked.as_ref().map_or(true, |meta| meta.dev() != opened.dev() || meta.ino() != opened.ino())
+        {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err("update_cache_unavailable".into());
+        }
+        file.write_all(value.as_bytes()).map_err(|_| "update_cache_unavailable")?;
+        file.sync_all().map_err(|_| "update_cache_unavailable")?;
+        return Ok(());
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, value).map_err(|_| "update_cache_unavailable".into())
+    }
+}
+
 /// Resume from the bytes already on disk, but never trust a segment that is
 /// larger than the package bound or larger than the size the server declares.
 pub(super) fn resume_offset(existing: u64, total: Option<u64>) -> u64 {
@@ -668,8 +702,7 @@ async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater
     if !identity_matches(stored.as_deref(), version, url) {
         // Never append a new release to a segment left by another artifact.
         discard_part(&part);
-        std::fs::write(&meta, part_identity(version, url))
-            .map_err(|_| "update_cache_unavailable")?;
+        write_part_identity(&meta, &part_identity(version, url))?;
     }
     let offset = resume_offset(part_bytes(&part), (announced < MAX_PACKAGE as u64).then_some(announced));
     // The cache, application and extraction volumes all need room for the
