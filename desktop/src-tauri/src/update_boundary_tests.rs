@@ -99,6 +99,21 @@ fn identity_file_never_writes_through_links() {
 }
 
 #[test]
+fn empty_and_oversized_segments_restart_without_a_permanent_error() {
+    let folder = tempfile::tempdir().unwrap();
+    let part = native_update::part_path(folder.path());
+    std::fs::write(&part, b"").unwrap();
+    assert_eq!(native_update::part_bytes(&part), 0);
+    drop(native_update::open_part(&part, 0).unwrap());
+    assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+
+    std::fs::write(&part, b"0123456789").unwrap();
+    assert_eq!(native_update::resume_offset(native_update::part_bytes(&part), Some(4)), 0);
+    drop(native_update::open_part(&part, 0).unwrap());
+    assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+}
+
+#[test]
 fn segment_identity_is_bound_to_version_and_url() {
     let folder = tempfile::tempdir().unwrap();
     let meta = native_update::part_meta_path(folder.path());
