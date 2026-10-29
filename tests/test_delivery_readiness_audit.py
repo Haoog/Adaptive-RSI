@@ -10,6 +10,7 @@ from adaptive_rsi.config import DEFAULTS
 import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
 from adaptive_rsi.gitops import git
+from adaptive_rsi.store import encode
 
 
 class ClosedPublicationTest(unittest.TestCase):
@@ -221,10 +222,28 @@ class AuthorizationReceiptTest(unittest.TestCase):
             git(case.repo, 'add', '.')
             git(case.repo, '-c', 'user.name=Test', '-c', 'user.email=t@localhost', 'commit', '-qm', 'fixed')
             target = git(case.repo, 'rev-parse', 'HEAD')
+            # Pin the exact check the receipt must re-run. Relying on adapter
+            # detection would make the delivery gate depend on the host's
+            # available toolchain rather than on sealed project configuration.
+            sealed = json.loads(case.run['config'])
+            sealed['checks'] = [{'name': 'calculator behaviour', 'cwd': '.',
+                                 'argv': ['python3', '-c',
+                                          'import calculator,sys; sys.exit(0 if calculator.add(2,3)==5 else 1)']}]
+            case.runtime.store.execute('UPDATE runs SET config=? WHERE id=?',
+                                       (encode(sealed), case.run['id']))
+            case.run = case.runtime.store.one('SELECT * FROM runs WHERE id=?', (case.run['id'],))
             outcome = {'merged_sha': target, 'feedback': {'state': 'verified'}}
-            with patch.object(release, 'api', side_effect=case.api):
+            # The sandbox backend is macOS-only in CI, so stub the execution while
+            # asserting it was asked to evaluate two snapshots of the exact target.
+            checked = []
+            def evaluate(baseline, candidate, checks, directory, config, **kwargs):
+                checked.append((git(baseline, 'rev-parse', 'HEAD'), git(candidate, 'rev-parse', 'HEAD'), checks))
+                return {'decision': 'pass', 'checks': {'candidate': [{'name': 'calculator behaviour', 'passed': True}]}}
+            with patch.object(release, 'api', side_effect=case.api), \
+                    patch.object(case.runtime.evaluator, 'evaluate', side_effect=evaluate):
                 data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
-            self.assertEqual(data['release']['state'], 'submitted')
+            self.assertEqual(data['release']['state'], 'submitted', data['release'].get('error'))
+            self.assertEqual(checked, [(target, target, sealed['checks'])])
             stored = json.loads(case.runtime.store.one('SELECT result FROM runs WHERE id=?',
                                                         (case.run['id'],))['result'])
             self.assertEqual(stored['feedback']['head'], target)
