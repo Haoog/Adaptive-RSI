@@ -283,6 +283,7 @@ class CIMetricsWorkflowTest(unittest.TestCase):
         jobs = WorkflowConfigurationTest().workflow('release.yml')['jobs']
         self.assertIn('timings', jobs)
         job = jobs['timings']
+        self.assertIs(job.get('continue-on-error'), True, 'Observational metrics must not fail a completed release')
         self.assertEqual(set(job['needs']), {'prepare', 'reuse', 'tests', 'node', 'browser', 'build', 'publish'})
         self.assertEqual(job['if'], 'always()')
         self.assertEqual(job['permissions'], {'contents': 'read', 'actions': 'read', 'checks': 'read'})

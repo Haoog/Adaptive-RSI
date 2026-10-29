@@ -308,6 +308,7 @@ jobs:
         run: python3 scripts/release.py publish
   timings:
     if: always()
+    continue-on-error: true
     needs: [prepare, reuse, tests, node, browser, build, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
