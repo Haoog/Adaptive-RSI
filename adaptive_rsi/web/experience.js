@@ -1091,33 +1091,38 @@ window.RSIExperience = (() => {
         "adaptive-rsi --state-dir /NEW/STATE restore /PATH/BACKUP.sqlite3",
       ),
     );
-    const diagnostics = await api("diagnostics"),
+    const diagnostics = await api("diagnostics/preview"),
       preview = el("details");
     preview.append(
       el("summary", t("诊断导出预览")),
       el(
         "p",
         t(
-          "仅包含版本、数量、故障代码和占用。不含凭据、路径、代码、任务正文或完整提示。",
+          "默认诊断包仅包含版本、数量、故障代码和占用。不含凭据、路径、代码、任务正文或完整提示。",
         ),
         "muted",
       ),
       el("pre", JSON.stringify(diagnostics, null, 2)),
     );
-    box.append(
-      preview,
-      action(t("下载诊断摘要"), () => {
-        const blob = new Blob([JSON.stringify(diagnostics, null, 2)], {
-            type: "application/json",
-          }),
-          url = URL.createObjectURL(blob),
-          link = el("a");
-        link.href = url;
-        link.download = "adaptive-rsi-diagnostics.json";
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-      }),
-    );
+    const consent = el("input");
+    consent.type = "checkbox";
+    consent.id = "diagnostic-consent";
+    const consentLabel = el("label");
+    consentLabel.append(consent, document.createTextNode(t("我已核对预览内容，并同意导出这份诊断包。")));
+    const exportButton = action(t("导出诊断包"), async () => {
+      const result = await api("diagnostics/export", { consent: true });
+      const blob = new Blob([result.body], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = el("a");
+      link.href = url;
+      link.download = result.filename || "adaptive-rsi-diagnostics.json";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast(t("诊断包已导出"));
+    });
+    exportButton.disabled = true;
+    consent.onchange = () => { exportButton.disabled = !consent.checked; };
+    box.append(preview, consentLabel, exportButton);
     if (data.expiring.length)
       box.append(
         el(
@@ -1241,6 +1246,41 @@ window.RSIExperience = (() => {
       ),
     );
   }
+  let shutdownOverlay = null;
+  async function showShutdownProgress() {
+    if (shutdownOverlay) return;
+    const overlay = el("div", undefined, "shutdown-overlay");
+    overlay.setAttribute("role", "status");
+    const title = el("h2", t("正在安全关闭本机服务"));
+    const status = el("p", t("正在准备关闭…"));
+    overlay.append(title, status);
+    document.body.append(overlay);
+    shutdownOverlay = { overlay, status };
+    const phases = {
+      stopping: "正在停止接收新任务",
+      authentication: "正在结束登录会话",
+      operations: "正在结束后台操作",
+      scheduler: "正在停止调度",
+      workers: "正在等待运行中的任务结束",
+      maintenance: "正在结束维护任务",
+      storage: "正在保存并关闭数据库",
+      completed: "本机服务已安全停止",
+      failed: "关闭过程中出现问题",
+    };
+    for (;;) {
+      try {
+        const data = await api("shutdown-status");
+        status.textContent = t(phases[data.phase] || "正在关闭本机服务") + " · " +
+          t("剩余任务") + " " + (data.remaining_workers || 0) + " · " +
+          t("后台操作") + " " + (data.remaining_operations || 0);
+        if (data.phase === "completed" || data.phase === "failed") break;
+      } catch {
+        status.textContent = t("本机服务已停止，正在退出应用。");
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 350));
+    }
+  }
   let deepLinkOpened = false;
   function refreshed() {
     safe(pollInbox);
@@ -1261,6 +1301,12 @@ window.RSIExperience = (() => {
     window.addEventListener('rsi-history-task',event=>{
       if(event.detail?.task&&event.detail?.project)safe(()=>openTask({id:event.detail.task,project:event.detail.project},false));
     });
+    window.addEventListener('rsi-native-command', event => {
+      const command = event.detail?.command;
+      if (command === 'export-diagnostics') safe(() => storage());
+      if (command === 'check-update') safe(() => window.RSINativeUpdate?.run('check'));
+    });
+    window.addEventListener('rsi-app-shutdown', () => safe(showShutdownProgress));
     $("attention-inbox").onclick = () => safe(inbox);
     $("mobile-install").onclick = () => safe(mobile);
     $("storage-tools").onclick = () => safe(storage);

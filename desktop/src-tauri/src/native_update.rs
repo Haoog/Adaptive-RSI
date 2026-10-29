@@ -1,10 +1,23 @@
 use super::*;
 use fs2::available_space;
-use std::{fs::File, path::{Path, PathBuf}};
+use std::{fs::File, path::{Path, PathBuf}, time::Instant};
 use tauri_plugin_updater::UpdaterExt;
 
 const FEED: &str = "https://github.com/Haoog/Adaptive-RSI/releases/latest/download/desktop-latest.json";
 pub(super) const MAX_PACKAGE: usize = 512 * 1024 * 1024;
+
+/// Persisted download segment. Resuming reads its length; a completed package is
+/// renamed to `CACHED_NAME` only after the signature has been verified.
+pub(super) const PART_NAME: &str = "staged-update.part";
+pub(super) const CACHED_NAME: &str = "staged-update.bin";
+
+// Transfer deadlines are split so a stalled phase reports its own cause. They are
+// deliberately not loosened: total time stays at the previous 600s bound.
+pub(super) const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const UPDATE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const UPDATE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const UPDATE_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(super) fn require_same_artifact(approved: &Value, current: Option<&Value>) -> Result<(), String> {
     if current == Some(approved) { Ok(()) } else { Err("update_target_changed".into()) }
@@ -43,6 +56,286 @@ pub(super) fn announced_size(feed: &Value) -> u64 {
         .and_then(Value::as_u64)
         .filter(|size| *size > 0)
         .unwrap_or(MAX_PACKAGE as u64)
+}
+
+/// Bytes still missing after a resume, so the preflight never reserves space twice.
+pub(super) fn remaining_bytes(announced: u64, offset: u64) -> u64 {
+    announced.saturating_sub(offset)
+}
+
+pub(super) fn part_path(cache: &Path) -> PathBuf { cache.join(PART_NAME) }
+pub(super) fn cached_path(cache: &Path) -> PathBuf { cache.join(CACHED_NAME) }
+
+/// Resume from the bytes already on disk, but never trust a segment that is
+/// larger than the package bound or larger than the size the server declares.
+pub(super) fn resume_offset(existing: u64, total: Option<u64>) -> u64 {
+    if existing > MAX_PACKAGE as u64 { return 0; }
+    if total.is_some_and(|total| existing > total) { return 0; }
+    existing
+}
+
+/// A resume request must start exactly at the persisted offset.
+pub(super) fn range_header(offset: u64) -> Option<String> {
+    (offset > 0).then(|| format!("bytes={offset}-"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ContentRange {
+    pub start: u64,
+    pub total: Option<u64>,
+}
+
+pub(super) fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let (range, total) = rest.split_once('/')?;
+    let (start, _end) = range.trim().split_once('-')?;
+    Some(ContentRange { start: start.trim().parse().ok()?, total: total.trim().parse().ok() })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SegmentAction {
+    /// 206 with a matching Content-Range start: keep the bytes on disk.
+    Append,
+    /// 200 (server ignored Range) or a mismatched 206: truncate and start over.
+    Restart,
+    /// 416 and other non-success statuses: the segment is unusable.
+    Rejected,
+}
+
+pub(super) fn segment_action(existing: u64, status: u16, content_range: Option<&ContentRange>) -> SegmentAction {
+    match status {
+        206 if existing > 0 && content_range.is_some_and(|range| range.start == existing) => SegmentAction::Append,
+        206 | 200 => SegmentAction::Restart,
+        _ => SegmentAction::Rejected,
+    }
+}
+
+/// A segment must not be resumed after a failure that makes its bytes untrusted.
+pub(super) fn discards_segment(error: &str) -> bool {
+    matches!(error, "update_size_limit" | "update_download_or_signature_failed" | "update_range_rejected")
+}
+
+#[cfg(unix)]
+fn single_link(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink() == 1
+}
+#[cfg(not(unix))]
+fn single_link(_: &std::fs::Metadata) -> bool { true }
+
+#[cfg(unix)]
+fn same_identity(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev() && before.ino() == after.ino()
+}
+
+pub(super) fn part_bytes(path: &Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && single_link(&metadata) => {
+            if metadata.len() > MAX_PACKAGE as u64 { discard_part(path); 0 } else { metadata.len() }
+        }
+        Ok(_) => { discard_part(path); 0 }
+        Err(_) => 0,
+    }
+}
+
+/// Removes anything squatting on the segment path, including directories, so a
+/// later resume can never write through a link or fail on a stale entry.
+pub(super) fn discard_part(path: &Path) {
+    if path.symlink_metadata().is_err() { return; }
+    if std::fs::remove_file(path).is_err() { let _ = std::fs::remove_dir(path); }
+}
+
+#[cfg(unix)]
+pub(super) fn open_part(path: &Path, offset: u64) -> Result<File, String> {
+    // A zero offset means a fresh download: an empty or reset segment cannot be
+    // reused, and exclusive creation must start from a missing path.
+    let before = if offset == 0 {
+        discard_part(path);
+        None
+    } else {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && single_link(&metadata) => Some(metadata),
+            Ok(_) => { discard_part(path); None }
+            Err(_) => None,
+        }
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Reject a symlink at open time and never block on a swapped FIFO;
+        // the metadata identity check below remains as the second layer.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    if offset > 0 {
+        // Resume must never create a new path; a missing segment is a failed
+        // resume, not permission to follow whatever now occupies the name.
+        options.append(true);
+    } else {
+        // Exclusive creation never follows a pre-existing symlink/hard link.
+        options.create_new(true);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(_) => {
+            // Remove a competing symlink/hard link before the next attempt; the
+            // link target itself is never opened or modified.
+            discard_part(path);
+            return Err("update_cache_unavailable".into());
+        }
+    };
+    // Always verify the object that was actually opened. A missing segment at
+    // the first metadata check must not skip this: an attacker could create a
+    // symlink or hard link before open and set_len would otherwise follow it.
+    let after = std::fs::symlink_metadata(path).map_err(|_| "update_cache_unavailable")?;
+    let opened = file.metadata().map_err(|_| "update_cache_unavailable")?;
+    let identity_ok = after.is_file() && single_link(&after) && same_identity(&opened, &after)
+        && before.as_ref().map_or(true, |value| same_identity(value, &after));
+    if !identity_ok {
+        drop(file);
+        discard_part(path);
+        return Err("update_range_rejected".into());
+    }
+    if offset == 0 {
+        file.set_len(0).map_err(|_| "update_cache_unavailable")?;
+    }
+    if offset > 0 {
+        let length = file.metadata().map_err(|_| "update_cache_unavailable")?.len();
+        if length != offset {
+            drop(file);
+            discard_part(path);
+            return Err("update_range_rejected".into());
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub(super) fn open_part(_: &Path, _: u64) -> Result<File, String> {
+    // Desktop updates are only produced and verified for macOS; refusing here
+    // keeps a non-Unix build from silently weakening the link checks.
+    Err("update_unsupported_platform".into())
+}
+
+/// Throttles progress writes to roughly one every `PROGRESS_INTERVAL`.
+pub(super) struct Progress {
+    started: Instant,
+    last: Instant,
+    base: u64,
+}
+
+impl Progress {
+    pub(super) fn new(now: Instant, base: u64) -> Self {
+        Self { started: now, last: now, base }
+    }
+
+    pub(super) fn due(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last) >= PROGRESS_INTERVAL {
+            self.last = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn rate(&self, bytes: u64, now: Instant) -> Option<u64> {
+        bytes_per_second(bytes.saturating_sub(self.base), now.saturating_duration_since(self.started))
+    }
+}
+
+/// `None` when the speed cannot be derived yet, which the UI renders as unknown.
+pub(super) fn bytes_per_second(bytes: u64, elapsed: Duration) -> Option<u64> {
+    if bytes == 0 || elapsed.is_zero() { return None; }
+    let rate = (bytes as u128).saturating_mul(1_000_000_000) / elapsed.as_nanos();
+    Some(rate.min(u64::MAX as u128) as u64)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Platform { Macos, Windows, Linux }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Arch { Aarch64, X86_64 }
+
+const PLATFORM_MARKERS: [(&str, Platform); 4] =
+    [("macos", Platform::Macos), ("darwin", Platform::Macos), ("windows", Platform::Windows), ("linux", Platform::Linux)];
+const ARCH_MARKERS: [(&str, Arch); 4] =
+    [("aarch64", Arch::Aarch64), ("arm64", Arch::Aarch64), ("x86-64", Arch::X86_64), ("amd64", Arch::X86_64)];
+
+pub(super) fn host_platform() -> &'static str { std::env::consts::OS }
+pub(super) fn host_arch() -> &'static str { std::env::consts::ARCH }
+
+pub(super) fn host_target() -> (Option<Platform>, Option<Arch>) {
+    let platform = match host_platform() {
+        "macos" => Some(Platform::Macos),
+        "windows" => Some(Platform::Windows),
+        "linux" => Some(Platform::Linux),
+        _ => None,
+    };
+    let arch = match host_arch() {
+        "aarch64" => Some(Arch::Aarch64),
+        "x86_64" => Some(Arch::X86_64),
+        _ => None,
+    };
+    (platform, arch)
+}
+
+fn has_marker(text: &str, marker: &str) -> bool {
+    let mut from = 0;
+    while let Some(index) = text[from..].find(marker) {
+        let start = from + index;
+        let end = start + marker.len();
+        let before = text[..start].chars().next_back().map_or(true, |value| !value.is_ascii_alphanumeric());
+        let after = text[end..].chars().next().map_or(true, |value| !value.is_ascii_alphanumeric());
+        if before && after { return true; }
+        from = end;
+    }
+    false
+}
+
+/// Unknown markers stay `None` so an unlabelled asset is never rejected blindly.
+pub(super) fn detect_target(label: &str) -> (Option<Platform>, Option<Arch>) {
+    let text = label.to_ascii_lowercase().replace('_', "-");
+    let platform = PLATFORM_MARKERS.iter().find(|(marker, _)| has_marker(&text, marker)).map(|(_, value)| *value);
+    let arch = ARCH_MARKERS.iter().find(|(marker, _)| has_marker(&text, marker)).map(|(_, value)| *value);
+    (platform, arch)
+}
+
+/// Only the asset file name is inspected, so a host or repository name cannot
+/// masquerade as a platform marker.
+pub(super) fn asset_label(url: &str, name: Option<&str>) -> String {
+    let path = url.split('#').next().unwrap_or(url);
+    let path = path.split('?').next().unwrap_or(path);
+    let file = path.rsplit('/').next().unwrap_or(path);
+    match name {
+        Some(name) if !name.is_empty() => format!("{file} {name}"),
+        _ => file.to_string(),
+    }
+}
+
+pub(super) fn require_compatible_asset(url: &str, name: Option<&str>,
+                                       host: (Option<Platform>, Option<Arch>)) -> Result<(), String> {
+    let (platform, arch) = detect_target(&asset_label(url, name));
+    let platform_mismatch = host.0.is_some_and(|host| platform.is_some_and(|found| found != host));
+    let arch_mismatch = host.1.is_some_and(|host| arch.is_some_and(|found| found != host));
+    if platform_mismatch || arch_mismatch { Err("update_incompatible_platform".into()) } else { Ok(()) }
+}
+
+fn asset_name(feed: &Value) -> Option<&str> {
+    ["name", "asset", "asset_name"].iter()
+        .find_map(|key| feed.get(*key).and_then(Value::as_str))
+}
+
+/// Adds the progress/identity fields the panel reads, with explicit nulls so an
+/// unknown total or an idle stage never looks like a number.
+pub(super) fn describe_snapshot(state: &mut Value, current_version: &str, platform: &str, arch: &str) {
+    for key in ["stage", "bytes", "total", "bytes_per_second"] {
+        if state.get(key).is_none() { state[key] = Value::Null; }
+    }
+    state["current_version"] = json!(current_version);
+    state["platform"] = json!(platform);
+    state["arch"] = json!(arch);
 }
 
 #[cfg(unix)]
@@ -216,7 +509,7 @@ fn configured(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, S
 
 pub fn snapshot(app: &tauri::AppHandle) -> Value {
     let mut state = app.state::<NativeUpdater>().state.lock().unwrap().clone();
-    state["current_version"] = json!(app.package_info().version.to_string());
+    describe_snapshot(&mut state, &app.package_info().version.to_string(), host_platform(), host_arch());
     state
 }
 
@@ -224,6 +517,149 @@ pub async fn check(app: tauri::AppHandle, download: bool) -> Result<Value, Strin
     let updater = app.state::<NativeUpdater>();
     let Ok(_operation) = updater.begin() else { return Ok(snapshot(&app)); };
     check_in_operation(&app, download).await
+}
+
+/// Streams the package into `staged-update.part`, resuming from the bytes that a
+/// previous run (or a cancelled run) left behind.
+async fn transfer(updater: &NativeUpdater, update: &tauri_plugin_updater::Update, part: &Path,
+                  mut offset: u64, total: &mut Option<u64>, version: &str, notes: &str) -> Result<u64, String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(UPDATE_CONNECT_TIMEOUT)
+        .build()
+        .map_err(|_| "update_check_failed")?;
+    let started = Instant::now();
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+        let request_started = Instant::now();
+        let mut request = client.get(update.download_url.clone()).headers(update.headers.clone());
+        if let Some(range) = range_header(offset) {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let send = request.send();
+        tokio::pin!(send);
+        let mut response = loop {
+            if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+            if request_started.elapsed() >= UPDATE_RESPONSE_TIMEOUT { return Err("update_response_timeout".into()); }
+            if started.elapsed() >= UPDATE_TOTAL_TIMEOUT { return Err("update_download_timeout".into()); }
+            tokio::select! {
+                value = &mut send => break value.map_err(|error| {
+                    if error.is_timeout() || error.is_connect() {
+                        "update_connect_timeout".to_string()
+                    } else {
+                        "update_connection_failed".to_string()
+                    }
+                })?,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        };
+        let status = response.status().as_u16();
+        if status == 416 {
+            discard_part(part);
+            return Err("update_range_rejected".into());
+        }
+        if !(200..300).contains(&status) { return Err("update_download_or_signature_failed".into()); }
+        let content_range = response.headers().get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        match segment_action(offset, status, content_range.as_ref()) {
+            SegmentAction::Rejected => {
+                // 416 is handled above; any other unexpected success status means
+                // the body cannot be trusted as a segment for this package.
+                discard_part(part);
+                return Err("update_download_or_signature_failed".into());
+            }
+            SegmentAction::Restart if offset > 0 => {
+                // The server ignored our offset (200) or answered for another start.
+                discard_part(part);
+                offset = 0;
+                if attempt < 2 { continue; }
+                // A second inconsistent answer is not written as if it were a
+                // full body; the segment is already gone and the caller retries.
+                return Err("update_download_or_signature_failed".into());
+            }
+            SegmentAction::Append | SegmentAction::Restart => {}
+        }
+        let declared = content_range.as_ref().and_then(|range| range.total)
+            .or_else(|| response.content_length().map(|length| offset.saturating_add(length)));
+        if declared.is_some_and(|value| value > MAX_PACKAGE as u64) {
+            discard_part(part);
+            return Err("update_size_limit".into());
+        }
+        if declared.is_some_and(|value| value < offset) {
+            discard_part(part);
+            return Err("update_download_or_signature_failed".into());
+        }
+        if let Some(value) = declared { *total = Some(value); }
+        let mut file = open_part(part, offset)?;
+        let mut progress = Progress::new(Instant::now(), offset);
+        let mut count = offset;
+        updater.set(json!({"state":"downloading","stage":"downloading","version":version,"notes":notes,
+            "bytes":count,"total":*total,"bytes_per_second":Value::Null}));
+        loop {
+            if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+            if started.elapsed() >= UPDATE_TOTAL_TIMEOUT { return Err("update_download_timeout".into()); }
+            let receive = tokio::time::timeout(UPDATE_IDLE_TIMEOUT, response.chunk());
+            tokio::pin!(receive);
+            let chunk = loop {
+                if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
+                if started.elapsed() >= UPDATE_TOTAL_TIMEOUT { return Err("update_download_timeout".into()); }
+                tokio::select! {
+                    value = &mut receive => break value.map_err(|_| "update_transfer_stalled")?
+                        .map_err(|_| "update_download_or_signature_failed")?,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            };
+            let Some(chunk) = chunk else { break; };
+            let next = count.saturating_add(chunk.len() as u64);
+            if next > MAX_PACKAGE as u64 {
+                discard_part(part);
+                return Err("update_size_limit".into());
+            }
+            file.write_all(&chunk).map_err(|_| "update_cache_unavailable")?;
+            count = next;
+            let now = Instant::now();
+            if progress.due(now) {
+                updater.set(json!({"state":"downloading","stage":"downloading","version":version,"notes":notes,
+                    "bytes":count,"total":*total,"bytes_per_second":progress.rate(count, now)}));
+            }
+        }
+        file.sync_all().map_err(|_| "update_cache_unavailable")?;
+        if total.is_some_and(|value| count < value) { return Err("update_download_incomplete".into()); }
+        return Ok(count);
+    }
+}
+
+async fn download_package(updater: &NativeUpdater, update: &tauri_plugin_updater::Update,
+                          cache: &Path, version: &str, notes: &str) -> Result<(), String> {
+    let cached = cached_path(cache);
+    let part = part_path(cache);
+    let announced = announced_size(&update.raw_json);
+    let offset = resume_offset(part_bytes(&part), (announced < MAX_PACKAGE as u64).then_some(announced));
+    preflight_space(cache, remaining_bytes(announced, offset))?;
+    let mut total = (announced < MAX_PACKAGE as u64).then_some(announced);
+    let mut count = offset;
+    // A segment that already holds the announced size needs no request at all.
+    if announced == MAX_PACKAGE as u64 || offset < announced {
+        count = transfer(updater, update, &part, offset, &mut total, version, notes).await?;
+    }
+    updater.set(json!({"state":"verifying","stage":"verifying","version":version,"notes":notes,
+        "bytes":count,"total":total,"bytes_per_second":Value::Null}));
+    let verified = read_package(&part).and_then(|bytes| {
+        update.verify(&bytes).map_err(|_| "update_download_or_signature_failed".to_string())
+    });
+    if let Err(error) = verified {
+        if discards_segment(&error) { discard_part(&part); }
+        return Err(error);
+    }
+    // Atomic hand-off: the verified bytes only become the cached package once
+    // the signature matched, so a crash can never stage an unverified file.
+    if std::fs::rename(&part, &cached).is_err() {
+        discard_part(&part);
+        return Err("update_cache_unavailable".into());
+    }
+    Ok(())
 }
 
 async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Value, String> {
@@ -240,12 +676,16 @@ async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Va
         if parse_version(&update.version).is_none() {
             return Err("unstable_update_rejected".into());
         }
+        // Reject a clearly foreign asset before any byte is requested. Unlabelled
+        // assets stay eligible, so the conservative default is unchanged.
+        require_compatible_asset(update.download_url.as_str(), asset_name(&update.raw_json), host_target())?;
+        if update.download_url.scheme() != "https" { return Err("invalid_update_feed".into()); }
         let version = update.version.clone();
         let notes = update.body.clone().unwrap_or_default();
         updater.set(json!({"state":"available","version":version,"notes":notes}));
         let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
         std::fs::create_dir_all(&cache).map_err(|_| "update_cache_unavailable")?;
-        let cached = cache.join("staged-update.bin");
+        let cached = cached_path(&cache);
         // A fresh feed and signature check are required even when using a persisted package.
         if let Ok(bytes) = read_package(&cached) {
             if update.verify(&bytes).is_ok() {
@@ -256,47 +696,8 @@ async fn check_in_operation(app: &tauri::AppHandle, download: bool) -> Result<Va
         }
         *updater.staged.lock().unwrap() = None;
         if !download { return Ok(snapshot(&app)); }
-        preflight_space(&cache, announced_size(&update.raw_json))?;
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(600)).build().map_err(|_| "update_check_failed")?;
-        if update.download_url.scheme() != "https" { return Err("invalid_update_feed".into()); }
-        let send = client.get(update.download_url.clone()).headers(update.headers.clone()).send();
-        tokio::pin!(send);
-        let mut response = loop {
-            if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
-            tokio::select! {
-                value = &mut send => break value.map_err(|_| "update_connection_failed")?,
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-            }
-        };
-        if !response.status().is_success() { return Err("update_download_or_signature_failed".into()); }
-        let total = response.content_length();
-        if total.is_some_and(|size| size > MAX_PACKAGE as u64) { return Err("update_size_limit".into()); }
-        let mut output = tempfile::NamedTempFile::new_in(&cache).map_err(|_| "update_cache_unavailable")?;
-        let mut count = 0u64;
-        loop {
-            let receive = tokio::time::timeout(Duration::from_secs(30), response.chunk());
-            tokio::pin!(receive);
-            let chunk = loop {
-                if updater.cancel.load(Ordering::SeqCst) { return Err("update_cancelled".into()); }
-                tokio::select! {
-                    value = &mut receive => break value.map_err(|_| "update_transfer_stalled")?
-                        .map_err(|_| "update_download_or_signature_failed")?,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            };
-            let Some(chunk) = chunk else { break; };
-            count += chunk.len() as u64;
-            if count > MAX_PACKAGE as u64 { return Err("update_size_limit".into()); }
-            output.write_all(&chunk).map_err(|_| "update_cache_unavailable")?;
-            updater.set(json!({"state":"downloading","version":version,"notes":notes,"bytes":count,"total":total}));
-        }
-        output.as_file().sync_all().map_err(|_| "update_cache_unavailable")?;
-        let bytes = read_package(output.path())?;
-        update.verify(&bytes).map_err(|_| "update_download_or_signature_failed")?;
-        drop(bytes);
-        output.persist(&cached).map_err(|_| "update_cache_unavailable")?;
-        *updater.staged.lock().unwrap() = Some((update.clone(), cached));
+        download_package(&updater, &update, &cache, &version, &notes).await?;
+        *updater.staged.lock().unwrap() = Some((update, cached));
         updater.set(json!({"state":"ready","version":version,"notes":notes}));
         Ok(snapshot(&app))
     }.await;
@@ -379,7 +780,7 @@ fn install_in_operation(app: tauri::AppHandle, window: String, approved: Value) 
         let cache = app.path().app_cache_dir().map_err(|_| "update_cache_unavailable")?;
         preflight_space(&cache, announced_size(&approved))?;
         if updater.cancel.load(Ordering::SeqCst) { return Err("update_wait_cancelled".into()); }
-        updater.set(json!({"state":"installing","version":version}));
+        updater.set(json!({"state":"installing","stage":"installing","version":version}));
         // Replacement starts only after owned work has drained. Other services are not stopped.
         // A stop request is irreversible: never treat a child whose stdin was already
         // closed as a usable connection, even if it has not exited within the grace period.

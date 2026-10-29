@@ -24,6 +24,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["time", "macros", "rt", "sync"] }
 minisign-verify = "0.3"
 base64 = "0.22"
+libc = "0.2"
 
 [profile.release]
 lto = true

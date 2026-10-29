@@ -308,6 +308,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._request_id = secrets.token_hex(8)
+        # The shutdown probe must stay readable while the runtime closes its
+        # store; it only reads in-memory phase and counters.
+        if urlparse(self.path).path == "/api/shutdown-status":
+            return self._do_GET()
         with self.server.runtime.store.query_scope(request=self._request_id):
             return self._do_GET()
 
@@ -412,6 +416,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/diagnostics":
                 from .storage_tools import diagnostics
                 self.respond(diagnostics(store))
+            elif parsed.path == "/api/diagnostics/preview":
+                from .storage_tools import diagnostic_preview
+                self.respond(diagnostic_preview(store))
+            elif parsed.path == "/api/shutdown-status":
+                self.respond(runtime.shutdown_status())
             elif parsed.path == "/api/backup":
                 identifier = params.get("id", [""])[0]
                 if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
@@ -794,6 +803,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/operations/cancel":
                 self.respond(runtime.operations.cancel(body.get("id")))
+                return
+            if path == "/api/diagnostics/export":
+                # Recompute the minimal preview instead of trusting client content;
+                # only an explicit consent flag is accepted from the caller.
+                if body.get("consent") is not True or set(body) != {"consent"}:
+                    raise RequestError("Diagnostic export requires explicit consent")
+                from .storage_tools import diagnostic_preview
+                import json as json_module
+                preview = diagnostic_preview(runtime.store)
+                encoded = json_module.dumps(preview, ensure_ascii=False, sort_keys=True,
+                                            allow_nan=False)
+                self.respond({"format": 1, "filename": "adaptive-rsi-diagnostics.json",
+                              "body": encoded, "bytes": len(encoded.encode("utf-8"))})
                 return
             if path == "/api/desktop-update":
                 from .lifecycle import readiness

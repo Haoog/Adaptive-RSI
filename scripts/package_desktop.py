@@ -31,6 +31,124 @@ FULL_BUILD_FILES = {
     "scripts/test_updater_signing.py",
 }
 
+# Explicit desktop platform support matrix. This is the single source of truth
+# for packaging, `--print-support-matrix` and the RELEASING tables: a target is
+# supported only when real build, install and updater evidence exists. Every
+# other combination stays unsupported and packaging refuses to emit an asset.
+SUPPORTED_TARGETS = {
+    "macos-arm64": {
+        "supported": True,
+        "system": "macOS",
+        "machine": "arm64",
+        "systems": ("darwin",),
+        "machines": ("arm64", "aarch64"),
+        "signing": "adhoc",
+        "evidence": {"build": "verified", "install": "partial", "update": "partial"},
+        "reason": "Formal release path: CI builds the ad-hoc signed DMG and verifies the image, the "
+                  "app signature and the bundled engine, and keeps evidence for the signed updater "
+                  "archive and desktop-latest.json; drag-install into Applications and moving an "
+                  "older desktop install still require manual confirmation.",
+    },
+    "macos-x86_64": {
+        "supported": False,
+        "system": "macOS",
+        "machine": "x86_64",
+        "systems": ("darwin",),
+        "machines": ("x86_64", "amd64", "x64"),
+        "signing": "none",
+        "evidence": {"build": "not_available", "install": "not_available", "update": "not_available"},
+        "reason": "Unsupported: there is no macOS x86_64 build, signing or updater end-to-end "
+                  "evidence; only the arm64 bundle is built and verified.",
+    },
+    "windows-x86_64": {
+        "supported": False,
+        "system": "Windows",
+        "machine": "x86_64",
+        "systems": ("windows",),
+        "machines": ("x86_64", "amd64", "x64"),
+        "signing": "none",
+        "evidence": {"build": "not_available", "install": "not_available", "update": "not_available"},
+        "reason": "Unsupported: there is no Windows build, code signing, installer or updater "
+                  "end-to-end evidence; no Windows installer is produced or verified.",
+    },
+    "windows-arm64": {
+        "supported": False,
+        "system": "Windows",
+        "machine": "arm64",
+        "systems": ("windows",),
+        "machines": ("arm64", "aarch64"),
+        "signing": "none",
+        "evidence": {"build": "not_available", "install": "not_available", "update": "not_available"},
+        "reason": "Unsupported: there is no Windows on ARM build, code signing, installer or "
+                  "updater end-to-end evidence; no Windows installer is produced or verified.",
+    },
+    "linux-x86_64": {
+        "supported": False,
+        "system": "Linux",
+        "machine": "x86_64",
+        "systems": ("linux",),
+        "machines": ("x86_64", "amd64", "x64"),
+        "signing": "none",
+        "evidence": {"build": "not_available", "install": "not_available", "update": "not_available"},
+        "reason": "Unsupported: there is no Linux build, package signing, installer or updater "
+                  "end-to-end evidence; no Linux package is produced or verified.",
+    },
+    "linux-arm64": {
+        "supported": False,
+        "system": "Linux",
+        "machine": "arm64",
+        "systems": ("linux",),
+        "machines": ("arm64", "aarch64"),
+        "signing": "none",
+        "evidence": {"build": "not_available", "install": "not_available", "update": "not_available"},
+        "reason": "Unsupported: there is no Linux build, package signing, installer or updater "
+                  "end-to-end evidence; no Linux package is produced or verified.",
+    },
+}
+UNKNOWN_TARGET = "unknown"
+UNKNOWN_TARGET_REASON = ("Unrecognized platform combination: no build, signing or updater "
+                         "end-to-end evidence exists, so it is unsupported.")
+SYSTEM_ALIASES = {"darwin": "darwin", "macos": "darwin", "windows": "windows", "win32": "windows",
+                  "linux": "linux"}
+MACHINE_ALIASES = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x86_64", "amd64": "x86_64",
+                   "x64": "x86_64"}
+
+
+def support_status(system, machine):
+    """Resolve one platform pair against the explicit support matrix."""
+    normalized_system = SYSTEM_ALIASES.get(str(system or "").strip().lower())
+    normalized_machine = MACHINE_ALIASES.get(str(machine or "").strip().lower())
+    if normalized_system and normalized_machine:
+        for target, entry in SUPPORTED_TARGETS.items():
+            if normalized_system in entry["systems"] and normalized_machine in entry["machines"]:
+                return {"supported": entry["supported"], "target": target, "reason": entry["reason"]}
+    return {"supported": False, "target": UNKNOWN_TARGET, "reason": UNKNOWN_TARGET_REASON}
+
+
+def require_supported_target(system=None, machine=None):
+    """Refuse unsupported desktop targets instead of emitting an asset."""
+    system = platform.system() if system is None else system
+    machine = platform.machine() if machine is None else machine
+    status = support_status(system, machine)
+    if not status["supported"]:
+        raise ValueError("Unsupported desktop target " + status["target"] +
+                         " (" + str(system) + "/" + str(machine) + "): " + status["reason"])
+    return status
+
+
+def support_matrix():
+    """Return the machine-readable support matrix printed by the CLI."""
+    return {
+        "format": 1,
+        "targets": [
+            {"target": target, "supported": entry["supported"], "system": entry["system"],
+             "machine": entry["machine"], "signing": entry["signing"],
+             "evidence": dict(entry["evidence"]), "reason": entry["reason"]}
+            for target, entry in sorted(SUPPORTED_TARGETS.items())
+        ],
+        "unknown": {"supported": False, "target": UNKNOWN_TARGET, "reason": UNKNOWN_TARGET_REASON},
+    }
+
 
 def desktop_build_mode(paths, event="pull_request"):
     """Require a full desktop build only when desktop packaging can change."""
@@ -112,10 +230,9 @@ def verify_macos_dmg(image, mountpoint):
 
 def package_desktop(bundle_dir=BUNDLE_DIR, output_dir=OUTPUT_DIR, version=None,
                     system=None, machine=None):
-    system = system or platform.system()
-    machine = (machine or platform.machine()).lower()
-    if system != "Darwin" or machine not in {"arm64", "aarch64"}:
-        raise ValueError("The formal desktop asset currently requires a macOS ARM64 build")
+    system = platform.system() if system is None else system
+    machine = platform.machine() if machine is None else machine
+    require_supported_target(system, machine)
     if version is None:
         source = (ROOT / "adaptive_rsi/__init__.py").read_text()
         match = re.search(r'(?m)^__version__ = "(\d+\.\d+\.\d+)"$', source)
@@ -225,7 +342,12 @@ def main():
     parser.add_argument("--event", default="pull_request")
     parser.add_argument("binary", nargs="?")
     parser.add_argument("--image")
+    parser.add_argument("--print-support-matrix", action="store_true",
+                        help="print the desktop platform support matrix as JSON and exit")
     args = parser.parse_args()
+    if args.print_support_matrix:
+        print(json.dumps(support_matrix(), ensure_ascii=False))
+        return
     if args.action == "classify":
         print(desktop_build_mode(sys.stdin.readlines(), args.event))
     elif args.action == "smoke-engine":
@@ -238,6 +360,12 @@ def main():
         with tempfile.TemporaryDirectory(prefix="rsi-dmg-verify-") as directory:
             print(json.dumps(verify_macos_dmg(args.image, Path(directory) / "mount"), ensure_ascii=False))
     else:
+        status = support_status(platform.system(), platform.machine())
+        if not status["supported"]:
+            print("Unsupported desktop target " + status["target"] + " (" +
+                  platform.system() + "/" + platform.machine() + "): " + status["reason"],
+                  file=sys.stderr)
+            raise SystemExit(2)
         image = package_desktop()
         if os.environ.get("RSI_UPDATER_PUBLIC_KEY"):
             source = (ROOT / "adaptive_rsi/__init__.py").read_text()

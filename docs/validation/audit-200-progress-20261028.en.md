@@ -6,7 +6,7 @@ Current continuation: the user has authorized work to continue. Read the [curren
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 117 implemented with targeted acceptance, 55 partial, and 29 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 124 implemented with targeted acceptance, 52 partial, and 25 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -121,20 +121,20 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 64. **partial** — Persist verified update downloads
 65. **partial** — Separate update transport deadlines
 66. **pending** — Exercise updater key rotation
-67. **pending** — Explain update compatibility requirements
-68. **pending** — Publish a tested platform asset matrix
+67. **implemented** — Explain update compatibility requirements
+68. **implemented** — Publish a tested platform asset matrix
 69. **pending** — Offer download bandwidth limits
-70. **pending** — Explain update progress by stage
+70. **implemented** — Explain update progress by stage
 71. **implemented** — Estimate space from actual assets
 72. **pending** — Make desktop lifecycle preferences explicit
-73. **partial** — Offer opt-in crash diagnostics
+73. **implemented** — Offer opt-in crash diagnostics
 74. **partial** — Scope navigation preferences to runtime instances
-75. **pending** — Add native desktop commands
+75. **partial** — Add native desktop commands
 76. **pending** — Diagnose proxy and certificate configuration
-77. **partial** — Explain which components an update affects
+77. **implemented** — Explain which components an update affects
 78. **implemented** — Add update maintenance windows
 79. **implemented** — Export upgrade receipts
-80. **partial** — Negotiate feature capabilities
+80. **implemented** — Negotiate feature capabilities
 81. **implemented** — Support bounded dependency DAGs
 82. **implemented** — Preview dependency cancellation effects
 83. **implemented** — Map grouped acceptance to individual evidence
@@ -148,7 +148,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 91. **implemented** — Implement resource priority and wait accounting
 92. **implemented** — Add disk and memory pressure admission
 93. **partial** — Consider deadline-driven scheduling
-94. **partial** — Explain graceful shutdown progress
+94. **implemented** — Explain graceful shutdown progress
 95. **implemented** — Use stage-specific deadlines
 96. **partial** — Reuse sealed read-only checkpoints
 97. **implemented** — Capture intervention reasons and outcomes

@@ -50,6 +50,25 @@ def existing_session(root):
         return None
 
 
+def drain_before_shutdown(runtime, server):
+    """Close the runtime while the HTTP server still answers shutdown-status.
+
+    The status endpoint reads the runtime phase directly, so the listening
+    socket must stay open until the drain has finished. Only then may the
+    server stop accepting requests.
+    """
+    completed = False
+    try:
+        runtime.close()
+        completed = True
+    finally:
+        # Leave one short polling window so the overlay can read phase=completed
+        # before the listener disappears; the app exits immediately afterwards.
+        if completed:
+            time.sleep(0.5)
+        server.shutdown()
+
+
 def run(root):
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     session = existing_session(root)
@@ -84,9 +103,15 @@ def run(root):
         atomic_json(root / "server.json", session)
         print(json.dumps({**session, "owned": True}), flush=True)
 
+        stopping = threading.Event()
+
         def stop(*unused):
+            if stopping.is_set():
+                return
+            stopping.set()
             runtime.stop.set()
-            threading.Thread(target=server.shutdown, daemon=True).start()
+            threading.Thread(target=drain_before_shutdown, args=(runtime, server),
+                             daemon=True).start()
 
         for sig in [signal.SIGTERM, signal.SIGINT]:
             signal.signal(sig, stop)

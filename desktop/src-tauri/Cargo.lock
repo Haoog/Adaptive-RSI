@@ -9,6 +9,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fs2",
+ "libc",
  "minisign-verify",
  "reqwest 0.12.28",
  "serde",

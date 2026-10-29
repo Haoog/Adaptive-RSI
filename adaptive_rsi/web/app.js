@@ -204,12 +204,18 @@ function featureForPath(path){
  // Configuration repair predates capability descriptors and remains a baseline operation.
  return null;
 }
+function updateCapabilityNotice(caps){
+ const notice=$('capability-notice');if(!notice)return;
+ const missing=caps===null||!caps.has('task-batch')||!caps.has('operations');
+ notice.hidden=!missing;
+ notice.textContent=missing?t('当前服务版本较旧，部分功能不可用；基础任务仍可继续。'):'';
+}
 async function negotiateCapabilities(){
  if(serviceCapabilities!==null)return serviceCapabilities;
  if(!serviceContractPromise)serviceContractPromise=(async()=>{
   const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),5000);
-  try{const response=await fetch('/api/contract',{signal:controller.signal});if(!response.ok){if([404,405].includes(response.status))return serviceCapabilities=new Set();throw Error('contract unavailable');}const contract=await response.json();return serviceCapabilities=new Set(Array.isArray(contract.descriptor?.capabilities)?contract.descriptor.capabilities:[]);}
-  catch{return null;}
+  try{const response=await fetch('/api/contract',{signal:controller.signal});if(!response.ok){if([404,405].includes(response.status)){serviceCapabilities=new Set();updateCapabilityNotice(serviceCapabilities);return serviceCapabilities;}throw Error('contract unavailable');}const contract=await response.json();serviceCapabilities=new Set(Array.isArray(contract.descriptor?.capabilities)?contract.descriptor.capabilities:[]);updateCapabilityNotice(serviceCapabilities);return serviceCapabilities;}
+  catch{updateCapabilityNotice(null);return null;}
   finally{clearTimeout(timeout);serviceContractPromise=null;}
  })();
  return serviceContractPromise;
@@ -1202,11 +1208,12 @@ function renderUpdate(){if(!state)return;const update=state.update||{state:'unch
  renderUpdateExtras(update);}
 $('check-update').addEventListener('click',()=>safe(async()=>{if(window.RSIDesktop&&window.RSINativeUpdate){await window.RSINativeUpdate.run('check');return;}if(window.RSIDesktop){await checkDesktopUpdate(true);if(desktopCheckError){toast(t('检查更新失败，请稍后重试。'),true);return;}if(!desktopUpdate)toast(t('已是最新稳定版'));return;}const result=await api('updates/check',{});if(result.update){state.update=result.update;renderUpdate();}else await refresh();if(result.started)toast(t('已开始检查更新'));}));
 $('apply-update').addEventListener('click',()=>safe(async()=>{if(!(await uiConfirm(t('将安装正式发布包，并在任务空闲时重启服务。确认更新？'))))return;await api('updates/apply',{confirm:true});toast(t('已申请更新，等待空闲和重启'));await refresh();}));
-safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();}await refresh();});
+safe(async()=>{if(window.RSIDesktop){await window.RSIDesktop.ready;restoreRuntimeNavigation();if(window.RSIDesktop.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});}await refresh();});
 if(window.RSIDesktop)safe(checkDesktopUpdate);
 $('language-select').addEventListener('change',()=>safe(async()=>{
  language=$('language-select').value;
  localWrite('rsi-language',language);
+ if(window.RSIDesktop?.invoke)window.RSIDesktop.invoke('set_native_language',{language}).catch(()=>{});
  translateStatic();
  const connectionStates=['已连接','连接中断','连接超时','需要重新登录'];
  $('connection').textContent=t(connectionStates.find(name=>[name,english[name]].includes($('connection').textContent))||'已连接');
