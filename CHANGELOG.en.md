@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.133
+
+<!-- adaptive-rsi-release:0.5.133;base:01a17ad88d5243e24d15fe6e3d82a168a17e1e3b -->
+
 - Redesign the app icon around a folded A, align desktop, browser, home-screen and sidebar marks, generate standard sizes and refresh the previous icon cache.
 - Redesign workspace, model, settings and detail surfaces with consistent light/dark themes; place status beside goal entry, align task rows, reveal batch actions on selection and contain long project paths in the sidebar.
 - Refresh project archive and attention inbox labels when switching languages.
