@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -145,6 +147,7 @@ class DeliveryRecoveryTest(unittest.TestCase):
                          "queued" if retry else "pr_open")
         if retry:
             self.assertTrue(json.loads(saved["result"])["close_pending"])
+            self.store.close()
             self.store = self.runtime.store = Store(self.store.root)
             with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
                     patch("adaptive_rsi.delivery.checked", return_value="") as close:
@@ -344,6 +347,281 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
             self.assertEqual(response.status, 400)
             self.assertEqual(payload, {"error": "Workflow repository must match the selected project's origin",
                                        "error_code": "validation_error"})
+
+
+class _ManualReconciliationFixture(unittest.TestCase):
+    """Shared real-runtime fixture for manual reconciliation tests."""
+
+    TRUSTED = "a" * 40
+    MERGED = "b" * 40
+    WORKFLOW = ".github/workflows/publish.yml"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name).resolve()
+        repo = fixture(root / "project")
+        git(repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        self.runtime = Runtime(Store(root / "state"), FakeAgent())
+        self.addCleanup(self.runtime.close)
+        self.project = self.runtime.add_project(repo, enabled=True)
+        release_policy = {**DEFAULTS["delivery"]["release"], "enabled": True, "workflow": self.WORKFLOW,
+                          "ref": "trusted-v1", "sha": self.TRUSTED}
+        deploy_policy = {**DEFAULTS["delivery"]["deploy"], "enabled": True, "workflow": self.WORKFLOW,
+                         "ref": "trusted-v1", "sha": self.TRUSTED, "automatic_rollback": False}
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"mode": "pr", "release": release_policy, "deploy": deploy_policy}},
+                               self.project)
+        task = self.runtime.goal(self.project, "Manual reconciliation")
+        run = self.runtime.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.store.execute(
+            "UPDATE runs SET state='merged', result=? WHERE id=?",
+            (encode({"merged_sha": self.MERGED, "feedback": {"state": "verified", "head": self.MERGED}}), run["id"]))
+        self.record = self.runtime.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+        self.posts = []
+
+    def operation(self, kind="release", state="dispatch_unknown", **extra):
+        policy = json.loads(self.record["config"])["delivery"][kind]
+        data = {"state": state, "repository": "example/project", "sha": self.MERGED,
+                "workflow": policy["workflow"], "ref": policy["ref"], "workflow_sha": policy["sha"],
+                "operation_id": "rsi-operation", "created_at": time.time(), "attempt": 0,
+                "dispatch_receipt": "unknown", "error": "GitHub did not confirm the dispatch"}
+        data.update(extra)
+        return release.save(self.runtime, self.record, kind, data)
+
+    def remote(self, run_id=17, **overrides):
+        data = {"id": run_id, "head_sha": self.TRUSTED, "head_branch": "trusted-v1",
+                "display_title": "rsi-operation", "event": "workflow_dispatch",
+                "path": self.WORKFLOW + "@refs/tags/trusted-v1", "status": "queued", "conclusion": None,
+                "run_attempt": 1, "created_at": "2026-10-30T00:00:00Z", "updated_at": "2026-10-30T00:00:00Z"}
+        data.update(overrides)
+        return data
+
+    def api(self, runs=None, single=None):
+        def handler(repo, endpoint, method="GET", fields=None):
+            self.assertEqual(repo, "example/project")
+            if method == "POST":
+                self.posts.append((endpoint, fields))
+                return {}
+            if endpoint.startswith("actions/runs/"):
+                run_id = int(endpoint.rsplit("/", 1)[1])
+                if single is not None:
+                    return single
+                match = next((item for item in runs or [] if item.get("id") == run_id), None)
+                if match is not None:
+                    return match
+                raise AssertionError("unexpected single-run read")
+            if "/runs?" in endpoint:
+                return {"workflow_runs": list(runs or [])}
+            raise AssertionError(endpoint)
+        return handler
+
+    def saved(self, kind="release"):
+        return self.runtime.store.setting(release.key(self.record["id"], kind))
+
+
+class ManualReconciliationTest(_ManualReconciliationFixture):
+    """Manual association may only bind an exact run returned by a read-only query."""
+
+    def test_rollback_rerun_resolution_resumes_parent_tracking(self):
+        self.operation(state="workflow_succeeded")
+        for status, conclusion in [("queued", None), ("in_progress", None), ("completed", "success"),
+                                   ("completed", "failure"), ("completed", "cancelled")]:
+            with self.subTest(status=status):
+                rollback = {**self.operation(kind="deploy"), "state": "rerun_unknown",
+                            "workflow_run_id": 17, "attempt": 1, "previous_attempt": 1,
+                            "rerun_pending": True, "rerun_requested_at": time.time() - 400}
+                self.operation(kind="deploy", state="rollback_failed", rollback=rollback, error="Previous attempt was unconfirmed")
+                self.assertFalse(release.pending(self.runtime, self.record))
+                with patch.object(release, "api", side_effect=self.api(single=self.remote(
+                        17, run_attempt=2, status=status, conclusion=conclusion))):
+                    release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17, target="rollback")
+                saved = self.saved("deploy")
+                resumed = conclusion not in {"failure", "cancelled"}
+                self.assertEqual(saved["state"], "rolling_back" if resumed else "rollback_failed")
+                self.assertEqual(release.pending(self.runtime, self.record), resumed)
+                if resumed:
+                    self.assertEqual(saved["error"], "")
+                self.assertEqual(self.posts, [])
+
+    def test_multiple_exact_candidates_bind_only_the_explicit_selection(self):
+        remotes = [self.remote(101), self.remote(102, status="in_progress")]
+        for selected, expected in [(101, "queued"), (102, "running")]:
+            with self.subTest(selected=selected):
+                self.operation()
+                with patch.object(release, "api", side_effect=self.api(runs=remotes)):
+                    view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+                    self.assertIsNone(self.saved().get("workflow_run_id"))
+                    self.assertEqual(view.get("reconciliation_state"), "manual_inspection_required")
+                    result = release.resolve(self.runtime, self.project, self.record["id"], "release", selected)
+                self.assertEqual(result["state"], expected)
+                saved = self.saved()
+                self.assertEqual(saved["workflow_run_id"], selected)
+                self.assertEqual(saved["manual_reconciliation"]["raw_candidates"], remotes)
+                self.assertEqual(self.posts, [])
+
+    def test_candidates_list_fixed_links_and_explain_absence_without_free_text(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(101), self.remote(102)])):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual([item["id"] for item in view["candidates"]], [101, 102])
+        self.assertEqual(view["candidates"][0]["url"], "https://github.com/example/project/actions/runs/101")
+        self.assertEqual(view["state"], "dispatch_unknown")
+        saved = self.saved()
+        self.assertEqual(saved["reconciliation"]["state"], "manual_inspection_required")
+        self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+        self.assertEqual(saved["state"], "dispatch_unknown")
+        self.assertEqual(self.posts, [])
+
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            empty = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(empty["candidates"], [])
+        self.assertEqual(empty["state"], "dispatch_unknown")
+        self.assertIn("manual run IDs are not accepted", empty["reason"])
+        self.assertIn("awaiting_remote_visibility", self.saved()["reconciliation"]["state"])
+        self.assertEqual(self.posts, [])
+
+    def test_selection_rejects_ids_outside_the_server_query(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "does not match this operation"):
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 99)
+        saved = self.saved()
+        self.assertEqual(saved["state"], "dispatch_unknown")
+        self.assertIsNone(saved.get("workflow_run_id"))
+        self.assertEqual(self.posts, [])
+
+    def test_selection_rejects_every_identity_mismatch(self):
+        self.operation()
+        mismatches = [
+            {"head_sha": "c" * 40},
+            {"head_branch": "other-ref"},
+            {"display_title": "other-operation"},
+            {"event": "push"},
+            {"path": ".github/workflows/other.yml@refs/tags/trusted-v1"},
+        ]
+        for overrides in mismatches:
+            with self.subTest(overrides=overrides), \
+                    patch.object(release, "api", side_effect=self.api(runs=[self.remote(17, **overrides)])):
+                with self.assertRaisesRegex(release.ReconciliationRejected, "does not match this operation"):
+                    release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+                self.assertEqual(self.saved()["state"], "dispatch_unknown")
+        self.assertEqual(self.posts, [])
+
+    def test_exact_selection_binds_read_only_and_persists_raw_audit(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17, status="in_progress")])):
+            release.candidates(self.runtime, self.project, self.record["id"], "release")
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 17, source="test")
+        saved = self.saved()
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(saved["state"], "running")
+        self.assertEqual(saved["workflow_run_id"], 17)
+        self.assertEqual(saved["reconciliation"]["state"], "matched")
+        self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+        audit = saved["manual_reconciliation"]
+        self.assertEqual(audit["source"], "test")
+        self.assertEqual(audit["selected_run_id"], 17)
+        self.assertEqual(audit["previous"]["state"], "dispatch_unknown")
+        self.assertEqual(audit["previous"]["candidate_run_ids"], [17])
+        self.assertEqual(audit["candidates"][0]["id"], 17)
+        self.assertEqual(audit["candidates"][0]["url"], "https://github.com/example/project/actions/runs/17")
+        self.assertGreater(audit["at"], 0)
+        self.assertEqual(saved["manual_reconciliations"][-1]["selected_run_id"], 17)
+        events = self.runtime.store.query("SELECT kind FROM events WHERE run=?", (self.record["id"],))
+        self.assertIn("automation_reconciled", [row["kind"] for row in events])
+        self.assertEqual(self.posts, [])
+
+    def test_selection_never_turns_queued_evidence_into_success(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17, status="queued", conclusion=None)])):
+            release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        saved = self.saved()
+        self.assertEqual(saved["state"], "queued")
+        self.assertNotEqual(saved["state"], "workflow_succeeded")
+        self.assertEqual(self.posts, [])
+
+    def test_rerun_unknown_requires_a_confirmed_new_attempt(self):
+        self.operation(state="rerun_unknown", workflow_run_id=17, attempt=1, previous_attempt=1,
+                       rerun_pending=True, rerun_requested_at=time.time() - 400)
+        with patch.object(release, "api", side_effect=self.api(single=self.remote(17, run_attempt=1))):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "has not confirmed a new attempt"):
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        self.assertEqual(self.saved()["state"], "rerun_unknown")
+
+        with patch.object(release, "api", side_effect=self.api(single=self.remote(17, run_attempt=2, status="in_progress"))):
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        saved = self.saved()
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(saved["state"], "running")
+        self.assertFalse(saved["rerun_pending"])
+        self.assertEqual(saved["rerun_receipt"], "confirmed")
+        self.assertEqual(saved["manual_reconciliation"]["previous"]["state"], "rerun_unknown")
+        self.assertEqual(self.posts, [])
+
+    def test_manual_selection_keeps_authorization_and_deployment_ownership_checks(self):
+        self.operation()
+        self.runtime.configure({"delivery": {"release": {"enabled": False}}}, self.project)
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "authorization"):
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        self.assertEqual(self.saved()["state"], "dispatch_unknown")
+
+        self.runtime.configure({"delivery": {"release": {"enabled": True}}}, self.project)
+        self.operation(kind="deploy")
+        policy = self.runtime.config(self.project)["delivery"]["deploy"]
+        self.runtime.store.put_setting(release.owner_key(self.project, "example/project", policy),
+                                       {"run": "another-run", "sha": self.MERGED})
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "newer deployment owns this target"):
+                release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17)
+        self.assertEqual(self.saved("deploy")["state"], "dispatch_unknown")
+        self.assertEqual(self.posts, [])
+
+
+class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
+    def test_endpoints_expose_candidates_and_reject_unsafe_ids(self):
+        import http.client
+        from adaptive_rsi import server as server_module
+        self.operation()
+        server = server_module.Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("GET", "/api/release-candidates?project=" + self.project +
+                                       "&run=" + self.record["id"] + "&kind=release",
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual([item["id"] for item in payload["candidates"]], [17])
+                self.assertEqual(payload["candidates"][0]["url"],
+                                 "https://github.com/example/project/actions/runs/17")
+
+                body = json.dumps({"project": self.project, "run": self.record["id"], "kind": "release",
+                                   "workflow_run_id": 99}).encode()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("POST", "/api/release-resolve", body, {
+                        "Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                        "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 400)
+                self.assertIn("does not match this operation", payload["error"])
+                self.assertEqual(self.posts, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+        self.assertEqual(self.saved()["state"], "dispatch_unknown")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import platform
@@ -88,6 +89,163 @@ ANTHROPIC_REQUEST_OUTPUT = (
 )
 ANTHROPIC_DEFAULT_REQUEST_OUTPUT = 8192
 
+# 能力规则核对日期：只说明本地这些规则最近一次核对官方页面/既有验证的时间，
+# 不代表供应商的模型变更日期，也不代表每个型号都在当天重新测试过。
+CAPABILITY_RULE_REVIEWED_AT = "2026-10-30"
+ANTHROPIC_MODELS_DOC = "https://docs.anthropic.com/en/docs/about-claude/models/overview"
+OPENAI_MODELS_DOC = "https://platform.openai.com/docs/models"
+GEMINI_MODELS_DOC = "https://ai.google.dev/gemini-api/docs/models"
+
+# 只收录 2026-10-30 现场核对成功的逐型号官方页；日期后缀必须与页面一致，
+# 任意变体或未知日期一律落入 heuristic，不能冒充 documented。
+# 每条为 (正则, 上下文上限, 输出上限, 官方来源)。顺序即优先级。
+CAPABILITY_RULES = (
+    (r"(?:^|[/:.])claude-opus-4-5(?:-20251101)?(?:-v\d+:\d+)?$", 200000, 64000,
+     "https://platform.claude.com/docs/en/models/opus-4-5/overview"),
+    (r"(?:^|[/:.])claude-sonnet-4-5(?:-20250929)?(?:-v\d+:\d+)?$", 200000, 64000,
+     "https://platform.claude.com/docs/en/models/sonnet-4-5/overview"),
+    (r"(?:^|[/:.])claude-haiku-4-5(?:-20251001)?(?:-v\d+:\d+)?$", 200000, 64000,
+     "https://platform.claude.com/docs/en/models/haiku-4-5/overview"),
+    (r"(?:^|[/:.])gpt-5$", 400000, 128000, "https://developers.openai.com/api/docs/models/gpt-5"),
+    (r"(?:^|[/:.])gpt-4\.1$", 1047576, 32768, "https://developers.openai.com/api/docs/models/gpt-4.1"),
+    (r"(?:^|[/:.])gpt-4o(?:-2024-08-06)?$", 128000, 16384,
+     "https://developers.openai.com/api/docs/models/gpt-4o"),
+    (r"(?:^|[/:.])o1$", 200000, 100000, "https://developers.openai.com/api/docs/models/o1"),
+    (r"(?:^|[/:.])o3$", 200000, 100000, "https://developers.openai.com/api/docs/models/o3"),
+    (r"(?:^|[/:.])o4-mini$", 200000, 100000, "https://developers.openai.com/api/docs/models/o4-mini"),
+    (r"(?:^|[/:.])gemini-2\.5-pro$", 1048576, 65536,
+     "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro"),
+    (r"(?:^|[/:.])gemini-2\.5-flash$", 1048576, 65536,
+     "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash"),
+    (r"(?:^|[/:.])gemini-2\.5-flash-lite$", 1048576, 65536,
+     "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite"),
+    (r"(?:^|[/:.])gemini-2\.0-flash$", 1048576, 8192,
+     "https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash"),
+)
+# 旧型号/旧快照没有当前官方逐型号页可引用：保留保守数值，但绝不带来源或核对日期。
+CAPABILITY_HEURISTIC_RULES = (
+    (r"(?:^|[/:.])claude-(?:opus|sonnet)-4(?:-1)?(?:-\d{8})?(?:-v\d+:\d+)?$", 200000, 32000),
+    (r"(?:^|[/:.])claude-3-(?:opus|sonnet|haiku)(?:-\d{8})?(?:-v\d+:\d+)?$", 200000, 4096),
+    (r"(?:^|[/:.])gpt-4o-2024-05-13$", 128000, 4096),
+    (r"(?:^|[/:.])gemini-1\.5-pro(?:-\d{3})?$", 2097152, 8192),
+    (r"(?:^|[/:.])gemini-1\.5-flash(?:-\d{3})?$", 1048576, 8192),
+)
+CAPABILITY_OVERRIDE_FIELDS = ("context_tokens", "max_output_tokens", "source_url", "note", "updated_at")
+
+
+def _capability_efforts(model):
+    value = str(model or "").lower()
+    if "claude" in value:
+        return ["low", "medium", "high", "max"]
+    if "gemini" in value:
+        return ["default"]
+    if re.search(r"gpt-[0-9]|\bo[134]\b", value):
+        return ["default", "low", "medium", "high", "xhigh", "max"]
+    return ["default"]
+
+
+def normalize_capability_override(value):
+    """校验并规范化人工覆盖；不读取模型基础值，调用方负责最终上限一致性检查。"""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("Model capability override must be an object")
+    unknown = set(value) - set(CAPABILITY_OVERRIDE_FIELDS)
+    if unknown:
+        raise ValueError("Unknown model capability override field: " + sorted(unknown)[0])
+    result = {}
+    for name in ("context_tokens", "max_output_tokens"):
+        limit = value.get(name)
+        if limit is None:
+            continue
+        # bool 是 int 的子类，但 True 不能当作 1 token 的能力上限。
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("Model capability {} must be a positive integer".format(name))
+        result[name] = limit
+    if result.get("context_tokens") is not None and result.get("max_output_tokens") is not None and \
+            result["max_output_tokens"] > result["context_tokens"]:
+        raise ValueError("max_output_tokens cannot exceed context_tokens")
+    source_url = value.get("source_url")
+    if source_url is not None:
+        if not isinstance(source_url, str) or len(source_url) > 500 or \
+                not re.fullmatch(r"https?://[^\s]+", source_url):
+            raise ValueError("Model capability source_url must be an http(s) URL")
+        result["source_url"] = source_url
+    note = value.get("note")
+    if note is not None:
+        if not isinstance(note, str) or len(note.strip()) > 500:
+            raise ValueError("Model capability note must be at most 500 characters")
+        if note.strip():
+            result["note"] = note.strip()
+    updated_at = value.get("updated_at")
+    if updated_at is not None:
+        if not isinstance(updated_at, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", updated_at):
+            raise ValueError("Model capability updated_at must be YYYY-MM-DD")
+        try:
+            datetime.date.fromisoformat(updated_at)
+        except ValueError:
+            raise ValueError("Model capability updated_at must be YYYY-MM-DD") from None
+        result["updated_at"] = updated_at
+    return result
+
+
+def model_capabilities(model, protocol="", override=None):
+    """Return conservative routing metadata; unknown models never inherit premium limits.
+
+    ``source``/``confidence``/``evidence`` distinguish documented model rules from
+    family inference, conservative defaults, and persistent manual overrides.
+    ``updated_at`` is the rule-review date for documented rules (or the manual
+    override date), never a claim about when the vendor changed the model.
+    """
+    value = str(model or "").lower()
+    result = {"id": model, "context_tokens": 128000, "max_output_tokens": 16384,
+              "efforts": [*_capability_efforts(model)], "tools": True,
+              "streaming": protocol in ("responses", "anthropic", "chat_completions", "gemini"),
+              "streaming_implemented": False, "metadata_version": 1, "updated_at": None,
+              "source": "conservative_default", "confidence": "heuristic", "evidence": "heuristic",
+              "source_url": None, "note": None, "date_semantics": None}
+    for pattern, context_tokens, max_output_tokens, source_url in CAPABILITY_RULES:
+        if re.search(pattern, value):
+            result.update(context_tokens=context_tokens, max_output_tokens=max_output_tokens,
+                          source="known_model", confidence="known", evidence="documented",
+                          source_url=source_url, updated_at=CAPABILITY_RULE_REVIEWED_AT,
+                          date_semantics="rule_reviewed")
+            break
+    else:
+        heuristic = next(((context, output) for pattern, context, output in CAPABILITY_HEURISTIC_RULES
+                          if re.search(pattern, value)), None)
+        if heuristic:
+            result.update(context_tokens=heuristic[0], max_output_tokens=heuristic[1],
+                          source="inferred_family", confidence="heuristic", evidence="heuristic")
+        elif "claude" in value:
+            result.update(context_tokens=200000, max_output_tokens=8192,
+                          source="inferred_family")
+        elif "gemini" in value:
+            result.update(source="inferred_family")
+        elif re.search(r"gpt-[0-9]|\bo[134]\b", value):
+            result.update(source="inferred_family")
+    if "luna" in value:
+        # 本地别名没有可引用的官方上限；保留历史上的 32k 上限，但标为推断。
+        result.update(max_output_tokens=min(result["max_output_tokens"], 32768),
+                      efforts=["default", "low", "medium", "high", "xhigh", "max"],
+                      source="inferred_family", confidence="heuristic", evidence="heuristic")
+    if override is not None:
+        limits = normalize_capability_override(override)
+        context_tokens = limits.get("context_tokens", result["context_tokens"])
+        max_output_tokens = limits.get("max_output_tokens", result["max_output_tokens"])
+        if max_output_tokens > context_tokens:
+            raise ValueError("max_output_tokens cannot exceed context_tokens")
+        result.update({name: limit for name, limit in limits.items()
+                       if name in ("context_tokens", "max_output_tokens")})
+        result.update(source="manual", confidence="manual", evidence="manual",
+                      source_url=limits.get("source_url", None), note=limits.get("note", None),
+                      updated_at=limits.get("updated_at"),
+                      date_semantics="manual_override" if limits.get("updated_at") else None,
+                      manual_fields=[name for name in ("context_tokens", "max_output_tokens")
+                                     if name in limits])
+    result["request_output_tokens"] = request_output_budget(result["id"], protocol, result["max_output_tokens"])
+    return result
+
 
 def request_output_budget(model, protocol, max_output_tokens=None):
     """单次请求的输出预算；永远不超过模型能力上限。
@@ -104,52 +262,6 @@ def request_output_budget(model, protocol, max_output_tokens=None):
     else:
         budget = limit or 16384
     return max(1, min(budget, limit)) if limit else max(1, budget)
-
-
-def model_capabilities(model, protocol="", override=None):
-    """Return conservative routing metadata; unknown models never inherit premium limits."""
-    value = str(model or "").lower()
-    result = {"id": model, "context_tokens": 128000, "max_output_tokens": 16384,
-              "efforts": ["default"], "tools": True, "streaming": protocol in ("responses", "anthropic", "chat_completions", "gemini"),
-              "streaming_implemented": False, "metadata_version": 1, "updated_at": None,
-              "source": "conservative_default", "confidence": "heuristic"}
-    if "claude" in value:
-        result.update(context_tokens=200000, max_output_tokens=32000,
-                      efforts=["low", "medium", "high", "max"], source="known_family", confidence="known")
-    elif "gemini" in value:
-        result.update(context_tokens=1000000, max_output_tokens=65536,
-                      efforts=["default"], source="known_family", confidence="known")
-    elif re.search(r"gpt-[0-9]|\bo[134]\b", value):
-        # Documented per-family output ceilings; the generic GPT ceiling is the
-        # conservative 16k used by gpt-4o, never an optimistic 32k.
-        if re.search(r"\bo[134]\b", value):
-            output_tokens = 100000
-        elif re.search(r"gpt-5", value):
-            output_tokens = 128000
-        elif re.search(r"gpt-4\.1", value):
-            output_tokens = 32768
-        else:
-            output_tokens = 16384
-        result.update(context_tokens=200000, max_output_tokens=output_tokens,
-                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family", confidence="known")
-    if "luna" in value:
-        result.update(max_output_tokens=min(result["max_output_tokens"], 32768),
-                      efforts=["default", "low", "medium", "high", "xhigh", "max"], source="known_family", confidence="known")
-    if override is not None:
-        if not isinstance(override, dict):
-            raise ValueError("Model capability override must be an object")
-        limits = {name: override.get(name) for name in ("context_tokens", "max_output_tokens")}
-        for name, limit in limits.items():
-            if limit is not None and (type(limit) is not int or limit <= 0):
-                raise ValueError("Model capability {} must be a positive integer".format(name))
-        if limits["context_tokens"] and limits["max_output_tokens"] and \
-                limits["max_output_tokens"] > limits["context_tokens"]:
-            raise ValueError("max_output_tokens cannot exceed context_tokens")
-        result.update({name: limit for name, limit in limits.items() if limit is not None},
-                      source="manual", confidence="manual",
-                      updated_at=override.get("updated_at"))
-    result["request_output_tokens"] = request_output_budget(result["id"], protocol, result["max_output_tokens"])
-    return result
 
 
 def provider_arguments(route, config, environment=None):

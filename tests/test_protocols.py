@@ -88,6 +88,7 @@ class NativeProtocolsTest(unittest.TestCase):
         (self.workspace / "source.py").write_text("def add(a,b): return a-b\n")
 
     def tearDown(self):
+        self.store.close()
         self.temp.cleanup()
 
     def config(self, fixture, protocol, **limits):
@@ -134,6 +135,35 @@ class NativeProtocolsTest(unittest.TestCase):
             self.assertEqual(len(fixture.requests), 1)
             state = self.store.one("SELECT state FROM calls WHERE project=?", ("text_only",))["state"]
             self.assertEqual(state, "failed")
+
+    def test_persisted_capability_override_controls_real_request_budget(self):
+        from adaptive_rsi.store import provider_identity
+        with ProtocolFixture("chat_completions", "bad_finish") as fixture:
+            config = self.config(fixture, "chat_completions")
+            provider = config["providers"][0]
+            self.store.put_setting("model-center:global:native:" + provider_identity(provider),
+                                   {"models": [{"id": "test-model", "capability_override": {
+                                       "context_tokens": 100000, "max_output_tokens": 2048}}]})
+            with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}):
+                CodexAgent(self.store).invoke("implementation", "task", self.workspace,
+                                             "override", "override", config)
+            self.assertEqual(fixture.requests[0][2]["max_tokens"], 2048)
+
+    def test_corrupt_capability_override_uses_the_visible_fallback(self):
+        from adaptive_rsi.store import provider_identity
+        with ProtocolFixture("chat_completions", "bad_finish") as fixture:
+            config = self.config(fixture, "chat_completions")
+            provider = config["providers"][0]
+            self.store.put_setting("model-center:global:native:" + provider_identity(provider),
+                                   {"models": [{"id": "test-model", "capability_override": {"max_output_tokens": -1}}]})
+            with patch.dict(os.environ, {"RSI_PROTOCOL_TEST_KEY": "test-only-secret"}):
+                CodexAgent(self.store).invoke("implementation", "task", self.workspace,
+                                             "corrupt-override", "corrupt-override", config)
+            self.assertEqual(fixture.requests[0][2]["max_tokens"], 16384)
+            events = self.store.query("SELECT data FROM events WHERE kind='capability_override_invalid' AND run=?",
+                                      ("corrupt-override",))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(json.loads(events[0]["data"])["model"], "test-model")
 
     def test_invalid_finish_arguments_are_reported_back_and_retried(self):
         for protocol in ["responses", "chat_completions"]:

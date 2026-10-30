@@ -65,6 +65,8 @@ Cancellation previews affected downstream tasks and defaults to cancelling only 
 
 Custom model IDs allow up to 256 characters. Display names are optional and default to the full ID. Custom display names allow up to 160 characters and survive catalog refreshes; names supplied by the service continue to follow catalog updates.
 
+Model details distinguish documented model rules, conservative inference and manual capability overrides, with sources and review dates; these dates are not vendor change dates. Large native-tool output uses run-owned artifacts for on-demand pagination and search. Uncertain release and deployment results can be reconciled by explicitly selecting a candidate from a fresh server query without repeating a remote workflow request. See the [batch validation record](docs/validation/operability-evidence-20261030.en.md) for acceptance limits.
+
 Desktop builds configured with update signing can check and download updates in the background, then install manually or when local work is idle. Updates are signature-verified and wait for local work to finish. Without signing configuration, download from the official releases page. See the [desktop guide](DESKTOP.en.md).
 
 Closing the window hides the app in the menu bar and active tasks continue. Choosing **Quit** from the menu bar stops the service started by the app. The current DMG uses a temporary signature and is not Apple-notarized.

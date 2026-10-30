@@ -17,6 +17,12 @@ from .store import encode
 KINDS = ("release", "deploy")
 TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked", "rerun_unknown"}
 RERUN_CONFIRM_SECONDS = 300
+RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown"}
+RECONCILIATION_AUDIT_LIMIT = 10
+
+
+class ReconciliationRejected(ValueError):
+    """A fixed, user-safe refusal for manual workflow reconciliation."""
 
 
 class ApiRejected(RuntimeError):
@@ -261,23 +267,101 @@ def validate_pin(repo, policy):
         raise ValueError("Pinned workflow does not implement the RSI dispatch contract")
 
 
-def find_remote(repo, data):
+def _bounded_text(value, limit=500):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _run_number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _candidate(repo, remote):
+    """Normalize one GitHub workflow run into bounded, auditable evidence."""
+    if not isinstance(remote, dict) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        return None
+    run_id = _run_number(remote.get("id"))
+    if run_id is None:
+        return None
+    path = _bounded_text(remote.get("path")) or ""
+    return {
+        "id": run_id,
+        # Construct the link from the authorized repository and numeric run id;
+        # never trust a remote-provided URL for an operator-facing link.
+        "url": "https://github.com/" + repo + "/actions/runs/" + str(run_id),
+        "status": _bounded_text(remote.get("status"), 40) or "unknown",
+        "conclusion": _bounded_text(remote.get("conclusion"), 40),
+        "attempt": _run_number(remote.get("run_attempt")),
+        "created_at": _bounded_text(remote.get("created_at"), 64),
+        "updated_at": _bounded_text(remote.get("updated_at"), 64),
+        "head_sha": _bounded_text(remote.get("head_sha"), 64),
+        "head_branch": _bounded_text(remote.get("head_branch"), 300),
+        "display_title": _bounded_text(remote.get("display_title"), 300),
+        "workflow": path.split("@")[0] or None,
+        "path": path or None,
+        "event": _bounded_text(remote.get("event"), 40),
+    }
+
+
+def _candidate_identity_mismatch(data, candidate):
+    """Return the first identity field that differs from the authorized operation."""
+    if not isinstance(candidate, dict):
+        return "candidate"
+    if candidate.get("display_title") != data.get("operation_id"):
+        return "operation_id"
+    if candidate.get("event") != "workflow_dispatch":
+        return "event"
+    if candidate.get("workflow") != data.get("workflow"):
+        return "workflow"
+    if candidate.get("head_sha") != data.get("workflow_sha"):
+        return "target_sha"
+    if candidate.get("head_branch") != data.get("ref"):
+        return "ref"
+    return None
+
+
+def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
+    candidates = [item for item in (_candidate(repo, remote) for remote in remotes or []) if item]
+    data["reconciliation"] = {
+        "state": state,
+        "candidate_run_ids": [item["id"] for item in candidates],
+        "candidates": candidates,
+        "checked_at": checked_at if checked_at is not None else time.time(),
+        "redispatch_allowed": False,
+        "reason": reason,
+    }
+    return candidates
+
+
+def _remote_runs(repo, data):
     endpoint = "actions/workflows/" + quote(data["workflow"].split("/")[-1], safe="") + "/runs?event=workflow_dispatch&per_page=100"
     found = []
     for page in range(1, 11):
         runs = api(repo, endpoint + "&page=" + str(page)).get("workflow_runs", [])
-        found.extend(item for item in runs if item.get("display_title") == data["operation_id"])
+        found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
         if len(runs) < 100:
             break
+    return found
+
+
+def find_remote(repo, data):
+    found = _remote_runs(repo, data)
     if len(found) > 1:
-        data["reconciliation"] = {"state": "manual_inspection_required",
-                                  "candidate_run_ids": [item["id"] for item in found],
-                                  "checked_at": time.time(), "redispatch_allowed": False}
+        _record_reconciliation(data, repo, found, "manual_inspection_required",
+                               "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.")
         return None
-    data["reconciliation"] = {"state": "matched" if found else "awaiting_remote_visibility",
-                              "candidate_run_ids": [item["id"] for item in found],
-                              "checked_at": time.time(), "redispatch_allowed": False}
-    return found[0] if found else None
+    if found:
+        _record_reconciliation(data, repo, found, "matched",
+                               "One matching workflow run is visible. Reading its status never starts another run.")
+        return found[0]
+    _record_reconciliation(data, repo, [], "awaiting_remote_visibility",
+                           "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.")
+    return None
 
 
 def reconcile(runtime, run, kind, data, persist=True):
@@ -295,8 +379,13 @@ def reconcile(runtime, run, kind, data, persist=True):
             data.update(rerun_pending=True, checked_at=time.time())
             if time.time() - requested >= RERUN_CONFIRM_SECONDS:
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
+            _record_reconciliation(data, repo, [remote],
+                                   "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
+                                   "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
+    _record_reconciliation(data, repo, [remote], "matched",
+                           "Workflow run status was read from GitHub; this never starts another run.")
     from datetime import datetime
     def timestamp(name):
         try:
@@ -320,6 +409,216 @@ def reconcile(runtime, run, kind, data, persist=True):
     else:
         data["state"] = "running" if remote.get("status") == "in_progress" else "queued"
     return save(runtime, run, kind, data) if persist else data
+
+
+def _reconciliation_operation(runtime, project_id, run_id, kind, target):
+    if kind not in KINDS:
+        raise ReconciliationRejected("Unknown automation kind")
+    if target not in {"operation", "rollback"}:
+        raise ReconciliationRejected("Unknown reconciliation target")
+    run = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=? AND state='merged'", (run_id, project_id))
+    if not run:
+        raise ReconciliationRejected("Only a verified merged run in this project can be reconciled")
+    try:
+        saved = json.loads(run["config"])
+        policy = saved["delivery"].get(kind, {})
+    except (TypeError, ValueError, KeyError, AttributeError):
+        raise ReconciliationRejected("This run has no valid delivery authorization to reconcile") from None
+    data = runtime.store.setting(key(run_id, kind), {})
+    if not isinstance(data, dict) or not data:
+        raise ReconciliationRejected("This operation has no delivery record to reconcile")
+    if target == "rollback":
+        rollback = data.get("rollback")
+        if kind != "deploy" or not isinstance(rollback, dict):
+            raise ReconciliationRejected("This operation has no rollback record to reconcile")
+        return runtime.project(project_id), run, saved, policy, data, rollback
+    return runtime.project(project_id), run, saved, policy, data, data
+
+
+def _reconciliation_repository(runtime, project, saved, data):
+    """Bind the operation to the saved, live and origin repository identities."""
+    repo = data.get("repository")
+    try:
+        live = runtime.config(project["id"])
+        saved_repo = (saved.get("github") or {}).get("repository")
+        live_repo = (live.get("github") or {}).get("repository")
+        origin = origin_repository(project["path"])
+    except (TypeError, ValueError, KeyError, AttributeError, OSError, RuntimeError):
+        raise ReconciliationRejected("Workflow run identity differs from the authorized operation") from None
+    if (not isinstance(repo, str) or not repo or repo != saved_repo or repo != live_repo or
+            repo.lower() != (origin or "").lower()):
+        raise ReconciliationRejected("Workflow run identity differs from the authorized operation")
+    return repo
+
+
+def _require_unknown(target_data):
+    if target_data.get("state") not in RECONCILIATION_UNKNOWN:
+        raise ReconciliationRejected("Manual reconciliation is only available while a workflow start or retry is unconfirmed")
+
+
+def _reconciliation_view(kind, target, data, repo):
+    reconciliation = data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else {}
+    return {
+        "kind": kind,
+        "target": target,
+        "state": data.get("state"),
+        "reconciliation_state": reconciliation.get("state"),
+        "repository": repo,
+        "workflow": data.get("workflow"),
+        "ref": data.get("ref"),
+        "operation_id": data.get("operation_id"),
+        "sha": data.get("sha"),
+        "workflow_sha": data.get("workflow_sha"),
+        "checked_at": reconciliation.get("checked_at"),
+        "reason": reconciliation.get("reason") or data.get("error", ""),
+        "candidates": reconciliation.get("candidates") or [],
+        "manual_reconciliation": data.get("manual_reconciliation"),
+    }
+
+
+def candidates(runtime, project_id, run_id, kind, target="operation"):
+    """Read-only re-query of the runs GitHub already exposes for this operation."""
+    with runtime.automation_lock_for(project_id, kind):
+        project, run, saved, policy, data, target_data = _reconciliation_operation(
+            runtime, project_id, run_id, kind, target)
+        repo = _reconciliation_repository(runtime, project, saved, target_data)
+        _require_unknown(target_data)
+        existing = _run_number(target_data.get("workflow_run_id"))
+        if existing:
+            remote = api(repo, "actions/runs/" + str(existing))
+            remotes = [remote] if isinstance(remote, dict) else []
+        else:
+            remotes = _remote_runs(repo, target_data)
+        normalized = [item for item in (_candidate(repo, remote) for remote in remotes) if item]
+        previous = _run_number(target_data.get("previous_attempt")) or _run_number(target_data.get("attempt")) or 1
+        if existing:
+            attempt = normalized[0].get("attempt") if normalized else None
+            if attempt is not None and attempt > previous:
+                state = "rerun_confirmed"
+                reason = "GitHub now reports a new run attempt. Selecting it only reads its status and never repeats the rerun request."
+            else:
+                state = "rerun_unconfirmed"
+                reason = "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request."
+        elif len(normalized) > 1:
+            state = "manual_inspection_required"
+            reason = "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one."
+        elif normalized:
+            state = "matched"
+            reason = "One matching workflow run is visible. Reading its status never starts another run."
+        else:
+            state = "awaiting_remote_visibility"
+            reason = "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted."
+        original = encode(data)
+        _record_reconciliation(target_data, repo, remotes, state, reason)
+        try:
+            save(runtime, run, kind, data, expected=original)
+        except _AutomationChanged:
+            # A concurrent tracking or retry pass already persisted newer
+            # evidence. Return that view instead of overwriting it.
+            current = runtime.store.setting(key(run_id, kind), {})
+            current_target = current.get("rollback") if target == "rollback" else current
+            if not isinstance(current_target, dict):
+                raise ReconciliationRejected("Automation changed during reconciliation; reload before checking again") from None
+            return _reconciliation_view(kind, target, current_target, repo)
+        return _reconciliation_view(kind, target, target_data, repo)
+
+
+def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operation", source="console"):
+    """Associate one server-returned run, then read its status from GitHub.
+
+    This function never dispatches or reruns a workflow. It only binds an
+    existing run after exact identity checks and delegates state changes to
+    :func:`reconcile`, which is a read-only GitHub query.
+    """
+    selected = _run_number(workflow_run_id)
+    if selected is None:
+        raise ReconciliationRejected("Select a workflow run returned by the current read-only query")
+    origin = source if isinstance(source, str) and re.fullmatch(r"[a-z_]{1,32}", source) else "console"
+    with runtime.automation_lock_for(project_id, kind):
+        project, run, saved, policy, data, target_data = _reconciliation_operation(
+            runtime, project_id, run_id, kind, target)
+        repo = _reconciliation_repository(runtime, project, saved, target_data)
+        _require_unknown(target_data)
+        try:
+            repo = authorized(runtime, project, run, kind, policy)
+        except Cancelled:
+            raise ReconciliationRejected("Release/deploy is paused or cancelled; restore the original authorization before reconciling") from None
+        except ValueError:
+            raise ReconciliationRejected("Release/deploy authorization was revoked or the target changed; restore the original authorization before reconciling") from None
+        if kind == "deploy":
+            try:
+                owner = deployment_owner(runtime, project["id"], repo, policy)
+            except ValueError:
+                raise ReconciliationRejected("Deployment ownership is ambiguous; reconcile it before selecting") from None
+            if owner and owner["run"] != run["id"]:
+                raise ReconciliationRejected("A newer deployment owns this target; this operation can no longer be reconciled")
+        existing = _run_number(target_data.get("workflow_run_id"))
+        if existing:
+            remote = api(repo, "actions/runs/" + str(existing))
+            remotes = [remote] if isinstance(remote, dict) else []
+        else:
+            remotes = _remote_runs(repo, target_data)
+        normalized = [item for item in (_candidate(repo, remote) for remote in remotes) if item]
+        exact = [item for item in normalized if item["id"] == selected and
+                 _candidate_identity_mismatch(target_data, item) is None]
+        if len(exact) != 1:
+            raise ReconciliationRejected("The selected workflow run does not match this operation's repository, workflow, ref, exact target SHA or operation ID")
+        if existing and existing != selected:
+            raise ReconciliationRejected("The selected workflow run does not match the operation's existing workflow run")
+        candidate = exact[0]
+        if target_data.get("state") == "rerun_unknown":
+            attempt = candidate.get("attempt")
+            previous = _run_number(target_data.get("previous_attempt")) or _run_number(target_data.get("attempt")) or 1
+            if attempt is None or attempt <= previous:
+                raise ReconciliationRejected("GitHub has not confirmed a new attempt for this rerun; do not repeat the rerun request")
+        now = time.time()
+        audit = {
+            "at": now,
+            "source": origin,
+            "selected_run_id": selected,
+            "repository": repo,
+            "workflow": target_data.get("workflow"),
+            "ref": target_data.get("ref"),
+            "operation_id": target_data.get("operation_id"),
+            "sha": target_data.get("sha"),
+            "workflow_sha": target_data.get("workflow_sha"),
+            "candidates": normalized,
+            "raw_candidates": remotes[:100],
+            "previous": {
+                "state": target_data.get("state"),
+                "error": target_data.get("error", ""),
+                "checked_at": target_data.get("checked_at"),
+                "candidate_run_ids": (target_data.get("reconciliation") or {}).get("candidate_run_ids", []),
+            },
+        }
+        original = encode(data)
+        target_data["workflow_run_id"] = selected
+        target_data["manual_reconciliation"] = audit
+        history = target_data.get("manual_reconciliations")
+        target_data["manual_reconciliations"] = ([*history] if isinstance(history, list) else [])[-(RECONCILIATION_AUDIT_LIMIT - 1):] + [audit]
+        _record_reconciliation(target_data, repo, [candidate], "selected",
+                               "An operator selected this workflow run from the server-returned candidates. Its status is read from GitHub; this never starts or repeats a run.", checked_at=now)
+        try:
+            reconciled = reconcile(runtime, run, kind, target_data, persist=False)
+        except (ValueError, KeyError, TypeError):
+            raise ReconciliationRejected("Workflow run identity differs from the authorized operation") from None
+        if not isinstance(reconciled, dict) or reconciled.get("state") in RECONCILIATION_UNKNOWN:
+            raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
+        if target == "rollback":
+            data["rollback"] = reconciled
+            if reconciled.get("state") in {"queued", "running", "workflow_succeeded"}:
+                data.update(state="rolling_back", error="")
+        try:
+            save(runtime, run, kind, data, expected=original)
+        except _AutomationChanged:
+            raise ReconciliationRejected("Automation changed during reconciliation; reload before selecting") from None
+        runtime.store.event("automation_reconciled", "Manual reconciliation associated an existing workflow run",
+                            project_id, run_id,
+                            {"kind": kind, "target": target, "workflow_run_id": selected,
+                             "source": origin, "at": now})
+        return {"kind": kind, "target": target, "state": target_data.get("state"), "operation": data,
+                "candidates": target_data.get("reconciliation", {}).get("candidates", []),
+                "manual_reconciliation": audit}
 
 
 def health_check(url, sha, timeout=15):

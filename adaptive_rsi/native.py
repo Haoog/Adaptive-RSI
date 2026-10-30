@@ -5,10 +5,12 @@ import contextlib
 import fnmatch
 import concurrent.futures
 import http.client
+import logging
 import os
 import re
 import stat
 import sqlite3
+import threading
 import uuid
 import sys
 import time
@@ -23,6 +25,15 @@ from .config import relative_path
 from .credentials import Credentials
 from .provider_health import ModelFailure, error_code, http_failure, provider_text_code
 from .process import Cancelled, Sandbox, scrub_tree
+from .tool_artifacts import (
+    ArtifactError,
+    DEFAULT_PAGE_BYTES,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_RESULT_BYTES,
+    ArtifactStore,
+    compact_result,
+    contains_artifact_reference,
+)
 
 
 class ProviderUnavailable(ModelFailure):
@@ -231,11 +242,18 @@ def tools_for(role):
     searching = object_schema({"text": TEXT})
     searching["properties"].update(path=TEXT, case_sensitive={"type": "boolean"}, regex={"type": "boolean"},
                                    cursor=TEXT, limit={"type": "integer"})
+    artifact_reader = object_schema({"artifact": TEXT})
+    artifact_reader["properties"].update(offset={"type": "integer"}, limit={"type": "integer"})
+    artifact_search = object_schema({"artifact": TEXT, "text": TEXT})
+    artifact_search["properties"].update(case_sensitive={"type": "boolean"}, cursor=TEXT,
+                                         limit={"type": "integer"})
     tools = [
         ("list_files", "List source files with optional offset and limit (1..1000); inspect truncation metadata.", listing),
         ("read_file", "Read at most 500 lines. Paths must be relative to this snapshot.", object_schema({
             "path": TEXT, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}})),
         ("search", "Find text with optional path glob, case_sensitive, regex, limit (1..100), and continuation cursor. Regex has a per-file time limit.", searching),
+        ("read_artifact", "Read a byte page of a large tool output stored by this invocation. Use the opaque artifact id from the tool result; offset and limit are bytes (limit at most 32768).", artifact_reader),
+        ("search_artifact", "Search a large tool output stored by this invocation literally; returns line numbers and a continuation cursor. Only this invocation's artifacts are readable.", artifact_search),
     ]
     if role == "implementation":
         tools += [
@@ -249,7 +267,8 @@ def tools_for(role):
 
 class WorkspaceTools:
     cancel: Optional[Callable[[], bool]]
-    def __init__(self, workspace, role, state, config, cancel, protected):
+    def __init__(self, workspace, role, state, config, cancel, protected,
+                 run=None, invocation=None, artifact_root=None):
         self.workspace = Path(workspace).resolve()
         self.role, self.state, self.config = role, state, config
         self.cancel, self.protected = cancel, protected
@@ -261,6 +280,28 @@ class WorkspaceTools:
         self.index_source = "filesystem_fallback"
         self.scope = None
         self.deadline = None
+        self._artifact_spec = None
+        self._artifact_store = None
+        self._artifact_lock = threading.Lock()
+        if run is not None or invocation is not None:
+            if run is None or invocation is None:
+                raise ValueError("Artifact storage requires both run and invocation identities")
+            root = (Path(artifact_root) if artifact_root is not None else
+                    Path(state) / "runs" / str(run) / "artifacts")
+            self._artifact_spec = (root, str(run), str(invocation))
+
+    def artifact_store(self):
+        """Create the invocation-owned store lazily; never inside the workspace."""
+        if self._artifact_spec is None:
+            return None
+        if self._artifact_store is None:
+            with self._artifact_lock:
+                if self._artifact_store is None:
+                    root, run, invocation = self._artifact_spec
+                    self._artifact_store = ArtifactStore(
+                        root, run=run, invocation=invocation, role=self.role,
+                        workspace=self.workspace)
+        return self._artifact_store
 
     def remaining(self):
         if self.deadline is None:
@@ -549,6 +590,17 @@ class WorkspaceTools:
             return "\n".join(rows)
         if name == "search":
             return self.search(args)
+        if name in ("read_artifact", "search_artifact"):
+            store = self.artifact_store()
+            if store is None:
+                raise ValueError("Artifact storage is unavailable for this invocation")
+            if name == "read_artifact":
+                return store.read(args["artifact"], offset=args.get("offset", 0),
+                                  limit=args.get("limit", DEFAULT_PAGE_BYTES))
+            return store.search(args["artifact"], args["text"],
+                                case_sensitive=args.get("case_sensitive", True),
+                                cursor=args.get("cursor"),
+                                limit=args.get("limit", DEFAULT_SEARCH_LIMIT))
         if name in ["write_file", "replace_text"]:
             path = self.path(args["path"])
             relative = path.relative_to(self.workspace).as_posix()
@@ -591,11 +643,37 @@ class WorkspaceTools:
             result = sandbox.check({"name": "model tool", **args}, self.workspace, self.cancel,
                                    protected=[self.workspace / ".git"], hidden=self.protected, writable=writable)
             scrub_tree(self.workspace)
-            return {k: result[k] for k in ["exit_code", "stdout", "stderr", "error"]}
+            # Preserve every structural field (exit code, error kind, timing);
+            # execute_tools replaces only a large stdout/stderr body with an
+            # artifact reference.  timed_out is an explicit compatibility alias.
+            value = {key: item for key, item in result.items() if key not in ("argv", "name")}
+            value["timed_out"] = bool(result.get("error_kind") == "timeout" or
+                                      result.get("error") == "Command timed out")
+            return value
         raise ValueError("Unknown tool")
 
 
+def _bounded_tool_value(value, error=None):
+    """Legacy bounded fallback used only when external storage is unavailable."""
+    detail = {"artifact_error": str(error)} if error else {}
+    if isinstance(value, dict) and "exit_code" in value:
+        def tail(body):
+            return body[-24000:] if isinstance(body, str) else body
+        return {**value, "stdout": tail(value.get("stdout", "")),
+                "stderr": tail(value.get("stderr", "")), "truncated": True, **detail}
+    return {"error": "Tool output exceeds limit; narrow the request", **detail}
+
+
 def execute_tools(tools, calls):
+    factory = getattr(tools, "artifact_store", None)
+    artifact_store: Any
+    try:
+        artifact_store = factory() if callable(factory) else None
+    except (ArtifactError, OSError, ValueError):
+        # A state/workspace layout that cannot provide private storage keeps
+        # the old bounded behavior rather than writing artifacts into source.
+        artifact_store = None
+
     def execute(call, isolated=False):
         call_id, name, args = call
         tools.check_cancelled()
@@ -608,6 +686,8 @@ def execute_tools(tools, calls):
             worker.deadline, worker.scope = tools.deadline, tools.scope
             worker._file_cache = tools._file_cache
             worker.files_truncated, worker.index_source = tools.files_truncated, tools.index_source
+            worker._artifact_spec = tools._artifact_spec
+            worker._artifact_store = artifact_store
         callback = getattr(tools, "trace", None)
         def trace(detail):
             if callback:
@@ -625,12 +705,22 @@ def execute_tools(tools, calls):
         trace({**identity, "state": "started"})
         try:
             value = worker.execute(name, args)
-            if len(json.dumps(value).encode()) > 128000:
-                if isinstance(value, dict) and "exit_code" in value:
-                    value = {**value, "stdout": value.get("stdout", "")[-24000:],
-                             "stderr": value.get("stderr", "")[-24000:], "truncated": True}
+            if artifact_store is not None and name != "read_artifact":
+                try:
+                    value = compact_result(artifact_store, name, value)
+                except ArtifactError as error:
+                    value = _bounded_tool_value(value, error)
+            if len(json.dumps(value).encode()) > MAX_RESULT_BYTES:
+                if artifact_store is not None:
+                    # Pathological result (many individually-small strings):
+                    # keep the complete structure in one JSON artifact.
+                    try:
+                        value = compact_result(artifact_store, name + "_result",
+                                               json.dumps(value, ensure_ascii=False))
+                    except ArtifactError as error:
+                        value = _bounded_tool_value(value, error)
                 else:
-                    value = {"error": "Tool output exceeds limit; narrow the request"}
+                    value = _bounded_tool_value(value)
         except (ValueError, OSError, UnicodeError) as error:
             value = {"error": str(error)}
         except Exception as error:
@@ -646,10 +736,20 @@ def execute_tools(tools, calls):
         tools.check_cancelled()
         return call_id, name, value
     if len(calls) > 1 and tools.remaining() > 5 and all(
-            name in {"read_file", "search", "list_files"} for _, name, _ in calls):
+            name in {"read_file", "search", "list_files", "read_artifact", "search_artifact"}
+            for _, name, _ in calls):
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(calls)), thread_name_prefix="rsi-read") as pool:
             return list(pool.map(lambda call: execute(call, True), calls))
     return [execute(call) for call in calls]
+
+
+def _has_artifact_reference(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return False
+    return contains_artifact_reference(value)
 
 
 class Conversation:
@@ -724,18 +824,29 @@ class Conversation:
             return
         for item in self.history[1:-4]:
             if isinstance(item, dict):
-                if item.get("type") == "function_call_output" and len(str(item.get("output", ""))) > 1000:
+                if (item.get("type") == "function_call_output" and
+                        len(str(item.get("output", ""))) > 1000):
+                    if _has_artifact_reference(item.get("output")):
+                        # Rewriting an artifact envelope would make its opaque
+                        # id unusable after context compression.
+                        continue
                     item["output"] = json.dumps({"truncated": True, "excerpt": str(item["output"])[:500]})
                 for part in item.get("parts", []):
                     response = part.get("functionResponse") if isinstance(part, dict) else None
                     if response and len(json.dumps(response.get("response", {}))) > 1000:
+                        if _has_artifact_reference(response.get("response")):
+                            continue
                         response["response"] = {"truncated": True, "excerpt": json.dumps(response["response"])[:500]}
                 content = item.get("content")
                 if isinstance(content, str) and len(content) > 1000:
+                    if _has_artifact_reference(content):
+                        continue
                     item["content"] = content[:500] + "\n...[output trimmed for context capacity]...\n" + content[-200:]
                 elif isinstance(content, list):
                     for part in content:
                         if isinstance(part, dict) and "content" in part and len(str(part.get("content", ""))) > 1000:
+                            if _has_artifact_reference(part.get("content")):
+                                continue
                             part["content"] = str(part["content"])[:500] + "...[trimmed]"
 
     def receive(self, response):
@@ -812,7 +923,10 @@ class NativeAgent:
             headers[{"anthropic": "x-api-key", "gemini": "x-goog-api-key"}.get(protocol, "Authorization")] = key if protocol in ["anthropic", "gemini"] else "Bearer " + key
         if protocol == "anthropic":
             headers["anthropic-version"] = "2023-06-01"
-        tools = WorkspaceTools(workspace, role, self.store.root, config, cancel, protected)
+        invocation = uuid.uuid4().hex
+        tools = WorkspaceTools(workspace, role, self.store.root, config, cancel, protected,
+                               run=run, invocation=invocation,
+                               artifact_root=self.store.root / "runs" / str(run) / "artifacts")
         if role == "implementation":
             plan_path = Path(workspace).resolve().parent / "tool-scope.json"
             if plan_path.is_file():
@@ -820,7 +934,23 @@ class NativeAgent:
                 if not isinstance(scope, list) or not scope:
                     raise RuntimeError("Approved native tool scope is invalid")
                 tools.scope = [relative_path(value) for value in scope]
-        capabilities = model_capabilities(route["model"], protocol)
+        from .store import credential_generation, provider_identity
+        identity = provider_identity(provider, credential_generation(self.store.root, provider))
+        directory, _ = self.store.catalog_entry(project, provider["id"], identity,
+                                                 provider_identity(provider))
+        entries = directory.get("models", []) if isinstance(directory, dict) else []
+        entry = next((item for item in entries if isinstance(item, dict) and
+                      item.get("id") == route["model"]), {}) if isinstance(entries, list) else {}
+        try:
+            capabilities = model_capabilities(route["model"], protocol, entry.get("capability_override"))
+        except (TypeError, ValueError):
+            capabilities = model_capabilities(route["model"], protocol)
+            capabilities["override_error"] = True
+            try:
+                self.store.event("capability_override_invalid", "Invalid model capability override; conservative defaults used",
+                                 project, run, {"provider": provider["id"], "model": route["model"]})
+            except (OSError, RuntimeError, sqlite3.Error):
+                logging.getLogger(__name__).warning("Capability override diagnostic unavailable")
         conversation = Conversation(protocol, route["model"], prompt + "\nUse the provided tools to inspect the snapshot. End by calling finish with the requested structured result.", tools_for(role), route["effort"],
                                     output_tokens=capabilities["max_output_tokens"],
                                     request_output_tokens=capabilities["request_output_tokens"])

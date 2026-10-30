@@ -44,6 +44,70 @@ async function main() {
     assert.equal(await page.locator('#mc-credential-status').innerText(), '无需密钥');
     assert.equal(await step('mc-step-account').getAttribute('data-state'), 'done');
     assert.equal(await step('mc-step-models').getAttribute('data-state'), 'done');
+    // 能力元数据：未知型号保持推断；人工覆盖持久化并在目录/诊断中使用，清除后恢复推断。
+    const capabilityRow = page.locator('#mc-model-list .mc-model-row').filter({hasText: 'fixture-pro'});
+    assert.match(await capabilityRow.innerText(), /保守默认值/);
+    await capabilityRow.locator('summary').click();
+    await capabilityRow.getByRole('button', {name: '能力元数据', exact: true}).click();
+    const capabilityDialog = page.locator('#mc-capability-dialog');
+    await capabilityDialog.waitFor();
+    assert.match(await capabilityDialog.innerText(), /保守默认值/);
+    assert.match(await capabilityDialog.innerText(), /不代表供应商的模型变更日期/);
+    await page.locator('#mc-capability-context').fill('64000');
+    await page.locator('#mc-capability-output').fill('4096');
+    await page.locator('#mc-capability-source-url').fill('https://example.test/model');
+    await page.locator('#mc-capability-note').fill('人工核对');
+    const capabilitySave = page.waitForResponse(response => response.url().endsWith('/api/model-center/model') && response.request().method() === 'POST');
+    await page.locator('#mc-capability-save').click();
+    const capabilityPayload = (await capabilitySave).request().postDataJSON().model;
+    assert.deepEqual(capabilityPayload.capability_override, {
+      context_tokens: 64000, max_output_tokens: 4096,
+      source_url: 'https://example.test/model', note: '人工核对'
+    });
+    await capabilityDialog.waitFor({state: 'hidden'});
+    assert.match(await capabilityRow.innerText(), /人工覆盖/);
+    assert.match(await capabilityRow.innerText(), /上下文 64K/);
+    assert.match(await capabilityRow.innerText(), /输出 4K/);
+    const capabilityProject = await page.locator('#project-select').inputValue();
+    const capabilityState = await page.evaluate(async projectId => {
+      const snapshot = await (await fetch('/api/model-center?project=' + encodeURIComponent(projectId))).json();
+      const provider = snapshot.providers.find(item => item.name === '本地目录服务');
+      const model = provider.catalog.models.find(item => item.id === 'fixture-pro');
+      return {capability_override: model.capability_override, capabilities: model.capabilities};
+    }, capabilityProject);
+    assert.equal(capabilityState.capabilities.source, 'manual');
+    assert.equal(capabilityState.capabilities.confidence, 'manual');
+    assert.equal(capabilityState.capabilities.context_tokens, 64000);
+    assert.equal(capabilityState.capabilities.max_output_tokens, 4096);
+    assert.equal(capabilityState.capabilities.source_url, 'https://example.test/model');
+    assert.equal(capabilityState.capability_override.note, '人工核对');
+    assert.match(capabilityState.capability_override.updated_at, /^\d{4}-\d{2}-\d{2}$/);
+    // 上下文小于输出被客户端拦截，不发出保存请求。
+    await capabilityRow.locator('summary').click();
+    await capabilityRow.getByRole('button', {name: '能力元数据', exact: true}).click();
+    await capabilityDialog.waitFor();
+    await page.locator('#mc-capability-context').fill('1024');
+    const postsBeforeCapabilityError = posts;
+    await page.locator('#mc-capability-save').click();
+    await page.waitForFunction(() => document.getElementById('mc-capability-error').textContent.includes('输出上限不能超过上下文上限'));
+    assert.equal(posts, postsBeforeCapabilityError);
+    await capabilityDialog.getByRole('button', {name: '关闭', exact: true}).click();
+    await capabilityDialog.waitFor({state: 'hidden'});
+    // 清除覆盖后回到基础规则；上一步的“更多”菜单仍保持展开。
+    const capabilityDetails = capabilityRow.locator('details');
+    if (!(await capabilityDetails.evaluate(node => node.open))) await capabilityDetails.locator('summary').click();
+    await capabilityRow.getByRole('button', {name: '能力元数据', exact: true}).click();
+    await capabilityDialog.waitFor();
+    await capabilityDialog.getByRole('button', {name: '清除人工覆盖', exact: true}).click();
+    await capabilityDialog.waitFor({state: 'hidden'});
+    assert.match(await capabilityRow.innerText(), /保守默认值/);
+    const clearedSource = await page.evaluate(async projectId => {
+      const snapshot = await (await fetch('/api/model-center?project=' + encodeURIComponent(projectId))).json();
+      const provider = snapshot.providers.find(item => item.name === '本地目录服务');
+      const model = provider.catalog.models.find(item => item.id === 'fixture-pro');
+      return model.capabilities.source;
+    }, capabilityProject);
+    assert.equal(clearedSource, 'conservative_default');
     await page.locator('#mc-model-list .model-more').first().locator('summary').click();
     await page.locator('#mc-model-list').getByRole('button', {name: '估算价格', exact: true}).first().click();
     await page.getByLabel('输入价格 / USD').fill('1.2');

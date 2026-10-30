@@ -119,6 +119,30 @@ const apiErrors={
  "Health response must confirm the exact deployment SHA and healthy status": "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。",
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
+ "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.": "有多个工作流执行记录都匹配本次操作编号。请先核对仓库、工作流、引用、目标提交和操作编号，再选择其中一条。",
+ "One matching workflow run is visible. Reading its status never starts another run.": "已看到一条匹配的工作流执行记录。读取状态不会再次启动工作流。",
+ "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.": "GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。",
+ "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.": "GitHub 尚未确认新的执行尝试。请核对原始执行记录；重新确认不会重复提交不确定的重试请求。",
+ "GitHub now reports a new run attempt. Selecting it only reads its status and never repeats the rerun request.": "GitHub 已报告新的执行尝试。选择它只会读取状态，不会再次提交重试请求。",
+ "Workflow run status was read from GitHub; this never starts another run.": "工作流状态来自 GitHub 只读查询，不会启动新的执行。",
+ "An operator selected this workflow run from the server-returned candidates. Its status is read from GitHub; this never starts or repeats a run.": "已从服务端返回的候选中人工选择这条工作流记录。状态仍从 GitHub 只读查询，不会启动或重复执行。",
+ "The selected workflow run does not match this operation's repository, workflow, ref, exact target SHA or operation ID": "所选工作流记录与本次操作的仓库、工作流、引用、精确目标提交或操作编号不一致，已拒绝关联。",
+ "GitHub has not confirmed a new attempt for this rerun; do not repeat the rerun request": "GitHub 尚未确认这次重试产生了新的执行尝试；请勿重复提交重试请求。",
+ "Select a workflow run returned by the current read-only query": "请从当前只读查询返回的工作流记录中选择一条，不能手动填写运行编号。",
+ "Manual reconciliation is only available while a workflow start or retry is unconfirmed": "只有工作流启动或重试仍待确认时，才能人工核对。",
+ "Only a verified merged run in this project can be reconciled": "只有本项目内已验证并已合并的运行才能人工核对。",
+ "Release/deploy is paused or cancelled; restore the original authorization before reconciling": "项目已暂停或操作已取消；请先恢复原授权再人工核对。",
+ "Release/deploy authorization was revoked or the target changed; restore the original authorization before reconciling": "发布或部署授权已撤销，或目标已改变；请先恢复原授权再人工核对。",
+ "A newer deployment owns this target; this operation can no longer be reconciled": "已有更新版本接管此服务，本次部署不能再人工核对。",
+ "Automation changed during reconciliation; reload before selecting": "核对期间发布状态已变化，请重新加载后再选择。",
+ "GitHub did not return a confirmed status for the selected workflow run; query again before selecting": "GitHub 未返回所选工作流记录的确认状态，请重新查询后再选择。",
+ "Unknown automation kind": "未知的自动化类型。",
+ "Unknown reconciliation target": "未知的核对目标。",
+ "This run has no valid delivery authorization to reconcile": "这次运行没有可用于核对的交付授权。",
+ "This operation has no delivery record to reconcile": "这次操作没有可核对的交付记录。",
+ "This operation has no rollback record to reconcile": "这次操作没有可核对的回滚记录。",
+ "Deployment ownership is ambiguous; reconcile it before selecting": "部署归属不明确，请先核对归属再选择。",
+ "The selected workflow run does not match the operation's existing workflow run": "所选工作流记录与这次操作原有的执行记录不一致，已拒绝关联。",
  "Candidate was cleaned up after the retention window; regenerate it before publishing": "候选已超过保留期被清理，请重新生成后再发布。",
  "Automatic merge requires PR delivery": "自动合并只在交付方式为 PR 时可用：请把「完成后如何交付」改为「自动提交修改，等待合并」或「检查通过后自动合并」，或关闭自动合并。",
  "Automation workflow must be a fixed .github/workflows YAML file": "工作流必须是 .github/workflows/ 目录下的固定 .yml 或 .yaml 文件（例如 .github/workflows/deploy.yml），请修正工作流路径后重新保存。",
@@ -1146,6 +1170,74 @@ async function authorizeRelease(kind){
   readinessCache.clear();await refresh();
  }finally{button.disabled=false;}
 }
+function releaseCandidateStatus(candidate){
+ const status=typeof candidate?.status==='string'&&candidate.status?candidate.status:'unknown',conclusion=typeof candidate?.conclusion==='string'&&candidate.conclusion?candidate.conclusion:'';
+ return conclusion?status+' · '+conclusion:status;
+}
+function releaseCandidateDetail(candidate){
+ const parts=[];
+ for(const [field,label] of [['created_at','创建时间'],['updated_at','更新时间']]){
+  const value=candidate?.[field];if(typeof value!=='string')continue;
+  const milliseconds=Date.parse(value);if(Number.isFinite(milliseconds))parts.push(t(label)+' '+stamp(milliseconds/1000));
+ }
+ if(Number.isInteger(candidate?.attempt))parts.push(t('尝试')+' '+candidate.attempt);
+ return parts.join(' · ');
+}
+function releaseReconciliationReason(reconciliation){
+ const reason=typeof reconciliation?.reason==='string'?reconciliation.reason:'';
+ if(!reason)return '';
+ // English mode keeps the server's fixed English evidence text; Chinese mode uses the local mapping.
+ return typeof language!=='undefined'&&language==='en'?reason:t(apiErrors[reason]||reason);
+}
+async function reloadReleaseOutcome(project){
+ if(projectId!==project)return;
+ await refresh();
+ if(detailTask)await showTask(detailTask);
+}
+function renderReleaseReconciliation(row,operation,project,run,kind,target){
+ const current=target==='rollback'?operation.rollback:operation;
+ if(!current||!['dispatch_unknown','rerun_unknown'].includes(current.state))return;
+ const reconciliation=current.reconciliation&&typeof current.reconciliation==='object'?current.reconciliation:{};
+ const candidates=Array.isArray(reconciliation.candidates)?reconciliation.candidates.filter(candidate=>
+  candidate&&Number.isInteger(candidate.id)&&typeof candidate.url==='string'&&/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/.test(candidate.url)):[];
+ const panel=el('div',undefined,'release-reconciliation');
+ panel.append(el('h5',t(current.state==='rerun_unknown'?'重试是否启动仍待确认':'是否启动仍待确认')));
+ if(Number.isFinite(reconciliation.checked_at))panel.append(el('p',t('核对时间')+' '+stamp(reconciliation.checked_at),'muted'));
+ const reason=releaseReconciliationReason(reconciliation);if(reason)panel.append(el('p',reason,'muted'));
+ panel.append(el('p',t('只读查询只读取 GitHub 状态，不会启动或重试工作流。'),'muted'));
+ if(candidates.length){
+  panel.append(el('p',t('已知候选工作流记录（只读）：'),'muted'));
+  const list=el('ul',undefined,'release-candidate-list');
+  for(const candidate of candidates){
+   const item=el('li'),link=el('a','#'+candidate.id+' · '+releaseCandidateStatus(candidate));
+   link.href=candidate.url;link.target='_blank';link.rel='noreferrer';item.append(link);
+   const detail=releaseCandidateDetail(candidate);if(detail)item.append(el('span',' · '+detail,'muted'));
+   list.append(item);
+  }
+  panel.append(list);
+  const select=el('select',undefined,'release-candidate-select');
+  select.setAttribute('aria-label',t('选择要关联的工作流记录'));
+  const placeholder=el('option',t('请选择一条工作流记录'));placeholder.value='';select.append(placeholder);
+  for(const candidate of candidates){const option=el('option','#'+candidate.id+' · '+releaseCandidateStatus(candidate));option.value=String(candidate.id);select.append(option);}
+  const bind=action(t('关联所选记录'),async()=>{
+   const selected=select.value;if(!selected)return;
+   bind.disabled=true;
+   try{await api('release-resolve',{project,run:run.id,kind,target,workflow_run_id:Number(selected)});await reloadReleaseOutcome(project);}
+   finally{bind.disabled=!select.value;}
+  },'text-button');
+  bind.disabled=true;select.addEventListener('change',()=>{bind.disabled=!select.value;});
+  panel.append(select,bind);
+ }else{
+  panel.append(el('p',t('GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。'),'muted'));
+ }
+ const recheck=action(t('只读重新查询'),async()=>{
+  recheck.disabled=true;
+  try{await api('release-candidates?project='+encodeURIComponent(project)+'&run='+encodeURIComponent(run.id)+'&kind='+encodeURIComponent(kind)+'&target='+encodeURIComponent(target));await reloadReleaseOutcome(project);}
+  finally{recheck.disabled=false;}
+ },'text-button');
+ panel.append(recheck);
+ row.append(panel);
+}
 async function renderReleaseOutcome(node,run,project){
  if(!['merged','pr_open'].includes(run.state))return;
  let automation;try{automation=await api('release-status?project='+encodeURIComponent(project)+'&run='+encodeURIComponent(run.id));}catch{return;}
@@ -1164,6 +1256,8 @@ async function renderReleaseOutcome(node,run,project){
   if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));
   if(rerunUnknown||dispatchRejected||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):dispatchRejected?t('修复权限后重试'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
   if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{closeTaskDetail();changeSettingsScope('project');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
+  renderReleaseReconciliation(row,operation,project,run,kind,'operation');
+  if(kind==='deploy')renderReleaseReconciliation(row,operation,project,run,kind,'rollback');
   section.append(row);
  }node.append(section);
 }

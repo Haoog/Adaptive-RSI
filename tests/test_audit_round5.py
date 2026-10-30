@@ -68,6 +68,7 @@ class AuditRound5Test(unittest.TestCase):
                                event=lambda *a: None, execute=lambda *a: None)
         with patch("adaptive_rsi.native.Credentials") as credentials, \
                 patch("adaptive_rsi.native.post_json", side_effect=response), \
+                patch.object(fake, "catalog_entry", create=True, return_value=({}, None)), \
                 patch("adaptive_rsi.native.time.monotonic", side_effect=lambda: clock[0]), \
                 patch.object(WorkspaceTools, "execute", execute):
             credentials.return_value.get.return_value = None
@@ -95,6 +96,7 @@ class AuditRound5Test(unittest.TestCase):
         with patch("adaptive_rsi.native.Credentials") as credentials, \
                 patch("adaptive_rsi.native.post_json", return_value=response), \
                 patch.object(WorkspaceTools, "execute") as execute:
+            fake.catalog_entry = lambda *a, **k: ({}, None)
             credentials.return_value.get.return_value = None
             with self.assertRaisesRegex(RuntimeError, "duplicate tool call IDs"):
                 NativeAgent(fake).invoke("implementation", "test", workspace, "p", "r",
@@ -114,6 +116,7 @@ class AuditRound5Test(unittest.TestCase):
         with patch("adaptive_rsi.native.Credentials") as credentials, \
                 patch("adaptive_rsi.native.post_json", return_value=response), \
                 patch.object(WorkspaceTools, "execute", return_value={"content": "ok"}) as execute:
+            fake.catalog_entry = lambda *a, **k: ({}, None)
             credentials.return_value.get.return_value = None
             with self.assertRaisesRegex(RuntimeError, "reused an earlier tool call ID"):
                 NativeAgent(fake).invoke("implementation", "test", workspace, "p", "r",
@@ -307,7 +310,7 @@ class AuditRound5Test(unittest.TestCase):
 
     def test_restore_accepts_legacy_v1_backup_without_migration_ledger(self):
         source = self.root / "legacy-v1.sqlite3"
-        with sqlite3.connect(source) as db:
+        with contextlib.closing(sqlite3.connect(source)) as db:
             db.executescript("""
                 CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT,path TEXT,config TEXT,paused INTEGER,created REAL);
                 CREATE TABLE tasks(id TEXT PRIMARY KEY,project TEXT,source TEXT,fingerprint TEXT,title TEXT,body TEXT,

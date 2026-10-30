@@ -717,7 +717,7 @@ class AuditModelDiagnosticsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake = SimpleNamespace(root=root, reserve_call=lambda *a: 'c', record_usage=lambda *a: None,
-                                   event=lambda *a: None, execute=lambda *a: None)
+                                   event=lambda *a: None, execute=lambda *a: None, catalog_entry=lambda *a, **k: ({}, None))
             with patch('adaptive_rsi.native.Credentials') as credentials, patch('adaptive_rsi.native.post_json',
                     return_value={'choices': [{'finish_reason': 'length', 'message': {'content': 'partial'}}]}):
                 credentials.return_value.get.return_value = None

@@ -26,4 +26,6 @@ Success on a small controlled Python repository establishes this scenario and de
 
 ## Validating another project
 
+The 2026-10-30 batch adds isolated real tasks with the specified DeepSeek model, cancellation and fresh retry, official signed in-app updates, interrupted-download recovery, and restoration of the old service after installation failure followed by a successful retry. See the [batch evidence](docs/validation/operability-evidence-20261030.en.md) for usage, context measurements and remaining human-feedback and fault-matrix gaps.
+
 Start with a paused independent project, select provider/model/effort, and configure executable checks. After explicit activation, inspect value evidence, sealed acceptance, all checks, review, exact commits and CI. Delivery defaults to local candidates; automatic PRs and merging require explicit authorization for that project. Strict required checks or a merge queue are recommended on mainline; GitHub review requirements always remain enforced. Inspect post-merge outcomes rather than treating local success as deployment proof.

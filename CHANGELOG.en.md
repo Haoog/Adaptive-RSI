@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Store large tool output as run-owned artifacts with summaries, pagination and search; all five native protocols retain readable references.
+- Show model-specific capability sources, rule-review dates, inference and manual overrides; catalog, diagnostics and actual request budgets agree.
+- Re-query uncertain release/deployment results read-only and explicitly select a matching GitHub run, preserving identity checks and operation audit.
+- Improve OpenCode private temporary directories and macOS child-process compatibility; add phase, thread and child diagnostics to test workers.
+- Record real signed updates, interrupted-download recovery, real-model tasks and retries; see the [batch record](docs/validation/operability-evidence-20261030.en.md) for measurement scope and acceptance limits.
+
 ## 0.5.131
 
 <!-- adaptive-rsi-release:0.5.131;base:5059592abd76fdf7e43f136411e26422aa7ebcc7 -->

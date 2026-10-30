@@ -730,6 +730,39 @@ for (const kind of ['release', 'deploy']) {
   }
 }
 
+test('manual reconciliation renders only server candidates and never a free-form run id', () => {
+  const page = browser();
+  page.context.language = 'zh-CN';
+  const row = page.document.createElement('div');
+  const operation = {state: 'dispatch_unknown', reconciliation: {
+    state: 'awaiting_remote_visibility', candidates: [], checked_at: 1700000000,
+    reason: 'GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.'}};
+  page.context.renderReleaseReconciliation(row, operation, 'a', {id: 'run'}, 'release', 'operation');
+  const panel = row.children[0];
+  assert.equal(panel.tagName, 'DIV');
+  assert.equal(panel.children.some(child => child.tagName === 'SELECT'), false);
+  assert.equal(panel.children.some(child => child.tagName === 'INPUT'), false);
+  assert.match(panel.children.map(child => child.textContent || '').join(' '), /不接受手动填写运行编号/);
+
+  const candidates = [
+    {id: 101, url: 'https://github.com/example/project/actions/runs/101', status: 'queued', attempt: 1,
+     created_at: '2026-10-30T00:00:00Z'},
+    {id: 102, url: 'https://github.com/example/project/actions/runs/102', status: 'completed',
+     conclusion: 'failure', attempt: 2, updated_at: '2026-10-30T00:05:00Z'},
+  ];
+  const withCandidates = page.document.createElement('div');
+  page.context.renderReleaseReconciliation(withCandidates, {state: 'dispatch_unknown', reconciliation: {
+    state: 'manual_inspection_required', candidates, checked_at: 1700000000,
+    reason: 'Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.'}},
+    'a', {id: 'run'}, 'release', 'operation');
+  const detailed = withCandidates.children[0];
+  const select = detailed.children.find(child => child.tagName === 'SELECT');
+  assert.deepEqual(select.children.map(option => option.value), ['', '101', '102']);
+  assert.deepEqual(detailed.children.find(child => child.tagName === 'UL').children.map(item => item.children[0].href),
+    candidates.map(item => item.url));
+  assert.equal(detailed.children.some(child => child.tagName === 'INPUT'), false);
+});
+
 test('issue sync activity separates scans, real changes and unfinished continuation', () => {
   const page = browser();
   const copy = event => vm.runInContext(`eventCopy(${JSON.stringify(event)})`, page.context);

@@ -27,6 +27,7 @@ from .config import BUILTIN_PROVIDERS, compatibility
 from .contracts import API_VERSION, descriptor
 from .gitops import git
 from .evolution import Evolution
+from .release import ReconciliationRejected
 from .updates import UpdateInProgress, atomic_json
 
 
@@ -646,6 +647,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(runtime.auth_sessions.status(params.get("id", [""])[0]))
             elif parsed.path == "/api/release-status":
                 self.respond(runtime.release_status(params.get("project", [""])[0], params.get("run", [""])[0]))
+            elif parsed.path == "/api/release-candidates":
+                try:
+                    self.respond(runtime.release_candidates(
+                        params.get("project", [""])[0], params.get("run", [""])[0],
+                        params.get("kind", [""])[0], params.get("target", ["operation"])[0]))
+                except ReconciliationRejected as exc:
+                    raise RequestError(str(exc)) from None
             elif parsed.path == "/api/release-workflows":
                 self.respond(runtime.workflow_choices(params.get("project", [""])[0]))
             elif parsed.path == "/api/task-runs":
@@ -689,12 +697,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/model-center":
                 project = params.get("project", [None])[0] or None
                 snapshot = runtime.model_center.snapshot(project)
-                from .agent import model_capabilities
                 config = runtime.config(project)
+                # 角色级能力必须与目录/诊断共用同一覆盖解析，不能绕过人工核对值。
                 snapshot["capabilities"] = {
-                    role: model_capabilities(route["model"], next(
-                        (p.get("protocol", "codex") for p in BUILTIN_PROVIDERS + config["providers"]
-                         if p["id"] == route.get("provider", "openai")), "codex"))
+                    role: runtime.model_center.capabilities(
+                        route.get("provider", "openai"), route["model"], project)
                     for role, route in config["models"].items()
                 }
                 self.respond(snapshot)
@@ -919,6 +926,12 @@ class Handler(BaseHTTPRequestHandler):
                     result = runtime.repair_global_config(body.get("confirmation"))
                 elif path == "/api/release-retry":
                     result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
+                elif path == "/api/release-resolve":
+                    try:
+                        result = runtime.resolve_release(body.get("project"), body.get("run"), body.get("kind"),
+                                                         body.get("workflow_run_id"), body.get("target", "operation"))
+                    except ReconciliationRejected as exc:
+                        raise RequestError(str(exc)) from None
                 elif path == "/api/release-authorize":
                     result = runtime.authorize_workflow(body.get("project"), body.get("kind"), body.get("workflow"))
                 elif path == "/api/goal":
