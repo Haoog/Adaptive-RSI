@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.132
+
+<!-- adaptive-rsi-release:0.5.132;base:53a7759bf95d48cbe7db45c26e0aa828009ec122 -->
+
 - Store large tool output as run-owned artifacts with summaries, pagination and search; all five native protocols retain readable references.
 - Show model-specific capability sources, rule-review dates, inference and manual overrides; catalog, diagnostics and actual request budgets agree.
 - Re-query uncertain release/deployment results read-only and explicitly select a matching GitHub run, preserving identity checks and operation audit.
