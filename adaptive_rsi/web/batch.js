@@ -125,5 +125,6 @@ window.RSIBatch=(()=>{
   await refresh({force:true});
   }finally{pending.delete(project);toolbar();}
  }
+ toolbar();
  return {row,toolbar,costText,evidence};
 })();

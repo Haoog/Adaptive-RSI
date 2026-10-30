@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 function load() {
- const context = {window:{},Map,Set,t:value=>value};
+ const context = {window:{},Map,Set,t:value=>value,document:{querySelector:()=>null}};
  vm.createContext(context);
  vm.runInContext(fs.readFileSync('adaptive_rsi/web/batch.js','utf8'),context);
  return context.window.RSIBatch;
