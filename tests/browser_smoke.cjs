@@ -8,8 +8,8 @@ async function checkCodexHTTPLogin(browser,url,errors){
  const page=await browser.newPage({viewport:{width:1100,height:900}});
  page.on('pageerror',error=>errors.push(error.message));
  try{
-  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
-  await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();
+  await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="providers"]').click();
   await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
   const start=async()=>{
    const response=page.waitForResponse(response=>response.url().endsWith('/api/auth/start')&&response.request().method()==='POST');
@@ -38,7 +38,7 @@ async function checkReleaseRetryUI(browser,url,errors){
  await page.route('**/api/release-status?*',route=>reply(route,automation));
  await page.route('**/api/release-retry',route=>reply(route,{ok:true}));
  try{
-  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+  await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
   await page.locator('[data-task-filter="attention"]').click();
   const project=await page.locator('#project-select').inputValue();
   for(const test of [
@@ -84,14 +84,14 @@ async function checkAccountAndReleaseUI(browser,url,errors){
  await page.route('**/api/release-workflows?*',route=>reply(route,{workflows:[{workflow:'.github/workflows/release.yml',name:'Release',compatible:true}]}));
  await page.route('**/api/release-authorize',route=>{requests.push({path:'/api/release-authorize',body:route.request().postDataJSON()});return reply(route,{enabled:true,workflow:'.github/workflows/release.yml',ref:'rsi-workflow-test',sha:'a'.repeat(40)});});
  try{
-  await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
+  await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
   await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
   const code=page.locator('[data-auth-field="code:browser-auth-session"]');await code.fill('keep-my-code');await code.focus();await page.locator('#mc-auth').filter({hasText:'暂时无法连接，授权状态已保留'}).waitFor();
   await page.waitForTimeout(1650);await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();assert.equal(authStarts,1);
   assert.equal(await code.inputValue(),'keep-my-code');assert(await code.evaluate(node=>document.activeElement===node));
   if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#mc-auth').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/account-sign-in.png'});
-  await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
+  await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
   await page.getByRole('button',{name:'取消登录',exact:true}).click();await page.locator('#mc-auth').filter({hasText:'已取消登录'}).waitFor();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();await code.fill('official-code');await page.getByRole('button',{name:'完成授权',exact:true}).click();
   await page.locator('#mc-auth').filter({hasText:'账号已连接'}).waitFor();assert.equal(requests.find(r=>r.path.endsWith('/complete')).body.code,'official-code');
@@ -107,6 +107,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   const started=requests.find(r=>r.body?.backend==='opencode'&&r.path.endsWith('/start'));assert.deepEqual(started.body.inputs,{deployment:'enterprise',domain:'github.example.com'});
   await page.locator('#mc-auth input[type="password"]').fill('fake-test-key');await page.getByRole('button',{name:'保存供应商密钥',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('#mc-auth input[type="password"]').value==='');assert.equal(requests.find(r=>r.path.endsWith('/key')).body.provider,'openai');
+  await page.locator('#project-settings').click();
   assert.equal(await page.locator('#deploy-health-settings').isVisible(),false);
   await page.locator('#release-workflow-list').selectOption('.github/workflows/release.yml');await page.locator('#release-authorize').click();await page.locator('#release-authorization-feedback').filter({hasText:'工作流已授权'}).waitFor();
   assert.equal(await page.locator('[data-path="delivery.release.enabled"]').isChecked(),true);assert.equal(await page.locator('[data-path="delivery.release.sha"]').inputValue(),'a'.repeat(40));assert.equal(requests.find(r=>r.path==='/api/release-authorize').body.kind,'release');
@@ -143,7 +144,7 @@ async function main() {
     await checkReleaseRetryUI(browser,url,errors);
     if(process.env.RSI_BROWSER_RELEASE_RETRY_ONLY){assert.deepEqual(errors,[]);console.log('Release confirmation and retry UI checks passed.');return;}
     if(process.env.RSI_BROWSER_AUTH_ONLY){await checkAccountAndReleaseUI(browser,url,errors);assert.deepEqual(errors,[]);console.log('Targeted account and release UI checks passed.');return;}
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#readiness-summary').filter({hasText: '基础条件已就绪'}).waitFor();
     assert.equal(await page.locator('#project-status').innerText(), '已暂停');
     const draftProject = await page.locator('#project-select').inputValue();
@@ -184,13 +185,16 @@ async function main() {
     await saveSettings();
     await page.locator('#toast').filter({hasText: '已保存'}).waitFor();
     const firstProject = await page.locator('#project-select').inputValue();
+    if (await page.locator('#sidebar-toggle').isVisible()) await page.locator('#sidebar-toggle').click();
     await page.locator('#global-settings').click();
     assert.equal(await page.locator('[data-schedule-preset]').count(), 2);
     assert.equal(await page.locator('[data-path="limits.daily_calls"], [data-path="limits.run_calls"], [data-path="limits.run_seconds"]').count(), 0);
+    await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-mc-tab="providers"]').click();
     await page.getByRole('button', {name:'OpenCode', exact:true}).click();
     await page.getByRole('heading', {name:'OpenCode', exact:true}).waitFor();
-    await page.locator('[data-mc-tab="roles"]').click();
+    await page.locator('#project-settings').click();
+    await page.locator('[data-settings-scope="global"]').click();
     await page.locator('[data-schedule-preset="light"]').selectOption('360');
     await page.locator('[data-schedule-preset="issues"]').selectOption('10080');
     await saveSettings();
@@ -206,6 +210,8 @@ async function main() {
       await page.locator('#mc-picker-search').fill(model);
       await page.locator('#mc-picker-list .mc-picker-option').filter({hasText:model}).click();
     };
+    await page.locator('.sidebar [data-view=models]').click();
+    await page.locator('[data-mc-tab="roles"]').click();
     const planning = page.locator('#mc-role-model-planning');
     const coding = page.locator('#mc-role-model-implementation');
     await selectRoute('planning',provider.id,'fixture-planner');
@@ -219,6 +225,7 @@ async function main() {
     assert.equal(snapshot.config.models.planning.effort, 'high');
     assert.equal(snapshot.config.models.implementation.effort, 'default');
     // 高级连接选项真实保存；隐藏的环境变量字段不能阻断其他认证方式。
+    await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#mc-add-provider').click();
     await page.locator('#mc-input-name').fill('浏览器连接验证');
     await page.locator('#mc-input-url').fill(provider.base_url);
@@ -293,6 +300,7 @@ async function main() {
     await page.locator('#schedule-mode').selectOption('inherit');
     await saveSettings();
     await page.locator('#toast').filter({hasText:'已保存'}).waitFor();
+    if (await page.locator('#sidebar-toggle').isVisible()) await page.locator('#sidebar-toggle').click();
     await page.locator('#global-settings').click();
     await page.locator('[data-schedule-preset="light"]').selectOption('720');
     await saveSettings();
@@ -303,7 +311,7 @@ async function main() {
     assert.equal(snapshot.projects.find(p=>p.id!==firstProject).config.models.implementation.model, 'fixture-coder');
     await page.locator('.brand').click();
     await page.locator('#language-select').selectOption('en');
-    await page.locator('[data-task-filter="active"]').filter({hasText: 'In progress'}).waitFor();
+    await page.locator('[data-task-filter="active"]').filter({hasText: 'Open tasks'}).waitFor();
     await page.setViewportSize({width: 390, height: 844});
     await page.locator('#project-settings').click();
     await page.locator('#delivery-choice').selectOption('local');
@@ -322,7 +330,11 @@ async function main() {
     if(process.env.RSI_SCREENSHOT_DIR){fs.mkdirSync(process.env.RSI_SCREENSHOT_DIR,{recursive:true});await page.screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/mobile-task.png'});}
     await page.locator('#detail-dialog .close-dialog').click();
     await page.setViewportSize({width:320,height:740});
+    if (await page.locator('#sidebar-toggle').isVisible()) await page.locator('#sidebar-toggle').click();
     await page.locator('#global-settings').click();
+    await page.locator('.sidebar [data-view=models]').click();
+    await page.locator('[data-settings-scope="global"]').click();
+    await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#mc-add-provider').click();
     await page.locator('#mc-connection-advanced summary').click();
     await page.locator('#mc-input-auth').selectOption('env');

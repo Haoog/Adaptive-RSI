@@ -52,6 +52,8 @@ Models, tasks, memory, usage, and delivery authorization remain separate per pro
 
 The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
 
+The workspace brings project status and tasks together. Selecting tasks reveals batch actions, while batch history stays accessible. Added goals link directly to their tasks; details show requirements and waiting reasons before optional supplement, dependency and evidence sections. Model services and runtime settings have separate pages, with model subpages and configuration scope retained on reload. Chinese, English, light and dark themes and mobile layouts are supported; mobile prioritizes tasks and groups less frequent navigation in a menu.
+
 Cancellation previews affected downstream tasks and defaults to cancelling only the current task; cascading requires an explicit selection. Cancelling revokes approval eligibility for undelivered candidates. Restore an archived project before retrying tasks or revising requirements. Requirement revisions expose exact before/after snapshots, diffs and paginated history. Task intervention history retains optional reasons, candidate identity and operation effects, and can export loaded records. See [workflow and mobile usage](EXPERIENCE.en.md) for scope and historical-evidence limits.
 
 ## Quick Start

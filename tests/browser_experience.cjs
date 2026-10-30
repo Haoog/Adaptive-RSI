@@ -144,10 +144,16 @@ async function checkGoalRecovery(page, evidence) {
     await page.unroute('**/api/goal', intercept);
   }
 }
+async function expandTaskEditor(dialog, selector) {
+  const editor = dialog.locator(selector);
+  if (!(await editor.evaluate(node => node.open))) await editor.locator(':scope > summary').click();
+}
+
 async function checkQueueEditor(page, evidence) {
   await page.locator('#language-select').selectOption('zh-CN');
   await page.getByRole('button', {name: '排队草稿验证', exact: true}).click();
   const box = page.getByRole('dialog', {name: '排队草稿验证', exact: true});
+  await expandTaskEditor(box, '.task-queue-editor');
   const select = box.getByRole('combobox', {name: '前置任务（合并后再开始）', exact: true});
   await box.getByText('前置任务候选页 1', {exact: true}).waitFor();
   assert.equal(await select.getByRole('option', {name: '旧失败前置任务', exact: true}).count(), 0);
@@ -165,6 +171,7 @@ async function checkQueueEditor(page, evidence) {
   await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
   assert.equal(await english.inputValue(), parent);
   assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
+  await expandTaskEditor(box, '.task-supplement-editor');
   await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Queue supplement preserves original draft');
   await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
   await box.getByText('Requirement revisions', {exact: true}).waitFor();
@@ -178,6 +185,7 @@ async function checkQueueEditor(page, evidence) {
   const size = await page.evaluate(() => ({width: innerWidth, scroll: document.documentElement.scrollWidth}));
   assert.ok(size.scroll <= size.width, JSON.stringify(size));
   await page.reload();
+  await expandTaskEditor(box, '.task-queue-editor');
   await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
   assert.equal(await english.inputValue(), parent, 'real server persists the off-page dependency');
   assert.equal(await box.getByRole('checkbox', {name: 'Urgent', exact: true}).isChecked(), false);
@@ -217,6 +225,7 @@ async function checkQueueEditor(page, evidence) {
         assert.equal(await box.getByRole('button', {name: '保存排队设置', exact: true}).isDisabled(), true);
         await page.locator('#language-select').selectOption('en');
       } else if (trigger === 'revision') {
+        await expandTaskEditor(box, '.task-supplement-editor');
         await box.getByRole('textbox', {name: 'Supplement requirements (on this task)', exact: true}).fill('Save acknowledgement race supplement');
         await box.getByRole('button', {name: 'Save supplement and reassess', exact: true}).click();
         await box.getByText('Save acknowledgement race supplement', {exact: false}).waitFor({state: 'attached'});
@@ -249,6 +258,7 @@ async function checkQueueEditor(page, evidence) {
     assert.equal(response.request().postDataJSON().dependency, null);
     assert.equal(response.request().postDataJSON().urgency, 0);
     await page.reload();
+    await expandTaskEditor(box, '.task-queue-editor');
     await box.getByText('Dependency candidate page 1', {exact: true}).waitFor();
     assert.equal(await english.inputValue(), ''); assert.equal(await urgent.isChecked(), false);
     console.log('Queue save race passed: committed server values, held acknowledgement, ' + trigger + ' rebuild, duplicate submit blocked, undo preserved and persisted.');
@@ -352,6 +362,7 @@ async function checkQueueEditor(page, evidence) {
     const liveTitle = await liveTask.innerText();
     await liveTask.click();
     await page.locator('#detail-dialog[open] #detail-title').filter({hasText: liveTitle}).waitFor();
+    await expandTaskEditor(page.locator('#detail-dialog'), '.task-supplement-editor');
     const liveDraft = page.locator('#detail-dialog .task-controls textarea').first();
     await liveDraft.fill('本地未保存草稿');
     let syncedDetail = false;
@@ -390,6 +401,7 @@ async function checkQueueEditor(page, evidence) {
       );
     await page.locator('.sidebar nav [data-view="usage"]').click();
     await page.locator("#usage-totals strong").first().waitFor();
+    if (await page.locator('#sidebar-toggle').isVisible() && await page.locator('#sidebar-toggle').getAttribute('aria-expanded') !== 'true') await page.locator('#sidebar-toggle').click();
     await page.locator("#mobile-install").click();
     await page
       .locator(".experience-dialog a")
@@ -431,6 +443,7 @@ async function checkQueueEditor(page, evidence) {
     await page
       .getByRole("button", { name: "手机测试目标", exact: true })
       .click();
+    await expandTaskEditor(page.locator('#detail-dialog'), '.task-supplement-editor');
     await page.getByRole("textbox", {name:"补充需求（保留在当前任务）",exact:true}).fill("增加手机验收要求");
     await page
       .getByRole("button", { name: "保存补充并重新评估", exact: true })
@@ -544,6 +557,7 @@ async function checkQueueEditor(page, evidence) {
     await deep.locator('#detail-dialog[open] #detail-title').filter({hasText:'Fix addition'}).waitFor();
     await deep.close();
     await page.locator("#detail-dialog .close-dialog").click();
+    if (await page.locator('#sidebar-toggle').isVisible() && await page.locator('#sidebar-toggle').getAttribute('aria-expanded') !== 'true') await page.locator('#sidebar-toggle').click();
     await page.locator("#storage-tools").click();
     await page
       .getByRole("button", { name: "创建一致性备份", exact: true })
@@ -653,18 +667,22 @@ async function checkQueueEditor(page, evidence) {
     await page.locator('#project-select').selectOption(ids[2]);
     await page.locator('#save-note[data-state="dirty"]').waitFor();
     assert.equal(await page.locator('#checks-editor [data-check-field="name"]').last().inputValue(),'Project A unsaved');
+    await page.locator('.sidebar [data-view=models]').click();
+    await page.locator('[data-mc-tab="roles"]').click();
     await page.emulateMedia({colorScheme:'dark'});
     await page.waitForFunction(()=>{
       const picker=document.querySelector('.mc-route-picker');
       const surface=getComputedStyle(document.documentElement).getPropertyValue('--surface').trim();
-      return picker&&surface==='#1e2620'&&getComputedStyle(picker).backgroundColor==='rgb(30, 38, 32)';
+      return picker&&surface==='#1d2227'&&getComputedStyle(picker).backgroundColor==='rgb(29, 34, 39)';
     });
+    await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#mc-add-provider').click();
     await page.locator('#mc-provider-preset').selectOption('opencode_go');
     assert.equal(await page.locator('#mc-input-name').inputValue(),'OpenCode Go');
     assert.equal(await page.locator('#mc-input-url').inputValue(),'');
     await page.locator('#mc-go-hint').filter({hasText:'official OpenCode console'}).waitFor();
     await page.locator('#mc-provider-dialog .close-dialog').click();
+    if (await page.locator('#sidebar-toggle').isVisible() && await page.locator('#sidebar-toggle').getAttribute('aria-expanded') !== 'true') await page.locator('#sidebar-toggle').click();
     assert.equal(
       await page.locator("#mobile-install").innerText(),
       "Install on phone",

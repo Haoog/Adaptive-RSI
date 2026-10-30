@@ -1,1 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><rect width="256" height="256" rx="56" fill="#235e4b"/><path d="M56 182 112 68h32l56 114h-38l-12-28h-47l-12 28Zm59-57h23l-11-28Z" fill="#fff"/><path d="M176 62h33v33m0-33-43 43" fill="none" stroke="#a6d6b2" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="240" y1="104" x2="776" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#323F3D"/><stop offset="1" stop-color="#182826"/></linearGradient>
+    <linearGradient id="edge" x1="512" y1="104" x2="512" y2="920" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF" stop-opacity=".22"/><stop offset=".55" stop-color="#FFFFFF" stop-opacity=".03"/><stop offset="1" stop-color="#172A25" stop-opacity=".4"/></linearGradient>
+    <linearGradient id="ribbon" x1="340" y1="320" x2="680" y2="720" gradientUnits="userSpaceOnUse"><stop stop-color="#FCFFF5"/><stop offset="1" stop-color="#DCECCF"/></linearGradient>
+    <linearGradient id="mint" x1="408" y1="384" x2="704" y2="640" gradientUnits="userSpaceOnUse"><stop stop-color="#BCE6C6"/><stop offset="1" stop-color="#78BC9E"/></linearGradient>
+  </defs>
+  <rect x="104" y="104" width="816" height="816" rx="182" fill="url(#tile)"/>
+  <rect x="106" y="106" width="812" height="812" rx="180" fill="none" stroke="url(#edge)" stroke-width="4"/>
+  <path d="M320 700L469 366C487 326 543 326 561 366L704 686H534C475 686 428 639 428 580C428 521 475 474 534 474H608" fill="none" stroke="#0A1D18" stroke-opacity=".25" stroke-width="88" stroke-linecap="round" stroke-linejoin="round" transform="translate(0 10)"/>
+  <path d="M320 700L469 366C487 326 543 326 561 366L704 686H534C475 686 428 639 428 580C428 521 475 474 534 474H608" fill="none" stroke="url(#ribbon)" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M704 686H534C475 686 428 639 428 580C428 521 475 474 534 474H608" fill="none" stroke="url(#mint)" stroke-width="88" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

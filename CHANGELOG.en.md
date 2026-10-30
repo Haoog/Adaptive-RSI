@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Redesign the app icon around a folded A, align desktop, browser, home-screen and sidebar marks, generate standard sizes and refresh the previous icon cache.
+- Redesign workspace, model, settings and detail surfaces with consistent light/dark themes; place status beside goal entry, align task rows, reveal batch actions on selection and contain long project paths in the sidebar.
+- Refresh project archive and attention inbox labels when switching languages.
+- Separate model services from runtime settings, retain model subpages and configuration scope on reload, and organize runtime settings by scanning, delivery, checks and advanced options.
+- Show requirements and waiting reasons directly in task details, disclose supplement and dependency editors on demand, confirm added goals with a task link, and prioritize tasks with compact mobile navigation.
+
 ## 0.5.132
 
 <!-- adaptive-rsi-release:0.5.132;base:c5404903465c28e322b4adc065041afba82a17ef -->

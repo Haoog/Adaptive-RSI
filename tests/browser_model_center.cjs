@@ -33,7 +33,7 @@ async function main() {
 
     await page.goto(url);
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-mc-tab="providers"]').click();
 
     // OAuth（Codex 登录）未连接时第 2 步保持 current。
@@ -126,7 +126,7 @@ async function main() {
     const selectDirectoryProvider = async target => {
       await target.goto(url);
       await target.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
-      await target.locator('#project-settings').click();
+      await target.locator('.sidebar [data-view=models]').click();
       await target.locator('[data-mc-tab="providers"]').click();
       await target.locator('#mc-provider-list .mc-provider').filter({hasText: '本地目录服务'}).click();
     };

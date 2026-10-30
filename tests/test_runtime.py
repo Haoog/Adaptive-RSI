@@ -1350,7 +1350,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn("default-src 'self'", denied.exception.headers["Content-Security-Policy"])
         with urllib.request.urlopen(self.server.origin + "/login.css") as response:
             self.assertIn("text/css", response.headers["Content-Type"])
-        for path in ["/api/state", "/app.js", "/style.css"]:
+        for path in ["/api/state", "/app.js", "/style.css", "/workspace.css"]:
             with self.assertRaises(urllib.error.HTTPError) as denied:
                 urllib.request.urlopen(self.server.origin + path)
             self.assertEqual(denied.exception.code, 401)
