@@ -21,6 +21,24 @@ const OWNERSHIP_ZH = '校验期间同一服务的部署归属发生了变化，�
 const DISCARDED_HEALTH_ZH = '已有更新版本接管此服务，本次部署的健康检查结果已作废。';
 const HEALTH_ZH = '健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。';
 const IDENTITY_ZH = '工作流执行记录与授权的部署操作不一致，请到 GitHub 核对本次部署对应的工作流记录。';
+const MULTI_REASON = 'Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.';
+const EMPTY_REASON = 'GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.';
+const RERUN_REASON = 'GitHub now reports a new run attempt. Selecting it only reads its status and never repeats the rerun request.';
+const candidate = (id, overrides = {}) => ({id, url: 'https://github.com/example/project/actions/runs/' + id,
+  status: 'queued', conclusion: null, attempt: 1, created_at: '2026-10-30T00:00:00Z',
+  updated_at: '2026-10-30T00:05:00Z', ...overrides});
+const manualOperation = (state, candidates, overrides = {}) => ({
+  release: {state, repository: 'example/project', workflow: '.github/workflows/publish.yml', ref: 'trusted-v1',
+    workflow_sha: 'a'.repeat(40), operation_id: 'rsi-operation', sha: 'b'.repeat(40),
+    error: state === 'rerun_unknown' ? 'GitHub has not confirmed a new run attempt' : 'GitHub did not confirm the dispatch',
+    workflow_run_id: state === 'rerun_unknown' ? 17 : undefined, previous_attempt: 1, attempt: 1,
+    checked_at: Math.floor(Date.now() / 1000),
+    reconciliation: {state: candidates.length > 1 ? 'manual_inspection_required' : candidates.length ? 'matched' : 'awaiting_remote_visibility',
+      candidate_run_ids: candidates.map(item => item.id), candidates,
+      checked_at: Math.floor(Date.now() / 1000), redispatch_allowed: false,
+      reason: state === 'rerun_unknown' ? RERUN_REASON : candidates.length > 1 ? MULTI_REASON : candidates.length ? 'One matching workflow run is visible. Reading its status never starts another run.' : EMPTY_REASON},
+    ...overrides},
+});
 
 // 场景 → [行标题, 状态文案, 消息, 期望样式]；样式 muted=进行中等待，form-error=真实失败。
 const CASES = [
@@ -80,8 +98,17 @@ async function main() {
     browser = await chromium.launch(process.env.RSI_BROWSER_CHANNEL ? {channel: process.env.RSI_BROWSER_CHANNEL} : {});
     const page = await browser.newPage({viewport: {width: 1380, height: 1000}});
     page.on('pageerror', error => errors.push(error.message));
-    let scenario = 'waiting_verification';
-    await page.route('**/api/release-status?*', route => reply(route, operation(scenario)));
+    let scenario = 'waiting_verification', statusOverride = null, candidatesReply = null, resolveReply = null;
+    const candidateCalls = [], resolvePosts = [];
+    await page.route('**/api/release-status?*', route => reply(route, statusOverride || operation(scenario)));
+    await page.route('**/api/release-candidates?*', route => {
+      candidateCalls.push(route.request().url());
+      return reply(route, candidatesReply || {state: 'dispatch_unknown', candidates: [], reason: EMPTY_REASON});
+    });
+    await page.route('**/api/release-resolve', route => {
+      resolvePosts.push(route.request().postDataJSON());
+      return reply(route, resolveReply?.data ?? {ok: true}, resolveReply?.status ?? 200);
+    });
     // 「发布与上线」只渲染在最新一次运行上；把 fixture 中已合并的 detail-h1 排到首位。
     await page.route('**/api/task-runs?*', async route => {
       const response = await route.fetch();
@@ -111,6 +138,90 @@ async function main() {
     await openDetail(page, 'Details');
     await assertRow(page, ['superseded_stale_en', ['Deploy', 'A newer version has taken over deployment', STALE_TARGET_EN, 'form-error']]);
     console.log('ok: English interface shows translated waiting and failure copy');
+
+    // 人工核对：无候选说明、只读重查、多候选选择、失败提示、重试确认和双语。
+    await page.evaluate(() => document.getElementById('detail-dialog').close());
+    await page.locator('#language-select').selectOption('zh-CN');
+    await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+    statusOverride = manualOperation('dispatch_unknown', []);
+    candidatesReply = {state: 'dispatch_unknown', candidates: [], reason: EMPTY_REASON};
+    await openDetail(page, '查看详情');
+    let panel = page.locator('#live-task-outcome .release-reconciliation').first();
+    await panel.waitFor({timeout: 10000});
+    assert.match(await panel.innerText(), /是否启动仍待确认/);
+    assert.match(await panel.innerText(), /不接受手动填写运行编号/);
+    assert.equal(await panel.locator('select').count(), 0, 'no candidates must not render a selector');
+    assert.equal(await panel.locator('input').count(), 0, 'no free-form run id input');
+    assert.equal(await panel.getByRole('button', {name: '关联所选记录', exact: true}).count(), 0);
+    await panel.getByRole('button', {name: '只读重新查询', exact: true}).waitFor();
+    console.log('ok: no candidates explain the state without a free-form run id');
+
+    // 只读重查：服务端返回候选后，用固定仓库链接和候选选择器展示。
+    const one = candidate(17);
+    statusOverride = manualOperation('dispatch_unknown', [one]);
+    candidatesReply = {state: 'dispatch_unknown', candidates: [one],
+      reason: 'One matching workflow run is visible. Reading its status never starts another run.'};
+    const rechecked = page.waitForResponse(response => response.url().includes('/api/release-candidates?') && response.status() === 200);
+    await panel.getByRole('button', {name: '只读重新查询', exact: true}).click();
+    await rechecked;
+    panel = page.locator('#live-task-outcome .release-reconciliation').first();
+    await panel.locator('a[href="https://github.com/example/project/actions/runs/17"]').waitFor({timeout: 10000});
+    assert.equal(await panel.locator('select option').count(), 2, 'placeholder plus one server candidate');
+    assert.equal(resolvePosts.length, 0, 're-query must not submit a selection');
+    assert.match(candidateCalls.at(-1), /project=[^&]+&run=[^&]+&kind=release&target=operation/);
+    console.log('ok: read-only re-query lists the fixed repository link');
+
+    // 多候选：只允许选择服务端候选；失败提示后仍可重试，成功后按 GitHub 状态显示。
+    const two = [candidate(101), candidate(102, {status: 'completed', conclusion: 'failure'})];
+    statusOverride = manualOperation('dispatch_unknown', two);
+    await page.evaluate(() => document.getElementById('detail-dialog').close());
+    await openDetail(page, '查看详情');
+    panel = page.locator('#live-task-outcome .release-reconciliation').first();
+    await panel.locator('a[href="https://github.com/example/project/actions/runs/101"]').waitFor({timeout: 10000});
+    assert.equal(await panel.locator('a[href="https://github.com/example/project/actions/runs/102"]').count(), 1);
+    const select = panel.locator('select.release-candidate-select');
+    assert.equal(await select.count(), 1);
+    assert.equal(await select.locator('option').count(), 3, 'placeholder plus two server candidates');
+    const bind = panel.getByRole('button', {name: '关联所选记录', exact: true});
+    assert.equal(await bind.isDisabled(), true, 'selection is explicit');
+    await select.selectOption('101');
+    assert.equal(await bind.isDisabled(), false);
+    const project = await page.locator('#project-select').inputValue();
+    resolveReply = {status: 400, data: {error: "The selected workflow run does not match this operation's repository, workflow, ref, exact target SHA or operation ID"}};
+    await bind.click();
+    await page.locator('#toast').filter({hasText: '所选工作流记录与本次操作的仓库、工作流、引用、精确目标提交或操作编号不一致'}).waitFor({timeout: 10000});
+    assert.equal(resolvePosts.length, 1);
+    assert.deepEqual(resolvePosts[0], {project, run: 'detail-h1', kind: 'release', target: 'operation', workflow_run_id: 101});
+    assert.equal(await panel.count(), 1, 'a rejected selection keeps the candidates visible');
+
+    const resolved = manualOperation('queued', []);
+    resolved.release.workflow_run_id = 101;
+    statusOverride = resolved;
+    resolveReply = {status: 200, data: {ok: true}};
+    const resolvedResponse = page.waitForResponse(response => response.url().includes('/api/release-status?') && response.status() === 200);
+    await bind.click();
+    await resolvedResponse;
+    await page.locator('#live-task-outcome .release-status-row').filter({hasText: '排队中'}).waitFor({timeout: 10000});
+    assert.equal(await page.locator('#live-task-outcome .release-reconciliation').count(), 0, 'resolved state leaves the manual panel');
+    assert.deepEqual(resolvePosts[1], {project, run: 'detail-h1', kind: 'release', target: 'operation', workflow_run_id: 101});
+    console.log('ok: multiple candidates require an explicit server-backed selection and show API failures');
+
+    // 重试待确认：列出原始执行记录，英文界面使用已翻译的状态标题和服务端英文原因。
+    await page.evaluate(() => document.getElementById('detail-dialog').close());
+    statusOverride = manualOperation('rerun_unknown', [candidate(17, {status: 'in_progress', attempt: 2})]);
+    await openDetail(page, '查看详情');
+    panel = page.locator('#live-task-outcome .release-reconciliation').first();
+    await panel.waitFor({timeout: 10000});
+    assert.match(await panel.innerText(), /重试是否启动仍待确认/);
+    await panel.locator('a[href="https://github.com/example/project/actions/runs/17"]').waitFor();
+    assert.match(await panel.innerText(), /核对时间/);
+    await page.locator('#language-select').selectOption('en');
+    await page.waitForFunction(() => document.documentElement.lang === 'en');
+    panel = page.locator('#live-task-outcome .release-reconciliation').first();
+    await panel.locator('h5').filter({hasText: 'Retry startup is still unconfirmed'}).waitFor({timeout: 10000});
+    assert.match(await panel.innerText(), /GitHub now reports a new run attempt/);
+    assert.match(await panel.innerText(), /#17/);
+    console.log('ok: bilingual rerun reconciliation keeps the server evidence');
     await page.close();
 
     assert.deepEqual(errors, [], 'no page errors: ' + JSON.stringify(errors));

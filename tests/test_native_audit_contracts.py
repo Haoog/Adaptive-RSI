@@ -191,8 +191,11 @@ class NativeAuditContractsTest(unittest.TestCase):
                 self.assertEqual(capability["request_output_tokens"], budget)
                 self.assertEqual(request_output_budget(model, "anthropic"), budget)
                 self.assertEqual(request_output_budget(model, "anthropic", capability["max_output_tokens"]), budget)
-                self.assertLess(capability["request_output_tokens"], capability["max_output_tokens"])
-                self.assertEqual(capability["max_output_tokens"], 32000 if "claude" in model else 16384)
+                # Request policy never exceeds the model's documented ceiling.
+                self.assertLessEqual(capability["request_output_tokens"], capability["max_output_tokens"])
+        # Unknown names keep the conservative default ceiling; do not infer a
+        # vendor-family maximum for a model that has no matching rule.
+        self.assertEqual(model_capabilities("unknown-model", "anthropic")["max_output_tokens"], 16384)
         # 旧型号保持 4096 的历史包络，新型号只在能力之内提高预算。
         _, body = Conversation("anthropic", "claude-opus", "prompt", [], "default", output_tokens=32000).request()
         self.assertEqual(body["max_tokens"], 4096)
@@ -220,6 +223,9 @@ class NativeAuditContractsTest(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertEqual(request_output_budget(model, "anthropic"), 4096)
                 capability = model_capabilities(model, "anthropic")
+                # Old Claude 3 must keep its documented 4096 ceiling; the
+                # request policy must not lift it to a newer family value.
+                self.assertEqual(capability["max_output_tokens"], 4096)
                 self.assertEqual(capability["request_output_tokens"], 4096)
                 _, body = Conversation("anthropic", model, "prompt", [], "default",
                                        output_tokens=capability["max_output_tokens"]).request()
@@ -231,6 +237,8 @@ class NativeAuditContractsTest(unittest.TestCase):
                               ("claude-haiku-4-5-20251001", 8192)]:
             with self.subTest(model=model):
                 self.assertEqual(request_output_budget(model, "anthropic"), budget)
+                self.assertLessEqual(request_output_budget(model, "anthropic"),
+                                     model_capabilities(model, "anthropic")["max_output_tokens"])
 
     def test_native_anthropic_request_sends_policy_budget_within_capability(self):
         store = self.native_store()
@@ -314,6 +322,58 @@ class NativeAuditContractsTest(unittest.TestCase):
                 with patch("adaptive_rsi.native.post_json", side_effect=[malformed, completed]) as post:
                     self.assertEqual(self.anthropic_invoke(store, workspace), {"summary": "RSI_OK"})
                 self.assertEqual(post.call_count, 2)
+
+
+class NativeToolArtifactContractsTest(unittest.TestCase):
+    """Independent contracts for externalizing large native tool bodies."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+
+    def tools(self, role="implementation", invocation="artifact-inv"):
+        return WorkspaceTools(self.workspace, role, self.state, {"limits": {"command_seconds": 30}},
+                              None, (), run="artifact-run", invocation=invocation,
+                              artifact_root=self.state / "runs" / "artifact-run" / "artifacts")
+
+    def test_small_run_command_result_keeps_legacy_shape(self):
+        tools = self.tools()
+        tools.execute = lambda name, args: {"exit_code": 0, "stdout": "ok\n", "stderr": "", "error": None}
+        result = execute_tools(tools, [("call", "run_command", {"cwd": ".", "argv": ["true"]})])[0][2]
+        self.assertEqual(result, {"exit_code": 0, "stdout": "ok\n", "stderr": "", "error": None})
+
+    def test_large_run_command_result_is_compacted_and_readable(self):
+        tools = self.tools()
+        body = "payload\n" * 5000
+        original = tools.execute
+        tools.execute = lambda name, args: {"exit_code": 0, "stdout": body, "stderr": "",
+                                            "error": None, "error_kind": None,
+                                            "timed_out": False, "seconds": 0.1}
+        result = execute_tools(tools, [("call", "run_command", {"cwd": ".", "argv": ["x"]})])[0][2]
+        tools.execute = original
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertIsInstance(result["stdout"], dict)
+        self.assertNotIn(body, json.dumps(result))
+        artifact = result["stdout"]["artifact"]
+        pages, offset = [], 0
+        while True:
+            page = tools.execute("read_artifact", {"artifact": artifact, "offset": offset,
+                                                   "limit": 32768})
+            pages.append(page["content"])
+            if page["eof"]:
+                break
+            offset = page["next_offset"]
+        self.assertEqual("".join(pages), body)
+
+    def test_read_artifact_is_not_offered_to_probe(self):
+        self.assertNotIn("read_artifact", [name for name, _, _ in tools_for("probe")])
+        self.assertIn("read_artifact", [name for name, _, _ in tools_for("review")])
 
 
 if __name__ == "__main__":

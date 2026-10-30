@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .agent import CodexAgent, model_capabilities
+from .agent import CodexAgent, model_capabilities, normalize_capability_override
 from .catalog import CatalogError, list_models
 from .config import BUILTIN_PROVIDERS as BUILTINS, fingerprint, merge, validate
 from .credentials import CredentialError, Credentials
@@ -54,7 +54,8 @@ class ModelCenter:
         return "model-center:" + (project or "global") + ":" + provider["id"] + ":" + (signature or self.signature(provider))
 
     def _save_directory(self, key, provider, project, directory):
-        fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices"}
+        fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices",
+                  "capability_override"}
         preferences = {"models": [{name: value for name, value in model.items() if name in fields}
                                   for model in directory.get("models", [])],
                        "fetched": None, "truncated": directory.get("truncated", False)}
@@ -78,6 +79,24 @@ class ModelCenter:
                     model.pop(key, None)
         return copy.deepcopy(value or {"models": [], "fetched": None, "truncated": False})
 
+    def _capability(self, provider, model):
+        """单一解析入口：目录展示、诊断和后续原生调用接线共享同一覆盖语义。"""
+        try:
+            return model_capabilities(model["id"], provider.get("protocol", "codex"),
+                                      model.get("capability_override"))
+        except (TypeError, ValueError):
+            # 历史或手工损坏的覆盖不能让整个目录不可读；忽略覆盖并显式标记。
+            result = model_capabilities(model["id"], provider.get("protocol", "codex"))
+            result["override_error"] = True
+            return result
+
+    def capabilities(self, provider_id, model_id, project=None):
+        provider = self.provider(provider_id, project)
+        directory = self.directory(provider, project)
+        entry = next((model for model in directory.get("models", [])
+                      if isinstance(model, dict) and model.get("id") == model_id), None)
+        return self._capability(provider, entry or {"id": model_id})
+
     def snapshot(self, project=None):
         config = self.runtime.config(project)
         items = []
@@ -90,6 +109,10 @@ class ModelCenter:
                         directory["models"].append({"id": item["model"], "name": item["model"], "enabled": True,
                                                     "manual": False, "missing": bool(directory["fetched"]), "configured": True})
                         known.add(item["model"])
+            for model in directory["models"]:
+                if isinstance(model, dict):
+                    # 只在本快照中附加解析结果，不写回目录，避免把推导值固化。
+                    model["capabilities"] = self._capability(provider, model)
             builtin = provider["id"] in {p["id"] for p in BUILTINS}
             items.append({**provider, "builtin": builtin, "credential_status": "opencode" if provider["id"] == "opencode" else "login" if provider["id"] == "openai"
                           else self.credentials.status(provider), "catalog": directory,
@@ -273,7 +296,9 @@ class ModelCenter:
             self._forget_credential(provider)
         if old and self.signature(old) != self.signature(provider):
             previous = self.directory(old, project)
-            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices"]}
+            preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual",
+                                                                      "favorite", "unit_price", "prices",
+                                                                      "capability_override"]}
                            for model in previous["models"]]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
@@ -359,20 +384,51 @@ class ModelCenter:
                 models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT),
                                "manual": old.get("manual", False), "missing": False, "name_override": custom_name,
                                **({"name": old["name"]} if custom_name else {}),
-                               **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price", "prices"] if k in old}})
+                               **{k: old[k] for k in ["verified", "probes", "last_attempt", "favorite", "unit_price",
+                                                      "prices", "capability_override"] if k in old}})
             retained = sorted(before.values(), key=lambda model: not (model.get("manual") or model.get("favorite") or
-                              model.get("name_override") or model.get("unit_price") is not None or bool(model.get("prices"))))
+                              model.get("name_override") or model.get("unit_price") is not None or bool(model.get("prices")) or
+                              bool(model.get("capability_override"))))
             omitted = len(models) + len(retained) > 2000
             if omitted and any(m.get("manual") or m.get("favorite") or m.get("name_override") or m.get("unit_price") is not None
-                               or bool(m.get("prices")) for m in retained[max(0, 2000 - len(models)):]):
+                               or bool(m.get("prices")) or bool(m.get("capability_override"))
+                               for m in retained[max(0, 2000 - len(models)):]):
                 raise CenterError("too_many_models")
             models.extend({**model, "missing": not model.get("manual", False)} for model in retained[:max(0, 2000 - len(models))])
             directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"] or omitted}
             self._save_directory(key, provider, project, directory)
         return directory
 
+    def _apply_capability_override(self, model, raw, provider):
+        """按字段合并人工覆盖；None/空值只清除该字段，校验失败不写入。"""
+        if raw is None:
+            model.pop("capability_override", None)
+            return
+        if not isinstance(raw, dict):
+            raise CenterError("invalid_capability")
+        merged = dict(model.get("capability_override") or {})
+        for key, value in raw.items():
+            if value is None or (key in ("source_url", "note") and isinstance(value, str)
+                                 and not value.strip()):
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        if not merged:
+            model.pop("capability_override", None)
+            return
+        try:
+            normalize_capability_override(merged)
+            # 人工覆盖的日期由服务器写入，表示本次覆盖/核对时间；客户端不能伪造供应商变更日期。
+            merged["updated_at"] = time.strftime("%Y-%m-%d")
+            normalized = normalize_capability_override(merged)
+            model_capabilities(model["id"], provider.get("protocol", "codex"), normalized)
+        except (TypeError, ValueError):
+            raise CenterError("invalid_capability") from None
+        model["capability_override"] = normalized
+
     def edit_model(self, provider_id, data, project=None):
-        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual", "favorite", "unit_price", "prices"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
+        if not isinstance(data, dict) or set(data) - {"id", "name", "enabled", "manual", "favorite", "unit_price", "prices",
+                                                      "capability_override"} or not re.fullmatch(r"[a-zA-Z0-9._/:-]{1,256}", str(data.get("id", ""))):
             raise CenterError("invalid_model")
         if "enabled" in data and type(data["enabled"]) is not bool or "manual" in data and type(data["manual"]) is not bool:
             raise CenterError("invalid_model")
@@ -428,6 +484,8 @@ class ModelCenter:
                         model["prices"] = merged
                     else:
                         model.pop("prices", None)
+            if "capability_override" in data:
+                self._apply_capability_override(model, data["capability_override"], provider)
             if data.get("manual"):
                 model.update(manual=True, missing=False)
             self._save_directory(key, provider, project, directory)
@@ -443,7 +501,7 @@ class ModelCenter:
         """Read-only route diagnostics; no paid model call or network probe is made."""
         config = self.runtime.config(project)
         provider = self.provider(provider_id, project)
-        capabilities = model_capabilities(model_id, provider.get("protocol", "codex"))
+        capabilities = self.capabilities(provider_id, model_id, project)
         health = ProviderHealth(self.store).diagnostics(
             config, provider_id, project or "model-center", model_id)
         directory = self.directory(provider, project)

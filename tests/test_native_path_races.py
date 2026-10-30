@@ -119,7 +119,7 @@ class NativePathRaceTest(unittest.TestCase):
         (self.workspace / 'source.txt').write_text(secret)
         store = Store(self.workspace.parent / 'trace-state')
         fake = SimpleNamespace(root=store.root, reserve_call=lambda *args: 'host-call', record_usage=lambda *args: None,
-                               event=store.event, execute=lambda *args: None)
+                               event=store.event, execute=lambda *args: None, catalog_entry=lambda *a, **k: ({}, None))
         replies = [{'output': [{'type': 'function_call', 'call_id': secret, 'name': 'read_file', 'arguments': json.dumps({'path': 'source.txt', 'start_line': 1, 'end_line': 1})}]},
                    {'output': [{'type': 'function_call', 'call_id': 'finish', 'name': 'finish', 'arguments': json.dumps({'summary': 'done'})}]}]
         try:
@@ -161,7 +161,7 @@ from adaptive_rsi.native import NativeAgent,WorkspaceTools
 from adaptive_rsi.store import Store
 state,workspace,marker=map(Path,sys.argv[1:])
 store=Store(state)
-fake=SimpleNamespace(root=store.root,reserve_call=lambda *args:'host-call',record_usage=lambda *args:None,event=store.event,execute=lambda *args:None)
+fake=SimpleNamespace(root=store.root,reserve_call=lambda *args:'host-call',record_usage=lambda *args:None,event=store.event,execute=lambda *args:None,catalog_entry=lambda *a,**k:({},None))
 response={'output':[{'type':'function_call','call_id':'write','name':'write_file','arguments':json.dumps({'path':'written.txt','content':'written once'})}]}
 original=WorkspaceTools.execute
 def interrupted(tools,name,args):
@@ -186,6 +186,7 @@ with patch('adaptive_rsi.native.Credentials') as credentials,patch('adaptive_rsi
             child.communicate(timeout=5)
         recovered = Runtime.open(state, agent=object())
         try:
+            recovered.configure({"updates": {"mode": "manual"}})
             recovered.start(paused=True)
             rows = recovered.store.query("SELECT data FROM events WHERE kind='native_tool'")
             self.assertEqual(len(rows), 1)

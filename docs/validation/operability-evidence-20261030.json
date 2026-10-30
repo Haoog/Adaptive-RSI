@@ -1,0 +1,372 @@
+{
+  "date": "2026-10-30",
+  "baseline": "ebf77de2abb6e1279adb2cd505a490ac1cd058df",
+  "signed_update": {
+    "scenario": "official_signed_in_app_upgrade",
+    "from_version": "0.5.130",
+    "bundle_version": "0.5.131",
+    "transaction": {
+      "arch": "aarch64",
+      "artifact_sha256": "133a8fb9c78b952f631e6a23955a6fbceb8b0dd4b522920b2c2d27e41101bdf7",
+      "artifact_url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v0.5.131/adaptive-rsi-0.5.131-macos-arm64.app.tar.gz",
+      "authorization_revision": 1,
+      "created_at": 1793329823,
+      "error_code": null,
+      "from_version": "0.5.130",
+      "install_window": "any",
+      "operation_id": "52c591eb4482b7c17e41966dfb8ee9f4",
+      "platform": "macos",
+      "receipt_version": 1,
+      "signature_sha256": "3575d9afa63b5e9b3bf76e27e8199e3c05480e11318fb65b7cdcba7ddc1c5b98",
+      "signature_verified": true,
+      "state": "succeeded",
+      "to_version": "0.5.131",
+      "updated_at": 1793329825
+    },
+    "health": {
+      "version": "0.5.131",
+      "build": "bc657be83ad30cc8",
+      "pid": 67463,
+      "api_version": 2,
+      "capabilities": [
+        "config-history",
+        "config-repair",
+        "config-revisions",
+        "desktop-update-drain",
+        "diagnostics-preview",
+        "documented-state",
+        "operations",
+        "shutdown-progress",
+        "state-snapshot",
+        "task-batch"
+      ],
+      "errors": {
+        "invalid_configuration": "A configuration field name, type or value is invalid",
+        "invalid_request": "The request body or parameters are invalid",
+        "config_revision_conflict": "Settings changed in another window",
+        "session_required": "The local console session must be reopened",
+        "internal_error": "The request could not be completed"
+      }
+    },
+    "health_status": 200
+  },
+  "interrupted_update": {
+    "interrupted": true,
+    "retained_segment_bytes": 37054,
+    "identity_raw": "0.5.131\nhttps://github.com/Haoog/Adaptive-RSI/releases/download/v0.5.131/adaptive-rsi-0.5.131-macos-arm64.app.tar.gz\n",
+    "verified_cache_present": true,
+    "verified_cache_bytes": 15773688,
+    "sha256": "133a8fb9c78b952f631e6a23955a6fbceb8b0dd4b522920b2c2d27e41101bdf7",
+    "partial_removed": true,
+    "transaction": {
+      "arch": "aarch64",
+      "artifact_sha256": "133a8fb9c78b952f631e6a23955a6fbceb8b0dd4b522920b2c2d27e41101bdf7",
+      "artifact_url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v0.5.131/adaptive-rsi-0.5.131-macos-arm64.app.tar.gz",
+      "authorization_revision": 1,
+      "created_at": 1793330874,
+      "error_code": null,
+      "from_version": "0.5.130",
+      "install_window": "any",
+      "operation_id": "07cc3061401962d4ba55210d433953cc",
+      "platform": "macos",
+      "receipt_version": 1,
+      "signature_sha256": "3575d9afa63b5e9b3bf76e27e8199e3c05480e11318fb65b7cdcba7ddc1c5b98",
+      "signature_verified": true,
+      "state": "succeeded",
+      "to_version": "0.5.131",
+      "updated_at": 1793330876
+    },
+    "health_status": 200,
+    "health_version": "0.5.131",
+    "bundle_version": "0.5.131"
+  },
+  "installer_failure": {
+    "scenario": "installer_temp_path_replaced_with_regular_file",
+    "bundle_version": "0.5.130",
+    "transaction": {
+      "arch": "aarch64",
+      "artifact_sha256": "133a8fb9c78b952f631e6a23955a6fbceb8b0dd4b522920b2c2d27e41101bdf7",
+      "artifact_url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v0.5.131/adaptive-rsi-0.5.131-macos-arm64.app.tar.gz",
+      "authorization_revision": 1,
+      "created_at": 1793332928,
+      "error_code": "update_install_failed",
+      "from_version": "0.5.130",
+      "install_window": "any",
+      "operation_id": "fc148afe92b818676140cc38d13d2b2e",
+      "platform": "macos",
+      "receipt_version": 1,
+      "signature_sha256": "3575d9afa63b5e9b3bf76e27e8199e3c05480e11318fb65b7cdcba7ddc1c5b98",
+      "signature_verified": true,
+      "state": "failed",
+      "to_version": "0.5.131",
+      "updated_at": 1793332928
+    },
+    "health_version": "0.5.130",
+    "health_status": 200
+  },
+  "artifact_measurement": {
+    "body_bytes": 80000,
+    "rows": [
+      {
+        "protocol": "responses",
+        "inline_request_bytes": 96237,
+        "artifact_request_bytes": 1167,
+        "saved_bytes": 95070
+      },
+      {
+        "protocol": "chat_completions",
+        "inline_request_bytes": 96214,
+        "artifact_request_bytes": 1144,
+        "saved_bytes": 95070
+      },
+      {
+        "protocol": "ollama",
+        "inline_request_bytes": 96233,
+        "artifact_request_bytes": 1163,
+        "saved_bytes": 95070
+      },
+      {
+        "protocol": "anthropic",
+        "inline_request_bytes": 96271,
+        "artifact_request_bytes": 1201,
+        "saved_bytes": 95070
+      },
+      {
+        "protocol": "gemini",
+        "inline_request_bytes": 88281,
+        "artifact_request_bytes": 1137,
+        "saved_bytes": 87144
+      }
+    ],
+    "scope": "same synthetic workload, serialized request bytes only; no token or billing claim"
+  },
+  "real_tasks": {
+    "provider": "OpenCode CLI",
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "effort": "max",
+    "initial": {
+      "state": "awaiting_approval",
+      "calls": [
+        {
+          "role": "planning",
+          "provider": "opencode",
+          "model": "opencode-go/deepseek-v4.1-flash",
+          "effort": "max",
+          "state": "completed",
+          "tokens": 8794,
+          "usage_known": 1,
+          "seconds": 21.641601874987828
+        },
+        {
+          "role": "implementation",
+          "provider": "opencode",
+          "model": "opencode-go/deepseek-v4.1-flash",
+          "effort": "max",
+          "state": "completed",
+          "tokens": 54063,
+          "usage_known": 1,
+          "seconds": 52.71490445800009
+        },
+        {
+          "role": "review",
+          "provider": "opencode",
+          "model": "opencode-go/deepseek-v4.1-flash",
+          "effort": "max",
+          "state": "completed",
+          "tokens": 24804,
+          "usage_known": 1,
+          "seconds": 29.331318625016138
+        }
+      ],
+      "summary": {
+        "run": "791152bb9dc64da8",
+        "task": "23dbc57327834328",
+        "project": "781eb3c97d9e4b5d",
+        "summary": "Fixed calculator.add to return a + b instead of a - b. Added tests/test_add_regression.py with regression cases for positive (2+3=5), negative (-2+-3=-5), and fractional (1.5+2.25=3.75) inputs. Confirmed the new tests fail on the unchanged baseline and all 4 tests, including the preserved test_zero, pass after the fix. Only calculator.py was modified and one new test file was added under tests/.",
+        "files": [
+          "calculator.py",
+          "tests/test_add_regression.py"
+        ],
+        "checks": {
+          "baseline": {
+            "passed": 0,
+            "total": 1
+          },
+          "candidate": {
+            "passed": 1,
+            "total": 1
+          },
+          "candidate_full": {
+            "passed": 1,
+            "total": 1
+          },
+          "test_first_baseline": {
+            "passed": 0,
+            "total": 1
+          },
+          "test_first_candidate": {
+            "passed": 1,
+            "total": 1
+          }
+        },
+        "usage": {
+          "calls": 3,
+          "tokens": 87661,
+          "seconds": 103.68782495800406,
+          "unknown_calls": 0
+        },
+        "attempts": 1,
+        "reused_stages": [],
+        "delivery_sha": null,
+        "postmerge_state": null,
+        "mainline_state": null,
+        "interventions": 0,
+        "value_feedback": null
+      }
+    },
+    "retry": {
+      "operator_rejections": 1,
+      "human_rejections": 0,
+      "human_ratings": 0,
+      "operator_action_note": "Agent-operated cancellation/retry, not independent human review",
+      "original_state": "superseded",
+      "cancellation": {
+        "saved": true,
+        "revision": "247b5fceaa1dfc0de5ae34965c0ffb299c98568d9529c6777e341b0cdcf9e5d2",
+        "cascade": false,
+        "receipts": [
+          {
+            "id": "23dbc57327834328",
+            "state": "cancelled",
+            "previous_state": "awaiting_approval",
+            "candidates": [
+              "791152bb9dc64da8"
+            ],
+            "publications": []
+          }
+        ],
+        "impact_truncated": false
+      },
+      "retry": {
+        "run": "e11537867c644e2a",
+        "state": "awaiting_approval",
+        "seconds": 103.21965199999977,
+        "calls": [
+          {
+            "role": "planning",
+            "provider": "opencode",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "effort": "max",
+            "state": "completed",
+            "tokens": 13725,
+            "usage_known": 1,
+            "seconds": 28.866414707998047
+          },
+          {
+            "role": "implementation",
+            "provider": "opencode",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "effort": "max",
+            "state": "completed",
+            "tokens": 75597,
+            "usage_known": 1,
+            "seconds": 39.683281542005716
+          },
+          {
+            "role": "review",
+            "provider": "opencode",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "effort": "max",
+            "state": "completed",
+            "tokens": 39153,
+            "usage_known": 1,
+            "seconds": 32.99820320800063
+          }
+        ],
+        "summary": {
+          "run": "e11537867c644e2a",
+          "task": "23dbc57327834328",
+          "project": "781eb3c97d9e4b5d",
+          "summary": "Fixed calculator.py so add(a, b) returns a + b instead of a - b, and added tests/test_add_regression.py with six regression tests covering positive (2+3=5), negative (-2+-3=-5), fractional (1.5+2.25=3.75), mixed-sign, additive-identity, and commutativity cases. Evidence: against the unchanged baseline, the new regression tests failed (5 failures) while the existing test_zero passed; after the fix, the full suite ran 7 tests with all passing, including the preserved add(0,0)==0 test. Only calculator.py was modified and one new test file added under the allowed tests scope; no existing tests, configuration, manifests, or entrypoints were changed, and nothing was published.",
+          "files": [
+            "calculator.py",
+            "tests/test_add_regression.py"
+          ],
+          "checks": {
+            "baseline": {
+              "passed": 0,
+              "total": 1
+            },
+            "candidate": {
+              "passed": 1,
+              "total": 1
+            },
+            "candidate_full": {
+              "passed": 1,
+              "total": 1
+            },
+            "test_first_baseline": {
+              "passed": 0,
+              "total": 1
+            },
+            "test_first_candidate": {
+              "passed": 1,
+              "total": 1
+            }
+          },
+          "usage": {
+            "calls": 3,
+            "tokens": 128475,
+            "seconds": 101.5478994580044,
+            "unknown_calls": 0
+          },
+          "attempts": 2,
+          "reused_stages": [],
+          "delivery_sha": null,
+          "postmerge_state": null,
+          "mainline_state": null,
+          "interventions": 2,
+          "value_feedback": null
+        }
+      },
+      "cost_usd": null,
+      "remote_delivery": false,
+      "source_unchanged": true
+    },
+    "tokens": 216136,
+    "human_ratings": 0,
+    "human_rejections": 0,
+    "operator_rejections": 1,
+    "cost_usd": null,
+    "remote_delivery": false
+  },
+  "limitations": [
+    "No production cost or effectiveness claim",
+    "No independent human rating",
+    "Post-replacement startup failure recovery not exercised live",
+    "HTTP Range byte saving not measured",
+    "Historical CI stall root cause not confirmed"
+  ],
+  "installer_failure_retry": {
+    "transaction": {
+      "arch": "aarch64",
+      "artifact_sha256": "133a8fb9c78b952f631e6a23955a6fbceb8b0dd4b522920b2c2d27e41101bdf7",
+      "artifact_url": "https://github.com/Haoog/Adaptive-RSI/releases/download/v0.5.131/adaptive-rsi-0.5.131-macos-arm64.app.tar.gz",
+      "authorization_revision": 1,
+      "created_at": 1793332977,
+      "error_code": null,
+      "from_version": "0.5.130",
+      "install_window": "any",
+      "operation_id": "78b272cb7ff97e8f75ee7d0e12f0e4b8",
+      "platform": "macos",
+      "receipt_version": 1,
+      "signature_sha256": "3575d9afa63b5e9b3bf76e27e8199e3c05480e11318fb65b7cdcba7ddc1c5b98",
+      "signature_verified": true,
+      "state": "succeeded",
+      "to_version": "0.5.131",
+      "updated_at": 1793332978
+    },
+    "health_status": 200,
+    "health_version": "0.5.131"
+  }
+}

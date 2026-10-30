@@ -251,6 +251,8 @@ class Sandbox:
             allowed.append(packages)
         profile = '(version 1)(deny default)(allow process*)(allow sysctl-read)(allow mach-lookup)(allow network*)'
         profile += '(allow file-read-metadata)(allow file-read* (literal "/"))'
+        # CLI standalone servers redirect child stdio to this device.
+        profile += '(allow file-write-data (literal "/dev/null"))'
         profile += '(allow file-read* ' + " ".join('(subpath %s)' % quote_sb(p) for p in allowed) + ')'
         profile += '(deny file-read* file-write* (subpath %s))' % quote_sb(self.state)
         # Codex 启动需要检查父目录元数据；控制器文件内容和目录枚举仍不可读。

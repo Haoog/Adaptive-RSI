@@ -70,10 +70,21 @@ def sync_codex_oauth(home, original):
 
 
 def run_cli(argv, workspace, home, config, cancel=None, protected=(), read_only=False, environment=None, state=None, timeout=0):
+    home = Path(home).resolve()
+    temporary = home / ".tmp"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    try:
+        descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ValueError("CLI temporary directory must be a private directory without links") from None
+    try:
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
     env = {**clean_environment(), **(environment or {}), "HOME": str(home),
            "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".local/share"),
            "XDG_CACHE_HOME": str(home / ".cache"), "XDG_STATE_HOME": str(home / ".local/state"),
-           "CODEX_HOME": str(home / ".codex"), "TMPDIR": "/tmp", "NO_COLOR": "1"}
+           "CODEX_HOME": str(home / ".codex"), "TMPDIR": str(temporary), "NO_COLOR": "1"}
     if platform.system() == "Darwin" and config["sandbox"]["backend"] != "docker":
         command = Sandbox(state or home.parent, config).worker(
             argv, workspace, protected=protected, read_only=read_only,

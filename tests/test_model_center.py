@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+from adaptive_rsi.agent import model_capabilities
 from adaptive_rsi.catalog import CatalogError, normalize
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.credentials import CredentialError, Credentials
@@ -476,7 +477,171 @@ class ActiveRunCredentialTest(unittest.TestCase):
         self.assertEqual(self.runtime.store.setting("credential-cleanup-pending"), {})
 
 
+class ModelCapabilityMetadataTest(unittest.TestCase):
+    """能力规则必须具体到型号；未知变体只给出可识别的推断值。"""
+
+    def test_verified_rules_use_exact_snapshots_only(self):
+        expected = {
+            "claude-opus-4-5": (200000, 64000),
+            "claude-opus-4-5-20251101": (200000, 64000),
+            "claude-sonnet-4-5": (200000, 64000),
+            "claude-sonnet-4-5-20250929": (200000, 64000),
+            "claude-haiku-4-5": (200000, 64000),
+            "claude-haiku-4-5-20251001": (200000, 64000),
+            "gpt-5": (400000, 128000),
+            "gpt-4.1": (1047576, 32768),
+            "gpt-4o": (128000, 16384),
+            "gpt-4o-2024-08-06": (128000, 16384),
+            "o1": (200000, 100000),
+            "o3": (200000, 100000),
+            "o4-mini": (200000, 100000),
+            "gemini-2.5-pro": (1048576, 65536),
+            "gemini-2.5-flash": (1048576, 65536),
+            "gemini-2.5-flash-lite": (1048576, 65536),
+            "gemini-2.0-flash": (1048576, 8192),
+        }
+        for model, (context, output) in expected.items():
+            with self.subTest(model=model):
+                capability = model_capabilities(model, "anthropic")
+                self.assertEqual((capability["context_tokens"], capability["max_output_tokens"]),
+                                 (context, output))
+                self.assertEqual(capability["source"], "known_model")
+                self.assertEqual(capability["confidence"], "known")
+                self.assertEqual(capability["evidence"], "documented")
+                self.assertTrue(capability["source_url"].startswith("https://"))
+                self.assertEqual(capability["updated_at"], "2026-10-30")
+                self.assertEqual(capability["date_semantics"], "rule_reviewed")
+                self.assertLessEqual(capability["request_output_tokens"], output)
+
+    def test_unverified_snapshots_stay_heuristic_without_provenance(self):
+        expected = {
+            "claude-3-opus": (200000, 4096),
+            "claude-3-opus-20240229": (200000, 4096),
+            "anthropic/claude-3-haiku-20240307": (200000, 4096),
+            "us.anthropic.claude-3-haiku-20240307-v1:0": (200000, 4096),
+            "claude-3-5-sonnet-20241022": (200000, 8192),
+            "claude-3-5-haiku": (200000, 8192),
+            "claude-3-7-sonnet-20250219": (200000, 8192),
+            "claude-sonnet-4-20250514": (200000, 32000),
+            "claude-opus-4-1": (200000, 32000),
+            "gpt-4o-2024-05-13": (128000, 4096),
+            "gpt-4o-2024-11-20": (128000, 16384),
+            "gpt-4o-mini": (128000, 16384),
+            "gemini-1.5-pro-002": (2097152, 8192),
+            "gemini-1.5-flash": (1048576, 8192),
+            "o1-pro": (128000, 16384),
+            "o4-pro": (128000, 16384),
+        }
+        for model, (context, output) in expected.items():
+            with self.subTest(model=model):
+                capability = model_capabilities(model, "anthropic")
+                self.assertEqual((capability["context_tokens"], capability["max_output_tokens"]),
+                                 (context, output))
+                self.assertEqual(capability["confidence"], "heuristic")
+                self.assertEqual(capability["evidence"], "heuristic")
+                self.assertNotEqual(capability["source"], "known_model")
+                self.assertIsNone(capability["source_url"])
+                self.assertIsNone(capability["updated_at"])
+                self.assertIsNone(capability["date_semantics"])
+
+    def test_arbitrary_suffixes_never_become_known(self):
+        for model in ("claude-sonnet-4-5-20260101", "claude-opus-4-5-20990101",
+                      "gpt-5-2099-01-01", "gpt-4o-2099-01-01", "gemini-2.5-pro-999",
+                      "gemini-2.0-flash-lite"):
+            with self.subTest(model=model):
+                capability = model_capabilities(model, "anthropic")
+                self.assertEqual(capability["confidence"], "heuristic")
+                self.assertNotEqual(capability["source"], "known_model")
+                self.assertIsNone(capability["source_url"])
+                self.assertIsNone(capability["updated_at"])
+
+    def test_unknown_variants_stay_heuristic_instead_of_inheriting_premium_limits(self):
+        expected = {
+            "claude-future-9": (200000, 8192),
+            "claude-3-opus-future": (200000, 8192),
+            "claude-3-5-sonnet-future": (200000, 8192),
+            "gemini-future-9": (128000, 16384),
+            "gemini-2.5-pro-future": (128000, 16384),
+            "gpt-5-future": (128000, 16384),
+            "gpt-future": (128000, 16384),
+            "unknown-model": (128000, 16384),
+        }
+        for model, (context, output) in expected.items():
+            with self.subTest(model=model):
+                capability = model_capabilities(model, "responses")
+                self.assertEqual((capability["context_tokens"], capability["max_output_tokens"]),
+                                 (context, output))
+                self.assertEqual(capability["confidence"], "heuristic")
+                self.assertNotEqual(capability["source"], "known_model")
+                self.assertEqual(capability["evidence"], "heuristic")
+                self.assertIsNone(capability["source_url"])
+                self.assertIsNone(capability["updated_at"])
+                self.assertIsNone(capability["date_semantics"])
+
+    def test_documented_gpt_and_gemini_values_are_model_specific(self):
+        expected = {
+            "gpt-4o": (128000, 16384),
+            "gpt-4o-2024-08-06": (128000, 16384),
+            "gpt-4.1": (1047576, 32768),
+            "gpt-5": (400000, 128000),
+            "o3": (200000, 100000),
+            "gemini-2.5-pro": (1048576, 65536),
+            "gemini-2.5-flash-lite": (1048576, 65536),
+            "gemini-2.0-flash": (1048576, 8192),
+        }
+        for model, (context, output) in expected.items():
+            with self.subTest(model=model):
+                capability = model_capabilities(model, "chat_completions")
+                self.assertEqual((capability["context_tokens"], capability["max_output_tokens"]),
+                                 (context, output))
+                self.assertEqual((capability["confidence"], capability["evidence"]),
+                                 ("known", "documented"))
+
+    def test_manual_override_is_partial_validated_and_carries_provenance(self):
+        capability = model_capabilities(
+            "claude-3-opus", "anthropic",
+            {"max_output_tokens": 2048, "source_url": "https://example.test/model",
+             "note": "供应商页面", "updated_at": "2026-10-28"})
+        self.assertEqual((capability["max_output_tokens"], capability["request_output_tokens"]),
+                         (2048, 2048))
+        self.assertEqual((capability["source"], capability["confidence"], capability["evidence"]),
+                         ("manual", "manual", "manual"))
+        self.assertEqual(capability["manual_fields"], ["max_output_tokens"])
+        self.assertEqual(capability["source_url"], "https://example.test/model")
+        self.assertEqual(capability["note"], "供应商页面")
+        self.assertEqual(capability["updated_at"], "2026-10-28")
+        self.assertEqual(capability["date_semantics"], "manual_override")
+        for override in [
+                {"context_tokens": 4096},
+                {"context_tokens": 4096, "max_output_tokens": 8192},
+                {"context_tokens": True},
+                {"max_output_tokens": 0},
+                {"source_url": "file:///tmp/model"},
+                {"updated_at": "2026-13-01"},
+                {"unknown": 1},
+                []]:
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                model_capabilities("unknown", "responses", override)
+
+    def test_model_center_error_copy_covers_invalid_capability(self):
+        source = (Path(__file__).resolve().parents[1] / "adaptive_rsi" / "web" / "model-center.js").read_text(encoding="utf-8")
+        self.assertIn("invalid_capability:", source)
+
+
 class ModelCenterTest(unittest.TestCase):
+    def test_catalog_refresh_never_discards_a_capability_override(self):
+        self.center.edit_model("ollama", {"id": "retained-model", "manual": True,
+                                          "capability_override": {"max_output_tokens": 2048}})
+        provider = self.center.provider("ollama")
+        directory = self.center.directory(provider)
+        directory["models"][0]["manual"] = False
+        self.center._save_directory(self.center.key(provider), provider, None, directory)
+        with patch("adaptive_rsi.model_center.list_models", return_value={
+                "models": [{"id": "model-%04d" % i} for i in range(2000)], "truncated": False}):
+            with self.assertRaises(CenterError):
+                self.center.fetch("ollama")
+        self.assertEqual(self.center.capabilities("ollama", "retained-model")["max_output_tokens"], 2048)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
@@ -921,6 +1086,29 @@ class ModelCenterTest(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_server_role_snapshot_shares_capability_override_resolution(self):
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True, "capability_override": {
+            "context_tokens": 64000, "max_output_tokens": 4096}})
+        self.runtime.configure({"models": {"planning": {
+            "provider": "ollama", "model": "coder-a", "effort": "default", "fallback": None}}})
+        server = Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                   "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    server.origin + "/api/model-center", headers=headers)) as response:
+                snapshot = json.load(response)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual(snapshot["capabilities"]["planning"], capability)
+        self.assertEqual((capability["context_tokens"], capability["max_output_tokens"],
+                          capability["source"]), (64000, 4096, "manual"))
+
     def test_credential_rotation_never_deletes_a_reference_still_in_use(self):
         # 评审实测回归：项目覆盖继承连接的密钥时，不能删除全局仍在引用的凭据。
         from adaptive_rsi.credentials import Credentials
@@ -1076,3 +1264,141 @@ class ModelCenterTest(unittest.TestCase):
         call = self.runtime.store.reserve_call(project, "run-override", "analysis", route,
                                                self.runtime.config(project))
         self.assertEqual(self.frozen(call), {"unit_price": None, "input_price": None, "output_price": None})
+
+    def test_capability_override_persists_and_matches_directory_snapshot_and_diagnose(self):
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True})
+        self.center.edit_model("ollama", {"id": "coder-a", "capability_override": {
+            "context_tokens": 64000, "max_output_tokens": 4096,
+            "source_url": "https://example.test/model", "note": "人工核对"}})
+        today = time.strftime("%Y-%m-%d")
+        provider = self.center.provider("ollama")
+        model = next(m for m in self.center.directory(provider)["models"] if m["id"] == "coder-a")
+        self.assertEqual(model["capability_override"]["updated_at"], today)
+        self.assertNotIn("capabilities", model)
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual((capability["context_tokens"], capability["max_output_tokens"],
+                          capability["source"], capability["confidence"], capability["evidence"]),
+                         (64000, 4096, "manual", "manual", "manual"))
+        self.assertEqual((capability["source_url"], capability["note"], capability["updated_at"]),
+                         ("https://example.test/model", "人工核对", today))
+        snapshot = self.center.snapshot()
+        snapshot_model = next(m for p in snapshot["providers"] if p["id"] == "ollama"
+                              for m in p["catalog"]["models"] if m["id"] == "coder-a")
+        self.assertEqual(snapshot_model["capabilities"], capability)
+        self.assertEqual(self.center.diagnose("ollama", "coder-a")["capabilities"], capability)
+        # 只提交输出字段时，上下文、来源和备注保持，不被旧表单覆盖。
+        self.center.edit_model("ollama", {"id": "coder-a", "capability_override": {"max_output_tokens": 2048}})
+        model = next(m for m in self.center.directory(provider)["models"] if m["id"] == "coder-a")
+        self.assertEqual((model["capability_override"]["context_tokens"],
+                          model["capability_override"]["max_output_tokens"],
+                          model["capability_override"]["source_url"],
+                          model["capability_override"]["note"]),
+                         (64000, 2048, "https://example.test/model", "人工核对"))
+        restarted = Runtime(Store(self.runtime.store.root))
+        try:
+            capability = restarted.model_center.capabilities("ollama", "coder-a")
+            self.assertEqual((capability["max_output_tokens"], capability["source"]), (2048, "manual"))
+        finally:
+            restarted.close()
+        # 清空单个字段只移除该覆盖，其余字段继续由人工证据支撑。
+        self.center.edit_model("ollama", {"id": "coder-a", "capability_override": {"source_url": None}})
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual((capability["source_url"], capability["note"], capability["max_output_tokens"]),
+                         (None, "人工核对", 2048))
+        self.center.edit_model("ollama", {"id": "coder-a", "capability_override": None})
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual((capability["source"], capability["confidence"]), ("conservative_default", "heuristic"))
+        self.assertNotIn("capability_override", next(
+            m for m in self.center.directory(provider)["models"] if m["id"] == "coder-a"))
+
+    def test_capability_override_validation_is_atomic_and_checks_context_against_output(self):
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True,
+                                          "capability_override": {"context_tokens": 64000,
+                                                                  "max_output_tokens": 4096}})
+        provider = self.center.provider("ollama")
+        before = self.center.directory(provider)
+        invalid = [
+            {"context_tokens": 1024, "max_output_tokens": 4096},
+            {"context_tokens": 1024},
+            {"max_output_tokens": 200000},
+            {"max_output_tokens": True},
+            {"max_output_tokens": 0},
+            {"context_tokens": -1},
+            {"source_url": "file:///tmp/model"},
+            {"source_url": "https://example.test/" + "x" * 600},
+            {"note": "x" * 501},
+            {"updated_at": "2026-13-01"},
+            {"updated_at": "2026-02-30"},
+            {"unknown": 1},
+            [],
+        ]
+        for override in invalid:
+            with self.subTest(override=override), self.assertRaises(CenterError) as error:
+                self.center.edit_model("ollama", {"id": "coder-a", "capability_override": override})
+            self.assertEqual(error.exception.code, "invalid_capability")
+            self.assertEqual(self.center.directory(provider), before)
+        # 只提高上下文、不改变输出是合法的；之后不能把输出抬到上下文之上。
+        self.center.edit_model("ollama", {"id": "coder-a", "capability_override": {"context_tokens": 100000}})
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual((capability["context_tokens"], capability["max_output_tokens"],
+                          capability["manual_fields"]),
+                         (100000, 4096, ["context_tokens", "max_output_tokens"]))
+        with self.assertRaises(CenterError):
+            self.center.edit_model("ollama", {"id": "coder-a",
+                                              "capability_override": {"max_output_tokens": 120000}})
+        self.center.edit_model("ollama", {"id": "coder-a",
+                                          "capability_override": {"context_tokens": 200000,
+                                                                  "max_output_tokens": 120000}})
+        capability = self.center.capabilities("ollama", "coder-a")
+        self.assertEqual((capability["context_tokens"], capability["max_output_tokens"]),
+                         (200000, 120000))
+
+    def test_concurrent_capability_fields_and_name_updates_do_not_lose_writes(self):
+        self.center.edit_model("ollama", {"id": "coder-a", "manual": True})
+        barrier = threading.Barrier(3)
+        errors = []
+
+        def update(payload):
+            try:
+                barrier.wait(timeout=5)
+                for _ in range(5):
+                    self.center.edit_model("ollama", payload)
+            except Exception as exc:  # 在线程中收集，由主线程断言。
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=update, args=({"id": "coder-a", "name": "并发名称"},)),
+            threading.Thread(target=update, args=({"id": "coder-a",
+                                                   "capability_override": {"context_tokens": 200000}},)),
+            threading.Thread(target=update, args=({"id": "coder-a",
+                                                   "capability_override": {"max_output_tokens": 100000}},)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertEqual(errors, [])
+        model = next(m for m in self.center.directory(self.center.provider("ollama"))["models"]
+                     if m["id"] == "coder-a")
+        self.assertEqual(model["name"], "并发名称")
+        self.assertEqual((model["capability_override"]["context_tokens"],
+                          model["capability_override"]["max_output_tokens"]),
+                         (200000, 100000))
+
+    def test_capability_override_survives_catalog_refresh_and_connection_change(self):
+        with DirectoryServer() as fixture:
+            self.save(fixture, "none", value="")
+            self.center.fetch("gateway")
+            self.center.edit_model("gateway", {"id": "coder-a", "capability_override": {
+                "context_tokens": 32000, "max_output_tokens": 4096,
+                "source_url": "https://example.test/model"}})
+            fixture.models = [{"id": "coder-a"}, {"id": "coder-b"}]
+            self.center.fetch("gateway")
+            self.center.save_provider({**fixture.provider,
+                                       "base_url": fixture.provider["base_url"] + "/v1"}, {"mode": "none"})
+            model = next(m for m in self.center.directory(self.center.provider("gateway"))["models"]
+                         if m["id"] == "coder-a")
+            self.assertEqual((model["capability_override"]["context_tokens"],
+                              model["capability_override"]["max_output_tokens"],
+                              model["capability_override"]["source_url"]),
+                             (32000, 4096, "https://example.test/model"))

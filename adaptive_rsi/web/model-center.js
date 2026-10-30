@@ -26,12 +26,12 @@ window.RSIModelCenter = (() => {
     codex_missing:'未找到 Codex CLI，请安装并登录。',opencode_missing:'未找到 OpenCode，请安装后重新获取模型。',opencode_error:'无法读取 OpenCode 模型，请检查连接配置和 CLI 版本。',opencode_version_unknown:'无法确认 OpenCode 版本，请升级 Adaptive RSI，或临时使用 OpenCode 1.19.3。',codex_error:'无法读取 Codex 模型目录，请检查 CLI 版本和登录状态。',
     provider_paused:'模型服务连续失败已暂停，请检查配置后恢复请求。',model_missing:'模型不存在或当前账号不可用，请重新获取目录。',tool_format:'模型未返回符合要求的工具结果，请检查协议与模型能力。',probe_failed:'基础能力测试未通过，请检查账号权限、推理参数和模型工具能力。',
     budget_exhausted:'模型服务暂未提供调用，请检查服务账号用量或稍后重试。',default_effort_required:'此接口要求使用服务默认思考深度。',
-    unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_routes:'角色配置不完整，请重新选择。'
+    unsupported_model_kind:'此模型类型不能用于当前代码任务。',invalid_model:'请填写有效的模型 ID 和名称。',invalid_capability:'能力覆盖必须使用正整数，并保证输出上限不超过上下文上限。',invalid_routes:'角色配置不完整，请重新选择。'
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
   let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, editorSession=null, probeSession=null, picking=null, busy=false, loading=false;
-  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null;
+  let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null,capabilityTarget=null;
   const pageSize=20;
   const priceFields=[['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']];
   const scopeKey = () => scope || 'global';
@@ -178,6 +178,21 @@ window.RSIModelCenter = (() => {
     const authProvider=provider.id,authScope=scope;window.RSIAuth?.show(authProvider,()=>fetchProvider(authProvider,authScope,true));
     renderModels();
   }
+  function tokenSize(value){
+    if(!Number.isFinite(Number(value))||Number(value)<=0)return '—';
+    const size=Number(value);
+    if(size>=1000000)return (size/1000000).toFixed(2).replace(/\.?0+$/,'')+'M';
+    if(size>=1000)return Math.round(size/1000)+'K';
+    return String(size);
+  }
+  function capabilitySource(capability){
+    return t({manual:'人工覆盖',known_model:'官方文档',inferred_family:'推断值',conservative_default:'保守默认值'}[capability?.source]||'未知来源');
+  }
+  function capabilityStatus(capability){
+    const parts=[t('能力'),capabilitySource(capability),t('上下文')+' '+tokenSize(capability?.context_tokens),t('输出')+' '+tokenSize(capability?.max_output_tokens)];
+    if(capability?.updated_at)parts.push(t(capability.source==='manual'?'覆盖日期':'规则核对')+' '+capability.updated_at);
+    return parts.join(' · ');
+  }
   function renderModels(){
     const provider=selected(),query=$('mc-search').value.toLowerCase(),list=$('mc-model-list');list.replaceChildren();
     const models=provider.catalog.models;
@@ -199,6 +214,8 @@ window.RSIModelCenter = (() => {
       const latest=Object.values(model.probes||{}).sort((a,b)=>b.at-a.at)[0];
       if(latest?.state==='fail')status.push(t('最近测试失败')+' · '+latest.effort+' · '+t(errors[latest.code]||''));
       if(model.verified)status.push(t('基础能力测试通过')+' · '+stamp(model.verified.at)+' · '+model.verified.effort+(model.verified.version?' · v'+model.verified.version:'')+' · '+t('仅适用于当时的连接与运行环境'));
+      if(model.capabilities)status.push(capabilityStatus(model.capabilities));
+      if(model.capabilities?.override_error)status.push(t('人工覆盖无效，已按基础规则显示'));
 
       if(!model.kind&&!model.verified&&!latest)status.push(t('尚未进行模型测试'));
       if(status.length)copy.append(el('small',status.join(' · ')));
@@ -213,9 +230,102 @@ window.RSIModelCenter = (() => {
       const test=action(t('测试模型'),()=>openProbe(provider,model),'mc-text-button');test.disabled=!!model.kind;test.setAttribute('aria-label',t('测试模型')+' '+model.name);
       const favorite=action(t(model.favorite?'取消收藏':'收藏'),async()=>{await request('model',{provider:provider.id,model:{id:model.id,favorite:!model.favorite}});await load();},'mc-text-button');
       const price=action(t('估算价格'),()=>{const snapshot={unit_price:model.unit_price==null?'':String(model.unit_price)};for(const [key] of priceFields)snapshot[key]=model.prices?.[key]==null?'':String(model.prices[key]);priceTarget={project:scope,provider:provider.id,model:model.id,snapshot};$('mc-price-target').textContent=provider.name+' / '+model.id;$('mc-price-input').value=snapshot.unit_price;for(const [key,id] of priceFields)$(id).value=snapshot[key];$('mc-price-error').textContent='';$('mc-price-dialog').showModal();},'mc-text-button');
-      const more=el('details',undefined,'model-more'),menu=el('div',undefined,'model-more-actions');more.append(el('summary',t('更多')));menu.append(favorite,test,price);more.append(menu);controls.append(label,more);row.append(copy,controls);list.append(row);
+      const more=el('details',undefined,'model-more'),menu=el('div',undefined,'model-more-actions');more.append(el('summary',t('更多')));menu.append(favorite,test,price,action(t('能力元数据'),()=>openCapabilities(provider,model),'mc-text-button'));more.append(menu);controls.append(label,more);row.append(copy,controls);list.append(row);
     }
     if(!matches.length)list.append(el('p',t(models.length?'没有匹配的模型。':'连接后点击「获取模型」，也可以添加自定义模型。'),'mc-empty'));
+  }
+  function capabilityDialog(){
+    let box=$('mc-capability-dialog');
+    if(box)return box;
+    box=el('dialog',undefined,'mc-dialog');box.id='mc-capability-dialog';
+    const form=el('form');form.id='mc-capability-form';
+    const heading=el('div',undefined,'dialog-heading');
+    const title=el('h2',t('能力元数据'));title.id='mc-capability-title';
+    const close=el('button','×','icon-button');close.type='button';close.setAttribute('aria-label',t('关闭'));close.addEventListener('click',()=>box.close());
+    heading.append(title,close);
+    const target=el('p');target.id='mc-capability-target';target.className='mc-secondary';
+    const summary=el('p');summary.id='mc-capability-summary';summary.className='mc-dialog-hint';
+    const field=(id,label,type='text',attrs={})=>{const wrapper=el('label'),input=el('input');input.id=id;input.type=type;Object.assign(input,attrs);wrapper.append(t(label),input);return wrapper;};
+    const hint=el('p',t('日期只表示能力规则的核对或人工覆盖时间，不代表供应商的模型变更日期。'),'mc-dialog-hint');
+    const error=el('p');error.id='mc-capability-error';error.className='mc-error';error.setAttribute('role','alert');
+    const actions=el('div',undefined,'mc-dialog-actions');
+    const clear=el('button',t('清除人工覆盖'),'text-button');clear.id='mc-capability-clear';clear.type='button';
+    const save=el('button',t('保存能力元数据'),'button primary');save.id='mc-capability-save';save.type='submit';
+    actions.append(clear,save);
+    form.append(heading,target,summary,
+      field('mc-capability-context','上下文上限（tokens）','number',{min:'1',step:'1'}),
+      field('mc-capability-output','单次输出上限（tokens）','number',{min:'1',step:'1'}),
+      field('mc-capability-source-url','来源链接（可选）','url',{placeholder:'https://'}),
+      field('mc-capability-note','备注（可选）'),
+      hint,error,actions);
+    box.append(form);document.body.append(box);
+    box.addEventListener('close',()=>{capabilityTarget=null;});
+    clear.addEventListener('click',()=>clearCapabilities());
+    form.addEventListener('submit',event=>submitCapabilities(event));
+    return box;
+  }
+  function openCapabilities(provider,model){
+    const box=capabilityDialog(),capability=model.capabilities||{};
+    const snapshot={context_tokens:capability.context_tokens==null?'':String(capability.context_tokens),
+      max_output_tokens:capability.max_output_tokens==null?'':String(capability.max_output_tokens),
+      source_url:capability.source_url||'',note:capability.note||''};
+    capabilityTarget={project:scope,provider:provider.id,model:model.id,capabilities:capability,snapshot};
+    $('mc-capability-title').textContent=(model.name||model.id)+' · '+t('能力元数据');
+    $('mc-capability-target').textContent=provider.name+' / '+model.id;
+    const summary=$('mc-capability-summary');summary.replaceChildren(document.createTextNode(capabilityStatus(capability)));
+    if(capability.source_url){summary.append(' · ');const link=el('a',capability.source_url);link.href=capability.source_url;link.target='_blank';link.rel='noreferrer noopener';summary.append(link);}
+    $('mc-capability-context').value=snapshot.context_tokens;$('mc-capability-output').value=snapshot.max_output_tokens;
+    $('mc-capability-source-url').value=snapshot.source_url;$('mc-capability-note').value=snapshot.note;
+    $('mc-capability-error').textContent='';$('mc-capability-clear').hidden=capability.source!=='manual';
+    $('mc-capability-clear').disabled=false;$('mc-capability-save').disabled=false;box.showModal();
+  }
+  function submitCapabilities(event){
+    event.preventDefault();
+    safe(async()=>{
+      const target=capabilityTarget;if(!target)return;
+      const project=scope,button=$('mc-capability-save');
+      $('mc-capability-error').textContent='';
+      try{
+        const values={
+          context_tokens:$('mc-capability-context').value.trim(),
+          max_output_tokens:$('mc-capability-output').value.trim(),
+          source_url:$('mc-capability-source-url').value.trim(),
+          note:$('mc-capability-note').value.trim()};
+        const override={};let changed=false;
+        for(const key of ['context_tokens','max_output_tokens']){
+          if(values[key]===target.snapshot[key])continue;
+          if(values[key]!==''&&(!/^\d+$/.test(values[key])||!Number.isSafeInteger(Number(values[key]))||Number(values[key])<=0))
+            throw Error(t('请输入正整数 token 数量。'));
+          override[key]=values[key]===''?null:Number(values[key]);changed=true;
+        }
+        if(values.source_url!==target.snapshot.source_url){
+          if(values.source_url&&!/^https?:\/\/\S+$/.test(values.source_url))throw Error(t('来源链接必须是 http(s) 地址。'));
+          override.source_url=values.source_url||null;changed=true;
+        }
+        if(values.note!==target.snapshot.note){override.note=values.note||null;changed=true;}
+        if(!changed){$('mc-capability-dialog').close();return;}
+        const context=override.context_tokens??target.capabilities.context_tokens;
+        const output=override.max_output_tokens??target.capabilities.max_output_tokens;
+        if(context!=null&&output!=null&&Number(output)>Number(context))throw Error(t('输出上限不能超过上下文上限。'));
+        button.disabled=true;
+        await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,capability_override:override}});
+        if(scope===project){await load();setStatus(t('模型能力元数据已保存。'));}
+        if(target===capabilityTarget)$('mc-capability-dialog').close();
+      }catch(error){$('mc-capability-error').textContent=message(error);}
+      finally{button.disabled=false;}
+    },event.target);
+  }
+  function clearCapabilities(){
+    safe(async()=>{
+      const target=capabilityTarget;if(!target)return;
+      $('mc-capability-clear').disabled=true;
+      try{
+        await api('model-center/model',{project:target.project,provider:target.provider,model:{id:target.model,capability_override:null}});
+        if(scope===target.project){await load();setStatus(t('已清除人工能力覆盖。'));}
+        if(target===capabilityTarget)$('mc-capability-dialog').close();
+      }catch(error){$('mc-capability-error').textContent=message(error);}
+      finally{$('mc-capability-clear').disabled=false;}
+    });
   }
   function effortOptions(route,advanced=false){
     const provider=data.providers.find(p=>p.id===route.provider),model=findModel(route);

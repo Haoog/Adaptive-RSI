@@ -63,6 +63,50 @@ raise SystemExit(3)
 
 
 class OpenCodeCommandCompatibilityTest(unittest.TestCase):
+    def test_private_temp_rejects_an_existing_symlink_before_spawn(self):
+        from adaptive_rsi.cli_worker import run_cli
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, outside = root / "home", root / "outside"
+            home.mkdir()
+            outside.mkdir()
+            (home / ".tmp").symlink_to(outside, target_is_directory=True)
+            before = outside.stat().st_mode
+            with patch("adaptive_rsi.cli_worker.run_process") as spawn:
+                with self.assertRaises(ValueError):
+                    run_cli(["opencode"], root, home, validate({}))
+            spawn.assert_not_called()
+            self.assertEqual(outside.stat().st_mode, before)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Seatbelt execution")
+    def test_read_only_worker_can_spawn_with_null_stdio(self):
+        from adaptive_rsi.cli_worker import run_cli
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home = root / "workspace/.rsi-agent/home"
+            home.mkdir(parents=True)
+            program = "import subprocess,sys;subprocess.run([sys.executable,'-c','pass'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True)"
+            result = run_cli([sys.executable, "-c", program], home.parent.parent, home,
+                             validate({}), state=root / "state", read_only=True, timeout=15)
+            self.assertEqual(result["exit_code"], 0, result["stderr"])
+
+    def test_macos_cli_uses_private_writable_temp_directory(self):
+        from adaptive_rsi.cli_worker import run_cli
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace, home = root / "workspace", root / "workspace/.rsi-agent/home"
+            home.mkdir(parents=True)
+            config = validate({"sandbox": {"backend": "seatbelt"}})
+            with patch("adaptive_rsi.cli_worker.platform.system", return_value="Darwin"), \
+                    patch("adaptive_rsi.cli_worker.Sandbox") as sandbox, \
+                    patch("adaptive_rsi.cli_worker.run_process", return_value={"exit_code": 0}) as execute:
+                run_cli(["opencode", "run"], workspace, home, config, read_only=True)
+            temporary = Path(execute.call_args.kwargs["env"]["TMPDIR"])
+            self.assertTrue(temporary.is_relative_to(home.resolve()))
+            self.assertTrue(temporary.is_dir())
+            self.assertEqual(temporary.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(sandbox.return_value.worker.call_args.kwargs["output_dir"], home.resolve().parent)
+
     def invoke(self, version, effort="high"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -70,6 +114,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             workspace.mkdir()
             script = version_fixture(root, version)
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({"models": {"implementation": {
                 "provider": "opencode", "model": "provider/model", "effort": effort}}})
             captured = []
@@ -128,6 +173,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             workspace.mkdir()
             script = version_fixture(root, "2.1.3")
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({"models": {"implementation": {
                 "provider": "opencode", "model": "selected/model", "effort": "default"}}})
             content = json.dumps({"provider": {"selected": {"options": {"apiKey": "private-key-value"}}}})
@@ -155,6 +201,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({
                 "sandbox": {"backend": "docker", "worker_image": "fixture-worker"},
                 "models": {"implementation": {
@@ -198,6 +245,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             workspace.mkdir()
             script = version_fixture(root, "2.1.3")
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({
                 "sandbox": {"backend": "docker", "worker_image": "fixture-worker"},
                 "models": {"implementation": {
@@ -250,6 +298,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
                                                    "access": "old-access", "expires": 1}}]
             export_path.write_text(json.dumps(original))
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({
                 "sandbox": {"backend": "docker", "worker_image": "fixture-worker"},
                 "models": {"implementation": {
@@ -313,6 +362,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             auth_path = data / "auth.json"
             auth_path.write_text(json.dumps({"other": {"type": "api", "key": "other-key"}}))
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({
                 "sandbox": {"backend": "docker", "worker_image": "fixture-worker"},
                 "models": {"implementation": {
@@ -384,6 +434,7 @@ class OpenCodeCommandCompatibilityTest(unittest.TestCase):
             workspace = root / "workspace"
             workspace.mkdir()
             store = Store(root / "state")
+            self.addCleanup(store.close)
             config = validate({
                 "sandbox": {"backend": "docker", "worker_image": "fixture-worker"},
                 "models": {"implementation": {
@@ -478,6 +529,7 @@ class OpenCodeIntegrationTest(unittest.TestCase):
             config = validate({"sandbox": {"backend": "docker" if container else "auto"},
                                "models": {"implementation": {"provider": "opencode", "model": "fixture/fixture", "effort": "default"}}})
             store = Store(root / "controller")
+            self.addCleanup(store.close)
             began = time.monotonic()
             try:
                 with patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": json.dumps(connection)}):

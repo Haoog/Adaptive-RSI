@@ -123,7 +123,7 @@ jobs:
             modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
           - name: 模型与可靠性
             os: ubuntu-latest
-            modules: tests.test_model_center tests.test_reliability tests.test_recovery tests.test_task_value_feedback
+            modules: tests.test_model_center tests.test_reliability tests.test_recovery tests.test_task_value_feedback tests.test_tool_artifacts
           - name: 运营、发现与文档
             os: ubuntu-latest
             modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report
@@ -187,6 +187,8 @@ jobs:
             tests.test_comprehensive_audit.AuditRegressionTest.test_command_cannot_write_outside_host_plan_scope \
             tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate \
             tests.test_controls.ValueAndIsolationTest.test_worker_and_native_command_cannot_read_other_project \
+            tests.test_opencode_integration.OpenCodeCommandCompatibilityTest.test_read_only_worker_can_spawn_with_null_stdio \
+            tests.test_opencode_integration.OpenCodeCommandCompatibilityTest.test_macos_cli_uses_private_writable_temp_directory \
             tests.test_model_center.ModelCenterTest.test_real_keychain_round_trip_and_no_plaintext_database_key \
             tests.test_audit_boundaries.CodexExecutableTest.test_symlinked_codex_can_start_itself_inside_permissions \
             tests.test_runtime.RuntimeTest.test_green_tests_cannot_bypass_blocking_maintainability_review \

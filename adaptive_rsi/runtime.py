@@ -478,6 +478,14 @@ class Runtime(Maintenance):
         from .release import retry
         return retry(self, project, run, kind)
 
+    def release_candidates(self, project, run, kind, target="operation"):
+        from .release import candidates
+        return candidates(self, project, run, kind, target)
+
+    def resolve_release(self, project, run, kind, workflow_run_id, target="operation"):
+        from .release import resolve
+        return resolve(self, project, run, kind, workflow_run_id, target, source="console")
+
     def workflow_choices(self, project):
         from .release import workflow_choices
         return workflow_choices(self, project)

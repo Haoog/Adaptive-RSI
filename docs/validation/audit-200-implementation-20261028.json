@@ -1063,7 +1063,7 @@
       "implementation": [],
       "validation": []
     },
-    {
+        {
       "id": 64,
       "title": {
         "zh": "已签名更新包持久化缓存与断点续传",
@@ -1079,7 +1079,7 @@
       "validation": [
         "cargo test --locked --manifest-path desktop/src-tauri/Cargo.toml --bin adaptive-rsi-desktop"
       ],
-      "residual": "Persisted staged-update.part is bound to the exact version and URL, Range resume, Range-ignored restart, 416 completion recovery, corrupt/length deletion and verify-before-cache hand-off are covered by boundary tests. A real signed update interrupted across an application restart remains unverified."
+      "residual": "Real signed 0.5.130->0.5.131 interruption retained 37054 bytes, recovered the complete verified cache and installed successfully. Installer failure preserved the old app and restored healthy service, then retry succeeded. HTTP Range savings, live bad-signature rejection, power loss and post-replacement startup failure remain unmeasured."
     },
     {
       "id": 65,
@@ -2107,7 +2107,7 @@
       ],
       "residual": "Restored case paths are invalidated/remapped and isolated database-only business rehearsal checks relationships without remote operations. Periodic scheduling, repository/artifact restoration and business execution remain unverified."
     },
-    {
+        {
       "id": 121,
       "title": {
         "zh": "模型能力元数据加入来源、日期和人工覆盖",
@@ -2115,9 +2115,17 @@
       },
       "source": "adaptive_rsi/agent.py",
       "acceptance": "未知模型保持保守，错误目录可回退，界面显示元数据来源及时间。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/agent.py",
+        "adaptive_rsi/model_center.py",
+        "adaptive_rsi/web/model-center.js"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_model_center.ModelCapabilityMetadataTest",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeAuditContractsTest.test_capability_override_has_provenance_and_rejects_invalid_limits"
+      ],
+      "residual": "Capability provenance, date, manual overrides, browser display and actual request-budget fixtures passed integrated acceptance. Current vendor evidence remains unavailable for some older models, which retain explicit heuristic labels."
     },
     {
       "id": 122,
@@ -2238,7 +2246,7 @@
       ],
       "residual": "Path/case/regex search has bounded worker execution, cancellation, continuation and explicit skipped/partial-result reasons."
     },
-    {
+        {
       "id": 129,
       "title": {
         "zh": "大工具输出保留为独立产物引用",
@@ -2246,9 +2254,16 @@
       },
       "source": "adaptive_rsi/native.py",
       "acceptance": "超限输出不会进入模型上下文，保留产物仍按容量和敏感信息规则管理。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/tool_artifacts.py",
+        "adaptive_rsi/native.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_tool_artifacts",
+        "python3 -B -m unittest tests.test_native_audit_contracts.NativeToolArtifactContractsTest"
+      ],
+      "residual": "Full integrated fixed tests round-trip artifacts, five native protocol envelopes and history references. Synthetic request-byte measurements are recorded in operability-evidence-20261030.json; real native-provider artifact consumption and production savings remain unmeasured."
     },
     {
       "id": 130,
@@ -2371,7 +2386,7 @@
       "implementation": [],
       "validation": []
     },
-    {
+        {
       "id": 137,
       "title": {
         "zh": "费用估计分开输入、输出及缓存价格",
@@ -2379,11 +2394,20 @@
       },
       "source": "adaptive_rsi/usage_report.py",
       "acceptance": "用公开固定样例核对账单公式，历史调用使用当时价表而非当前价格。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "implemented",
+      "implementation": [
+        "adaptive_rsi/usage_report.py",
+        "adaptive_rsi/usage.py",
+        "adaptive_rsi/model_center.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_usage_report.UsageReportTest.test_component_prices_and_unit_price_fallback_without_double_counting",
+        "python3 -B -m unittest tests.test_usage_report.UsageReportTest.test_price_denominators_are_consistent_across_aggregates",
+        "python3 -B -m unittest tests.test_model_center.ModelCenterTest.test_prices_freeze_per_call_and_estimates_use_frozen_basis",
+        "python3 -B -m unittest tests.test_model_center.ActiveRunCredentialTest.test_frozen_run_price_uses_its_own_credential_generation_after_rotation"
+      ]
     },
-    {
+        {
       "id": 138,
       "title": {
         "zh": "明确费用币种、单位和订阅估值含义",
@@ -2391,9 +2415,16 @@
       },
       "source": "adaptive_rsi/usage_report.py",
       "acceptance": "混合 API 和订阅调用时总计准确标记未知部分，用户可导出依据。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "adaptive_rsi/usage_report.py",
+        "adaptive_rsi/usage.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_usage_report.UsageReportTest.test_empty_not_zero_cost",
+        "python3 -B -m unittest tests.test_usage_report.UsageReportTest.test_component_prices_and_unit_price_fallback_without_double_counting"
+      ],
+      "residual": "USD labels, unknown/unpriced marking and meta.pricing_basis are exposed in /api/usage JSON; there is no one-click usage export control and no real provider billing/invoice reconciliation."
     },
     {
       "id": 139,
@@ -2457,7 +2488,7 @@
       ],
       "residual": "Task/spec/tree/overlay/environment identities are sealed and verified; this establishes input integrity, not independent reproduction or causal improvement."
     },
-    {
+        {
       "id": 143,
       "title": {
         "zh": "最终晋升使用未参与候选选择的独立复核集",
@@ -2465,14 +2496,16 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "复核集未参与提案或排序，使用记录可查，样本不足时不宣称提升。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/evolution.py"
       ],
       "validation": [
+        "python3 -B -m unittest tests.test_runtime.RuntimeTest.test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_reserved_holdout_blocks_concurrent_proposal_and_survives_failure",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_no_fresh_holdout_stops_before_any_paid_call",
         "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_plan_tamper_and_incomplete_execution_are_rejected"
-      ],
-      "residual": "Fresh holdout metadata and complete-plan checks are wired into promotion, but concurrent holdout selection/reservation is not sealed; no independent fresh-final-set acceptance test establishes that boundary."
+      ]
     },
     {
       "id": 144,
@@ -2526,7 +2559,7 @@
       ],
       "residual": "Planned repetitions and load conditions are required; observed ranges/stdev explain measured noise. Synthetic measurements do not prove production improvement or population confidence."
     },
-    {
+        {
       "id": 147,
       "title": {
         "zh": "用固定负例验证检查工具确实能抓到错误",
@@ -2534,16 +2567,16 @@
       },
       "source": "adaptive_rsi/evaluator.py",
       "acceptance": "负例必须被现有门禁阻止；不以 mutation 分数替代真实需求验收。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/evaluator.py"
       ],
       "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_configured_controls_run_in_production_evaluation_and_can_block",
         "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate"
-      ],
-      "residual": "Explicit negative-control API executes real local gates on fixed examples; automatic criterion-control generation/scheduling in the normal pipeline is not integrated."
+      ]
     },
-    {
+        {
       "id": 148,
       "title": {
         "zh": "按验收要求设计反例而非只验证正常路径",
@@ -2551,14 +2584,14 @@
       },
       "source": "adaptive_rsi/evaluator.py",
       "acceptance": "关键要求的正例通过、反例失败，来源和执行结果可以追溯。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/evaluator.py"
       ],
       "validation": [
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_configured_controls_run_in_production_evaluation_and_can_block",
         "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate"
-      ],
-      "residual": "Explicit negative-control API executes real local gates on fixed examples; automatic criterion-control generation/scheduling in the normal pipeline is not integrated."
+      ]
     },
     {
       "id": 149,
@@ -2596,7 +2629,7 @@
       ],
       "residual": "Standard and acceptance stages collect fixed workspace-relative reports with total byte limits and explicit missing/rejected states; arbitrary host paths and symlinks are rejected."
     },
-    {
+        {
       "id": 151,
       "title": {
         "zh": "缓存不可变的依赖准备环境",
@@ -2604,14 +2637,15 @@
       },
       "source": "adaptive_rsi/environment.py",
       "acceptance": "工具、锁文件、种子或配置变化自动失效，跨任务无可写污染。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/environment.py"
+        "adaptive_rsi/environment.py",
+        "adaptive_rsi/pipeline.py"
       ],
       "validation": [
+        "python3 -B -m unittest tests.test_audit_environment.AuditEnvironmentTest.test_prepared_environment_cache_runs_on_pipeline_path_and_invalidates",
         "python3 -B -m unittest tests.test_audit_environment.AuditEnvironmentTest.test_cache_invalidates_tools_locks_seeds_and_restores_private_copies"
-      ],
-      "residual": "Immutable dependency-seed cache API invalidates tools/locks/seeds/configuration and restores private writable copies. Normal preparation does not automatically select or schedule this cache."
+      ]
     },
     {
       "id": 152,
@@ -3076,7 +3110,7 @@
       ],
       "residual": "Read-only permission fixtures distinguish read/write and unknown capabilities without test writes; real scoped-token and user-facing workflow acceptance remain."
     },
-    {
+        {
       "id": 179,
       "title": {
         "zh": "结果未知的远端派发提供人工核对界面",
@@ -3086,12 +3120,15 @@
       "acceptance": "延迟出现及多个匹配运行时不盲目重发，人工结论留审计记录。",
       "status": "partial",
       "implementation": [
-        "adaptive_rsi/release.py"
+        "adaptive_rsi/release.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/web/app.js"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_delivery_readiness_audit.AuthorizationReceiptTest.test_multiple_matches_remain_unknown_and_expose_candidates"
+        "python3 -B -m unittest tests.test_release_endpoints.ManualReconciliationTest",
+        "python3 -B -m unittest tests.test_release_endpoints.ReleaseReconciliationEndpointTest"
       ],
-      "residual": "Ambiguous dispatch exposes candidate runs and manual-inspection state without replay; no reconciliation UI/manual decision audit or real delayed-run acceptance."
+      "residual": "Real browser and HTTP fixture acceptance cover absent and multiple candidates, explicit selection, exact identity, audit and zero redispatch. A live delayed GitHub workflow reconciliation remains unexercised."
     },
     {
       "id": 180,
@@ -3310,7 +3347,7 @@
       ],
       "residual": "Toolchain pins and SOURCE_DATE_EPOCH inventory timestamp are present; full same-input reproducible rebuild comparison remains unverified."
     },
-    {
+        {
       "id": 192,
       "title": {
         "zh": "增加真实签名桌面 N 到 N+1 升级端到端测试",
@@ -3318,9 +3355,14 @@
       },
       "source": "scripts/release_smoke.py",
       "acceptance": "正确包成功升级，坏签名、断电窗口和启动失败各有经过验证的安全结果。",
-      "status": "pending",
-      "implementation": [],
-      "validation": []
+      "status": "partial",
+      "implementation": [
+        "scripts/upgrade_harness.py"
+      ],
+      "validation": [
+        "python3 -B -m unittest tests.test_upgrade_harness"
+      ],
+      "residual": "Real official signed 0.5.130->0.5.131 normal and interrupted-download replacements passed. A real installer temp-path failure retained the old app and restored healthy service; after repair, retry succeeded. Full bad-signature, power-loss and post-replacement startup-failure matrix remains pending."
     },
     {
       "id": 193,

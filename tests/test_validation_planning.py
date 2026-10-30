@@ -2,8 +2,11 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -471,3 +474,147 @@ class ValidationPlanningTest(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertIn('verification_mode=full',output.read_text())
             self.assertFalse((root/'unsafe-executed').exists())
+
+
+class WorkerDiagnosticsTest(unittest.TestCase):
+    """Diagnostics must localize a stalled worker without dispatching it again."""
+
+    @staticmethod
+    def transcript():
+        from scripts import test_worker
+        lines = []
+        return test_worker.Progress(emit=lines.append), lines
+
+    def test_worker_marks_running_finished_timings_and_completion(self):
+        from scripts import test_worker
+        events = []
+        class Case(unittest.TestCase):
+            def test_a(self): events.append('a')
+            def test_b(self): events.append('b')
+        def load(name):
+            return unittest.TestSuite([Case(name)])
+        progress, lines = self.transcript()
+        chosen = 'test_a test_b'
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(unittest.defaultTestLoader, 'loadTestsFromName', side_effect=load), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            output = Path(directory) / 'timing.json'
+            self.assertEqual(test_worker.run(['test_a', 'test_b'], output, progress=progress), 0)
+            self.assertTrue(output.exists())
+        text = '\n'.join(lines)
+        for phase in ('loading', 'running', 'finished', 'timings', 'completed'):
+            self.assertIn('phase=' + phase, text)
+        self.assertIn('phase=running selector=' + chosen, text)
+        self.assertIn('phase=finished selector=' + chosen, text)
+        self.assertIn('phase=timings selector=' + chosen, text)
+        order = [text.index('phase=' + phase) for phase in
+                 ('loading', 'running', 'finished', 'timings', 'completed')]
+        self.assertEqual(order, sorted(order))
+
+    def test_stall_diagnostic_reports_phase_named_threads_and_only_owned_children(self):
+        from scripts import test_worker
+        lines, gate = [], threading.Event()
+        progress = test_worker.Progress(emit=lines.append)
+        progress.set('running', 'tests.demo.Case')
+        probe = threading.Thread(target=gate.wait, name='rsi-diagnostic-probe', daemon=True)
+        probe.start()
+        own, child, sibling = os.getpid(), os.getpid() + 7, os.getpid() + 101
+        rows = ('  {child}  {own} S+ /usr/bin/child\n'
+                '  {sibling}  1 Ss /usr/bin/sibling\n'
+                '  {own}  1 Ss /usr/bin/python\n').format(own=own, child=child, sibling=sibling)
+        completed = subprocess.CompletedProcess(['ps'], 0, rows, '')
+        try:
+            with patch.object(test_worker.subprocess, 'run', return_value=completed) as run:
+                progress.stalled('probe')
+        finally:
+            gate.set()
+            probe.join(5)
+        self.assertFalse(probe.is_alive())
+        text = '\n'.join(lines)
+        self.assertIn('reason=probe', text)
+        self.assertIn('phase=running', text)
+        self.assertIn('selector=tests.demo.Case', text)
+        self.assertIn('rsi-diagnostic-probe', text)
+        self.assertIn('child pid={}'.format(child), text)
+        self.assertNotIn(str(sibling), text)
+        self.assertEqual(run.call_args.args[0], ['ps', '-axo', 'pid=,ppid=,stat=,comm='])
+        self.assertNotIn('args', ' '.join(run.call_args.args[0]))
+        self.assertLessEqual(run.call_args.kwargs['timeout'], 5)
+
+    def test_stall_diagnostic_survives_replaced_streams_without_reads_or_spawns(self):
+        from scripts import test_worker
+        read_fd, write_fd = os.pipe()
+        try:
+            progress = test_worker.Progress(emit=test_worker.emit_fd(write_fd))
+            progress.set('running', 'tests.demo')
+            completed = subprocess.CompletedProcess(['ps'], 0, '', '')
+            with patch.dict(os.environ, {'RSI_DIAGNOSTIC_SENTINEL': 'must-not-appear'}), \
+                    patch('builtins.open', side_effect=AssertionError('diagnostics must not read files')), \
+                    patch.object(test_worker.subprocess, 'run', return_value=completed), \
+                    patch.object(test_worker.subprocess, 'Popen',
+                                 side_effect=AssertionError('diagnostics must not spawn a runner')), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                progress.stalled('redirected')
+        finally:
+            os.close(write_fd)
+        try:
+            report = os.read(read_fd, 1 << 20).decode('utf-8')
+        finally:
+            os.close(read_fd)
+        self.assertIn('reason=redirected', report)
+        self.assertIn('phase=running', report)
+        self.assertIn('MainThread', report)
+        self.assertNotIn('must-not-appear', report)
+
+    def test_stall_watchdog_is_a_daemon_and_reports_after_completion(self):
+        from scripts import test_worker
+        lines, reported = [], threading.Event()
+        def emit(line):
+            lines.append(line)
+            if 'diagnostic' in line:
+                reported.set()
+        progress = test_worker.Progress(emit=emit)
+        progress.set('completed')
+        stop = threading.Event()
+        with patch.object(test_worker, 'describe_threads', return_value=[]), \
+                patch.object(test_worker, 'describe_children', return_value=[]):
+            watcher = test_worker.start_stall_watch(progress, interval=0.01, stop=stop)
+            try:
+                self.assertTrue(reported.wait(10))
+                self.assertTrue(watcher.daemon)
+                self.assertEqual(watcher.name, 'rsi-test-stall-watch')
+            finally:
+                stop.set()
+                watcher.join(5)
+        self.assertFalse(watcher.is_alive())
+        self.assertIn('phase=completed', '\n'.join(lines))
+
+    def test_crash_dumps_are_process_wide_and_never_cancelled_between_groups(self):
+        from scripts import test_worker
+        class Fast(unittest.TestCase):
+            def test_one(self): pass
+        class Slow(unittest.TestCase):
+            def test_two(self): pass
+        mapping = {'fast': Fast('test_one'), 'slow': Slow('test_two')}
+        def load(name):
+            return unittest.TestSuite([mapping[name]])
+        stream = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(unittest.defaultTestLoader, 'loadTestsFromName', side_effect=load), \
+                patch.object(test_worker.faulthandler, 'dump_traceback_later') as schedule, \
+                patch.object(test_worker.faulthandler, 'cancel_dump_traceback_later') as cancel, \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertTrue(test_worker.install_crash_dumps(30, stream))
+            self.assertEqual(test_worker.run(['fast', 'slow'], Path(directory) / 'timing.json'), 0)
+        schedule.assert_called_once_with(30, repeat=True, file=stream)
+        cancel.assert_not_called()
+
+    def test_child_listing_without_ps_reports_unavailable_instead_of_failing(self):
+        from scripts import test_worker
+        with patch.object(test_worker.subprocess, 'run',
+                          side_effect=subprocess.TimeoutExpired('ps', 5)) as run:
+            lines = test_worker.describe_children()
+        self.assertEqual(len(lines), 1)
+        self.assertIn('children unavailable', lines[0])
+        self.assertIn('TimeoutExpired', lines[0])
+        self.assertLessEqual(run.call_args.kwargs['timeout'], 5)

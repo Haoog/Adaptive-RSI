@@ -6,7 +6,7 @@ Current continuation: the user has authorized work to continue. Read the [curren
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 123 implemented with targeted acceptance, 53 partial, and 25 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 128 implemented with targeted acceptance, 53 partial, and 20 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -175,7 +175,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 118. **partial** — Offer previewable reversible cleanup
 119. **implemented** — Verify archive content integrity
 120. **partial** — Rehearse business-level restoration
-121. **pending** — Version capability metadata with provenance
+121. **partial** — Version capability metadata with provenance
 122. **partial** — Budget and paginate tool results independently
 123. **pending** — Estimate tokens with language-aware uncertainty
 124. **implemented** — Parallelize independent read-only tools
@@ -183,7 +183,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 126. **implemented** — Stream bounded line ranges from large sources
 127. **implemented** — Respect ignore rules during indexing
 128. **implemented** — Add scoped search options
-129. **pending** — Reference large tool output as artifacts
+129. **partial** — Reference large tool output as artifacts
 130. **implemented** — Classify retry safety for paid requests
 131. **implemented** — Correlate provider request identifiers
 132. **pending** — Add native streaming progress
@@ -191,21 +191,21 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 134. **implemented** — Preserve provider stop reasons end to end
 135. **partial** — Expand cross-protocol response contracts
 136. **pending** — Explain fallback fault domains
-137. **pending** — Price input, output and cache usage separately
-138. **pending** — Explain currency and estimation limits
+137. **implemented** — Price input, output and cache usage separately
+138. **partial** — Explain currency and estimation limits
 139. **pending** — Compare estimated and actual task cost
 140. **implemented** — Invalidate stale evidence after credential rotation
 141. **implemented** — Stratify evaluation sampling
 142. **implemented** — Hash complete experiment inputs
-143. **partial** — Use fresh final promotion evidence
+143. **implemented** — Use fresh final promotion evidence
 144. **partial** — Calibrate monitoring with optional human feedback
 145. **implemented** — Seal experiment plans before execution
 146. **implemented** — Measure benchmark noise and uncertainty
-147. **partial** — Validate harness sensitivity with negative controls
-148. **partial** — Exercise criterion-specific counterexamples
+147. **implemented** — Validate harness sensitivity with negative controls
+148. **implemented** — Exercise criterion-specific counterexamples
 149. **implemented** — Record executed test identities
 150. **implemented** — Collect standard test and coverage artifacts
-151. **partial** — Cache immutable prepared environments
+151. **implemented** — Cache immutable prepared environments
 152. **implemented** — Gate performance gains on secondary guardrails
 153. **implemented** — Audit dataset retirement and reclassification
 154. **partial** — Explain strategy changes before promotion
@@ -246,7 +246,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 189. **implemented** — Improve narrow-screen diff reading
 190. **implemented** — Localize structured runtime errors
 191. **partial** — Pin remaining build toolchains
-192. **pending** — Test real signed desktop upgrades end to end
+192. **partial** — Test real signed desktop upgrades end to end
 193. **partial** — Expand supported-Python boundary coverage
 194. **implemented** — Balance tests using actual module durations
 195. **implemented** — Track flaky failures without hiding them
