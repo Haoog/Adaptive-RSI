@@ -20,6 +20,20 @@ const {chromium} = require('playwright');
     await page.goto(url);
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
     await page.locator('[data-task-filter="attention"]').click();
+    const evidence = page.getByRole('button', {name:'逐条验收证据', exact:true}).first();
+    await evidence.waitFor();
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({width, height:1000});
+      const bounds = await evidence.evaluate(button => {
+        const text = document.createRange();text.selectNodeContents(button);
+        return {lines:text.getClientRects().length, height:button.getBoundingClientRect().height,
+          fits:document.documentElement.scrollWidth <= innerWidth};
+      });
+      assert.equal(bounds.lines, 1, 'batch evidence action stays on one readable line');
+      assert(bounds.height <= 44, 'batch evidence action stays compact');
+      assert(bounds.fits, 'batch task fits desktop and mobile viewports');
+    }
+    await page.setViewportSize({width:1440, height:1000});
     await page.getByRole('checkbox', {name:'选择任务 · 拆分来源一'}).check();
     let previews = 0, writes = 0, receipts = 0;
     await page.route('**/api/tasks/batch*', async route => {

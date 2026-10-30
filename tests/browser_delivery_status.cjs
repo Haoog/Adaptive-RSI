@@ -11,7 +11,7 @@ const OWNERSHIP_ERROR = 'Deployment ownership changed during validation';
 const DISCARDED_HEALTH_ERROR = 'A newer deployment owns this target; old health evidence was discarded';
 const HEALTH_ERROR = 'Health response must confirm the exact deployment SHA and healthy status';
 const IDENTITY_ERROR = 'Workflow run identity differs from the authorized operation';
-const RED = 'rgb(157, 48, 41)';
+const RED = 'rgb(164, 61, 52)';
 
 const VERIFICATION_ZH = '合并后检查尚未通过，发布与部署会在检查通过后自动继续。';
 const VERIFICATION_EN = 'Post-merge verification has not passed yet; release and deploy will continue automatically once it passes.';
@@ -222,6 +222,13 @@ async function main() {
     assert.match(await panel.innerText(), /GitHub now reports a new run attempt/);
     assert.match(await panel.innerText(), /#17/);
     console.log('ok: bilingual rerun reconciliation keeps the server evidence');
+    await page.evaluate(() => document.getElementById('detail-dialog').close());
+    await page.locator('#language-select').selectOption('zh-CN');
+    statusOverride = manualOperation('blocked', []);
+    await openDetail(page, '查看详情');
+    await page.getByRole('button', {name:'检查发布设置',exact:true}).click();
+    assert.equal(await page.locator('#view-settings').isVisible(), true, 'release recovery opens the runtime settings destination');
+    assert.equal(await page.locator('#release-settings').isVisible(), true);
     await page.close();
 
     assert.deepEqual(errors, [], 'no page errors: ' + JSON.stringify(errors));

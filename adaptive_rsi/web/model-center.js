@@ -30,7 +30,8 @@ window.RSIModelCenter = (() => {
   };
   const purpose = {analysis:'查找有依据的改进',planning:'判断是否值得执行',implementation:'实现并补充验证',review:'检查正确性与可维护性',evolution:'分析证据与提出待验证改动'};
   const drafts = new Map(), baselines = new Map(), jobs = new Set(), savingRoutes = new Set(), inheritanceResets = new Map();
-  let data, active='openai', scope=null, tab='roles', sequence=0, editing=null, editorSession=null, probeSession=null, picking=null, busy=false, loading=false;
+  const initialTab=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;
+  let data, active='openai', scope=null, tab=initialTab==='roles'?'roles':'providers', sequence=0, editing=null, editorSession=null, probeSession=null, picking=null, busy=false, loading=false;
   let feedbackKey='',feedbackError=false,modelPage=0,pickerPage=0,priceTarget=null,capabilityTarget=null;
   const pageSize=20;
   const priceFields=[['input','mc-price-input-tokens'],['output','mc-price-output'],['cache_read','mc-price-cache-read'],['cache_write','mc-price-cache-write']];
@@ -458,7 +459,7 @@ window.RSIModelCenter = (() => {
   }
   function init(){
     const tabs=[...document.querySelectorAll('[data-mc-tab]')];
-    tabs.forEach(button=>{button.tabIndex=button.dataset.mcTab===tab?0:-1;button.addEventListener('click',()=>{tab=button.dataset.mcTab;render();});});
+    tabs.forEach(button=>{button.tabIndex=button.dataset.mcTab===tab?0:-1;button.addEventListener('click',()=>{tab=button.dataset.mcTab;rememberTab();render();});});
     tabs[0].parentElement.addEventListener('keydown',event=>{
       if(event.key!=='ArrowLeft'&&event.key!=='ArrowRight')return;
       const current=tabs.indexOf(document.activeElement);
@@ -563,9 +564,14 @@ window.RSIModelCenter = (() => {
     if($('mc-advanced-dialog').open){const provider=$('mc-fallback-provider').value,model=$('mc-fallback-model').value,effort=$('mc-fallback-effort').querySelector('select').value;renderFallback(provider?{provider,model,effort}:null);const role=$('mc-advanced-dialog').dataset.role;$('mc-advanced-title').textContent=t(roleNames[role])+' · '+t('高级参数');}
     if($('mc-probe-dialog').open){const dialog=$('mc-probe-dialog'),model=data.providers.find(p=>p.id===dialog.dataset.provider)?.catalog.models.find(m=>m.id===dialog.dataset.model);$('mc-probe-title').textContent=t('测试模型')+' · '+(model?.name||dialog.dataset.model);}
   }
+  function rememberTab(){
+    if(!location.href||location.pathname===undefined)return;
+    const route=new URLSearchParams(String(location.hash||'').replace(/^#/,''));route.set('modelTab',tab);
+    history.replaceState(history.state,'',location.pathname+location.search+'#'+route);
+  }
   return {show:(requested=null,reload=false)=>{
     const next=requested||null,changed=scope!==next;changeScope(next);
     if(loading&&!changed)return;
     if(!data||changed||data.project!==scope||reload)safe(()=>load());
-  },connections:()=>{tab='providers';if(data)render();},translate,load};
+  },connections:(reset=true)=>{const requested=location.href?new URLSearchParams(String(location.hash||'').replace(/^#/, '')).get('modelTab'):null;tab=!reset&&['providers','roles'].includes(requested)?requested:'providers';if(data)render();},translate,load};
 })();

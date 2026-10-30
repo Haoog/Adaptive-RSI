@@ -82,13 +82,14 @@ window.RSIBatch=(()=>{
   const host=document.querySelector('.task-toolbar');if(!host)return;
   let panel=document.getElementById('batch-actions');
   if(!panel){panel=el('div',undefined,'task-actions');panel.id='batch-actions';host.after(panel);}
+  panel.dataset.selection=ids().size?'selected':'empty';
   panel.replaceChildren(el('span',t('已选择任务')+' · '+ids().size,'muted'));
   for(const [kind,label] of [['group','合并任务'],['ungroup','拆分未开始的任务'],['split_retry','拆分失败任务组并重做'],['retry','批量重试'],['cancel','批量取消'],['approve','批量批准交付']]){
    const button=el('button',t(label),'text-button');button.type='button';button.disabled=!ids().size||pending.has(projectId);
    button.addEventListener('click',()=>safe(()=>perform(kind)));panel.append(button);
   }
   const suggest=el('button',t('推荐任务簇'),'text-button');suggest.type='button';suggest.disabled=!ids().size||pending.has(projectId);suggest.onclick=()=>safe(recommendations);panel.append(suggest);
-  const records=el('button',t('批次记录'),'text-button');records.type='button';records.disabled=!projectId;records.onclick=()=>safe(history);panel.append(records);
+  const records=el('button',t('批次记录'),'text-button');records.id='batch-records';records.type='button';records.disabled=!projectId;records.onclick=()=>safe(history);panel.append(records);
  }
  function row(task){
   const box=el('input');box.type='checkbox';box.checked=ids().has(task.id);

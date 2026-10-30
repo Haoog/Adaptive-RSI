@@ -20,6 +20,48 @@ async function closeDetail(page) {
   await page.locator('#detail-dialog').waitFor({ state: 'hidden', timeout: 10000 });
 }
 
+async function checkDetailReadingOrder(page) {
+  const metadataPattern = /\/api\/task\?id=/;
+  const runPattern = /\/api\/run\?id=detail-h3$/;
+  for (const first of ['controls', 'outcome']) {
+    let release;
+    const gate = new Promise(resolve => release = resolve);
+    const metadataRoute = async route => {
+      if (first === 'outcome') await gate;
+      await route.continue();
+    };
+    const runRoute = async route => {
+      if (first === 'controls') await gate;
+      await route.continue();
+    };
+    await page.route(metadataPattern, metadataRoute);
+    await page.route(runPattern, runRoute);
+    try {
+      await openDetail(page, '详情历史任务', 'attention');
+      const controls = page.locator('#detail-body > .task-controls');
+      const outcome = page.locator('#detail-body > #live-task-outcome');
+      await (first === 'controls' ? controls : outcome).waitFor({timeout: 5000});
+      assert.equal(await (first === 'controls' ? outcome : controls).count(), 0,
+        'the slower response remains gated while ' + first + ' renders');
+      release();
+      await controls.waitFor({timeout: 5000});
+      await outcome.waitFor({timeout: 5000});
+      const order = await page.locator('#detail-body').evaluate(body => {
+        const nodes = [...body.children];
+        return ['.task-requirements', '.task-controls', '#live-task-outcome', '.detail-section']
+          .map(selector => nodes.indexOf(body.querySelector(selector)));
+      });
+      assert(order.every(index => index >= 0) && order.every((index, i) => i === 0 || order[i - 1] < index),
+        'requirements and next steps precede results and evidence when ' + first + ' responds first: ' + order.join(','));
+    } finally {
+      release();
+      await closeDetail(page);
+      await page.unroute(metadataPattern, metadataRoute);
+      await page.unroute(runPattern, runRoute);
+    }
+  }
+}
+
 async function checkTaskDetail(browser, url, errors) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.on('pageerror', error => errors.push(error.message));
@@ -45,6 +87,7 @@ async function checkTaskDetail(browser, url, errors) {
     assert.equal(await qualityCard('后续主线出现回归').locator('strong').textContent(), '1');
     await page.unroute('**/api/state?*');
     const project = await page.locator('#project-select').inputValue();
+    await checkDetailReadingOrder(page);
 
     // ---------- 1) 运行历史懒加载失败：区块内错误项 + 重试成功 ----------
     await openDetail(page, '详情历史任务', 'attention');
@@ -107,8 +150,12 @@ async function checkTaskDetail(browser, url, errors) {
     await liveStatus.waitFor({state: 'hidden', timeout: 15000});
     assert.equal(await page.locator('#live-task-outcome .value-feedback textarea').inputValue(), '尚未保存的草稿');
     // 清空已保存评价同样是未提交草稿，不能被另一个窗口的评价或轮询重建覆盖。
-    await page.locator('#live-task-outcome .value-feedback select').selectOption('');
-    await page.locator('#live-task-outcome .value-feedback textarea').fill('');
+    // Capture both edits on the same form before a live poll can replace it.
+    await page.locator('#live-task-outcome .value-feedback').evaluate(form => {
+      const rating = form.querySelector('select'), note = form.querySelector('textarea');
+      rating.value = '';rating.dispatchEvent(new Event('change', {bubbles:true}));
+      note.value = '';note.dispatchEvent(new Event('input', {bubbles:true}));
+    });
     liveSummary = '清空评价后的实时结果';
     await page.locator('#live-task-outcome').filter({hasText: liveSummary}).waitFor({timeout: 15000});
     assert.equal(await page.locator('#live-task-outcome .value-feedback select').inputValue(), '',
@@ -174,6 +221,8 @@ async function checkTaskDetail(browser, url, errors) {
     await page.locator('#live-task-outcome').waitFor({ timeout: 5000 });
     const cancelButton = page.locator('#detail-body button', { hasText: '取消任务' });
     assert.equal(await cancelButton.count(), 1, 'awaiting_approval detail must offer 取消任务');
+    assert.equal(await cancelButton.isVisible(), false, 'cancellation is secondary to reading the task');
+    await page.locator('.task-secondary-actions > summary').click();
     let cancelPosts = 0;
     page.on('request', request => {
       if (new URL(request.url()).pathname === '/api/cancel' && request.method() === 'POST') cancelPosts++;

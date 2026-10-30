@@ -37,6 +37,19 @@ test('a generic structured reason preserves existing specific safe guidance',asy
   page.context.fetch=async()=>response({error:"Automation requires the trusted workflow tag's full commit SHA",error_code:'validation_error',reason_code:'config_invalid',field_path:null},400);
   await assert.rejects(page.context.api('config',{values:{}}),error=>error.message.includes('小写'));
 });
+function descendants(node) {
+  return (node.children || []).flatMap(child => [child, ...descendants(child)]);
+}
+
+function editorForm(controls, className) {
+  const editor = descendants(controls).find(node => node.className === className);
+  return editor && descendants(editor).find(node => node.tagName === 'FORM');
+}
+
+function supplementForm(controls) {
+  return editorForm(controls, 'task-supplement-editor');
+}
+
 async function waitFor(predicate) {
   const deadline = Date.now() + 5000;
   while (!predicate()) {
@@ -54,7 +67,7 @@ function browser(savedSession = new Map()) {
   let created = 0, nextTimer = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
-      id, _value: '',
+      id, _value: '', textContent: '',
       get value() {return this.tagName === 'SELECT' ? this.children.find(option=>option.selected)?.value || '' : this._value;},
       set value(value) {this._value=value;if(this.tagName === 'SELECT')for(const option of this.children)option.selected=option.value===value;},
       get selectedOptions() {return this.children.filter(option=>option.selected);},
@@ -863,8 +876,10 @@ test('live task details rerender when synced input changes but keep unchanged po
   await waitFor(() => renders === 2 && polls > before);
   assert.equal(page.node('detail-title').textContent, '同步后的标题');
   assert.match(draft(page.node('detail-body')).value, /未保存补充草稿/);
-  assert.ok(page.node('detail-body').children.some(node =>
-    node.className === 'detail-section' && node.children.some(child => child.textContent === '同步后的正文')));
+  const requirements = page.node('detail-body').children.find(node => node.className === 'task-requirements');
+  assert.equal(requirements.tagName, 'SECTION', 'task requirements are visible without expanding evidence');
+  assert.ok(requirements.children.some(child =>
+    child.tagName === 'P' && child.id === 'task-requirements' && child.textContent === '同步后的正文'));
   // Unchanged polls must not rebuild the dialog.
   const settled = polls;
   await waitFor(() => page.timers.some(timer => timer.active && timer.delay === 5000));
@@ -896,7 +911,7 @@ test('out-of-order task details cannot attach cancellation for the previous task
   await page.context.showTask(b);
   finishA(); await pendingA;
   assert.equal(page.node('detail-title').textContent, 'Task b');
-  const buttons = page.node('detail-body').children.filter(node => node.textContent === '取消任务');
+  const buttons = descendants(page.node('detail-body')).filter(node => node.tagName === 'BUTTON' && node.textContent === '取消任务');
   assert.equal(buttons.length, 1);
   await buttons[0].handlers.click();
   assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
@@ -910,7 +925,7 @@ test('closing task details while a response waits keeps the dialog closed', asyn
   const pending = page.context.showTask({id: 'a', title: 'Task a', evidence: '[]', state: 'executing'});
   page.context.closeTaskDetail(); finish(); await pending;
   assert.notEqual(page.node('detail-dialog').open, true);
-  assert.equal(page.node('detail-body').children.filter(node => node.textContent === '取消任务').length, 0);
+  assert.equal(descendants(page.node('detail-body')).filter(node => node.tagName === 'BUTTON' && node.textContent === '取消任务').length, 0);
 });
 
 test('settings drafts retain independent baselines and duration units across project scopes', () => {
@@ -1681,7 +1696,7 @@ test('live detail removes expired backoff retry without rebuilding supplement dr
   const retry=()=>controls.children.find(node=>node.textContent==='立即重试');
   assert.ok(retry());
   retry().remove=()=>{controls.children=controls.children.filter(node=>node.textContent!=='立即重试');};
-  const form=controls.children.find(node=>node.tagName==='FORM'),textarea=form.children[0].children[0];
+  const form=supplementForm(controls),textarea=form.children[0].children[0];
   textarea.value='尚未保存的补充草稿';
   vm.runInContext('Date.now=()=>1700000001000',page.context);
   page.fireTimer(5000);await new Promise(setImmediate);await page.context.lastAction;
@@ -1800,7 +1815,7 @@ test('a whitespace-only supplement is rejected inside the form without a request
     return response({tasks: []});
   };
   const controls = await openExperienceTask(page, task);
-  const form = controls.children.find(node => node.tagName === 'FORM');
+  const form = supplementForm(controls);
   const textarea = form.children[0].children[0];
   textarea.value = '   \n\t ';
   form.onsubmit({preventDefault() {}});
@@ -1823,7 +1838,7 @@ test('an oversized Issue composition explains the 30000-character limit in the f
     return response({tasks: []});
   };
   const controls = await openExperienceTask(page, task);
-  const form = controls.children.find(node => node.tagName === 'FORM');
+  const form = supplementForm(controls);
   form.children[0].children[0].value = '0123456789';
   form.onsubmit({preventDefault() {}});
   await page.context.lastAction;
@@ -1833,8 +1848,7 @@ test('an oversized Issue composition explains the 30000-character limit in the f
 });
 
 function queueForm(page) {
-  return page.node('detail-body').children.find(node => node.className === 'task-controls')
-    .children.filter(node => node.tagName === 'FORM').at(-1);
+  return editorForm(page.node('detail-body'), 'task-queue-editor');
 }
 function changeDetailLanguage(page, language = 'en') {
   Object.assign(page.context, {language: 'zh-CN', english: {}, translateStatic() {}});
@@ -1864,7 +1878,7 @@ for (const trigger of ['language', 'supplement']) {
       form.children[1].children[0].checked = !remove;
       if (trigger === 'language') await changeDetailLanguage(page);
       else {
-        const supplement = controls.children.find(node => node.tagName === 'FORM');
+        const supplement = supplementForm(controls);
         supplement.children[0].children[0].value = 'Additional requirement';
         supplement.onsubmit({preventDefault() {}}); await page.context.lastAction;
       }
@@ -1905,7 +1919,7 @@ for (const trigger of ['language', 'revision', 'periodic']) {
       form.children[0].children[0].value = ''; form.children[1].children[0].checked = false;
       if (trigger === 'language') await changeDetailLanguage(page);
       if (trigger === 'revision') {
-        const supplement = page.node('detail-body').children.find(node => node.className === 'task-controls').children.find(node => node.tagName === 'FORM');
+        const supplement = supplementForm(page.node('detail-body'));
         supplement.children[0].children[0].value = 'Rebuild during schedule save';
         supplement.onsubmit({preventDefault() {}}); await page.context.lastAction;
       }
@@ -2100,7 +2114,7 @@ test('runless detail polling updates cancellation controls and preserves supplem
     reads++; return response(metadata);
   };
   const controls = await openExperienceTask(page, task);
-  const supplement = controls.children.find(node => node.tagName === 'FORM').children[0].children[0];
+  const supplement = supplementForm(controls).children[0].children[0];
   supplement.value = 'Keep this unfinished supplement'; supplement.handlers.input();
   const before = page.node('detail-body').children.slice();
   page.fireTimer(5000); await new Promise(setImmediate);
@@ -2115,7 +2129,7 @@ test('runless detail polling updates cancellation controls and preserves supplem
   assert.ok(text(page.node('detail-body')).includes('基于当前输入重新检查'));
   assert.equal(text(page.node('detail-body')).includes('取消任务'), false);
   const updatedControls = page.node('detail-body').children.find(node => node.className === 'task-controls');
-  assert.equal(updatedControls.children.find(node => node.tagName === 'FORM').children[0].children[0].value, supplement.value);
+  assert.equal(supplementForm(updatedControls).children[0].children[0].value, supplement.value);
   assert.equal(page.node('detail-dialog').scrollTop, 42);
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 5000).length, 1, 'one live poll after rebuilding details');
   assert.ok(reads >= 4);
@@ -2134,14 +2148,14 @@ for (const dependency of ['draft-parent', '']) {
       return response(metadata);
     };
     const controls = await openExperienceTask(page, task);
-    const original = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const original = editorForm(controls, 'task-queue-editor');
     original.children[0].children[0].value = dependency;
     original.children[1].children[0].checked = !!dependency;
     metadata = {...metadata, state: 'queued', dependency: {dependency: 'new-server-parent'}};
     page.fireTimer(5000); await new Promise(setImmediate);
     await page.context.lastAction;
     const updated = page.node('detail-body').children.find(node => node.className === 'task-controls');
-    const form = updated.children.filter(node => node.tagName === 'FORM').at(-1);
+    const form = editorForm(updated, 'task-queue-editor');
     assert.notEqual(form, original, 'metadata transition rebuilds controls');
     assert.equal(form.children[0].children[0].value, dependency);
     assert.equal(form.children[1].children[0].checked, !!dependency);
@@ -2172,7 +2186,7 @@ for (const failFirst of [false, true]) {
       return response(metadata);
     };
     const controls = await openExperienceTask(page, task);
-    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const form = editorForm(controls, 'task-queue-editor');
     const dependency = form.children[0].children[0], urgency = form.children[1].children[0], submit = form.children[2];
     dependency.value = 'parent'; urgency.checked = true;
     form.onsubmit({preventDefault() {}}); const first = page.context.lastAction;
@@ -2208,7 +2222,7 @@ for (const editTiming of ['after acknowledgement', 'during save']) {
       return response(metadata);
     };
     const controls = await openExperienceTask(page, task);
-    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const form = editorForm(controls, 'task-queue-editor');
     const dependency = form.children[0].children[0], urgency = form.children[1].children[0];
     dependency.value = 'parent'; urgency.checked = true;
     form.onsubmit({preventDefault() {}});
@@ -2224,7 +2238,7 @@ for (const editTiming of ['after acknowledgement', 'during save']) {
     page.fireTimer(5000); await new Promise(setImmediate);
     await page.context.lastAction;
     const updated = page.node('detail-body').children.find(node => node.className === 'task-controls');
-    const rebuilt = updated.children.filter(node => node.tagName === 'FORM').at(-1);
+    const rebuilt = editorForm(updated, 'task-queue-editor');
     assert.equal(rebuilt.children[0].children[0].value, '', 'returning to the opened value remains an unsaved edit after saving');
     assert.equal(rebuilt.children[1].children[0].checked, false);
   });
@@ -2242,7 +2256,7 @@ for (const navigation of ['close', 'project', 'other-task']) {
       return response(url.includes('id=other&') ? fixtureTask('other', 'queued') : task);
     };
     const controls = await openExperienceTask(page, task);
-    const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+    const form = editorForm(controls, 'task-queue-editor');
     form.children[0].children[0].value = 'parent';
     form.children[1].children[0].checked = true;
     form.onsubmit({preventDefault() {}});
@@ -2257,7 +2271,7 @@ for (const navigation of ['close', 'project', 'other-task']) {
     assert.equal(refreshes, 0, 'obsolete save does not refresh the new context');
     assert.equal(page.node('toast').textContent, toast, 'obsolete save does not announce success in the new context');
     if (navigation === 'other-task') {
-      const other = page.node('detail-body').children.find(node => node.className === 'task-controls').children.filter(node => node.tagName === 'FORM').at(-1);
+      const other = queueForm(page);
       assert.equal(other.children[0].children[0].value, '');
       assert.equal(other.children[1].children[0].checked, false);
     }
@@ -2277,7 +2291,7 @@ test('runless metadata rebuilding accepts server queue changes for untouched fie
   page.fireTimer(5000); await new Promise(setImmediate);
   await page.context.lastAction;
   const controls = page.node('detail-body').children.find(node => node.className === 'task-controls');
-  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  const form = editorForm(controls, 'task-queue-editor');
   assert.equal(form.children[0].children[0].value, 'server-parent');
   assert.equal(form.children[1].children[0].checked, true);
 });
@@ -2291,7 +2305,7 @@ test('runless terminal transition does not restore inapplicable queue controls',
     return response(metadata);
   };
   const controls = await openExperienceTask(page, task);
-  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  const form = editorForm(controls, 'task-queue-editor');
   form.children[0].children[0].value = 'draft-parent';
   form.children[1].children[0].checked = true;
   metadata = {...task, state: 'cancelled'};
@@ -2389,7 +2403,7 @@ test('an urgency-only save preserves an off-page dependency; explicit removal st
     return response({...task, dependency: {dependency: 'outside-page'}, urgency: 0});
   };
   const controls = await openExperienceTask(page, task);
-  const form = controls.children.filter(node => node.tagName === 'FORM').at(-1);
+  const form = editorForm(controls, 'task-queue-editor');
   const select = form.children[0].children[0], urgency = form.children[1].children[0];
   assert.equal(select.value, 'outside-page');
   assert.equal(select.children.find(option => option.value === 'outside-page').textContent, 'Task outside-page');
@@ -2422,7 +2436,7 @@ for (const actionKind of ['retry', 'supplement']) {
         const controls = await openExperienceTask(page, task);
         if (actionKind === 'retry') controls.children.find(node => node.textContent === '基于当前输入重新检查').handlers.click();
         else {
-          const form = controls.children.find(node => node.tagName === 'FORM');
+          const form = supplementForm(controls);
           form.children[0].children[0].value = 'More requirements';
           form.onsubmit({preventDefault() {}});
         }
@@ -2453,7 +2467,7 @@ for (const actionKind of ['retry', 'supplement']) {
     const controls = await openExperienceTask(page, task);
     if (actionKind === 'retry') controls.children.find(node => node.textContent === '基于当前输入重新检查').handlers.click();
     else {
-      const form = controls.children.find(node => node.tagName === 'FORM');
+      const form = supplementForm(controls);
       form.children[0].children[0].value = 'More requirements';
       form.onsubmit({preventDefault() {}});
     }

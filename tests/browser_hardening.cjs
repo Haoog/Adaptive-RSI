@@ -14,7 +14,7 @@ async function checkReadiness(browser, url, staleFails, errors) {
     return reply(route, {ready: true, items: []});
   });
   try {
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
     await page.waitForFunction(() => document.getElementById('readiness-summary').textContent.includes('正在检查'));
     await page.locator('#project-settings').click();
@@ -51,9 +51,9 @@ async function checkModelForms(browser, url, errors) {
     assert.equal((await response).status(), 200);
   };
   try {
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#mc-provider-list .mc-provider').filter({hasText: '测试目录服务'}).click();
     await page.locator('#mc-add-model').click();
@@ -112,9 +112,9 @@ async function checkProviderSaveRace(browser, url, errors, reopen = false) {
     await route.fulfill({response});
   });
   try {
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.locator('.sidebar [data-view=models]').click();
     await page.locator('[data-settings-scope="project"]').click();
     await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#view-models[data-scope]:not([data-scope="global"])').waitFor();
@@ -163,7 +163,7 @@ async function checkProviderSaveRace(browser, url, errors, reopen = false) {
     const newer = global.providers.filter(provider => provider.name === revised);
     assert.equal(newer.length, reopen ? 1 : 0);
     if (reopen) assert.notEqual(newer[0].id, created.id);
-  } finally { release(); await page.close(); }
+  } finally { release(); await page.unrouteAll({behavior:'wait'}); await page.close(); }
 }
 
 async function checkRouteSaveRace(browser,url,errors) {
@@ -172,8 +172,9 @@ async function checkRouteSaveRace(browser,url,errors) {
   let posts=0;
   await page.route('**/api/model-center/routes',async route=>{posts++;const response=await route.fetch();arrived();await gate;await route.fulfill({response});});
   try{
-    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
-    await page.locator('#project-settings').click();
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.locator('.sidebar [data-view=models]').click();
+    await page.locator('[data-mc-tab="roles"]').click();
     const effort=page.locator('#mc-role-effort-implementation');
     const original=await effort.inputValue();
     await effort.selectOption('default');await page.locator('#mc-save-routes').click();await received;
@@ -189,9 +190,9 @@ async function checkRouteSaveRace(browser,url,errors) {
     await page.unroute('**/api/model-center/routes');
     await page.locator('#mc-save-routes').click();
     await page.locator('#mc-dirty').filter({hasText:'模型分工已保存'}).waitFor();
-    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('#project-settings').click();
+    await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="roles"]').click();
     assert.equal(await effort.inputValue(),original);
-  }finally{release();await page.close();}
+  }finally{release();await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkUpdatePending(browser,url,errors) {
@@ -204,7 +205,7 @@ async function checkUpdatePending(browser,url,errors) {
   });
   await page.route('**/api/updates/check',route=>{checked=true;return reply(route,{started:true,update:{state:'checking',busy:false,channel:'managed'}});});
   try{
-    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('#project-settings').click();
     await page.locator('#advanced-settings > summary').click();
     await page.locator('#update-status').filter({hasText:'previous-check-error'}).waitFor();
@@ -216,7 +217,7 @@ async function checkUpdatePending(browser,url,errors) {
     await page.locator('#language-select').selectOption('en');
     await page.locator('#update-status').filter({hasText:'Checking for updates'}).waitFor();
     assert.equal(await page.locator('#settings-save').isDisabled(),false);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkUpdateRateLimit(browser,url,errors) {
@@ -257,7 +258,7 @@ async function checkUpdateRateLimit(browser,url,errors) {
     await screenshot('update-cooldown-'+locale+(expired?'-expired':''));
   };
   try{
-    await page.goto(url);await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('#project-settings').click();
     await page.locator('#advanced-settings > summary').click();
     await page.locator('#update-status').filter({hasText:'GitHub 匿名 API 额度已用尽'}).waitFor();
@@ -279,7 +280,7 @@ async function checkUpdateRateLimit(browser,url,errors) {
     assert.deepEqual(requests,['/api/updates/check']);
     assert.equal(await page.locator('#check-update').isDisabled(),true);
     assert.equal(await page.locator('#apply-update').isDisabled(),true);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkPendingSettingsDraft(browser, url, errors) {
@@ -302,7 +303,7 @@ async function checkPendingSettingsDraft(browser, url, errors) {
       const response = earlyResponse || await route.fetch(); assert.equal(response.status(), 200, await response.text()); await route.fulfill({response});
     });
     try {
-      await page.goto(url);
+      await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
       await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor();
       await page.locator('#project-settings').click();
       if (global) await page.locator('[data-settings-scope="global"]').click();
@@ -355,7 +356,7 @@ async function checkPendingSettingsDraft(browser, url, errors) {
       assert.equal(await page.evaluate(id => window.RSIDraftStore.get('settings', id), key), null);
       await leave(); assert.equal(await weight.inputValue(), '4', 'the other scope keeps its independent draft');
       console.log('Pending settings draft browser check passed: ' + scenario);
-    } finally { release(); await page.close(); }
+    } finally { release(); await page.unrouteAll({behavior:'wait'}); await page.close(); }
   }
 }
 
@@ -363,7 +364,7 @@ async function checkDraftRecovery(browser, url, errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   const secret='BROWSER-SECRET-MUST-NOT-PERSIST';
   try{
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('#goal-text').fill('Unsubmitted browser goal draft');
     await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
@@ -383,6 +384,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.waitForFunction(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('125'));
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('bug, urgent')||false),true);
     assert.equal(await page.evaluate(()=>sessionStorage.getItem('rsi-ui-drafts')?.includes('RAW-CHECKS-MUST-NOT-PERSIST')||false),false);
+    await page.locator('.sidebar [data-view=models]').click();
     const secretField=page.locator('[data-mc-tab="providers"]');
     await secretField.click();
     await page.locator('#mc-add-provider').click();
@@ -411,7 +413,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'');
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkInvalidConfigRepair(browser,url,errors) {
@@ -427,7 +429,7 @@ async function checkInvalidConfigRepair(browser,url,errors) {
     await reply(route,{saved:true,repaired:true,paused:true});
   });
   try{
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-config-error').filter({hasText:'项目配置异常'}).waitFor();
     const button=page.locator('#project-config-error').getByRole('button',{name:'重置损坏设置'});
     await button.waitFor();
@@ -448,7 +450,7 @@ async function checkInvalidConfigRepair(browser,url,errors) {
     assert.equal(repairs[0].project,await page.locator('#project-select').inputValue());
     assert.equal(repairs[0].confirmation,'reset-invalid-overrides-to-global-defaults');
     assert.equal(await page.locator('#pause-button').textContent(),'开始运行');
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkReadinessInstallAction(browser,url,errors) {
@@ -457,14 +459,14 @@ async function checkReadinessInstallAction(browser,url,errors) {
     code:'tools',ready:false,action:'install',reason:'tools_missing',missing:['fixture-tool'],detail:'Missing fixture-tool'
   }]}));
   try{
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     const action=page.locator('#readiness-items button').filter({hasText:'检查运行环境'});
     await action.waitFor();await action.click();
     await page.locator('#view-settings').waitFor({state:'visible'});
     assert.equal(await page.locator('#advanced-settings').evaluate(node=>node.open),true);
     assert.equal(await page.locator('#capabilities').evaluate(node=>node.closest('details').open),true);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkRunProgress(browser,url,errors) {
@@ -481,18 +483,18 @@ async function checkRunProgress(browser,url,errors) {
     await route.fulfill({response,body:JSON.stringify(data)});
   });
   try{
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject());await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#current-work-detail').filter({hasText:'正在评审改动'}).waitFor();
     const text=await page.locator('#current-work-detail').textContent();
     assert.match(text,/已运行/);assert.match(text,/最近进展/);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkObsoleteActions(browser,url,errors) {
   const page=await browser.newPage();page.on('pageerror',error=>errors.push(error.message));
   let paid=0;page.on('request',request=>{if(/\/api\/(?:model-center\/probe|pause|request)$/.test(new URL(request.url()).pathname)&&request.method()==='POST')paid++;});
   try {
-    await page.goto(url);
+    await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     await page.locator('[data-task-filter="history"]').click();
     const retryRow=page.locator('.task-row').filter({has:page.getByRole('button',{name:'过时任务重试入口',exact:true})});
@@ -513,7 +515,7 @@ async function checkObsoleteActions(browser,url,errors) {
     assert.equal(paid,0,'obsolete actions must not enable projects or start model tests');
     assert.deepEqual(errors,[]);
     console.log('Obsolete history retry and detail revision passed against real HTTP; project remains paused.');
-  } finally {await page.close();}
+  } finally {await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function main() {

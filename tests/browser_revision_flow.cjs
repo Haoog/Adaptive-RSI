@@ -120,7 +120,16 @@ async function checkRevisionFlow(browser, url, errors) {
       if (name === 'mobile') await checkBackoffRetry(page, url, errors);
       if (name === 'desktop') {
         await openDetail(page, '修订长文本任务', 'attention');
+        const supplement = page.locator('.task-supplement-editor');
+        assert.equal(await supplement.count(), 1, 'supplement has its own disclosure');
+        assert.equal(await supplement.evaluate(node => node.open), false, 'empty supplement starts collapsed');
+        assert.equal(await supplement.locator('textarea').first().isVisible(), false);
+        await page.locator('.task-supplement-editor > summary').click();
         await page.getByLabel('补充需求（保留在当前任务）', {exact: true}).fill('验证精确修订快照');
+        await closeDetail(page);
+        await openDetail(page, '修订长文本任务', 'attention');
+        assert.equal(await supplement.evaluate(node => node.open), true, 'unsaved supplement reopens automatically');
+        assert.equal(await page.getByLabel('补充需求（保留在当前任务）', {exact: true}).inputValue(), '验证精确修订快照');
         await page.getByLabel('干预原因（可选，保留原文）', {exact: true}).fill('补充边界条件');
         const saved = page.waitForResponse(response => new URL(response.url()).pathname === '/api/task/revise' && response.request().method() === 'POST');
         await page.getByRole('button', {name: '保存补充并重新评估', exact: true}).click();

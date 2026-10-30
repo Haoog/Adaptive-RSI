@@ -1,6 +1,21 @@
 'use strict';
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
+ "更多导航": "More navigation",
+ "目标已添加": "Goal added",
+ "未完成": "Open tasks",
+ "查看任务": "View task",
+ "任务要求": "Requirements",
+ "更多操作": "More actions",
+ "排队设置": "Queue settings",
+ "如何连接模型服务": "How to connect a model service",
+ "添加目标需要填写内容；也可以直接开始运行，让系统自主检查。": "Enter a goal to add a task, or start the project for autonomous inspection.",
+ "＋ 添加目标": "+ Add goal",
+ "运行概况": "Runtime overview",
+ "扫描时间": "Scan timing",
+ "验收检查": "Verification checks",
+ "高级选项": "Advanced options",
+ "调整检查频率、验收条件与交付方式。模型在「模型服务」中单独配置。": "Set inspection timing, verification checks and delivery. Configure models separately in Model services.",
  "能力": "Capability",
  "人工覆盖": "Manual override",
  "官方文档": "Official documentation",

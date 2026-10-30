@@ -386,6 +386,10 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    const waitReason = metadata.wait_reason || task.wait_reason ||
+      (["queued", "blocked", "deferred", "waiting_budget", "interrupted"].includes(metadata.state) && currentProject()?.paused ? "paused" : null);
+    if (waitReason) controls.append(el("p", t(waiting[waitReason] || waitReason), "task-wait-context"));
+    if (waitReason === "paused") controls.append(action(t("返回工作台"), () => {closeTaskDetail();showView("overview");}, "text-button"));
     if(['queued','blocked','deferred','waiting_budget','interrupted'].includes(metadata.state)){
       const causes=el('details'),content=el('div'),reload=el('button',t('刷新阻塞原因'),'text-button');reload.type='button';
       causes.append(el('summary',t('为什么还没开始')),content,reload);controls.append(causes);let loading=false;
@@ -465,14 +469,17 @@ window.RSIExperience = (() => {
       ].includes(metadata.state) &&
       !task.source.startsWith("system_")
     ) {
-      const form = el("form"),
+      const supplement = el("details", undefined, "task-supplement-editor"),
+        form = el("form"),
         label = el("label", t("补充需求（保留在当前任务）")),
         input = el("textarea");
+      supplement.append(el("summary", t("补充需求（保留在当前任务）")));
       input.rows = 3;
       input.maxLength = 10000;
       // 空白补充由下面的显式校验拦下；HTML required 会放过纯空白并产生未本地化的原生提示。
       input.setAttribute("aria-required", "true");
         input.value = draftStore.get('task-supplement', task.id) || '';
+        supplement.open = !!input.value;
         input.addEventListener('input', () => draftStore.set('task-supplement', task.id, input.value));
       label.append(input);
       const reasonLabel = el("label", t("干预原因（可选，保留原文）")), reason = el("textarea");
@@ -500,10 +507,12 @@ window.RSIExperience = (() => {
           }
         }, form);
       };
-      controls.append(form);
+      supplement.append(form);
+      controls.append(supplement);
     }
     if (["queued", "deferred", "blocked"].includes(metadata.state)) {
-      const form = el("form"),
+      const queue = el("details", undefined, "task-queue-editor"),
+        form = el("form"),
         label = el("label", t("前置任务（合并后再开始）")),
         select = el("select"),
         none = el("option", t("无前置任务"));
@@ -515,6 +524,8 @@ window.RSIExperience = (() => {
       if (!editor.baseline || (!queueSaves.has(editor.key) && editor.version === baselineVersion))
         editor.baseline = {dependencies: (metadata.dependencies || (metadata.dependency ? [metadata.dependency] : [])).map(parent => parent.dependency).sort(), urgency: !!metadata.urgency};
       queueDraft = readQueueDraft();
+      queue.open = !!queueDraft && Object.keys(queueDraft).length > 0;
+      queue.append(el("summary", t("排队设置")));
       const dependencies = editor.baseline.dependencies;
       const pager = el("div", undefined, "task-pagination"),
         pageNote = el("span");
@@ -612,7 +623,8 @@ window.RSIExperience = (() => {
           }
         }, form);
       };
-      controls.append(form);
+      queue.append(form);
+      controls.append(queue);
     }
     if (metadata.decision) {
       const rejected = metadata.state === "rejected";
@@ -756,7 +768,8 @@ window.RSIExperience = (() => {
       link.href = url;link.download = "adaptive-rsi-interventions.json";link.click();setTimeout(() => URL.revokeObjectURL(url), 1000);
     };
     controls.append(interventions);
-    body.append(controls);
+    const anchor = body.querySelector('.task-requirements')?.nextSibling || body.querySelector('.detail-section');
+    if (anchor) body.insertBefore(controls, anchor);else body.append(controls);
   }
   function readQueueDraft() {
     if (!queueEditor || !queueEditorCurrent(queueEditor)) return;
@@ -1393,7 +1406,7 @@ window.RSIExperience = (() => {
     if (!window.RSIDesktop && "serviceWorker" in navigator && isSecureContext)
       navigator.serviceWorker.register("/sw.js").catch(() => {});
   });
-  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时"); } };
+  return { queueCopy, queueDraft: readQueueDraft, taskOpened, taskClosed() { queueEditor = null; liveFailures = 0; liveNotice(); clearTimeout(liveTimer); }, enhanceOutcome, showDiff, refreshed, detailsSnapshot, translate() { if (usageButton) usageButton.textContent = t("流程质量与耗时");const inbox=$("attention-inbox");if(inbox)inbox.textContent=t("所有项目待办")+(inbox.textContent.match(/ · \d+$/)?.[0]||''); } };
 })();
 
 'use strict';

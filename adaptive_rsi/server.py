@@ -761,7 +761,7 @@ class Handler(BaseHTTPRequestHandler):
                     elif current and line.startswith("-") and not line.startswith("---"):
                         current["deletions"] += 1
                 self.respond([{**item, "path": item["path"] or "unknown"} for item in files])
-            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/native-update.js", "/batch.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/favicon.svg"]:
+            elif parsed.path in ["/", "/index.html", "/app.js", "/experience.js", "/native-update.js", "/batch.js", "/model-center.js", "/auth.js", "/desktop.js", "/usage.js", "/i18n.js", "/lang-bootstrap.js", "/style.css", "/model-center.css", "/workspace.css", "/favicon.svg"]:
                 name = "index.html" if parsed.path == "/" else parsed.path[1:]
                 path = Path(__file__).parent / "web" / name
                 payload = self.server.assets[name]

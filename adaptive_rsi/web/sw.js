@@ -1,7 +1,7 @@
 "use strict";
 // Executable assets and navigation always use the network so upgrades cannot mix builds.
 // Only public icons are cached; credential-bearing URLs never enter the cache.
-const SHELL_CACHE = "rsi-shell-icons-v2";
+const SHELL_CACHE = "rsi-shell-icons-v3";
 const SHELL_ASSETS = new Set(["/favicon.svg", "/icon-192.png", "/icon-512.png"]);
 
 self.addEventListener("install", () => self.skipWaiting());
