@@ -163,7 +163,7 @@ async function checkProviderSaveRace(browser, url, errors, reopen = false) {
     const newer = global.providers.filter(provider => provider.name === revised);
     assert.equal(newer.length, reopen ? 1 : 0);
     if (reopen) assert.notEqual(newer[0].id, created.id);
-  } finally { release(); await page.close(); }
+  } finally { release(); await page.unrouteAll({behavior:'wait'}); await page.close(); }
 }
 
 async function checkRouteSaveRace(browser,url,errors) {
@@ -192,7 +192,7 @@ async function checkRouteSaveRace(browser,url,errors) {
     await page.locator('#mc-dirty').filter({hasText:'模型分工已保存'}).waitFor();
     await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="roles"]').click();
     assert.equal(await effort.inputValue(),original);
-  }finally{release();await page.close();}
+  }finally{release();await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkUpdatePending(browser,url,errors) {
@@ -217,7 +217,7 @@ async function checkUpdatePending(browser,url,errors) {
     await page.locator('#language-select').selectOption('en');
     await page.locator('#update-status').filter({hasText:'Checking for updates'}).waitFor();
     assert.equal(await page.locator('#settings-save').isDisabled(),false);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkUpdateRateLimit(browser,url,errors) {
@@ -280,7 +280,7 @@ async function checkUpdateRateLimit(browser,url,errors) {
     assert.deepEqual(requests,['/api/updates/check']);
     assert.equal(await page.locator('#check-update').isDisabled(),true);
     assert.equal(await page.locator('#apply-update').isDisabled(),true);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkPendingSettingsDraft(browser, url, errors) {
@@ -356,7 +356,7 @@ async function checkPendingSettingsDraft(browser, url, errors) {
       assert.equal(await page.evaluate(id => window.RSIDraftStore.get('settings', id), key), null);
       await leave(); assert.equal(await weight.inputValue(), '4', 'the other scope keeps its independent draft');
       console.log('Pending settings draft browser check passed: ' + scenario);
-    } finally { release(); await page.close(); }
+    } finally { release(); await page.unrouteAll({behavior:'wait'}); await page.close(); }
   }
 }
 
@@ -413,7 +413,7 @@ async function checkDraftRecovery(browser, url, errors) {
     await page.reload();await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar nav [data-view="overview"]').click();
     await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();
     assert.equal(await page.locator('#goal-text').inputValue(),'');
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkInvalidConfigRepair(browser,url,errors) {
@@ -450,7 +450,7 @@ async function checkInvalidConfigRepair(browser,url,errors) {
     assert.equal(repairs[0].project,await page.locator('#project-select').inputValue());
     assert.equal(repairs[0].confirmation,'reset-invalid-overrides-to-global-defaults');
     assert.equal(await page.locator('#pause-button').textContent(),'开始运行');
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkReadinessInstallAction(browser,url,errors) {
@@ -466,7 +466,7 @@ async function checkReadinessInstallAction(browser,url,errors) {
     await page.locator('#view-settings').waitFor({state:'visible'});
     assert.equal(await page.locator('#advanced-settings').evaluate(node=>node.open),true);
     assert.equal(await page.locator('#capabilities').evaluate(node=>node.closest('details').open),true);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkRunProgress(browser,url,errors) {
@@ -487,7 +487,7 @@ async function checkRunProgress(browser,url,errors) {
     await page.locator('#current-work-detail').filter({hasText:'正在评审改动'}).waitFor();
     const text=await page.locator('#current-work-detail').textContent();
     assert.match(text,/已运行/);assert.match(text,/最近进展/);
-  }finally{await page.close();}
+  }finally{await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function checkObsoleteActions(browser,url,errors) {
@@ -515,7 +515,7 @@ async function checkObsoleteActions(browser,url,errors) {
     assert.equal(paid,0,'obsolete actions must not enable projects or start model tests');
     assert.deepEqual(errors,[]);
     console.log('Obsolete history retry and detail revision passed against real HTTP; project remains paused.');
-  } finally {await page.close();}
+  } finally {await page.unrouteAll({behavior:'wait'});await page.close();}
 }
 
 async function main() {
