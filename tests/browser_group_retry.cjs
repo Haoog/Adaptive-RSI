@@ -59,6 +59,10 @@ const {chromium} = require('playwright');
     assert.equal(detail.group_lineage.groups[0].evidence_scope, 'whole_group');
     await page.locator('#detail-dialog .close-dialog').click();
     await page.waitForFunction(() => !new URLSearchParams(location.hash.slice(1)).has('task'));
+    await page.route('**/batch.js', async route => {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await route.continue();
+    });
     await page.reload();
     await page.locator('#project-status').waitFor();
     assert.equal(await page.locator('#detail-dialog[open]').count(), 0, 'closed detail must stay closed after reload');

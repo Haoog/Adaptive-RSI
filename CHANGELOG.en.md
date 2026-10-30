@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- Restore batch actions and history when the batch module loads after the first render.
 - Store large tool output as run-owned artifacts with summaries, pagination and search; all five native protocols retain readable references.
 - Show model-specific capability sources, rule-review dates, inference and manual overrides; catalog, diagnostics and actual request budgets agree.
 - Re-query uncertain release/deployment results read-only and explicitly select a matching GitHub run, preserving identity checks and operation audit.
