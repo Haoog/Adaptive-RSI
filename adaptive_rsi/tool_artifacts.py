@@ -294,6 +294,9 @@ class ArtifactStore:
             raise ArtifactError("Artifact offset must be a non-negative integer")
         if type(limit) is not int or not 1 <= limit <= MAX_PAGE_BYTES:
             raise ArtifactError("Artifact page limit must be 1..%d bytes" % MAX_PAGE_BYTES)
+        # JSON can expand each control byte to six bytes. Keep read pages below
+        # the tool envelope even with escaped content, so reads stay inline.
+        limit = min(limit, (MAX_RESULT_BYTES - 4096) // 6)
         metadata = self._load_metadata(artifact)
         data = self._verified_bytes(metadata)
         size = len(data)

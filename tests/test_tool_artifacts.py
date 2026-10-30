@@ -24,6 +24,7 @@ from adaptive_rsi.tool_artifacts import (
     DEFAULT_PAGE_BYTES,
     INLINE_BODY_BYTES,
     MAX_PAGE_BYTES,
+    MAX_RESULT_BYTES,
     artifact_reference,
     compact_result,
 )
@@ -286,6 +287,25 @@ class CompactResultContractTest(unittest.TestCase):
 
 
 class NativeToolArtifactIntegrationTest(unittest.TestCase):
+    def test_execute_tools_reads_bounded_unicode_pages_inline_without_new_artifacts(self):
+        tools = self.tools()
+        text = "🙂汉字\n" * 10000 + "\x00" * 40000
+        store = tools.artifact_store()
+        artifact = store.put("stdout", text)["artifact"]
+        before = len(list(store.root.glob("art_*.json")))
+        pages, offset = [], 0
+        while True:
+            page = execute_tools(tools, [("page", "read_artifact", {
+                "artifact": artifact, "offset": offset, "limit": MAX_PAGE_BYTES})])[0][2]
+            self.assertIsInstance(page["content"], str)
+            self.assertLessEqual(len(json.dumps(page).encode()), MAX_RESULT_BYTES)
+            pages.append(page["content"])
+            if page["eof"]:
+                break
+            offset = page["next_offset"]
+        self.assertEqual("".join(pages), text)
+        self.assertEqual(len(list(store.root.glob("art_*.json"))), before)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

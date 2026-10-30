@@ -423,6 +423,27 @@ class _ManualReconciliationFixture(unittest.TestCase):
 class ManualReconciliationTest(_ManualReconciliationFixture):
     """Manual association may only bind an exact run returned by a read-only query."""
 
+    def test_rollback_rerun_resolution_resumes_parent_tracking(self):
+        self.operation(state="workflow_succeeded")
+        for status, conclusion in [("queued", None), ("in_progress", None), ("completed", "success"),
+                                   ("completed", "failure"), ("completed", "cancelled")]:
+            with self.subTest(status=status):
+                rollback = {**self.operation(kind="deploy"), "state": "rerun_unknown",
+                            "workflow_run_id": 17, "attempt": 1, "previous_attempt": 1,
+                            "rerun_pending": True, "rerun_requested_at": time.time() - 400}
+                self.operation(kind="deploy", state="rollback_failed", rollback=rollback, error="Previous attempt was unconfirmed")
+                self.assertFalse(release.pending(self.runtime, self.record))
+                with patch.object(release, "api", side_effect=self.api(single=self.remote(
+                        17, run_attempt=2, status=status, conclusion=conclusion))):
+                    release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17, target="rollback")
+                saved = self.saved("deploy")
+                resumed = conclusion not in {"failure", "cancelled"}
+                self.assertEqual(saved["state"], "rolling_back" if resumed else "rollback_failed")
+                self.assertEqual(release.pending(self.runtime, self.record), resumed)
+                if resumed:
+                    self.assertEqual(saved["error"], "")
+                self.assertEqual(self.posts, [])
+
     def test_multiple_exact_candidates_bind_only_the_explicit_selection(self):
         remotes = [self.remote(101), self.remote(102, status="in_progress")]
         for selected, expected in [(101, "queued"), (102, "running")]:

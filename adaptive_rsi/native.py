@@ -705,7 +705,7 @@ def execute_tools(tools, calls):
         trace({**identity, "state": "started"})
         try:
             value = worker.execute(name, args)
-            if artifact_store is not None:
+            if artifact_store is not None and name != "read_artifact":
                 try:
                     value = compact_result(artifact_store, name, value)
                 except ArtifactError as error:

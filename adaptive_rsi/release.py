@@ -606,6 +606,8 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
         if target == "rollback":
             data["rollback"] = reconciled
+            if reconciled.get("state") in {"queued", "running", "workflow_succeeded"}:
+                data.update(state="rolling_back", error="")
         try:
             save(runtime, run, kind, data, expected=original)
         except _AutomationChanged:
