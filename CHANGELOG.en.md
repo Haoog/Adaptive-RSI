@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.132
+
+<!-- adaptive-rsi-release:0.5.132;base:c5404903465c28e322b4adc065041afba82a17ef -->
+
 - Restore batch actions and history when the batch module loads after the first render.
 - Store large tool output as run-owned artifacts with summaries, pagination and search; all five native protocols retain readable references.
 - Show model-specific capability sources, rule-review dates, inference and manual overrides; catalog, diagnostics and actual request budgets agree.
