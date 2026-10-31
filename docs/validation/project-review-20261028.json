@@ -19,8 +19,8 @@
       "code_supported": 5
     },
     "status": {
-      "open": 33,
-      "fixed_in_working_tree": 6
+      "open": 9,
+      "fixed_in_working_tree": 30
     },
     "area": {
       "data": 5,
@@ -122,7 +122,7 @@
       "existing_id": 4,
       "area": "data",
       "source_key": "data-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-001",
       "assessment_en": "SQLite integrity and user_version checks accept an unknown migration ledger that Store refuses to open. Retention then deletes the older usable backup. Validate migration history and recovery compatibility before selecting a protected snapshot."
     },
@@ -143,7 +143,7 @@
       "existing_id": null,
       "area": "delivery",
       "source_key": "delivery-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-002",
       "assessment_en": "Feedback verifies later head H but release.advance dispatches merged SHA M based only on state=verified. The fixture demonstrates failing M, passing H, then dispatch of M. Bind authorization to successful evidence for the exact dispatched SHA."
     },
@@ -164,7 +164,7 @@
       "existing_id": null,
       "area": "delivery",
       "source_key": "delivery-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-003",
       "assessment_en": "Clean post-merge snapshots yield an empty working-tree diff. The evaluator freezes the old harness and reuses it as candidate_full, hiding a changed failing test. Compute the committed baseline-to-head diff and run the current real harness when it changed."
     },
@@ -185,7 +185,7 @@
       "existing_id": null,
       "area": "data",
       "source_key": "data-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-004",
       "assessment_en": "A merged run with result=[] passes backup checks but crashes restore with AttributeError. Validate historical result containers per record, preserve malformed source evidence, and continue restoring healthy data."
     },
@@ -206,7 +206,7 @@
       "existing_id": null,
       "area": "data",
       "source_key": "data-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-005",
       "assessment_en": "A write between summary and detail queries yields summary_calls=1 and daily_calls=2 in one response. Read the report through one SQLite snapshot, keeping the transaction as short as practical."
     },
@@ -227,7 +227,7 @@
       "existing_id": 104,
       "area": "data",
       "source_key": "data-4",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-006",
       "assessment_en": "Two unchanged backups are fully hashed on each forced overview refresh. Cache published digests by file identity, invalidate changed files, and distinguish cached metadata from an explicit integrity verification."
     },
@@ -248,7 +248,7 @@
       "existing_id": null,
       "area": "delivery",
       "source_key": "delivery-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-007",
       "assessment_en": "json_extract in a batch WHERE clause fails on one malformed superseded result before per-item error handling. Guard JSON extraction or move parsing inside each item boundary in both schedule and tick."
     },
@@ -269,7 +269,7 @@
       "existing_id": 201,
       "area": "delivery",
       "source_key": "delivery-4",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-008",
       "assessment_en": "When detection adds one command, candidate_full starts with every configured check again. Reuse completed checks only when exact source, dependencies, harness and execution identities match, and run the added commands separately."
     },
@@ -311,7 +311,7 @@
       "existing_id": null,
       "area": "desktop",
       "source_key": "desktop-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-010",
       "assessment_en": "AuthError inherits RuntimeError, so the earlier RuntimeError handler rethrows it and makes the intended invalid-credential fallback unreachable. Catch AuthError first and preserve the healthy backend status."
     },
@@ -353,7 +353,7 @@
       "existing_id": null,
       "area": "desktop",
       "source_key": "desktop-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-012",
       "assessment_en": "Catalog fetch records catalog_inflight but update readiness only checks model_center.busy. A blocked fake catalog request still allows readiness commit to installing. Register it atomically as cancellable active work and drain it during shutdown."
     },
@@ -395,7 +395,7 @@
       "existing_id": null,
       "area": "desktop",
       "source_key": "desktop-5",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-014",
       "assessment_en": "After stdin EOF requests shutdown, a 30-second timeout restores a child whose control pipe is already gone. engine_stopped remains false, so later exit has no bootstrap recovery. Track shutdown-requested ownership and recover when the old process actually exits. The long experiment was not run."
     },
@@ -416,7 +416,7 @@
       "existing_id": 1,
       "area": "frontend",
       "source_key": "frontend-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-015",
       "assessment_en": "A successful diagnostics request calls dialog, which exists only inside a different IIFE. The actual callback raises ReferenceError. Use a locally defined or explicitly exported modal helper and test visible results."
     },
@@ -437,7 +437,7 @@
       "existing_id": 1,
       "area": "frontend",
       "source_key": "frontend-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-016",
       "assessment_en": "Project settings store an ID in scope, but the callback compares it with the literal project, sending project:null. Send the actual scope and cover both global and project requests."
     },
@@ -458,7 +458,7 @@
       "existing_id": 37,
       "area": "frontend",
       "source_key": "frontend-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-017",
       "assessment_en": "Recommended groups generate a fresh request ID on every confirmation and bypass normal batch receipt recovery. A lost response followed by retry produces two IDs. Persist a stable ID and expose unknown-result reconciliation; duplicate grouping is not asserted."
     },
@@ -479,7 +479,7 @@
       "existing_id": 188,
       "area": "frontend",
       "source_key": "frontend-4",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-018",
       "assessment_en": "Auth rendering replaces the provider search/select without focus restoration. A Chromium fixture loses search focus during translation; polling uses the same render path. Preserve these controls or restore focus and selection."
     },
@@ -500,7 +500,7 @@
       "existing_id": null,
       "area": "frontend",
       "source_key": "frontend-5",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-019",
       "assessment_en": "Downloading an already available update is nested inside the six-hour check interval. Reloading with download policy and a recent check only calls status. Move download policy evaluation outside the check-due branch while retaining failure backoff."
     },
@@ -521,7 +521,7 @@
       "existing_id": 95,
       "area": "runtime",
       "source_key": "runtime-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-020",
       "assessment_en": "Experiment mode skips the parent database transition to evaluating. Runtime.is_cancelled therefore uses the preparation clock, and the shallow trial context does not propagate its timeout marker to the parent. Use an explicit per-trial phase clock and propagate structured deadline evidence."
     },
@@ -542,7 +542,7 @@
       "existing_id": 153,
       "area": "runtime",
       "source_key": "runtime-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-021",
       "assessment_en": "The development-case query ignores spec.active although validation and holdout selection honor it. A retired task still appears in the actual proposal prompt. Apply lifecycle filtering before the query limit and assert prompt exclusion."
     },
@@ -563,7 +563,7 @@
       "existing_id": 169,
       "area": "runtime",
       "source_key": "runtime-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-022",
       "assessment_en": "Every scheduler pass loads and parses all postprocess settings, including completed receipts, while holding dispatch_lock. Separate indexed pending work from historical receipts and keep critical sections short. No large-load timing is claimed."
     },
@@ -584,7 +584,7 @@
       "existing_id": 143,
       "area": "runtime",
       "source_key": "runtime-4",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-023",
       "assessment_en": "Freshness is known to be insufficient before paired trials start, but proposal and full trials still run before promotion is rejected. Check promotion-eligible fresh holdout availability before model work or explicitly mark an exploratory run."
     },
@@ -647,7 +647,7 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-026",
       "assessment_en": "test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full runner. A real isolated parent exits -15 while its detached worker survives. Share bounded signal cleanup and verify actual process termination."
     },
@@ -668,7 +668,7 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-027",
       "assessment_en": "test_worker.run considers an empty suite successful. The direct standard-unittest path is version-dependent: local Python 3.14 rejects empty suites, while the custom worker still returns 0. Require nonempty expansion for each selector and report loader errors."
     },
@@ -689,7 +689,7 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-3",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-028",
       "assessment_en": "Distinct selector strings can overlap: a class plus one of its methods executes three tests instead of two across groups. Expand IDs first and reject overlap or normalize it while preserving fixture boundaries."
     },
@@ -732,7 +732,7 @@
       "existing_id": 194,
       "area": "validation",
       "source_key": "validation-5",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-030",
       "assessment_en": "Timing mode creates one runner per selector, repeating setUpClass for methods from the same class. Preserve suite fixture semantics while collecting result timing or group selectors by fixture ownership."
     },
