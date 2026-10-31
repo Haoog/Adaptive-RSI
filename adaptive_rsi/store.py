@@ -163,7 +163,9 @@ class Store:
         with self.connect() as db:
             if db.execute("PRAGMA user_version").fetchone()[0] > 2:
                 raise RuntimeError("Database schema is newer than this runtime")
-            from .schema_migrations import apply, validate_history
+            from .schema_migrations import apply, heal, validate_history
+            # 先补账本再校验：已生效的迁移只回填账本行，不重放；无法确认时 heal 直接报错。
+            heal(db)
             sealed = validate_history(db)
             if not sealed:
                 self._bootstrap(db)
