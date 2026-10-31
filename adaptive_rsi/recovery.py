@@ -85,6 +85,29 @@ def cached(runtime, run, stage, signature, accept=None):
     return None
 
 
+def enforce_cached_review(runtime, run, stage, review, stage_signature, config):
+    """Re-check one reused review record without aborting the whole recovery.
+
+    Stored records are enforce_review output, so they also carry derived
+    fields (reported_decision, blocking_threshold) that validate_output
+    rejects; normalizing back to the review schema keeps that gate strict
+    for fresh model output. The decision is re-derived from findings and
+    assessments, so a corrupt or stale record only invalidates its own
+    stage and is reviewed again, matching parsed_result/delivery's
+    per-record isolation.
+    """
+    from .agent import SCHEMAS
+    from .review import enforce_review
+    fields = SCHEMAS["review"]["properties"]
+    try:
+        return enforce_review({key: value for key, value in review.items() if key in fields}, config)
+    except Exception as exc:
+        runtime.store.event("stage_invalidated", "Reused review record is no longer valid", run["project"], run["id"],
+                            {"stage": stage, "signature": stage_signature, "reason": "reused_record_invalid",
+                             "error": str(exc)[:200]})
+        return None
+
+
 def signature(run, task, base, strategies, configuration=None):
     from .build import BUILD_ID
     return fingerprint({"build": BUILD_ID,

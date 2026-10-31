@@ -719,6 +719,83 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(cached(runtime, {"id": "next-review-run", "task": task, "project": self.project},
                                 "review", "review-signature", accept=accept)["decision"], "pass")
 
+    def test_reused_dirty_review_record_only_invalidates_its_own_stage(self):
+        class RejectOnce(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "review" and not getattr(self, "reviewed", False):
+                    self.reviewed = True
+                    result["decision"] = "fail"
+                    result["reason"] = "Rejected to create a retryable failed run"
+                return result
+        self.runtime.agent = RejectOnce()
+        task, run = self.claim()
+        baseline = (str(self.repo), git(self.repo, "rev-parse", "HEAD"), "main")
+        with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
+             patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+            self.runtime.process(run)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "failed")
+            result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            self.assertEqual(result["review"]["decision"], "fail")
+            # 模拟历史脏记录：schema 内但缺必需字段，归一化后仍无法通过校验；
+            # accept 只看 decision，脏记录伪装成 pass 仍然会被复用路径拦下。
+            dirty = {key: value for key, value in result["review"].items() if key != "findings"}
+            dirty["decision"] = "pass"
+            self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='review'", (encode(dirty), run["id"]))
+            self.runtime.retry(task)
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+            # 单条脏记录只作废评审项；其余阶段照常复用，恢复不被中断。
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+            events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+            invalid = [json.loads(row["data"]) for row in events if row["kind"] == "stage_invalidated"]
+            self.assertEqual([row["stage"] for row in invalid if row["reason"] == "reused_record_invalid"], ["review"])
+            reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+            self.assertIn("planning", reused)
+            review = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])["review"]
+            self.assertEqual(review["decision"], "pass")
+            self.assertIn("findings", review)
+        # 脏记录被作废后重新评审；取消候选后重试，修正后的记录照常复用，不再重跑评审角色。
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
+        self.runtime.cancel_task(task)
+        self.runtime.retry(task)
+        third = self.store.claim(self.project, self.runtime.config(self.project))
+        with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
+             patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+            self.runtime.process(third)
+        third_events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (third["id"],))
+        third_reused = [json.loads(row["data"])["stage"] for row in third_events if row["kind"] == "stage_reused"]
+        self.assertIn("review", third_reused)
+        self.assertIn("validated_candidate", third_reused)
+        self.assertNotIn("reused_record_invalid", [json.loads(row["data"]).get("reason") for row in third_events])
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+
+    def test_healthy_reused_review_record_passes_isolated_revalidation(self):
+        from types import SimpleNamespace
+        from adaptive_rsi.recovery import enforce_cached_review
+        from adaptive_rsi.review import enforce_review
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}):
+            review = enforce_review(self.runtime.agent.invoke("review", "", None, None, None, DEFAULTS), DEFAULTS)
+        self.assertEqual(review["decision"], "pass")
+        events = []
+        runtime = SimpleNamespace(store=SimpleNamespace(
+            event=lambda *args, **kwargs: events.append(args), execute=lambda *args, **kwargs: None))
+        # 落库形态（含派生字段）先被归一化回 schema 字段，再重新校验，健康记录照常复用。
+        healthy = enforce_cached_review(runtime, {"id": "next", "project": "p"}, "review", review, "sig", DEFAULTS)
+        self.assertEqual(healthy["decision"] if healthy else None, "pass")
+        self.assertEqual(events, [])
+        # 记录自称通过但含阻断性发现时，重新推导出的结论优先，复用的旧记录不能放宽门禁。
+        stale = {**review, "findings": [{"severity": "critical", "area": "correctness", "path": "calculator.py",
+                                         "line": 2, "title": "Wrong addition", "reason": "add subtracts",
+                                         "suggestion": "Use addition"}]}
+        enforced = enforce_cached_review(runtime, {"id": "next", "project": "p"}, "review", stale, "sig", DEFAULTS)
+        self.assertEqual(enforced["decision"] if enforced else None, "fail")
+
     def test_documentation_plan_cannot_change_source_even_with_real_scope(self):
         class Drift(FakeAgent):
             def invoke(self, role, *args, **kwargs):
