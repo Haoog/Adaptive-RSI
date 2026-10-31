@@ -4,7 +4,7 @@
 
 This review starts from `e78aea5cc892010b86987bac8fc54254728370a4` (0.5.125). Changes remain in the `chore/audit-validation-feedback-20261028` working tree. No commit, push, merge, release or installed-application update was performed. Existing `docs/research/` files were preserved.
 
-The report contains 39 substantive findings: 3 P1, 30 P2 and 6 P3. 34 have deterministic probe or execution evidence; 5 are supported by call-chain inspection. 30 are fixed in the working tree and 9 remain open. Related legacy IDs identify overlapping areas or incomplete old acceptance, not a renewed certification.
+The report contains 39 substantive findings: 3 P1, 30 P2 and 6 P3. 34 have deterministic probe or execution evidence; 5 are supported by call-chain inspection. 29 are fixed in the working tree and 10 remain open. Related legacy IDs identify overlapping areas or incomplete old acceptance, not a renewed certification.
 
 The historical 201-item ledger records 114 implemented, 56 partial and 31 pending items, leaving 87 partial or pending. Those items are not added again or recertified here. See the [machine-readable report](project-review-20261028.json).
 
@@ -246,7 +246,7 @@ A shared file description let parent seeks rewind child output and overwrite res
 
 **Reproduction or validation:** tests.test_release_parallel.ParallelReleaseTest.test_log_reader_cannot_rewind_a_running_workers_output
 
-### R4-026 · P2 · Fixed · Selected-test SIGTERM leaves detached workers running
+### R4-026 · P2 · Open · Selected-test SIGTERM leaves detached workers running
 
 Location: [scripts/test_selected.py](../../scripts/test_selected.py), lines 31–35. Evidence: confirmed.
 

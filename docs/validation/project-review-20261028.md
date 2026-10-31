@@ -4,7 +4,7 @@
 
 本次审查基于 `e78aea5cc892010b86987bac8fc54254728370a4`（0.5.125），实现位于 `chore/audit-validation-feedback-20261028` 工作树。未提交、推送、合并、发布或更新本地应用；原有 `docs/research/` 保留。
 
-共 39 条实质发现：P1 3 条、P2 30 条、P3 6 条；34 条有确定性探针或实际执行证据，5 条为调用链证据。工作树已处理 30 条，另外 9 条仍待修复。相关历史编号只表示重叠领域或旧验收未覆盖，不表示该项已由历史测试证明。
+共 39 条实质发现：P1 3 条、P2 30 条、P3 6 条；34 条有确定性探针或实际执行证据，5 条为调用链证据。工作树已处理 29 条，另外 10 条仍待修复。相关历史编号只表示重叠领域或旧验收未覆盖，不表示该项已由历史测试证明。
 
 已有201项历史台账为114项已实现、56项部分完成、31项待做，尚余87项部分完成或待做；本次没有将它们重复加到新清单，也没有替旧记录重新认证。机器清单见 [JSON](project-review-20261028.json)。
 
@@ -346,7 +346,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** tests.test_release_parallel.ParallelReleaseTest.test_log_reader_cannot_rewind_a_running_workers_output
 
-### R4-026 · P2 · 已修 · 选测入口收到 SIGTERM 后遗留独立 worker
+### R4-026 · P2 · 待修 · 选测入口收到 SIGTERM 后遗留独立 worker
 
 位置：[scripts/test_selected.py](../../scripts/test_selected.py)，行 31–35。
 

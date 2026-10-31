@@ -19,8 +19,8 @@
       "code_supported": 5
     },
     "status": {
-      "open": 9,
-      "fixed_in_working_tree": 30
+      "open": 10,
+      "fixed_in_working_tree": 29
     },
     "area": {
       "data": 5,
@@ -647,7 +647,7 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-1",
-      "status": "fixed_in_working_tree",
+      "status": "open",
       "id": "R4-026",
       "assessment_en": "test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full runner. A real isolated parent exits -15 while its detached worker survives. Share bounded signal cleanup and verify actual process termination."
     },
