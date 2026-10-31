@@ -10,7 +10,7 @@ LOGGER = logging.getLogger(__name__)
 
 SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (5, "005_task_group_lineage.sql"), (6, "006_dependency_dag.sql"),
-           (7, "007_call_prices.sql"))
+           (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"))
 
 # 账本缺行时用于判断迁移是否真的执行过的可见痕迹：说明 + 只读检查。
 # 缺失的版本只能补账本、不能重放迁移，因此每一项都必须能由 schema 自身核对。
