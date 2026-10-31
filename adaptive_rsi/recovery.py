@@ -65,12 +65,23 @@ def save(runtime, run, stage, data, signature):
                           (run["id"], stage, signature, encode(data), time.time()))
 
 
-def cached(runtime, run, stage, signature, accept=None):
+def cached(runtime, run, stage, signature, accept=None, normalize=None):
     row = runtime.store.one("SELECT s.data,s.run FROM stages s JOIN runs r ON s.run=r.id "
                             "WHERE r.task=? AND s.stage=? AND s.signature=? AND r.id<>? "
                             "ORDER BY s.created DESC LIMIT 1", (run["task"], stage, signature, run["id"]))
     if row:
         data = json.loads(row["data"])
+        if normalize is not None:
+            try:
+                data = normalize(data)
+            except (RuntimeError, KeyError, TypeError, ValueError, AttributeError) as exc:
+                # Only this stored record is unusable; the caller redoes this stage
+                # while every other reused stage and the recovery itself continue.
+                runtime.store.event("stage_invalidated", "Cached stage result is unusable; verification will run again",
+                                    run["project"], run["id"],
+                                    {"stage": stage, "reason": "reused_record_invalid", "from_run": row["run"],
+                                     "error": str(exc)[:200]})
+                return None
         if accept is not None and not accept(data):
             runtime.store.event("stage_invalidated", "Cached stage result requires rework", run["project"], run["id"],
                                 {"stage": stage, "reason": "result_requires_rework", "from_run": row["run"]})
@@ -85,27 +96,20 @@ def cached(runtime, run, stage, signature, accept=None):
     return None
 
 
-def enforce_cached_review(runtime, run, stage, review, stage_signature, config):
-    """Re-check one reused review record without aborting the whole recovery.
+def enforce_cached_review(review, config):
+    """Rebuild one stored review record through the full review gate.
 
     Stored records are enforce_review output, so they also carry derived
     fields (reported_decision, blocking_threshold) that validate_output
-    rejects; normalizing back to the review schema keeps that gate strict
-    for fresh model output. The decision is re-derived from findings and
-    assessments, so a corrupt or stale record only invalidates its own
-    stage and is reviewed again, matching parsed_result/delivery's
-    per-record isolation.
+    rejects; keep the schema fields, then let enforce_review re-derive the
+    decision from findings and assessments. A stale record cannot reuse a
+    weaker verdict, and a record that cannot be trusted raises exactly as
+    a fresh output would; cached() turns that into per-stage isolation.
     """
     from .agent import SCHEMAS
     from .review import enforce_review
     fields = SCHEMAS["review"]["properties"]
-    try:
-        return enforce_review({key: value for key, value in review.items() if key in fields}, config)
-    except Exception as exc:
-        runtime.store.event("stage_invalidated", "Reused review record is no longer valid", run["project"], run["id"],
-                            {"stage": stage, "signature": stage_signature, "reason": "reused_record_invalid",
-                             "error": str(exc)[:200]})
-        return None
+    return enforce_review({key: value for key, value in review.items() if key in fields}, config)
 
 
 def signature(run, task, base, strategies, configuration=None):

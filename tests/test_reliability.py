@@ -751,9 +751,14 @@ class ReliabilityTest(unittest.TestCase):
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
             events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
             invalid = [json.loads(row["data"]) for row in events if row["kind"] == "stage_invalidated"]
-            self.assertEqual([row["stage"] for row in invalid if row["reason"] == "reused_record_invalid"], ["review"])
+            invalidated = [row for row in invalid if row["reason"] == "reused_record_invalid"]
+            self.assertEqual([row["stage"] for row in invalidated], ["review"])
+            self.assertTrue(invalidated[0]["from_run"])
+            self.assertIn("schema", invalidated[0]["error"])
             reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
             self.assertIn("planning", reused)
+            # 脏记录在复用事件之前就被拦下，不会让用量统计虚增复用阶段。
+            self.assertNotIn("review", reused)
             review = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])["review"]
             self.assertEqual(review["decision"], "pass")
             self.assertIn("findings", review)
@@ -775,26 +780,24 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
 
-    def test_healthy_reused_review_record_passes_isolated_revalidation(self):
-        from types import SimpleNamespace
+    def test_stored_review_records_are_renormalized_before_reuse(self):
         from adaptive_rsi.recovery import enforce_cached_review
         from adaptive_rsi.review import enforce_review
-        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}):
-            review = enforce_review(self.runtime.agent.invoke("review", "", None, None, None, DEFAULTS), DEFAULTS)
+        review = enforce_review(self.runtime.agent.invoke("review", "", None, None, None, DEFAULTS), DEFAULTS)
         self.assertEqual(review["decision"], "pass")
-        events = []
-        runtime = SimpleNamespace(store=SimpleNamespace(
-            event=lambda *args, **kwargs: events.append(args), execute=lambda *args, **kwargs: None))
         # 落库形态（含派生字段）先被归一化回 schema 字段，再重新校验，健康记录照常复用。
-        healthy = enforce_cached_review(runtime, {"id": "next", "project": "p"}, "review", review, "sig", DEFAULTS)
-        self.assertEqual(healthy["decision"] if healthy else None, "pass")
-        self.assertEqual(events, [])
-        # 记录自称通过但含阻断性发现时，重新推导出的结论优先，复用的旧记录不能放宽门禁。
+        healthy = enforce_cached_review(review, DEFAULTS)
+        self.assertEqual(healthy["decision"], "pass")
+        self.assertEqual(healthy["reported_decision"], "pass")
+        # 自称通过但含阻断性发现：重新推导的结论优先，旧记录不能放宽门禁。
         stale = {**review, "findings": [{"severity": "critical", "area": "correctness", "path": "calculator.py",
                                          "line": 2, "title": "Wrong addition", "reason": "add subtracts",
                                          "suggestion": "Use addition"}]}
-        enforced = enforce_cached_review(runtime, {"id": "next", "project": "p"}, "review", stale, "sig", DEFAULTS)
-        self.assertEqual(enforced["decision"] if enforced else None, "fail")
+        self.assertEqual(enforce_cached_review(stale, DEFAULTS)["decision"], "fail")
+        # 无法重建的脏记录继续抛错，由 cached() 捕获后只作废该项。
+        dirty = {key: value for key, value in review.items() if key != "findings"}
+        with self.assertRaises(RuntimeError):
+            enforce_cached_review(dirty, DEFAULTS)
 
     def test_documentation_plan_cannot_change_source_even_with_real_scope(self):
         class Drift(FakeAgent):

@@ -556,12 +556,12 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
     review_key = _review_key(run, task, base, strategies, config, plan, evaluation, result["summary"], patch)
-    saved_review = None if experiment else cached(runtime, run, "review", review_key, accept=_approved_review)
+    # 复用历史评审记录时逐项隔离：归一化后仍无法通过评审门禁的记录只作废该项，
+    # 随后重新评审；其余阶段照常复用，不再中断整个恢复。
+    saved_review = None if experiment else cached(
+        runtime, run, "review", review_key, accept=_approved_review,
+        normalize=lambda value: enforce_cached_review(value, config))
     review = saved_review
-    if review is not None:
-        # 恢复路径复用历史评审记录时逐项隔离：单条脏记录只作废该项并重新评审，
-        # 不再让 enforce_review 抛错中断整个恢复。
-        review = enforce_cached_review(runtime, run, "review", saved_review, review_key, config)
     if review is None:
         review_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
                           "summary": result["summary"]}
@@ -570,10 +570,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         review = enforce_review(runtime.invoke("review", REVIEW_PROMPT + encode(review_context), workspace, run), config)
     risk_review = None
     if risk_review_required(plan, review, files, patch):
-        risk_review = None if experiment else cached(runtime, run, "risk_review", review_key, accept=_approved_review)
-        if risk_review is not None:
-            # 复用的风险评估记录同样逐项隔离；fresh 输出仍走正常 enforce_review 门禁。
-            risk_review = enforce_cached_review(runtime, run, "risk_review", risk_review, review_key, config)
+        # 复用的高风险评审记录同样逐项隔离；fresh 输出仍走正常 enforce_review 门禁。
+        risk_review = None if experiment else cached(
+            runtime, run, "risk_review", review_key, accept=_approved_review,
+            normalize=lambda value: enforce_cached_review(value, config))
         if risk_review is None:
             risk_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation)}
             if acceptance:
