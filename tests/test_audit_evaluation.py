@@ -57,6 +57,60 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertFalse(result['checks']['candidate_full'][0]['passed'])
             self.assertEqual(result['decision'], 'fail')
 
+    def test_unavailable_diff_blocks_pass_and_freeze_reuse(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            check = {'name': 'criterion', 'argv': ['python3', 'app.py']}
+            calls = []
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                calls.append(Path(workspace).name)
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator._changed_files', return_value=False), patch(
+                    'adaptive_rsi.evaluator._committed_changes', return_value=False), patch(
+                    'adaptive_rsi.evaluator.detect', return_value={'checks': [check]}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state')).evaluate(
+                    source, source, [check], root / 'evaluation', merge(DEFAULTS, {}))
+            self.assertEqual(result['decision'], 'insufficient_evidence')
+            self.assertNotIn('checks', result)
+            self.assertEqual(calls, [])
+
+    def test_committed_history_unavailable_blocks_pass_between_snapshots(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.gitops import git, snapshot
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            git(source, 'init', '-q')
+            git(source, 'add', '.')
+            git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
+            candidate = snapshot(source, root / 'candidate')
+            check = {'name': 'criterion', 'argv': ['python3', 'app.py']}
+            calls = []
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                calls.append(Path(workspace).name)
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator._committed_changes', return_value=False), patch(
+                    'adaptive_rsi.evaluator.detect', return_value={'checks': [check]}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state2')).evaluate(
+                    source, candidate, [check], root / 'evaluation', merge(DEFAULTS, {}))
+            self.assertEqual(result['decision'], 'insufficient_evidence')
+            self.assertNotIn('checks', result)
+            self.assertEqual(calls, [])
+
     def test_detected_additions_run_once_with_unchanged_harness(self):
         from adaptive_rsi.config import DEFAULTS, merge
         from adaptive_rsi.store import Store

@@ -807,6 +807,35 @@ print('BOUNDARIES_OK')
         self.assertEqual(outcome["feedback"]["head"], head)
         self.assertEqual(outcome["feedback"]["state"], "verified")
 
+    def test_unreadable_git_history_blocks_postmerge_feedback_verification(self):
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        run["path"] = str(directory)
+        merged = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "calculator.py").write_text("def add(a, b):\n    return a + b - 1\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "later mainline")
+        head = git(self.repo, "rev-parse", "HEAD")
+        outcome = {"merged_sha": merged, "merged_at": time.time()}
+        check = {"name": CHECKS[0]["name"], "cwd": ".", "argv": CHECKS[0]["argv"]}
+        calls = []
+        def execute(_sandbox, check, workspace, *args, **kwargs):
+            calls.append(Path(workspace).name)
+            return {"name": check["name"], "argv": check["argv"], "exit_code": 0,
+                    "stdout": "Ran 1 test\n", "stderr": "", "error": None}
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), patch(
+                "adaptive_rsi.delivery.committed_changes", side_effect=RuntimeError("corrupt git history")), patch(
+                "adaptive_rsi.evaluator.detect", return_value={"checks": [check]}), patch(
+                "adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=execute):
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), time.time())
+        result = outcome["feedback"]
+        self.assertEqual(result["state"], "insufficient_evidence")
+        self.assertNotIn("evaluation", result)
+        self.assertEqual(calls, [])
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression(self):
         (self.repo / "calculator.py").write_text("def add(a,b):\n    return a+b\n")
