@@ -178,5 +178,114 @@ class RecordUsageTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 150)
 
 
+class MigrationLedgerHealTest(unittest.TestCase):
+    """账本缺行时只补账本，不重放迁移；无法确认时明确报错。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "state"
+
+    def seed(self):
+        store = Store(self.root)
+        store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        task = store.add_task("p", "goal", "ledger-heal", "fixture title")
+        store.execute("INSERT INTO task_revisions(task,previous_body,created) VALUES (?,?,?)", (task, "old", 1))
+        store.execute("INSERT INTO task_revision_snapshots VALUES (1,'after','impact')")
+        store.close()
+        return task
+
+    def versions(self):
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
+            return [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
+
+    def pending_apply(self, pending):
+        """Replace apply() with a recorder so a replay attempt is visible without running migrations."""
+        def record(db):
+            pending.append([version for version in range(1, 8)
+                            if not db.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone()])
+        return record
+
+    def test_every_migration_registers_ledger_evidence(self):
+        from adaptive_rsi.schema_migrations import EVIDENCE, scripts
+        self.assertEqual(set(EVIDENCE), {1, 2} | {version for version, _ in scripts()})
+
+    def test_gap_backfills_ledger_row_without_replaying_migration(self):
+        import hashlib
+        from adaptive_rsi.schema_migrations import scripts
+        task = self.seed()
+        store = Store(self.root)
+        store.execute("DELETE FROM schema_migrations WHERE version=4")
+        store.close()
+        self.assertEqual(self.versions(), [1, 2, 3, 5, 6, 7])
+        pending = []
+        with self.assertLogs("adaptive_rsi.schema_migrations", level="WARNING") as logged, \
+                patch("adaptive_rsi.schema_migrations.apply", side_effect=self.pending_apply(pending)):
+            reopened = Store(self.root)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(pending, [[]])  # apply 运行时已无待执行迁移
+        self.assertIn("version(s) 4", logged.output[0])
+        healed = reopened.one("SELECT checksum FROM schema_migrations WHERE version=4")
+        content = next(bytes_ for version, bytes_ in scripts() if version == 4)
+        self.assertEqual(healed["checksum"], hashlib.sha256(content).hexdigest())
+        self.assertEqual(reopened.one("SELECT title FROM tasks WHERE id=?", (task,))["title"], "fixture title")
+        self.assertEqual(reopened.one("SELECT after_body FROM task_revision_snapshots")["after_body"], "after")
+
+    def test_lost_trailing_rows_and_empty_ledger_are_backfilled_without_bootstrap(self):
+        task = self.seed()
+        store = Store(self.root)
+        store.execute("DELETE FROM schema_migrations WHERE version>=5")
+        store.close()
+        reopened = Store(self.root)
+        try:
+            self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(reopened.one("SELECT title FROM tasks WHERE id=?", (task,))["title"], "fixture title")
+        finally:
+            reopened.close()
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db, db:
+            db.execute("DELETE FROM schema_migrations")
+        with patch.object(Store, "_bootstrap", side_effect=AssertionError("bootstrap repeated")):
+            reopened = Store(self.root)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+
+    def test_gap_without_visible_effect_fails_instead_of_starting(self):
+        self.seed()
+        store = Store(self.root)
+        store.execute("DROP TABLE task_revision_snapshots")
+        store.execute("DELETE FROM schema_migrations WHERE version=4")
+        store.close()
+        with self.assertRaisesRegex(RuntimeError, "gap at version 4.*task_revision_snapshots.*version 7"):
+            Store(self.root)
+        self.assertEqual(self.versions(), [1, 2, 3, 5, 6, 7])  # 失败启动不留下半个补账
+
+    def test_unregistered_migration_version_is_left_to_apply(self):
+        from adaptive_rsi.schema_migrations import scripts
+        self.seed()
+        store = Store(self.root)
+        store.execute("DELETE FROM schema_migrations WHERE version=7")
+        store.close()
+        extra = scripts() + [(8, b"CREATE TABLE future_probe(id TEXT);\n")]
+        with patch("adaptive_rsi.schema_migrations.scripts", return_value=extra):
+            reopened = Store(self.root)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(reopened.one("SELECT count(*) AS n FROM sqlite_master WHERE name='future_probe'")["n"], 1)
+
+    def test_foreign_and_rewritten_history_still_fail(self):
+        self.seed()
+        for statement, message in [
+                ("UPDATE schema_migrations SET checksum='changed' WHERE version=5", "checksum mismatch"),
+                ("INSERT INTO schema_migrations VALUES (999,'future',0)", "newer than this runtime")]:
+            with self.subTest(message=message):
+                root = Path(self.temp.name) / ("corrupt-" + message.split()[0])
+                store = Store(root)
+                store.execute(statement)
+                store.close()
+                with self.assertRaisesRegex(RuntimeError, message):
+                    Store(root)
+
+
 if __name__ == "__main__":
     unittest.main()
