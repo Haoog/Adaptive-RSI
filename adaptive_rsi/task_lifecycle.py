@@ -9,6 +9,12 @@ from .store import decode_object
 CANCELLABLE = ("queued", "planning", "executing", "evaluating", "blocked", "waiting_budget",
                "deferred", "insufficient_evidence", "failed", "interrupted", "awaiting_approval")
 
+# 迁移 008 的表达式索引 events_intervention_task 依赖这里完全一致的
+# json_valid(data) 条件与 json_extract(data,'$.task') 表达式；改动两者会让查询退回按项目扫描。
+HISTORY_QUERY = ("SELECT seq,run,kind,created,data FROM events WHERE project=? AND seq<? "
+                 "AND kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') "
+                 "AND json_valid(data) AND json_extract(data,'$.task')=? ORDER BY seq DESC LIMIT 101")
+
 
 def intervention_reason(reason):
     if reason is not None and (not isinstance(reason, str) or len(reason) > 2000):
@@ -21,10 +27,7 @@ def intervention_history(store, task, project, before=2**63 - 1):
         raise ValueError("Invalid event pagination")
     if not store.one("SELECT 1 FROM tasks WHERE id=? AND project=?", (task, project)):
         raise ValueError("Task not found")
-    rows = store.query("SELECT seq,run,kind,created,data FROM events WHERE project=? AND seq<? "
-                       "AND kind IN ('manual_retry','requirements_revised','queue_settings','cancelled','delivery_approved') "
-                       "AND json_valid(data) AND json_extract(data,'$.task')=? ORDER BY seq DESC LIMIT 101",
-                       (project, before, task))
+    rows = store.query(HISTORY_QUERY, (project, before, task))
     for row in rows:
         row["data"] = decode_object(row["data"])
     return {"task": task, "project": project, "entries": rows[:100], "has_more": len(rows) > 100,

@@ -188,6 +188,75 @@ class TaskLifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'not found'):
             intervention_history(self.store, task, 'q')
 
+    def test_intervention_history_seeks_within_task_events_instead_of_project_events(self):
+        from adaptive_rsi.task_lifecycle import HISTORY_QUERY
+        task = self.task('indexed history')
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            rows = []
+            for index in range(40):
+                other = 'other-%d' % index
+                db.execute("INSERT INTO tasks(id,project,source,title,state,created,updated) "
+                           "VALUES (?,?,'goal',?,'queued',0,0)", (other, 'p', other))
+                rows.extend(('p', None, kind, 'noise', json.dumps({'task': other}), 0.0)
+                            for kind in ('call', 'stage', 'task_state', 'blocked'))
+                rows.append(('p', None, 'manual_retry', 'retry', json.dumps({'task': other}), 0.0))
+            rows.extend(('p', None, kind, 'intervention', json.dumps({'task': task}), 0.0)
+                        for kind in ('manual_retry', 'requirements_revised', 'cancelled'))
+            db.executemany("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)", rows)
+        plan = ' '.join(row['detail'] for row in self.store.query(
+            'EXPLAIN QUERY PLAN ' + HISTORY_QUERY, ('p', 2 ** 63 - 1, task)))
+        # 迁移 008 的索引把每次分页限制在该任务的事件范围内，不再随项目事件总量增长。
+        self.assertIn('events_intervention_task', plan)
+        self.assertNotIn('project_events', plan)
+        history = intervention_history(self.store, task, 'p')
+        self.assertEqual([row['kind'] for row in history['entries']],
+                         ['cancelled', 'requirements_revised', 'manual_retry'])
+
+    def test_intervention_history_results_do_not_depend_on_the_index(self):
+        task = self.task('index parity')
+        other = self.task('other task')
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.executemany("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           [('p', None, 'manual_retry', 'first', json.dumps({'task': task, 'reason': '1'}), 1.0),
+                            ('p', None, 'call', 'other kind', json.dumps({'task': task}), 2.0),
+                            ('p', None, 'cancelled', 'second', json.dumps({'task': task}), 3.0),
+                            ('p', None, 'delivery_approved', 'other task',
+                             json.dumps({'task': other}), 4.0),
+                            ('p', None, 'manual_retry', 'malformed', '{oops', 5.0),
+                            ('p', None, 'manual_retry', 'missing data', None, 6.0),
+                            ('p', None, 'manual_retry', 'no task key', json.dumps({'reason': 'x'}), 7.0),
+                            ('p', None, 'queue_settings', 'third', json.dumps({'task': task}), 8.0)])
+        indexed = intervention_history(self.store, task, 'p')
+        self.assertEqual([row['kind'] for row in indexed['entries']], ['queue_settings', 'cancelled', 'manual_retry'])
+        boundary = indexed['entries'][1]['seq']
+        indexed_page = intervention_history(self.store, task, 'p', boundary)
+        self.store.execute('DROP INDEX events_intervention_task')
+        self.assertEqual(intervention_history(self.store, task, 'p'), indexed)
+        self.assertEqual(intervention_history(self.store, task, 'p', boundary), indexed_page)
+        self.assertEqual(len(indexed_page['entries']), 1)
+
+    def test_index_migration_applies_to_existing_events(self):
+        self.store.event('manual_retry', 'legacy', 'p', data={'task': 'legacy'})
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('DROP INDEX events_intervention_task')
+            db.execute('DELETE FROM schema_migrations WHERE version>=8')
+        self.store.close()
+        reopened = Store(self.store.root)
+        try:
+            self.assertEqual([row['version'] for row in reopened.schema_migrations()],
+                             [1, 2, 3, 4, 5, 6, 7, 8])
+            index = reopened.one("SELECT sql FROM sqlite_master WHERE type='index' "
+                                 "AND name='events_intervention_task'")
+            self.assertIn("json_extract(data,'$.task')", index['sql'])
+            # 迁移只新增索引：历史事件仍可被索引查到。
+            self.assertEqual(reopened.one("SELECT count(*) AS n FROM events WHERE json_extract(data,'$.task')=?",
+                                          ('legacy',))['n'], 1)
+        finally:
+            reopened.close()
+
     def test_old_revisions_remain_accessible_after_more_than_one_hundred_edits(self):
         task = self.task('long history')
         for index in range(105):
