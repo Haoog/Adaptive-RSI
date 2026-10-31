@@ -14,7 +14,7 @@ A test in `tests/test_validation_planning.py` selects both a whole test class an
 
 The fix was merged in [PR #92](https://github.com/Haoog/Adaptive-RSI/pull/92), commit `fa09f3b`:
 
-- `scripts/test_selected.py` checks selector containment and duplicate concrete tests before dispatch and rejects empty selections.
+- `scripts/test_selected.py` checks selector containment and duplicate concrete tests before dispatch and rejects empty selections; exact duplicate selectors are idempotent and run once after deduplication.
 - `scripts/test_parallel.py` uses `RSI_TEST_RUNNING` to reject reentry into a module already executing in a worker, and dispatches at most four workers. Controlled paths that execute other modules for isolation fixtures remain, so the guard must not be described as prohibiting every nested process.
 - The `scripts.test_worker` execution path exits when its parent disappears. On cancellation, the runner terminates and reaps the process groups it owns.
 
