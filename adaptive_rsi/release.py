@@ -621,8 +621,28 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
                 "manual_reconciliation": audit}
 
 
+def _health_url_rejection(url):
+    """运行时 scheme 闸门：config 保存层已挡新写入，这里兜底拦截存量库里的 http 地址。"""
+    if not isinstance(url, str) or not url:
+        return "Deployment health URL is required"
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return ("Deployment health URL requires HTTPS without credentials, query or fragment; "
+                "replace it with an https:// URL in the project settings")
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or
+            parsed.password is not None or parsed.query or parsed.fragment or
+            any(c.isspace() or ord(c) < 32 for c in url)):
+        return ("Deployment health URL requires HTTPS without credentials, query or fragment; "
+                "replace it with an https:// URL in the project settings")
+    return None
+
+
 def health_check(url, sha, timeout=15):
     from .process import checked
+    rejection = _health_url_rejection(url)
+    if rejection:
+        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False, "error": rejection}
     argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
             else [sys.executable, "-m", "adaptive_rsi.health_transport"])
     try:
@@ -639,6 +659,11 @@ def health_check(url, sha, timeout=15):
 
 
 def direct_health_check(url, sha, timeout=15):
+    result = {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False}
+    rejection = _health_url_rejection(url)
+    if rejection:
+        result["error"] = rejection
+        return result
     class SameOrigin(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
             original, target = urlsplit(url), urlsplit(newurl)
@@ -646,7 +671,6 @@ def direct_health_check(url, sha, timeout=15):
                     target.username is not None or target.password is not None or target.query or target.fragment):
                 raise ValueError("Deployment health redirect changed the authorized origin")
             return super().redirect_request(request, fp, code, msg, headers, newurl)
-    result = {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False}
     deadline = time.monotonic() + timeout
     try:
         request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "Adaptive-RSI-health"})
@@ -789,6 +813,11 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             data["state"] = observed
             if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
+                urls = [policy["health_url"], *policy.get("health_urls", [])]
+                if any(_health_url_rejection(url) for url in urls if url):
+                    data["error"] = ("Deployment health gate failed; the health URL must be a valid https:// URL "
+                                     "without credentials, query or fragment. Update it in the project settings "
+                                     "and retry the deployment")
             persist(runtime, run, "deploy", data)
             if observed == "healthy":
                 runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
