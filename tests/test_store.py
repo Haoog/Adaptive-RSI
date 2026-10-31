@@ -199,10 +199,19 @@ class MigrationLedgerHealTest(unittest.TestCase):
         with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
             return [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")]
 
+    @staticmethod
+    def applied_versions():
+        """All versions this runtime knows, so assertions follow new migrations without edits."""
+        from adaptive_rsi.schema_migrations import scripts
+        return list(range(1, max(version for version, _ in scripts()) + 1))
+
     def pending_apply(self, pending):
         """Replace apply() with a recorder so a replay attempt is visible without running migrations."""
+        from adaptive_rsi.schema_migrations import scripts
+        top = max(version for version, _ in scripts())
+
         def record(db):
-            pending.append([version for version in range(1, 8)
+            pending.append([version for version in range(1, top + 1)
                             if not db.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone()])
         return record
 
@@ -217,13 +226,13 @@ class MigrationLedgerHealTest(unittest.TestCase):
         store = Store(self.root)
         store.execute("DELETE FROM schema_migrations WHERE version=4")
         store.close()
-        self.assertEqual(self.versions(), [1, 2, 3, 5, 6, 7])
+        self.assertEqual(self.versions(), self.applied_versions()[:3] + self.applied_versions()[4:])
         pending = []
         with self.assertLogs("adaptive_rsi.schema_migrations", level="WARNING") as logged, \
                 patch("adaptive_rsi.schema_migrations.apply", side_effect=self.pending_apply(pending)):
             reopened = Store(self.root)
         self.addCleanup(reopened.close)
-        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(self.versions(), self.applied_versions())
         self.assertEqual(pending, [[]])  # apply 运行时已无待执行迁移
         self.assertIn("version(s) 4", logged.output[0])
         healed = reopened.one("SELECT checksum FROM schema_migrations WHERE version=4")
@@ -239,7 +248,7 @@ class MigrationLedgerHealTest(unittest.TestCase):
         store.close()
         reopened = Store(self.root)
         try:
-            self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual(self.versions(), self.applied_versions())
             self.assertEqual(reopened.one("SELECT title FROM tasks WHERE id=?", (task,))["title"], "fixture title")
         finally:
             reopened.close()
@@ -248,7 +257,7 @@ class MigrationLedgerHealTest(unittest.TestCase):
         with patch.object(Store, "_bootstrap", side_effect=AssertionError("bootstrap repeated")):
             reopened = Store(self.root)
         self.addCleanup(reopened.close)
-        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(self.versions(), self.applied_versions())
 
     def test_gap_without_visible_effect_fails_instead_of_starting(self):
         self.seed()
@@ -256,9 +265,10 @@ class MigrationLedgerHealTest(unittest.TestCase):
         store.execute("DROP TABLE task_revision_snapshots")
         store.execute("DELETE FROM schema_migrations WHERE version=4")
         store.close()
-        with self.assertRaisesRegex(RuntimeError, "gap at version 4.*task_revision_snapshots.*version 7"):
+        with self.assertRaisesRegex(RuntimeError,
+                                    "gap at version 4.*task_revision_snapshots.*version %d" % self.applied_versions()[-1]):
             Store(self.root)
-        self.assertEqual(self.versions(), [1, 2, 3, 5, 6, 7])  # 失败启动不留下半个补账
+        self.assertEqual(self.versions(), self.applied_versions()[:3] + self.applied_versions()[4:])  # 失败启动不留下半个补账
 
     def test_unregistered_migration_version_is_left_to_apply(self):
         from adaptive_rsi.schema_migrations import scripts
@@ -266,11 +276,12 @@ class MigrationLedgerHealTest(unittest.TestCase):
         store = Store(self.root)
         store.execute("DELETE FROM schema_migrations WHERE version=7")
         store.close()
-        extra = scripts() + [(8, b"CREATE TABLE future_probe(id TEXT);\n")]
+        future = max(version for version, _ in scripts()) + 1
+        extra = scripts() + [(future, b"CREATE TABLE future_probe(id TEXT);\n")]
         with patch("adaptive_rsi.schema_migrations.scripts", return_value=extra):
             reopened = Store(self.root)
         self.addCleanup(reopened.close)
-        self.assertEqual(self.versions(), [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual(self.versions(), list(range(1, future + 1)))
         self.assertEqual(reopened.one("SELECT count(*) AS n FROM sqlite_master WHERE name='future_probe'")["n"], 1)
 
     def test_foreign_and_rewritten_history_still_fail(self):

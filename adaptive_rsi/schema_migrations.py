@@ -31,6 +31,8 @@ EVIDENCE = {
     7: ("calls price columns input_price, output_price, cache_read_price, cache_write_price, price_basis",
         lambda db, tables, indexes: {"input_price", "output_price", "cache_read_price", "cache_write_price",
                                      "price_basis"} <= set(_columns(db, "calls"))),
+    8: ("index events_intervention_task on events(project, task, seq)",
+        lambda db, tables, indexes: "events_intervention_task" in indexes),
 }
 
 
