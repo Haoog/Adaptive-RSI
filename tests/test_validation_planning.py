@@ -326,9 +326,13 @@ class ValidationPlanningTest(unittest.TestCase):
         self.assertEqual(test_selected.expand([selector, selector,
                                                __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker']),
                          [selector, __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker'])
-        with self.assertRaises(test_selected.SelectionError):
-            test_selected.expand([whole, selector])
         with patch.object(test_parallel.subprocess, 'Popen', side_effect=AssertionError('Rejected selections must never spawn')) as spawn:
+            with self.assertRaises(test_selected.SelectionError):
+                test_selected.expand([whole, selector])
+            with patch('sys.argv', ['selected', whole, selector]), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    test_selected.main()
+                self.assertNotEqual(result.exception.code, 0)
             with patch('sys.argv', ['selected', __name__ + '.EmptySelection']), redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as result:
                     test_selected.main()
