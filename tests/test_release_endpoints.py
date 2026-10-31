@@ -419,6 +419,11 @@ class _ManualReconciliationFixture(unittest.TestCase):
     def saved(self, kind="release"):
         return self.runtime.store.setting(release.key(self.record["id"], kind))
 
+    def stored_size(self, kind="release"):
+        row = self.runtime.store.one("SELECT value FROM settings WHERE key=?",
+                                     (release.key(self.record["id"], kind),))
+        return len(row["value"])
+
 
 class ManualReconciliationTest(_ManualReconciliationFixture):
     """Manual association may only bind an exact run returned by a read-only query."""
@@ -457,7 +462,8 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
                 self.assertEqual(result["state"], expected)
                 saved = self.saved()
                 self.assertEqual(saved["workflow_run_id"], selected)
-                self.assertEqual(saved["manual_reconciliation"]["raw_candidates"], remotes)
+                self.assertEqual([item["id"] for item in saved["manual_reconciliation"]["candidates"]], [101, 102])
+                self.assertEqual(saved["manual_reconciliation"]["previous"]["candidate_run_ids"], [101, 102])
                 self.assertEqual(self.posts, [])
 
     def test_candidates_list_fixed_links_and_explain_absence_without_free_text(self):
@@ -576,6 +582,86 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
             with self.assertRaisesRegex(release.ReconciliationRejected, "newer deployment owns this target"):
                 release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17)
         self.assertEqual(self.saved("deploy")["state"], "dispatch_unknown")
+        self.assertEqual(self.posts, [])
+
+
+class ReconciliationAuditPayloadTest(_ManualReconciliationFixture):
+    """Reconciliation keeps bounded evidence instead of the raw GitHub page."""
+
+    FIELDS = {"id", "url", "status", "conclusion", "attempt", "created_at", "updated_at",
+              "head_sha", "head_branch", "display_title", "workflow", "path", "event"}
+    BUDGET = 64 * 1024
+
+    def page(self, count=99):
+        # A real page carries actor, repository and commit objects. Nothing in
+        # them is needed to re-check one selection, so they must not persist.
+        # Pages stay below 100 runs because the stub repeats one page for every
+        # page number, which would otherwise extend the read-only query tenfold.
+        padding = "x" * 4096
+        return [self.remote(1000 + index,
+                            actor={"login": "operator", "avatar_url": "https://avatars.example/" + padding},
+                            repository={"full_name": "example/project", "description": padding},
+                            head_commit={"id": "c" * 40, "message": padding})
+                for index in range(count)]
+
+    def test_large_page_stores_bounded_evidence_and_keeps_the_audit(self):
+        remotes = self.page(99)
+        self.assertGreater(len(encode(remotes)), 1_000_000)
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=remotes)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 1042)
+        self.assertEqual(view["state"], "dispatch_unknown")
+        self.assertEqual(view["candidate_count"], 99)
+        self.assertEqual(len(view["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertEqual(result["state"], "queued")
+        saved = self.saved()
+        self.assertEqual(saved["state"], "queued")
+        audit = saved["manual_reconciliation"]
+        self.assertEqual(set(audit), set(release.RECONCILIATION_AUDIT_FIELDS))
+        self.assertEqual(audit["candidate_count"], 99)
+        self.assertEqual(audit["selected_run_id"], 1042)
+        self.assertEqual([item["id"] for item in audit["candidates"]],
+                         [1000 + index for index in range(release.RECONCILIATION_CANDIDATE_LIMIT)])
+        first = audit["candidates"][0]
+        self.assertEqual(set(first), self.FIELDS)
+        self.assertEqual((first["id"], first["status"]), (1000, "queued"))
+        self.assertEqual((first["created_at"], first["updated_at"]),
+                         ("2026-10-30T00:00:00Z", "2026-10-30T00:00:00Z"))
+        self.assertEqual(first["url"], "https://github.com/example/project/actions/runs/1000")
+        self.assertEqual(first["head_sha"], self.TRUSTED)
+        self.assertEqual(saved["reconciliation"]["candidate_count"], 1)
+        self.assertLess(self.stored_size(), self.BUDGET)
+        self.assertEqual(self.posts, [])
+
+    def test_stored_size_does_not_follow_the_remote_page_size(self):
+        sizes = []
+        for count in (20, 99):
+            self.operation()
+            with patch.object(release, "api", side_effect=self.api(runs=self.page(count))):
+                release.candidates(self.runtime, self.project, self.record["id"], "release")
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 1001)
+            sizes.append(self.stored_size())
+            self.assertLess(sizes[-1], self.BUDGET)
+        self.assertLessEqual(abs(sizes[1] - sizes[0]), 32)
+        self.assertEqual(self.posts, [])
+
+    def test_history_drops_legacy_raw_payloads_and_stays_capped(self):
+        legacy = {"at": 1.0, "source": "console", "selected_run_id": 7,
+                  "candidates": [{"id": 7, "status": "queued"}],
+                  "raw_candidates": self.page(3),
+                  "previous": {"state": "dispatch_unknown"}}
+        self.operation(manual_reconciliations=[dict(legacy) for _ in range(12)])
+        self.assertGreater(self.stored_size(), 4 * self.BUDGET)
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+            release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        history = self.saved()["manual_reconciliations"]
+        self.assertEqual(len(history), release.RECONCILIATION_AUDIT_LIMIT)
+        self.assertEqual([entry["selected_run_id"] for entry in history][-1], 17)
+        for entry in history:
+            self.assertLessEqual(set(entry), set(release.RECONCILIATION_AUDIT_FIELDS))
+            self.assertLessEqual(len(entry["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertLess(self.stored_size(), self.BUDGET)
         self.assertEqual(self.posts, [])
 
 
