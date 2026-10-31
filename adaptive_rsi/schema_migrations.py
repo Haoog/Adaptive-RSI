@@ -7,7 +7,7 @@ import time
 
 SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (5, "005_task_group_lineage.sql"), (6, "006_dependency_dag.sql"),
-           (7, "007_call_prices.sql"))
+           (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"))
 
 
 def scripts():
