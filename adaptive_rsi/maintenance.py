@@ -181,7 +181,17 @@ def _recover_cleanup_locked(store):
             target = recycle / ('receipt.invalid-' + name)
             if target.is_symlink():
                 raise ValueError('Unsafe cleanup receipt quarantine path')
-            if journal.exists() or journal.is_symlink():
+            if target.exists() and journal.exists():
+                # Quarantining again would overwrite the tombstone and destroy
+                # its preserved original bytes; keep both copies instead.
+                stored = target / 'receipt.json'
+                suffix = 1
+                while (target / ('receipt.' + str(suffix) + '.json')).exists() or \
+                        (target / ('receipt.' + str(suffix) + '.json')).is_symlink():
+                    suffix += 1
+                os.replace(journal, target / ('receipt.' + str(suffix) + '.json'))
+                _sync_directory(target)
+            elif journal.exists() or journal.is_symlink():
                 target.mkdir(mode=0o700, exist_ok=True)
                 os.replace(journal, target / 'receipt.json')
                 try:

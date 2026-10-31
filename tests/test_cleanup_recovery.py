@@ -310,6 +310,26 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         maintenance.recover_cleanup(self.store)
         self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
 
+    def test_second_quarantine_of_same_receipt_keeps_both_original_journals(self):
+        identifier = '9' * 32
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('recycle:' + identifier,
+                            '{"id":"' + identifier + '","run":"r","objects":[]}'))
+        corrupt = self.store.root / 'recycle' / identifier
+        corrupt.mkdir(parents=True)
+        (corrupt / 'receipt.json').write_text('{"id":"' + identifier + '","run":"../escape","objects":[]}',
+                                              encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        tombstone = self.store.root / 'recycle' / ('receipt.invalid-' + identifier)
+        first = (tombstone / 'receipt.json').read_text(encoding='utf-8')
+        corrupt.mkdir(parents=True, exist_ok=True)
+        (corrupt / 'receipt.json').write_text('{"id":"' + identifier + '","run":"other","objects":[]}',
+                                              encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((tombstone / 'receipt.json').read_text(encoding='utf-8'), first)
+        self.assertEqual((tombstone / 'receipt.1.json').read_text(encoding='utf-8'),
+                         '{"id":"' + identifier + '","run":"other","objects":[]}')
+
     def test_quarantine_evidence_is_replayed_after_lost_commit(self):
         corrupt = self.store.root / 'recycle' / ('0' * 32)
         corrupt.mkdir(parents=True)
