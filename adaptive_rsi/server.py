@@ -834,23 +834,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(readiness(runtime, body.get("action", "status"), body.get("version"), body.get("lease")))
                 return
             if path.startswith("/api/auth/"):
+                # AuthSessions 自带会话锁与凭据锁，且 GET 路径本就在 dispatch_lock 外
+                # 调用同一批方法；这里只把更新就绪门禁留在锁内，避免认证端点在
+                # 等待 worker 启动（最长 25s）或凭据写入时阻塞任务领取与全部写端点。
                 with runtime.dispatch_lock:
                     if path != "/api/auth/cancel":
                         runtime.updates.require_ready()
-                    auth = runtime.auth_sessions
-                    if path == "/api/auth/start":
-                        result = auth.start(body.get("backend"), body.get("provider"), body.get("method", 0), body.get("inputs"))
-                    elif path == "/api/auth/complete":
-                        result = auth.complete(body.get("id"), body.get("code", ""))
-                    elif path == "/api/auth/cancel":
-                        result = auth.cancel(body.get("id"))
-                    elif path == "/api/auth/logout":
-                        result = auth.logout(body.get("backend"), body.get("provider"))
-                    elif path == "/api/auth/key":
-                        result = auth.set_api_key(body.get("backend"), body.get("provider"), body.get("key"))
-                    else:
-                        self.respond({"error": "Not found"}, 404)
-                        return
+                auth = runtime.auth_sessions
+                if path == "/api/auth/start":
+                    result = auth.start(body.get("backend"), body.get("provider"), body.get("method", 0), body.get("inputs"))
+                elif path == "/api/auth/complete":
+                    result = auth.complete(body.get("id"), body.get("code", ""))
+                elif path == "/api/auth/cancel":
+                    result = auth.cancel(body.get("id"))
+                elif path == "/api/auth/logout":
+                    result = auth.logout(body.get("backend"), body.get("provider"))
+                elif path == "/api/auth/key":
+                    result = auth.set_api_key(body.get("backend"), body.get("provider"), body.get("key"))
+                else:
+                    self.respond({"error": "Not found"}, 404)
+                    return
                 self.respond(result)
                 return
             if path.startswith("/api/model-center/"):

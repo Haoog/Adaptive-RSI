@@ -221,6 +221,90 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
         self.assertEqual(json.load(denied.exception)["error_code"], "update_in_progress")
         self.auth.start.assert_not_called()
 
+    def test_auth_writes_do_not_hold_dispatch_lock_while_running(self):
+        # BUG-02 回归：认证调用可能同步等待 worker 启动或凭据写入，端点不得在
+        # 此期间持有 dispatch_lock，否则任务领取与全部写端点一起排队。
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def slow_set_api_key(backend, provider, key):
+            entered.set()
+            release.wait(timeout=5)
+            return {"saved": True}
+
+        self.auth.set_api_key.side_effect = slow_set_api_key
+
+        def post():
+            try:
+                with self.request("/api/auth/key", {"backend": "opencode", "provider": "example", "key": "private-key"}):
+                    pass
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                release.set()
+
+        thread = threading.Thread(target=post, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            time.sleep(0.05)
+            self.assertTrue(self.runtime.dispatch_lock.acquire(timeout=2),
+                            "auth write endpoint held dispatch_lock while the auth call was running")
+            self.runtime.dispatch_lock.release()
+        finally:
+            release.set()
+            thread.join(timeout=5)
+        self.assertEqual(errors, [])
+
+    def test_slow_auth_write_does_not_block_task_claim(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_set_api_key(backend, provider, key):
+            entered.set()
+            release.wait(timeout=5)
+            return {"saved": True}
+
+        self.auth.set_api_key.side_effect = slow_set_api_key
+        self.runtime.pause(self.project, False)
+        self.runtime.store.add_task(self.project, "goal", "claim", "Claim while auth write is busy")
+
+        def post():
+            try:
+                with self.request("/api/auth/key", {"backend": "opencode", "provider": "example", "key": "private-key"}):
+                    pass
+            finally:
+                release.set()
+
+        thread = threading.Thread(target=post, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            deadline = time.monotonic() + 2
+            run = None
+            while time.monotonic() < deadline:
+                if self.runtime.dispatch_lock.acquire(timeout=0.2):
+                    try:
+                        run = self.runtime.store.claim(self.project, self.runtime.config(self.project))
+                    finally:
+                        self.runtime.dispatch_lock.release()
+                    if run:
+                        break
+                time.sleep(0.02)
+            self.assertTrue(run, "task claim stayed blocked by dispatch_lock while an auth write was running")
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+    def test_auth_key_write_still_rejected_during_update_window(self):
+        self.runtime.updates.installing = True
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("/api/auth/key", {"backend": "opencode", "provider": "example", "key": "private-key"})
+        self.assertEqual(denied.exception.code, 503)
+        self.assertEqual(json.load(denied.exception)["error_code"], "update_in_progress")
+        self.auth.set_api_key.assert_not_called()
+
     def test_release_status_cannot_read_another_project_run(self):
         other = self.runtime.add_project(fixture(self.root / "other"))
         task = self.runtime.store.add_task(other, "goal", "other", "Private project change")
