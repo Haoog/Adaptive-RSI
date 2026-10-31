@@ -79,7 +79,7 @@ class AuditEvaluationTest(unittest.TestCase):
                 result = evaluator.Evaluator(Store(root / 'state')).evaluate(
                     source, source, [check], root / 'evaluation', merge(DEFAULTS, {}))
             self.assertEqual(result['decision'], 'insufficient_evidence')
-            self.assertNotIn('checks', result)
+            self.assertEqual(result['checks'], {})
             self.assertEqual(calls, [])
 
     def test_committed_history_unavailable_blocks_pass_between_snapshots(self):
@@ -108,8 +108,45 @@ class AuditEvaluationTest(unittest.TestCase):
                 result = evaluator.Evaluator(Store(root / 'state2')).evaluate(
                     source, candidate, [check], root / 'evaluation', merge(DEFAULTS, {}))
             self.assertEqual(result['decision'], 'insufficient_evidence')
-            self.assertNotIn('checks', result)
+            self.assertEqual(result['checks'], {})
             self.assertEqual(calls, [])
+
+    def test_committed_test_edit_blocks_freeze_reuse_between_snapshots(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.gitops import git, snapshot
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            git(source, 'init', '-q')
+            (source / 'app.py').write_text('VALUE = 1\n')
+            (source / 'test_value.py').write_text('assert True\n')
+            git(source, 'add', '.')
+            git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
+            base_sha = git(source, 'rev-parse', 'HEAD')
+            baseline = snapshot(source, root / 'baseline', base_sha)
+            (source / 'test_value.py').write_text('assert False\n')
+            git(source, 'add', '.')
+            git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'break')
+            head_sha = git(source, 'rev-parse', 'HEAD')
+            candidate = snapshot(source, root / 'candidate', head_sha)
+            self.assertEqual(evaluator._changed_files(candidate), [])
+            check = {'name': 'criterion', 'argv': ['python3', 'app.py']}
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                broken = 'False' in (Path(workspace) / 'test_value.py').read_text()
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None} if not broken else {
+                        'name': check['name'], 'argv': check['argv'], 'exit_code': 1,
+                        'stdout': '', 'stderr': 'AssertionError', 'error': None}
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': [check]}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state3')).evaluate(
+                    baseline, candidate, [check], root / 'evaluation', merge(DEFAULTS, {}))
+            self.assertFalse(result['candidate_full_reused'])
+            self.assertFalse(result['checks']['candidate_full'][0]['passed'])
+            self.assertEqual(result['decision'], 'fail')
 
     def test_detected_additions_run_once_with_unchanged_harness(self):
         from adaptive_rsi.config import DEFAULTS, merge
