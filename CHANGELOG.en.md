@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Fixed test_selected rejecting exact duplicate selectors: duplicates are now idempotent and run once after deduplication, while class-versus-method containment overlaps and empty selections remain rejected.
+
+## 0.5.134
+
+<!-- adaptive-rsi-release:0.5.134;base:b39240359864cb2313d55e8c104c359fde9879d6 -->
+
+- Release verified mainline improvements from commit `b39240359864cb2313d55e8c104c359fde9879d6`.
+
 ## 0.5.133
 
 <!-- adaptive-rsi-release:0.5.133;base:01a17ad88d5243e24d15fe6e3d82a168a17e1e3b -->

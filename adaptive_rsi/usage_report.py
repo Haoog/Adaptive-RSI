@@ -6,6 +6,8 @@ import statistics
 import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .store import Store
+
 
 DAILY_MAX_DAYS = 93
 RUN_LIMIT = 50
@@ -68,21 +70,27 @@ def _interval(values):
     return {"p25": q25, "median": median, "p75": q75, "samples": len(values)}
 
 
-def one_snapshot(function):
+def one_snapshot(*, store_arg=0):
     """Serve every read in a report from the same SQLite snapshot.
 
     Summary, trends, groups and call details are derived from one transaction so a
     concurrent write can never make the response contradict its own totals. Nested
     snapshots reuse the outer transaction.
     """
-    @functools.wraps(function)
-    def wrapped(store, params):
-        with store.snapshot():
-            return function(store, params)
-    return wrapped
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            # store 可按位置或关键字传入；位置参数缺失时回退 kwargs，保持各函数原有调用约定。
+            store = kwargs.get("store") if len(args) <= store_arg else args[store_arg]
+            if not isinstance(store, Store):
+                raise TypeError("one_snapshot requires the decorated function to take a Store")
+            with store.snapshot():
+                return function(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
-@one_snapshot
+@one_snapshot()
 def report(store, params):
     def value(key, default=None):
         return params.get(key, [default])[0]

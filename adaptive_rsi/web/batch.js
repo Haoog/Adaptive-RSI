@@ -103,8 +103,12 @@ window.RSIBatch=(()=>{
   pending.add(project);toolbar();
   try{
   const signature=JSON.stringify([kind,tasks]),saved=window.RSIDraftStore?.get('batch',project);
-  let prior=null;
-  if(saved?.signature===signature)prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;
+  let prior=null,unverified=false;
+  // 回执核对只用于恢复上一次已确认的请求；瞬时失败时保留原请求编号继续，由服务端按回执幂等复核。
+  if(saved?.signature===signature){
+   try{prior=(await api('tasks/batch?project='+encodeURIComponent(project)+'&id='+encodeURIComponent(saved.id))).receipt;}
+   catch{unverified=true;}
+  }
   if(prior?.complete){window.RSIDraftStore?.remove('batch',project);selected.get(project)?.clear();toolbar();toast(t('批量操作已完成'));await refresh({force:true});return;}
   const preview=prior||await api('tasks/batch',{project,tasks,action:kind,preview:true});
   const description=preview.tasks.map(item=>{
@@ -116,10 +120,13 @@ window.RSIBatch=(()=>{
   const conflict=preview.conflicts.length?t('存在重叠文件，请复核。')+'\n':'';
   const unknown=preview.unknown_scope.length?t('部分任务的文件范围未知，请先核对需求。')+'\n':'';
   const grouping=kind==='group'?t('原任务将合并为一个新任务并保留原始要求。')+'\n':kind==='split_retry'?t('原任务将恢复到队列，各自重新验证；任务组的失败证据继续保留。')+'\n'+preview.originals.map(item=>item.title).join('\n')+'\n'+(preview.supplement_required?t('分组后修订的完整要求将另建任务重新验证，避免丢失或猜测归属。')+'\n':''):'';
-  if(!(await uiConfirm(t('确认对所选任务执行此操作？')+'\n'+grouping+(preview.verification_cost?costText(preview.verification_cost)+'\n':'')+conflict+unknown+description)))return;
+  const receiptNote=unverified?t('上次的批次回执暂时无法核对；继续会沿用原请求编号，服务端按回执返回结果，不会重复执行。')+'\n':'';
+  if(!(await uiConfirm(t('确认对所选任务执行此操作？')+'\n'+receiptNote+grouping+(preview.verification_cost?costText(preview.verification_cost)+'\n':'')+conflict+unknown+description)))return;
   const request_id=saved?.signature===signature?saved.id:crypto.randomUUID();
   window.RSIDraftStore?.set('batch',project,{signature,id:request_id,tasks,action:kind});
-  const result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});
+  let result;
+  try{result=await api('tasks/batch',{project,tasks,action:kind,request_id,revision:preview.revision,preview:false});}
+  catch(error){toast(t('批量操作结果待核对，原请求编号已保留；网络恢复后重新执行会先核对回执，不会重复操作。')+' · '+(error.message||''),true);return;}
   if(result.complete)window.RSIDraftStore?.remove('batch',project);
   selected.get(project)?.clear();toolbar();
   toast(t(result.complete?'批量操作已完成':'部分结果待核对，请打开批次记录。')+' · '+result.receipts.filter(item=>['accepted','grouped','restored'].includes(item.state)).length+'/'+result.receipts.length);

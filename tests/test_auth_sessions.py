@@ -278,6 +278,31 @@ class AuthSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthError, "service_closed"):
             self.manager.start("codex")
 
+    def test_reserve_registers_busy_session_before_any_worker_launch(self):
+        session = self.manager.reserve("codex")
+        self.assertEqual(session["state"], "starting")
+        # 登记返回后 busy 立即计入 starting 会话，更新准入不能再 commit；
+        # 慢的 worker 启动尚未发生，留待 launch 在临界区外执行。
+        self.assertEqual(self.manager.busy, 1)
+        self.assertEqual(self.created, [])
+        self.manager.launch(session["id"])
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not self.created:
+            time.sleep(0.005)
+        self.assertEqual(len(self.created), 1)
+        self.wait_state(session, "awaiting_authorization")
+        self.gate.set()
+        self.wait_state(session, "completed")
+
+    def test_launch_rejects_unknown_or_terminal_sessions(self):
+        with self.assertRaisesRegex(AuthError, "unknown_session"):
+            self.manager.launch("missing")
+        session = self.manager.reserve("codex")
+        self.manager.close()
+        self.assertEqual(self.manager.status(session["id"])["state"], "interrupted")
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.launch(session["id"])
+
     def test_rejects_invalid_provider_method_and_inputs(self):
         for kwargs in ({"backend": "unknown"}, {"backend": []}, {"backend": "opencode", "provider": "../oops"},
                        {"backend": "codex", "method": True}, {"backend": "codex", "inputs": {"x": []}}):

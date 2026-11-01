@@ -1,4 +1,5 @@
 """Background artifact retention and bounded state maintenance."""
+import hashlib
 import json
 import sqlite3
 import threading
@@ -162,22 +163,125 @@ def _recover_cleanup_locked(store):
     db = sqlite3.connect(str(store.path), timeout=15)
     try:
         db.execute('BEGIN IMMEDIATE')
+
+        def note(kind, message, data):
+            # The caller owns the write transaction; commit inside it so the
+            # evidence survives even when a later receipt aborts the pass.
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) "
+                       "VALUES (NULL,NULL,?,?,?,?)", (kind, message, json.dumps(data), time.time()))
+            db.execute('COMMIT')
+            db.execute('BEGIN IMMEDIATE')
+
+        def quarantine(name, journal, error, reason):
+            """Move one corrupt journal aside and commit searchable evidence.
+
+            Idempotent: a crash mid-move leaves the tombstone behind and the
+            next pass finishes from the same journal without failing.
+            """
+            target = recycle / ('receipt.invalid-' + name)
+            if target.is_symlink():
+                raise ValueError('Unsafe cleanup receipt quarantine path')
+            if target.exists() and journal.exists():
+                # Quarantining again would overwrite the tombstone and destroy
+                # its preserved original bytes; keep both copies instead.
+                stored = target / 'receipt.json'
+                suffix = 1
+                while (target / ('receipt.' + str(suffix) + '.json')).exists() or \
+                        (target / ('receipt.' + str(suffix) + '.json')).is_symlink():
+                    suffix += 1
+                os.replace(journal, target / ('receipt.' + str(suffix) + '.json'))
+                _sync_directory(target)
+            elif journal.exists() or journal.is_symlink():
+                target.mkdir(mode=0o700, exist_ok=True)
+                os.replace(journal, target / 'receipt.json')
+                try:
+                    journal.parent.rmdir()
+                except OSError:
+                    pass  # Unexpected siblings stay observable instead of hiding the damage.
+                _sync_directory(target)
+                _sync_directory(target.parent)
+            stored = target / 'receipt.json'
+            digest = None
+            if not stored.is_symlink() and stored.exists():
+                digest = hashlib.sha256(stored.read_bytes()).hexdigest()
+            evidence = {'folder': name, 'error_type': type(error).__name__,
+                        'reason': reason, 'receipt_sha256': digest}
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                       ('cleanup-receipt-quarantine:' + name, json.dumps(evidence, sort_keys=True)))
+            note('cleanup_receipt_quarantined',
+                 'Cleanup disk receipt quarantined: ' + name + ' (' + reason + ')', evidence)
+
         for folder in sorted(recycle.iterdir()):
             if not folder.is_dir() or folder.is_symlink():
                 continue
+            name = folder.name
+            if name.startswith('receipt.invalid-'):
+                # Quarantine tombstone from an earlier pass; its evidence row was
+                # committed before the tombstone, so replay only when lost.
+                identifier = name.split('-', 1)[-1]
+                key = 'cleanup-receipt-quarantine:' + identifier
+                if store.one('SELECT 1 FROM settings WHERE key=?', (key,)):
+                    continue
+                stored = folder / 'receipt.json'
+                digest = None
+                if not stored.is_symlink() and stored.exists():
+                    digest = hashlib.sha256(stored.read_bytes()).hexdigest()
+                evidence = {'folder': name, 'error_type': 'ValueError',
+                            'reason': 'quarantine evidence lost before commit',
+                            'receipt_sha256': digest}
+                note('cleanup_receipt_quarantined',
+                     'Cleanup disk receipt quarantined: ' + name + ' (evidence lost before commit)', evidence)
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           (key, json.dumps(evidence, sort_keys=True)))
+                continue
             journal = folder / 'receipt.json'
             if journal.is_symlink():
-                raise ValueError('Unsafe cleanup disk receipt')
+                quarantine(name, journal, ValueError('Unsafe cleanup disk receipt'),
+                           'Unsafe cleanup disk receipt')
+                continue
             if not journal.exists():
                 continue
-            receipt = json.loads(journal.read_text(encoding='utf-8'))
-            if receipt['id'] != folder.name:
-                raise ValueError('Cleanup disk receipt identifier mismatch')
+            try:
+                raw = journal.read_text(encoding='utf-8')
+                receipt = json.loads(raw)
+                if receipt['id'] != name:
+                    raise ValueError('Cleanup disk receipt identifier mismatch')
+            except (ValueError, TypeError, KeyError) as error:
+                reason = ('Cleanup disk receipt identifier mismatch' if isinstance(error, ValueError)
+                          else 'Cleanup disk receipt is unreadable or malformed')
+                quarantine(name, journal, error, reason)
+                continue
             row = db.execute('SELECT value FROM settings WHERE key=?',
                              ('recycle:' + receipt['id'],)).fetchone()
-            if row and json.loads(row[0]) != receipt:
-                raise ValueError('Cleanup disk and database receipts disagree')
+            if row:
+                try:
+                    disagree = json.loads(row[0]) != receipt
+                except (ValueError, TypeError):
+                    # The row is unreadable but the journal is valid: repair the
+                    # row with the journal's exact bytes, the source undo reads.
+                    note('cleanup_receipt_row_invalid',
+                         'Cleanup database receipt row was invalid; repaired from disk journal',
+                         {'folder': name})
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                               ('recycle:' + receipt['id'], raw))
+                    disagree = False
+            else:
+                disagree = False
+            if row and disagree:
+                quarantine(name, journal, ValueError('Cleanup disk and database receipts disagree'),
+                           'Cleanup disk and database receipts disagree')
+                continue
+            try:
+                # Deep structural validation: a receipt naming an unsafe or
+                # malformed path is corrupt data, not a live artifact conflict.
+                _cleanup_paths(store, receipt)
+            except (ValueError, TypeError, KeyError) as error:
+                quarantine(name, journal, error, str(error))
+                continue
             _place_cleanup(store, receipt, recycled=bool(row))
+        # Commit repairs and evidence accumulated after the last note(); the
+        # finally below still rolls back an in-flight item that failed.
+        db.commit()
     finally:
         db.rollback()
         db.close()

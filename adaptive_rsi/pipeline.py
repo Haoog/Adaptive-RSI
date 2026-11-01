@@ -261,7 +261,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             raise ProcessError(prepared, "Dependency preparation failed before planning: " +
                                (prepared.get("error") or prepared.get("stderr") or prepared.get("stdout") or "Command failed"))
     from .context import code_map
-    from .recovery import signature, cached, save
+    from .recovery import signature, cached, save, enforce_cached_review
     from .discovery import related_work
     overlaps = related_work(runtime.store, project["id"], task)
     issue_comments = {"status": "not_issue", "comments": [], "warning": None, "updated_at": None}
@@ -556,18 +556,24 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
     review_key = _review_key(run, task, base, strategies, config, plan, evaluation, result["summary"], patch)
-    saved_review = None if experiment else cached(runtime, run, "review", review_key, accept=_approved_review)
+    # 复用历史评审记录时逐项隔离：归一化后仍无法通过评审门禁的记录只作废该项，
+    # 随后重新评审；其余阶段照常复用，不再中断整个恢复。
+    saved_review = None if experiment else cached(
+        runtime, run, "review", review_key, accept=_approved_review,
+        normalize=lambda value: enforce_cached_review(value, config))
     review = saved_review
     if review is None:
         review_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
                           "summary": result["summary"]}
         if acceptance:
             review_context["independent_acceptance"] = acceptance["spec"]
-        review = runtime.invoke("review", REVIEW_PROMPT + encode(review_context), workspace, run)
-    review = enforce_review(review, config)
+        review = enforce_review(runtime.invoke("review", REVIEW_PROMPT + encode(review_context), workspace, run), config)
     risk_review = None
     if risk_review_required(plan, review, files, patch):
-        risk_review = None if experiment else cached(runtime, run, "risk_review", review_key, accept=_approved_review)
+        # 复用的高风险评审记录同样逐项隔离；fresh 输出仍走正常 enforce_review 门禁。
+        risk_review = None if experiment else cached(
+            runtime, run, "risk_review", review_key, accept=_approved_review,
+            normalize=lambda value: enforce_cached_review(value, config))
         if risk_review is None:
             risk_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation)}
             if acceptance:

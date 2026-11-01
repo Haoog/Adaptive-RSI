@@ -3,6 +3,7 @@ import json
 import time
 from .config import fingerprint
 from .store import decode_object, decode_evidence
+from .usage_report import one_snapshot
 
 
 MERGE_STATES = ("verified", "regressed")
@@ -31,6 +32,7 @@ def merge_attribution(evidence):
     return {"postmerge_state": original, "mainline_state": mainline}
 
 
+@one_snapshot()
 def quality_summary(store, project=None):
     projects = {}
     failures = {}
