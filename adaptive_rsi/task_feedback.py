@@ -5,10 +5,12 @@ import time
 
 from .store import decode_evidence, decode_object, encode
 from .telemetry import merge_attribution
+from .usage_report import one_snapshot
 
 RATINGS = {"helpful", "unnecessary", "false_positive"}
 
 
+@one_snapshot()
 def dashboard_usage(store):
     """Use the detailed report's pricing rules for the existing 24-hour cards."""
     from .usage_report import TOTALS
