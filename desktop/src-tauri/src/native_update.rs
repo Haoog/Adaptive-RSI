@@ -405,12 +405,37 @@ fn extraction_root(_executable: &Path, temporary: &Path) -> Result<PathBuf, Stri
     Ok(temporary.to_path_buf())
 }
 
+/// Only a feed transport or parse failure counts as being offline. Cancellations
+/// and configuration problems keep their meaning and never unlock the fallback.
+pub(super) fn offline_check_failure(code: &str) -> bool { code == "update_check_failed" }
+
 fn revalidate(app: &tauri::AppHandle, approved: &Value) -> Result<(), String> {
     let current = tauri::async_runtime::block_on(async {
         let updater = configured(app)?;
-        cancellable(updater.check(), &app.state::<NativeUpdater>().cancel, "update_check_failed").await
+        match cancellable(updater.check(), &app.state::<NativeUpdater>().cancel, "update_check_failed").await {
+            Ok(current) => Ok(current.as_ref().map(artifact)),
+            // A feed that cannot be reached does not withdraw an already staged
+            // package: the exact bytes are signature-verified again before the
+            // replacement, so the comparison falls back to the staged artifact.
+            Err(code) if offline_check_failure(&code) => Ok(Some(staged_artifact(app)?)),
+            Err(code) => Err(code),
+        }
     })?;
-    require_same_artifact(approved, current.as_ref().map(artifact).as_ref())
+    require_same_artifact(approved, current.as_ref())
+}
+
+/// Feed unavailable at install time: an already staged package may still install
+/// offline, but only when it is the exact artifact the panel approved. Nothing
+/// here skips verification — the install itself re-verifies every byte.
+fn offline_install_fallback(app: &tauri::AppHandle, approved: &Value,
+                            feed_error: &str) -> Result<Value, String> {
+    if !offline_check_failure(feed_error) { return Err(feed_error.into()); }
+    let updater = app.state::<NativeUpdater>();
+    let staged = updater.staged.lock().unwrap().clone().ok_or_else(|| feed_error.to_string())?;
+    require_same_artifact(approved, Some(&artifact(&staged.0)))?;
+    updater.set(json!({"state":"ready","version":staged.0.version,
+        "notes":staged.0.body.clone().unwrap_or_default()}));
+    Ok(snapshot(app))
 }
 
 pub(super) async fn cancellable<T, E>(operation: impl std::future::Future<Output = Result<T, E>>,
@@ -981,7 +1006,15 @@ pub async fn install(app: tauri::AppHandle, window: String, revision: u64, autom
     let request = InstallRequest { revision: Some(revision), automatic, window: &window,
         current_version: &current, target_version: &target };
     let permit = updater.require_install_permit(&request)?;
-    let eligibility = check_in_operation(&app, false).await?;
+    // A fresh feed check keeps its veto, but being offline does not: an already
+    // staged package installs from the cache and is signature-verified again
+    // before any replacement. The staged artifact must still be the exact one
+    // this install approved.
+    let eligibility = match check_in_operation(&app, false).await {
+        Ok(snapshot) => snapshot,
+        Err(code) if offline_check_failure(&code) => offline_install_fallback(&app, &approved, &code)?,
+        Err(code) => return Err(code),
+    };
     if eligibility["state"] != "ready" { return Err("update_not_downloaded".into()); }
     require_same_artifact(&approved, Some(&staged_artifact(&app)?))?;
     updater.require_install_permit(&request)?;
