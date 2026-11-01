@@ -219,6 +219,40 @@ class MigrationLedgerHealTest(unittest.TestCase):
         from adaptive_rsi.schema_migrations import EVIDENCE, scripts
         self.assertEqual(set(EVIDENCE), {1, 2} | {version for version, _ in scripts()})
 
+    def test_interrupted_bootstrap_is_completed_on_reopen(self):
+        """executescript 已提交、补列事务未提交即中断：重开必须补完 bootstrap，不得误判已封版。"""
+        from adaptive_rsi.schema_migrations import BOOTSTRAP_SCHEMA
+        path = self.root / "state.sqlite3"
+        self.root.mkdir(parents=True)
+        with sqlite3.connect(str(path)) as db:
+            db.executescript(BOOTSTRAP_SCHEMA)
+        with sqlite3.connect(str(path)) as db:
+            self.assertEqual([row[0] for row in db.execute("SELECT version FROM schema_migrations")], [])
+            self.assertNotIn("request_log_created",
+                             {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='index'")})
+        pending = []
+        with patch("adaptive_rsi.schema_migrations.apply", side_effect=self.pending_apply(pending)):
+            reopened = Store(self.root)
+        reopened.close()
+        for table, expected in [("tasks", ("urgency", "infra_retries", "budget_waits")),
+                                ("calls", ("provider", "unit_price", "unit", "input_tokens", "output_tokens",
+                                           "cache_read_tokens", "cache_write_tokens", "usage_known")),
+                                ("phase_times", ("duration",)), ("remote_waits", ("duration",))]:
+            with sqlite3.connect(str(path)) as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(" + table + ")")}
+            self.assertTrue(set(expected) <= columns, table)
+        self.assertEqual(self.versions(), [1, 2])  # bootstrap 补写 1–2；apply 被 recorder 替换，不落库
+        with sqlite3.connect(str(path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(pending, [self.applied_versions()[2:]])  # apply 继续 3–8，未重放已生效迁移
+        final = Store(self.root)
+        try:
+            self.assertEqual(self.versions(), self.applied_versions())
+        finally:
+            final.close()
+        with sqlite3.connect(str(path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+
     def test_gap_backfills_ledger_row_without_replaying_migration(self):
         import hashlib
         from adaptive_rsi.schema_migrations import scripts

@@ -172,87 +172,8 @@ class Store:
             apply(db)
 
     def _bootstrap(self, db):
-        db.executescript("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY, checksum TEXT NOT NULL, applied REAL NOT NULL);
-            PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY, name TEXT, path TEXT UNIQUE, config TEXT,
-                paused INTEGER DEFAULT 1, created REAL);
-            CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY, project TEXT REFERENCES projects(id), source TEXT,
-                fingerprint TEXT, title TEXT, body TEXT, evidence TEXT, acceptance TEXT,
-                state TEXT, priority INTEGER DEFAULT 50, attempts INTEGER DEFAULT 0,
-                overrides TEXT DEFAULT '{}', available REAL DEFAULT 0, created REAL, updated REAL,
-                UNIQUE(project, fingerprint));
-            CREATE TABLE IF NOT EXISTS runs (
-                id TEXT PRIMARY KEY, task TEXT REFERENCES tasks(id), project TEXT,
-                state TEXT, config TEXT, strategy TEXT, base TEXT, path TEXT,
-                calls INTEGER DEFAULT 0, tokens INTEGER DEFAULT 0, started REAL, ended REAL,
-                result TEXT DEFAULT '{}');
-            CREATE TABLE IF NOT EXISTS events (
-                seq INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, run TEXT,
-                kind TEXT, message TEXT, data TEXT, created REAL);
-            CREATE TABLE IF NOT EXISTS schedules (
-                project TEXT, kind TEXT, due REAL, fingerprint TEXT DEFAULT '',
-                PRIMARY KEY(project,kind));
-            CREATE TABLE IF NOT EXISTS candidates (
-                id TEXT PRIMARY KEY, project TEXT, kind TEXT, parent TEXT, status TEXT,
-                content TEXT, evidence TEXT DEFAULT '{}', created REAL, promoted REAL);
-            CREATE TABLE IF NOT EXISTS skills (
-                id TEXT PRIMARY KEY, project TEXT, task TEXT, status TEXT, triggers TEXT,
-                content TEXT, evidence TEXT, expires REAL, created REAL);
-            CREATE TABLE IF NOT EXISTS cases (
-                id TEXT PRIMARY KEY, project TEXT, family TEXT, split TEXT,
-                spec TEXT, uses INTEGER DEFAULT 0, created REAL,
-                UNIQUE(project,family));
-            CREATE TABLE IF NOT EXISTS calls (
-                id TEXT PRIMARY KEY, project TEXT, run TEXT, role TEXT, model TEXT, effort TEXT,
-                state TEXT, tokens INTEGER DEFAULT 0, seconds REAL DEFAULT 0, created REAL,
-                provider TEXT DEFAULT 'openai');
-            CREATE TABLE IF NOT EXISTS stages (
-                run TEXT REFERENCES runs(id), stage TEXT, signature TEXT, data TEXT, created REAL,
-                PRIMARY KEY(run,stage));
-            CREATE INDEX IF NOT EXISTS project_tasks ON tasks(project,updated DESC);
-            CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
-            CREATE INDEX IF NOT EXISTS task_runs ON runs(task,started DESC,id DESC);
-            CREATE INDEX IF NOT EXISTS delivery_runs ON runs(state,project);
-            CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
-            CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
-            CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
-            CREATE TABLE IF NOT EXISTS task_decisions (
-                task TEXT PRIMARY KEY REFERENCES tasks(id), data TEXT NOT NULL, created REAL);
-            CREATE TABLE IF NOT EXISTS task_revisions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, task TEXT REFERENCES tasks(id),
-                previous_body TEXT, supplement TEXT, created REAL);
-            CREATE TABLE IF NOT EXISTS task_dependencies (
-                task TEXT PRIMARY KEY REFERENCES tasks(id), dependency TEXT REFERENCES tasks(id));
-            CREATE TABLE IF NOT EXISTS submissions (
-                project TEXT, request TEXT, signature TEXT, task TEXT REFERENCES tasks(id),
-                PRIMARY KEY(project,request));
-            CREATE TABLE IF NOT EXISTS phase_times (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), phase TEXT,
-                started REAL, ended REAL);
-            CREATE TABLE IF NOT EXISTS remote_waits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, run TEXT REFERENCES runs(id), reason TEXT,
-                started REAL, ended REAL);
-            CREATE TABLE IF NOT EXISTS task_completions (
-                task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, project TEXT, created REAL);
-            CREATE TABLE IF NOT EXISTS request_log (
-                id TEXT PRIMARY KEY, method TEXT, path TEXT, status INTEGER, started REAL,
-                ended REAL, error_code TEXT);
-            CREATE TABLE IF NOT EXISTS relationship_quarantine (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT, row_id TEXT, data TEXT, created REAL);
-            CREATE INDEX IF NOT EXISTS request_log_started ON request_log(started DESC);
-            CREATE INDEX IF NOT EXISTS project_completions ON task_completions(project);
-            CREATE INDEX IF NOT EXISTS event_kind_created ON events(kind, created);
-            CREATE INDEX IF NOT EXISTS phase_times_run ON phase_times(run);
-            CREATE INDEX IF NOT EXISTS remote_waits_run ON remote_waits(run);
-            CREATE INDEX IF NOT EXISTS task_revisions_task ON task_revisions(task);
-            CREATE INDEX IF NOT EXISTS task_dependencies_dependency ON task_dependencies(dependency);
-            CREATE INDEX IF NOT EXISTS runs_task_state ON runs(task, state);
-        """)
+        from .schema_migrations import BOOTSTRAP_SCHEMA
+        db.executescript(BOOTSTRAP_SCHEMA)
         db.execute("BEGIN IMMEDIATE")
         for field, definition in [("urgency", "INTEGER DEFAULT 0"), ("infra_retries", "INTEGER DEFAULT 0"),
                                   ("budget_waits", "INTEGER DEFAULT 0")]:
