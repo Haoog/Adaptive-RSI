@@ -450,39 +450,83 @@ def restore(source, destination):
     return {"restored": True, "paused": True, "artifacts_restored": False}
 
 
-def rehearse_restore(source):
+def rehearsal_report_path(source, store=None, report_path=None):
+    if report_path is not None and report_path is not True:
+        return Path(report_path).expanduser().resolve()
+    source = Path(source).expanduser().resolve()
+    if store is not None:
+        root = store if isinstance(store, (str, Path)) else getattr(store, "root", store)
+    else:
+        root = None
+    if root is not None:
+        folder = Path(root) / "reports"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        return folder / f"rehearsal-{source.stem}.json"
+    if source.parent.name == "backups" and (source.parent.parent / "state.sqlite3").exists():
+        folder = source.parent.parent / "reports"
+        folder.mkdir(mode=0o700, exist_ok=True)
+        return folder / f"rehearsal-{source.stem}.json"
+    return source.parent / f"{source.stem}-rehearsal.json"
+
+
+def rehearse_restore(source, report_path=None):
     """Exercise database recovery in disposable state without constructing a runtime.
 
     Project repositories, credentials and remote APIs are never opened. Missing
     files are reported, not treated as successful artifact recovery.
     """
+    source = Path(source).expanduser().resolve()
     try:
         verify_backup(source)
     except (ValueError, sqlite3.Error) as exc:
-        return {"valid": False, "checked_at": time.time(), "scope": "database_only",
-                "remote_operations": 0, "error_type": type(exc).__name__,
-                "failure_stage": "snapshot_validation", "artifacts_restored": False}
-    with tempfile.TemporaryDirectory(prefix="rsi-restore-drill-") as directory:
-        destination = Path(directory) / "state"
-        restore(source, destination)
-        store = Store(destination)
+        report = {"valid": False, "checked_at": time.time(), "scope": "database_only",
+                  "remote_operations": 0, "error_type": type(exc).__name__,
+                  "failure_stage": "snapshot_validation", "artifacts_restored": False}
+    else:
+        with tempfile.TemporaryDirectory(prefix="rsi-restore-drill-") as directory:
+            destination = Path(directory) / "state"
+            try:
+                restore(source, destination)
+            except (ValueError, sqlite3.Error) as exc:
+                report = {"valid": False, "checked_at": time.time(), "scope": "database_only",
+                          "remote_operations": 0, "error_type": type(exc).__name__,
+                          "failure_stage": "restore_execution", "artifacts_restored": False}
+            else:
+                store = Store(destination)
+                try:
+                    audit = store.relationship_audit()
+                    relationships_valid = not any(value for key, value in audit.items() if not key.startswith('_'))
+                    complete = not any(audit['_truncated'].values())
+                    paused = not store.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
+                    active = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
+                    cases = store.one("SELECT count(*) AS n FROM cases")["n"]
+                    report = {"valid": relationships_valid and complete and paused and active == 0,
+                              "checked_at": time.time(), "scope": "database_only", "remote_operations": 0,
+                              "all_projects_paused": paused, "active_runs": active,
+                              "projects": store.one("SELECT count(*) AS n FROM projects")["n"],
+                              "tasks": store.one("SELECT count(*) AS n FROM tasks")["n"],
+                              "runs": store.one("SELECT count(*) AS n FROM runs")["n"],
+                              "unavailable_cases": cases, "relationship_audit": audit,
+                              "artifacts_restored": False, "repository_revalidation_required": True}
+                finally:
+                    store.close()
+    if report_path:
+        target_path = None if report_path is True else report_path
+        report_file = rehearsal_report_path(source, report_path=target_path)
+        report_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        encoded = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        fd = os.open(report_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            audit = store.relationship_audit()
-            relationships_valid = not any(value for key, value in audit.items() if not key.startswith('_'))
-            complete = not any(audit['_truncated'].values())
-            paused = not store.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
-            active = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
-            cases = store.one("SELECT count(*) AS n FROM cases")["n"]
-            return {"valid": relationships_valid and complete and paused and active == 0,
-                    "checked_at": time.time(), "scope": "database_only", "remote_operations": 0,
-                    "all_projects_paused": paused, "active_runs": active,
-                    "projects": store.one("SELECT count(*) AS n FROM projects")["n"],
-                    "tasks": store.one("SELECT count(*) AS n FROM tasks")["n"],
-                    "runs": store.one("SELECT count(*) AS n FROM runs")["n"],
-                    "unavailable_cases": cases, "relationship_audit": audit,
-                    "artifacts_restored": False, "repository_revalidation_required": True}
-        finally:
-            store.close()
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+        except BaseException:
+            report_file.unlink(missing_ok=True)
+            raise
+        report["report_path"] = str(report_file)
+    return report
 
 
 def _file_info(paths, follow_symlinks=False):
