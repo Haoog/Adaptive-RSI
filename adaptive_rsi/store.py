@@ -627,6 +627,20 @@ class Store:
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
 
+    def pop_setting(self, key, default=None):
+        """读取并删除一个 settings 键；空值与缺失同样幂等，供意图类消费键使用。"""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            if row:
+                db.execute("DELETE FROM settings WHERE key=?", (key,))
+        if not row:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (ValueError, TypeError):
+            return default
+
     def reserve_case_exposure(self, project, case, experiment, limit):
         key = "case-exposure:" + experiment + ":" + case
         with self.connect() as db:

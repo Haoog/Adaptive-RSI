@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import merge
 from .gitops import git, origin_repository, snapshot
-from .process import Cancelled, checked
+from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
 
 
@@ -358,6 +358,8 @@ def _supersede_pr(store, run, outcome, task_state, now):
                        "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND "
                        "(started>? OR (started=? AND id>?)))",
                        (task_state, now, run["task"], run["task"], run["started"], run["started"], run["id"]))
+            # 转为关闭流程：此前记录的自动合并意图随之作废，同事务内清理。
+            db.execute("DELETE FROM settings WHERE key=?", ("merge-intent:" + run["id"],))
     return bool(changed)
 
 
@@ -470,10 +472,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
                 if pr["state"] == "MERGED":
+                    # 崩溃对账：意图在 gh pr merge 之前落盘，这里一次性消费，
+                    # 区分「本进程发起的合并」与「人工合并」；缺失或损坏时回落 pr_view。
+                    intent = store.pop_setting("merge-intent:" + run["id"])
+                    outcome["merged_by_local"] = bool(intent) and intent.get("head") == policy["head"]
                     if (not sealed_target or pr["headRefOid"] != policy["head"] or
                             pr.get("baseRefName", policy["branch"]) != policy["branch"]):
                         outcome["delivery_status"] = "unverified_merge"
                         store.execute("UPDATE runs SET state='unverified_merge',result=? WHERE id=?", (encode(outcome), run["id"]))
+                        run["state"] = "unverified_merge"
                         _update_pr_task(store, run, "blocked", now)
                     else:
                         outcome["merged_sha"] = pr["mergeCommit"]["oid"]
@@ -549,9 +556,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 merge_admitted = True
                                 store.put_setting("merge-intent:" + run["id"], {"head": policy["head"], "at": now})
                         if merge_admitted:
-                            checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
-                                     "--match-head-commit", policy["head"]])
-                            outcome["delivery_status"] = "merge_submitted"
+                            try:
+                                checked(["gh", "pr", "merge", outcome["pr"], "--repo", repo, "--squash",
+                                         "--match-head-commit", policy["head"]])
+                            except ProcessError as exc:
+                                # 提交失败时保留意图：远端可能已生效（响应丢失），
+                                # 由下一轮对账凭意图与 pr_view 澄清；明确失败则由用户人工重试。
+                                store.event("merge_intent_retry", str(exc), project["id"], run["id"])
+                            else:
+                                outcome["delivery_status"] = "merge_submitted"
                     elif gate == "stale" and not outcome.get("replanned"):
                         if tracking_cancelled():
                             return
