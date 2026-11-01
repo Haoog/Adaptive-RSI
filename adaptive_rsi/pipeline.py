@@ -213,11 +213,14 @@ def _reusable_evaluation(source, resolve_environment=None):
             raise RuntimeError("Stored evaluation record is incomplete")
         if data.get("source") != source:
             raise RuntimeError("Stored evaluation was produced from a different source tree or check configuration")
-        stored_env = data.get("execution_environment")
-        if stored_env is None:
+        # The key must exist so a record without one is incomplete; None only
+        # means this backend offers no cross-run identity (non-docker hosts),
+        # and a present-but-different identity still blocks reuse below.
+        if "execution_environment" not in data:
             raise RuntimeError("Stored evaluation did not record an execution environment")
+        stored_env = data["execution_environment"]
         current_env = resolve_environment() if callable(resolve_environment) else resolve_environment
-        if current_env is None or current_env != stored_env:
+        if current_env != stored_env:
             raise RuntimeError("Execution environment has changed since stored evaluation")
         return data
     return accept
@@ -630,6 +633,12 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             acceptance_cancel.set()
             acceptance_executor.shutdown(wait=True, cancel_futures=True)
     if not experiment:
+        # Real evaluate() results always carry the execution environment; older
+        # or stubbed records can miss the key, and reuse would then discard
+        # them as incomplete. Bind the current identity at save time so every
+        # stored evaluation is reusable on the same host.
+        if isinstance(evaluation, dict) and "execution_environment" not in evaluation:
+            evaluation = {**evaluation, "execution_environment": runtime.evaluator.execution_identity(config)}
         save(runtime, run, "evaluation", evaluation, candidate_key)
     if evaluation["decision"] != "pass" and not experiment:
         runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))

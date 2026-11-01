@@ -321,14 +321,19 @@ class ReliabilityTest(unittest.TestCase):
         config = self.runtime.config(self.project)
         source = _evaluation_source(config, "a" * 40, CHECKS, "candidate patch", "digest", None,
                                     True, "behavior")
+        identity = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
         record = {"decision": "pass", "reason": "Regression and full candidate checks passed",
                   "harness_hash": "harness", "checks": {"candidate": [{"name": "regression",
                                                                        "passed": True}]},
-                  "source": source}
-        self.assertEqual(_reusable_evaluation(source)(record), record)
+                  "execution_environment": identity, "source": source}
+        self.assertEqual(_reusable_evaluation(source, lambda: identity)(record), record)
+        # 非docker后端没有可跨主机比对的执行身份：键存在且当前身份同为None即可复用。
+        non_docker = {**record, "execution_environment": None}
+        self.assertEqual(_reusable_evaluation(source, lambda: None)(non_docker), non_docker)
         for changed in ({**record, "decision": "insufficient_evidence"},
                         {**record, "checks": {}},
                         {key: value for key, value in record.items() if key != "harness_hash"},
+                        {key: value for key, value in record.items() if key != "execution_environment"},
                         {**record, "source": {**source, "base": "b" * 40}},
                         {**record, "source": {**source, "patch_hash": "other"}},
                         {**record, "source": {**source, "checks": []}},
@@ -337,6 +342,13 @@ class ReliabilityTest(unittest.TestCase):
                         {**record, "source": {**source, "validation": {"controls": [{"id": "extra"}]}}}):
             with self.assertRaises(RuntimeError):
                 _reusable_evaluation(source)(changed)
+        # 执行身份绑定是双向的：当前身份缺失、镜像变化，或记录缺身份而当前身份存在，都拒绝复用。
+        with self.assertRaises(RuntimeError):
+            _reusable_evaluation(source, lambda: None)(record)
+        with self.assertRaises(RuntimeError):
+            _reusable_evaluation(source, lambda: {**identity, "image_id": "sha256:" + "b" * 64})(record)
+        with self.assertRaises(RuntimeError):
+            _reusable_evaluation(source, lambda: identity)(non_docker)
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_changed_baseline_invalidates_recovery_cache(self):
@@ -920,12 +932,15 @@ class ReliabilityTest(unittest.TestCase):
         baseline = (str(self.repo), git(self.repo, "rev-parse", "HEAD"), "main")
         # 恢复只复用完整且来源一致的评估记录，桩数据需具备真实记录的判定、
         # 检查明细和 harness 指纹，否则会被当作不完整记录重新评价。
+        identity = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
         evaluation = {"decision": "pass", "reason": "Fixed checks passed", "harness_hash": "stub",
                       "checks": {"candidate": [{"name": "real unittest regression", "cwd": ".",
                                                 "argv": ["python3", "-m", "unittest"], "passed": True,
                                                 "exit_code": 0, "error": None}]}}
         with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
              patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+             patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity)), \
              patch.object(self.runtime.evaluator, "evaluate", return_value=evaluation):
             self.runtime.process(run)
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "failed")
@@ -961,6 +976,8 @@ class ReliabilityTest(unittest.TestCase):
         third = self.store.claim(self.project, self.runtime.config(self.project))
         with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
              patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+             patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity)), \
              patch.object(self.runtime.evaluator, "evaluate", return_value=evaluation):
             self.runtime.process(third)
         third_events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (third["id"],))
