@@ -85,6 +85,54 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.assertEqual(self.store.namespaced_setting('cache', 'one', list, version=2, default=[] , now=109), [])
         self.assertIsNone(self.store.namespaced_setting('cache', 'one', dict, version=1, now=109))
 
+        # 存量旧格式惰性升级：无前缀既有键
+        self.store.execute("INSERT INTO settings VALUES ('cache:legacy','{\"migrated\": true}')")
+        self.assertEqual(self.store.namespaced_setting('cache', 'legacy', dict), {'migrated': True})
+        migrated_row = self.store.one("SELECT value FROM settings WHERE key='namespace:cache:legacy'")
+        assert migrated_row is not None
+        migrated_envelope = json.loads(migrated_row['value'])
+        self.assertEqual(migrated_envelope['version'], 1)
+        self.assertEqual(migrated_envelope['type'], 'dict')
+        self.assertEqual(migrated_envelope['value'], {'migrated': True})
+        self.assertIsNone(migrated_envelope['expires'])
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='cache:legacy'"))
+
+        # 存量旧格式惰性升级：已带 namespace: 前缀但未包信封的原始 JSON 值
+        self.store.execute("INSERT INTO settings VALUES ('namespace:cache:raw_num','88')")
+        self.assertIsNone(self.store.namespaced_setting('cache', 'raw_num', dict))
+        # 类型不匹配时不破坏底层原始值
+        raw_row = self.store.one("SELECT value FROM settings WHERE key='namespace:cache:raw_num'")
+        assert raw_row is not None
+        self.assertEqual(raw_row['value'], '88')
+        self.assertEqual(self.store.namespaced_setting('cache', 'raw_num', int), 88)
+        raw_row2 = self.store.one("SELECT value FROM settings WHERE key='namespace:cache:raw_num'")
+        assert raw_row2 is not None
+        raw_env = json.loads(raw_row2['value'])
+        self.assertEqual(raw_env, {'version': 1, 'type': 'int', 'value': 88, 'expires': None})
+
+        # 写路径统一新格式并清理旧格式残留
+        self.store.execute("INSERT INTO settings VALUES ('cache:write_target','\"old_wire\"')")
+        self.store.put_namespaced_setting('cache', 'write_target', {'rewritten': True}, version=3, ttl=30)
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='cache:write_target'"))
+        target_row = self.store.one("SELECT value FROM settings WHERE key='namespace:cache:write_target'")
+        assert target_row is not None
+        rewritten_env = json.loads(target_row['value'])
+        self.assertEqual(rewritten_env['version'], 3)
+        self.assertEqual(rewritten_env['type'], 'dict')
+        self.assertEqual(rewritten_env['value'], {'rewritten': True})
+
+        # 损坏单一 namespace 时只隔离自身，不影响其他功能
+        self.store.execute("INSERT INTO settings VALUES ('namespace:damaged:corrupt','{broken-json')")
+        self.store.execute("INSERT INTO settings VALUES ('damaged:legacy_corrupt','not-json')")
+        self.store.execute("INSERT INTO settings VALUES ('namespace:damaged:bad_envelope','{\"version\":\"NaN\",\"type\":\"str\",\"value\":\"x\"}')")
+        self.assertEqual(self.store.namespaced_setting('damaged', 'corrupt', dict, default={'fallback': True}), {'fallback': True})
+        self.assertIsNone(self.store.namespaced_setting('damaged', 'legacy_corrupt', str))
+        self.assertIsNone(self.store.namespaced_setting('damaged', 'bad_envelope', str))
+        # 其它 namespace 与全局设置仍正常可用
+        self.store.put_namespaced_setting('isolated', 'healthy', 'good')
+        self.assertEqual(self.store.namespaced_setting('isolated', 'healthy', str), 'good')
+        self.assertEqual(self.store.setting('healthy'), 42)
+
     def test_restore_replaces_malformed_case_without_old_path(self):
         self.store.execute("INSERT INTO cases(id,project,spec) VALUES ('case','p',?)", (json.dumps('/private/source'),))
         snapshot = storage_tools.backup(self.store)
@@ -272,6 +320,74 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.store.execute("INSERT OR REPLACE INTO settings VALUES ('legal-hold-project:p','{')")
         with self.assertRaises(ValueError):
             preview_cleanup(self.store, 'r')
+
+    def test_cleanup_recycle_undo_linux_renameat2_and_fallback(self):
+        import sys
+        import ctypes
+        from adaptive_rsi.maintenance import preview_cleanup, recycle_cleanup, undo_cleanup, _rename_cleanup
+        directory = self.store.root / 'runs' / 'r'
+        (directory / 'workspace').mkdir(parents=True)
+        (directory / 'workspace' / 'file').write_text('linux evidence')
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
+
+        # 1. 真实执行路径：在本机（Linux）跑通回收/撤销闭环真实执行
+        preview = preview_cleanup(self.store, 'r')
+        receipt = recycle_cleanup(self.store, preview)
+        self.assertFalse((directory / 'workspace').exists())
+        self.assertTrue((self.store.root / 'recycle' / receipt['id'] / 'workspace' / 'file').exists())
+        undo_cleanup(self.store, receipt['id'])
+        self.assertEqual((directory / 'workspace' / 'file').read_text(), 'linux evidence')
+
+        if sys.platform == 'linux':
+            # 2. 如 libc 无 renameat2 则验证 fallback 分支（通过 syscall）并留证据，不得静默跳过
+            real_cdll = ctypes.CDLL
+
+            class LibcWithoutRenameat2:
+                def __init__(self, lib):
+                    self._lib = lib
+                def syscall(self, *args):
+                    calls.append(args)
+                    orig = getattr(self._lib, 'syscall', None)
+                    if orig is not None:
+                        return orig(*args)
+                    raise AttributeError('syscall')
+                def __getattr__(self, name):
+                    if name == 'renameat2':
+                        raise AttributeError("simulated libc without renameat2")
+                    return getattr(self._lib, name)
+
+            calls = []
+            def fake_cdll(name, use_errno=False):
+                lib = real_cdll(name, use_errno=use_errno)
+                return LibcWithoutRenameat2(lib)
+
+            (directory / 'workspace' / 'file').write_text('fallback evidence')
+            preview_fallback = preview_cleanup(self.store, 'r')
+            with patch('ctypes.CDLL', side_effect=fake_cdll):
+                receipt_fallback = recycle_cleanup(self.store, preview_fallback)
+                self.assertFalse((directory / 'workspace').exists())
+                self.assertGreater(len(calls), 0, "libc 无 renameat2 时必须触发 syscall fallback")
+                undo_cleanup(self.store, receipt_fallback['id'])
+                self.assertEqual((directory / 'workspace' / 'file').read_text(), 'fallback evidence')
+
+            # 3. 验证 fallback 分支在目标已存在时拒绝覆盖
+            target = directory / 'workspace'
+            candidate = directory / 'candidate'
+            candidate.mkdir(parents=True)
+            (candidate / 'file').write_text('collision')
+            with patch('ctypes.CDLL', side_effect=fake_cdll):
+                with self.assertRaises(FileExistsError):
+                    _rename_cleanup(candidate, target)
+            (candidate / 'file').unlink()
+            candidate.rmdir()
+
+            # 4. 验证当 renameat2 与 syscall 均不可用时抛出明确异常，绝不静默跳过
+            class LibcUnavailable:
+                def __getattr__(self, name):
+                    raise AttributeError(name)
+            with patch('ctypes.CDLL', return_value=LibcUnavailable()):
+                with self.assertRaisesRegex(OSError, 'Atomic no-replace cleanup rename unavailable'):
+                    _rename_cleanup(directory / 'workspace', directory / 'other')
 
     def test_backup_under_concurrent_writes_has_explicit_deadline(self):
         import sqlite3

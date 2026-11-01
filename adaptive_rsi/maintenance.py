@@ -132,8 +132,29 @@ def _rename_cleanup(source, target):
         library = ctypes.CDLL(None, use_errno=True)
         if sys.platform == 'darwin':
             result = library.renamex_np(os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
-        else:
+        elif hasattr(library, 'renameat2'):
             result = library.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+        elif hasattr(library, 'syscall'):
+            import platform
+            syscall_numbers = {
+                'x86_64': 316,
+                'aarch64': 276,
+                'arm': 382,
+                'armv7l': 382,
+                'armv8l': 382,
+                'i386': 353,
+                'i686': 353,
+                'riscv64': 276,
+                's390x': 347,
+                'ppc64le': 357,
+            }
+            syscall_nr = syscall_numbers.get(platform.machine())
+            if syscall_nr is not None:
+                result = library.syscall(syscall_nr, -100, os.fsencode(source), -100, os.fsencode(target), 1)
+            else:
+                raise OSError('Atomic no-replace cleanup rename unavailable')
+        else:
+            raise OSError('Atomic no-replace cleanup rename unavailable')
         if result:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(target))

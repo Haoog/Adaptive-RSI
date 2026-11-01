@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.store import POOL_SIZE, Store
+from adaptive_rsi.store import POOL_SIZE, Store, encode
 
 
 class StorePoolTest(unittest.TestCase):
@@ -146,6 +146,77 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store._pool.qsize(), 0)
         self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
+
+    def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):
+        # 存量旧格式迁移
+        self.store.execute("INSERT INTO settings VALUES ('ns:item','{\"migrated\":true}')")
+        self.assertEqual(self.store.namespaced_setting('ns', 'item', dict), {'migrated': True})
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:item'"))
+        row = self.store.one("SELECT value FROM settings WHERE key='namespace:ns:item'")
+        assert row is not None
+        envelope = json.loads(row['value'])
+        self.assertEqual(envelope, {'version': 1, 'type': 'dict', 'value': {'migrated': True}, 'expires': None})
+
+        # 写路径清理残留并写入新信封
+        self.store.execute("INSERT INTO settings VALUES ('ns:overwritten','\"legacy\"')")
+        self.store.put_namespaced_setting('ns', 'overwritten', 12345, version=2)
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:overwritten'"))
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+
+        # 坏数据隔离自身，连接池仍健康
+        self.store.execute("INSERT INTO settings VALUES ('namespace:broken_ns:bad','invalid-json')")
+        self.assertEqual(self.store.namespaced_setting('broken_ns', 'bad', dict, default='fallback'), 'fallback')
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+        self.assertEqual(self.store._pool.qsize(), 1)
+
+    def test_namespaced_key_with_colon_is_rejected_on_both_paths(self):
+        # 线程 A：key 含 ':' 时 legacy 键空间 'namespace:<ns>:<key>' 会与规范信封
+        # 键空间重叠（'namespace' 命名空间下会删掉其它 namespace 的信封），
+        # 写侧拒绝、读侧返回默认值，双方键空间互不影响。
+        self.store.put_namespaced_setting('cache', 'item', {'from': 'cache-ns'})
+        with self.assertRaises(ValueError):
+            self.store.put_namespaced_setting('namespace', 'cache:item', {'from': 'colon-key'})
+        self.assertEqual(self.store.namespaced_setting('cache', 'item', dict), {'from': 'cache-ns'})
+        self.assertIsNone(self.store.namespaced_setting('namespace', 'cache:item', dict))
+        self.assertIsNone(self.store.namespaced_setting('cache', 'item:sub', dict))
+        rows = self.store.query("SELECT key FROM settings WHERE key LIKE 'namespace:%' ORDER BY key")
+        self.assertEqual([row['key'] for row in rows], ['namespace:cache:item'])
+
+    def test_namespaced_lazy_migration_loses_to_concurrent_envelope_writer(self):
+        # 线程 B：迁移事务开始前，并发写者已 committed 新的 v2 信封（不经
+        # put_namespaced_setting，legacy 行仍在）。迁移必须基于事务内的重新
+        # SELECT：读者拿到默认值而不是复活旧值，v2 信封不得被 v1 升级覆盖。
+        self.store.execute("INSERT INTO settings VALUES ('ns:item','\"legacy\"')")
+        v2_envelope = {"version": 2, "type": "str", "value": "v2", "expires": None}
+        injected = []
+        store = self.store
+        real_connect = self.store.connect
+
+        @contextlib.contextmanager
+        def racing_connect():
+            with real_connect() as db:
+                class Proxy:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    def execute(self, sql, args=()):
+                        if not injected and sql == "BEGIN IMMEDIATE":
+                            injected.append(True)
+                            # 写者恰在迁移事务前经自己的连接提交 v2 信封。
+                            with contextlib.closing(store._new_connection()) as writer:
+                                writer.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                               ('namespace:ns:item', encode(v2_envelope)))
+                                writer.commit()
+                        return db.execute(sql, args)
+
+                yield Proxy()
+
+        with patch.object(self.store, 'connect', racing_connect):
+            result = self.store.namespaced_setting('ns', 'item', str)
+        self.assertIsNone(result)
+        self.assertTrue(injected)
+        self.assertEqual(self.store.namespaced_setting('ns', 'item', str, version=2), 'v2')
+        self.assertIsNone(self.store.namespaced_setting('ns', 'item', str))
 
 
 class RecordUsageTest(unittest.TestCase):
