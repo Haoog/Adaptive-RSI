@@ -247,6 +247,228 @@ class Evolution:
                 mismatches.append(relative)
         return {"valid": not mismatches, "mismatches": mismatches, "limitations": manifest.get("limitations", [])}
 
+    @staticmethod
+    def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
+        """Inspect and verify offline reproduction readiness for a sealed bundle.
+
+        Verifies input integrity and itemizes all missing tool dependencies and
+        credentials without failing fast on the first missing requirement.
+        """
+        import os
+        import shutil
+        import subprocess
+
+        root = Path(directory).resolve()
+        bundle_file = root / "bundle.json"
+        if not bundle_file.is_file():
+            return {
+                "valid": False,
+                "integrity": {"valid": False, "mismatches": ["bundle.json"]},
+                "dependencies": {"available": [], "missing": []},
+                "credentials": {"available": [], "missing": []},
+                "limitations": ["Missing bundle.json: target is not a valid reproduction bundle directory"],
+                "reproducible": False,
+                "executed_checks": [],
+            }
+
+        try:
+            integrity = Evolution.verify_bundle(root)
+        except Exception as exc:
+            integrity = {"valid": False, "mismatches": [f"bundle.json: {exc}"], "limitations": []}
+
+        manifest = {}
+        try:
+            manifest = json.loads(bundle_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+        limitations = list(manifest.get("limitations") or integrity.get("limitations") or [])
+
+        evidence = {}
+        if (root / "evidence.json").is_file():
+            try:
+                evidence = json.loads((root / "evidence.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        env_dict = os.environ if env is None else env
+        path_env = env["PATH"] if (env is not None and "PATH" in env) else os.environ.get("PATH")
+        lookup = which or shutil.which
+
+        available_tools = []
+        missing_tools = []
+
+        # 1. VCS dependency (git)
+        git_found = lookup("git", path=path_env) if path_env else lookup("git")
+        if git_found:
+            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found)})
+        else:
+            missing_tools.append({"name": "git", "type": "vcs", "reason": "git executable not found in PATH"})
+
+        # 2. Inspect case check dependencies across all sealed cases
+        cases_dir = root / "cases"
+        case_items = []
+        if cases_dir.is_dir():
+            for case_entry in sorted(cases_dir.iterdir()):
+                case_json = case_entry / "case.json"
+                if case_json.is_file():
+                    try:
+                        spec = json.loads(case_json.read_text(encoding="utf-8"))
+                        case_items.append((case_entry.name, case_entry, spec))
+                    except Exception:
+                        pass
+
+        seen_tools = {}
+        for case_id, case_entry, spec in case_items:
+            for check in spec.get("checks", []):
+                argv = check.get("argv", [])
+                if not argv or not isinstance(argv, list):
+                    continue
+                cmd = argv[0]
+                check_name = check.get("name", "check")
+                if cmd not in seen_tools:
+                    found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
+                    if found:
+                        info = {"name": cmd, "type": "executable", "path": str(found),
+                                "cases": [case_id], "checks": [check_name]}
+                        seen_tools[cmd] = ("available", info)
+                    else:
+                        info = {"name": cmd, "type": "executable",
+                                "reason": f"Command '{cmd}' not found in PATH",
+                                "cases": [case_id], "checks": [check_name]}
+                        seen_tools[cmd] = ("missing", info)
+                else:
+                    status, info = seen_tools[cmd]
+                    if case_id not in info["cases"]:
+                        info["cases"].append(case_id)
+                    if check_name not in info["checks"]:
+                        info["checks"].append(check_name)
+
+        for status, info in seen_tools.values():
+            if status == "available":
+                available_tools.append(info)
+            else:
+                missing_tools.append(info)
+
+        # 3. Model credentials check
+        if required_credentials is not None:
+            needed_creds = list(required_credentials)
+        else:
+            needed_creds = []
+            models = evidence.get("models") or {}
+            providers = evidence.get("providers") or []
+            provider_names = set()
+            if isinstance(models, dict):
+                for route in models.values():
+                    if isinstance(route, dict) and route.get("provider"):
+                        provider_names.add(route["provider"])
+            if isinstance(providers, list):
+                for prov in providers:
+                    if isinstance(prov, dict):
+                        if prov.get("env_key"):
+                            needed_creds.append(prov["env_key"])
+                        elif prov.get("id"):
+                            provider_names.add(prov["id"])
+
+            standard_provider_keys = {
+                "openai": "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "opencode": "OPENCODE_API_KEY",
+                "gemini": "GEMINI_API_KEY",
+            }
+            for pname in provider_names:
+                key = standard_provider_keys.get(pname, f"{pname.upper()}_API_KEY")
+                if key not in needed_creds:
+                    needed_creds.append(key)
+
+            if not needed_creds:
+                needed_creds.append("OPENAI_API_KEY")
+
+        available_creds = []
+        missing_creds = []
+        for cred_key in sorted(needed_creds):
+            val = env_dict.get(cred_key)
+            if val:
+                available_creds.append({"name": cred_key, "type": "env_key"})
+            else:
+                missing_creds.append({"name": cred_key, "type": "env_key",
+                                      "reason": f"Credential environment variable '{cred_key}' is not set"})
+
+        # 4. Formulate limitations
+        repro_limitations = list(limitations)
+        if missing_creds:
+            msg = f"Missing credentials: {', '.join(c['name'] for c in missing_creds)} not configured; online model generation cannot be reproduced without external provider access"
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+        if missing_tools:
+            msg = f"Missing host tools: {len(missing_tools)} required executable(s) missing ({', '.join(t['name'] for t in missing_tools)})"
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+        offline_note = "Isolated offline environment: external model APIs cannot be contacted without network egress and valid credentials"
+        if offline_note not in repro_limitations:
+            repro_limitations.append(offline_note)
+
+        is_reproducible = (
+            bool(integrity.get("valid")) and
+            len(missing_tools) == 0 and
+            len(missing_creds) == 0
+        )
+
+        # 5. Optional check execution
+        executed_checks = []
+        if run_checks and integrity.get("valid") and not missing_tools:
+            for case_id, case_entry, spec in case_items:
+                repo_dir = case_entry / "repository"
+                for check in spec.get("checks", []):
+                    argv = check.get("argv", [])
+                    if not argv:
+                        continue
+                    cwd = (repo_dir / check.get("cwd", ".")).resolve()
+                    run_cwd = cwd if cwd.is_dir() else repo_dir
+                    try:
+                        proc = subprocess.run(
+                            argv,
+                            cwd=run_cwd,
+                            capture_output=True,
+                            text=True,
+                            timeout=60,
+                            env=env_dict,
+                        )
+                        executed_checks.append({
+                            "case": case_id,
+                            "check": check.get("name"),
+                            "argv": argv,
+                            "exit_code": proc.returncode,
+                            "passed": proc.returncode == 0,
+                            "stdout": proc.stdout[:1000],
+                            "stderr": proc.stderr[:1000],
+                        })
+                    except Exception as exc:
+                        executed_checks.append({
+                            "case": case_id,
+                            "check": check.get("name"),
+                            "argv": argv,
+                            "exit_code": -1,
+                            "passed": False,
+                            "error": str(exc),
+                        })
+
+        return {
+            "valid": bool(integrity.get("valid")),
+            "integrity": integrity,
+            "dependencies": {
+                "available": available_tools,
+                "missing": missing_tools,
+            },
+            "credentials": {
+                "available": available_creds,
+                "missing": missing_creds,
+            },
+            "limitations": repro_limitations,
+            "reproducible": is_reproducible,
+            "executed_checks": executed_checks,
+        }
+
     def import_case(self, project, manifest):
         self.runtime.project(project)
         required = {"family", "split", "repository", "base", "task", "checks", "source"}
@@ -815,3 +1037,8 @@ class Evolution:
                 if json.loads(skill["evidence"]).get("candidate") == candidate:
                     db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
         self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
+
+
+reproduce_bundle = Evolution.reproduce_bundle
+verify_bundle = Evolution.verify_bundle
+

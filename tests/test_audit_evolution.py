@@ -352,6 +352,113 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_offline_reproduction_enumerates_dependencies_without_aborting(self):
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {
+            'task': 'offline reproduction task',
+            'base': base,
+            'checks': [
+                {'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']},
+                {'name': 'missing_tool_1', 'cwd': '.', 'argv': ['fake-compiler-xyz']},
+                {'name': 'missing_tool_2', 'cwd': '.', 'argv': ['nonexistent-linter-abc', '--check']},
+            ],
+            'source': 'real',
+            'signature': 'sig1',
+            'repository': str(repo),
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-01', 'p', 'family-01', 'validation', encode(spec), 0, time.time()))
+        evidence = {
+            'dataset': {'manifest': [{'case': 'case-01'}]},
+            'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
+        }
+        self.candidate(evidence)
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+
+        # Reproduce in credential-free environment with simulated missing tools
+        # git is found, python3 is found, but fake-compiler-xyz and nonexistent-linter-abc are missing
+        result = Evolution.reproduce_bundle(
+            destination,
+            env={'PATH': '/usr/bin:/bin'},  # No model API credentials
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None
+        )
+
+        # 1. Input integrity is verified
+        self.assertTrue(result['valid'])
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['integrity']['mismatches'], [])
+
+        # 2. Reproduction cannot proceed due to missing tools and credentials
+        self.assertFalse(result['reproducible'])
+
+        # 3. Missing tools are enumerated item-by-item instead of failing on the first one
+        missing_tool_names = [item['name'] for item in result['dependencies']['missing']]
+        self.assertIn('fake-compiler-xyz', missing_tool_names)
+        self.assertIn('nonexistent-linter-abc', missing_tool_names)
+        available_tool_names = [item['name'] for item in result['dependencies']['available']]
+        self.assertIn('git', available_tool_names)
+        self.assertIn('python3', available_tool_names)
+
+        # 4. Missing credentials are enumerated
+        missing_cred_names = [item['name'] for item in result['credentials']['missing']]
+        self.assertIn('OPENAI_API_KEY', missing_cred_names)
+
+        # 5. Limitations explicitly declare credentials, tools, and offline environment
+        limitations_text = ' '.join(result['limitations'])
+        self.assertIn('Credentials are excluded', limitations_text)
+        self.assertIn('Missing credentials', limitations_text)
+        self.assertIn('Missing host tools', limitations_text)
+        self.assertIn('Isolated offline environment', limitations_text)
+
+    def test_bundle_offline_reproduction_detects_tampered_bundle(self):
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})}})
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+        self.assertTrue(Evolution.reproduce_bundle(destination)['integrity']['valid'])
+
+        # Tampering with bundle file invalidates integrity
+        (destination / 'candidate.json').write_text('{"tampered": true}')
+        tampered_result = Evolution.reproduce_bundle(destination)
+        self.assertFalse(tampered_result['valid'])
+        self.assertFalse(tampered_result['integrity']['valid'])
+        self.assertIn('candidate.json', tampered_result['integrity']['mismatches'])
+        self.assertFalse(tampered_result['reproducible'])
+
+    def test_bundle_offline_reproduction_cli_script(self):
+        import subprocess
+        import sys
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})}})
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+
+        # Test CLI invocation with --json in clean environment (no API keys)
+        proc = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--json'],
+            capture_output=True,
+            text=True,
+            env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(proc.returncode, 0)
+        cli_data = json.loads(proc.stdout)
+        self.assertTrue(cli_data['valid'])
+        self.assertFalse(cli_data['reproducible'])
+        self.assertIn('OPENAI_API_KEY', [c['name'] for c in cli_data['credentials']['missing']])
+
+        # Test CLI invocation with --strict exits non-zero (2) when dependencies/credentials missing
+        strict_proc = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--strict'],
+            capture_output=True,
+            text=True,
+            env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(strict_proc.returncode, 2)
+        self.assertIn('Sealed Bundle Reproduction Inspection', strict_proc.stdout)
+        self.assertIn('OPENAI_API_KEY', strict_proc.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()
