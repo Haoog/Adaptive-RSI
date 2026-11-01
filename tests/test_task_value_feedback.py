@@ -388,3 +388,15 @@ class TaskValueFeedbackTest(unittest.TestCase):
         self.assertTrue(connections)
         self.assertTrue(all(connection is not None for connection in connections))
         self.assertEqual(len({id(connection) for connection in connections}), 1)
+
+    def test_one_snapshot_supports_store_passed_by_keyword(self):
+        # store 也可以按关键字传入：装饰器必须能从位置或关键字参数里找到它，
+        # 否则 report(store=..., ...) 这类一直合法的调用会在进入快照前 IndexError。
+        from adaptive_rsi.task_feedback import dashboard_usage
+        from adaptive_rsi.telemetry import quality_summary
+        from adaptive_rsi.usage_report import report
+        result = report(store=self.store, params={"start": ["0"], "end": ["200"]})
+        self.assertEqual(result["summary"]["calls"], 0)
+        summary = quality_summary(store=self.store, project="p")
+        self.assertEqual([item["runs"] for item in summary], [1])
+        self.assertEqual(dashboard_usage(store=self.store), {"usage": [], "model_usage": []})

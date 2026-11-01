@@ -80,7 +80,8 @@ def one_snapshot(*, store_arg=0):
     def decorate(function):
         @functools.wraps(function)
         def wrapped(*args, **kwargs):
-            store = kwargs.get("store") if store_arg == "store" else args[store_arg]
+            # store 可按位置或关键字传入；位置参数缺失时回退 kwargs，保持各函数原有调用约定。
+            store = kwargs.get("store") if len(args) <= store_arg else args[store_arg]
             if not isinstance(store, Store):
                 raise TypeError("one_snapshot requires the decorated function to take a Store")
             with store.snapshot():
