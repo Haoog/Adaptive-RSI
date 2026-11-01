@@ -4,7 +4,8 @@ Selectors are expanded before any process starts. A selector that names a whole
 class and another that names one of its methods select the same test twice; such
 overlaps are rejected here instead of being handed to a worker. Without that
 check a worker re-runs the very test that started the runner and spawns another
-generation, which exhausts the machine (see audit 2026-10-28).
+generation, which exhausts the machine (see audit 2026-10-28). Exact duplicate
+selectors are idempotent and run their tests once.
 """
 import argparse
 from collections import defaultdict
@@ -23,12 +24,13 @@ class SelectionError(ValueError):
 
 
 def overlapping(left, right):
-    """True when one selector contains the other, without importing anything."""
-    return left == right or left.startswith(right + ".") or right.startswith(left + ".")
+    """True when one selector strictly contains the other, without importing anything."""
+    return left.startswith(right + ".") or right.startswith(left + ".")
 
 
 def expand(selectors):
     """Return every concrete test id exactly once, or raise SelectionError."""
+    selectors = list(dict.fromkeys(selectors))
     for index, name in enumerate(selectors):
         if any(overlapping(name, other) for other in selectors[index + 1:]):
             raise SelectionError("Overlapping selectors name the same tests: {}".format(name))
@@ -87,8 +89,6 @@ def main():
     parser.add_argument("--durations", type=Path)
     parser.add_argument("selectors", nargs="+")
     args = parser.parse_args()
-    if len(set(args.selectors)) != len(args.selectors):
-        parser.error("Selectors must be unique")
     if not 1 <= args.timeout <= 900:
         parser.error("Timeout must be 1..900 seconds")
     if any(not name.startswith("tests.") or not all(part.isidentifier() for part in name.split(".")) for name in args.selectors):
