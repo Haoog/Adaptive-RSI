@@ -9,17 +9,18 @@
 核对过程：
 
 - 服务器上能找到的 failures 记录只有两批，均为 Linux 平台：7 条（`wt-bug06` worktree 的 `.ci/test-durations.failures.json`，2026-10-31 09:37–09:39 UTC）与 36 条（`TMPDIR` 下 4 个 `tmp*.failures.json` 孤立回执，11:57:54–11:58:35 UTC）。两批合计 43 条，没有任何一份文件恰好 21 条。
-- GitHub 全量扫描了 `release-verify.yml` 与 `release.yml` 的 190 个 run，并在本轮（2026-10-31）下载了当时存在的全部 45 份 `timing-*` artifact（上传步骤定义于 `release-verify.yml:62-68`、`release.yml:136-142`）：artifact 内只有 `test-durations.json`，没有任何 failures 文件。通过的选择器组不产生记录；崩溃（如 exit -11）的选择器组同样不产生记录（见下节机制）。数据源仍在用户 Mac 侧的可能性无法排除，但审计引用的是相对路径，本轮无法证实。
+- GitHub 全量扫描了 `release-verify.yml` 与 `release.yml` 的 190 个 run，并在本轮（2026-10-31）下载了当时存在的全部 45 份 `timing-*` artifact（上传步骤定义于 `release-verify.yml:62-68`、`release.yml:136-142`）：artifact 内只有 `test-durations.json`，没有任何 failures 文件。通过的选择器组不产生记录；判定前因段错误终止的 suite 同样不产生记录（见下节机制，已写出的回执不受 worker 后续崩溃影响）。数据源仍在用户 Mac 侧的可能性无法排除，但审计引用的是相对路径，本轮无法证实。
 - 「21 条」的一种可能解释是孤立回执之和（4 个文件分别含 15/10/6/5 条，存在多种和为 21 的组合），但没有证据表明审计读取过这些文件，不作定论。
 
-## 记录产生机制（为何能排除崩溃记录）
+## 记录产生机制（按 suite 粒度对应，不是整体互斥）
 
-失败记录由 `scripts/test_worker.py:278-292` 在**一个选择器组跑完且 unittest 返回失败**时写入临时回执，由 `scripts/test_parallel.py:152-159,180-188` 在父进程存活时汇总进 `.ci/test-durations.failures.json`。因此：
+失败记录由 `scripts/test_worker.py:278-292` 在**一个类级 suite 跑完且 unittest 判定失败**时写入临时回执：worker 的 `suites()`（`scripts/test_worker.py:50-71`）先把模块选择器拆成类级组，失败回执的 `selector` 字段保留原模块选择器；回执写在同一份文件里，父进程收集时不看 worker 退出码（`scripts/test_parallel.py:152-159,180-188`）。因此：
 
-- worker 崩溃（SIGSEGV/exit -11）的组写不出任何记录——崩溃发生在结果判定之前；
+- 判定之前因段错误（SIGSEGV/exit -11）终止的 suite，自身不会为所在的组写出记录；
+- 但 worker 在**后续** suite 或收尾阶段崩溃，不会删除它早先写出的回执——这些回执照常被汇总。所以「有失败记录」不能证明「该 worker 全程健康」，「某 worker exit -11」也不能推出「它跑过的组都没有失败记录」；
 - 父进程先于 worker 结束时，回执成为 `TMPDIR` 下的孤立文件，不进入 `.ci/`。本轮找到的 4 个 `tmp*.failures.json` 正是这种残留。
 
-所以「failures.json 里的记录」与「worker exit -11」在机制上是互斥的两种结果，前者不能作为后者的证据。
+结论：记录与崩溃的关系必须对应到具体 suite 与时间窗来判断；下文对 exit -11 的排除建立在平台、时间与「CI 的 exit -11 组无对应记录」三个证据上，而不是「记录与崩溃机制互斥」。
 
 ## 分类统计
 
@@ -54,7 +55,7 @@
 | tests.test_delivery_loop | 1 | 33 |
 | 其余 12 个模块（各 1 条） | 12 | 49 |
 
-合计 36 条记录、23 个模块、287 个失败用例（去重 286 个）。同一模块出现多条记录且失败用例各不相同，说明是同一模块被重复执行多次。
+合计 36 条记录、23 个模块、287 个失败用例（去重 286 个）。同一模块的多条记录不必是重复执行：worker 按测试类拆组，每个失败的类各写一条回执并保留模块选择器，test_backend_hardening 恰有 5 个测试类、test_model_center 恰有 3 个，与回执条数一一对应。因此这批记录与「23 个模块各产生 1–5 条失败类回执」的单次执行形态一致（修订说明：初稿曾据「同模块多记录且失败用例不同」推断为重复执行，经评审指出并核对源码后更正；依赖时间窗与模块覆盖面的 213 轮并行归因不受影响）。
 
 ### 维度汇总
 
@@ -75,7 +76,7 @@
 上述 43 条记录与它不吻合：
 
 1. 平台不同：CI 的 exit -11 在 macOS runner；两批记录全部是 Linux 本机。
-2. 机制不同：exit -11 的组不产生失败记录（机制互斥，见上）；43 条记录全部由 unittest 结果判定产生，每条都有具体失败用例。
+2. 记录性质不同：43 条记录全部由 unittest 结果判定产生，每条都有具体失败用例；CI 的 exit -11 组（group 1）没有留下任何带失败用例的记录（日志无断言失败）。按上节机制，段错误发生的 suite 在判定前终止、不写出记录，而同 worker 早先 suite 的回执不受影响——两组证据按 suite 对应后不重合。
 3. 时间不同：本机两批发生在 2026-10-31 09:37 与 11:58（UTC）；CI run 41203204855 开始于 12:55 UTC。
 4. 分布不同：批次一与测试运行器递归事故记录无关，与 adaptive-rsi-loop 运行经验里已记载的本机稳定失败集合一致（test_audit_environment / test_controls / test_experience / test_delivery_loop / test_runtime / test_reliability / test_workflow_experience）；批次二覆盖 23 个模块、秒级集中爆发，是并行资源踩踏的形态，与单 worker 段错误不同。
 
@@ -87,7 +88,7 @@
 
 1. 服务器上可核实的 43 条 unclassified 记录中没有任何真 flaky：批次一是本机已知环境性失败的复现，批次二是全量运行与循环轮次并行导致的资源踩踏。
 2. 审计 PROC-02 的三个表述（21 条、全 macOS、与 exit -11 吻合）均与可核实数据不符；21 条的原始数据源本轮未能定位，需要用户侧（Mac 工作副本）确认。
-3. `worker exit -11` 的排查对象应保持为 CI macOS runner 上看门狗 faulthandler dump 路径（run 41203204855 的既有结论），与 failures.json 记录无关。
+3. `worker exit -11` 的排查对象应保持为 CI macOS runner 上看门狗 faulthandler dump 路径（run 41203204855 的既有结论）；可核实的 failures.json 记录中没有与它对应的失败用例证据。
 4. 流程教训：全量 `test_parallel.py` 不应与循环轮次并行（本机仅 2 vCPU / 2 GB）；轮次结束前应等待或终止自己启动的后台全量，并把最终状态写入 SUMMARY。
 
 本轮为只读分析 + 新增文档，未改动测试运行器行为，未改动既有事故记录正文（`test-runner-recursion-20261028.md`），未放宽任何护栏。
