@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from .adapters import detect
 from .agent import CodexAgent
 from .config import BUILTIN_PROVIDERS, DEFAULTS, compatibility, fingerprint, merge, relative_path, validate, within_hours
-from .evaluator import Evaluator
+from .evaluator import Evaluator, check_identity
 from .gitops import changes, git, origin_repository, repository, snapshot
 from .process import Cancelled, checked
 from .store import decode_object, encode, uid
@@ -1697,9 +1697,19 @@ class Runtime(Maintenance):
             task_fields = {"state": "queued", "available": time.time() + delay}
         transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)
         if state == "failed" and transitioned and self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"] == "failed":
-            checks = result.get("evaluation", {}).get("checks", {})
-            regression = any(old.get("passed") and not new.get("passed")
-                             for old, new in zip(checks.get("baseline", []), checks.get("candidate", [])))
+            checks = (result.get("evaluation") or {}).get("checks") or {}
+            candidate_rows = checks.get("candidate_full") or checks.get("candidate") or []
+            candidate_by_id = {
+                check_identity(row): row
+                for row in candidate_rows
+                if isinstance(row, dict) and check_identity(row) is not None
+            }
+            baseline_rows = checks.get("baseline") or []
+            regression = any(
+                old.get("passed") and not candidate_by_id[check_identity(old)].get("passed")
+                for old in baseline_rows
+                if isinstance(old, dict) and check_identity(old) in candidate_by_id
+            )
             self.monitor_strategy(run["project"], False, run, attributable=regression)
         if retry and transitioned and self.store.one("SELECT state FROM tasks WHERE id=?", (task["id"],))["state"] == "queued":
             self.store.event("retry", "Fresh run scheduled with bounded backoff", run["project"], run["id"])

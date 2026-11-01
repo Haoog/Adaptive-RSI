@@ -202,8 +202,21 @@ def affected_checks(changed, checks, graph):
         if expanded == selected:
             break
         selected = expanded
+    while True:
+        expanded = selected | {dep for name in selected for dep in graph[name]["depends_on"]}
+        if expanded == selected:
+            break
+        selected = expanded
     needed = {name for package in selected for name in graph[package]["checks"]}
     return [check for check in checks if check["name"] in needed] or list(checks)
+
+
+def check_identity(row):
+    """Normalized identity tuple (name, argv, cwd) for a check spec or result row."""
+    if not isinstance(row, dict):
+        return None
+    argv = row.get("argv")
+    return (row.get("name"), tuple(argv) if isinstance(argv, (list, tuple)) else (), row.get("cwd") or ".")
 
 
 def structured_test_summary(text):
@@ -1067,11 +1080,9 @@ class Evaluator:
             # Keep full_checks order: reused checks come from the candidate
             # stage, supplement checks from this stage. Names repeat across
             # nested modules, so pair them with argv and cwd.
-            def identity(row):
-                return (row["name"], tuple(row["argv"]), row.get("cwd", "."))
-            own = {identity(row): row for row in results["candidate_full"]}
-            previous = {identity(row): row for row in results.get("candidate", [])}
-            merged = [own.get(identity(check)) or previous.get(identity(check)) for check in full_checks]
+            own = {check_identity(row): row for row in results["candidate_full"]}
+            previous = {check_identity(row): row for row in results.get("candidate", [])}
+            merged = [own.get(check_identity(check)) or previous.get(check_identity(check)) for check in full_checks]
             results["candidate_full"] = [row for row in merged if row]
         if cached_baseline is None and "baseline" in results:
             self._cache_put(cache_scope, baseline_key, results["baseline"])

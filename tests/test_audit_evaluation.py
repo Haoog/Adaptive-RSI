@@ -342,8 +342,16 @@ class AuditEvaluationTest(unittest.TestCase):
         graph = {'a': {'paths': ['packages/a/'], 'depends_on': [], 'checks': ['a']},
                  'b': {'paths': ['packages/b/'], 'depends_on': ['a'], 'checks': ['b']}}
         self.assertEqual([c['name'] for c in evaluator.affected_checks(['packages/a/x'], checks, graph)], ['a', 'b'])
+        self.assertEqual([c['name'] for c in evaluator.affected_checks(['packages/b/x'], checks, graph)], ['a', 'b'])
         self.assertEqual(evaluator.affected_checks(['unknown/x'], checks, graph), checks)
         self.assertEqual(evaluator.affected_checks(['packages/a/x'], checks, {'b': graph['b']}), checks)
+
+    def test_check_identity_normalization(self):
+        self.assertEqual(evaluator.check_identity({'name': 'a', 'argv': ['cmd', 'arg']}), ('a', ('cmd', 'arg'), '.'))
+        self.assertEqual(evaluator.check_identity({'name': 'b', 'argv': ('cmd',), 'cwd': 'pkg'}), ('b', ('cmd',), 'pkg'))
+        self.assertEqual(evaluator.check_identity({'name': 'c'}), ('c', (), '.'))
+        self.assertIsNone(evaluator.check_identity(None))
+        self.assertIsNone(evaluator.check_identity('string'))
 
     def scheduling_fixtures(self, root, graph):
         source = root / 'source'
@@ -394,6 +402,25 @@ class AuditEvaluationTest(unittest.TestCase):
             result, calls = self.run_scheduled_evaluation(
                 root, source, checks, acceptance, ['pkg_a/value.py'])
         # 跨包闭包：pkg_a 变更触发自身与依赖方 pkg_b 的检查，无关 pkg_c 留给全量阶段。
+        self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
+        self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate']], ['check_a', 'check_b'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate_full']],
+                         ['check_a', 'check_b', 'check_c', 'detected'])
+        self.assertFalse(result['candidate_full_reused'])
+        self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
+        self.assertEqual(result['decision'], 'pass')
+
+    def test_affected_check_scheduling_runs_prerequisite_closure_in_candidate_stage(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_b/value.py'])
+        # 前置闭包：只改 pkg_b 时，前置包 pkg_a 也在同一 candidate workspace 里先执行。
         self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
         self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
         self.assertEqual([row['name'] for row in result['checks']['candidate']], ['check_a', 'check_b'])
