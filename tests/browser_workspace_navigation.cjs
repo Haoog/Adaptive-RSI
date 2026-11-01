@@ -24,6 +24,8 @@ const {chromium} = require('playwright');
     assert.equal(await page.locator('#page-name').textContent(),'模型服务');
     assert.equal(await page.locator('.sidebar [data-view=models]').getAttribute('aria-current'),'page');
     assert.equal(await page.locator('#settings-form').isVisible(),false,'model page has no unrelated runtime settings');
+    // 面板在模型快照返回后才显示；等首屏渲染完成再断言，避免把加载中的空帧当成导航失败。
+    await page.locator('#mc-providers-panel').waitFor();
     assert.equal(await page.locator('#mc-providers-panel').isVisible(),true);
     assert.equal(await page.evaluate(() => scrollY),0,'model page opens at its heading');
     await page.reload();

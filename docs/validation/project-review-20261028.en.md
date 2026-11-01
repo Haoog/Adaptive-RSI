@@ -4,7 +4,7 @@
 
 This review starts from `e78aea5cc892010b86987bac8fc54254728370a4` (0.5.125). Changes remain in the `chore/audit-validation-feedback-20261028` working tree. No commit, push, merge, release or installed-application update was performed. Existing `docs/research/` files were preserved.
 
-The report contains 39 substantive findings: 3 P1, 30 P2 and 6 P3. 34 have deterministic probe or execution evidence; 5 are supported by call-chain inspection. 6 are fixed in the working tree and 33 remain open. Related legacy IDs identify overlapping areas or incomplete old acceptance, not a renewed certification.
+The report contains 39 substantive findings: 3 P1, 30 P2 and 6 P3. 34 have deterministic probe or execution evidence; 5 are supported by call-chain inspection. 29 are fixed in the working tree and 10 remain open. Related legacy IDs identify overlapping areas or incomplete old acceptance, not a renewed certification.
 
 The historical 201-item ledger records 114 implemented, 56 partial and 31 pending items, leaving 87 partial or pending. Those items are not added again or recertified here. See the [machine-readable report](project-review-20261028.json).
 
@@ -46,7 +46,7 @@ The 562 extra Python executions in the CI matrix come from the 3.9 and 3.14 comp
 
 Fixed means implemented and tested in this working tree. Open findings remain. Deterministic fixtures do not establish production-load or real-remote behavior.
 
-### R4-001 · P1 · Open · Backup validation ignores migration history and retention can delete the only recoverable snapshot
+### R4-001 · P1 · Fixed · Backup validation ignores migration history and retention can delete the only recoverable snapshot
 
 Location: [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py), lines 215–232; related legacy #4. Evidence: confirmed.
 
@@ -54,7 +54,7 @@ SQLite integrity and user_version checks accept an unknown migration ledger that
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe_extra.py；另运行 data_probe.py 查看验证通过、恢复失败的配对结果。两个脚本仅创建 scratch 临时 Store。
 
-### R4-002 · P1 · Open · Later mainline verification authorizes release of a failing merge commit
+### R4-002 · P1 · Fixed · Later mainline verification authorizes release of a failing merge commit
 
 Location: [adaptive_rsi/release.py](../../adaptive_rsi/release.py), lines 578–637. Evidence: confirmed.
 
@@ -62,7 +62,7 @@ Feedback verifies later head H but release.advance dispatches merged SHA M based
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 delivery-probe-results.json 的 failed_merge_fixed_later 和 release_uses_failed_merge。只运行本地 fixture 的 Python assert；GitHub API、授权和存储为隔离替身，没有远程写。
 
-### R4-003 · P1 · Open · Post-merge snapshots hide changed failing tests behind the old harness
+### R4-003 · P1 · Fixed · Post-merge snapshots hide changed failing tests behind the old harness
 
 Location: [adaptive_rsi/delivery.py](../../adaptive_rsi/delivery.py), lines 667–676. Evidence: confirmed.
 
@@ -70,7 +70,7 @@ Clean post-merge snapshots yield an empty working-tree diff. The evaluator freez
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；changed_mainline_test_hidden: direct_current_exit=1, decision=pass, candidate_full_reused=true。
 
-### R4-004 · P2 · Open · Malformed historical run result containers abort the entire restore
+### R4-004 · P2 · Fixed · Malformed historical run result containers abort the entire restore
 
 Location: [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py), lines 391–394. Evidence: confirmed.
 
@@ -78,7 +78,7 @@ A merged run with result=[] passes backup checks but crashes restore with Attrib
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；查看 malformed_result_verification 与 malformed_result_restore。
 
-### R4-005 · P2 · Open · Usage report reads lack a shared snapshot and can contradict their own totals
+### R4-005 · P2 · Fixed · Usage report reads lack a shared snapshot and can contradict their own totals
 
 Location: [adaptive_rsi/usage_report.py](../../adaptive_rsi/usage_report.py), lines 59–130. Evidence: confirmed.
 
@@ -86,7 +86,7 @@ A write between summary and detail queries yields summary_calls=1 and daily_call
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；脚本通过 one 包装器在两次读取之间确定性插入一条本地调用记录，不执行模型。
 
-### R4-006 · P2 · Open · Storage overview refresh rehashes unchanged backup contents
+### R4-006 · P2 · Fixed · Storage overview refresh rehashes unchanged backup contents
 
 Location: [adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py), lines 557–567; related legacy #104. Evidence: confirmed.
 
@@ -94,7 +94,7 @@ Two unchanged backups are fully hashed on each forced overview refresh. Cache pu
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；overview_hashes 通过包装真实 file_digest 计数，不使用大文件或长时间压测。
 
-### R4-007 · P2 · Open · One malformed superseded receipt aborts delivery scanning and recovery
+### R4-007 · P2 · Fixed · One malformed superseded receipt aborts delivery scanning and recovery
 
 Location: [adaptive_rsi/delivery.py](../../adaptive_rsi/delivery.py), lines 387–389. Evidence: confirmed.
 
@@ -102,7 +102,7 @@ json_extract in a batch WHERE clause fails on one malformed superseded result be
 
 **Reproduction or validation:** sqlite3 :memory: 中 CREATE TABLE runs(state TEXT,result TEXT); INSERT INTO runs VALUES('merged','{}'),('superseded','broken-json'); SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR (state='superseded' AND json_extract(result,'$.close_pending')=1)); 返回 malformed JSON。实际已用 Python sqlite3 执行，无仓库或远程状态修改。
 
-### R4-008 · P2 · Open · Additional detected checks make candidate_full repeat configured checks
+### R4-008 · P2 · Fixed · Additional detected checks make candidate_full repeat configured checks
 
 Location: [adaptive_rsi/evaluator.py](../../adaptive_rsi/evaluator.py), lines 831–903; related legacy #201. Evidence: confirmed.
 
@@ -118,7 +118,7 @@ Feedback always creates two snapshots and runs baseline and candidate even for i
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 identical_postmerge_trees.physical_stages。
 
-### R4-010 · P2 · Open · RuntimeError handler shadows credential recovery in auth snapshots
+### R4-010 · P2 · Fixed · RuntimeError handler shadows credential recovery in auth snapshots
 
 Location: [adaptive_rsi/auth_sessions.py](../../adaptive_rsi/auth_sessions.py), lines 869–877. Evidence: confirmed.
 
@@ -134,7 +134,7 @@ An API-key worker is not tracked by close and does not recheck closed before cre
 
 **Reproduction or validation:** 运行 desktop_probes.py；key_install_after_close.installed[0].after_closed 为 true。Worker 为纯内存替身，FAKE_TEST_VALUE 未发送到网络或真实凭据存储。
 
-### R4-012 · P2 · Open · Update admission ignores in-flight model catalog requests
+### R4-012 · P2 · Fixed · Update admission ignores in-flight model catalog requests
 
 Location: [adaptive_rsi/model_center.py](../../adaptive_rsi/model_center.py), lines 319–343. Evidence: confirmed.
 
@@ -150,7 +150,7 @@ The desktop bootstrap reads one handshake then drops stdout, while the reused Py
 
 **Reproduction or validation:** 代码支持，未启动真实应用：检查 main.rs:654-661 的一次性 reader、desktop.py:63-69 的持续 rotated 输出以及 transport.rs:126-133 的凭据发布条件。集成复现需隔离状态目录下先 serve，再 desktop-runtime，随后从另一客户端 rotate。
 
-### R4-014 · P2 · Open · Runtime shutdown timeout leaves an unrecoverable stale connection
+### R4-014 · P2 · Fixed · Runtime shutdown timeout leaves an unrecoverable stale connection
 
 Location: [desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs), lines 376–383. Evidence: code_supported.
 
@@ -158,7 +158,7 @@ After stdin EOF requests shutdown, a 30-second timeout restores a child whose co
 
 **Reproduction or validation:** 代码支持，未更新实际应用：用隔离假运行器在读到 stdin EOF 后延迟超过30秒退出，执行安装停止阶段，观察失败回包后进程退出而 local/target 未重新 bootstrap。当前未运行该超过30秒实验，符合本次单项验证<=30秒约束。
 
-### R4-015 · P2 · Open · Model diagnostics calls an out-of-scope dialog helper
+### R4-015 · P2 · Fixed · Model diagnostics calls an out-of-scope dialog helper
 
 Location: [adaptive_rsi/web/model-center.js](../../adaptive_rsi/web/model-center.js), lines 167–168; related legacy #1. Evidence: confirmed.
 
@@ -166,7 +166,7 @@ A successful diagnostics request calls dialog, which exists only inside a differ
 
 **Reproduction or validation:** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；输出 error=ReferenceError: dialog is not defined
 
-### R4-016 · P2 · Open · Project diagnostics always sends the global scope
+### R4-016 · P2 · Fixed · Project diagnostics always sends the global scope
 
 Location: [adaptive_rsi/web/model-center.js](../../adaptive_rsi/web/model-center.js), lines 166–166; related legacy #1. Evidence: confirmed.
 
@@ -174,7 +174,7 @@ Project settings store an ID in scope, but the callback compares it with the lit
 
 **Reproduction or validation:** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；request.payload.project 为 null，而 fixture scope 为 project-123
 
-### R4-017 · P2 · Open · Recommended groups bypass batch idempotency recovery
+### R4-017 · P2 · Fixed · Recommended groups bypass batch idempotency recovery
 
 Location: [adaptive_rsi/web/batch.js](../../adaptive_rsi/web/batch.js), lines 44–48; related legacy #37. Evidence: confirmed.
 
@@ -182,7 +182,7 @@ Recommended groups generate a fresh request ID on every confirmation and bypass 
 
 **Reproduction or validation:** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；batch.request_ids=[request-1,request-2]
 
-### R4-018 · P2 · Open · Auth rerenders discard provider search focus and selection focus
+### R4-018 · P2 · Fixed · Auth rerenders discard provider search focus and selection focus
 
 Location: [adaptive_rsi/web/auth.js](../../adaptive_rsi/web/auth.js), lines 96–104; related legacy #188. Evidence: confirmed.
 
@@ -190,7 +190,7 @@ Auth rendering replaces the provider search/select without focus restoration. A 
 
 **Reproduction or validation:** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；focus={before:mc-auth-provider-search,after:"",oldConnected:false}
 
-### R4-019 · P2 · Open · Background download stalls behind the check interval after reload
+### R4-019 · P2 · Fixed · Background download stalls behind the check interval after reload
 
 Location: [adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js), lines 98–104. Evidence: confirmed.
 
@@ -198,7 +198,7 @@ Downloading an already available update is nested inside the six-hour check inte
 
 **Reproduction or validation:** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/native-resume-repro.cjs；calls=[status,status]，policy=download，界面发现新版本。
 
-### R4-020 · P2 · Open · Experiment evaluation uses the parent's planning state and loses deadline receipts
+### R4-020 · P2 · Fixed · Experiment evaluation uses the parent's planning state and loses deadline receipts
 
 Location: [adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py), lines 387–398; related legacy #95. Evidence: confirmed.
 
@@ -206,7 +206,7 @@ Experiment mode skips the parent database transition to evaluating. Runtime.is_c
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/runtime-probes.py；experiment_deadline 使用真实 Store.claim 和 Runtime.is_cancelled， preparation_seconds=1、evaluation_seconds=100、准备时钟过去5秒。当前测试 test_evaluation_deadline_has_its_own_clock 先显式 transition('evaluating')，未覆盖 experiment=True 的不落库分支。
 
-### R4-021 · P2 · Open · Retired development cases remain in strategy proposal prompts
+### R4-021 · P2 · Fixed · Retired development cases remain in strategy proposal prompts
 
 Location: [adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py), lines 315–327; related legacy #153. Evidence: confirmed.
 
@@ -214,7 +214,7 @@ The development-case query ignores spec.active although validation and holdout s
 
 **Reproduction or validation:** 运行同目录 runtime-probes.py，查看 retired_development。现有 test_retirement_and_reclassification_keep_exposure 只核对数据库中的 active/uses/lifecycle，不断言提案提示或样本选择排除 inactive 数据。
 
-### R4-022 · P2 · Open · Postprocessing rescans completed history while holding the dispatch lock
+### R4-022 · P2 · Fixed · Postprocessing rescans completed history while holding the dispatch lock
 
 Location: [adaptive_rsi/runtime.py](../../adaptive_rsi/runtime.py), lines 1137–1151; related legacy #169. Evidence: confirmed.
 
@@ -222,7 +222,7 @@ Every scheduler pass loads and parses all postprocess settings, including comple
 
 **Reproduction or validation:** 运行同目录 runtime-probes.py 查看 postprocess_query.loaded_completed_records=3；可补充一个无 pending、上千 completed 的测试，断言读取/解析记录数与 pending 数关联，而不是只测耗时。现有恢复测试只用少量记录，不覆盖历史放大。
 
-### R4-023 · P2 · Open · Evolution runs paid trials despite insufficient fresh holdout cases
+### R4-023 · P2 · Fixed · Evolution runs paid trials despite insufficient fresh holdout cases
 
 Location: [adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py), lines 279–282; related legacy #143. Evidence: code_supported.
 
@@ -254,7 +254,7 @@ test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full ru
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-027 · P2 · Open · Empty selected suites pass as successful validation
+### R4-027 · P2 · Fixed · Empty selected suites pass as successful validation
 
 Location: [scripts/test_worker.py](../../scripts/test_worker.py), lines 18–26. Evidence: confirmed.
 
@@ -262,7 +262,7 @@ test_worker.run considers an empty suite successful. The direct standard-unittes
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-028 · P2 · Open · Overlapping selectors duplicate and parallelize the same tests
+### R4-028 · P2 · Fixed · Overlapping selectors duplicate and parallelize the same tests
 
 Location: [scripts/test_selected.py](../../scripts/test_selected.py), lines 18–30. Evidence: confirmed.
 
@@ -278,7 +278,7 @@ Malformed JSON, non-object data and nonnumeric timings crashed selected-test pla
 
 **Reproduction or validation:** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-030 · P2 · Open · Timing mode repeats class fixtures for separate method selectors
+### R4-030 · P2 · Fixed · Timing mode repeats class fixtures for separate method selectors
 
 Location: [scripts/test_worker.py](../../scripts/test_worker.py), lines 16–21; related legacy #194. Evidence: confirmed.
 
