@@ -188,6 +188,164 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         self.assertEqual((source / 'evidence').read_text(), 'original')
         self.assertTrue(target.is_dir())
 
+    def _make_valid_recycle(self, identifier, committed=True):
+        """Rebuild one recycle: durable journal, moved artifact, optionally the committed row."""
+        import os
+        import time
+        preview = maintenance.preview_cleanup(self.store, 'r')
+        folder = self.store.root / 'recycle' / identifier
+        folder.mkdir(parents=True, mode=0o700)
+        receipt = {**preview, 'id': identifier, 'expires': time.time() + 7 * 86400}
+        (folder / 'receipt.json').write_text(json.dumps(receipt), encoding='utf-8')
+        os.rename(self.directory / 'workspace', folder / 'workspace')
+        if committed:
+            self.store.execute("INSERT INTO settings VALUES (?,?)",
+                               ('recycle:' + identifier, json.dumps(receipt)))
+        return receipt
+
+    def test_corrupt_receipt_is_quarantined_and_other_receipts_still_recovered(self):
+        import hashlib
+        self._make_valid_recycle('b' * 32, committed=False)
+        corrupt = self.store.root / 'recycle' / ('0' * 32)
+        corrupt.mkdir()
+        (corrupt / 'receipt.json').write_text('{broken', encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+        self.assertFalse((self.store.root / 'recycle' / ('b' * 32)).exists())
+        quarantined = self.store.root / 'recycle' / ('receipt.invalid-' + '0' * 32)
+        self.assertEqual((quarantined / 'receipt.json').read_text(encoding='utf-8'), '{broken')
+        self.assertFalse((corrupt / 'receipt.json').exists())
+        evidence = json.loads(self.store.one(
+            'SELECT value FROM settings WHERE key=?',
+            ('cleanup-receipt-quarantine:' + '0' * 32,))['value'])
+        self.assertEqual(evidence['error_type'], 'JSONDecodeError')
+        self.assertEqual(evidence['receipt_sha256'], hashlib.sha256(b'{broken').hexdigest())
+        event = self.store.one("SELECT message,data FROM events WHERE kind='cleanup_receipt_quarantined'")
+        self.assertIn('0' * 32, event['message'])
+        self.assertEqual(json.loads(event['data'])['folder'], '0' * 32)
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual(self.store.one("SELECT count(*) AS c FROM events "
+                                        "WHERE kind='cleanup_receipt_quarantined'")['c'], 1)
+
+    def test_each_corrupt_receipt_is_isolated_individually(self):
+        payloads = [
+            ('1' * 32, '{"id":"' + '1' * 32 + '","run":"../escape","objects":[]}'),
+            ('2' * 32, '[1,2]'),
+            ('3' * 32, '{"id":"' + '4' * 32 + '","run":"r","objects":[]}'),
+            ('4' * 32, '{"id":"' + '4' * 32 + '","run":"r"}'),
+        ]
+        for identifier, payload in payloads:
+            folder = self.store.root / 'recycle' / identifier
+            folder.mkdir(parents=True)
+            (folder / 'receipt.json').write_text(payload, encoding='utf-8')
+        self._make_valid_recycle('f' * 32, committed=False)
+        maintenance.recover_cleanup(self.store)
+        for identifier, payload in payloads:
+            quarantined = self.store.root / 'recycle' / ('receipt.invalid-' + identifier)
+            self.assertEqual((quarantined / 'receipt.json').read_text(encoding='utf-8'), payload, identifier)
+            self.assertIsNotNone(self.store.one(
+                'SELECT 1 FROM settings WHERE key=?',
+                ('cleanup-receipt-quarantine:' + identifier,)), identifier)
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+
+    def test_quarantined_receipt_unblocks_recycle_and_undo(self):
+        corrupt = self.store.root / 'recycle' / ('0' * 32)
+        corrupt.mkdir(parents=True)
+        (corrupt / 'receipt.json').write_text('{broken', encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        receipt = maintenance.recycle_cleanup(self.store, maintenance.preview_cleanup(self.store, 'r'))
+        self.assertFalse((self.directory / 'workspace').exists())
+        maintenance.undo_cleanup(self.store, receipt['id'])
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+
+    def test_disk_and_database_disagreement_is_quarantined_with_row_kept(self):
+        identifier = 'c' * 32
+        receipt = self._make_valid_recycle(identifier)
+        self.store.execute("UPDATE settings SET value=? WHERE key=?",
+                           (json.dumps({**receipt, 'objects': []}), 'recycle:' + identifier))
+        maintenance.recover_cleanup(self.store)
+        quarantined = self.store.root / 'recycle' / ('receipt.invalid-' + identifier)
+        self.assertTrue((quarantined / 'receipt.json').exists())
+        self.assertIsNotNone(self.store.one('SELECT value FROM settings WHERE key=?',
+                                            ('recycle:' + identifier,)))
+        evidence = json.loads(self.store.one(
+            'SELECT value FROM settings WHERE key=?',
+            ('cleanup-receipt-quarantine:' + identifier,))['value'])
+        self.assertEqual(evidence['error_type'], 'ValueError')
+        self.assertIn('disagree', evidence['reason'])
+
+    def test_invalid_database_row_recovers_from_disk_journal(self):
+        identifier = 'd' * 32
+        self._make_valid_recycle(identifier)
+        self.store.execute("UPDATE settings SET value='not-json' WHERE key=?", ('recycle:' + identifier,))
+        maintenance.recover_cleanup(self.store)
+        row = self.store.one('SELECT value FROM settings WHERE key=?', ('recycle:' + identifier,))
+        disk = (self.store.root / 'recycle' / identifier / 'receipt.json').read_text(encoding='utf-8')
+        self.assertEqual(row['value'], disk)
+        event = self.store.one("SELECT data FROM events WHERE kind='cleanup_receipt_row_invalid'")
+        self.assertEqual(json.loads(event['data'])['folder'], identifier)
+        maintenance.undo_cleanup(self.store, identifier)
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+
+    def test_placement_conflict_still_stops_recovery_but_quarantine_persists(self):
+        self._make_valid_recycle('e' * 32, committed=False)
+        corrupt = self.store.root / 'recycle' / ('0' * 32)
+        corrupt.mkdir()
+        (corrupt / 'receipt.json').write_text('{broken', encoding='utf-8')
+        original = maintenance._place_cleanup
+        def conflicting(store, receipt, recycled):
+            (self.directory / 'workspace').mkdir()
+            (self.directory / 'workspace' / 'new').write_text('new')
+            return original(store, receipt, recycled)
+        with patch.object(maintenance, '_place_cleanup', conflicting):
+            with self.assertRaisesRegex(ValueError, 'conflicts'):
+                maintenance.recover_cleanup(self.store)
+        self.assertTrue((self.store.root / 'recycle' / ('e' * 32) / 'receipt.json').exists())
+        self.assertEqual((self.directory / 'workspace' / 'new').read_text(), 'new')
+        self.assertTrue((self.store.root / 'recycle' / ('receipt.invalid-' + '0' * 32) / 'receipt.json').exists())
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('cleanup-receipt-quarantine:' + '0' * 32,)))
+        (self.directory / 'workspace' / 'new').unlink()
+        (self.directory / 'workspace').rmdir()
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+
+    def test_second_quarantine_of_same_receipt_keeps_both_original_journals(self):
+        identifier = '9' * 32
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('recycle:' + identifier,
+                            '{"id":"' + identifier + '","run":"r","objects":[]}'))
+        corrupt = self.store.root / 'recycle' / identifier
+        corrupt.mkdir(parents=True)
+        (corrupt / 'receipt.json').write_text('{"id":"' + identifier + '","run":"../escape","objects":[]}',
+                                              encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        tombstone = self.store.root / 'recycle' / ('receipt.invalid-' + identifier)
+        first = (tombstone / 'receipt.json').read_text(encoding='utf-8')
+        corrupt.mkdir(parents=True, exist_ok=True)
+        (corrupt / 'receipt.json').write_text('{"id":"' + identifier + '","run":"other","objects":[]}',
+                                              encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((tombstone / 'receipt.json').read_text(encoding='utf-8'), first)
+        self.assertEqual((tombstone / 'receipt.1.json').read_text(encoding='utf-8'),
+                         '{"id":"' + identifier + '","run":"other","objects":[]}')
+
+    def test_quarantine_evidence_is_replayed_after_lost_commit(self):
+        corrupt = self.store.root / 'recycle' / ('0' * 32)
+        corrupt.mkdir(parents=True)
+        (corrupt / 'receipt.json').write_text('{broken', encoding='utf-8')
+        maintenance.recover_cleanup(self.store)
+        self.store.execute("DELETE FROM settings WHERE key=?", ('cleanup-receipt-quarantine:' + '0' * 32,))
+        self.store.execute("DELETE FROM events WHERE kind='cleanup_receipt_quarantined'")
+        maintenance.recover_cleanup(self.store)
+        evidence = json.loads(self.store.one(
+            'SELECT value FROM settings WHERE key=?',
+            ('cleanup-receipt-quarantine:' + '0' * 32,))['value'])
+        self.assertEqual(evidence['error_type'], 'ValueError')
+        self.assertIn('lost before commit', evidence['reason'])
+        self.assertEqual((self.store.root / 'recycle' / ('receipt.invalid-' + '0' * 32) / 'receipt.json')
+                         .read_text(encoding='utf-8'), '{broken')
+
     def test_partial_recycle_move_failure_restores_all_artifacts(self):
         (self.directory / 'candidate').mkdir()
         (self.directory / 'candidate' / 'evidence').write_text('candidate')
