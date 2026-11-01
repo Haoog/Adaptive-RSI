@@ -91,58 +91,134 @@ class AppSourceGuardTest(unittest.TestCase):
             bundle = fake_bundle(directory)
             self.assertEqual(harness.validate_app_source(bundle), bundle.resolve())
 
+    def test_escaping_symlink_in_bundle_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = fake_bundle(directory)
+            outside = Path(directory) / "outside-target"
+            outside.write_text("OUTSIDE")
+
+            # Escaping symlink in Contents/MacOS
+            escaping_bin = bundle / "Contents/MacOS/escape_bin"
+            escaping_bin.symlink_to(outside)
+            with self.assertRaises(ValueError) as ctx:
+                harness.validate_app_source(bundle)
+            self.assertIn("escaping symlink", str(ctx.exception))
+
+            # Remove the escaping binary link and test escaping Info.plist link
+            escaping_bin.unlink()
+            (bundle / "Contents/Info.plist").unlink()
+            (bundle / "Contents/Info.plist").symlink_to(outside)
+            with self.assertRaises(ValueError) as ctx:
+                harness.validate_app_source(bundle)
+            self.assertIn("escaping symlink", str(ctx.exception))
+
+            # Restore valid Info.plist and test internal symlink is accepted
+            (bundle / "Contents/Info.plist").unlink()
+            (bundle / "Contents/Info.plist").write_text(
+                "<plist><dict><key>CFBundleShortVersionString</key><string>1.2.3</string></dict></plist>"
+            )
+            internal_link = bundle / "Contents/MacOS/internal_link"
+            internal_link.symlink_to("adaptive-rsi")
+            self.assertEqual(harness.validate_app_source(bundle), bundle.resolve())
+
 
 class FailureMatrixStageTest(unittest.TestCase):
-    def test_bad_signature_stage_asserts_old_app_preserved_and_service_recoverable(self):
+    def setUp(self):
+        self._orig_verify_codesign = harness.verify_codesign
+        harness.verify_codesign = lambda path: (0, "")
+
+    def tearDown(self):
+        harness.verify_codesign = self._orig_verify_codesign
+
+    def test_bad_signature_stage_reports_blocked_requiring_real_updater_integration(self):
         with tempfile.TemporaryDirectory() as app_dir, tempfile.TemporaryDirectory() as state_dir:
             bundle = fake_bundle(app_dir)
             result = harness.stage_bad_signature(bundle, state=state_dir)
-            self.assertEqual(result["status"], "passed")
-            self.assertTrue(result["old_app_preserved"])
-            self.assertTrue(result["service_recoverable"])
-            self.assertEqual(result["version"], "1.2.3")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "requires_real_updater_integration")
+            self.assertIn("native_update.rs", result["detail"])
 
-            receipt_file = Path(state_dir) / "update-receipts/update-receipt.json"
-            self.assertTrue(receipt_file.exists())
-            receipt = json.loads(receipt_file.read_text())
-            self.assertEqual(receipt["state"], "failed")
-            self.assertEqual(receipt["error_code"], "update_download_or_signature_failed")
-            self.assertFalse(receipt["signature_verified"])
-            self.assertEqual(receipt["from_version"], "1.2.3")
-
-    def test_startup_failure_stage_asserts_old_app_preserved_and_service_recoverable(self):
+    def test_startup_failure_stage_reports_blocked_requiring_real_updater_integration(self):
         with tempfile.TemporaryDirectory() as app_dir, tempfile.TemporaryDirectory() as state_dir:
             bundle = fake_bundle(app_dir)
             result = harness.stage_startup_failure(bundle, state=state_dir)
-            self.assertEqual(result["status"], "passed")
-            self.assertTrue(result["old_app_preserved"])
-            self.assertTrue(result["service_recoverable"])
-            self.assertEqual(result["version"], "1.2.3")
+            self.assertEqual(result["status"], "blocked")
+            self.assertEqual(result["reason"], "requires_real_updater_integration")
+            self.assertIn("native_update.rs", result["detail"])
 
-            receipt_file = Path(state_dir) / "update-receipts/update-receipt.json"
-            self.assertTrue(receipt_file.exists())
-            receipt = json.loads(receipt_file.read_text())
-            self.assertEqual(receipt["state"], "failed")
-            self.assertEqual(receipt["error_code"], "update_health_failed")
-            self.assertTrue(receipt["signature_verified"])
-            self.assertEqual(receipt["from_version"], "1.2.3")
+    def test_expected_bad_signature_receipt_shape(self):
+        receipt = harness.make_bad_signature_receipt("1.2.3", now=1700000000)
+        self.assertEqual(receipt["receipt_version"], 1)
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["error_code"], "update_download_or_signature_failed")
+        self.assertFalse(receipt["signature_verified"])
+        self.assertEqual(receipt["from_version"], "1.2.3")
+        self.assertEqual(receipt["to_version"], "9.9.9")
+
+    def test_expected_startup_failure_receipt_shape(self):
+        receipt = harness.make_startup_failure_receipt("1.2.3", now=1700000000)
+        self.assertEqual(receipt["receipt_version"], 1)
+        self.assertEqual(receipt["state"], "failed")
+        self.assertEqual(receipt["error_code"], "update_health_failed")
+        self.assertTrue(receipt["signature_verified"])
+        self.assertEqual(receipt["from_version"], "1.2.3")
+        self.assertEqual(receipt["to_version"], "broken-candidate")
 
     def test_run_executes_failure_matrix_stages_with_app(self):
         with tempfile.TemporaryDirectory() as app_dir, tempfile.TemporaryDirectory() as state_dir:
             bundle = fake_bundle(app_dir)
             report, status = harness.run(["bad_signature", "startup_failure"], app=bundle, state=state_dir)
             self.assertEqual(status, 0)
-            self.assertEqual(report["passed"], ["bad_signature", "startup_failure"])
+            self.assertEqual(report["passed"], [])
             self.assertEqual(report["failed"], [])
-            self.assertEqual(report["blocked"], [])
+            self.assertEqual(report["blocked"], ["bad_signature", "startup_failure"])
             self.assertEqual(report["actual_acceptance"], "incomplete")
 
+    def test_escaping_symlink_leaves_external_target_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            purelib = Path(d) / "purelib.app"
+            (purelib / "Contents").mkdir(parents=True)
+            (purelib / "Contents/MacOS").mkdir(parents=True)
+            (purelib / "Contents/Info.plist").write_text(
+                "<plist><dict><key>CFBundleShortVersionString</key><string>1.2.3</string></dict></plist>"
+            )
+            outside = Path(d) / "outside-bin"
+            outside.write_text("ORIGINAL")
+            binpath = purelib / "Contents/MacOS/purelib"
+            binpath.symlink_to(outside)
+
+            res_startup = harness.stage_startup_failure(purelib)
+            self.assertEqual(res_startup["status"], "blocked")
+            self.assertIn("escaping symlink", res_startup["reason"])
+
+            res_bad_sig = harness.stage_bad_signature(purelib)
+            self.assertEqual(res_bad_sig["status"], "blocked")
+            self.assertIn("escaping symlink", res_bad_sig["reason"])
+
+            self.assertEqual(outside.read_text(), "ORIGINAL")
+
+    def test_codesign_boundary_mocking(self):
+        with tempfile.TemporaryDirectory() as app_dir:
+            bundle = fake_bundle(app_dir)
+            harness.verify_codesign = lambda path: (0, "")
+            res_pass = harness.stage_isolation(bundle, None)
+            self.assertEqual(res_pass["status"], "passed")
+
+            harness.verify_codesign = lambda path: (1, "code object is not signed at all")
+            res_fail = harness.stage_isolation(bundle, None)
+            self.assertEqual(res_fail["status"], "failed")
+            self.assertEqual(res_fail["exit_code"], 1)
+            self.assertEqual(res_fail["reason"], "the isolated copy does not keep a valid signature")
+
+
+class MacOSCodesignTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS codesign and app bundle environment")
-    def test_macos_codesign_guard_on_tampered_bundle(self):
-        with tempfile.TemporaryDirectory() as directory:
-            bundle = fake_bundle(directory)
-            result = harness.stage_bad_signature(bundle)
-            self.assertIn(result["status"], ("passed", "failed"))
+    def test_macos_real_codesign_requires_signed_fixture(self):
+        real_app = os.environ.get("REAL_SIGNED_APP")
+        if not real_app or not Path(real_app).exists():
+            self.skipTest("requires a genuinely signed macOS .app build artifact via REAL_SIGNED_APP")
+        rc, err = harness.verify_codesign(real_app)
+        self.assertEqual(rc, 0, f"real codesign verification failed: {err}")
 
 
 class SummaryTest(unittest.TestCase):
@@ -175,6 +251,13 @@ class SummaryTest(unittest.TestCase):
                "TAURI_SIGNING_PRIVATE_KEY_PASSWORD": "secret", "HOME": "/tmp"}
         cleaned = harness.strip_signing_env(env)
         self.assertEqual(sorted(cleaned), ["HOME", "PATH"])
+
+    def test_blocked_failure_stages_cause_require_complete_to_exit_3(self):
+        blocked_stages = [{"stage": "bad_signature", "status": "blocked", "reason": "requires_real_updater_integration"}]
+        report, status = harness.summarize(blocked_stages, require_complete=True)
+        self.assertEqual(status, 3)
+        self.assertEqual(report["actual_acceptance"], "incomplete")
+        self.assertIn("bad_signature", report["blocked"])
 
 
 if __name__ == "__main__":

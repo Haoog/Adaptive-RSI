@@ -81,6 +81,13 @@ def validate_app_source(app, stage_name="isolation"):
     for required in ("Contents/Info.plist", "Contents/MacOS"):
         if not (resolved / required).exists():
             raise ValueError("the app fixture is missing " + required)
+    for root, dirs, files in os.walk(resolved, followlinks=False):
+        for name in dirs + files:
+            entry = Path(root) / name
+            if entry.is_symlink():
+                target = entry.resolve()
+                if resolved not in target.parents:
+                    raise ValueError(f"the app fixture contains an escaping symlink: {entry.relative_to(resolved)}")
     return resolved
 
 
@@ -155,6 +162,18 @@ def stage_cargo(name):
             "detail": " | ".join(details), "duration_s": round(time.monotonic() - started, 3)}
 
 
+def verify_codesign(path):
+    """Verify codesign signature on macOS if codesign tool is present.
+
+    Returns (returncode, stderr). On non-Darwin or without /usr/bin/codesign, returns (0, "").
+    """
+    if sys.platform != "darwin" or not Path("/usr/bin/codesign").exists():
+        return 0, ""
+    result = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    return result.returncode, result.stderr
+
+
 def stage_isolation(app, state):
     started = time.monotonic()
     try:
@@ -167,22 +186,21 @@ def stage_isolation(app, state):
     copy = work / source.name
     try:
         shutil.copytree(source, copy, symlinks=True)
-        verify = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(copy)],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        returncode, stderr = verify_codesign(copy)
         after = digest_of(source / "Contents/Info.plist")
         if after != before:
             return {"stage": "isolation", "status": "failed",
                     "reason": "the source bundle changed while it was copied",
                     "duration_s": round(time.monotonic() - started, 3)}
-        if verify.returncode != 0:
-            return {"stage": "isolation", "status": "failed", "exit_code": verify.returncode,
+        if returncode != 0:
+            return {"stage": "isolation", "status": "failed", "exit_code": returncode,
                     "command": ["/usr/bin/codesign", "--verify", "--deep", "--strict", "<isolated copy>"],
                     "reason": "the isolated copy does not keep a valid signature",
-                    "detail": verify.stderr.strip()[-1000:],
+                    "detail": stderr.strip()[-1000:],
                     "duration_s": round(time.monotonic() - started, 3)}
         if state:
             Path(state).expanduser().mkdir(parents=True, exist_ok=True)
-        return {"stage": "isolation", "status": "passed", "exit_code": verify.returncode,
+        return {"stage": "isolation", "status": "passed", "exit_code": returncode,
                 "command": ["/usr/bin/codesign", "--verify", "--deep", "--strict", "<isolated copy>"],
                 "source": str(source), "version": bundle_version(copy),
                 "state": str(Path(state).expanduser()) if state else "",
@@ -192,196 +210,77 @@ def stage_isolation(app, state):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def stage_bad_signature(app, state=None):
+def make_bad_signature_receipt(version, now=None):
+    ts = int(time.time()) if now is None else int(now)
+    return {
+        "receipt_version": 1,
+        "operation_id": f"bad-sig-{ts}",
+        "from_version": version or "0.0.0",
+        "to_version": "9.9.9",
+        "artifact_sha256": "0" * 64,
+        "signature_sha256": "f" * 64,
+        "signature_verified": False,
+        "created_at": ts,
+        "updated_at": ts,
+        "state": "failed",
+        "error_code": "update_download_or_signature_failed",
+    }
+
+
+def make_startup_failure_receipt(version, now=None):
+    ts = int(time.time()) if now is None else int(now)
+    return {
+        "receipt_version": 1,
+        "operation_id": f"startup-fail-{ts}",
+        "from_version": version or "0.0.0",
+        "to_version": "broken-candidate",
+        "artifact_sha256": "0" * 64,
+        "signature_sha256": "0" * 64,
+        "signature_verified": True,
+        "created_at": ts,
+        "updated_at": ts,
+        "state": "failed",
+        "error_code": "update_health_failed",
+    }
+
+
+def stage_bad_signature(app=None, state=None):
     """Exercises bad signature rejection and asserts the old app and service remain safe."""
     started = time.monotonic()
-    try:
-        source = validate_app_source(app, "bad_signature")
-    except ValueError as error:
-        return {"stage": "bad_signature", "status": "blocked", "reason": str(error),
-                "duration_s": round(time.monotonic() - started, 3)}
-    before_source = digest_of(source / "Contents/Info.plist")
-    work = Path(tempfile.mkdtemp(prefix="rsi-upgrade-bad-sig-"))
-    copy = work / source.name
-    try:
-        shutil.copytree(source, copy, symlinks=True)
-        before_plist = digest_of(copy / "Contents/Info.plist")
-        macos_dir = copy / "Contents/MacOS"
-        binaries = [f for f in macos_dir.iterdir() if f.is_file()]
-        before_binaries = {f.name: digest_of(f) for f in binaries}
-        version = bundle_version(copy)
-
-        if sys.platform == "darwin" and Path("/usr/bin/codesign").exists():
-            verify = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(copy)],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
-            if verify.returncode != 0:
-                return {"stage": "bad_signature", "status": "failed", "exit_code": verify.returncode,
-                        "command": ["/usr/bin/codesign", "--verify", "--deep", "--strict", "<isolated copy>"],
-                        "reason": "the isolated copy does not keep a valid signature",
-                        "detail": verify.stderr.strip()[-1000:],
-                        "duration_s": round(time.monotonic() - started, 3)}
-
-        # Reject update on bad signature: verify old app remains untouched
-        after_source = digest_of(source / "Contents/Info.plist")
-        if after_source != before_source:
-            return {"stage": "bad_signature", "status": "failed",
-                    "reason": "the source bundle changed while it was copied",
+    if app is not None:
+        try:
+            validate_app_source(app, "bad_signature")
+        except ValueError as error:
+            return {"stage": "bad_signature", "status": "blocked", "reason": str(error),
                     "duration_s": round(time.monotonic() - started, 3)}
-
-        after_plist = digest_of(copy / "Contents/Info.plist")
-        after_binaries = {f.name: digest_of(f) for f in macos_dir.iterdir() if f.is_file()}
-        if after_plist != before_plist or after_binaries != before_binaries:
-            return {"stage": "bad_signature", "status": "failed",
-                    "reason": "the installed application bundle was altered during bad signature rejection",
-                    "duration_s": round(time.monotonic() - started, 3)}
-
-        if sys.platform == "darwin" and Path("/usr/bin/codesign").exists():
-            verify_after = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(copy)],
-                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
-            if verify_after.returncode != 0:
-                return {"stage": "bad_signature", "status": "failed", "exit_code": verify_after.returncode,
-                        "reason": "the preserved application does not keep a valid signature",
-                        "duration_s": round(time.monotonic() - started, 3)}
-
-        if not binaries or not any(os.access(f, os.X_OK | os.R_OK) for f in binaries):
-            return {"stage": "bad_signature", "status": "failed",
-                    "reason": "the preserved application lacks executable service binaries",
-                    "duration_s": round(time.monotonic() - started, 3)}
-
-        if state:
-            receipt_dir = Path(state).expanduser() / "update-receipts"
-            receipt_dir.mkdir(parents=True, exist_ok=True)
-            receipt_path = receipt_dir / "update-receipt.json"
-            now = int(time.time())
-            receipt = {
-                "receipt_version": 1,
-                "operation_id": f"bad-sig-{now}",
-                "from_version": version or "0.0.0",
-                "to_version": "9.9.9",
-                "artifact_sha256": "0" * 64,
-                "signature_sha256": "f" * 64,
-                "signature_verified": False,
-                "created_at": now,
-                "updated_at": now,
-                "state": "failed",
-                "error_code": "update_download_or_signature_failed",
-            }
-            receipt_path.write_text(json.dumps(receipt, indent=2))
-
-        return {
-            "stage": "bad_signature",
-            "status": "passed",
-            "old_app_preserved": True,
-            "service_recoverable": True,
-            "source": str(source),
-            "version": version,
-            "state": str(Path(state).expanduser()) if state else "",
-            "detail": "bad signature rejected; old application preserved and service remains recoverable",
-            "duration_s": round(time.monotonic() - started, 3),
-        }
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    return {
+        "stage": "bad_signature",
+        "status": "blocked",
+        "reason": "requires_real_updater_integration",
+        "detail": "Exercising bad signature rejection requires driving native_update.rs "
+                  "and observing the real receipt store. This harness does not simulate updater failure paths.",
+        "duration_s": round(time.monotonic() - started, 3),
+    }
 
 
-def stage_startup_failure(app, state=None):
+def stage_startup_failure(app=None, state=None):
     """Exercises post-replacement startup failure rollback and asserts safety."""
     started = time.monotonic()
-    try:
-        source = validate_app_source(app, "startup_failure")
-    except ValueError as error:
-        return {"stage": "startup_failure", "status": "blocked", "reason": str(error),
-                "duration_s": round(time.monotonic() - started, 3)}
-    before_source = digest_of(source / "Contents/Info.plist")
-    work = Path(tempfile.mkdtemp(prefix="rsi-upgrade-startup-fail-"))
-    copy = work / source.name
-    backup = work / f"{source.name}.backup"
-    try:
-        shutil.copytree(source, copy, symlinks=True)
-        before_plist = digest_of(copy / "Contents/Info.plist")
-        macos_dir = copy / "Contents/MacOS"
-        binaries = [f for f in macos_dir.iterdir() if f.is_file()]
-        before_binaries = {f.name: digest_of(f) for f in binaries}
-        version = bundle_version(copy)
-
-        # 1. Back up old app before attempting replacement
-        shutil.copytree(copy, backup, symlinks=True)
-
-        # 2. Simulate replacement with candidate that fails startup health check
-        broken_plist = copy / "Contents/Info.plist"
-        broken_plist.write_text("<plist><dict><key>CFBundleShortVersionString</key><string>broken-candidate</string></dict></plist>")
-        for b in binaries:
-            (copy / "Contents/MacOS" / b.name).write_text("corrupted-candidate-binary")
-
-        # 3. Startup failure detected; automatic rollback restores old app
-        shutil.rmtree(copy)
-        shutil.copytree(backup, copy, symlinks=True)
-        shutil.rmtree(backup, ignore_errors=True)
-
-        restored_plist = digest_of(copy / "Contents/Info.plist")
-        restored_binaries = {f.name: digest_of(copy / "Contents/MacOS" / f.name) for f in binaries}
-        if restored_plist != before_plist or restored_binaries != before_binaries:
-            return {"stage": "startup_failure", "status": "failed",
-                    "reason": "the restored application bundle does not match the original old app",
+    if app is not None:
+        try:
+            validate_app_source(app, "startup_failure")
+        except ValueError as error:
+            return {"stage": "startup_failure", "status": "blocked", "reason": str(error),
                     "duration_s": round(time.monotonic() - started, 3)}
-
-        if bundle_version(copy) != version:
-            return {"stage": "startup_failure", "status": "failed",
-                    "reason": "the restored application version does not match the original old app",
-                    "duration_s": round(time.monotonic() - started, 3)}
-
-        after_source = digest_of(source / "Contents/Info.plist")
-        if after_source != before_source:
-            return {"stage": "startup_failure", "status": "failed",
-                    "reason": "the source bundle changed during rollback",
-                    "duration_s": round(time.monotonic() - started, 3)}
-
-        if sys.platform == "darwin" and Path("/usr/bin/codesign").exists():
-            verify_restored = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(copy)],
-                                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
-            if verify_restored.returncode != 0:
-                return {"stage": "startup_failure", "status": "failed", "exit_code": verify_restored.returncode,
-                        "reason": "the restored application does not keep a valid signature",
-                        "duration_s": round(time.monotonic() - started, 3)}
-
-        # 4. Verify service is recoverable
-        if not binaries or not any(os.access(copy / "Contents/MacOS" / f.name, os.X_OK | os.R_OK) for f in binaries):
-            return {"stage": "startup_failure", "status": "failed",
-                    "reason": "the restored application lacks executable service binaries",
-                    "duration_s": round(time.monotonic() - started, 3)}
-
-        if state:
-            receipt_dir = Path(state).expanduser() / "update-receipts"
-            receipt_dir.mkdir(parents=True, exist_ok=True)
-            receipt_path = receipt_dir / "update-receipt.json"
-            now = int(time.time())
-            receipt = {
-                "receipt_version": 1,
-                "operation_id": f"startup-fail-{now}",
-                "from_version": version or "0.0.0",
-                "to_version": "broken-candidate",
-                "artifact_sha256": "0" * 64,
-                "signature_sha256": "0" * 64,
-                "signature_verified": True,
-                "created_at": now,
-                "updated_at": now,
-                "state": "failed",
-                "error_code": "update_health_failed",
-            }
-            receipt_path.write_text(json.dumps(receipt, indent=2))
-
-        return {
-            "stage": "startup_failure",
-            "status": "passed",
-            "old_app_preserved": True,
-            "service_recoverable": True,
-            "source": str(source),
-            "version": version,
-            "state": str(Path(state).expanduser()) if state else "",
-            "detail": "post-replacement startup failure safely rolled back; old application preserved and service restored",
-            "duration_s": round(time.monotonic() - started, 3),
-        }
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    return {
+        "stage": "startup_failure",
+        "status": "blocked",
+        "reason": "requires_real_updater_integration",
+        "detail": "Exercising post-replacement startup failure rollback requires driving "
+                  "native_update.rs / update_receipt.rs and observing the real health check. "
+                  "This harness does not simulate updater failure paths.",
+        "duration_s": round(time.monotonic() - started, 3),
+    }
 
 
 def stage_replacement():
@@ -406,15 +305,24 @@ def summarize(stages, require_complete=False):
     # Only a real replacement stage can make the acceptance complete; signature,
     # receipt and isolation checks are real, but they are not the app swap.
     complete = not failed and not blocked and bool(replaced)
+    if complete:
+        note = ""
+    else:
+        notes = []
+        if not replaced or any(item["stage"] == "replacement" and item["status"] == "blocked" for item in stages):
+            notes.append("The real signed N -> N+1 app replacement was not exercised.")
+        if any(item["stage"] in ("bad_signature", "startup_failure") and item["status"] == "blocked" for item in stages):
+            notes.append("Failure recovery stages require real updater integration.")
+        if not notes:
+            notes.append("These stages cover signatures, the persisted receipt and the native authorization gates.")
+        note = " ".join(notes)
     report = {"harness": "desktop-upgrade", "stages": stages,
               "passed": [item["stage"] for item in stages if item["status"] == "passed"],
               "blocked": [item["stage"] for item in stages if item["status"] == "blocked"],
               "failed": [item["stage"] for item in stages if item["status"] == "failed"],
               "actual_acceptance": "complete" if complete else "incomplete",
               "acceptance_scope": "real_installer_replacement" if complete else "staging_only",
-              "note": "" if complete else "The real signed N -> N+1 app replacement was not "
-                                          "exercised; these stages cover signatures, the persisted "
-                                          "receipt and the native authorization gates."}
+              "note": note}
     if failed:
         status = 1
     elif require_complete and (blocked or not replaced):
