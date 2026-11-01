@@ -20,7 +20,7 @@ let capabilitySequence=0,scopeChosen=false,scopeInitialized=false,taskOffset=0;
 const readinessCache=new Map(),bootBuild=document.documentElement?.dataset?.build||'';
 let readinessSequence=0;
 const loadedStateSections={analyticsProject:null,analyticsAt:0,candidatesProject:null,candidatesAt:0};
-const pendingForms=new WeakSet(),pendingSettingsSaves=new Map(),listSnapshots=new WeakMap(),goalReceipts=new Map();
+const pendingForms=new WeakSet(),pendingSettingsSaves=new Map(),listSnapshots=new WeakMap(),goalReceipts=new Map(),releaseCandidatesCache=new Map();
 function changedList(node,rows){const signature=JSON.stringify([projectId,language,rows]);if(listSnapshots.get(node)===signature)return false;listSnapshots.set(node,signature);return true;}
 const draftStore=(()=>{
  const memory=new Map();let warned=false;
@@ -1247,9 +1247,13 @@ async function reloadReleaseOutcome(project){
 function renderReleaseReconciliation(row,operation,project,run,kind,target){
  const current=target==='rollback'?operation.rollback:operation;
  if(!current||!['dispatch_unknown','rerun_unknown'].includes(current.state))return;
+ const cacheKey=`${project}:${run.id}:${kind}:${target}`;
+ const cachedSelectable=releaseCandidatesCache.get(cacheKey);
  const reconciliation=current.reconciliation&&typeof current.reconciliation==='object'?current.reconciliation:{};
- const candidates=Array.isArray(reconciliation.candidates)?reconciliation.candidates.filter(candidate=>
-  candidate&&Number.isInteger(candidate.id)&&typeof candidate.url==='string'&&/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/.test(candidate.url)):[];
+ const rawCandidates=Array.isArray(reconciliation.selectable_candidates)?reconciliation.selectable_candidates:(Array.isArray(cachedSelectable)?cachedSelectable:(Array.isArray(reconciliation.candidates)?reconciliation.candidates:[]));
+ const candidates=rawCandidates.filter(candidate=>
+  candidate&&Number.isInteger(candidate.id)&&typeof candidate.url==='string'&&/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/\d+$/.test(candidate.url));
+ const candidateCount=Number.isInteger(reconciliation.candidate_count)?reconciliation.candidate_count:candidates.length;
  const panel=el('div',undefined,'release-reconciliation');
  panel.append(el('h5',t(current.state==='rerun_unknown'?'重试是否启动仍待确认':'是否启动仍待确认')));
  if(Number.isFinite(reconciliation.checked_at))panel.append(el('p',t('核对时间')+' '+stamp(reconciliation.checked_at),'muted'));
@@ -1265,6 +1269,9 @@ function renderReleaseReconciliation(row,operation,project,run,kind,target){
    list.append(item);
   }
   panel.append(list);
+  if(candidateCount>candidates.length){
+   panel.append(el('p',t('共 {total} 条，当前展示 {shown} 条').replace('{total}',candidateCount).replace('{shown}',candidates.length),'muted'));
+  }
   const select=el('select',undefined,'release-candidate-select');
   select.setAttribute('aria-label',t('选择要关联的工作流记录'));
   const placeholder=el('option',t('请选择一条工作流记录'));placeholder.value='';select.append(placeholder);
@@ -1272,7 +1279,7 @@ function renderReleaseReconciliation(row,operation,project,run,kind,target){
   const bind=action(t('关联所选记录'),async()=>{
    const selected=select.value;if(!selected)return;
    bind.disabled=true;
-   try{await api('release-resolve',{project,run:run.id,kind,target,workflow_run_id:Number(selected)});await reloadReleaseOutcome(project);}
+   try{await api('release-resolve',{project,run:run.id,kind,target,workflow_run_id:Number(selected)});releaseCandidatesCache.delete(cacheKey);await reloadReleaseOutcome(project);}
    finally{bind.disabled=!select.value;}
   },'text-button');
   bind.disabled=true;select.addEventListener('change',()=>{bind.disabled=!select.value;});
@@ -1282,7 +1289,11 @@ function renderReleaseReconciliation(row,operation,project,run,kind,target){
  }
  const recheck=action(t('只读重新查询'),async()=>{
   recheck.disabled=true;
-  try{await api('release-candidates?project='+encodeURIComponent(project)+'&run='+encodeURIComponent(run.id)+'&kind='+encodeURIComponent(kind)+'&target='+encodeURIComponent(target));await reloadReleaseOutcome(project);}
+  try{
+   const view=await api('release-candidates?project='+encodeURIComponent(project)+'&run='+encodeURIComponent(run.id)+'&kind='+encodeURIComponent(kind)+'&target='+encodeURIComponent(target));
+   if(view&&Array.isArray(view.selectable_candidates))releaseCandidatesCache.set(cacheKey,view.selectable_candidates);
+   await reloadReleaseOutcome(project);
+  }
   finally{recheck.disabled=false;}
  },'text-button');
  panel.append(recheck);

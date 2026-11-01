@@ -79,6 +79,7 @@ class Evolution:
     def __init__(self, runtime):
         self.runtime = runtime
         self.store = runtime.store
+        self._plan_keys = {}
 
     def verify_inputs(self, project, manifest):
         mismatches = []
@@ -918,6 +919,8 @@ class Evolution:
                 self.store.event("promotion", "Candidate passed paired validation and holdout; limited operational monitoring started",
                                  project["id"], run["id"], {"candidate": candidate})
                 state = "stable"
+                if hasattr(self, "_plan_keys"):
+                    self._plan_keys.pop(candidate, None)
             else:
                 self.save(candidate, "ready" if state == "pass" else state, evidence)
             self.record_attempt(project["id"], signature, state, candidate, evidence["reason"])
@@ -1050,11 +1053,23 @@ class Evolution:
                 "reason": "Repeated paired improvement on both splits without observed regressions"}
 
     def save(self, candidate, status, evidence):
-        if evidence.get("preregistered_plan"):
-            evidence["plan_verification"] = self.verify_plan(evidence["preregistered_plan"], evidence.get("trials", []))
-            if status == "evaluating" and not evidence["plan_verification"]["valid"]:
-                evidence["plan_verification"]["analysis"] = "planned_in_progress"
-        evidence["win_rate"] = paired_summary(evidence.get("trials", []))
+        if not hasattr(self, "_plan_keys"):
+            self._plan_keys = {}
+        plan = evidence.get("preregistered_plan")
+        plan_key = fingerprint(plan) if plan else None
+        sentinel = object()
+        plan_changed = (self._plan_keys.get(candidate, sentinel) != plan_key) or (bool(plan) and "plan_verification" not in evidence)
+        is_terminal = (status != "evaluating")
+
+        if is_terminal or plan_changed or "win_rate" not in evidence:
+            if plan:
+                evidence["plan_verification"] = self.verify_plan(plan, evidence.get("trials", []))
+                if status == "evaluating" and not evidence["plan_verification"]["valid"]:
+                    evidence["plan_verification"]["analysis"] = "planned_in_progress"
+            evidence["win_rate"] = paired_summary(evidence.get("trials", []))
+            self._plan_keys[candidate] = plan_key
+        if is_terminal:
+            self._plan_keys.pop(candidate, None)
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))
 
     @staticmethod
