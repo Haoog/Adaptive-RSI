@@ -13,7 +13,7 @@ Sealed experiment bundles exported through the strategy evolution subsystem (`Ev
 - Whole-input SHA-256 manifest and declared limitations (`bundle.json`)
 
 Sealed bundles adhere to deterministic input and credential exclusion principles:
-1. **Credential exclusion**: Bundles never include third-party API keys, private tokens, or environment credentials.
+1. **Credential exclusion**: Bundles never include third-party API keys, private tokens, or environment credentials. `evidence.json` records only non-secret provider requirements (provider id and required environment variable name), never key values.
 2. **Frozen inputs**: Source code repositories, base commit SHAs, and check commands are frozen at export time to prevent external drift.
 3. **Isolation boundaries**: Input integrity verification establishes that files are untampered; it is not proof of standalone autonomous model execution in an air-gapped environment without external providers.
 
@@ -34,17 +34,17 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 ### Stage 3: Host tools and execution dependencies
 
 - [ ] **3.1 Check VCS tooling**: Verify `git` is available on the isolated host to operate on case repository snapshots.
-- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`).
+- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification.
 - [ ] **3.3 Enumerate missing tools**: The reproduction script enumerates every missing dependency without aborting at the first failure, allowing comprehensive batch provisioning.
 
 ### Stage 4: Credentials and model access
 
-- [ ] **4.1 Inspect model environment**: Check for required provider keys (such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`).
+- [ ] **4.1 Inspect model environment**: Credential requirements come from the provider requirements recorded at export (the `providers` field of `evidence.json`, containing only provider ids and `env_key` environment variable names). Only providers whose `env_key` names an environment variable need a credential; login-based or local providers (empty `env_key`) require no API key and never imply `OPENAI_API_KEY`. Bundles exported without this field produce a "credential availability cannot be determined" limitation instead of guessed key requirements.
 - [ ] **4.2 Declare offline limitations**: When operating without credentials or network egress, verify that missing credentials and unreachable model APIs are explicitly enumerated in limitations without crashing.
 
 ### Stage 5: Offline execution and replay
 
-- [ ] **5.1 Verify baseline checks**: With host tools available, run `--run-checks` to execute frozen checks against case repositories.
+- [ ] **5.1 Verify baseline checks**: With host tools available, run `--run-checks` to execute frozen checks against the cases. Commands run inside a disposable temporary copy: the `repository` is copied first, then the sealed `overlay` is layered onto the copy with the same symlink-rejection semantics as the evaluator; bundle files stay untouched, and only manifest-registered cases run.
 - [ ] **5.2 End-to-end evaluation note**: Re-running candidate generation requires provisioning appropriate model access and trusted network gateways.
 
 ## Reproduction script usage

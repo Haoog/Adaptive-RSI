@@ -188,6 +188,58 @@ class Evolution:
                 "interaction_only": [key for key, group in groups.items() if group["combined"] and not any(group[v] for v in variants - {"combined"})],
                 "limitation": "Descriptive matched outcomes; no causal attribution without controlled execution"}
 
+    def experiment_config(self, candidate_row, evidence):
+        """Configuration of the sealed experiment run for export-time metadata.
+
+        The recorded run configuration is authoritative; candidates without a
+        stored run fall back to the current project configuration.
+        """
+        run_id = evidence.get("run") if isinstance(evidence, dict) else None
+        if isinstance(run_id, str) and run_id:
+            run_row = self.store.one("SELECT config FROM runs WHERE id=?", (run_id,))
+            if run_row:
+                try:
+                    config = json.loads(run_row["config"])
+                except (TypeError, ValueError):
+                    config = None
+                if isinstance(config, dict):
+                    return config
+        try:
+            config = self.runtime.config(candidate_row["project"])
+        except Exception:
+            return {}
+        return config if isinstance(config, dict) else {}
+
+    @staticmethod
+    def provider_requirements(config):
+        """Non-secret provider requirements: provider id plus credential env var name.
+
+        Mirrors readiness semantics: a provider needs an environment credential
+        only when its env_key names one; login-based or local providers carry an
+        empty env_key and must never imply OPENAI_API_KEY.
+        """
+        if not isinstance(config, dict):
+            return []
+        providers = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
+        requirements = []
+        seen = set()
+        models = config.get("models")
+        routes = models.values() if isinstance(models, dict) else []
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            for item in [route, route.get("fallback")]:
+                if not isinstance(item, dict):
+                    continue
+                provider_id = item.get("provider", "openai")
+                if not isinstance(provider_id, str) or provider_id in seen:
+                    continue
+                seen.add(provider_id)
+                entry = providers.get(provider_id) or {}
+                env_key = entry.get("env_key")
+                requirements.append({"id": provider_id, "env_key": env_key if isinstance(env_key, str) else ""})
+        return requirements
+
     def export_bundle(self, candidate, destination):
         """Export sealed local inputs, never credentials or arbitrary evidence paths."""
         import hashlib
@@ -198,6 +250,17 @@ class Evolution:
         root.mkdir(parents=True, exist_ok=False)
         evidence = json.loads(row["evidence"])
         try:
+            # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
+            # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
+            # 一律丢弃；未登记时才从实验 run 配置计算。
+            providers_meta = evidence.get("providers")
+            if isinstance(providers_meta, list):
+                evidence["providers"] = [
+                    {"id": item.get("id") if isinstance(item.get("id"), str) else "",
+                     "env_key": item.get("env_key") if isinstance(item.get("env_key"), str) else ""}
+                    for item in providers_meta if isinstance(item, dict)]
+            else:
+                evidence["providers"] = self.provider_requirements(self.experiment_config(row, evidence))
             (root / "evidence.json").write_text(encode(evidence), encoding="utf-8")
             (root / "candidate.json").write_text(row["content"], encoding="utf-8")
             limitations = ["Credentials are excluded; external services, model availability and host tools must be supplied independently",
@@ -305,18 +368,42 @@ class Evolution:
         else:
             missing_tools.append({"name": "git", "type": "vcs", "reason": "git executable not found in PATH"})
 
-        # 2. Inspect case check dependencies across all sealed cases
-        cases_dir = root / "cases"
+        # 2. Inspect case check dependencies across verified manifest entries only.
+        # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
+        # 同一套规则判 integrity 失效（防 verify 与读取之间被调包）。
         case_items = []
-        if cases_dir.is_dir():
-            for case_entry in sorted(cases_dir.iterdir()):
-                case_json = case_entry / "case.json"
-                if case_json.is_file():
+        invalid_cases = []
+        if integrity.get("valid"):
+            files = manifest.get("files")
+            if isinstance(files, dict):
+                for relative in sorted(files):
+                    parts = Path(relative).parts
+                    if len(parts) != 3 or parts[0] != "cases" or parts[2] != "case.json":
+                        continue
+                    case_json = root.joinpath(*parts)
+                    if any(p.is_symlink() for p in [case_json] + list(case_json.parents)):
+                        invalid_cases.append(relative)
+                        continue
                     try:
                         spec = json.loads(case_json.read_text(encoding="utf-8"))
-                        case_items.append((case_entry.name, case_entry, spec))
-                    except Exception:
-                        pass
+                    except (OSError, ValueError):
+                        invalid_cases.append(relative)
+                        continue
+                    if isinstance(spec, dict):
+                        case_items.append((parts[1], case_json.parent, spec))
+                # 未登记的用例目录与符号链接条目按 verify_bundle 同一规则判失效：
+                # 只做存在性检查，不读取其内容，更不执行。
+                cases_dir = root / "cases"
+                if cases_dir.is_dir():
+                    for entry in sorted(cases_dir.iterdir()):
+                        if entry.is_symlink():
+                            invalid_cases.append(f"cases/{entry.name}")
+                        elif (entry / "case.json").is_file() and f"cases/{entry.name}/case.json" not in files:
+                            invalid_cases.append(f"cases/{entry.name}/case.json")
+            if invalid_cases:
+                integrity = {**integrity, "valid": False,
+                             "mismatches": list(integrity.get("mismatches", [])) + invalid_cases}
+                case_items = []
 
         seen_tools = {}
         for case_id, case_entry, spec in case_items:
@@ -350,39 +437,26 @@ class Evolution:
             else:
                 missing_tools.append(info)
 
-        # 3. Model credentials check
+        # 3. Model credentials check, derived from exported provider requirements
+        credential_limitation = None
         if required_credentials is not None:
             needed_creds = list(required_credentials)
         else:
-            needed_creds = []
-            models = evidence.get("models") or {}
-            providers = evidence.get("providers") or []
-            provider_names = set()
-            if isinstance(models, dict):
-                for route in models.values():
-                    if isinstance(route, dict) and route.get("provider"):
-                        provider_names.add(route["provider"])
-            if isinstance(providers, list):
-                for prov in providers:
+            providers_meta = evidence.get("providers") if isinstance(evidence, dict) else None
+            if isinstance(providers_meta, list):
+                # 导出包已记录非机密 provider 需求：只有 env_key 指向环境变量的
+                # provider 才需要凭据；login 或本地 provider 不暗示任何默认密钥。
+                needed_creds = []
+                for prov in providers_meta:
                     if isinstance(prov, dict):
-                        if prov.get("env_key"):
-                            needed_creds.append(prov["env_key"])
-                        elif prov.get("id"):
-                            provider_names.add(prov["id"])
-
-            standard_provider_keys = {
-                "openai": "OPENAI_API_KEY",
-                "anthropic": "ANTHROPIC_API_KEY",
-                "opencode": "OPENCODE_API_KEY",
-                "gemini": "GEMINI_API_KEY",
-            }
-            for pname in provider_names:
-                key = standard_provider_keys.get(pname, f"{pname.upper()}_API_KEY")
-                if key not in needed_creds:
-                    needed_creds.append(key)
-
-            if not needed_creds:
-                needed_creds.append("OPENAI_API_KEY")
+                        env_key = prov.get("env_key")
+                        if isinstance(env_key, str) and env_key and env_key not in needed_creds:
+                            needed_creds.append(env_key)
+            else:
+                # 导出包未记录 provider 需求：凭据可用性无法判定，不再默认要求 OPENAI_API_KEY。
+                needed_creds = []
+                credential_limitation = ("Bundle does not record provider requirements; "
+                                         "credential availability cannot be determined")
 
         available_creds = []
         missing_creds = []
@@ -396,6 +470,8 @@ class Evolution:
 
         # 4. Formulate limitations
         repro_limitations = list(limitations)
+        if credential_limitation and credential_limitation not in repro_limitations:
+            repro_limitations.append(credential_limitation)
         if missing_creds:
             msg = f"Missing credentials: {', '.join(c['name'] for c in missing_creds)} not configured; online model generation cannot be reproduced without external provider access"
             if msg not in repro_limitations:
@@ -411,47 +487,86 @@ class Evolution:
         is_reproducible = (
             bool(integrity.get("valid")) and
             len(missing_tools) == 0 and
-            len(missing_creds) == 0
+            len(missing_creds) == 0 and
+            credential_limitation is None
         )
 
         # 5. Optional check execution
+        # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
+        # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
         executed_checks = []
         if run_checks and integrity.get("valid") and not missing_tools:
+            import tempfile
             for case_id, case_entry, spec in case_items:
                 repo_dir = case_entry / "repository"
-                for check in spec.get("checks", []):
-                    argv = check.get("argv", [])
-                    if not argv:
-                        continue
-                    cwd = (repo_dir / check.get("cwd", ".")).resolve()
-                    run_cwd = cwd if cwd.is_dir() else repo_dir
+                overlay_dir = case_entry / "overlay"
+                staging_tmp = None
+                try:
+                    staging_tmp = tempfile.mkdtemp(prefix="bundle-check-")
+                    staging = Path(staging_tmp) / "repository"
+                    overlay_applied = False
                     try:
-                        proc = subprocess.run(
-                            argv,
-                            cwd=run_cwd,
-                            capture_output=True,
-                            text=True,
-                            timeout=60,
-                            env=env_dict,
-                        )
-                        executed_checks.append({
-                            "case": case_id,
-                            "check": check.get("name"),
-                            "argv": argv,
-                            "exit_code": proc.returncode,
-                            "passed": proc.returncode == 0,
-                            "stdout": proc.stdout[:1000],
-                            "stderr": proc.stderr[:1000],
-                        })
+                        shutil.copytree(repo_dir, staging, symlinks=True)
+                        if overlay_dir.is_dir():
+                            scrub_tree(overlay_dir)
+                            for parent, dirs, files in os.walk(overlay_dir, followlinks=False):
+                                for name in files:
+                                    source = Path(parent) / name
+                                    target = staging / source.relative_to(overlay_dir)
+                                    if target.is_symlink() or any(p.is_symlink() for p in target.parents):
+                                        raise RuntimeError("Symlink overlaps reproduction overlay")
+                                    target.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(source, target)
+                                    overlay_applied = True
                     except Exception as exc:
                         executed_checks.append({
-                            "case": case_id,
-                            "check": check.get("name"),
-                            "argv": argv,
-                            "exit_code": -1,
-                            "passed": False,
-                            "error": str(exc),
+                            "case": case_id, "check": None, "argv": [],
+                            "exit_code": -1, "passed": False, "error": str(exc),
                         })
+                        continue
+                    for check in spec.get("checks", []):
+                        argv = check.get("argv", [])
+                        if not argv:
+                            continue
+                        cwd = (staging / check.get("cwd", ".")).resolve()
+                        run_cwd = cwd if cwd.is_dir() else staging
+                        try:
+                            proc = subprocess.run(
+                                argv,
+                                cwd=run_cwd,
+                                capture_output=True,
+                                text=True,
+                                timeout=60,
+                                env=env_dict,
+                            )
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "exit_code": proc.returncode,
+                                "passed": proc.returncode == 0,
+                                "overlay_applied": overlay_applied,
+                                "stdout": proc.stdout[:1000],
+                                "stderr": proc.stderr[:1000],
+                            })
+                        except Exception as exc:
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "exit_code": -1,
+                                "passed": False,
+                                "overlay_applied": overlay_applied,
+                                "error": str(exc),
+                            })
+                except Exception as exc:
+                    executed_checks.append({
+                        "case": case_id, "check": None, "argv": [],
+                        "exit_code": -1, "passed": False, "error": str(exc),
+                    })
+                finally:
+                    if staging_tmp:
+                        shutil.rmtree(staging_tmp, ignore_errors=True)
 
         return {
             "valid": bool(integrity.get("valid")),
