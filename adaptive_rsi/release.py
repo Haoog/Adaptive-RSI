@@ -379,9 +379,12 @@ def reconcile(runtime, run, kind, data, persist=True):
             data.update(rerun_pending=True, checked_at=time.time())
             if time.time() - requested >= RERUN_CONFIRM_SECONDS:
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
-            _record_reconciliation(data, repo, [remote],
-                                   "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
-                                   "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
+            # 只读对账已确认的 rerun_confirmed / manual_inspection_required 证据，
+            # 不能被一次回落到旧 attempt 的轮询覆写。
+            if (data.get("reconciliation") or {}).get("state") not in {"rerun_confirmed", "manual_inspection_required"}:
+                _record_reconciliation(data, repo, [remote],
+                                       "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
+                                       "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
     _record_reconciliation(data, repo, [remote], "matched",
@@ -1038,7 +1041,24 @@ def advance(runtime, project, run, outcome, cancel=None):
                     if comparison.get("status") != "ahead":
                         result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
                         continue
-            validate_pin(repo, policy)
+            try:
+                validate_pin(repo, policy)
+            except ApiRejected as exc:
+                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
+                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
+                # 状态被轮询无限重试。
+                identity = {"repository": repo, "workflow": policy["workflow"], "ref": policy["ref"],
+                            "workflow_sha": policy["sha"], "sha": outcome["merged_sha"], "kind": kind}
+                if not data:
+                    data = {"state": "failed", **identity}
+                for field, value in identity.items():
+                    data.setdefault(field, value)
+                data.setdefault("operation_id", "rsi-" + fingerprint(
+                    {"project": project["id"], "run": run["id"], "kind": kind,
+                     "repository": repo, "sha": outcome["merged_sha"]})[:32])
+                data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                            dispatch_http_status=exc.status)
+                raise
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy, cancel)
                 if kind == "deploy" and deployment_owner(runtime, project["id"], repo, policy) != expected_owner:

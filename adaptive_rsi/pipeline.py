@@ -126,7 +126,7 @@ def _artifact_identity(artifacts):
             for name, row in artifacts.items() if isinstance(row, dict)}
 
 
-def _review_identity(evaluation, run_id=None):
+def _review_identity(evaluation):
     """Cache identity for a completed review: complete results, no wall-clock noise."""
     evidence = _review_evidence(evaluation, include_test_output=False)
     checks = {}
@@ -150,8 +150,10 @@ def _review_identity(evaluation, run_id=None):
             for key in ("stdout", "stderr"):
                 text = row.get(key)
                 if isinstance(text, str):
-                    if run_id:
-                        text = text.replace('/runs/' + run_id + '/', '/runs/<run>/')
+                    # A reused evaluation still quotes the run directory that
+                    # produced it, so normalize any run id: the key must not
+                    # depend on which attempt first executed the checks.
+                    text = re.sub(r'/runs/[^/\s]+/', '/runs/<run>/', text)
                     text = re.sub(r'(?m)^(Ran \d+ tests? in )[0-9.]+(s)$', r'\1<duration>\2', text)
                 diagnostics[key] = text
             item["diagnostics"] = fingerprint(diagnostics)
@@ -175,8 +177,44 @@ def _review_key(run, task, base, strategies, config, plan, evaluation, summary, 
     from .recovery import signature
     review_config, _ = _stage_config(config, "review")
     return fingerprint({"inputs": signature(run, task, base, strategies, review_config), "plan": plan,
-                        "evaluation": _review_identity(evaluation, run.get("id")), "summary": summary,
+                        "evaluation": _review_identity(evaluation), "summary": summary,
                         "patch_hash": fingerprint(patch)})
+
+
+def _evaluation_source(config, base, checks, patch, environment_digest, acceptance, test_first, change_type):
+    """The exact trees and settings one evaluation result describes.
+
+    The stage signature is computed before implementation and therefore cannot
+    tell two different candidates apart; binding the patch hash, the base tree
+    and the check configuration here keeps a stored verdict tied to the code it
+    actually ran. Host counterexample controls are part of the check contract
+    but live outside the stage-cache subset, so they are named here too.
+    """
+    return {"base": base, "checks": checks, "patch_hash": fingerprint(patch),
+            "environment": environment_digest, "validation": config.get("validation"),
+            "acceptance_hash": acceptance["hash"] if acceptance else None,
+            "test_first": bool(test_first), "change_kind": change_type}
+
+
+def _reusable_evaluation(source):
+    """Accept one stored evaluation only when it can stand in for a fresh run.
+
+    A failed, truncated or differently sourced record raises, so ``cached``
+    discards that single stage and the caller evaluates the candidate again;
+    reuse can never soften the verdict it replays.
+    """
+    def accept(data):
+        if not isinstance(data, dict) or data.get("decision") != "pass":
+            raise RuntimeError("Stored evaluation did not pass this candidate")
+        checks = data.get("checks")
+        if not isinstance(checks, dict) or not checks or not all(isinstance(rows, list) for rows in checks.values()):
+            raise RuntimeError("Stored evaluation has no complete check results")
+        if not data.get("reason") or "harness_hash" not in data:
+            raise RuntimeError("Stored evaluation record is incomplete")
+        if data.get("source") != source:
+            raise RuntimeError("Stored evaluation was produced from a different source tree or check configuration")
+        return data
+    return accept
 
 
 def _approved_review(value):
@@ -534,12 +572,25 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             acceptance_baseline = acceptance_future.result()
             acceptance_executor.shutdown(wait=True)
             acceptance_executor = None
-        evaluation = runtime.evaluator.evaluate(
-            baseline, workspace, checks, directory / "evaluation", config,
-            lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,
-            acceptance_baseline=acceptance_baseline, cache_scope=project["id"], cache_base=base,
-            environment_digest=environment["sha256"], test_first=test_first,
-            test_first_kind=change_type, changed_files=files)
+        evaluation_source = _evaluation_source(config, base, checks, patch, environment["sha256"],
+                                               acceptance, test_first, change_type)
+        # A resumed candidate replays exactly the saved patch, so a stored
+        # verdict for the same tree and check settings replaces the full
+        # evaluation run; anything missing, partial or differently sourced
+        # falls back to evaluating the candidate again.
+        saved_evaluation = None
+        if saved_candidate:
+            saved_evaluation = cached(runtime, run, "evaluation", candidate_key,
+                                      normalize=_reusable_evaluation(evaluation_source))
+        if saved_evaluation is not None:
+            evaluation = saved_evaluation
+        else:
+            evaluation = {**runtime.evaluator.evaluate(
+                baseline, workspace, checks, directory / "evaluation", config,
+                lambda: runtime.is_cancelled(run), seeds=seeds, acceptance=acceptance,
+                acceptance_baseline=acceptance_baseline, cache_scope=project["id"], cache_base=base,
+                environment_digest=environment["sha256"], test_first=test_first,
+                test_first_kind=change_type, changed_files=files), "source": evaluation_source}
     finally:
         if acceptance_executor is not None:
             acceptance_cancel.set()

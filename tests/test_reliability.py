@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +20,8 @@ from adaptive_rsi.readiness import budget, inspect as readiness
 from adaptive_rsi.recovery import failure
 from adaptive_rsi.review import risk_review_required
 from adaptive_rsi.runtime import Runtime
-from adaptive_rsi.pipeline import _review_evidence, _stage_config, _uses_test_first
+from adaptive_rsi.pipeline import (_evaluation_source, _review_evidence, _reusable_evaluation,
+                                   _stage_config, _uses_test_first)
 from adaptive_rsi.store import Store, encode
 from adaptive_rsi.workflow import change_kind, improvement, supports_test_first
 from tests.test_runtime import CHECKS, FakeAgent, fixture
@@ -88,6 +90,8 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.store.query("SELECT * FROM calls"), [])
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
+    # 测试 ID 被 CI 矩阵固定（.github/workflows/checks.yml macos_sandbox_flows），
+    # 行为已改为复用已完成评估：补丁与检查配置不变时不再重跑评价阶段。
     def test_review_outage_reuses_plan_and_patch_but_reruns_checks(self):
         class Outage(FakeAgent):
             unavailable = True
@@ -104,7 +108,8 @@ class ReliabilityTest(unittest.TestCase):
             self.runtime.retry(task)
             second = self.store.claim(self.project, self.runtime.config(self.project))
             self.runtime.process(second)
-            self.assertEqual(evaluate.call_count, 2)
+            # 恢复时补丁未变、检查配置一致，已完成的评价随候选一起复用。
+            self.assertEqual(evaluate.call_count, 1)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
         roles = [r[0] for r in self.runtime.agent.roles]
         self.assertEqual(roles.count("planning"), 1)
@@ -150,6 +155,149 @@ class ReliabilityTest(unittest.TestCase):
         self.runtime.process(self.store.claim(self.project, self.runtime.config(self.project)))
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("review"), 1)
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
+    def evaluation_sandbox(self):
+        """Deterministic check launcher for hosts without a sandbox backend.
+
+        Checks pass exactly when the tree carries the fixed implementation, so
+        baseline rows fail and candidate rows pass without weakening any gate;
+        the evaluator, its stages and the recovery cache stay real.
+        """
+        def fake_check(sandbox, check, workspace, *args, **kwargs):
+            fixed = "return a + b" in (Path(workspace) / "calculator.py").read_text(encoding="utf-8")
+            return {"name": check["name"], "argv": check["argv"], "exit_code": 0 if fixed else 1,
+                    "stdout": "Ran 1 test\nOK" if fixed else "Ran 1 test\nFAILED (failures=1)\n",
+                    "stderr": "", "seconds": 0.0, "error": None}
+        return (patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="stub"),
+                patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=fake_check),
+                patch("adaptive_rsi.evaluator.run_process", return_value={
+                    "exit_code": 0, "error": None, "stdout": "sha256:" + "a" * 64, "stderr": ""}),
+                patch("adaptive_rsi.readiness.inspect",
+                      return_value={"ready": True, "items": [], "checks": CHECKS}))
+
+    def evaluation_reuse_fixture(self, interrupted_role):
+        """One provider outage at ``interrupted_role`` on the first attempt only."""
+        class Outage(FakeAgent):
+            failed = False
+            def invoke(self, role, *args, **kwargs):
+                if role == interrupted_role and not self.failed:
+                    self.failed = True
+                    self.roles.append((role, {}))
+                    raise RuntimeError("Provider connection timeout")
+                return super().invoke(role, *args, **kwargs)
+        self.runtime.agent = Outage()
+        return self.evaluation_sandbox()
+
+    def interrupt(self, interrupted_role):
+        """Run one attempt that stops at the injected provider outage."""
+        self.runtime.configure({"sources": {"inspection": False, "issues": False}}, self.project)
+        task, run = self.claim()
+        with ExitStack() as stack:
+            for scenario in self.evaluation_reuse_fixture(interrupted_role):
+                stack.enter_context(scenario)
+            self.runtime.process(run)
+        return task, run
+
+    def resume(self, task):
+        """Retry the interrupted task and process the resumed run."""
+        self.runtime.retry(task)
+        with ExitStack() as stack:
+            for scenario in self.evaluation_sandbox():
+                stack.enter_context(scenario)
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(run)
+        return run
+
+    def run_recovery_pair(self, interrupted_role):
+        """Run once to the outage, retry, and return both runs."""
+        task, run = self.interrupt(interrupted_role)
+        return task, run, self.resume(task)
+
+    def test_resume_with_saved_evaluation_skips_evaluation_rerun(self):
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            task, run, second = self.run_recovery_pair("review")
+            self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        self.assertEqual(result["review"]["decision"], "pass")
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+        self.assertIn("evaluation", reused)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 1)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (second["id"],))["data"])
+        self.assertEqual(saved["decision"], "pass")
+        self.assertEqual(saved["source"], result["evaluation"]["source"])
+        self.assertEqual(saved["source"]["patch_hash"], result["patch_hash"])
+
+    def test_resume_without_saved_evaluation_reruns_evaluation(self):
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            task, run, second = self.run_recovery_pair("implementation")
+            self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+        self.assertNotIn("evaluation", reused)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
+
+    def test_resume_with_saved_evaluation_reruns_after_checks_reconfiguration(self):
+        task, run = self.interrupt("review")
+        self.runtime.configure({"checks": CHECKS + [{"name": "extra probe", "cwd": ".",
+                                                     "argv": ["python3", "-c", "assert True"]}]}, self.project)
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            second = self.resume(task)
+            self.assertEqual(evaluate.call_count, 1)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+        self.assertNotIn("evaluation", reused)
+        self.assertEqual([r[0] for r in self.runtime.agent.roles].count("implementation"), 2)
+
+    def test_resume_with_incomplete_saved_evaluation_reruns_evaluation(self):
+        task, run = self.interrupt("review")
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (run["id"],))["data"])
+        saved["checks"] = {}
+        self.store.execute("UPDATE stages SET data=? WHERE run=? AND stage='evaluation'",
+                           (encode(saved), run["id"]))
+        with patch.object(self.runtime.evaluator, "evaluate",
+                          wraps=self.runtime.evaluator.evaluate) as evaluate:
+            second = self.resume(task)
+            self.assertEqual(evaluate.call_count, 1)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        stages = [(row["kind"], json.loads(row["data"])["stage"]) for row in events
+                  if row["kind"] in {"stage_reused", "stage_invalidated"}]
+        self.assertNotIn(("stage_reused", "evaluation"), stages)
+        self.assertIn(("stage_invalidated", "evaluation"), stages)
+        result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
+        self.assertEqual(result["evaluation"]["decision"], "pass")
+
+    def test_evaluation_reuse_requires_matching_tree_checks_and_controls(self):
+        config = self.runtime.config(self.project)
+        source = _evaluation_source(config, "a" * 40, CHECKS, "candidate patch", "digest", None,
+                                    True, "behavior")
+        record = {"decision": "pass", "reason": "Regression and full candidate checks passed",
+                  "harness_hash": "harness", "checks": {"candidate": [{"name": "regression",
+                                                                       "passed": True}]},
+                  "source": source}
+        self.assertEqual(_reusable_evaluation(source)(record), record)
+        for changed in ({**record, "decision": "insufficient_evidence"},
+                        {**record, "checks": {}},
+                        {key: value for key, value in record.items() if key != "harness_hash"},
+                        {**record, "source": {**source, "base": "b" * 40}},
+                        {**record, "source": {**source, "patch_hash": "other"}},
+                        {**record, "source": {**source, "checks": []}},
+                        {**record, "source": {**source, "environment": "other"}},
+                        {**record, "source": {**source, "acceptance_hash": "other"}},
+                        {**record, "source": {**source, "validation": {"controls": [{"id": "extra"}]}}}):
+            with self.assertRaises(RuntimeError):
+                _reusable_evaluation(source)(changed)
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_changed_baseline_invalidates_recovery_cache(self):
@@ -731,10 +879,15 @@ class ReliabilityTest(unittest.TestCase):
         self.runtime.agent = RejectOnce()
         task, run = self.claim()
         baseline = (str(self.repo), git(self.repo, "rev-parse", "HEAD"), "main")
+        # 恢复只复用完整且来源一致的评估记录，桩数据需具备真实记录的判定、
+        # 检查明细和 harness 指纹，否则会被当作不完整记录重新评价。
+        evaluation = {"decision": "pass", "reason": "Fixed checks passed", "harness_hash": "stub",
+                      "checks": {"candidate": [{"name": "real unittest regression", "cwd": ".",
+                                                "argv": ["python3", "-m", "unittest"], "passed": True,
+                                                "exit_code": 0, "error": None}]}}
         with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
              patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
-             patch.object(self.runtime.evaluator, "evaluate", return_value={
-                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+             patch.object(self.runtime.evaluator, "evaluate", return_value=evaluation):
             self.runtime.process(run)
             self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "failed")
             result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
@@ -769,8 +922,7 @@ class ReliabilityTest(unittest.TestCase):
         third = self.store.claim(self.project, self.runtime.config(self.project))
         with patch("adaptive_rsi.delivery.baseline", return_value=baseline), \
              patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
-             patch.object(self.runtime.evaluator, "evaluate", return_value={
-                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+             patch.object(self.runtime.evaluator, "evaluate", return_value=evaluation):
             self.runtime.process(third)
         third_events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (third["id"],))
         third_reused = [json.loads(row["data"])["stage"] for row in third_events if row["kind"] == "stage_reused"]
