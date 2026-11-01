@@ -303,6 +303,25 @@ class AuthSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
             self.manager.launch(session["id"])
 
+    def test_start_returns_expired_when_ttl_elapses_within_reserve_launch_window(self):
+        # 确定性复现 3.9 上的时序竞态：expires_at 直接落在过去，
+        # reserve 与 launch 之间不需要真实耗掉任何时间。
+        self.manager.ttl = -1.0
+        session = self.manager.start("codex")
+        self.assertEqual(session["state"], "expired")
+        self.assertEqual(session["error"], "auth_expired")
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.created, [])
+        self.gate.set()
+        self.assertFalse((self.root / "codex/auth.json").exists())
+
+    def test_launch_still_rejects_interrupted_sessions(self):
+        session = self.manager.reserve("codex")
+        self.manager.close()
+        self.assertEqual(self.manager.status(session["id"])["state"], "interrupted")
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.launch(session["id"])
+
     def test_rejects_invalid_provider_method_and_inputs(self):
         for kwargs in ({"backend": "unknown"}, {"backend": []}, {"backend": "opencode", "provider": "../oops"},
                        {"backend": "codex", "method": True}, {"backend": "codex", "inputs": {"x": []}}):

@@ -923,7 +923,10 @@ class AuthSessions:
         thread.start()
 
     def start(self, backend, provider=None, method=0, inputs=None):
-        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。"""
+        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
+
+        reserve 与 launch 之间 ttl 耗尽时返回 expired 终态，不抛 invalid_auth_state。
+        """
         session = self.reserve(backend, provider, method, inputs)
         return self.launch(session["id"], method, inputs)
 
@@ -964,7 +967,15 @@ class AuthSessions:
             raise AuthError("invalid_auth_method")
         self.status(session_id)
         with self.lock:
-            if self.sessions[session_id]["state"] not in ACTIVE:
+            item = self.sessions[session_id]
+            if item["state"] not in ACTIVE:
+                # reserve 与 launch 之间 ttl 可能已耗尽：status() 会把从未派发
+                # worker 的 starting 会话收敛为 expired。此时返回该终态而不抛
+                # invalid_auth_state，慢调度下 /api/auth/start 仍给前端干净的
+                # 过期结果；其余终态（interrupted 等）语义保持不变。
+                # workers 检查防御已派发 worker 后的异常 expired 回流。
+                if item["state"] == "expired" and session_id not in self.workers:
+                    return self.status(session_id)
                 raise AuthError("invalid_auth_state")
         self._thread(lambda: self._run(session_id, method, inputs))
         return self.status(session_id)
