@@ -886,14 +886,14 @@ class Evaluator:
         if changed_files is None:
             changed_files = _changed_files(candidate)
             if changed_files is None:
+                # Failed worktree inspection cannot see uncommitted edits, so
+                # committed history cannot complete the delta: reusing the
+                # frozen harness on a nonempty committed diff would ignore
+                # unknown worktree changes. Report unavailable evidence when a
+                # repository exists; without one the executed harness files are
+                # compared below instead.
                 if _is_repository(candidate):
-                    # The working-tree diff failed, so committed history cannot
-                    # prove the worktree clean; empty or unavailable history is
-                    # unavailable evidence, never a verified empty set.
-                    committed = _committed_changes(baseline, candidate)
-                    changed_files = committed if committed else False
-                # Without a repository there is no diff evidence by design; the
-                # executed harness files are compared below instead.
+                    changed_files = False
             elif not changed_files and _is_repository(candidate):
                 # A clean snapshot hides committed edits; committed history
                 # decides between a proven empty set and unavailable evidence.
