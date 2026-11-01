@@ -157,7 +157,44 @@ class RemoteTimingTest(unittest.TestCase):
         self.assertEqual(result['timing']['queue_seconds'], 60)
         self.assertEqual(result['timing']['execution_seconds'], 120)
         self.assertIsNone(result['timing']['build_seconds'])
+        self.assertIsNone(result['timing']['reverification_seconds'])
         self.assertEqual(result['timing']['completed_at_basis'], 'updated_at')
+        self.assertFalse(isinstance(result['timing']['build_seconds'], (int, float)))
+        self.assertFalse(isinstance(result['timing']['reverification_seconds'], (int, float)))
+
+    def test_unavailable_build_phase_never_outputs_numeric_duration(self):
+        data = {'repository': 'example/project', 'workflow_run_id': 12, 'workflow_sha': 'c', 'operation_id': 'op-build', 'workflow': '.github/workflows/release.yml'}
+        remote = {'id': 12, 'head_sha': 'c', 'display_title': 'op-build', 'event': 'workflow_dispatch', 'path': data['workflow'], 'status': 'completed', 'conclusion': 'success',
+                  'created_at': '2026-10-28T01:00:00Z', 'run_started_at': '2026-10-28T01:00:30Z', 'updated_at': '2026-10-28T01:05:00Z'}
+        with patch.object(release, 'api', return_value=remote):
+            result = release.reconcile(None, {}, 'release', data, persist=False)
+        timing = result['timing']
+        for phase in ('queue_seconds', 'execution_seconds', 'build_seconds', 'reverification_seconds'):
+            self.assertIn(phase, timing)
+        self.assertEqual(timing['queue_seconds'], 30)
+        self.assertEqual(timing['execution_seconds'], 270)
+        self.assertIsNone(timing['build_seconds'])
+        self.assertIsNone(timing['reverification_seconds'])
+        self.assertNotEqual(timing['build_seconds'], 0)
+        self.assertNotEqual(timing['reverification_seconds'], 0)
+        self.assertFalse(isinstance(timing['build_seconds'], (int, float)))
+        self.assertFalse(isinstance(timing['reverification_seconds'], (int, float)))
+
+    def test_missing_remote_timestamps_yield_none_rather_than_zero_or_omission(self):
+        data = {'repository': 'example/project', 'workflow_run_id': 15, 'workflow_sha': 'd', 'operation_id': 'op-pending', 'workflow': '.github/workflows/release.yml'}
+        remote = {'id': 15, 'head_sha': 'd', 'display_title': 'op-pending', 'event': 'workflow_dispatch', 'path': data['workflow'], 'status': 'in_progress',
+                  'created_at': '2026-10-28T02:00:00Z', 'run_started_at': None, 'updated_at': '2026-10-28T02:00:10Z'}
+        with patch.object(release, 'api', return_value=remote):
+            result = release.reconcile(None, {}, 'release', data, persist=False)
+        timing = result['timing']
+        for phase in ('queue_seconds', 'execution_seconds', 'build_seconds', 'reverification_seconds'):
+            self.assertIn(phase, timing)
+        self.assertIsNone(timing['queue_seconds'])
+        self.assertIsNone(timing['execution_seconds'])
+        self.assertIsNone(timing['build_seconds'])
+        self.assertIsNone(timing['reverification_seconds'])
+        self.assertNotEqual(timing['queue_seconds'], 0)
+        self.assertNotEqual(timing['execution_seconds'], 0)
 
 
 class AuthorizationReceiptTest(unittest.TestCase):
