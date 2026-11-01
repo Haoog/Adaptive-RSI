@@ -147,6 +147,88 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
 
+    def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):
+        # 存量旧格式迁移
+        self.store.execute("INSERT INTO settings VALUES ('ns:item','{\"migrated\":true}')")
+        self.assertEqual(self.store.namespaced_setting('ns', 'item', dict), {'migrated': True})
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:item'"))
+        row = self.store.one("SELECT value FROM settings WHERE key='namespace:ns:item'")
+        assert row is not None
+        envelope = json.loads(row['value'])
+        self.assertEqual(envelope, {'version': 1, 'type': 'dict', 'value': {'migrated': True}, 'expires': None})
+
+        # 写路径清理残留并写入新信封
+        self.store.execute("INSERT INTO settings VALUES ('ns:overwritten','\"legacy\"')")
+        self.store.put_namespaced_setting('ns', 'overwritten', 12345, version=2)
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:overwritten'"))
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+
+        # 坏数据隔离自身，连接池仍健康
+        self.store.execute("INSERT INTO settings VALUES ('namespace:broken_ns:bad','invalid-json')")
+        self.assertEqual(self.store.namespaced_setting('broken_ns', 'bad', dict, default='fallback'), 'fallback')
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+        self.assertEqual(self.store._pool.qsize(), 1)
+
+    def test_namespaced_setting_lazy_migration_race_protects_concurrent_write(self):
+        # 验收标准 1：并发写者在读出 legacy 之后写入 v2 信封 → 最终值必须是 v2（旧值不得复活）
+        self.store.execute("INSERT INTO settings VALUES ('race:item','\"v1_legacy\"')")
+        orig_one = self.store.one
+        concurrently_written = []
+
+        def race_one(sql, args=()):
+            res = orig_one(sql, args)
+            if args and args[0] == 'race:item':
+                # 读出 legacy 后、进入迁移事务前，并发写者提交 v2 信封
+                self.store.put_namespaced_setting('race', 'item', 'v2_new', version=2, ttl=60)
+                concurrently_written.append(True)
+            return res
+
+        with patch.object(self.store, 'one', side_effect=race_one):
+            res_v1 = self.store.namespaced_setting('race', 'item', str, version=1)
+
+        self.assertEqual(len(concurrently_written), 1)
+        # reader 请求 version=1，但此时 DB 已是 version=2，故 reader 得 default/None
+        self.assertIsNone(res_v1)
+        # 最终值必须是 v2，旧值不得复活或覆盖新信封
+        self.assertEqual(self.store.namespaced_setting('race', 'item', str, version=2), 'v2_new')
+        row = self.store.one("SELECT value FROM settings WHERE key='namespace:race:item'")
+        self.assertIsNotNone(row)
+        assert row is not None
+        envelope = json.loads(row['value'])
+        self.assertEqual(envelope['version'], 2)
+        self.assertEqual(envelope['value'], 'v2_new')
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='race:item'"))
+
+    def test_namespaced_setting_colon_key_isolation(self):
+        # 验收标准 2：put_namespaced_setting('cache','item',…) 与 put_namespaced_setting('namespace','cache:item',…)
+        # 互不影响（谁的键都不被对方删除）；读侧同理。
+        self.store.put_namespaced_setting('cache', 'item', 'cache_data')
+        self.store.put_namespaced_setting('namespace', 'cache:item', 'ns_data')
+        self.assertEqual(self.store.namespaced_setting('cache', 'item', str), 'cache_data')
+        self.assertEqual(self.store.namespaced_setting('namespace', 'cache:item', str), 'ns_data')
+
+        # 反向写入顺序同理
+        self.store.put_namespaced_setting('namespace', 'cache:item', 'ns_v2', version=2)
+        self.assertEqual(self.store.namespaced_setting('cache', 'item', str), 'cache_data')
+        self.assertEqual(self.store.namespaced_setting('namespace', 'cache:item', str, version=2), 'ns_v2')
+
+        self.store.put_namespaced_setting('cache', 'item', 'cache_v2', version=2)
+        self.assertEqual(self.store.namespaced_setting('cache', 'item', str, version=2), 'cache_v2')
+        self.assertEqual(self.store.namespaced_setting('namespace', 'cache:item', str, version=2), 'ns_v2')
+
+        # 读侧孤立键查询：当一方存在时，另一方查询不得删掉对方信封或当成 legacy 读走
+        self.store.put_namespaced_setting('cache', 'isolated_item', 'cache_only')
+        self.assertIsNone(self.store.namespaced_setting('namespace', 'cache:isolated_item', str))
+        self.assertEqual(self.store.namespaced_setting('cache', 'isolated_item', str), 'cache_only')
+
+        # 读侧遗留键隔离：'cache:legacy_item' 存在时，namespace='namespace', key='cache:legacy_item' 查询不得迁移之
+        self.store.execute("INSERT INTO settings VALUES ('cache:legacy_item','\"raw_cache\"')")
+        self.assertIsNone(self.store.namespaced_setting('namespace', 'cache:legacy_item', str))
+        # 原有 legacy_key 仍完好无损，且由真正归属者正常读取迁移
+        self.assertEqual(self.store.namespaced_setting('cache', 'legacy_item', str), 'raw_cache')
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='cache:legacy_item'"))
+        self.assertEqual(self.store.namespaced_setting('cache', 'legacy_item', str), 'raw_cache')
+
 
 class RecordUsageTest(unittest.TestCase):
     def setUp(self):
