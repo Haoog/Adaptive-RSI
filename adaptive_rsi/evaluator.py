@@ -485,16 +485,37 @@ def _changed_files(candidate):
     return sorted({path for path in (tracked + "\0" + untracked).split("\0") if path})
 
 
+def _is_repository(path):
+    return Path(path, ".git").exists()
+
+
+def _diff_committed(candidate, base, head):
+    return sorted({path for path in git(
+        candidate, "diff", "--name-only", "-z", base, head, "--").split("\0") if path})
+
+
 def _committed_changes(baseline, candidate):
-    """Files committed on top of the baseline tree, even when the worktree is clean."""
+    """Files committed on top of the baseline tree, even when the worktree is clean.
+
+    Returns False when history cannot prove which files changed; callers must
+    treat that as unavailable evidence, never as an empty change set.
+    """
     try:
         base = git(baseline, "rev-parse", "HEAD")
         head = git(candidate, "rev-parse", "HEAD")
         if base == head:
             return []
-        return sorted({path for path in git(candidate, "diff", "--name-only", "-z", base, head, "--").split("\0") if path})
+        try:
+            return _diff_committed(candidate, base, head)
+        except RuntimeError:
+            # Depth-one snapshots fetch a single commit, so baseline-tree
+            # objects may be missing; the sealed origin serves exactly this
+            # baseline, which the delivery output preflight already trusts.
+            git(candidate, "-c", "protocol.file.allow=always", "fetch", "--quiet",
+                "--depth=1", "--no-tags", "origin", base, timeout=180)
+            return _diff_committed(candidate, base, head)
     except RuntimeError:
-        return None
+        return False
 
 
 def _harness_differs(baseline, candidate, checks):
@@ -864,13 +885,39 @@ class Evaluator:
             self._execution_environment(config) if cache_scope and cache_base else (config, None))
         if changed_files is None:
             changed_files = _changed_files(candidate)
-        elif not changed_files:
+            if changed_files is None:
+                # Failed worktree inspection cannot see uncommitted edits, so
+                # committed history cannot complete the delta: reusing the
+                # frozen harness on a nonempty committed diff would ignore
+                # unknown worktree changes. Report unavailable evidence when a
+                # repository exists; without one the executed harness files are
+                # compared below instead.
+                if _is_repository(candidate):
+                    changed_files = False
+            elif not changed_files and _is_repository(candidate):
+                # A clean snapshot hides committed edits; committed history
+                # decides between a proven empty set and unavailable evidence.
+                committed = _committed_changes(baseline, candidate)
+                if committed is False:
+                    changed_files = False
+                else:
+                    changed_files = committed
+        elif not changed_files and _is_repository(baseline) and _is_repository(candidate):
             # A clean snapshot reports no working-tree delta even when the
             # candidate committed test or harness edits; compare committed
             # history so frozen regression evidence cannot be reused.
             committed = _committed_changes(baseline, candidate)
             if committed:
                 changed_files = committed
+            elif committed is False:
+                changed_files = False
+        if changed_files is False:
+            # Diff and committed history were both unavailable: the frozen
+            # baseline harness may not be reused, and checks cannot prove a
+            # pass, so treat the evaluation as insufficient evidence.
+            return {"decision": "insufficient_evidence",
+                    "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
+                    "changed_files_available": False, "checks": {}}
         added_tests = _added_test_files(candidate) if test_first else []
         existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
