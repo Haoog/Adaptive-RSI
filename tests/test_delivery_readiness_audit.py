@@ -535,3 +535,116 @@ class RateLimitTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'rate limit'):
                 release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
             self.assertEqual(command.call_count, 1)
+
+    def test_primary_limit_blocks_following_calls_without_replaying_write(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('API rate limit exceeded for user (HTTP 403)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 403)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_too_many_requests_429_blocks_following_calls_without_replaying_write(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('too many requests (HTTP 429)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 429)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_rate_limit_cooldown_blocks_pr_write_without_replay(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('rate limit exceeded (HTTP 429)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'pulls', 'POST', {'title': 'fix', 'head': 'feature', 'base': 'main'})
+            self.assertEqual(first.exception.status, 429)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_primary_limit_blocks_cross_resource_writes_without_replay(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('API rate limit exceeded (HTTP 403)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 403)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'pulls', 'POST', {'title': 'fix', 'head': 'feature', 'base': 'main'})
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_forbidden_without_rate_limit_does_not_activate_cooldown(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('Resource not accessible by integration (HTTP 403)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 403)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(second.exception.status, 403)
+            self.assertEqual(command.call_count, 2)
+
+    def test_abuse_detection_403_activates_cooldown(self):
+        # GitHub 的滥用检测提示不含 "rate limit" 字样，也必须在同一冷却里拦截。
+        with patch.object(release, 'checked', side_effect=RuntimeError('abuse detection mechanism (HTTP 403)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 403)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_cooldown_blocks_reads_without_sending(self):
+        with patch.object(release, 'checked', side_effect=RuntimeError('API rate limit exceeded (HTTP 403)')) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'commits/main')
+            self.assertEqual(first.exception.status, 403)
+            with self.assertRaises(release.ApiRejected) as second:
+                release.api('example/project', 'commits/main')
+            self.assertIn('cooldown active', str(second.exception))
+            self.assertEqual(second.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+
+    def test_cooldown_expires_after_window_and_next_request_is_sent_once(self):
+        clock = [1000.0]
+
+        def now():
+            return clock[0]
+
+        with patch.object(release.time, 'monotonic', side_effect=now), \
+                patch.object(release, 'checked',
+                             side_effect=[RuntimeError('too many requests (HTTP 429)'), '{"ok": true}']) as command:
+            with self.assertRaises(release.ApiRejected) as first:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertEqual(first.exception.status, 429)
+            clock[0] += 59
+            with self.assertRaises(release.ApiRejected) as blocked:
+                release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+            self.assertIn('cooldown active', str(blocked.exception))
+            self.assertEqual(blocked.exception.status, 429)
+            self.assertEqual(command.call_count, 1)
+            clock[0] += 1
+            self.assertEqual(release.api('example/project', 'actions/workflows/a/dispatches', 'POST'), {'ok': True})
+            self.assertEqual(command.call_count, 2)
+
+    def test_unclassified_write_failure_does_not_activate_cooldown(self):
+        # 5xx/408 属于结果未知：原样上抛交给调用方对账，不进入冷却也不转成 ApiRejected。
+        for error in ['Server Error (HTTP 502)', 'Request Timeout (HTTP 408)']:
+            with self.subTest(error=error):
+                release._API_BACKOFF.clear()
+                with patch.object(release, 'checked', side_effect=RuntimeError(error)) as command:
+                    with self.assertRaises(RuntimeError) as first:
+                        release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+                    self.assertNotIsInstance(first.exception, release.ApiRejected)
+                    with self.assertRaises(RuntimeError) as second:
+                        release.api('example/project', 'actions/workflows/a/dispatches', 'POST')
+                    self.assertNotIsInstance(second.exception, release.ApiRejected)
+                    self.assertEqual(command.call_count, 2)

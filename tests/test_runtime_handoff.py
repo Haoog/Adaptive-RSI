@@ -187,6 +187,250 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills')['n'], 1)
         self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
 
+    def test_postprocess_delivery_crash_before_and_after_recovers_without_duplicates(self):
+        for boundary in ('before', 'after'):
+            with self.subTest(boundary=boundary):
+                project = self.runtime.add_project(fixture(self.root / f'delivery-{boundary}'))
+                self.runtime.configure({'delivery': {'mode': 'pr'}, 'evolution': {'enabled': False}}, project)
+                self.runtime.pause(project, False)
+                task = self.runtime.goal(project, f'Delivery crash {boundary}')
+                run = self.store.claim(project, self.runtime.config(project))
+                self.runtime.queue_postprocess(run)
+                self.store.transition(run['id'], 'awaiting_approval', {
+                    'summary': 'Verified outcome',
+                    'evaluation': {'decision': 'pass'},
+                    'review': {'decision': 'pass'},
+                }, True)
+
+                orig_deliver = self.runtime.deliver
+
+                if boundary == 'before':
+                    with patch.object(self.runtime, 'deliver', side_effect=RuntimeError('crash before delivery')):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash before delivery')
+                    self.assertNotIn('delivery', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 0)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 0)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('delivery', record['steps'])
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                else:
+                    def deliver_and_crash(run_id, automatic=False):
+                        orig_deliver(run_id, automatic=automatic)
+                        raise RuntimeError('crash after delivery')
+
+                    with patch.object(self.runtime, 'deliver', side_effect=deliver_and_crash):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash after delivery')
+                    self.assertNotIn('delivery', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 0)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('delivery', record['steps'])
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    publish_tasks = self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                                     (project, 'publish:' + run['id']))
+                    self.assertEqual(len(publish_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+    def test_postprocess_monitor_crash_before_and_after_recovers_without_duplicates(self):
+        for boundary in ('before', 'after'):
+            with self.subTest(boundary=boundary):
+                project = self.runtime.add_project(fixture(self.root / f'monitor-{boundary}'))
+                self.runtime.configure({'evolution': {'enabled': True, 'monitor_tasks': 5}}, project)
+                self.runtime.pause(project, False)
+
+                candidate_id = f'cand-monitor-{boundary}'
+                self.store.execute(
+                    "INSERT INTO candidates(id,project,kind,status,content,evidence,created) VALUES (?,?,?,'stable','{}',?,?)",
+                    (candidate_id, project, 'instruction',
+                     json.dumps({'monitor': {'passed': 0, 'failed': 0, 'runs': []}}), time.time())
+                )
+
+                task = self.runtime.goal(project, f'Monitor crash {boundary}')
+                run = self.store.claim(project, self.runtime.config(project))
+                self.store.execute('UPDATE runs SET strategy=? WHERE id=?',
+                                   (json.dumps([{'id': candidate_id}]), run['id']))
+                self.runtime.queue_postprocess(run)
+                self.store.transition(run['id'], 'awaiting_approval', {'summary': 'Verified outcome'}, True)
+
+                orig_monitor = self.runtime.monitor_strategy
+
+                if boundary == 'before':
+                    with patch.object(self.runtime, 'monitor_strategy', side_effect=RuntimeError('crash before monitor')):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash before monitor')
+                    self.assertNotIn('monitor', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 0)
+                    self.assertEqual(ev['monitor']['runs'], [])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('monitor', record['steps'])
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 1)
+                    self.assertEqual(ev['monitor']['runs'], [run['id']])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 1)
+                    self.assertEqual(ev['monitor']['runs'], [run['id']])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                else:
+                    def monitor_and_crash(proj, passed, run_obj, attributable=False):
+                        orig_monitor(proj, passed, run_obj, attributable)
+                        raise RuntimeError('crash after monitor')
+
+                    with patch.object(self.runtime, 'monitor_strategy', side_effect=monitor_and_crash):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash after monitor')
+                    self.assertNotIn('monitor', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 1)
+                    self.assertEqual(ev['monitor']['runs'], [run['id']])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('monitor', record['steps'])
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 1)
+                    self.assertEqual(ev['monitor']['runs'], [run['id']])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    row = self.store.one('SELECT evidence FROM candidates WHERE id=?', (candidate_id,))
+                    ev = json.loads(row['evidence'])
+                    self.assertEqual(ev['monitor']['passed'], 1)
+                    self.assertEqual(ev['monitor']['runs'], [run['id']])
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+    def test_postprocess_evolution_crash_before_and_after_recovers_without_duplicates(self):
+        for boundary in ('before', 'after'):
+            with self.subTest(boundary=boundary):
+                project = self.runtime.add_project(fixture(self.root / f'evolution-{boundary}'))
+                self.runtime.configure({'evolution': {'enabled': True, 'every_completed': 1}}, project)
+                self.runtime.pause(project, False)
+
+                task = self.runtime.goal(project, f'Evolution crash {boundary}')
+                run = self.store.claim(project, self.runtime.config(project))
+                self.runtime.queue_postprocess(run)
+                self.store.transition(run['id'], 'awaiting_approval', {'summary': 'Verified outcome'}, True)
+
+                orig_evolve = self.runtime.maybe_evolve
+
+                if boundary == 'before':
+                    with patch.object(self.runtime, 'maybe_evolve', side_effect=RuntimeError('crash before evolution')):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash before evolution')
+                    self.assertNotIn('evolution', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 0)
+                    self.assertIsNone(self.store.setting('last-evolution:' + str(project)))
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('evolution', record['steps'])
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 1)
+                    self.assertEqual(self.store.setting('last-evolution:' + str(project)), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                else:
+                    def evolve_and_crash(proj, cfg):
+                        orig_evolve(proj, cfg)
+                        raise RuntimeError('crash after evolution')
+
+                    with patch.object(self.runtime, 'maybe_evolve', side_effect=evolve_and_crash):
+                        self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'pending')
+                    self.assertEqual(record['last_error'], 'crash after evolution')
+                    self.assertNotIn('evolution', record['steps'])
+                    self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 1)
+                    self.assertEqual(self.store.setting('last-evolution:' + str(project)), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    record = self.store.setting('postprocess:' + run['id'])
+                    self.assertEqual(record['state'], 'completed')
+                    self.assertIn('evolution', record['steps'])
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 1)
+                    self.assertEqual(self.store.setting('last-evolution:' + str(project)), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
+                    self.runtime.drain_postprocess()
+                    evolve_tasks = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                                    (project,))
+                    self.assertEqual(len(evolve_tasks), 1)
+                    self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
+
     def test_postprocess_rotates_past_a_full_batch_of_transient_failures(self):
         from adaptive_rsi.runtime import POSTPROCESS_BATCH
         for index in range(POSTPROCESS_BATCH + 1):
