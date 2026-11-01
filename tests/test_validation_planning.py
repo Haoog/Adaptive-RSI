@@ -312,6 +312,34 @@ class ValidationPlanningTest(unittest.TestCase):
                     self.assertNotEqual(result.exception.code, 0)
                     spawn.assert_not_called()
 
+    def test_duplicate_selectors_are_idempotent_but_overlap_and_empty_stay_rejected(self):
+        selector = __name__ + '.ValidationPlanningTest.test_selected_rejects_empty_and_overlapping_expansions'
+        with patch('sys.argv', ['selected', selector, selector]), \
+                patch.object(test_selected, 'run_groups', return_value=0) as run, redirect_stderr(io.StringIO()):
+            self.assertEqual(test_selected.main(), 0)
+        self.assertEqual(run.call_args.args[0], [[selector]])
+        whole = __name__ + '.ValidationPlanningTest'
+        loader = unittest.TestLoader()
+        expected = list(test_parallel.test_ids(loader.loadTestsFromName(whole)))
+        expanded = test_selected.expand([whole, whole])
+        self.assertEqual(expanded, expected)
+        self.assertTrue(len(expanded) > 1 and len(expanded) == len(set(expanded)))
+        self.assertEqual(test_selected.expand([selector, selector,
+                                               __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker']),
+                         [selector, __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker'])
+        with patch.object(test_parallel.subprocess, 'Popen', side_effect=AssertionError('Rejected selections must never spawn')) as spawn:
+            with self.assertRaises(test_selected.SelectionError):
+                test_selected.expand([whole, selector])
+            with patch('sys.argv', ['selected', whole, selector]), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    test_selected.main()
+                self.assertNotEqual(result.exception.code, 0)
+            with patch('sys.argv', ['selected', __name__ + '.EmptySelection']), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as result:
+                    test_selected.main()
+                self.assertNotEqual(result.exception.code, 0)
+            spawn.assert_not_called()
+
     def test_selected_keeps_same_module_fixtures_in_one_worker(self):
         names = [__name__ + '.ValidationPlanningTest.test_selected_rejects_empty_and_overlapping_expansions',
                  __name__ + '.ValidationPlanningTest.test_selected_keeps_same_module_fixtures_in_one_worker']
