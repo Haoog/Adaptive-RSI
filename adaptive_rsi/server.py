@@ -1005,8 +1005,13 @@ class Handler(BaseHTTPRequestHandler):
                         if not backups:
                             raise RequestError("No backup available for rehearsal")
                         source = backups[0]
-                    report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
-                    result = rehearse_restore(source, report_path=report_file)
+                    try:
+                        report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
+                        result = rehearse_restore(source, report_path=report_file, store=runtime.store)
+                    except ValueError as exc:
+                        if "conflicts with database" in str(exc):
+                            raise RequestError("report_conflicts_with_database") from exc
+                        raise RequestError(str(exc)) from exc
                 elif path == "/api/request":
                     result = {"id": runtime.request(body["project"], body["kind"])}
                 elif path == "/api/pause":

@@ -1,6 +1,7 @@
 """Offline storage acceptance: no model, credential or remote operations."""
 from contextlib import closing
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -531,6 +532,194 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(f"rehearsal-{snapshot['id']}.json", body["reports"])
         self.assertEqual(body["latest"]["valid"], True)
+
+    def test_rehearsal_report_rejects_source_alias_and_preserves_database(self):
+        import io
+        import sqlite3
+        from contextlib import redirect_stderr
+        from adaptive_rsi import cli
+
+        task = self.store.add_task('p', 'manual', 'rehearsal-alias-task', 'task for rehearsal')
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+
+        # Check table count and integrity before attempts
+        with sqlite3.connect(source) as db:
+            tables_before = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            integrity_before = db.execute("PRAGMA integrity_check").fetchall()
+
+        # 1. Direct call with source
+        with self.assertRaises(ValueError):
+            storage_tools.rehearse_restore(source, report_path=source)
+
+        # 2. Direct call with symlink to source
+        symlink_target = self.root / "source_symlink.sqlite3"
+        symlink_target.symlink_to(source)
+        with self.assertRaises(ValueError):
+            storage_tools.rehearse_restore(source, report_path=symlink_target)
+
+        # 3. Direct call with hard link to source
+        hardlink_target = self.root / "source_hardlink.sqlite3"
+        os.link(source, hardlink_target)
+        with self.assertRaises(ValueError):
+            storage_tools.rehearse_restore(source, report_path=hardlink_target)
+
+        # 4. Direct call with sidecar path (-wal, -shm)
+        wal_path = Path(str(source) + "-wal")
+        with self.assertRaises(ValueError):
+            storage_tools.rehearse_restore(source, report_path=wal_path)
+
+        # 5. CLI invocation with alias
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main(['--state-dir', str(self.store.root), 'rehearse-restore', str(source), '--report', str(source)])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("conflicts with database", stderr.getvalue())
+
+        # Assert database remains completely intact and valid
+        with sqlite3.connect(source) as db:
+            tables_after = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            integrity_after = db.execute("PRAGMA integrity_check").fetchall()
+        self.assertEqual(tables_after, tables_before)
+        self.assertEqual(integrity_after, integrity_before)
+        self.assertEqual(integrity_after, [("ok",)])
+
+    def test_rehearsal_report_rejects_live_state_database_alias(self):
+        import http.client
+        import sqlite3
+        from types import SimpleNamespace
+        from adaptive_rsi.operations import Operations
+        from adaptive_rsi.server import Server
+
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+
+        runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
+                                  stop=threading.Event(),
+                                  updates=SimpleNamespace(require_ready=lambda: None),
+                                  wake=threading.Event(),
+                                  shutdown_status=lambda: {})
+
+        # 1. Via Operations execute
+        operations = Operations(runtime)
+        self.addCleanup(operations.pool.shutdown, False)
+
+        with sqlite3.connect(self.store.path) as db:
+            tables_before = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            integrity_before = db.execute("PRAGMA integrity_check").fetchall()
+
+        stop = threading.Event()
+        with self.assertRaises(ValueError):
+            operations._execute("op_alias", "rehearse-restore", {"id": snapshot["id"], "report": str(self.store.path)}, stop)
+
+        # 2. Via Server HTTP POST endpoint
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def post_rehearsal(report_destination):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            headers = {
+                "Cookie": server.cookie + "=" + server.token,
+                "Origin": server.local_origin,
+                "X-RSI-CSRF": server.csrf,
+                "Content-Type": "application/json"
+            }
+            try:
+                conn.request("POST", "/api/rehearse-restore",
+                             body=json.dumps({"id": snapshot["id"], "report": str(report_destination)}),
+                             headers=headers)
+                resp = conn.getresponse()
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        status, body = post_rehearsal(self.store.path)
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error"), "report_conflicts_with_database")
+
+        # Test symlink to state.sqlite3 via HTTP
+        state_link = self.root / "state_alias_link.sqlite3"
+        state_link.symlink_to(self.store.path)
+        status, body = post_rehearsal(state_link)
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error"), "report_conflicts_with_database")
+
+        # Assert live state database is intact
+        with sqlite3.connect(self.store.path) as db:
+            tables_after = db.execute("SELECT count(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
+            integrity_after = db.execute("PRAGMA integrity_check").fetchall()
+        self.assertEqual(tables_after, tables_before)
+        self.assertEqual(integrity_after, integrity_before)
+        self.assertEqual(integrity_after, [("ok",)])
+
+    def test_rehearsal_report_atomic_publish_reads_old_report_before_replace(self):
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+        custom_report = self.root / 'atomic-rehearsal-report.json'
+
+        # First rehearsal generates initial report
+        res1 = storage_tools.rehearse_restore(source, report_path=custom_report, store=self.store)
+        self.assertTrue(res1['valid'])
+        self.assertTrue(custom_report.is_file())
+        initial_content = custom_report.read_text(encoding='utf-8')
+        initial_json = json.loads(initial_content)
+        self.assertTrue(initial_json['valid'])
+
+        # Second rehearsal with os.replace interception
+        interception_verified = False
+        orig_replace = os.replace
+
+        def checked_replace(src, dst):
+            nonlocal interception_verified
+            if Path(dst).resolve() == custom_report.resolve():
+                # Destination must still contain full, uncorrupted old report
+                current_on_disk = custom_report.read_text(encoding='utf-8')
+                self.assertEqual(current_on_disk, initial_content)
+                self.assertTrue(json.loads(current_on_disk)['valid'])
+
+                # Temp file exists, in same directory, with valid new JSON
+                src_path = Path(src)
+                self.assertTrue(src_path.is_file())
+                self.assertEqual(src_path.parent, custom_report.parent)
+                self.assertTrue(src_path.name.startswith("."))
+                self.assertTrue(json.loads(src_path.read_text(encoding='utf-8'))['valid'])
+                interception_verified = True
+            return orig_replace(src, dst)
+
+        with patch("os.replace", side_effect=checked_replace):
+            res2 = storage_tools.rehearse_restore(source, report_path=custom_report, store=self.store)
+        self.assertTrue(res2['valid'])
+        self.assertTrue(interception_verified)
+        self.assertTrue(custom_report.is_file())
+        self.assertTrue(json.loads(custom_report.read_text(encoding='utf-8'))['valid'])
+
+    def test_rehearsal_report_failure_preserves_old_report_and_cleans_temporary_files(self):
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+        custom_report = self.root / 'fault-rehearsal-report.json'
+
+        custom_report.write_text('{"preserved_previous_report": true, "valid": true}', encoding='utf-8')
+        initial_content = custom_report.read_text(encoding='utf-8')
+
+        orig_fsync = os.fsync
+        def failing_fsync(fd):
+            raise OSError("Simulated disk error during fsync")
+
+        with patch("os.fsync", side_effect=failing_fsync):
+            with self.assertRaises(OSError):
+                storage_tools.rehearse_restore(source, report_path=custom_report, store=self.store)
+
+        # Old report content must be untouched
+        self.assertEqual(custom_report.read_text(encoding='utf-8'), initial_content)
+
+        # Temporary files must be cleaned up
+        temps = [p for p in custom_report.parent.glob(".*tmp*") if p.is_file()]
+        self.assertEqual(temps, [])
 
 
 if __name__ == '__main__':

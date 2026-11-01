@@ -227,7 +227,7 @@ def main(argv=None):
             else:
                 source = Path(source).expanduser().resolve()
             report_file = rehearsal_report_path(source, store=root, report_path=args.report)
-            result = rehearse_restore(source, report_path=report_file)
+            result = rehearse_restore(source, report_path=report_file, store=root)
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return
         if args.command == "desktop-runtime":
