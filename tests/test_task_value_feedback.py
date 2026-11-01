@@ -299,3 +299,104 @@ class TaskValueFeedbackTest(unittest.TestCase):
         with self.store.snapshot():
             nested = workflow_metrics(self.store, "q")
         self.assertEqual((nested["accepted"], nested["delivered"]), (1, 1))
+
+    def test_quality_summary_and_dashboard_usage_report_one_committed_snapshot(self):
+        # quality_summary 和 dashboard_usage 的多次读取必须共享同一只读事务：
+        # 并发写入只能让响应整体对应新快照或旧快照，不能出现半新半旧的混合计数。
+        from adaptive_rsi.task_feedback import dashboard_usage
+        from adaptive_rsi.telemetry import quality_summary
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) VALUES ('q','Q','/q','{}',0,1)")
+        task = self.store.add_task("q", "manual", "snapshot", "Snapshot task")
+        record = self.store.claim("q", copy.deepcopy(DEFAULTS))
+        assert record is not None
+        run = record["id"]
+        self.store.transition(run, "awaiting_approval", {
+            "summary": "Snapshot run", "files": ["app.py"],
+            "evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
+            "review": {"decision": "pass"}}, True)
+        before_usage = dashboard_usage(self.store)
+        self.assertEqual(before_usage, {"usage": [], "model_usage": []})
+        original, writes = self.store.query, []
+
+        def insert_call(sql, args=()):
+            rows = original(sql, args)
+            # 恰在 dashboard_usage 第一条聚合查询之后、第二条之前，用一个独立写事务
+            # 原子插入 calls 行：旧快照整体为空，新快照整体包含该行，混合响应即缺陷。
+            if not writes:
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("INSERT INTO calls(id,project,run,tokens,usage_known,unit_price,created) "
+                               "VALUES ('q-call',?,?,?,?,?,?)", ("q", run, 200, 1, 5, time.time()))
+                writes.append(True)
+            return rows
+
+        def merge_task(sql, args=()):
+            rows = original(sql, args)
+            # 恰在 quality_summary 取回行之后追加合并反馈：唯一一条查询已被旧快照
+            # 填充，响应必须仍是旧值；新快照整体可见 postmerge_verified=1。
+            if not writes:
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("UPDATE tasks SET state='merged' WHERE id=?", (task,))
+                    db.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (json.dumps({
+                        "summary": "Snapshot run", "files": ["app.py"],
+                        "evaluation": {"decision": "pass", "checks": {"candidate": [{"passed": True}]}},
+                        "review": {"decision": "pass"}, "merged_sha": "a" * 40,
+                        "feedback": {"state": "verified", "head": "a" * 40}}), run))
+                writes.append(True)
+            return rows
+
+        with patch.object(self.store, "query", side_effect=insert_call):
+            during_usage = dashboard_usage(self.store)
+        self.assertTrue(writes)
+        self.assertEqual(during_usage, {"usage": [], "model_usage": []})
+        after_usage = dashboard_usage(self.store)
+        usage = next(item for item in after_usage["usage"] if item["project"] == "q")
+        self.assertEqual((usage["calls"], usage["priced_calls"], usage["unpriced"]), (1, 1, 0))
+        self.assertAlmostEqual(usage["estimate"], 0.001)
+        writes.clear()
+        before_quality = quality_summary(self.store, "q")
+        self.assertEqual((before_quality[0]["runs"], before_quality[0]["passed"],
+                          before_quality[0]["postmerge_verified"]), (1, 1, 0))
+        with patch.object(self.store, "query", side_effect=merge_task):
+            during_quality = quality_summary(self.store, "q")
+        self.assertTrue(writes)
+        quality = during_quality[0]
+        self.assertEqual((quality["runs"], quality["passed"], quality["postmerge_verified"]), (1, 1, 0))
+        after_quality = quality_summary(self.store, "q")
+        quality = after_quality[0]
+        self.assertEqual((quality["runs"], quality["passed"], quality["postmerge_verified"]), (1, 1, 1))
+
+    def test_one_snapshot_decorators_reuse_outer_snapshot(self):
+        # 嵌套在已有快照内调用时不再开新事务，语义与 workflow_metrics 一致。
+        from adaptive_rsi.task_feedback import dashboard_usage
+        from adaptive_rsi.telemetry import quality_summary
+        connections = []
+
+        original_query = self.store.query
+
+        def query(sql, args=()):
+            connections.append(getattr(self.store._read_snapshot, "connection", None))
+            return original_query(sql, args)
+
+        self.store.query = query
+        try:
+            quality_summary(self.store, "p")
+            dashboard_usage(self.store)
+        finally:
+            self.store.query = original_query
+        self.assertTrue(connections)
+        self.assertTrue(all(connection is not None for connection in connections))
+        self.assertEqual(len({id(connection) for connection in connections}), 1)
+
+    def test_one_snapshot_supports_store_passed_by_keyword(self):
+        # store 也可以按关键字传入：装饰器必须能从位置或关键字参数里找到它，
+        # 否则 report(store=..., ...) 这类一直合法的调用会在进入快照前 IndexError。
+        from adaptive_rsi.task_feedback import dashboard_usage
+        from adaptive_rsi.telemetry import quality_summary
+        from adaptive_rsi.usage_report import report
+        result = report(store=self.store, params={"start": ["0"], "end": ["200"]})
+        self.assertEqual(result["summary"]["calls"], 0)
+        summary = quality_summary(store=self.store, project="p")
+        self.assertEqual([item["runs"] for item in summary], [1])
+        self.assertEqual(dashboard_usage(store=self.store), {"usage": [], "model_usage": []})
