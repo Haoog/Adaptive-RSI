@@ -1704,7 +1704,7 @@
       ],
       "validation": [
         "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_scheduled_wall_time_rejects_gap_and_requires_fold",
-        "python3 -B -m unittest tests.test_task_schedule_http",
+        "python3 -B -m unittest tests.test_schedule_consistency.TaskScheduleEndpointTest",
         "node --test tests/web_requests.cjs"
       ],
       "residual": "Scheduling API rejects DST gaps, ambiguous repeated hours and past times with fixed messages over HTTP and the console; reservations display their wall time and zone. Browser-scenario acceptance for the new dialog is still pending."
