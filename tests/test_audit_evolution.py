@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.config import fingerprint
-from adaptive_rsi.evolution import Evolution
+from adaptive_rsi.evolution import Evolution, case_spec
 from adaptive_rsi.store import Store, encode
 
 
@@ -221,6 +221,60 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertNotIn('holdout secret task', self.prompts[0])
         self.assertIn('active example', self.prompts[0])
         self.assertEqual(result['status'], 'insufficient_evidence')
+
+    def test_eligible_case_filter_matches_row_by_row_reference(self):
+        def reference(project, limit):
+            # 旧实现的逐行过滤，作为新单查询的等价性参照保留。
+            available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
+                                         "ORDER BY created,id", (project,))
+            cases = []
+            for case in available:
+                spec = case_spec(case)
+                if (case['uses'] < limit and spec is not None and
+                        spec.get('available', True) and spec.get('active', True) and
+                        isinstance(spec.get('task'), str) and
+                        isinstance(spec.get('repository'), str) and isinstance(spec.get('base'), str)):
+                    cases.append(case['id'])
+            return cases
+
+        rows = [
+            ('ok', 'p', 'validation', '{"task":"t","base":"b","repository":"r"}', 0, 1),
+            ('within-limit', 'p', 'validation', '{"task":"t","base":"b","repository":"r"}', 2, 2),
+            ('at-limit', 'p', 'holdout', '{"task":"t","base":"b","repository":"r"}', 3, 3),
+            ('retired', 'p', 'validation', '{"task":"t","base":"b","repository":"r","active":false}', 0, 4),
+            ('retired-integer', 'p', 'validation', '{"task":"t","base":"b","repository":"r","active":0}', 0, 5),
+            ('unavailable', 'p', 'validation', '{"task":"t","base":"b","repository":"r","available":false}', 0, 6),
+            ('unavailable-text-zero', 'p', 'validation', '{"task":"t","base":"b","repository":"r","available":"0"}', 0, 7),
+            ('unavailable-object', 'p', 'holdout', '{"task":"t","base":"b","repository":"r","available":{"x":1}}', 0, 8),
+            ('unavailable-array', 'p', 'holdout', '{"task":"t","base":"b","repository":"r","available":[0]}', 0, 9),
+            ('missing-task', 'p', 'validation', '{"base":"b","repository":"r"}', 0, 10),
+            ('null-task', 'p', 'validation', '{"task":null,"base":"b","repository":"r"}', 0, 11),
+            ('numeric-task', 'p', 'validation', '{"task":7,"base":"b","repository":"r"}', 0, 12),
+            ('missing-repository', 'p', 'validation', '{"task":"t","base":"b"}', 0, 13),
+            ('numeric-base', 'p', 'validation', '{"task":"t","base":2,"repository":"r"}', 0, 14),
+            ('broken-json', 'p', 'validation', '{not json', 0, 15),
+            ('json-array', 'p', 'validation', '["task"]', 0, 16),
+            ('empty-object', 'p', 'validation', '{}', 0, 17),
+            ('duplicate-spec-a', 'p', 'validation', '{"task":"t","base":"b","repository":"r"}', 0, 19),
+            ('duplicate-spec-b', 'p', 'validation', '{"task":"t","base":"b","repository":"r"}', 0, 19),
+            ('other-project', 'q', 'validation', '{"task":"t","base":"b","repository":"r"}', 0, 20),
+            ('other-split', 'p', 'development', '{"task":"t","base":"b","repository":"r"}', 0, 21),
+        ]
+        for case_id, project, split, spec, uses, created in rows:
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (case_id, project, case_id, split, spec, uses, created))
+        for limit in (0, 1, 3, 4):
+            self.assertEqual([case['id'] for case in self.evolution.eligible_cases('p', limit)],
+                             reference('p', limit))
+        self.assertEqual([case['id'] for case in self.evolution.eligible_cases('q', 4)],
+                         ['other-project'])
+
+    def test_exposed_holdout_short_circuits_before_paid_proposal(self):
+        args = self.setup_proposal(holdout_uses=1)
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(result['code'], 'evolution_fresh_holdout_required')
 
     def test_long_term_failure_is_detected_after_initial_window(self):
         self.candidate({'monitor': {'passed': 1, 'failed': 0, 'runs': ['old']}})
