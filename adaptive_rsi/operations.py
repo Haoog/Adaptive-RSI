@@ -6,6 +6,7 @@ import math
 import re
 import threading
 import time
+from pathlib import Path
 
 from .store import uid
 
@@ -88,7 +89,7 @@ class Operations:
             return bool(self.active)
 
     def start(self, kind, parameters):
-        if kind not in ("backup", "diagnostics", "probe", "import", "restore-check"):
+        if kind not in ("backup", "diagnostics", "probe", "import", "restore-check", "rehearse-restore", "rehearsal"):
             raise ValueError("Unknown background operation")
         if not isinstance(parameters, dict):
             raise ValueError("Background operation parameters must be an object")
@@ -137,6 +138,26 @@ class Operations:
                     char not in "0123456789abcdef" for char in identifier):
                 raise ValueError("Invalid backup ID")
             result = verify_backup(self.store.root / "backups" / (identifier + ".sqlite3"))
+        elif kind in ("rehearse-restore", "rehearsal"):
+            from .storage_tools import rehearse_restore, rehearsal_report_path
+            identifier = parameters.get("id")
+            if identifier:
+                if not isinstance(identifier, str) or len(identifier) != 16 or any(
+                        char not in "0123456789abcdef" for char in identifier):
+                    raise ValueError("Invalid backup ID")
+                source = self.store.root / "backups" / (identifier + ".sqlite3")
+            elif parameters.get("path") or parameters.get("file"):
+                raw_path = parameters.get("path") or parameters.get("file")
+                source = Path(str(raw_path))
+            else:
+                backups = sorted((p for p in (self.store.root / "backups").glob("*.sqlite3")
+                                  if p.is_file() and not p.is_symlink()),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+                if not backups:
+                    raise ValueError("No backup available for rehearsal")
+                source = backups[0]
+            report_file = rehearsal_report_path(source, store=self.store, report_path=parameters.get("report"))
+            result = rehearse_restore(source, report_path=report_file)
         else:
             result = {"id": self.runtime.import_project(parameters["url"], parameters.get("directory"))}
         return result

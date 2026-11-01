@@ -387,6 +387,151 @@ class StorageAcceptanceTest(unittest.TestCase):
         storage_tools.overview(self.store)
         self.assertEqual(len(getattr(self.store, "_storage_digests")), 1)
 
+    def test_rehearsal_trigger_entry_cli_drops_report_file(self):
+        import io
+        from contextlib import redirect_stdout
+        from adaptive_rsi import cli
+
+        task = self.store.add_task('p', 'manual', 'rehearsal-task', 'task for rehearsal')
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+
+        # 1. Trigger via CLI specifying backup file and default report path
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            cli.main(['--state-dir', str(self.store.root), 'rehearse-restore', str(source)])
+        output = json.loads(stdout.getvalue())
+        self.assertTrue(output['valid'])
+        self.assertEqual(output['remote_operations'], 0)
+        self.assertEqual(output['tasks'], 1)
+        self.assertEqual(output['projects'], 1)
+        self.assertTrue(output['all_projects_paused'])
+
+        expected_report = self.store.root / 'reports' / f"rehearsal-{snapshot['id']}.json"
+        self.assertTrue(expected_report.is_file())
+        self.assertEqual(output['report_path'], str(expected_report))
+        self.assertEqual(expected_report.stat().st_mode & 0o777, 0o600)
+        saved = json.loads(expected_report.read_text(encoding='utf-8'))
+        self.assertEqual(saved['valid'], True)
+        self.assertEqual(saved['remote_operations'], 0)
+        self.assertEqual(saved['tasks'], 1)
+
+        # 2. Trigger via CLI with explicit custom --report path
+        custom_report = self.root / 'custom-rehearsal.json'
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            cli.main(['--state-dir', str(self.store.root), 'rehearse', str(source), '--report', str(custom_report)])
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output['report_path'], str(custom_report))
+        self.assertTrue(custom_report.is_file())
+        self.assertEqual(custom_report.stat().st_mode & 0o777, 0o600)
+
+        # 3. Trigger via CLI omitting file (defaults to newest backup in root / backups)
+        expected_report.unlink()
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            cli.main(['--state-dir', str(self.store.root), 'rehearse-restore'])
+        output = json.loads(stdout.getvalue())
+        self.assertTrue(output['valid'])
+        self.assertTrue(expected_report.is_file())
+
+    def test_rehearsal_trigger_entry_handles_invalid_backup_and_drops_failure_report(self):
+        import io
+        import sqlite3
+        from contextlib import redirect_stdout
+        from adaptive_rsi import cli
+
+        db = sqlite3.connect(self.store.path)
+        try:
+            with db:
+                db.execute("INSERT INTO stages(run,stage,data) VALUES ('orphan','test','{}')")
+        finally:
+            db.close()
+        snapshot = storage_tools.backup(self.store)
+        source = self.store.root / 'backups' / (snapshot['id'] + '.sqlite3')
+
+        custom_report = self.root / 'failure-rehearsal.json'
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            cli.main(['--state-dir', str(self.store.root), 'rehearse-restore', str(source), '--report', str(custom_report)])
+        output = json.loads(stdout.getvalue())
+        self.assertFalse(output['valid'])
+        self.assertEqual(output['failure_stage'], 'snapshot_validation')
+        self.assertTrue(custom_report.is_file())
+        saved = json.loads(custom_report.read_text(encoding='utf-8'))
+        self.assertFalse(saved['valid'])
+        self.assertEqual(saved['failure_stage'], 'snapshot_validation')
+
+    def test_rehearsal_operations_trigger_drops_report_file(self):
+        from types import SimpleNamespace
+        from adaptive_rsi.operations import Operations
+
+        snapshot = storage_tools.backup(self.store)
+        runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
+                                 stop=threading.Event(),
+                                 updates=SimpleNamespace(require_ready=lambda: None),
+                                 wake=threading.Event())
+        operations = Operations(runtime)
+        self.addCleanup(operations.pool.shutdown, False)
+
+        stop = threading.Event()
+        result = operations._execute("op1", "rehearse-restore", {"id": snapshot["id"]}, stop)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["remote_operations"], 0)
+        report_path = Path(result["report_path"])
+        self.assertTrue(report_path.exists())
+        self.assertEqual(report_path.stat().st_mode & 0o777, 0o600)
+
+    def test_rehearsal_server_endpoints_trigger_and_retrieve_report(self):
+        import http.client
+        from types import SimpleNamespace
+        from adaptive_rsi.server import Server
+
+        self.store.add_task('p', 'manual', 'rehearsal-task', 'task for rehearsal')
+        snapshot = storage_tools.backup(self.store)
+
+        runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
+                                 stop=threading.Event(),
+                                 updates=SimpleNamespace(require_ready=lambda: None),
+                                 wake=threading.Event(),
+                                 shutdown_status=lambda: {})
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def req(path, method="GET", body=None):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            headers = {"Cookie": server.cookie + "=" + server.token}
+            if method == "POST":
+                headers.update({"Origin": server.local_origin, "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"})
+                data = json.dumps(body or {})
+            else:
+                data = None
+            try:
+                conn.request(method, path, body=data, headers=headers)
+                resp = conn.getresponse()
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        status, body = req("/api/rehearse-restore", method="POST", body={"id": snapshot["id"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["valid"])
+        self.assertEqual(body["remote_operations"], 0)
+        self.assertIn("report_path", body)
+
+        status, body = req(f"/api/rehearse-restore?id={snapshot['id']}")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["valid"])
+
+        status, body = req("/api/rehearsal")
+        self.assertEqual(status, 200)
+        self.assertIn(f"rehearsal-{snapshot['id']}.json", body["reports"])
+        self.assertEqual(body["latest"]["valid"], True)
+
 
 if __name__ == '__main__':
     unittest.main()
