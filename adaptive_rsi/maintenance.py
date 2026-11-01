@@ -55,6 +55,22 @@ def _cleanup_hold(store, key):
         return True
 
 
+def _merged_monitoring_completed(result):
+    """Report whether a merged run finished post-merge monitoring.
+
+    Mirrors _cleanup_hold's fail-closed rule: an unreadable result keeps the
+    run retained like an unfinished monitor, and a corrupt value must never
+    count as completed evidence.  Readable dicts keep the previous truthiness
+    judgment; only previously crashing shapes (non-JSON, non-objects) change,
+    from a per-run scheduler failure to an ordinary retained skip.
+    """
+    try:
+        parsed = json.loads(result)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and bool(parsed.get("monitoring_completed"))
+
+
 def retention_hold(store, run_id, project):
     """Return the legal hold that protects a run from cleanup, or None.
 
@@ -526,7 +542,7 @@ class Maintenance:
                             # 保留标记与手动清理共享同一判断；损坏值按已保留处理。
                             if retention_hold(self.store, run["id"], project["id"]):
                                 continue
-                            if (run["state"] == "pr_open" or run["state"] == "merged" and not json.loads(run["result"]).get("monitoring_completed") or
+                            if (run["state"] == "pr_open" or run["state"] == "merged" and not _merged_monitoring_completed(run["result"]) or
                                     self.store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
                                                    "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
                                                    (project["id"], run["id"]))):
