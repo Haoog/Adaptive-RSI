@@ -923,6 +923,16 @@ class AuthSessions:
         thread.start()
 
     def start(self, backend, provider=None, method=0, inputs=None):
+        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。"""
+        session = self.reserve(backend, provider, method, inputs)
+        return self.launch(session["id"], method, inputs)
+
+    def reserve(self, backend, provider=None, method=0, inputs=None):
+        """快速登记会话：返回时 state 已是 starting，busy 立即计入该会话。
+
+        调用方（服务端更新准入检查）在 dispatch_lock 临界区内调用本方法，
+        因此这里只做校验、登记与缓存失效，不启动 worker 线程。
+        """
         self._backend(backend)
         if backend == "opencode":
             _identifier(provider)
@@ -944,10 +954,20 @@ class AuthSessions:
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
                                          "state": "starting", "expires_at": time.time() + self.ttl, "error": ""}
             self._persist()
-            self._thread(lambda: self._run(session_id, method, inputs))
             # 认证状态即将变化，缓存的供应商发现结果不再可靠。
             self._invalidate_caches(backend)
-            return copy.deepcopy(self.sessions[session_id])
+        return copy.deepcopy(self.sessions[session_id])
+
+    def launch(self, session_id, method=0, inputs=None):
+        """在锁外启动会话 worker；慢操作（握手、凭据写入、complete）不回锁。"""
+        if not isinstance(method, int) or isinstance(method, bool) or method < 0 or method > 100:
+            raise AuthError("invalid_auth_method")
+        self.status(session_id)
+        with self.lock:
+            if self.sessions[session_id]["state"] not in ACTIVE:
+                raise AuthError("invalid_auth_state")
+        self._thread(lambda: self._run(session_id, method, inputs))
+        return self.status(session_id)
 
     def _update(self, session_id, **values):
         with self.lock:
