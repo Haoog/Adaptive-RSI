@@ -50,7 +50,7 @@ flowchart LR
 
 Models, tasks, memory, usage, and delivery authorization remain separate per project. Pausing a project or revoking authorization blocks subsequent operations that have not yet been issued.
 
-The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks.
+The task list supports previewing bulk retries, cancellations and delivery approvals, and grouping compatible queued goals in one project for shared verification. The preview flags known file overlaps and unknown scopes. An unstarted group can be split to restore its original tasks. A transient failure while reading a batch receipt never discards a confirmed operation: it resumes with the same request ID and the server reconciles the stored receipt instead of repeating it.
 
 The workspace brings project status and tasks together. Selecting tasks reveals batch actions, while batch history stays accessible. Added goals link directly to their tasks; details show requirements and waiting reasons before optional supplement, dependency and evidence sections. Model services and runtime settings have separate pages, with model subpages and configuration scope retained on reload. Chinese, English, light and dark themes and mobile layouts are supported; mobile prioritizes tasks and groups less frequent navigation in a menu.
 
