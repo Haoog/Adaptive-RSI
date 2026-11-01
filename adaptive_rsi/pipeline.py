@@ -279,19 +279,27 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not experiment:
             runtime.store.transition(run["id"], state, {"stage": state, **(result or {})}, terminal,
                                      task_fields=task_fields)
-    def sealed(stage, inputs, action):
+    def sealed(stage, inputs, action, accept=None):
         """Reuse a sealed read-only checkpoint only when the operator opted in.
 
         Only the read-only stages pass through here; implementation, workspace
-        writes and remote delivery always execute their action.
+        writes and remote delivery always execute their action. A sealed result
+        the approval predicate rejects is shown to no one: the stage executes
+        again, and only a fresh outcome that passes is sealed in its place, so
+        retrying an inconclusive assessment really obtains a new assessment.
         """
         if not checkpoint_reuse or not hasattr(runtime, "evaluator"):
             return action()
         return runtime.evaluator.execute_stage(
             stage + ":" + project["id"], inputs, action, effect="read_only", enabled=True,
+            accept=accept,
             on_reuse=lambda name: runtime.store.event("stage_reused", "Reused sealed read-only checkpoint",
                                                       run["project"], run["id"],
-                                                      {"stage": stage, "checkpoint": name}))
+                                                      {"stage": stage, "checkpoint": name}),
+            on_reject=lambda name: runtime.store.event("stage_invalidated", "Cached stage result requires rework",
+                                                       run["project"], run["id"],
+                                                       {"stage": stage, "reason": "result_requires_rework",
+                                                        "from_checkpoint": name}))
     from .readiness import inspect as readiness
     check = readiness(runtime, project, config, workspace, required=1, run=run["id"])
     if not check["ready"]:
@@ -667,7 +675,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         review = sealed(
             "review",
             {"review_key": review_key, "patch_hash": fingerprint(patch)},
-            _invoke_review)
+            _invoke_review,
+            accept=_approved_review)
     risk_review = None
     if risk_review_required(plan, review, files, patch):
         # 复用的高风险评审记录同样逐项隔离；fresh 输出仍走正常 enforce_review 门禁。
@@ -689,7 +698,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             risk_review = sealed(
                 "risk_review",
                 {"review_key": review_key, "patch_hash": fingerprint(patch)},
-                _invoke_risk_review)
+                _invoke_risk_review,
+                accept=_approved_review)
         (directory / "risk-review.json").write_text(encode(risk_review), encoding="utf-8")
         if not experiment:
             save(runtime, run, "risk_review", risk_review, review_key)

@@ -109,6 +109,66 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertEqual(result['generation'], 2)
         self.assertEqual(len(calls), 2)
 
+    def test_rejected_sealed_review_reruns_stage_without_resealing(self):
+        store, runner = _stage_runner()
+        calls, reused, rejected = [], [], []
+        inputs = {'review_key': 'k', 'patch_hash': 'h'}
+        # 上一轮把一条证据不足的评审结果封存了；审批谓词只接受通过的记录。
+        runner.seal_checkpoint('review', inputs, {'decision': 'insufficient_evidence', 'generation': 1},
+                               effect='read_only')
+        approved = lambda value: value.get('decision') == 'pass'
+
+        def unclear():
+            calls.append(1)
+            return {'decision': 'insufficient_evidence', 'generation': 2}
+
+        result = runner.execute_stage('review', inputs, unclear, enabled=True, accept=approved,
+                                      on_reuse=reused.append, on_reject=rejected.append)
+        # 被拒的封存结果不能顶替真实执行，也不能报告为复用。
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, [])
+        self.assertEqual(rejected, ['review'])
+        # 仍未通过的复查结果不会覆盖封存记录，重试时依旧重新评审。
+        self.assertEqual(runner.reuse_checkpoint('review', inputs),
+                         {'decision': 'insufficient_evidence', 'generation': 1})
+
+        def passing():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': 3}
+
+        runner.execute_stage('review', inputs, passing, enabled=True, accept=approved, on_reuse=reused.append)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(reused, [])
+        # 通过的复查结果照常封存，之后的重试直接复用而不再执行评审。
+        final = runner.execute_stage('review', inputs, passing, enabled=True, accept=approved,
+                                     on_reuse=reused.append)
+        self.assertEqual(final['generation'], 3)
+        self.assertEqual(reused, ['review'])
+        self.assertEqual(len(calls), 2)
+
+    def test_accept_predicate_error_blocks_reuse_and_sealing(self):
+        store, runner = _stage_runner()
+        calls, reused = [], []
+        inputs = {'review_key': 'k'}
+        runner.seal_checkpoint('review', inputs, {'decision': 'insufficient_evidence'}, effect='read_only')
+
+        def broken(_value):
+            raise ValueError('predicate bug')
+
+        def action():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': 2}
+
+        result = runner.execute_stage('review', inputs, action, enabled=True, accept=broken,
+                                      on_reuse=reused.append)
+        # 谓词自身异常视同拒绝：真实执行、不报告复用，也不把新结果写进封存记录。
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, [])
+        self.assertEqual(store.data['sealed-read-checkpoint:review']['result'],
+                         {'decision': 'insufficient_evidence'})
+
     def test_write_and_remote_stages_never_reuse_or_seal_checkpoints(self):
         store, runner = _stage_runner()
         for effect in ('workspace_write', 'remote_action'):

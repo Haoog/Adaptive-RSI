@@ -639,22 +639,39 @@ class Evaluator:
             return None
         return copy.deepcopy(data["result"])
 
-    def execute_stage(self, name, inputs, action, *, effect="read_only", enabled=False, on_reuse=None):
+    def execute_stage(self, name, inputs, action, *, effect="read_only", enabled=False,
+                      accept=None, on_reuse=None, on_reject=None):
         """Run one stage, reusing a sealed checkpoint only for explicitly enabled read-only work.
 
         Write and remote stages always execute: no checkpoint can replay them.
         A stored result is used only when build, effect, input fingerprint and
-        checksum all match, so any changed input recomputes the stage.
+        checksum all match, so any changed input recomputes the stage. When
+        ``accept`` is supplied the stored result must also satisfy it: a
+        rejected or unevaluable checkpoint is reported through ``on_reject``
+        and the stage executes instead. Only an accepted result is sealed, so a
+        failed or inconclusive stage is never replayed from a checkpoint.
         """
         if effect != "read_only" or not enabled:
             return action()
         reused = self.reuse_checkpoint(name, inputs)
         if reused is not None:
-            if on_reuse is not None:
-                on_reuse(name)
-            return reused
+            try:
+                acceptable = accept is None or bool(accept(reused))
+            except Exception:
+                acceptable = False
+            if acceptable:
+                if on_reuse is not None:
+                    on_reuse(name)
+                return reused
+            if on_reject is not None:
+                on_reject(name)
         result = action()
-        self.seal_checkpoint(name, inputs, result, effect="read_only")
+        try:
+            can_seal = accept is None or bool(accept(result))
+        except Exception:
+            can_seal = False
+        if can_seal:
+            self.seal_checkpoint(name, inputs, result, effect="read_only")
         return result
 
     @staticmethod

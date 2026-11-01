@@ -988,6 +988,75 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual([r[0] for r in self.runtime.agent.roles].count("review"), 2)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
 
+    def test_sealed_insufficient_review_is_reviewed_again_on_retry(self):
+        """封存的评审结果同样要过审批门禁：证据不足的复查必须真正重跑。"""
+        class UnsureFirst(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == "review" and [r[0] for r in self.roles].count("review") == 1:
+                    result["decision"] = "insufficient_evidence"
+                    result["reason"] = "Deferred: the first pass did not inspect the staged diff"
+                return result
+        self.runtime.agent = UnsureFirst()
+        self.runtime.configure({"checks": CHECKS, "recovery": {"reuse_sealed_checkpoints": True}}, self.project)
+        task, run = self.claim()
+        identity = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
+        scenarios = (*self.evaluation_sandbox(),
+                     patch.object(self.runtime.evaluator, "_execution_environment",
+                                  return_value=(self.runtime.config(self.project), identity)))
+        reviews = lambda: [r[0] for r in self.runtime.agent.roles].count("review")
+        checkpoint = {}
+        real_execute = self.runtime.evaluator.execute_stage
+        def recording_execute(name, inputs, action, **options):
+            # 记下 pipeline 为 review 阶段算出的封存键，稍后用同一份输入封存旧记录。
+            if name.startswith("review:"):
+                checkpoint.update(name=name, inputs=inputs)
+            return real_execute(name, inputs, action, **options)
+        with ExitStack() as stack:
+            for scenario in scenarios:
+                stack.enter_context(scenario)
+            # 只旁听不改变行为：封存判定与真实评审执行都走原路径。
+            stack.enter_context(patch.object(self.runtime.evaluator, "execute_stage",
+                                             side_effect=recording_execute))
+            self.runtime.process(run)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+        first = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(first["review"]["decision"], "insufficient_evidence")
+        self.assertEqual(reviews(), 1)
+        # 旧行为会把证据不足的评审结果一起封存，重试时原样播回，复发永远拿不到新结论。
+        self.runtime.evaluator.seal_checkpoint(checkpoint["name"], checkpoint["inputs"], first["review"],
+                                               effect="read_only")
+        self.runtime.retry(task)
+        second = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in scenarios:
+                stack.enter_context(scenario)
+            self.runtime.process(second)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        # 封存的不足证据没有被播回：评审角色被真实调用了一次。
+        self.assertEqual(reviews(), 2)
+        second_events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        invalidated = [json.loads(row["data"]) for row in second_events if row["kind"] == "stage_invalidated"]
+        self.assertIn(("review", "result_requires_rework"),
+                      [(row["stage"], row["reason"]) for row in invalidated])
+        self.assertFalse([json.loads(row["data"]) for row in second_events if row["kind"] == "stage_reused"
+                          and "checkpoint" in json.loads(row["data"])])
+        # 通过的复查结果正常封存：清掉阶段记录后只剩检查点，重试直接复用而不再评审。
+        self.store.execute("DELETE FROM stages WHERE stage='review' AND run IN (SELECT id FROM runs WHERE task=?)",
+                           (task,))
+        self.runtime.cancel_task(task)
+        self.runtime.retry(task)
+        third = self.store.claim(self.project, self.runtime.config(self.project))
+        with ExitStack() as stack:
+            for scenario in scenarios:
+                stack.enter_context(scenario)
+            self.runtime.process(third)
+        self.assertEqual(reviews(), 2)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+        third_events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (third["id"],))
+        self.assertIn({"stage": "review", "checkpoint": checkpoint["name"]},
+                      [json.loads(row["data"]) for row in third_events if row["kind"] == "stage_reused"])
+
     def test_stored_review_records_are_renormalized_before_reuse(self):
         from adaptive_rsi.recovery import enforce_cached_review
         from adaptive_rsi.review import enforce_review
