@@ -222,28 +222,38 @@ def _prepare_environment(runtime, run, project, config, directory, workspace, ch
     return environment, seed_source
 
 
-def experiment_skill_context(skills, strategies, experiment_skills=None):
-    """实验路径的技能集合：只保留当前引导策略的技能，再追加显式声明的候选技能。
+def experiment_skill_context(skills, strategies, baseline_ids=None, injected=None):
+    """实验路径的技能集合：把既有技能固定到实验开始时的基线策略集合。
 
-    受控消融需要测量尚未晋升的技能，但真实任务仍只检索已验证且属于当前稳定策略
-    的技能；这里不写数据库，注入只影响这一次实验的上下文。
+    受控消融比较的是「策略」「技能」两个因素，四配置的既有技能必须完全相同，不能
+    随各变体的 guide 变化；否则 strategy_wins 可能只是在测量「删掉旧技能」。
+
+    候选技能不在这里追加：它已随 ``runtime.memories(..., extra=...)`` 走完同一条
+    生产 ``related()`` 检索、排序与 limit/字符上限，因此本函数只做「收紧」一件事。
+    只有本变体显式注入的候选技能（``injected`` 里的候选 id）可以在基线集合之外保留，
+    不会因为写入端遗留的 evidence 字段而整类放行。
+
+    ``baseline_ids`` 为 None 时按当次 guide 策略过滤，保留旧行为供其它调用点使用。
     """
-    guide_ids = {g.get("id") for g in strategies if g.get("id")}
-    kept = [m for m in skills if m["evidence"].get("candidate") in guide_ids]
-    if experiment_skills:
-        kept = kept + [{"content": item["content"], "evidence": item["evidence"],
-                        "created": item["created"], "triggers": item["triggers"]}
-                       for item in experiment_skills]
-    return kept
+    target_ids = set(baseline_ids) if baseline_ids is not None else {
+        g.get("id") for g in strategies if g.get("id")}
+    target_ids |= {c for c in (injected or ()) if c}
+    return [m for m in skills if m.get("evidence", {}).get("candidate") in target_ids]
 
 
 def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False,
-                      experiment_skills=None):
+                      experiment_skills=None, baseline_ids=None):
     """One production path for real tasks and paired experiments; experiments never deliver.
 
     ``experiment_skills`` only exists for controlled ablations: it injects candidate
     skills that are not promoted yet, so experiment runs can measure them without
-    writing verified rows that real tasks would retrieve.
+    writing verified rows that real tasks would retrieve. They are merged into the
+    same production retrieval as verified skills, so ``context.related()`` still
+    decides relevance, ordering and the count/character limits.
+
+    ``baseline_ids`` pins the existing skill set to the strategies active when the
+    experiment started, so the four ablation configurations differ only in the
+    factor under test.
     """
     config = json.loads(run["config"])
     from .workflow import change_kind, documentation_only, evidence_contract, supports_test_first
@@ -316,8 +326,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                             "related_work": overlaps, "issue_comments": comment_evidence})
     saved_plan = None if experiment else cached(runtime, run, "planning", plan_key)
     saved_acceptance = None if experiment else cached(runtime, run, "acceptance", plan_key)
+    extra = experiment_skills if experiment else None
     context = {"task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]},
-               "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"]),
+               "stable_strategies": strategies, "skills": runtime.memories(project["id"], task["body"], extra=extra),
                "toolchains": detect(workspace), "code_map": code_map(workspace, task["body"], limit=12), "baseline": base,
                "postmerge_outcomes": planning_outcomes,
                "open_prs": open_prs,
@@ -326,7 +337,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                "previous_attempts": runtime.store.query("SELECT id,base,state,result FROM runs WHERE task=? AND ended IS NOT NULL "
                                                       "ORDER BY started DESC LIMIT 2", (task["id"],))}
     if experiment:
-        context["skills"] = experiment_skill_context(context["skills"], strategies, experiment_skills)
+        injected = {item.get("evidence", {}).get("candidate") for item in experiment_skills or ()}
+        context["skills"] = experiment_skill_context(context["skills"], strategies,
+                                                     baseline_ids=baseline_ids, injected=injected)
     from .experience import protected_feedback_values, retry_feedback
     protected_feedback = protected_feedback_values(runtime.store, task["id"])
     context["previous_attempts"] = [retry_feedback(r, protected_feedback) for r in context["previous_attempts"]]

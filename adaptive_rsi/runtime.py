@@ -1408,7 +1408,13 @@ class Runtime(Maintenance):
             result.append({"id": row["id"], "kind": row["kind"], "content": content})
         return result
 
-    def memories(self, project, text):
+    def memories(self, project, text, extra=None):
+        """Retrieve verified skills for active strategies matching text, plus optional extra candidate skills.
+
+        Candidate skills in ``extra`` are subjected to the same relevance ranking,
+        per-skill character limit, and context.related() limit and character budget
+        as promoted verified skills.
+        """
         rows = self.store.query("SELECT * FROM skills WHERE project=? AND status='verified' AND expires>? "
                                 "ORDER BY created DESC LIMIT 50", (project, time.time()))
         active = {c["id"] for c in self.active_strategies(project)}
@@ -1427,6 +1433,17 @@ class Runtime(Maintenance):
             if evidence.get("candidate") in active and any(t.lower() in lower for t in triggers if t.strip()):
                 eligible.append({"content": r["content"][:2000], "evidence": evidence,
                                  "created": r["created"], "triggers": triggers})
+        if extra:
+            # 候选技能不额外放宽任何条件：并入同一批 eligible 后，由 related() 决定
+            # 是否命中、排序位置以及 limit/字符上限，与已验证技能走同一条规则。
+            for item in extra:
+                triggers = item.get("triggers", [])
+                if not isinstance(triggers, list):
+                    continue
+                eligible.append({"content": str(item.get("content", ""))[:2000],
+                                 "evidence": item.get("evidence", {}),
+                                 "created": item.get("created", time.time()),
+                                 "triggers": [t for t in triggers if isinstance(t, str) and t.strip()]})
         return related(eligible, text)
 
     def invoke(self, role, text, workspace, run):
@@ -1685,10 +1702,10 @@ class Runtime(Maintenance):
             self.wake.set()
 
     def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False,
-                          experiment_skills=None):
+                          experiment_skills=None, baseline_ids=None):
         from .pipeline import execute_candidate
         return execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment,
-                                 experiment_skills)
+                                 experiment_skills, baseline_ids)
 
     def finish_failure(self, run, task, result, config):
         state = "insufficient_evidence" if result["decision"] == "insufficient_evidence" else "failed"

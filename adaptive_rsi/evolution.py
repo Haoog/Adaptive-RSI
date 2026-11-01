@@ -337,7 +337,7 @@ class Evolution:
         """
         record = {"state": "insufficient_evidence", "configurations": list(ABLATION_CONFIGURATIONS),
                   "scope": "validation inputs with a demonstrated joint gain", "sampled": 0,
-                  "rows": [], "trials": [],
+                  "rows": [], "trials": [], "partial": False,
                   "attribution": {"state": "insufficient_evidence",
                                   "reason": "Controlled ablation has not run"},
                   "limitation": "Descriptive matched outcomes on sampled inputs; the learned skill is injected "
@@ -366,7 +366,11 @@ class Evolution:
                  "created": time.time()}
         guide = [c for c in current if c["kind"] != proposal["kind"]] + [
             {"kind": proposal["kind"], "content": proposal}]
-        error = None
+        # 四配置的既有技能按实验开始时的基线策略固定，不从各变体的 guide 推导：
+        # baseline/skill_only 用 current，strategy_only/combined 换成 guide，
+        # 只有这样才能保证技能集合只差「是否注入候选技能」。
+        baseline_ids = {c["id"] for c in current if c.get("id")}
+        error, invisible = None, False
         try:
             for trial in wins:
                 if len({row["input"] for row in record["rows"]}) >= limit:
@@ -375,16 +379,21 @@ class Evolution:
                 spec = case_spec(row) if row else None
                 if spec is None or not self.skill_relevant(proposal["triggers"], spec.get("task", "")):
                     continue
+                # 候选技能必须在生产检索（runtime.memories → context.related）下可见，
+                # 否则 skill_only 与 baseline 实际相同，四行结果只是在为看不见的技能报数。
+                if not self.skill_retrievable(project["id"], spec.get("task", ""), skill):
+                    invisible = True
+                    continue
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled")
                 skill_only = self.run_configuration(run, project, row, spec, "skill_only", trial["repetition"],
                                                     current, directory, candidate, config, branch="ablation",
-                                                    experiment_skills=[skill])
+                                                    experiment_skills=[skill], baseline_ids=baseline_ids)
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled")
                 combined = self.run_configuration(run, project, row, spec, "combined", trial["repetition"],
                                                   guide, directory, candidate, config, branch="ablation",
-                                                  experiment_skills=[skill])
+                                                  experiment_skills=[skill], baseline_ids=baseline_ids)
                 record["rows"].extend([
                     {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"]},
                     {"input": trial["case"], "variant": "strategy_only", "pass": trial["candidate"]["pass"]},
@@ -397,14 +406,28 @@ class Evolution:
         except Exception as exc:
             error = "Controlled ablation did not complete: " + str(exc)[:300]
         record["sampled"] = len({row["input"] for row in record["rows"]})
-        record["attribution"] = self.attribution(record["rows"])
-        record["state"] = record["attribution"].get("state", "insufficient_evidence")
         if error:
+            # 后续输入抛异常时已完成的四行只是部分证据，不能因为 attribution() 能
+            # 凑齐一个输入就报 complete；晋升评审引用同一份不足证据。
+            record["state"] = "insufficient_evidence"
+            record["attribution"] = {"state": "insufficient_evidence", "reason": error}
             record["reason"] = error
-        elif record["state"] != "complete":
-            record["reason"] = ("Four matched configurations are unavailable for the sampled inputs; "
-                                "the learned skill may not be retrieved by any sampled task")
+            record["partial"] = bool(record["rows"])
+        else:
+            record["attribution"] = self.attribution(record["rows"])
+            record["state"] = record["attribution"].get("state", "insufficient_evidence")
+            if record["state"] != "complete":
+                record["reason"] = ("Four matched configurations are unavailable for the sampled inputs; " +
+                                    ("the candidate skill is not visible under production retrieval" if invisible
+                                     else "the learned skill may not be retrieved by any sampled task"))
         return record
+
+    def skill_retrievable(self, project, text, skill):
+        """候选技能是否能被生产检索选中（与晋升后真实任务同一条 related() 规则）。"""
+        evidence = skill.get("evidence", {})
+        retrieved = self.runtime.memories(project, text, extra=[skill])
+        return any(item.get("evidence", {}).get("candidate") == evidence.get("candidate") and
+                   item.get("evidence", {}).get("ablation") for item in retrieved)
 
     def export_bundle(self, candidate, destination):
         """Export sealed local inputs, never credentials or arbitrary evidence paths."""
@@ -862,11 +885,12 @@ class Evolution:
             "reason": str(reason or "")[:1000], "at": time.time()})
 
     def run_configuration(self, run, project, case, spec, variant, repetition, guide, directory, candidate, config,
-                          branch="experiments", experiment_skills=None):
+                          branch="experiments", experiment_skills=None, baseline_ids=None):
         """Run one controlled configuration through the normal experimental pipeline.
 
         配对试验与消融试验共用这条路径：同样的案例曝光上限、取消检查、预算记录和
-        overlay 评估，不存在绕开评估器的第二通道。
+        overlay 评估，不存在绕开评估器的第二通道。``baseline_ids`` 是实验开始时
+        ``active_strategies`` 的策略 id 集合，用于把四配置的既有技能固定成同一批。
         """
         trial_dir = directory / branch / (case["id"] + "-" + str(repetition)) / variant
         trial_dir.mkdir(parents=True)
@@ -883,7 +907,7 @@ class Evolution:
                       "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
         outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
             trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
-            experiment=True, experiment_skills=experiment_skills)
+            experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
         if hasattr(self.runtime, "propagate_deadline"):
             self.runtime.propagate_deadline(run, trial_run)
         # A case overlay is host-owned and remains outside model-visible workspaces.
@@ -1051,6 +1075,9 @@ class Evolution:
                                     "cases": [case["id"] for case in selection["holdout"]],
                                     "fresh": all(case["uses"] == 0 for case in selection["holdout"])}
         self.save(candidate, "evaluating", evidence)
+        # 四配置的既有技能必须来自同一批基线策略：稳定版与候选版 guide 不同，
+        # 若各自推导技能集合，strategy_only 会连带丢掉被替换策略的旧技能。
+        baseline_ids = {c["id"] for c in current if c.get("id")}
         try:
             for split in ["validation", "holdout"]:
                 selected = selection[split]
@@ -1067,7 +1094,8 @@ class Evolution:
                                 raise Cancelled("Evolution cancelled")
                             guide = current if variant == "stable" else [c for c in current if c["kind"] != proposal["kind"]] + [{"kind": proposal["kind"], "content": proposal}]
                             trial[variant] = self.run_configuration(run, project, case, spec, variant, repetition,
-                                                                    guide, directory, candidate, config)
+                                                                    guide, directory, candidate, config,
+                                                                    baseline_ids=baseline_ids)
                         evidence["trials"].append(trial)
                         self.save(candidate, "evaluating", evidence)
                 if split == "validation":

@@ -2798,7 +2798,11 @@
         "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_joint_strategy_and_skill_change_runs_the_scheduled_ablation",
         "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_stays_insufficient_when_no_sampled_input_matches_the_skill",
         "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_skill_is_injected_only_into_declared_experiment_contexts",
-        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_limit_validation_rejects_invalid_values"
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_limit_validation_rejects_invalid_values",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_four_configurations_differ_only_in_the_tested_factor",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_candidate_skill_is_ranked_and_bounded_by_production_retrieval",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_stays_insufficient_when_production_retrieval_hides_the_skill",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_marks_partial_rows_insufficient_when_a_later_input_raises"
       ]
     },
     {
