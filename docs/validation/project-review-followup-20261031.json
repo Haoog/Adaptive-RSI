@@ -1,0 +1,165 @@
+{
+  "counts": {
+    "open": 10,
+    "fixed_in_working_tree": 29
+  },
+  "updated_ids": [
+    "R4-001",
+    "R4-002",
+    "R4-003",
+    "R4-004",
+    "R4-005",
+    "R4-006",
+    "R4-007",
+    "R4-008",
+    "R4-010",
+    "R4-012",
+    "R4-014",
+    "R4-015",
+    "R4-016",
+    "R4-017",
+    "R4-018",
+    "R4-019",
+    "R4-020",
+    "R4-021",
+    "R4-022",
+    "R4-023",
+    "R4-027",
+    "R4-028",
+    "R4-030"
+  ],
+  "status_changes": [
+    {
+      "id": "R4-001",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-002",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-003",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-004",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-005",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-006",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-007",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-008",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-010",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-012",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-014",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-015",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-016",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-017",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-018",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-019",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-020",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-021",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-022",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-023",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-027",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-028",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    },
+    {
+      "id": "R4-030",
+      "before": "open",
+      "after": "fixed_in_working_tree"
+    }
+  ],
+  "evidence": {
+    "run_log": "/home/ubuntu/rsi-ops/runs/20261031_211300_302-proc01-ledger/run.log",
+    "run_log_note": "上一轮（20261031_211300_302-proc01-ledger）对 24 条逐条核对了当前 HEAD 的实现代码与回归测试，结论与逐条证据见该日志末尾「核对结论」。",
+    "status_backfill_commit": "ab15952a7795ebbe0662a111a2cd04dd72e63e1c",
+    "test_existence_check": "本轮仅做集体体检：23 条的回归测试名在 tests/ 与 desktop/src-tauri/src/regression_tests.rs 中 grep 命中（23/23），未重新逐条核验实现。",
+    "review_round": "PR #128 的 Codex 评审指出 R4-026 不应标 fixed：scripts/test_selected.py 的 main()（行 107）直接调 run_groups()，未安装 SIGTERM handler（handler 只在 scripts/test_parallel.py:main），且 run_groups 在缺省 --durations 时启动裸 python -m unittest worker、无 parent watch——与台账原始触发路径一致。本轮在代码中复核属实（grep 无 signal 处理），将 R4-026 恢复为 open。"
+  },
+  "residual_risks": [
+    {
+      "id": "R4-026",
+      "risk": "保持 open：scripts/test_selected.py main() 未安装 SIGTERM→KeyboardInterrupt handler，缺省 --durations 时 run_groups 启动裸 python -m unittest worker（无 test_worker watch_parent）；父进程被默认 SIGTERM 终止会绕过 run_groups 的 finally，独立 session 的 worker 遗留。进程组清理与 watch_parent 仅覆盖 test_parallel 路径与 --durations worker 路径。"
+    },
+    {
+      "id": null,
+      "risk": "fixed_in_working_tree 状态依据上一轮 run.log 的逐条实现核对回填；本轮只验证了对应回归测试存在，未重新逐条核验实现，也未在本轮重跑这 23 条测试。"
+    }
+  ]
+}

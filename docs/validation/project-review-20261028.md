@@ -4,7 +4,7 @@
 
 本次审查基于 `e78aea5cc892010b86987bac8fc54254728370a4`（0.5.125），实现位于 `chore/audit-validation-feedback-20261028` 工作树。未提交、推送、合并、发布或更新本地应用；原有 `docs/research/` 保留。
 
-共 39 条实质发现：P1 3 条、P2 30 条、P3 6 条；34 条有确定性探针或实际执行证据，5 条为调用链证据。工作树已处理 6 条，另外 33 条仍待修复。相关历史编号只表示重叠领域或旧验收未覆盖，不表示该项已由历史测试证明。
+共 39 条实质发现：P1 3 条、P2 30 条、P3 6 条；34 条有确定性探针或实际执行证据，5 条为调用链证据。工作树已处理 29 条，另外 10 条仍待修复。相关历史编号只表示重叠领域或旧验收未覆盖，不表示该项已由历史测试证明。
 
 已有201项历史台账为114项已实现、56项部分完成、31项待做，尚余87项部分完成或待做；本次没有将它们重复加到新清单，也没有替旧记录重新认证。机器清单见 [JSON](project-review-20261028.json)。
 
@@ -46,7 +46,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 “已修”仅表示当前工作树有实现和本次回归；“待修”表示保留的问题。确定性fixture不等于真实远程/生产负载能力。
 
-### R4-001 · P1 · 待修 · 备份验证未检查迁移账本，轮换可删除唯一可恢复备份
+### R4-001 · P1 · 已修 · 备份验证未检查迁移账本，轮换可删除唯一可恢复备份
 
 位置：[adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py)，行 215–232；关联旧#4。
 
@@ -58,7 +58,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe_extra.py；另运行 data_probe.py 查看验证通过、恢复失败的配对结果。两个脚本仅创建 scratch 临时 Store。
 
-### R4-002 · P1 · 待修 · 合并后通过的是后续主线，却发布尚未通过检查的原合并提交
+### R4-002 · P1 · 已修 · 合并后通过的是后续主线，却发布尚未通过检查的原合并提交
 
 位置：[adaptive_rsi/release.py](../../adaptive_rsi/release.py)，行 578–637。
 
@@ -70,7 +70,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 delivery-probe-results.json 的 failed_merge_fixed_later 和 release_uses_failed_merge。只运行本地 fixture 的 Python assert；GitHub API、授权和存储为隔离替身，没有远程写。
 
-### R4-003 · P1 · 待修 · 合并后快照比较把修改过的失败测试恢复为旧测试并复用为完整检查
+### R4-003 · P1 · 已修 · 合并后快照比较把修改过的失败测试恢复为旧测试并复用为完整检查
 
 位置：[adaptive_rsi/delivery.py](../../adaptive_rsi/delivery.py)，行 667–676。
 
@@ -82,7 +82,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；changed_mainline_test_hidden: direct_current_exit=1, decision=pass, candidate_full_reused=true。
 
-### R4-004 · P2 · 待修 · 历史运行结果容器异常会中止整库恢复
+### R4-004 · P2 · 已修 · 历史运行结果容器异常会中止整库恢复
 
 位置：[adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py)，行 391–394。
 
@@ -94,7 +94,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；查看 malformed_result_verification 与 malformed_result_restore。
 
-### R4-005 · P2 · 待修 · 用量报告多次读取缺少共同快照，总计与明细可能自相矛盾
+### R4-005 · P2 · 已修 · 用量报告多次读取缺少共同快照，总计与明细可能自相矛盾
 
 位置：[adaptive_rsi/usage_report.py](../../adaptive_rsi/usage_report.py)，行 59–130。
 
@@ -106,7 +106,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；脚本通过 one 包装器在两次读取之间确定性插入一条本地调用记录，不执行模型。
 
-### R4-006 · P2 · 待修 · 存储概览刷新重复读取全部备份内容计算 hash
+### R4-006 · P2 · 已修 · 存储概览刷新重复读取全部备份内容计算 hash
 
 位置：[adaptive_rsi/storage_tools.py](../../adaptive_rsi/storage_tools.py)，行 557–567；关联旧#104。
 
@@ -118,7 +118,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/data_probe.py；overview_hashes 通过包装真实 file_digest 计数，不使用大文件或长时间压测。
 
-### R4-007 · P2 · 待修 · 单条损坏的待关闭 PR 记录阻断整个交付扫描与恢复
+### R4-007 · P2 · 已修 · 单条损坏的待关闭 PR 记录阻断整个交付扫描与恢复
 
 位置：[adaptive_rsi/delivery.py](../../adaptive_rsi/delivery.py)，行 387–389。
 
@@ -130,7 +130,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** sqlite3 :memory: 中 CREATE TABLE runs(state TEXT,result TEXT); INSERT INTO runs VALUES('merged','{}'),('superseded','broken-json'); SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR (state='superseded' AND json_extract(result,'$.close_pending')=1)); 返回 malformed JSON。实际已用 Python sqlite3 执行，无仓库或远程状态修改。
 
-### R4-008 · P2 · 待修 · candidate_full 追加探测检查时再次执行全部已跑固定检查
+### R4-008 · P2 · 已修 · candidate_full 追加探测检查时再次执行全部已跑固定检查
 
 位置：[adaptive_rsi/evaluator.py](../../adaptive_rsi/evaluator.py)，行 831–903；关联旧#201。
 
@@ -154,7 +154,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/delivery_probe.py；查看 identical_postmerge_trees.physical_stages。
 
-### R4-010 · P2 · 待修 · 认证快照的 RuntimeError 分支遮蔽 AuthError 恢复逻辑
+### R4-010 · P2 · 已修 · 认证快照的 RuntimeError 分支遮蔽 AuthError 恢复逻辑
 
 位置：[adaptive_rsi/auth_sessions.py](../../adaptive_rsi/auth_sessions.py)，行 869–877。
 
@@ -178,7 +178,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** 运行 desktop_probes.py；key_install_after_close.installed[0].after_closed 为 true。Worker 为纯内存替身，FAKE_TEST_VALUE 未发送到网络或真实凭据存储。
 
-### R4-012 · P2 · 待修 · 更新空闲屏障遗漏正在运行的模型目录请求
+### R4-012 · P2 · 已修 · 更新空闲屏障遗漏正在运行的模型目录请求
 
 位置：[adaptive_rsi/model_center.py](../../adaptive_rsi/model_center.py)，行 319–343。
 
@@ -202,7 +202,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** 代码支持，未启动真实应用：检查 main.rs:654-661 的一次性 reader、desktop.py:63-69 的持续 rotated 输出以及 transport.rs:126-133 的凭据发布条件。集成复现需隔离状态目录下先 serve，再 desktop-runtime，随后从另一客户端 rotate。
 
-### R4-014 · P2 · 待修 · 更新停止运行器超时后保留已失去控制管道的旧连接
+### R4-014 · P2 · 已修 · 更新停止运行器超时后保留已失去控制管道的旧连接
 
 位置：[desktop/src-tauri/src/native_update.rs](../../desktop/src-tauri/src/native_update.rs)，行 376–383。
 
@@ -214,7 +214,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** 代码支持，未更新实际应用：用隔离假运行器在读到 stdin EOF 后延迟超过30秒退出，执行安装停止阶段，观察失败回包后进程退出而 local/target 未重新 bootstrap。当前未运行该超过30秒实验，符合本次单项验证<=30秒约束。
 
-### R4-015 · P2 · 待修 · 模型诊断成功返回后调用不可见的 dialog 函数
+### R4-015 · P2 · 已修 · 模型诊断成功返回后调用不可见的 dialog 函数
 
 位置：[adaptive_rsi/web/model-center.js](../../adaptive_rsi/web/model-center.js)，行 167–168；关联旧#1。
 
@@ -226,7 +226,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；输出 error=ReferenceError: dialog is not defined
 
-### R4-016 · P2 · 待修 · 项目模型诊断始终使用全局配置
+### R4-016 · P2 · 已修 · 项目模型诊断始终使用全局配置
 
 位置：[adaptive_rsi/web/model-center.js](../../adaptive_rsi/web/model-center.js)，行 166–166；关联旧#1。
 
@@ -238,7 +238,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/diagnostics-repro.cjs；request.payload.project 为 null，而 fixture scope 为 project-123
 
-### R4-017 · P2 · 待修 · 推荐任务簇路径遗漏批量幂等恢复
+### R4-017 · P2 · 已修 · 推荐任务簇路径遗漏批量幂等恢复
 
 位置：[adaptive_rsi/web/batch.js](../../adaptive_rsi/web/batch.js)，行 44–48；关联旧#37。
 
@@ -250,7 +250,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；batch.request_ids=[request-1,request-2]
 
-### R4-018 · P2 · 待修 · 授权轮询重绘打断供应商搜索和键盘导航
+### R4-018 · P2 · 已修 · 授权轮询重绘打断供应商搜索和键盘导航
 
 位置：[adaptive_rsi/web/auth.js](../../adaptive_rsi/web/auth.js)，行 96–104；关联旧#188。
 
@@ -262,7 +262,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/frontend-repro.cjs；focus={before:mc-auth-provider-search,after:"",oldConnected:false}
 
-### R4-019 · P2 · 待修 · 桌面后台下载在重新打开页面后被六小时检查间隔阻塞
+### R4-019 · P2 · 已修 · 桌面后台下载在重新打开页面后被六小时检查间隔阻塞
 
 位置：[adaptive_rsi/web/native-update.js](../../adaptive_rsi/web/native-update.js)，行 98–104。
 
@@ -274,7 +274,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** node /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/native-resume-repro.cjs；calls=[status,status]，policy=download，界面发现新版本。
 
-### R4-020 · P2 · 待修 · 实验评估沿用父运行 planning 状态，命中准备时限且丢失阶段超时回执
+### R4-020 · P2 · 已修 · 实验评估沿用父运行 planning 状态，命中准备时限且丢失阶段超时回执
 
 位置：[adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py)，行 387–398；关联旧#95。
 
@@ -286,7 +286,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/runtime-probes.py；experiment_deadline 使用真实 Store.claim 和 Runtime.is_cancelled， preparation_seconds=1、evaluation_seconds=100、准备时钟过去5秒。当前测试 test_evaluation_deadline_has_its_own_clock 先显式 transition('evaluating')，未覆盖 experiment=True 的不落库分支。
 
-### R4-021 · P2 · 待修 · 停用的 development 样本仍进入策略提案上下文
+### R4-021 · P2 · 已修 · 停用的 development 样本仍进入策略提案上下文
 
 位置：[adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py)，行 315–327；关联旧#153。
 
@@ -298,7 +298,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** 运行同目录 runtime-probes.py，查看 retired_development。现有 test_retirement_and_reclassification_keep_exposure 只核对数据库中的 active/uses/lifecycle，不断言提案提示或样本选择排除 inactive 数据。
 
-### R4-022 · P2 · 待修 · 后处理每轮扫描并解析全部历史完成记录且持有全局调度锁
+### R4-022 · P2 · 已修 · 后处理每轮扫描并解析全部历史完成记录且持有全局调度锁
 
 位置：[adaptive_rsi/runtime.py](../../adaptive_rsi/runtime.py)，行 1137–1151；关联旧#169。
 
@@ -310,7 +310,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** 运行同目录 runtime-probes.py 查看 postprocess_query.loaded_completed_records=3；可补充一个无 pending、上千 completed 的测试，断言读取/解析记录数与 pending 数关联，而不是只测耗时。现有恢复测试只用少量记录，不覆盖历史放大。
 
-### R4-023 · P2 · 待修 · 明知新鲜 holdout 数不足仍执行整套付费试验后才拒绝晋升
+### R4-023 · P2 · 已修 · 明知新鲜 holdout 数不足仍执行整套付费试验后才拒绝晋升
 
 位置：[adaptive_rsi/evolution.py](../../adaptive_rsi/evolution.py)，行 279–282；关联旧#143。
 
@@ -358,7 +358,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-027 · P2 · 待修 · 空 suite 被选测 worker 标记通过
+### R4-027 · P2 · 已修 · 空 suite 被选测 worker 标记通过
 
 位置：[scripts/test_worker.py](../../scripts/test_worker.py)，行 18–26。
 
@@ -370,7 +370,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-028 · P2 · 待修 · 选测仅按 selector 字符串去重，允许同一测试重复并发执行
+### R4-028 · P2 · 已修 · 选测仅按 selector 字符串去重，允许同一测试重复并发执行
 
 位置：[scripts/test_selected.py](../../scripts/test_selected.py)，行 18–30。
 
@@ -394,7 +394,7 @@ CI的562次额外Python测试执行来自3.9和3.14两个兼容套，各281项�
 
 **复现或验证：** python3 -B /Users/neg-entropy/.hermes/cache/scratch/adaptive-rsi-review-20261028/validation_probe.py
 
-### R4-030 · P2 · 待修 · 按 selector 单独启动 runner 重复执行同类 fixture
+### R4-030 · P2 · 已修 · 按 selector 单独启动 runner 重复执行同类 fixture
 
 位置：[scripts/test_worker.py](../../scripts/test_worker.py)，行 16–21；关联旧#194。
 

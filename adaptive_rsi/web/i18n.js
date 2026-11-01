@@ -1889,6 +1889,8 @@ const english = {
  "继续并核对批次": "Continue and reconcile batch",
  "导出批次记录": "Export batch history",
  "部分结果待核对，请打开批次记录。": "Some outcomes need reconciliation. Open batch history.",
+ "上次的批次回执暂时无法核对；继续会沿用原请求编号，服务端按回执返回结果，不会重复执行。": "The previous batch receipt cannot be checked right now; continuing reuses the same request ID and the server returns the stored receipt instead of running the operation twice.",
+ "批量操作结果待核对，原请求编号已保留；网络恢复后重新执行会先核对回执，不会重复操作。": "The batch outcome needs reconciliation and its request ID is kept; retrying after the connection recovers reconciles the stored receipt instead of repeating the operation.",
  "实时刷新中断 · 上次成功更新 {time}。详情可能不是最新，可立即重试。": "Live refresh interrupted · Last successful update {time}. Details may be out of date. Retry now.",
  "实时刷新中断 · 尚未成功更新。详情可能不是最新，可立即重试。": "Live refresh interrupted · No successful update yet. Details may be out of date. Retry now.",
  "用量刷新失败：当前显示「{range}」的数据（最后成功更新 {time}）。本次筛选尚未加载。": "Usage refresh failed: showing data for “{range}” (last successful update {time}). The current filters have not loaded.",
