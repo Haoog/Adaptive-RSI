@@ -2785,14 +2785,21 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "同输入下比较各配置，报告不把组合收益全部归给单一模块。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/evolution.py"
+        "adaptive_rsi/evolution.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/runtime.py",
+        "tests/test_audit_evolution.py"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_attribution_does_not_assign_combined_gain_to_strategy"
-      ],
-      "residual": "Matched four-configuration attribution helper reports interaction-only gains and insufficient evidence; automatic controlled ablation scheduling is not integrated."
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_attribution_does_not_assign_combined_gain_to_strategy",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_joint_strategy_and_skill_change_runs_the_scheduled_ablation",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_stays_insufficient_when_no_sampled_input_matches_the_skill",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_skill_is_injected_only_into_declared_experiment_contexts",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_limit_validation_rejects_invalid_values"
+      ]
     },
     {
       "id": 160,

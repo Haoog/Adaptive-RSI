@@ -213,7 +213,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 156. **partial** — Export sealed experiment reproduction bundles
 157. **implemented** — Record exact host tool versions
 158. **partial** — Model monorepo check dependencies
-159. **partial** — Separate strategy and skill attribution
+159. **implemented** — Separate strategy and skill attribution
 160. **implemented** — Compare quality, cost and latency jointly
 161. **pending** — Explain merge queue states
 162. **partial** — Inspect GitHub ruleset requirements

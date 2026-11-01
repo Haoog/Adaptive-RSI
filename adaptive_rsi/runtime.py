@@ -1684,9 +1684,11 @@ class Runtime(Maintenance):
                                ("run-stop:" + run["id"], run["id"]))
             self.wake.set()
 
-    def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False):
+    def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False,
+                          experiment_skills=None):
         from .pipeline import execute_candidate
-        return execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment)
+        return execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment,
+                                 experiment_skills)
 
     def finish_failure(self, run, task, result, config):
         state = "insufficient_evidence" if result["decision"] == "insufficient_evidence" else "failed"

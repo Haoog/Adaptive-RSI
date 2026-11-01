@@ -222,8 +222,29 @@ def _prepare_environment(runtime, run, project, config, directory, workspace, ch
     return environment, seed_source
 
 
-def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False):
-    """One production path for real tasks and paired experiments; experiments never deliver."""
+def experiment_skill_context(skills, strategies, experiment_skills=None):
+    """实验路径的技能集合：只保留当前引导策略的技能，再追加显式声明的候选技能。
+
+    受控消融需要测量尚未晋升的技能，但真实任务仍只检索已验证且属于当前稳定策略
+    的技能；这里不写数据库，注入只影响这一次实验的上下文。
+    """
+    guide_ids = {g.get("id") for g in strategies if g.get("id")}
+    kept = [m for m in skills if m["evidence"].get("candidate") in guide_ids]
+    if experiment_skills:
+        kept = kept + [{"content": item["content"], "evidence": item["evidence"],
+                        "created": item["created"], "triggers": item["triggers"]}
+                       for item in experiment_skills]
+    return kept
+
+
+def execute_candidate(runtime, run, project, task, source, base, directory, workspace, strategies, experiment=False,
+                      experiment_skills=None):
+    """One production path for real tasks and paired experiments; experiments never deliver.
+
+    ``experiment_skills`` only exists for controlled ablations: it injects candidate
+    skills that are not promoted yet, so experiment runs can measure them without
+    writing verified rows that real tasks would retrieve.
+    """
     config = json.loads(run["config"])
     from .workflow import change_kind, documentation_only, evidence_contract, supports_test_first
     def transition(state, result=None, terminal=False, task_fields=None):
@@ -305,8 +326,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                "previous_attempts": runtime.store.query("SELECT id,base,state,result FROM runs WHERE task=? AND ended IS NOT NULL "
                                                       "ORDER BY started DESC LIMIT 2", (task["id"],))}
     if experiment:
-        guide_ids = {g.get("id") for g in strategies if g.get("id")}
-        context["skills"] = [m for m in context["skills"] if m["evidence"].get("candidate") in guide_ids]
+        context["skills"] = experiment_skill_context(context["skills"], strategies, experiment_skills)
     from .experience import protected_feedback_values, retry_feedback
     protected_feedback = protected_feedback_values(runtime.store, task["id"])
     context["previous_attempts"] = [retry_feedback(r, protected_feedback) for r in context["previous_attempts"]]
