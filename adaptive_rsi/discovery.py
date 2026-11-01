@@ -1,5 +1,6 @@
 """Bounded Issue synchronization with a durable, project-scoped continuation."""
 import datetime
+import difflib
 import heapq
 import json
 import re
@@ -287,6 +288,32 @@ def issue_requirements_body(requirements):
     return body
 
 
+def _diff_audit(db, project, run, task_id, prior, row):
+    """Emit the requirement diff event inside the same transaction that wrote the task.
+
+    审计与任务行同事务落库：中途失败时两者一起回滚，不会留下没有审计记录的静默改写，
+    也不会留下指向旧内容的审计记录。来源时间与原文保留在 before/after/source 中。
+    """
+    if not prior or (prior["title"], prior["body"]) == (row["title"], row["body"]):
+        return False
+    try:
+        evidence = json.loads(row["evidence"])
+    except (TypeError, ValueError):
+        evidence = []
+    source = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
+    db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+               (project, run, "issue_requirements_diff", "Synchronized Issue requirements changed",
+                encode({"task": task_id,
+                        "before": {key: prior[key] for key in ("title", "body", "evidence")},
+                        "after": {key: row[key] for key in ("title", "body", "evidence")},
+                        "source": {key: source.get(key) for key in ("number", "url", "updated")},
+                        "observed_at": time.time(), "authority": "untrusted_task_data",
+                        "diff": "\n".join(difflib.unified_diff(prior["body"].splitlines(), row["body"].splitlines(),
+                                                               fromfile="previous", tofile="synchronized", lineterm=""))}),
+                time.time()))
+    return True
+
+
 def _issue_task(db, project, repository, number):
     """Adopt a legacy key only when its evidence proves the repository identity."""
     key = "issue:" + repository.lower() + ":" + str(number)
@@ -311,7 +338,7 @@ def _issue_task(db, project, repository, number):
     return key, None
 
 
-def sync(runtime, project, config, checked, cancel=None):
+def sync(runtime, project, config, checked, cancel=None, run_id=None):
     repo = config["github"]["repository"]
     if not repo:
         raise ValueError("No GitHub repository configured")
@@ -339,8 +366,12 @@ def sync(runtime, project, config, checked, cancel=None):
             db.execute("BEGIN IMMEDIATE")
             task_key, existing = _issue_task(db, project["id"], repo, number)
             if existing:
+                prior = dict(existing)
                 if apply_existing(issue, existing, db):
                     changed += 1
+                    row = db.execute("SELECT id,title,body,evidence FROM tasks WHERE id=?",
+                                     (existing["id"],)).fetchone()
+                    _diff_audit(db, project["id"], run_id, existing["id"], prior, dict(row))
                 return
         labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
