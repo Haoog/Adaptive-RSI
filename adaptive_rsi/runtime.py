@@ -642,6 +642,7 @@ class Runtime(Maintenance):
                        (now, row["project"], task))
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
+            db.execute("DELETE FROM settings WHERE key=?", ('task-schedule:' + task,))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'requirements_revised','Requirements supplemented; fresh verification required',?,?)",
                        (row["project"], encode({"task": task, "revision": revision, "reason": reason,

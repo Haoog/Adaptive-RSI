@@ -197,6 +197,19 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.synchronize([issue])
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE source='issue'")["state"], "obsolete")
 
+    def test_issue_revision_requeueing_a_task_drops_its_stale_reservation(self):
+        issue = self.issue()
+        self.synchronize([issue])
+        task = self.store.one("SELECT * FROM tasks WHERE source='issue'")["id"]
+        # 旧版本留下的预约键：任务已不可用，设置却还留着。
+        self.store.put_setting("task-schedule:" + task, {"at": 4102444800.0, "timezone": "UTC",
+                                                         "local_time": "2100-01-01T00:00:00", "fold": None})
+        self.store.execute("UPDATE tasks SET state='failed',available=4102444800.0 WHERE id=?", (task,))
+        self.synchronize([{**issue, "body": "revised body", "updated_at": "2026-10-21T00:00:00Z"}])
+        refreshed = self.store.one("SELECT state,available FROM tasks WHERE id=?", (task,))
+        self.assertEqual((refreshed["state"], refreshed["available"]), ("queued", 0))
+        self.assertIsNone(self.store.setting("task-schedule:" + task))
+
     def test_issue_sync_page_budget_persists_and_resumes_without_losing_issues(self):
         pages = []
         def checked(args, **kwargs):

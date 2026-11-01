@@ -591,7 +591,10 @@ class Handler(BaseHTTPRequestHandler):
                             task_schedules[row["key"].split(":", 1)[1]] = data
                     for task in rows["tasks"]:
                         schedule = task_schedules.get(task["id"])
-                        if schedule:
+                        if (schedule and task.get("state") == "queued"
+                                and (task.get("available") or 0) > 0
+                                and abs((task.get("available") or 0) - schedule.get("at", 0)) < 1e-4
+                                and schedule.get("at") > time.time()):
                             task["schedule"] = schedule
                     project_by_id = {project["id"]: project for project in projects}
                     for schedule in schedules:

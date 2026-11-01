@@ -204,9 +204,9 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(self.manager.busy, 1)
 
     def test_busy_expires_without_browser_polling(self):
-        self.manager.ttl = 0.03
+        self.manager.ttl = 1
         session = self.manager.start("codex")
-        time.sleep(0.05)
+        time.sleep(1.05)
         self.assertEqual(self.manager.busy, 0)
         self.assertEqual(self.manager.status(session["id"])["state"], "expired")
         self.gate.set()

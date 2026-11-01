@@ -435,6 +435,7 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                 body = issue_requirements_body(requirements)
                 db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
+                db.execute("DELETE FROM settings WHERE key=?", ("task-schedule:" + existing["id"],))
                 return True
             if revised:
                 db.execute("UPDATE tasks SET evidence=?,updated=? WHERE id=?",
@@ -457,6 +458,7 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                 body = issue_requirements_body(requirements)
                 db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
+                db.execute("DELETE FROM settings WHERE key=?", ("task-schedule:" + existing["id"],))
                 return True
             if (not active and not revised and existing["state"] in
                   ["queued", "deferred", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and
