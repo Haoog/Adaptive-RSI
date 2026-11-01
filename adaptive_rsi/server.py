@@ -837,23 +837,32 @@ class Handler(BaseHTTPRequestHandler):
                 # AuthSessions 自带会话锁与凭据锁，且 GET 路径本就在 dispatch_lock 外
                 # 调用同一批方法；这里只把更新就绪门禁留在锁内，避免认证端点在
                 # 等待 worker 启动（最长 25s）或凭据写入时阻塞任务领取与全部写端点。
-                with runtime.dispatch_lock:
-                    if path != "/api/auth/cancel":
-                        runtime.updates.require_ready()
                 auth = runtime.auth_sessions
                 if path == "/api/auth/start":
-                    result = auth.start(body.get("backend"), body.get("provider"), body.get("method", 0), body.get("inputs"))
-                elif path == "/api/auth/complete":
-                    result = auth.complete(body.get("id"), body.get("code", ""))
-                elif path == "/api/auth/cancel":
-                    result = auth.cancel(body.get("id"))
-                elif path == "/api/auth/logout":
-                    result = auth.logout(body.get("backend"), body.get("provider"))
-                elif path == "/api/auth/key":
-                    result = auth.set_api_key(body.get("backend"), body.get("provider"), body.get("key"))
+                    # 更新准入与会话登记必须在同一段 dispatch_lock 临界区内原子完成：
+                    # require_ready 放行后、登记前若出现窗口，桌面更新可以在
+                    # busy==0 期间 commit，随后请求又创建出 starting 会话。
+                    # worker 启动/握手与后续状态轮询仍在锁外进行。
+                    with runtime.dispatch_lock:
+                        runtime.updates.require_ready()
+                        session = auth.reserve(body.get("backend"), body.get("provider"),
+                                               body.get("method", 0), body.get("inputs"))
+                    result = auth.launch(session["id"], body.get("method", 0), body.get("inputs"))
                 else:
-                    self.respond({"error": "Not found"}, 404)
-                    return
+                    with runtime.dispatch_lock:
+                        if path != "/api/auth/cancel":
+                            runtime.updates.require_ready()
+                    if path == "/api/auth/complete":
+                        result = auth.complete(body.get("id"), body.get("code", ""))
+                    elif path == "/api/auth/cancel":
+                        result = auth.cancel(body.get("id"))
+                    elif path == "/api/auth/logout":
+                        result = auth.logout(body.get("backend"), body.get("provider"))
+                    elif path == "/api/auth/key":
+                        result = auth.set_api_key(body.get("backend"), body.get("provider"), body.get("key"))
+                    else:
+                        self.respond({"error": "Not found"}, 404)
+                        return
                 self.respond(result)
                 return
             if path.startswith("/api/model-center/"):

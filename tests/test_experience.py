@@ -2,14 +2,17 @@ import json
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest.mock import Mock
 
+from adaptive_rsi.auth_sessions import AuthError, AuthSessions
 from adaptive_rsi.dashboard import records
 from adaptive_rsi.discovery import finding_identity, related_task, related_work
+from adaptive_rsi.lifecycle import readiness
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.server import Server
 from adaptive_rsi.store import Store, encode
@@ -166,7 +169,8 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
         self.auth = Mock()
         self.runtime.auth_sessions = self.auth
         self.auth.snapshot.return_value = {"codex": {"state": "signed_out"}}
-        self.auth.start.return_value = {"id": "login", "state": "awaiting_authorization"}
+        self.auth.reserve.return_value = {"id": "login", "state": "starting"}
+        self.auth.launch.return_value = {"id": "login", "state": "awaiting_authorization"}
         self.auth.status.return_value = {"id": "login", "state": "cancelled"}
         self.auth.set_api_key.return_value = {"saved": True}
         self.server = Server(self.runtime)
@@ -206,7 +210,8 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
         with self.request("/api/auth/start", {"backend": "opencode", "provider": "example", "method": 2,
                                                "inputs": {"tenant": "work"}}) as response:
             self.assertEqual(json.load(response)["id"], "login")
-        self.auth.start.assert_called_once_with("opencode", "example", 2, {"tenant": "work"})
+        self.auth.reserve.assert_called_once_with("opencode", "example", 2, {"tenant": "work"})
+        self.auth.launch.assert_called_once_with("login", 2, {"tenant": "work"})
         with self.request("/api/auth/key", {"backend": "opencode", "provider": "example", "key": "private-key"}):
             pass
         self.auth.set_api_key.assert_called_once_with("opencode", "example", "private-key")
@@ -219,7 +224,8 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
             self.request("/api/auth/start", {"backend": "codex"})
         self.assertEqual(denied.exception.code, 503)
         self.assertEqual(json.load(denied.exception)["error_code"], "update_in_progress")
-        self.auth.start.assert_not_called()
+        self.auth.reserve.assert_not_called()
+        self.auth.launch.assert_not_called()
 
     def test_auth_writes_do_not_hold_dispatch_lock_while_running(self):
         # BUG-02 回归：认证调用可能同步等待 worker 启动或凭据写入，端点不得在
@@ -304,6 +310,99 @@ class ConnectionAndReleaseRoutesTest(unittest.TestCase):
         self.assertEqual(denied.exception.code, 503)
         self.assertEqual(json.load(denied.exception)["error_code"], "update_in_progress")
         self.auth.set_api_key.assert_not_called()
+
+    def test_login_reservation_admitted_atomically_with_update_gate(self):
+        # BUG-02 跟进：require_ready 放行后、登记前的窗口里，桌面更新可以在
+        # busy==0 时 commit，随后请求又创建出 starting 会话。回归要求在
+        # 准入检查与登记之间插入更新准入检查时，看到的是 busy>0 的已登记会话。
+        # 用真实 AuthSessions（经探针包装）验证：reserve 在 dispatch_lock 内执行、
+        # 登记返回即 busy>0、慢的 worker 启动发生在锁外。
+        self.runtime.auth_sessions.close()
+        real = AuthSessions(self.root / "atomic-auth", factory=lambda backend: self.fail("placeholder"), ttl=60)
+        phase_a_started = threading.Event()
+        phase_a_release = threading.Event()
+        factory_entered = threading.Event()
+        factory_release = threading.Event()
+        observed = {}
+        errors = []
+
+        def stuck_factory(backend):
+            factory_entered.set()
+            factory_release.wait(timeout=5)
+            raise AuthError("auth_timeout")
+
+        real.factory = stuck_factory
+        observations_done = threading.Event()
+
+        class Probe:
+            # readiness() 经 getattr(auth_sessions, "busy") 读取忙碌计数，必须透传。
+            busy = property(lambda self: real.busy)
+
+            def reserve(self, *args):
+                phase_a_started.set()
+                phase_a_release.wait(timeout=5)
+                return real.reserve(*args)
+
+            def launch(self, *args):
+                result = real.launch(*args)
+                # 拖住 HTTP 响应，避免请求结束后 factory 被提前释放，
+                # 会话转入 failed 让探针的忙碌观测失真。
+                if not observations_done.wait(timeout=5):
+                    errors.append(AssertionError("probe never finished observations"))
+                return result
+
+        wrapper = Probe()
+
+        def probe():
+            try:
+                if not phase_a_started.wait(timeout=5):
+                    errors.append(AssertionError("reserve was not entered"))
+                    return
+                # 服务端此刻停在 reserve 调用内部，dispatch_lock 必然被它持有。
+                observed["lock_free_during_reserve"] = self.runtime.dispatch_lock.acquire(timeout=0.5)
+                if observed["lock_free_during_reserve"]:
+                    self.runtime.dispatch_lock.release()
+                observed["busy_before_register"] = real.busy
+                phase_a_release.set()
+                if not factory_entered.wait(timeout=5):
+                    errors.append(AssertionError("worker launch never entered the factory"))
+                    return
+                # worker 工厂已在锁外执行；会话已登记为 starting，busy 立即 > 0。
+                observed["lock_free_during_factory"] = self.runtime.dispatch_lock.acquire(timeout=0.5)
+                if observed["lock_free_during_factory"]:
+                    self.runtime.dispatch_lock.release()
+                observed["busy_after_register"] = real.busy
+                with self.runtime.dispatch_lock:
+                    observed["reasons"] = readiness(self.runtime)["reasons"]
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                phase_a_release.set()
+                factory_release.set()
+                observations_done.set()
+
+        original_auth = self.runtime.auth_sessions
+        self.runtime.auth_sessions = wrapper
+        probe_thread = threading.Thread(target=probe, daemon=True)
+        probe_thread.start()
+        try:
+            with self.request("/api/auth/start", {"backend": "opencode", "provider": "example"}):
+                pass
+        finally:
+            factory_release.set()
+            observations_done.set()
+            probe_thread.join(timeout=5)
+            real.close()
+            self.runtime.auth_sessions = original_auth
+        self.assertEqual(errors, [])
+        self.assertIs(observed["lock_free_during_reserve"], False,
+                      "reserve must run inside the dispatch_lock critical section")
+        self.assertEqual(observed["busy_before_register"], 0)
+        self.assertIs(observed["lock_free_during_factory"], True,
+                      "worker launch must run outside the dispatch_lock critical section")
+        self.assertEqual(observed["busy_after_register"], 1)
+        self.assertIn("authentication", observed["reasons"],
+                      "update admission must observe the reserved session as busy")
 
     def test_release_status_cannot_read_another_project_run(self):
         other = self.runtime.add_project(fixture(self.root / "other"))
