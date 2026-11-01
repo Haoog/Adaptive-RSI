@@ -290,6 +290,45 @@ class OperabilityTest(unittest.TestCase):
         self.assertNotIn("task-proof:proj01:stale-old", keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
 
+    def test_retention_cleanup_skips_unreadable_merged_result_without_aborting(self):
+        store = self.store
+        stale = time.time() - 120 * 86400
+        store.execute("INSERT INTO projects VALUES (?,?,?,?,?,?)",
+                      ("proj01", "fixture", str(Path(self.temp.name) / "project"), "{}", 1, stale))
+        runs_root = Path(self.temp.name) / "state" / "runs"
+        cases = [("runbad01", "merged", "'{"), ("runold02", "completed", "{}"),
+                 ("rundone03", "merged", '{"monitoring_completed": true}'), ("runlist04", "merged", "[1,2]")]
+        for run, state, result in cases:
+            store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state,priority,attempts,overrides,available,created,updated) "
+                          "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)",
+                          ("task" + run, "proj01", "goal", "fp" + run, "title", "body", "[]", "[]", state, 50, 0, "{}", stale, stale))
+            store.execute("INSERT INTO runs(id,task,project,state,config,started,ended,result) VALUES (?,?,?,?,?,?,?,?)",
+                          (run, "task" + run, "proj01", state, "{}", stale, stale, result))
+            store.execute("UPDATE runs SET path=? WHERE id=?", (str(runs_root / run), run))
+        for run in [case[0] for case in cases]:
+            store.put_setting("run-baseline:" + run, {"sha": run})
+        kept = [runs_root / run / name for run in ("runbad01", "runlist04") for name in ("workspace", "baseline")]
+        removed = [runs_root / run / name for run in ("runold02", "rundone03") for name in ("workspace", "baseline")]
+        for directory in kept + removed:
+            (directory / "nested").mkdir(parents=True)
+        # 损坏或非对象 result 的过期 merged 运行按已保留处理：整轮不抛错，可清理的照常清理。
+        self.runtime.maintenance()
+        self.assertTrue(all(directory.exists() for directory in kept))
+        self.assertFalse(any(directory.exists() for directory in removed))
+        states = {row["id"]: row["state"] for row in store.query("SELECT id,state FROM runs")}
+        self.assertEqual(states, {"runbad01": "merged", "runold02": "completed",
+                                  "rundone03": "merged", "runlist04": "merged"})
+        keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+        self.assertIn("run-baseline:runbad01", keys)
+        self.assertIn("run-baseline:runlist04", keys)
+        self.assertNotIn("run-baseline:runold02", keys)
+        # merged 运行的派生键在交付生命周期结束前按设计保留，与监控是否完成无关。
+        self.assertIn("run-baseline:rundone03", keys)
+        # maintenance-last 正常推进，不再因同一损坏行每 5 秒重试整轮维护。
+        self.assertGreater(store.setting("maintenance-last", 0), stale)
+        # 损坏结果按「已保留」的常规决策跳过，不作为调度故障写入事件。
+        self.assertEqual(store.query("SELECT 1 FROM events WHERE kind='scheduler_error'"), [])
+
     def test_retention_settings_batches_drain_remaining_runs(self):
         store = self.store
         now = 2_000_000_000
