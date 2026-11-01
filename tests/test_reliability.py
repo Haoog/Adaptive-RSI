@@ -384,8 +384,11 @@ class ReliabilityTest(unittest.TestCase):
         config = self.runtime.config(self.project)
         identity = {"backend": "docker", "image_id": "sha256:" + "a" * 64}
         labels = []
-        def stage(label, *args):
+        stage_run_checks = []
+        def stage(label, *args, **kwargs):
             labels.append(label)
+            if label == "candidate":
+                stage_run_checks.append(kwargs.get("run_checks"))
             value = 10 if label == "acceptance_baseline" else 4
             return {"rows": [{"passed": True, "exit_code": 0, "error": None, "stderr": "",
                               "stdout": json.dumps({"metric": "latency", "unit": "ms", "value": value})}]}
@@ -403,6 +406,9 @@ class ReliabilityTest(unittest.TestCase):
                 self.assertEqual(result["improvement"]["before"], 10)
                 self.assertEqual(result["improvement"]["after"], 4)
         self.assertEqual(labels.count("acceptance_baseline"), 2)
+        # Default config keeps affected-check scheduling off, so the candidate
+        # stage must never receive a scheduled check subset.
+        self.assertEqual(stage_run_checks, [None, None])
 
     def test_baseline_cache_invalidates_when_same_tag_image_id_changes(self):
         base = git(self.repo, "rev-parse", "HEAD")
