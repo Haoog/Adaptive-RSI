@@ -345,6 +345,118 @@ class AuditEvaluationTest(unittest.TestCase):
         self.assertEqual(evaluator.affected_checks(['unknown/x'], checks, graph), checks)
         self.assertEqual(evaluator.affected_checks(['packages/a/x'], checks, {'b': graph['b']}), checks)
 
+    def scheduling_fixtures(self, root, graph):
+        source = root / 'source'
+        source.mkdir()
+        for package in ('pkg_a', 'pkg_b', 'pkg_c'):
+            (source / package).mkdir()
+            (source / package / 'value.py').write_text('VALUE = 1\n')
+            (source / package / 'check.py').write_text('print("ok")\n')
+        checks = [{'name': name, 'argv': ['python3', package + '/check.py']}
+                  for name, package in [('check_a', 'pkg_a'), ('check_b', 'pkg_b'), ('check_c', 'pkg_c')]]
+        acceptance = {'hash': 'h', 'change_kind': 'refactor', 'criteria': ['behavior remains preserved'],
+                      'checks': [{'name': 'ac', 'argv': ['python3', '-c', 'print(9)']}],
+                      'spec': {'files': [], 'checks': [{'name': 'ac', 'criteria': [0]}]},
+                      'contract': {'check_dependencies': graph}}
+        return source, checks, acceptance
+
+    def run_scheduled_evaluation(self, root, source, checks, acceptance, changed_files, scheduling=True,
+                                 detected=True, evaluation='evaluation'):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        detected_check = {'name': 'detected', 'argv': ['python3', '-c', 'print(3)']} if detected else None
+        config = merge(DEFAULTS, {'validation': {'affected_check_scheduling': scheduling}})
+        acceptance_baseline = {'decision': 'pass', 'execution_environment': None,
+                               'rows': [{'name': 'ac', 'argv': ['python3', '-c', 'print(9)'], 'passed': True,
+                                         'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}]}
+        calls = []
+        def execute(_sandbox, check, workspace, *args, **kwargs):
+            calls.append((Path(workspace).name, check['name']))
+            return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                    'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+        store = Store(root / ('state-' + evaluation))
+        self.addCleanup(store.close)
+        with patch('adaptive_rsi.evaluator.detect', return_value={'checks': [detected_check] if detected_check else []}), patch(
+                'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+            result = evaluator.Evaluator(store).evaluate(
+                source, source, checks, root / evaluation, config, changed_files=changed_files,
+                acceptance=acceptance, acceptance_baseline=acceptance_baseline)
+        return result, calls
+
+    def test_affected_check_scheduling_runs_graph_closure_and_keeps_full_surface(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'])
+        # 跨包闭包：pkg_a 变更触发自身与依赖方 pkg_b 的检查，无关 pkg_c 留给全量阶段。
+        self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
+        self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate']], ['check_a', 'check_b'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate_full']],
+                         ['check_a', 'check_b', 'check_c', 'detected'])
+        self.assertFalse(result['candidate_full_reused'])
+        self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
+        self.assertEqual(result['decision'], 'pass')
+
+    def test_scheduling_fallback_runs_complete_configured_surface(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            # 未知路径：回退完整集合，candidate 阶段执行全部配置检查。
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['docs/readme.md'], detected=False)
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertEqual([stage for stage, _ in calls if stage == 'candidate_full'], [])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+            self.assertEqual(result['decision'], 'pass')
+            calls.clear()
+            # 空 diff 同样回退。
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, [], detected=False, evaluation='evaluation-empty')
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            calls.clear()
+            # 无效 graph（未知依赖）回退。
+            invalid = {'pb': {'paths': ['pkg_b/'], 'depends_on': ['missing'], 'checks': ['check_b']}}
+            acceptance = {**acceptance, 'contract': {'check_dependencies': invalid}}
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_b/value.py'], detected=False,
+                evaluation='evaluation-invalid')
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+
+    def test_scheduling_requires_opt_in_and_type_checked_config(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        from adaptive_rsi.config import DEFAULTS, merge, validate
+        self.assertIs(validate(merge(DEFAULTS, {}))['validation']['affected_check_scheduling'], False)
+        with self.assertRaises(ValueError):
+            validate(merge(DEFAULTS, {'validation': {'affected_check_scheduling': 'yes'}}))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'], scheduling=False, detected=False)
+            # 默认关闭：调度不改变既有行为，配置检查全部照常执行。
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+
     def test_performance_guardrail_blocks_primary_gain(self):
         threshold = {'metric': 'latency', 'unit': 'ms', 'direction': 'lower', 'target': 8, 'tolerance': 0}
         guard = {'metric': 'memory', 'unit': 'MiB', 'direction': 'lower', 'target': 50, 'tolerance': 0}

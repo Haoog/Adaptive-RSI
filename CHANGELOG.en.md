@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- Added opt-in `validation.affected_check_scheduling`: with a monorepo check dependency graph configured, the candidate stage runs only checks affected by the changed paths, and the full candidate stage supplements the remaining checks; an invalid graph, unknown paths or unavailable evidence fall back to the complete check set.
 - Fixed test_selected rejecting exact duplicate selectors: duplicates are now idempotent and run once after deduplication, while class-versus-method containment overlaps and empty selections remain rejected.
 
 ## 0.5.134
