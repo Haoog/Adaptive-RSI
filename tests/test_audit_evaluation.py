@@ -8,6 +8,23 @@ from pathlib import Path
 from adaptive_rsi import evaluator, workflow
 
 
+def _config(**recovery):
+    from adaptive_rsi.config import DEFAULTS, merge
+    return merge(DEFAULTS, {'recovery': recovery} if recovery else {})
+
+
+def _stage_runner():
+    """Minimal settings store: the sealed checkpoint layer never needs SQLite."""
+    from adaptive_rsi.evaluator import Evaluator
+
+    class MemoryStore:
+        def __init__(self): self.data = {}
+        def setting(self, key, default=None): return self.data.get(key, default)
+        def put_setting(self, key, value): self.data[key] = value
+    store = MemoryStore()
+    return store, Evaluator(store)
+
+
 class AuditEvaluationTest(unittest.TestCase):
     def test_sealed_read_only_checkpoint_rejects_mutation_or_changed_input(self):
         from adaptive_rsi.evaluator import Evaluator
@@ -25,6 +42,91 @@ class AuditEvaluationTest(unittest.TestCase):
             runner.seal_checkpoint('write', inputs, {}, effect='workspace_write')
         store.data['sealed-read-checkpoint:read']['result']['pass'] = False
         self.assertIsNone(runner.reuse_checkpoint('read', inputs))
+
+    def test_stage_reuse_requires_explicit_opt_in(self):
+        from adaptive_rsi.evaluator import checkpoint_reuse_enabled
+        self.assertFalse(checkpoint_reuse_enabled(_config()))
+        self.assertTrue(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints=True)))
+        # 只有显式 true 才开启；字符串或数字不能悄悄打开复用。
+        self.assertFalse(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints='yes')))
+        self.assertFalse(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints=1)))
+        self.assertFalse(checkpoint_reuse_enabled({'recovery': None}))
+        store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'generation': len(calls)}
+
+        # 默认关闭：既不复用也不写入检查点。
+        runner.execute_stage('planning', {'tree': 'a'}, action, enabled=False)
+        runner.execute_stage('planning', {'tree': 'a'}, action, enabled=False)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('sealed-read-checkpoint:planning', store.data)
+
+    def test_stage_reuse_returns_sealed_result_and_reports_reuse(self):
+        store, runner = _stage_runner()
+        calls, reused = [], []
+        inputs = {'tree': 'a', 'checks': ['x']}
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'value': {'impact': 'high'}}
+
+        first = runner.execute_stage('planning', inputs, action, enabled=True, on_reuse=reused.append)
+        second = runner.execute_stage('planning', inputs, action, enabled=True, on_reuse=reused.append)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, ['planning'])
+        self.assertIsNotNone(store.data.get('sealed-read-checkpoint:planning'))
+
+    def test_stage_reuse_invalidated_by_changed_input(self):
+        _store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'generation': len(calls)}
+
+        first = runner.execute_stage('planning', {'tree': 'a'}, action, enabled=True)
+        second = runner.execute_stage('planning', {'tree': 'b'}, action, enabled=True)
+        self.assertEqual(first['generation'], 1)
+        self.assertEqual(second['generation'], 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_stage_reuse_invalidated_by_tampered_checkpoint(self):
+        store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': len(calls)}
+
+        runner.execute_stage('review', {'review_key': 'k'}, action, enabled=True)
+        store.data['sealed-read-checkpoint:review']['result']['decision'] = 'fail'
+        result = runner.execute_stage('review', {'review_key': 'k'}, action, enabled=True)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_write_and_remote_stages_never_reuse_or_seal_checkpoints(self):
+        store, runner = _stage_runner()
+        for effect in ('workspace_write', 'remote_action'):
+            calls = []
+
+            def action():
+                calls.append(1)
+                return {'effect': effect, 'generation': len(calls)}
+
+            # 即便显式要求复用，写工作区与远端动作也始终真实执行。
+            runner.execute_stage('implementation', {'patch': 'p'}, action, effect=effect, enabled=True)
+            result = runner.execute_stage('implementation', {'patch': 'p'}, action, effect=effect, enabled=True)
+            self.assertEqual(result['generation'], 2)
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn('sealed-read-checkpoint:implementation', store.data)
+        # 写阶段即便被显式要求封存也只允许 read_only，直接拒绝。
+        with self.assertRaises(ValueError):
+            runner.seal_checkpoint('implementation', {'patch': 'p'}, {'ok': True}, effect='workspace_write')
 
     def test_clean_committed_harness_change_cannot_reuse_frozen_regression(self):
         from adaptive_rsi.config import DEFAULTS, merge

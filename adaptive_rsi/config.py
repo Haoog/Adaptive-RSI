@@ -24,7 +24,7 @@ DEFAULTS = {
         "evolution": {"provider": "openai", "model": "gpt-6.1-sol", "effort": "high", "fallback": None},
     },
     "review": {"block_on": "medium"},
-    "recovery": {"provider_retry_minutes": 0},
+    "recovery": {"provider_retry_minutes": 0, "reuse_sealed_checkpoints": False},
     "deadlines": {"preparation_seconds": 900, "model_seconds": 3600, "evaluation_seconds": 3600},
     "triage": {"policy": "Prioritize evidenced defects and meaningful user benefit; avoid cosmetic churn and speculative rewrites."},
     "updates": {"mode": "notify", "interval_minutes": 1440, "auto_policy": "patch", "require_provenance": False},
@@ -115,6 +115,8 @@ def validate(config):
         raise ValueError('Stage deadlines must be 1..86400 seconds')
     if not 0 <= config["recovery"]["provider_retry_minutes"] <= 1440:
         raise ValueError("provider_retry_minutes must be 0..1440")
+    if type(config["recovery"].get("reuse_sealed_checkpoints")) is not bool:
+        raise ValueError("reuse_sealed_checkpoints must be true or false")
     # 旧额度字段仅用于读取历史配置，不再阻断运行；command_seconds 是安全超时而非额度，单独保留。
     for key in ["daily_calls", "run_calls", "run_seconds", "max_changed_files"]:
         config["limits"][key] = 0

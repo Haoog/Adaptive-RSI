@@ -1136,15 +1136,21 @@ def retry(runtime, project_id, run_id, kind):
         policy = json.loads(run["config"])["delivery"].get(kind, {})
         project = runtime.project(project_id)
         repo = authorized(runtime, project, run, kind, policy)
-        if kind == "deploy":
-            owner = deployment_owner(runtime, project_id, repo, policy)
-            if owner and owner["run"] != run_id:
-                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
+        is_preflight_rejected = (
+            kind == "deploy" and
+            data.get("state") == "failed" and
+            data.get("dispatch_receipt") == "rejected" and
+            not data.get("workflow_run_id")
+        )
+        if kind == "deploy" and not is_preflight_rejected:
+            owner = deployment_owner(runtime, project_id, repo, policy)
+            if owner and owner["run"] != run_id:
+                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         try:
             outcome = json.loads(run["result"] or "{}")
         except (TypeError, ValueError):
@@ -1164,17 +1170,25 @@ def retry(runtime, project_id, run_id, kind):
             runtime.wake.set()
             return data
         expected = encode(data)
+        expected_owner = None
 
         def persist_retry(require_authorization=False):
             nonlocal expected
             with runtime.dispatch_lock:
                 if require_authorization:
                     authorized(runtime, project, run, kind, policy)
+                ownership = None
                 if require_authorization and kind == "deploy":
-                    owner = deployment_owner(runtime, project_id, repo, policy)
-                    if owner and owner["run"] != run_id:
-                        raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
-                save(runtime, run, kind, data, expected=expected)
+                    if target.get("state") == "dispatching":
+                        if deployment_owner(runtime, project_id, repo, policy) != expected_owner:
+                            raise ValueError("Deployment ownership changed during validation")
+                        ownership = (owner_key(project_id, repo, policy), expected_owner,
+                                     {"run": run_id, "sha": target["sha"]})
+                    else:
+                        owner = deployment_owner(runtime, project_id, repo, policy)
+                        if owner and owner["run"] != run_id:
+                            raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
+                save(runtime, run, kind, data, expected=expected, ownership=ownership)
                 expected = encode(data)
 
         target = data
@@ -1194,6 +1208,15 @@ def retry(runtime, project_id, run_id, kind):
             raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
         if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
                 not target.get("workflow_run_id")):
+            if kind == "deploy":
+                expected_owner = deployment_owner(runtime, project_id, repo, policy)
+                if expected_owner and expected_owner["run"] != run_id:
+                    previous = runtime.store.setting(key(expected_owner["run"], "deploy"), {})
+                    if not deployment_terminal(previous, policy):
+                        raise ValueError("Another deployment is still active on this target")
+                    comparison = api(repo, "compare/" + expected_owner["sha"] + "..." + target["sha"])
+                    if comparison.get("status") != "ahead":
+                        raise ValueError("Deployment target already has this or a newer commit; refusing a stale or diverged deployment")
             validate_pin(repo, policy)
             authorized(runtime, project, run, kind, policy)
             target.update(state="dispatching", error="", dispatch_receipt="pending")

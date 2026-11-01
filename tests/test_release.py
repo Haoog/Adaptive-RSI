@@ -464,6 +464,63 @@ class ReleaseAutomationTest(unittest.TestCase):
         # 终态失败只属于本 run：release 仍保持成功状态，不被覆盖。
         self.assertEqual(self.runtime.store.setting(key(self.run["id"], "release"))["state"], "workflow_succeeded")
 
+    def test_retry_rejected_preflight_without_owner_acquires_deployment_ownership(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", deploy))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["state"], "submitted")
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
+    def test_retry_rejected_preflight_with_terminal_owner_and_ahead_transfers_ownership(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        previous_run = "previous-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": previous_run, "sha": PREVIOUS})
+        self.runtime.store.put_setting(key(previous_run, "deploy"), {"state": "healthy"})
+        def api_ahead(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=api_ahead):
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["state"], "submitted")
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
+    def test_retry_rejected_preflight_refuses_when_another_deployment_active(self):
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        active_run = "active-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": active_run, "sha": PREVIOUS})
+        self.runtime.store.put_setting(key(active_run, "deploy"), {"state": "dispatching"})
+        self.commands.clear()
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            with self.assertRaisesRegex(ValueError, "Another deployment is still active on this target"):
+                retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertFalse(any("/dispatches" in item[0] for item in self.commands))
+
     def test_deploy_success_without_health_target_is_explicitly_unverified(self):
         self.setup_deployment()
         self.runtime.configure({"delivery": {"deploy": {"health_url": ""}}}, self.project)

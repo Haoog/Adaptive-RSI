@@ -214,10 +214,13 @@ class ReliabilityTest(unittest.TestCase):
         return task, run, self.resume(task)
 
     def test_resume_with_saved_evaluation_skips_evaluation_rerun(self):
-        with patch.object(self.runtime.evaluator, "evaluate",
-                          wraps=self.runtime.evaluator.evaluate) as evaluate:
-            task, run, second = self.run_recovery_pair("review")
-            self.assertEqual(evaluate.call_count, 1)
+        identity = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
+        with patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity)):
+            with patch.object(self.runtime.evaluator, "evaluate",
+                              wraps=self.runtime.evaluator.evaluate) as evaluate:
+                task, run, second = self.run_recovery_pair("review")
+                self.assertEqual(evaluate.call_count, 1)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (second["id"],))["result"])
         self.assertEqual(result["evaluation"]["decision"], "pass")
@@ -232,6 +235,42 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(saved["decision"], "pass")
         self.assertEqual(saved["source"], result["evaluation"]["source"])
         self.assertEqual(saved["source"]["patch_hash"], result["patch_hash"])
+        self.assertEqual(saved.get("execution_environment"), identity)
+
+    def test_resume_with_changed_execution_identity_reruns_evaluation(self):
+        identity1 = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
+        identity2 = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "b" * 64}
+        with patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity1)):
+            task, run = self.interrupt("review")
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (run["id"],))["data"])
+        self.assertEqual(saved.get("execution_environment"), identity1)
+        with patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity2)):
+            with patch.object(self.runtime.evaluator, "evaluate",
+                              wraps=self.runtime.evaluator.evaluate) as evaluate:
+                second = self.resume(task)
+                self.assertEqual(evaluate.call_count, 1)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+        self.assertNotIn("evaluation", reused)
+
+    def test_resume_without_execution_identity_reruns_evaluation(self):
+        task, run = self.interrupt("review")
+        saved = json.loads(self.store.one("SELECT data FROM stages WHERE run=? AND stage='evaluation'",
+                                          (run["id"],))["data"])
+        self.assertIsNone(saved.get("execution_environment"))
+        identity = {"build": "test-build", "backend": "docker", "image_id": "sha256:" + "a" * 64}
+        with patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), identity)):
+            with patch.object(self.runtime.evaluator, "evaluate",
+                              wraps=self.runtime.evaluator.evaluate) as evaluate:
+                second = self.resume(task)
+                self.assertEqual(evaluate.call_count, 1)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"])["stage"] for row in events if row["kind"] == "stage_reused"]
+        self.assertNotIn("evaluation", reused)
 
     def test_resume_without_saved_evaluation_reruns_evaluation(self):
         with patch.object(self.runtime.evaluator, "evaluate",
@@ -1066,6 +1105,34 @@ class ReliabilityTest(unittest.TestCase):
         evidence = {row["role"]: row for row in readiness(
             self.runtime, self.runtime.project(self.project), config)["model_evidence"]}
         self.assertFalse(evidence["planning"]["task_verified"])
+
+    def drop_stage_rows(self, stage):
+        """Simulate run-retention cleanup: the stage row is gone, settings remain."""
+        self.store.execute("DELETE FROM stages WHERE stage=?", (stage,))
+
+    def test_resume_reuses_sealed_planning_checkpoint_when_opted_in(self):
+        self.runtime.configure({"recovery": {"reuse_sealed_checkpoints": True}}, self.project)
+        task, run = self.interrupt("review")
+        self.assertIsNotNone(self.store.setting("sealed-read-checkpoint:planning:" + self.project))
+        self.drop_stage_rows("planning")
+        second = self.resume(task)
+        # 规划只读阶段由封存检查点提供结果，模型不再被重新调用。
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("planning"), 1)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"]) for row in events if row["kind"] == "stage_reused"]
+        self.assertIn("planning:" + self.project, [item.get("checkpoint") for item in reused])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "awaiting_approval")
+
+    def test_resume_without_opt_in_reruns_planning_instead_of_reusing_checkpoint(self):
+        task, run = self.interrupt("review")
+        self.assertIsNone(self.store.setting("sealed-read-checkpoint:planning:" + self.project))
+        self.drop_stage_rows("planning")
+        second = self.resume(task)
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("planning"), 2)
+        events = self.store.query("SELECT kind,data FROM events WHERE run=? ORDER BY seq", (second["id"],))
+        reused = [json.loads(row["data"]) for row in events if row["kind"] == "stage_reused"]
+        self.assertNotIn("checkpoint", {key for item in reused for key in item})
+
 
 
 class EvidenceContractTest(unittest.TestCase):
