@@ -14,7 +14,7 @@
 
 修复已经随 [PR #92](https://github.com/Haoog/Adaptive-RSI/pull/92) 合并，位于提交 `fa09f3b`：
 
-- `scripts/test_selected.py` 在派发前检查选择器包含关系及具体用例重复，拒绝空选择。
+- `scripts/test_selected.py` 在派发前检查选择器包含关系及具体用例重复，拒绝空选择；完全重复的选择器按幂等处理，去重后执行一次。
 - `scripts/test_parallel.py` 使用 `RSI_TEST_RUNNING` 拒绝重入 worker 正在执行的模块，最多派发四个 worker。为隔离夹具执行其他模块的受控路径仍存在，因此不能把该防护描述成禁止任何嵌套进程。
 - 使用 `scripts.test_worker` 的运行路径在父进程消失后退出；取消时运行器终止并回收自己拥有的进程组。
 
