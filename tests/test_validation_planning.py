@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -441,6 +442,51 @@ class ValidationPlanningTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'already running'):
                         test_parallel.run_groups([[selector]])
                     self.assertEqual(calls, [])
+
+    def test_matrix_checker_rejects_duplicate_invalid_and_out_of_scope_selectors(self):
+        import types
+        from scripts import check_test_matrix
+        from scripts.test_parallel import test_ids
+        loader = unittest.TestLoader()
+        expected = set(test_ids(loader.discover(str(test_parallel.ROOT), top_level_dir=str(test_parallel.ROOT))))
+        self.assertTrue(expected)
+        module_selector = __name__ + '.CIMetricsTest'
+        real = __name__ + '.ValidationPlanningTest.test_matrix_checker_rejects_duplicate_invalid_and_out_of_scope_selectors'
+        empty_selector = 'tests.browser_fixture'
+        probe = types.ModuleType('tests.probe_out_of_discovery')
+        setattr(probe, 'OutOfScopeCase', type('OutOfScopeCase', (unittest.TestCase,),
+               {'__module__': 'tests.probe_out_of_discovery', 'runTest': lambda self: None}))
+        sys.modules['tests.probe_out_of_discovery'] = probe
+        setattr(sys.modules['tests'], 'probe_out_of_discovery', probe)
+        self.addCleanup(sys.modules.pop, 'tests.probe_out_of_discovery', None)
+        self.addCleanup(delattr, sys.modules['tests'], 'probe_out_of_discovery')
+        out_of_scope = 'tests.probe_out_of_discovery.OutOfScopeCase'
+        plain_matrix = [selector for group in check_test_matrix.matrix_groups(
+            test_parallel.ROOT / '.github/workflows/checks.yml') for selector in group]
+        cases = [('duplicate in-group selector', 'repeats tests', [module_selector, real, real]),
+                 ('invalid selector', 'Invalid CI selector', [module_selector, real, 'tests.probe_matrix_nonexistent']),
+                 ('selector expanding to no test', 'expands to no test', [module_selector, real, empty_selector]),
+                 ('selector outside discovery', 'outside discovery', [module_selector, real, out_of_scope])]
+        for label, fragment, selectors in cases:
+            with self.subTest(case=label), patch.object(check_test_matrix, 'matrix_groups',
+                                                        return_value=[selectors]):
+                with self.assertRaisesRegex(ValueError, fragment):
+                    check_test_matrix.check()
+
+    def test_matrix_checker_overlaps_and_discovered_count(self):
+        from scripts import check_test_matrix
+        # Real matrix: one pair of identical interpreter shards (Python
+        # 3.9/3.14) plus four jobs deliberately re-running slow core modules.
+        groups = check_test_matrix.matrix_groups(test_parallel.ROOT / '.github/workflows/checks.yml')
+        self.assertEqual(check_test_matrix.overlap_report(groups), (1, 4))
+        self.assertEqual(check_test_matrix.overlap_report([['a'], ['a'], ['b']]), (1, 0))
+        self.assertEqual(check_test_matrix.overlap_report([['a'], ['a', 'b']]), (0, 1))
+        self.assertEqual(check_test_matrix.overlap_report([['a', 'b'], ['b']]), (0, 1))
+        self.assertEqual(check_test_matrix.overlap_report([['a'], ['b']]), (0, 0))
+        from scripts.test_parallel import test_ids
+        loader = unittest.TestLoader()
+        discovered = set(test_ids(loader.discover(str(test_parallel.ROOT), top_level_dir=str(test_parallel.ROOT))))
+        self.assertEqual(check_test_matrix.check(), len(discovered))
 
     def test_worker_parent_watch_exits_when_parent_changes(self):
         from scripts import test_worker
