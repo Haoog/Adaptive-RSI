@@ -622,6 +622,30 @@ print('BOUNDARIES_OK')
         self.assertFalse(json.loads(row["result"]).get("merged_by_local", False))
         self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
 
+    def test_merge_intent_preserved_if_reconciled_run_update_fails(self):
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        self.store.put_setting("merge-intent:" + run["id"], {"head": "head", "at": 1})
+        # 注入 runs 更新失败：验证意图删除与终态落库原子绑定，失败时不丢失意图证据。
+        self.store.execute("CREATE TRIGGER fail_reconcile_update BEFORE UPDATE OF state ON runs "
+                           "WHEN NEW.id='" + run["id"] + "' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected reconcile failure'); END")
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr):
+            tick(self.runtime, 120)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertIsNotNone(self.store.setting("merge-intent:" + run["id"]))
+
+        # 故障恢复：清理注入触发器后下一次 tick 重新执行对账，仍能识别本地发起合并。
+        self.store.execute("DROP TRIGGER fail_reconcile_update")
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 240)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertTrue(json.loads(row["result"])["merged_by_local"])
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+        feedback.assert_called_once()
+
     def test_stale_supersession_and_requeue_roll_back_together(self):
         run = self.tracked_pr()
         self.store.execute("CREATE TRIGGER reject_replan BEFORE UPDATE OF state ON tasks "

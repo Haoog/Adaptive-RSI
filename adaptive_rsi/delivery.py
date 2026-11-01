@@ -472,25 +472,37 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
                 if pr["state"] == "MERGED":
-                    # 崩溃对账：意图在 gh pr merge 之前落盘，这里一次性消费，
+                    # 崩溃对账：意图在 gh pr merge 之前落盘，与终态落库原子消费，
                     # 区分「本进程发起的合并」与「人工合并」；缺失或损坏时回落 pr_view。
-                    intent = store.pop_setting("merge-intent:" + run["id"])
-                    outcome["merged_by_local"] = bool(intent) and intent.get("head") == policy["head"]
                     if (not sealed_target or pr["headRefOid"] != policy["head"] or
                             pr.get("baseRefName", policy["branch"]) != policy["branch"]):
+                        target_state = "unverified_merge"
                         outcome["delivery_status"] = "unverified_merge"
-                        store.execute("UPDATE runs SET state='unverified_merge',result=? WHERE id=?", (encode(outcome), run["id"]))
-                        run["state"] = "unverified_merge"
-                        _update_pr_task(store, run, "blocked", now)
                     else:
+                        target_state = "merged"
                         outcome["merged_sha"] = pr["mergeCommit"]["oid"]
                         outcome["merged_at"] = now
                         outcome["delivery_status"] = "merged"
-                        store.execute("UPDATE runs SET state='merged',result=? WHERE id=?", (encode(outcome), run["id"]))
-                        run["state"] = "merged"
+                    intent_key = "merge-intent:" + run["id"]
+                    with store.connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        row = db.execute("SELECT value FROM settings WHERE key=?", (intent_key,)).fetchone()
+                        intent = None
+                        if row:
+                            db.execute("DELETE FROM settings WHERE key=?", (intent_key,))
+                            try:
+                                intent = json.loads(row["value"])
+                            except Exception:
+                                intent = None
+                        outcome["merged_by_local"] = bool(intent) and intent.get("head") == policy["head"]
+                        db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (target_state, encode(outcome), run["id"]))
+                    run["state"] = target_state
+                    if target_state == "unverified_merge":
+                        _update_pr_task(store, run, "blocked", now)
+                    else:
                         _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
-                        if task["source"] == "rollback":
+                        if task and task["source"] == "rollback":
                             original_id = json.loads(task["evidence"])[0]["run"]
                             original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
                             if original:
