@@ -425,3 +425,15 @@ fn changing_the_stored_authorization_stops_a_waiting_automatic_replacement() {
     updater.authorize(Authorization::parse(2, "automatic", "patch", "weekend").unwrap()).unwrap();
     assert_eq!(updater.require_install_permit(&request).unwrap_err(), "update_authorization_changed");
 }
+
+/// 离线安装只对 feed 传输/解析失败开放：取消与配置错误保持原语义，
+/// 不能因为断网而把所有检查失败都放宽成可继续安装。
+#[test]
+fn only_feed_transport_failures_unlock_the_offline_install_fallback() {
+    use native_update::offline_check_failure;
+    assert!(offline_check_failure("update_check_failed"));
+    for code in ["update_cancelled", "updater_key_missing", "invalid_update_feed",
+                 "invalid_update_configuration", "update_cache_unavailable"] {
+        assert!(!offline_check_failure(code), "{code}");
+    }
+}
