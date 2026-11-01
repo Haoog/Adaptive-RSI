@@ -594,7 +594,7 @@ class Store:
             return default
 
     def put_namespaced_setting(self, namespace, key, value, version=1, ttl=None):
-        """Explicit opt-in envelope; existing settings retain their wire format."""
+        """Typed and versioned settings envelope with unified wire format."""
         if not isinstance(namespace, str) or not namespace or ':' in namespace:
             raise ValueError("Invalid settings namespace")
         if not isinstance(key, str) or not key or type(version) is not int or version < 1:
@@ -607,22 +607,87 @@ class Store:
             json.dumps(value, allow_nan=False)
         except (ValueError, TypeError) as exc:
             raise ValueError("Settings value must be finite JSON") from exc
-        self.put_setting('namespace:' + namespace + ':' + key,
-                         {"version": version, "type": type(value).__name__, "value": value,
-                          "expires": time.time() + ttl if ttl is not None else None})
+        envelope = {
+            "version": version,
+            "type": type(value).__name__,
+            "value": value,
+            "expires": time.time() + ttl if ttl is not None else None,
+        }
+        legacy_key = namespace + ':' + key
+        envelope_key = 'namespace:' + namespace + ':' + key
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM settings WHERE key=?", (legacy_key,))
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (envelope_key, encode(envelope)))
 
     def namespaced_setting(self, namespace, key, expected_type, version=1, default=None, now=None):
-        envelope = self.setting('namespace:' + namespace + ':' + key)
-        if not isinstance(envelope, dict) or envelope.get('version') != version:
+        if not isinstance(namespace, str) or not namespace or ':' in namespace:
             return default
-        value = envelope.get('value')
-        if type(value) is not expected_type or envelope.get('type') != expected_type.__name__:
+        if not isinstance(key, str) or not key or type(version) is not int or version < 1:
             return default
-        expires = envelope.get('expires')
-        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
-                                    expires <= (time.time() if now is None else now)):
+        target_type = type(None) if expected_type is None else expected_type
+        if target_type not in (dict, list, str, int, float, bool, type(None)):
             return default
-        return value
+
+        envelope_key = 'namespace:' + namespace + ':' + key
+        legacy_key = namespace + ':' + key
+
+        row = self.one("SELECT value FROM settings WHERE key=?", (envelope_key,))
+        target_key = envelope_key
+        if row is None:
+            row = self.one("SELECT value FROM settings WHERE key=?", (legacy_key,))
+            target_key = legacy_key
+        if row is None:
+            return default
+
+        try:
+            raw = json.loads(row["value"])
+        except (ValueError, TypeError):
+            # 损坏单一 namespace 时只隔离自身，返回默认值
+            return default
+
+        is_envelope = (
+            isinstance(raw, dict)
+            and set(raw.keys()) <= {"version", "type", "value", "expires"}
+            and "version" in raw
+            and "type" in raw
+            and "value" in raw
+        )
+
+        current_time = time.time() if now is None else now
+
+        if is_envelope:
+            if not isinstance(raw.get("version"), int) or raw.get("version") != version:
+                return default
+            val = raw.get("value")
+            if type(val) is not target_type or raw.get("type") != target_type.__name__:
+                return default
+            expires = raw.get("expires")
+            if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
+                                        expires <= current_time):
+                return default
+            if target_key == legacy_key:
+                with self.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (envelope_key, encode(raw)))
+                    db.execute("DELETE FROM settings WHERE key=?", (legacy_key,))
+            return val
+        else:
+            # 存量旧格式：惰性信封升级
+            if type(raw) is not target_type:
+                return default
+            upgraded = {
+                "version": version,
+                "type": target_type.__name__,
+                "value": raw,
+                "expires": None,
+            }
+            with self.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (envelope_key, encode(upgraded)))
+                if legacy_key != envelope_key:
+                    db.execute("DELETE FROM settings WHERE key=?", (legacy_key,))
+            return raw
 
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))

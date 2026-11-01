@@ -147,6 +147,28 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
 
+    def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):
+        # 存量旧格式迁移
+        self.store.execute("INSERT INTO settings VALUES ('ns:item','{\"migrated\":true}')")
+        self.assertEqual(self.store.namespaced_setting('ns', 'item', dict), {'migrated': True})
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:item'"))
+        row = self.store.one("SELECT value FROM settings WHERE key='namespace:ns:item'")
+        assert row is not None
+        envelope = json.loads(row['value'])
+        self.assertEqual(envelope, {'version': 1, 'type': 'dict', 'value': {'migrated': True}, 'expires': None})
+
+        # 写路径清理残留并写入新信封
+        self.store.execute("INSERT INTO settings VALUES ('ns:overwritten','\"legacy\"')")
+        self.store.put_namespaced_setting('ns', 'overwritten', 12345, version=2)
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key='ns:overwritten'"))
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+
+        # 坏数据隔离自身，连接池仍健康
+        self.store.execute("INSERT INTO settings VALUES ('namespace:broken_ns:bad','invalid-json')")
+        self.assertEqual(self.store.namespaced_setting('broken_ns', 'bad', dict, default='fallback'), 'fallback')
+        self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
+        self.assertEqual(self.store._pool.qsize(), 1)
+
 
 class RecordUsageTest(unittest.TestCase):
     def setUp(self):
