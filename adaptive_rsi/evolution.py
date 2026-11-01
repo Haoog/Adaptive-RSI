@@ -134,6 +134,23 @@ class Evolution:
                        (project, "case_lifecycle", "Evaluation case retired or reclassified; exposure retained",
                         encode({"case": case, **history[-1]}), time.time()))
 
+    def eligible_cases(self, project, limit):
+        """Fresh-enough cases for one experiment, filtered inside SQLite in one query.
+
+        与逐行 json.loads 过滤完全同义：损坏 spec 与缺失/空/假值字段的行被跳过；
+        available/active 缺省视为 True，标量、对象或 "0" 这类非布尔值视为不可用。
+        CASE WHEN json_valid 先行，保证 json_type/json_each 永不求值于损坏 JSON。
+        """
+        condition = ("CASE WHEN json_valid(spec) THEN (json_type(spec)='object' "
+                     "AND json_type(spec,'$.task')='text' AND json_type(spec,'$.repository')='text' "
+                     "AND json_type(spec,'$.base')='text' "
+                     "AND (json_type(spec,'$.available') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.available')) "
+                     "AND json_extract(spec,'$.available') NOT IN (0,''))) "
+                     "AND (json_type(spec,'$.active') IS NULL OR (EXISTS(SELECT 1 FROM json_each(spec,'$.active')) "
+                     "AND json_extract(spec,'$.active') NOT IN (0,'')))) ELSE 0 END")
+        return self.store.query("SELECT * FROM cases WHERE project=? AND uses<? AND split IN ('validation','holdout') "
+                                "AND " + condition + " ORDER BY created,id", (project, limit))
+
     def record_feedback(self, candidate, label, source, run=None, note=""):
         if label not in ("false_positive", "confirmed_regression", "rejected") or not source or not source.startswith("human:"):
             raise ValueError("Feedback requires a supported label and human provenance")
@@ -361,16 +378,7 @@ class Evolution:
                     else "insufficient_evidence", "repeated": True,
                     "code": "evolution_inputs_unchanged"}
         limit = config["evolution"]["max_holdout_uses"]
-        available = self.store.query("SELECT * FROM cases WHERE project=? AND split IN ('validation','holdout') "
-                                     "ORDER BY created,id", (project["id"],))
-        cases = []
-        for case in available:
-            spec = case_spec(case)
-            if (case["uses"] < limit and spec is not None and
-                    spec.get("available", True) and spec.get("active", True) and
-                    isinstance(spec.get("task"), str) and
-                    isinstance(spec.get("repository"), str) and isinstance(spec.get("base"), str)):
-                cases.append(case)
+        cases = self.eligible_cases(project["id"], limit)
         minimum = config["evolution"]["min_cases_per_split"]
         validation_cases = [case for case in cases if case["split"] == "validation"]
         # 晋升要求未曝光的 holdout；先按用途过滤新鲜样本，再在新鲜样本内分层选择。
