@@ -493,6 +493,43 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.run["config"] = encode(config)
         return deploy
 
+    def test_lost_rollback_dispatch_response_preserves_receipt_without_redispatch(self):
+        deploy = self.setup_deployment(rollback=True)
+        data = {'state': 'health_failed', 'operation_id': 'fixture', 'sha': MERGED,
+                'repository': 'example/project', 'workflow': deploy['workflow'], 'ref': deploy['ref'],
+                'workflow_sha': deploy['sha'], 'rollback_target': {'sha': PREVIOUS}}
+        self.runtime.store.put_setting(key(self.run['id'], 'deploy'), data)
+        self.runtime.store.put_setting(owner_key(self.project, 'example/project', deploy),
+                                       {'run': self.run['id'], 'sha': MERGED})
+        calls = []
+        def network(repo, endpoint, method='GET', fields=None):
+            if method == 'POST':
+                calls.append(endpoint)
+                raise OSError('lost response')
+            return self.api(repo, endpoint, method, fields)
+        with patch('adaptive_rsi.release.validate_pin'), patch('adaptive_rsi.release.api', side_effect=network):
+            self.tick()
+            saved = self.runtime.store.setting(key(self.run['id'], 'deploy'))
+            self.assertEqual(saved['state'], 'rolling_back')
+            self.assertEqual(saved['rollback']['state'], 'dispatch_unknown')
+            self.tick()
+        self.assertEqual(len(calls), 1)
+
+    def test_health_exception_does_not_modify_concurrent_receipt(self):
+        deploy = self.setup_deployment(rollback=True)
+        name = key(self.run['id'], 'deploy')
+        original = {'state': 'health_failed', 'operation_id': 'old', 'sha': MERGED,
+                    'repository': 'example/project', 'workflow': deploy['workflow'], 'ref': deploy['ref'],
+                    'workflow_sha': deploy['sha'], 'rollback_target': {'sha': PREVIOUS}}
+        replacement = {'state': 'healthy', 'operation_id': 'new', 'error': 'new-error'}
+        self.runtime.store.put_setting(name, original)
+        def concurrent(runtime, project, run, data, policy, cancel, persist):
+            runtime.store.put_setting(name, replacement)
+            raise OSError('old-operation-error')
+        with patch('adaptive_rsi.release.deployment_health', side_effect=concurrent):
+            self.tick()
+        self.assertEqual(self.runtime.store.setting(name), replacement)
+
     def test_rejected_preflight_leaves_waiting_release_with_failed_state_and_manual_entry(self):
         self.runtime.configure({"delivery": {"deploy": self.policy}}, self.project)
         config = self.runtime.config(self.project)

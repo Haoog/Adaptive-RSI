@@ -1225,7 +1225,14 @@ def advance(runtime, project, run, outcome, cancel=None):
                 data = reconcile(runtime, run, kind, data, persist=False)
                 persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
-                data = deployment_health(runtime, project, run, data, policy, cancel, persist=persist)
+                try:
+                    data = deployment_health(runtime, project, run, data, policy, cancel, persist=persist)
+                except Exception:
+                    current, raw = _read_automation(runtime, run["id"], kind)
+                    if raw != expected or current and current.get("receipt_error"):
+                        raise _AutomationChanged("Automation receipt changed during health tracking")
+                    data = current
+                    raise
                 persist(runtime, run, kind, data)
             if data and data["state"] not in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}:
                 result[kind] = data
