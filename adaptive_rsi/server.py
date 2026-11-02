@@ -431,6 +431,27 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
                 self.backup(path, params)
+            elif parsed.path in ("/api/rehearse-restore", "/api/rehearsal"):
+                identifier = params.get("id", [""])[0]
+                reports_dir = store.root / "reports"
+                if identifier:
+                    if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
+                        raise RequestError("Invalid backup ID")
+                    report_file = reports_dir / f"rehearsal-{identifier}.json"
+                    if not report_file.exists():
+                        raise RequestError("Rehearsal report not found")
+                    self.respond(json.loads(report_file.read_text(encoding="utf-8")))
+                else:
+                    reports = sorted((p for p in reports_dir.glob("rehearsal-*.json")
+                                      if p.is_file() and not p.is_symlink()),
+                                     key=lambda p: p.stat().st_mtime, reverse=True) if reports_dir.exists() else []
+                    latest = None
+                    if reports:
+                        try:
+                            latest = json.loads(reports[0].read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                    self.respond({"reports": [p.name for p in reports[:20]], "latest": latest})
             elif parsed.path == "/api/tasks/batch":
                 project = params.get("project", [""])[0]
                 runtime.project(project)
@@ -966,6 +987,31 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/backup":
                     from .storage_tools import backup
                     result = backup(runtime.store)
+                elif path in ("/api/rehearse-restore", "/api/rehearsal"):
+                    from .storage_tools import rehearse_restore, rehearsal_report_path
+                    identifier = body.get("id")
+                    if identifier:
+                        if not isinstance(identifier, str) or len(identifier) != 16 or any(
+                                char not in "0123456789abcdef" for char in identifier):
+                            raise RequestError("Invalid backup ID")
+                        source = runtime.store.root / "backups" / (identifier + ".sqlite3")
+                    elif body.get("path") or body.get("file"):
+                        raw_path = body.get("path") or body.get("file")
+                        source = Path(str(raw_path))
+                    else:
+                        backups = sorted((p for p in (runtime.store.root / "backups").glob("*.sqlite3")
+                                          if p.is_file() and not p.is_symlink()),
+                                         key=lambda p: p.stat().st_mtime, reverse=True)
+                        if not backups:
+                            raise RequestError("No backup available for rehearsal")
+                        source = backups[0]
+                    try:
+                        report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
+                        result = rehearse_restore(source, report_path=report_file, store=runtime.store)
+                    except ValueError as exc:
+                        if "conflicts with database" in str(exc):
+                            raise RequestError("report_conflicts_with_database") from exc
+                        raise RequestError(str(exc)) from exc
                 elif path == "/api/request":
                     result = {"id": runtime.request(body["project"], body["kind"])}
                 elif path == "/api/pause":

@@ -93,6 +93,7 @@ class StorePoolTest(unittest.TestCase):
 
     def test_wal_and_foreign_keys_survive_pool_reuse(self):
         self.assertEqual(self.store.query("PRAGMA journal_mode"), [{"journal_mode": "wal"}])
+        self.assertEqual(self.store.query("PRAGMA synchronous"), [{"synchronous": 1}])
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.execute("INSERT INTO tasks(id,project,title,state) VALUES ('t','missing','x','queued')")
         self.assertEqual(self.store.one("SELECT count(*) AS n FROM tasks")["n"], 0)
@@ -258,6 +259,51 @@ class RecordUsageTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 40)
         self.store.record_usage("call", "run", self.usage(150), 3.0)
         self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 150)
+
+    def test_record_usage_transitions_state_to_completed(self):
+        call_row = self.store.one("SELECT state FROM calls WHERE id='call'")
+        assert call_row is not None
+        self.assertEqual(call_row["state"], "reserved")
+        self.store.record_usage("call", "run", self.usage(100), 1.0)
+        call_row = self.store.one("SELECT state FROM calls WHERE id='call'")
+        assert call_row is not None
+        self.assertEqual(call_row["state"], "completed")
+
+    def test_record_usage_robust_to_missing_tokens_and_partial_details(self):
+        self.store.record_usage("call", "run", {"usage_known": True}, 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, output_tokens, usage_known FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {
+            "state": "completed",
+            "tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "usage_known": 1,
+        })
+        run_row = self.store.one("SELECT tokens FROM runs WHERE id='run'")
+        assert run_row is not None
+        self.assertEqual(run_row["tokens"], 0)
+
+        self.store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,created) "
+                           "VALUES ('call-partial','p','run','planning','m','high','reserved',0,0)")
+        self.store.record_usage("call-partial", "run", {"input_tokens": 5, "usage_known": True}, 0.5)
+        partial_row = self.store.one("SELECT state, tokens, input_tokens, usage_known FROM calls WHERE id='call-partial'")
+        self.assertEqual(partial_row, {
+            "state": "completed",
+            "tokens": 5,
+            "input_tokens": 5,
+            "usage_known": 1,
+        })
+
+    def test_recover_only_interrupts_uncompleted_calls(self):
+        self.store.record_usage("call", "run", self.usage(100), 1.0)
+        self.store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,created) "
+                           "VALUES ('call-in-flight','p','run','planning','m','high','reserved',0,0)")
+        self.store.recover()
+        call_row = self.store.one("SELECT state FROM calls WHERE id='call'")
+        in_flight_row = self.store.one("SELECT state FROM calls WHERE id='call-in-flight'")
+        assert call_row is not None and in_flight_row is not None
+        self.assertEqual(call_row["state"], "completed")
+        self.assertEqual(in_flight_row["state"], "interrupted")
 
 
 class MigrationLedgerHealTest(unittest.TestCase):
