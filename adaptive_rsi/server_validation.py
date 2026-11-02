@@ -10,7 +10,7 @@ unknown_provider invalid_provider invalid_mode invalid_key invalid_reference mis
 keychain_unavailable keychain_locked keychain_failed credential_file_unavailable
 builtin_provider provider_in_use update_in_progress connection_changed invalid_model
 invalid_routes too_many_models unsupported_model_kind probe_failed default_effort_required
-rate_limit auth connection unavailable unknown timeout too_large invalid_response
+rate_limit auth connection unavailable unknown timeout too_large patch_too_large invalid_response
 unsupported http_error provider_paused model_missing tool_format budget_exhausted
 codex_missing codex_error opencode_missing opencode_error opencode_version_unknown
 opencode_version_unsupported opencode_capability_missing invalid_credentials
@@ -149,6 +149,10 @@ Configuration must be an object
 
 class RequestError(ValueError):
     """本模块固定的用户提示；其余异常一律通过安全错误边界处理。"""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def project_display_name(name, path):

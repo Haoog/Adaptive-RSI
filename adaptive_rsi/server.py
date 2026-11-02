@@ -35,6 +35,18 @@ from .server_validation import (SAFE_ERROR_CODES, SAFE_VALIDATION_MESSAGES, Requ
                                 project_display_name, configuration_error)
 
 
+PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
+PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
+                           "download it from the run directory instead")
+
+
+def read_patch_preview(path):
+    """Read a patch for the console; return None when it exceeds the preview limit."""
+    with path.open("rb") as stream:
+        payload = stream.read(PATCH_PREVIEW_LIMIT + 1)
+    return payload if len(payload) <= PATCH_PREVIEW_LIMIT else None
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -172,7 +184,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_error(self, exc):
         if isinstance(exc, RequestError):
-            self.respond({"error": str(exc)}, 400)
+            payload = {"error": str(exc)}
+            code = getattr(exc, "code", None)
+            if isinstance(code, str) and code in SAFE_ERROR_CODES:
+                payload["error_code"] = code
+            self.respond(payload, 400)
             return
         code = getattr(exc, "code", None)
         code = code if isinstance(code, str) and (code in SAFE_ERROR_CODES or
@@ -763,12 +779,11 @@ class Handler(BaseHTTPRequestHandler):
                     path = run_artifact_path(store, run, "candidate.patch")
                     if not path.is_file():
                         raise ValueError("Missing patch")
-                    with path.open("rb") as stream:
-                        payload = stream.read(2 * 1024 * 1024 + 1)
-                    if len(payload) > 2 * 1024 * 1024:
-                        raise ValueError("Candidate patch exceeds the UI size limit; download it from the run directory")
+                    payload = read_patch_preview(path)
                 except (ValueError, OSError, RuntimeError):
                     raise RequestError("Run has no artifacts in this state directory") from None
+                if payload is None:
+                    raise RequestError(PATCH_PREVIEW_TOO_LARGE, code="patch_too_large")
                 self.respond(payload, content_type="text/plain; charset=utf-8")
             elif parsed.path == "/api/diff-files":
                 from .storage_tools import run_artifact_path
@@ -780,10 +795,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Run has no artifacts in this state directory")
                 files, current = [], None
                 from .gitops import diff_path
-                with path.open("rb") as stream:
-                    payload = stream.read(2 * 1024 * 1024 + 1)
-                if len(payload) > 2 * 1024 * 1024:
-                    raise RequestError("Run has no artifacts in this state directory")
+                payload = read_patch_preview(path)
+                if payload is None:
+                    raise RequestError(PATCH_PREVIEW_TOO_LARGE, code="patch_too_large")
                 for number, line in enumerate(payload.decode("utf-8", errors="replace").splitlines(), 1):
                     if line.startswith("diff --git "):
                         current = {"path": None, "line": number, "additions": 0, "deletions": 0}
