@@ -309,6 +309,37 @@ class AuthSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthError, "unsupported_auth_method"):
             self.manager.set_api_key("opencode", "unknown", "key")
 
+    def test_corrupt_legacy_auth_does_not_block_login_and_is_preserved(self):
+        path = self.root / "data/opencode/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{corrupt")
+        self.assertEqual(self.manager.snapshot()["opencode"]["error"], "invalid_credentials")
+        self.assertEqual(list(path.parent.glob("auth.json.invalid-*")), [])
+        self.assertEqual(path.read_text(), "{corrupt")
+        session = self.manager.start("opencode", "openai")
+        self.wait_state(session, "awaiting_authorization")
+        self.gate.set()
+        self.assertEqual(self.wait_state(session, "completed")["state"], "completed")
+        self.assertEqual(json.loads(path.read_text())["openai"]["type"], "oauth")
+        backups = list(path.parent.glob("auth.json.invalid-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "{corrupt")
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.manager.snapshot()["opencode"]["state"], "authenticated")
+
+    def test_corrupt_legacy_auth_does_not_block_key_save_or_logout(self):
+        path = self.root / "data/opencode/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{corrupt")
+        self.manager.set_api_key("opencode", "openai", "PRIVATE-KEY")
+        self.assertEqual(json.loads(path.read_text())["openai"]["key"], "PRIVATE-KEY")
+        path.write_text("{corrupt-again")
+        self.manager.logout("opencode", "openai")
+        self.assertFalse(path.exists())
+        self.assertEqual(sorted(item.read_text() for item in path.parent.glob("auth.json.invalid-*")),
+                         ["{corrupt", "{corrupt-again"])
+        self.assertEqual(self.manager.snapshot()["opencode"]["state"], "signed_out")
+
     def test_failure_codes_do_not_reflect_provider_error_or_secrets(self):
         self.options["failure"] = "device_auth_unavailable"
         session = self.manager.start("codex")
