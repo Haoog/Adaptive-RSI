@@ -112,8 +112,9 @@ async function main() {
     // 「发布与上线」只渲染在最新一次运行上；把 fixture 中已合并的 detail-h1 排到首位。
     await page.route('**/api/task-runs?*', async route => {
       const response = await route.fetch();
-      const rows = await response.json();
-      await route.fulfill({response, contentType: 'application/json', body: JSON.stringify([...rows].reverse())});
+      const page = await response.json();
+      await route.fulfill({response, contentType: 'application/json',
+        body: JSON.stringify({...page, runs: [...page.runs].reverse()})});
     });
     await page.goto(url);
     await page.locator('#project-status').filter({hasText: '已暂停'}).waitFor({timeout: 15000});

@@ -734,7 +734,10 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     args = (params["task"][0], limit + 1)
                 rows = store.query(query, args)
-                self.respond(rows[:limit])
+                page = rows[:limit]
+                has_more = len(rows) > limit
+                self.respond({"runs": page, "has_more": has_more,
+                              "next_before": "%s:%s" % (page[-1]["started"], page[-1]["id"]) if has_more else None})
             elif parsed.path == "/api/capabilities":
                 project = runtime.project(params.get("project", [""])[0])
                 data = detect(project["path"])
