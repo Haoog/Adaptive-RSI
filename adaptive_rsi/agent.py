@@ -528,9 +528,8 @@ class CodexAgent:
                 raise problem
             data = json.loads(output_path.read_text(encoding="utf-8"))
             validate_output(data, SCHEMAS[role])
-            self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             return data
         except Exception:
-            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=? AND state='reserved'",
+            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?",
                                (time.time() - started, call))
             raise
