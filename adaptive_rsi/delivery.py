@@ -261,7 +261,10 @@ def publish(runtime, project, task, run, workspace, config):
                          (project["id"], run["id"]))
     if not approval or run["state"] != "awaiting_approval":
         raise RuntimeError("Publishing requires explicit approval or persisted project policy")
-    authorization = json.loads(approval["evidence"])
+    try:
+        authorization = json.loads(approval["evidence"] or "[]")
+    except (TypeError, ValueError):
+        authorization = []
     def authorize_write():
         live = runtime.config(project["id"])
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
@@ -346,7 +349,12 @@ def publish(runtime, project, task, run, workspace, config):
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             original = db.execute("SELECT state,result FROM runs WHERE id=?", (run["id"],)).fetchone()
-            receipt = json.loads(original["result"])
+            try:
+                receipt = json.loads(original["result"] or "{}")
+            except (TypeError, ValueError):
+                receipt = {}
+            if not isinstance(receipt, dict):
+                receipt = {}
             receipt["pr"] = url
             state = "superseded" if original["state"] == "superseded" else "pr_open"
             if state == "superseded":
@@ -627,8 +635,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             live_identity = store.setting("run-baseline:" + run["id"])
                             if (remote == policy["base"] and branch == policy["branch"] and
                                     live_run and live_run["state"] == "pr_open" and
-                                    json.loads(live_run["config"])["delivery"]["auto_merge"] and
-                                    json.loads(live_run["result"]).get("pr") == outcome["pr"] and
+                                    json.loads(live_run["config"] or "{}").get("delivery", {}).get("auto_merge") and
+                                    json.loads(live_run["result"] or "{}").get("pr") == outcome["pr"] and
                                     live_config["delivery"]["mode"] == "pr" and
                                     live_config["delivery"]["auto_merge"] and
                                     live_config["github"]["repository"] == repo and

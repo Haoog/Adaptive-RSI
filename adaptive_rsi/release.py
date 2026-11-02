@@ -302,7 +302,11 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stab
         if ownership is not None:
             owner_name, previous, owner = ownership
             current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
-            if (json.loads(current["value"]) if current else None) != previous:
+            try:
+                current_value = json.loads(current["value"]) if current and current["value"] else None
+            except (TypeError, ValueError):
+                current_value = None
+            if current_value != previous:
                 raise _AutomationChanged("Deployment ownership changed during reconciliation")
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (owner_name, encode(owner)))
         if stable is not None:
@@ -326,7 +330,12 @@ def authorized(runtime, project, run, kind, policy, cancel=None):
     if run["project"] != project["id"]:
         raise ValueError("Automation run belongs to a different project")
     live = runtime.config(project["id"])
-    saved = json.loads(run["config"])
+    try:
+        saved = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
     if runtime.stop.is_set() or runtime.project(project["id"])["paused"] or (cancel and cancel()):
         raise Cancelled("Release/deploy paused or cancelled")
     identity = runtime.store.setting("delivery:" + run["id"], {})
@@ -1127,7 +1136,12 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
     from .adapters import detect
     from .gitops import snapshot
     from .storage_tools import run_artifact_path
-    config = json.loads(run["config"])
+    try:
+        config = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
     retry_key = "legacy-release-pin:" + run["id"] + ":" + target_sha
     previous = runtime.store.setting(retry_key, {})
     if previous.get("retry_at", 0) > time.time():
@@ -1183,10 +1197,15 @@ def _retry_target_allowed(runtime, run, outcome, data, target):
 def advance(runtime, project, run, outcome, cancel=None):
     if not re.fullmatch(r"[a-f0-9]{40}", outcome.get("merged_sha", "")):
         return {}
-    saved = json.loads(run["config"])
+    try:
+        saved = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
     result = {}
     for kind in KINDS:
-        policy = saved["delivery"].get(kind, {})
+        policy = saved.get("delivery", {}).get(kind, {})
         data, expected = _read_automation(runtime, run["id"], kind)
         if data and data.get("receipt_error"):
             result[kind] = data
@@ -1372,7 +1391,13 @@ def retry(runtime, project_id, run_id, kind):
         run = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=? AND state='merged'", (run_id, project_id))
         if not run:
             raise ValueError("Only a verified merged run in this project can be retried")
-        policy = json.loads(run["config"])["delivery"].get(kind, {})
+        try:
+            run_config = json.loads(run["config"] or "{}")
+        except (TypeError, ValueError):
+            run_config = {}
+        if not isinstance(run_config, dict):
+            run_config = {}
+        policy = run_config.get("delivery", {}).get(kind, {})
         project = runtime.project(project_id)
         data, raw = _read_automation(runtime, run_id, kind)
         if data and data.get("receipt_error"):

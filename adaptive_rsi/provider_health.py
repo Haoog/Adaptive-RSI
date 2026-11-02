@@ -297,7 +297,11 @@ class ProviderHealth:
                     if code == "rate_limit" and value.get("retry_at"):
                         shared_key = attempt.get("account_key") if attempt else self.account_key(config, provider)
                         prior = db.execute("SELECT value FROM settings WHERE key=?", (shared_key,)).fetchone()
-                        retry_at = max(value["retry_at"], json.loads(prior[0]).get("retry_at", 0) if prior else 0)
+                        try:
+                            prior_retry = json.loads(prior[0]).get("retry_at", 0) if prior and prior[0] else 0
+                        except (TypeError, ValueError, AttributeError):
+                            prior_retry = 0
+                        retry_at = max(value["retry_at"], prior_retry)
                         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
                                    (shared_key, json.dumps({"retry_at": retry_at, "at": time.time()})))
             if model and value is not None:

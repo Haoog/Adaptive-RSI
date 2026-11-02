@@ -713,7 +713,12 @@ class Runtime(Maintenance):
             if self.project(task["project"])["paused"]:
                 continue
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 1", (task["id"],))
-            problem = json.loads(run["result"]).get("failure", {}) if run else {}
+            try:
+                problem = json.loads(run["result"] or "{}").get("failure", {}) if run else {}
+            except (TypeError, ValueError, AttributeError):
+                problem = {}
+            if not isinstance(problem, dict):
+                problem = {}
             if problem.get("code") != "provider" or problem.get("action") != "retry_later" or problem.get("recoverable") is not True:
                 continue
             current = connection_key(self.config(task["project"]), provider, task["project"], root=self.store.root)
@@ -748,7 +753,12 @@ class Runtime(Maintenance):
             if not source or source["state"] != "awaiting_approval":
                 # 历史数据或并发取消/重试后，候选的授权已失效；不得留下成功回执或发布任务。
                 raise ValueError("Source task is no longer awaiting approval; this candidate cannot be delivered")
-            result = json.loads(original["result"])
+            try:
+                result = json.loads(original["result"] or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
             if result.get("evaluation", {}).get("decision") != "pass" or result.get("review", {}).get("decision") != "pass":
                 raise ValueError("Independent gates have not passed")
             evidence = [{"authorization": "project_policy" if automatic else "per_candidate"}]
@@ -782,7 +792,12 @@ class Runtime(Maintenance):
         original = self.store.one("SELECT * FROM runs WHERE id=?", (run_id,))
         if not original or original["state"] not in ["pr_open", "awaiting_approval", "merged"]:
             raise ValueError("No verified code candidate to revert")
-        outcome = json.loads(original["result"])
+        try:
+            outcome = json.loads(original["result"] or "{}")
+        except (TypeError, ValueError):
+            outcome = {}
+        if not isinstance(outcome, dict):
+            outcome = {}
         task = self.store.add_task(original["project"], "rollback", "rollback:" + run_id,
                                    "Revert Adaptive RSI run " + run_id,
                                    "Reverse only the patch produced by run " + run_id,
@@ -960,7 +975,12 @@ class Runtime(Maintenance):
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],)) if not decision else None
-            prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
+            try:
+                prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
+            except (TypeError, ValueError):
+                prior = {}
+            if not isinstance(prior, dict):
+                prior = {}
             if prior and not decision:
                 prior = {"decision_source": "legacy_triage", "wake_condition": "inputs_policy_or_relevant_baseline_change", **prior}
                 self.store.defer(task["id"], prior)
@@ -1331,7 +1351,18 @@ class Runtime(Maintenance):
             record.update(state='obsolete', reason='Candidate approval is no longer valid', ended=time.time())
             self.store.put_setting(key, record)
             return
-        outcome, config = json.loads(run['result']), json.loads(run['config'])
+        try:
+            outcome = json.loads(run['result'] or "{}")
+        except (TypeError, ValueError):
+            outcome = {}
+        if not isinstance(outcome, dict):
+            outcome = {}
+        try:
+            config = json.loads(run['config'] or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
         for step in ('delivery', 'observation', 'monitor', 'evolution'):
             if step in record['steps']:
                 continue
@@ -1396,7 +1427,11 @@ class Runtime(Maintenance):
                      ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
             if run.get('_deadline_stage') != stage:
                 run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
-            limits = merge(DEFAULTS['deadlines'], json.loads(run['config']).get('deadlines', {}))
+            try:
+                run_config = json.loads(run['config'] or "{}")
+            except (TypeError, ValueError):
+                run_config = {}
+            limits = merge(DEFAULTS['deadlines'], (run_config if isinstance(run_config, dict) else {}).get('deadlines', {}))
             evaluation_started = run.get('_evaluation_started')
             if evaluation_started is not None and time.monotonic() - evaluation_started >= limits['evaluation_seconds']:
                 run['_timed_out_stage'] = 'evaluation'
@@ -1465,8 +1500,19 @@ class Runtime(Maintenance):
 
     def invoke(self, role, text, workspace, run):
         protected = [p["path"] for p in self.store.query("SELECT path FROM projects")]
-        protected += [json.loads(c["spec"])["repository"] for c in self.store.query("SELECT spec FROM cases")]
-        config = json.loads(run["config"])
+        for c in self.store.query("SELECT spec FROM cases"):
+            try:
+                spec = json.loads(c["spec"] or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            if isinstance(spec, dict) and spec.get("repository"):
+                protected.append(spec["repository"])
+        try:
+            config = json.loads(run["config"] or "{}")
+        except (TypeError, ValueError):
+            config = None
+        if not isinstance(config, dict):
+            raise RuntimeError("Run configuration is unreadable; cannot invoke model calls")
         if role in ["acceptance", "triage"]:
             config["models"][role] = config["models"]["planning"]
         if role == "review":
@@ -1541,7 +1587,12 @@ class Runtime(Maintenance):
                 original = self.store.one("SELECT * FROM runs WHERE id=? AND project=?", (task["body"], project["id"]))
                 if not original:
                     raise ValueError("Approved run not found")
-                outcome = json.loads(original["result"])
+                try:
+                    outcome = json.loads(original["result"] or "{}")
+                except (TypeError, ValueError):
+                    outcome = {}
+                if not isinstance(outcome, dict):
+                    outcome = {}
                 if original["state"] in ["pr_open", "merged"] and outcome.get("pr"):
                     self.store.transition(run["id"], "completed", {"reason": "Existing delivery recovered", "pr": outcome["pr"]}, True)
                     return
@@ -1679,13 +1730,22 @@ class Runtime(Maintenance):
             task = self.store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
             if problem["code"] == "provider" and task and not task["source"].startswith("system_"):
                 from .provider_health import ProviderHealth, connection_key, error_code
-                config = json.loads(run["config"])
+                try:
+                    config = json.loads(run["config"] or "{}")
+                except (TypeError, ValueError):
+                    config = {}
+                if not isinstance(config, dict):
+                    config = {}
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
-                provider = getattr(exc, "provider_id", None) or (call["provider"] if call else config["models"]["planning"]["provider"])
-                problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
+                provider = getattr(exc, "provider_id", None) or (call["provider"] if call else
+                                                               config.get("models", {}).get("planning", {}).get("provider", "unknown"))
                 transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
-                circuit = ProviderHealth(self.store).status(config, provider, run["project"])
-                problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
+                if config.get("providers"):
+                    problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
+                    circuit = ProviderHealth(self.store).status(config, provider, run["project"])
+                    problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
+                else:
+                    problem["recoverable"] = transient
                 self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?", (task["id"],))
                 if transient and task["infra_retries"] < 3 and not self.is_cancelled(run):
                     import random
@@ -1831,7 +1891,7 @@ class Runtime(Maintenance):
                                              "postmerge_outcomes": module_outcomes,
                                              "open_prs": prs_context,
                                              "strategy": [s["id"] for s in strategies],
-                                             "model": json.loads(run["config"])["models"]["analysis"]})
+                                             "model": json.loads(run["config"] or "{}").get("models", {}).get("analysis")})
         if self.store.setting(selected_key) == inspection_signature:
             self.store.event("inspection_skip", "Committed snapshot unchanged; no model call", project["id"], run["id"])
             self.store.put_setting(module_head_key, head)
@@ -1953,7 +2013,7 @@ class Runtime(Maintenance):
                 record = {
                     "base": head,
                     "triage_input": fingerprint({"body": item["body"], "evidence": encode([candidate["evidence"]]),
-                                                 "policy": json.loads(run["config"])["triage"]["policy"]}),
+                                                 "policy": json.loads(run["config"] or "{}").get("triage", {}).get("policy")}),
                     "reason": decisions.get(candidate["index"], {}).get("reason", ""),
                     "decision": decision,
                 }

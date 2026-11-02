@@ -474,7 +474,12 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                 if body == existing["body"]:
                     decision = db.execute("SELECT data FROM task_decisions WHERE task=?", (existing["id"],)).fetchone()
                     if decision:
-                        prior = json.loads(decision["data"])
+                        try:
+                            prior = json.loads(decision["data"])
+                        except (TypeError, ValueError):
+                            prior = {}
+                        if not isinstance(prior, dict):
+                            prior = {}
                         old_signature = fingerprint({"body": body, "evidence": existing["evidence"],
                                                      "policy": config["triage"]["policy"]})
                         if prior.get("triage_input") == old_signature:
