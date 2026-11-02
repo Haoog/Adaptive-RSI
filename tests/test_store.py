@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -304,6 +305,35 @@ class RecordUsageTest(unittest.TestCase):
         assert call_row is not None and in_flight_row is not None
         self.assertEqual(call_row["state"], "completed")
         self.assertEqual(in_flight_row["state"], "interrupted")
+
+    def test_recover_interrupts_reserved_candidates_without_touching_settled_ones(self):
+        """重启必须清掉提案预留；否则残留的 reserved 会阻塞该项目一小时。"""
+        now = time.time()
+        rows = [("reserved-fresh", "p", "reserved", now),
+                ("reserved-old", "p", "reserved", now - 7200),
+                ("reserved-other-project", "other", "reserved", now),
+                ("legacy-proposing", "p", "proposing", now),
+                ("evaluating", "p", "evaluating", now),
+                ("stable", "p", "stable", now),
+                ("insufficient", "p", "insufficient_evidence", now)]
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                           "VALUES (?,?,'strategy',?,'{}','{}',?)", rows)
+        self.store.recover()
+        statuses = {row["id"]: row["status"] for row in
+                    self.store.query("SELECT id,status FROM candidates")}
+        self.assertEqual(statuses["reserved-fresh"], "interrupted")
+        self.assertEqual(statuses["reserved-old"], "interrupted")
+        self.assertEqual(statuses["reserved-other-project"], "interrupted")
+        self.assertEqual(statuses["legacy-proposing"], "interrupted")
+        self.assertEqual(statuses["evaluating"], "interrupted")
+        self.assertEqual(statuses["stable"], "stable")
+        self.assertEqual(statuses["insufficient"], "insufficient_evidence")
+        # 重复恢复幂等，不会再次改写已中断候选。
+        self.store.recover()
+        again = self.store.one("SELECT status FROM candidates WHERE id='reserved-fresh'")
+        assert again is not None
+        self.assertEqual(again["status"], "interrupted")
 
 
 class MigrationLedgerHealTest(unittest.TestCase):

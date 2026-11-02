@@ -190,6 +190,21 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='stale'")['status'], 'interrupted')
         self.assertEqual(self.calls['proposal'], 1)
 
+    def test_restart_recovery_releases_fresh_reservation_before_expiry(self):
+        """崩溃重启后不能等满一小时：recover() 必须中断仍在保留窗口内的预留。"""
+        args = self.setup_proposal()
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('crash-reservation', 'p', 'strategy', 'reserved', '{}', '{}', time.time() - 300))
+        self.store.recover()
+        recovered = self.store.one("SELECT status FROM candidates WHERE id='crash-reservation'")
+        assert recovered is not None
+        self.assertEqual(recovered['status'], 'interrupted')
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertNotEqual(result.get('code'), 'evolution_reservation_busy')
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls['proposal'], 1)
+
     def test_changed_policy_cases_or_strategies_rearm_the_failed_experiment(self):
         args = self.setup_proposal()
         self.evolution.propose_and_evaluate(*args)
@@ -455,6 +470,89 @@ class AuditEvolutionTest(unittest.TestCase):
         executable = Evolution.overlay_digest(overlay)
         (overlay / 'empty').mkdir()
         self.assertNotEqual(executable, Evolution.overlay_digest(overlay))
+
+    def test_missing_overlay_directory_is_unavailable_instead_of_fatal(self):
+        """维护清理或工作树删除后，历史用例的 overlay 目录消失不是调度错误。"""
+        gone = self.root / 'cleaned-overlay'
+        self.assertIsNone(Evolution.overlay_digest(gone))
+        self.assertIsNone(Evolution.overlay_digest(str(gone)))
+        self.assertIsNone(Evolution.overlay_digest(''))
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        digest = str(Evolution.overlay_digest(overlay) or '')
+        self.assertRegex(digest, r'^[0-9a-f]{64}$')
+        shutil.rmtree(overlay)
+        # 先算过摘要的目录被清掉后同样降级，不再抛 FileNotFoundError。
+        self.assertIsNone(Evolution.overlay_digest(overlay))
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        self.assertEqual(digest, Evolution.overlay_digest(overlay))
+        # overlay 必须是目录；路径指向普通文件时同样不可用。
+        self.assertIsNone(Evolution.overlay_digest(overlay / 'case.txt'))
+
+    def test_unreadable_overlay_is_unavailable_while_malformed_content_still_raises(self):
+        import os
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        with patch('pathlib.Path.lstat', side_effect=PermissionError('overlay denied')):
+            self.assertIsNone(Evolution.overlay_digest(overlay))
+        # 非常规文件不是「不可用」而是「不可复现」，仍要显式报错，避免被当成有效输入。
+        os.mkfifo(overlay / 'pipe', 0o600)
+        with self.assertRaisesRegex(ValueError, 'regular files'):
+            Evolution.overlay_digest(overlay)
+
+    def test_missing_overlay_does_not_block_periodic_evolution_attempt(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        missing = self.root / 'missing-overlay'
+        base_spec = {'task': 'historical task', 'repository': str(self.root),
+                     'base': 'HEAD', 'checks': []}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('with-overlay', 'p', 'f1', 'validation',
+                            encode({**base_spec, 'overlay': str(missing)}), 0, 1.0))
+        signature = str(evolution.input_signature('p', config) or '')
+        self.assertRegex(signature, r'^[0-9a-f]{64}$')
+        due, computed, attempt = evolution.attempt_due('p', config)
+        self.assertIs(due, True)
+        self.assertEqual(computed, signature)
+        self.assertEqual(attempt, {})
+        # 缺失的 overlay 不会让签名每次抖动：记录尝试后同一输入不再重复触发。
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+        due_again, again, recorded = evolution.attempt_due('p', config)
+        self.assertFalse(due_again)
+        self.assertEqual(again, signature)
+        self.assertEqual(recorded['status'], 'insufficient_evidence')
+        # overlay 缺失不等同于「没有 overlay」：spec 指纹仍区分两种用例。
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('without-overlay', 'p', 'f2', 'validation',
+                            encode({**base_spec, 'overlay': None}), 0, 2.0))
+        self.assertNotEqual(signature, evolution.input_signature('p', config))
+
+    def test_vanished_overlay_is_reported_as_changed_input_not_a_valid_manifest(self):
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'marker.txt').write_text('sealed\n')
+        spec = {'task': 'fix add', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'repository': str(repo), 'overlay': str(overlay)}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case', 'p', 'f', 'holdout', encode(spec), 0, 1))
+        item = {'case': 'case', 'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                'tree': git(repo, 'rev-parse', spec['base'] + '^{tree}'), 'checks': fingerprint(CHECKS),
+                'overlay': Evolution.overlay_digest(overlay)}
+        self.assertTrue(self.evolution.verify_inputs('p', [item])['valid'])
+        shutil.rmtree(overlay)
+        result = self.evolution.verify_inputs('p', [item])
+        # 优雅降级只放宽调度，不放宽封存校验：已归档的 overlay 消失仍判为输入变化。
+        self.assertFalse(result['valid'])
+        self.assertEqual(result['mismatches'], [{'case': 'case', 'fields': ['overlay']}])
 
     def test_plan_tamper_and_incomplete_execution_are_rejected(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
