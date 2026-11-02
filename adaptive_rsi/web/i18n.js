@@ -798,6 +798,7 @@ const english = {
   "请恢复原工作流授权，系统会继续跟踪待执行操作。": "Restore the original workflow authorization. Tracking will continue the pending operation.",
   "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。": "Confirm the workflow result on GitHub first. Only confirmed failed runs can be retried.",
   "检查发布设置": "Check release settings",
+  "重新检查健康": "Recheck health",
   "填写服务的健康检查地址，用于确认新版本正常运行。": "Enter the service health check URL to confirm that the new version is running correctly.",
   "健康检查接口使用不含账号、查询参数的 HTTPS 地址，并返回当前完整提交 SHA 和健康状态，例如 {\"sha\":\"完整提交 SHA\",\"healthy\":true}。": "Use an HTTPS health endpoint without credentials or query parameters. Return the full deployed commit SHA and health status, for example {\"sha\":\"full commit SHA\",\"healthy\":true}.",
   "模型正在使用此账号，请暂停项目并等待当前调用结束后重试。": "A model is using this account. Pause the project, wait for the current call to finish and try again.",

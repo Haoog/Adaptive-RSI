@@ -77,6 +77,24 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(payload), {"started": False, "update": pending})
 
+    def test_release_retry_preserves_fixed_rejections_and_hides_unknown_errors(self):
+        messages = [
+            'Post-merge verification must pass for the exact target commit before retrying delivery',
+            'A newer deployment owns this target; stale delivery cannot be retried',
+            'Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation',
+        ]
+        for message in messages + ['PRIVATE-INTERNAL-ERROR']:
+            with self.subTest(message=message):
+                def reject(*args):
+                    raise ValueError(message)
+                self.runtime.retry_release = reject
+                status, _, body = self.request('/api/release-retry', 'POST',
+                                               {'project': 'p', 'run': 'r', 'kind': 'deploy'})
+                payload = json.loads(body)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload['error'], message if message in messages else 'Invalid request')
+                self.assertEqual(payload['error_code'], 'validation_error' if message in messages else 'invalid_request')
+
     def test_diagnostic_export_requires_consent_and_recomputes_allowlisted_preview(self):
         secret = "private-key-and-source-text"
         self.store.execute("INSERT INTO runs(id,project,state,result) VALUES ('r','p',?,?)",

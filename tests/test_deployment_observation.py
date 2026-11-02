@@ -43,6 +43,16 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertEqual(stable['sha'], self.data['sha'])
         self.assertEqual(len(self.data['health_observations']), 4)
 
+    def test_healthy_observation_clears_stale_rollback_warnings(self):
+        self.policy['health_consecutive_successes'] = 1
+        self.data.update(rollback_unavailable=True, rollback_blocked_reason='data_compatibility',
+                         rollback_recovery_notes='stale warning', rollback_target={'sha': 'c' * 40})
+        result = self.tick(True, 100)
+        self.assertEqual(result['state'], 'healthy')
+        for field in ('rollback_unavailable', 'rollback_blocked_reason', 'rollback_recovery_notes'):
+            self.assertNotIn(field, result)
+        self.assertEqual(result['rollback_target'], {'sha': 'c' * 40})
+
     def test_interval_skips_probes_and_exhaustion_is_failure_even_after_last_success(self):
         self.policy['health_attempts'] = 2
         self.tick(False, 100)
