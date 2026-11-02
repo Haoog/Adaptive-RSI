@@ -129,6 +129,21 @@ class AuditEnvironmentTest(unittest.TestCase):
             self.assertEqual(os.readlink(root / 'one/deps/link'), 'script')
             self.assertTrue(os.access(root / 'one/deps/script', os.W_OK))
 
+    def test_clone_attempt_leaves_no_partial_file_when_the_filesystem_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source, target = root / 'source', root / 'target'
+            source.write_bytes(b'payload')
+            if environment.clone_supported(root):
+                environment._clone_file(source, target)
+                self.assertEqual(target.read_bytes(), b'payload')
+                self.assertNotEqual(os.stat(source).st_ino, os.stat(target).st_ino)
+                return
+            with self.assertRaises(OSError):
+                environment._clone_file(source, target)
+            # 失败的克隆不能留下半截文件，否则后续复制会命中已存在的目标。
+            self.assertFalse(target.exists())
+
     def test_stage_copies_share_seed_blocks_only_when_the_filesystem_clones(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

@@ -1,6 +1,7 @@
 import ctypes
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ SEED_DIGEST_PREFIX = b"adaptive-rsi-dependencies-v2\0"
 # are remembered here so later files in the same tree take the plain copy path.
 FICLONE = 0x40049409
 _NO_CLONE_DEVICES = set()
+_CLONE_LIBRARY = None
 
 
 def _seed_root(source, relative):
@@ -495,13 +497,14 @@ def _clone_file(source, target):
         os.close(descriptor)
 
 
-def _clone_or_copy(source, target):
+def _clone_or_copy(source, target, device=None):
     """``copytree`` copy function: clone shared blocks, else write a real copy."""
     if not stat.S_ISREG(os.stat(source).st_mode):
         # copytree only routes non-directories here; anything that is not a
         # regular file must keep raising the same SpecialFileError as before.
         return shutil.copy2(source, target)
-    device = os.stat(os.path.dirname(str(target))).st_dev
+    if device is None:
+        device = os.stat(os.path.dirname(str(target))).st_dev
     if device not in _NO_CLONE_DEVICES:
         try:
             _clone_file(source, target)
@@ -544,7 +547,8 @@ def restore(source, target, config):
         # inode: a write there is allocated on demand and never reaches another
         # copy, and filesystems without clone support get a full copy.
         shutil.copytree(Path(source) / relative, destination, symlinks=True,
-                        copy_function=_clone_or_copy)
+                        copy_function=functools.partial(
+                            _clone_or_copy, device=destination.parent.stat().st_dev))
         # Cache storage is immutable; each workspace owns an independently writable
         # copy. Never hardlink dependency files between tasks.
         for path in [destination] + list(destination.rglob("*")):
