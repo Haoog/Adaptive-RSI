@@ -429,6 +429,9 @@ def reconcile(runtime, run, kind, data, persist=True):
             return None
     created, started = timestamp("created_at"), timestamp("run_started_at")
     finished = timestamp("updated_at") if remote.get("status") == "completed" else None
+    # Reconciled timing covers queue, execution, build and reverification phases.
+    # Missing phases stay explicit None (unknown) rather than omitted or defaulted to 0;
+    # GitHub workflow_run timestamps do not isolate build or reverification phases.
     data["timing"] = {"created_at": remote.get("created_at"), "started_at": remote.get("run_started_at"),
                       "completed_at": remote.get("updated_at") if finished is not None else None,
                       "completed_at_basis": "updated_at" if finished is not None else None,
