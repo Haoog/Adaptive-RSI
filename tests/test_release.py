@@ -380,7 +380,7 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertEqual(sum("/dispatches" in item[0] for item in self.commands), 2)
 
     def test_health_failure_rolls_back_only_to_previously_verified_same_target(self):
-        from adaptive_rsi.release import stable_key
+        from adaptive_rsi.release import owner_key, stable_key
         deploy = self.setup_deployment(rollback=True)
         self.runtime.store.put_setting(stable_key(self.project, "example/project", deploy["health_url"]), {"sha": PREVIOUS})
         with patch("adaptive_rsi.release.api", side_effect=self.api), patch("adaptive_rsi.release.health_check", side_effect=lambda url, sha: {"healthy": sha == PREVIOUS, "sha": sha}):
@@ -395,6 +395,66 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertEqual(rolled["state"], "rolled_back")
             self.assertTrue(rolled["rollback"]["health"]["healthy"])
         self.assertEqual(sum("/dispatches" in item[0] for item in self.commands), 2)
+        owner = self.runtime.store.setting(owner_key(self.project, "example/project", deploy))
+        self.assertEqual(owner["sha"], PREVIOUS)
+        self.assertEqual(owner["run"], self.run["id"])
+        stable = self.runtime.store.setting(stable_key(self.project, "example/project", deploy["health_url"]))
+        self.assertEqual(stable["sha"], PREVIOUS)
+        self.assertEqual(stable["run"], self.run["id"])
+        self.assertTrue(stable["health"]["healthy"])
+
+    def test_rollback_updates_deployment_owner_and_allows_subsequent_advance_without_superseded(self):
+        from adaptive_rsi.release import owner_key, stable_key
+        deploy = self.setup_deployment(rollback=True)
+        self.runtime.store.put_setting(stable_key(self.project, "example/project", deploy["health_url"]), {"sha": PREVIOUS})
+        with patch("adaptive_rsi.release.api", side_effect=self.api), patch("adaptive_rsi.release.health_check", side_effect=lambda url, sha: {"healthy": sha == PREVIOUS, "sha": sha}):
+            first = self.tick()["deploy"]
+            self.remote = self.remote_run(first)
+            failed = self.tick()["deploy"]
+            self.assertEqual(failed["state"], "rolling_back")
+            rollback = failed["rollback"]
+            self.remote = self.remote_run(rollback)
+            rolled = self.tick()["deploy"]
+            self.assertEqual(rolled["state"], "rolled_back")
+
+        # 1. 验证 deployment_owner 更新为回滚目标提交
+        owner = self.runtime.store.setting(owner_key(self.project, "example/project", deploy))
+        self.assertEqual(owner["sha"], PREVIOUS)
+        self.assertEqual(owner["run"], self.run["id"])
+
+        # 2. 验证 stable_key 同步更新为回滚提交与健康凭证
+        stable = self.runtime.store.setting(stable_key(self.project, "example/project", deploy["health_url"]))
+        self.assertEqual(stable["sha"], PREVIOUS)
+        self.assertEqual(stable["run"], self.run["id"])
+        self.assertTrue(stable["health"]["healthy"])
+
+        # 3. 后续演进运行 Run 2（基于回滚基准提交 PREVIOUS 分支）
+        NEXT = "d" * 40
+        self.runtime.goal(self.project, "Subsequent evolution commit")
+        run2 = self.runtime.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.store.transition(run2["id"], "merged", {"merged_sha": NEXT, "feedback": {"state": "verified", "head": NEXT}}, True)
+        run2 = self.runtime.store.one("SELECT * FROM runs WHERE id=?", (run2["id"],))
+        self.runtime.store.put_setting("delivery:" + run2["id"], {"repository": "example/project", "branch": "main", "head": "evaluated", "base": "baseline"})
+
+        compare_endpoints = []
+        def api_with_compare(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                compare_endpoints.append(endpoint)
+                base, head = endpoint[len("compare/"):].split("...")
+                self.assertEqual(base, PREVIOUS)
+                self.assertEqual(head, NEXT)
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+
+        with patch("adaptive_rsi.release.api", side_effect=api_with_compare):
+            run2_result = advance(self.runtime, self.runtime.project(self.project), run2,
+                                  {"merged_sha": NEXT, "feedback": {"state": "verified", "head": NEXT}})
+
+        self.assertEqual(compare_endpoints, [f"compare/{PREVIOUS}...{NEXT}"])
+        self.assertEqual(run2_result["deploy"]["state"], "submitted")
+        new_owner = self.runtime.store.setting(owner_key(self.project, "example/project", deploy))
+        self.assertEqual(new_owner["sha"], NEXT)
+        self.assertEqual(new_owner["run"], run2["id"])
 
     def test_no_previous_stable_sha_never_claims_successful_rollback(self):
         self.setup_deployment(rollback=True)
