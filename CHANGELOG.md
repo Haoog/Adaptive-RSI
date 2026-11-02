@@ -4,6 +4,7 @@
 
 ## Unreleased
 
+- 新增 opt-in 的 `validation.affected_check_scheduling`：配置 monorepo 检查依赖图后，候选阶段只执行受变更影响的检查，剩余检查由全量候选阶段补齐；依赖图无效、路径未知或证据不可用时回退完整检查集合。
 - 修复 test_selected 完全重复选择器被误拒的问题：重复选择器按幂等处理、去重后只执行一次，类与方法的包含重叠及空选择仍然拒绝。
 
 ## 0.5.134
