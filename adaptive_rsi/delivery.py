@@ -217,9 +217,11 @@ def failure_attribution(merged, head, result):
     checks = result.get("checks") or {}
     baseline_checks = [check for label, rows in checks.items() if label in ("baseline", "acceptance_baseline") for check in rows]
     baseline_passed = bool(baseline_checks) and all(check.get("passed") is True for check in baseline_checks)
+    scope = "subsequent_mainline" if head != merged and baseline_passed else "unknown"
     return {"merged_sha": merged, "observed_head": head,
-            "scope": "subsequent_mainline" if head != merged and baseline_passed else "unknown",
-            "merge_baseline_passed": baseline_passed, "candidate_regression_proven": False}
+            "scope": scope,
+            "merge_baseline_passed": baseline_passed, "candidate_regression_proven": False,
+            "disclaimer": "later-mainline 失败不记候选回归" if scope == "subsequent_mainline" else ""}
 
 
 def publish(runtime, project, task, run, workspace, config):

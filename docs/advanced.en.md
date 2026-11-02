@@ -284,7 +284,7 @@ python3 scripts/rsi import-case PROJECT_ID case.json
 python3 scripts/rsi evolve PROJECT_ID
 ```
 
-Splits are `development`, `validation`, and `holdout`. A family or identical task snapshot cannot span splits; curators must label near-duplicate defect families correctly. Defaults require at least three families in both validation and holdout, with at most three exposures per case. The controller stores overlays and injects them into test directories only during independent evaluation, without giving them to candidates. Synthetic defects stay out of the real project queue and are not presented as business evidence.
+Splits are `development`, `validation`, and `holdout`. A family or identical task snapshot cannot span splits; curators must label near-duplicate defect families correctly. Defaults require at least three families in both validation and holdout, with at most three exposures per case. The controller stores overlays and injects them into test directories only during independent evaluation, without giving them to candidates. Synthetic defects stay out of the real project queue and are not presented as business evidence. For verification and reproduction steps in offline or isolated environments, see the [offline reproduction checklist](offline-reproduction.en.md).
 
 ## Codex plugin
 

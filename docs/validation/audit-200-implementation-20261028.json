@@ -1693,14 +1693,21 @@
       },
       "source": "adaptive_rsi/runtime.py",
       "acceptance": "夏令时跳过及重复小时测试给出确定行为，时区变化不静默移动授权时间。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/runtime.py"
+        "adaptive_rsi/runtime.py",
+        "adaptive_rsi/server.py",
+        "adaptive_rsi/server_validation.py",
+        "adaptive_rsi/web/app.js",
+        "adaptive_rsi/web/experience.js",
+        "adaptive_rsi/web/i18n.js"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_scheduled_wall_time_rejects_gap_and_requires_fold"
+        "python3 -B -m unittest tests.test_runtime_handoff.RuntimeHandoffTest.test_scheduled_wall_time_rejects_gap_and_requires_fold",
+        "python3 -B -m unittest tests.test_schedule_consistency.TaskScheduleEndpointTest",
+        "node --test tests/web_requests.cjs"
       ],
-      "residual": "Scheduling API rejects DST gaps and requires an explicit fold for repeated hours, preserving an authorized absolute instant. No HTTP endpoint/UI integration or browser acceptance."
+      "residual": "Scheduling API rejects DST gaps, ambiguous repeated hours and past times with fixed messages over HTTP and the console; reservations display their wall time and zone. Browser-scenario acceptance for the new dialog is still pending."
     },
     {
       "id": 99,
@@ -2778,14 +2785,25 @@
       },
       "source": "adaptive_rsi/evolution.py",
       "acceptance": "同输入下比较各配置，报告不把组合收益全部归给单一模块。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/evolution.py"
+        "adaptive_rsi/evolution.py",
+        "adaptive_rsi/config.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/runtime.py",
+        "tests/test_audit_evolution.py"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_attribution_does_not_assign_combined_gain_to_strategy"
-      ],
-      "residual": "Matched four-configuration attribution helper reports interaction-only gains and insufficient evidence; automatic controlled ablation scheduling is not integrated."
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_attribution_does_not_assign_combined_gain_to_strategy",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_joint_strategy_and_skill_change_runs_the_scheduled_ablation",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_stays_insufficient_when_no_sampled_input_matches_the_skill",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_skill_is_injected_only_into_declared_experiment_contexts",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_limit_validation_rejects_invalid_values",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_four_configurations_differ_only_in_the_tested_factor",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_candidate_skill_is_ranked_and_bounded_by_production_retrieval",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_stays_insufficient_when_production_retrieval_hides_the_skill",
+        "python3 -B -m unittest tests.test_audit_evolution.AuditEvolutionTest.test_ablation_marks_partial_rows_insufficient_when_a_later_input_raises"
+      ]
     },
     {
       "id": 160,
@@ -2834,9 +2852,11 @@
       ],
       "validation": [
         "python3 -B -m unittest tests.test_delivery_readiness_audit.ProtectionRulesTest.test_active_rules_endpoint_can_establish_strictness_without_classic_protection",
-        "python3 -B -m unittest tests.test_delivery_readiness_audit.ProtectionRulesTest.test_ruleset_read_failure_is_unknown_even_with_classic_rules"
+        "python3 -B -m unittest tests.test_delivery_readiness_audit.ProtectionRulesTest.test_ruleset_read_failure_is_unknown_even_with_classic_rules",
+        "python3 -B -m unittest tests.test_delivery_readiness_audit -q",
+        "docs/validation/ruleset-verification-evidence-20261101.json"
       ],
-      "residual": "Ruleset/classic protection read fixtures retain unknown permissions; no real GitHub ruleset acceptance."
+      "residual": "Live read-only check on 2026-11-01: the managed repository reports classic protection with strict checks and an empty repository ruleset index; a plan-limited private repository returns HTTP 403 for both endpoints and readiness stays unknown. The classic+ruleset combination and strictness inside an active ruleset are replayed from captured public payloads, because creating a ruleset is a write operation outside the read-only scope."
     },
     {
       "id": 163,

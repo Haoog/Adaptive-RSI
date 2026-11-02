@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .adapters import detect
 from .agent import CodexAgent
@@ -642,6 +642,7 @@ class Runtime(Maintenance):
                        (now, row["project"], task))
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             db.execute("UPDATE tasks SET body=?,evidence=?,state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (body, evidence, now, task))
+            db.execute("DELETE FROM settings WHERE key=?", ('task-schedule:' + task,))
             db.execute("INSERT INTO events(project,run,kind,message,data,created) "
                        "VALUES (?,NULL,'requirements_revised','Requirements supplemented; fresh verification required',?,?)",
                        (row["project"], encode({"task": task, "revision": revision, "reason": reason,
@@ -654,7 +655,12 @@ class Runtime(Maintenance):
         local = datetime.datetime.fromisoformat(local_time)
         if local.tzinfo is not None or fold not in (None, 0, 1):
             raise ValueError('Use a naive local time and fold 0 or 1')
-        zone = ZoneInfo(timezone)
+        try:
+            zone = ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+            # ZoneInfoNotFoundError 是 KeyError 子类；不拦截会落进笼统的
+            # invalid_request 兜底，用户看不到确定性提示。
+            raise ValueError('Unknown time zone') from exc
         candidates = {}
         for choice in (0, 1):
             instant = local.replace(tzinfo=zone, fold=choice).timestamp()
@@ -1402,7 +1408,13 @@ class Runtime(Maintenance):
             result.append({"id": row["id"], "kind": row["kind"], "content": content})
         return result
 
-    def memories(self, project, text):
+    def memories(self, project, text, extra=None):
+        """Retrieve verified skills for active strategies matching text, plus optional extra candidate skills.
+
+        Candidate skills in ``extra`` are subjected to the same relevance ranking,
+        per-skill character limit, and context.related() limit and character budget
+        as promoted verified skills.
+        """
         rows = self.store.query("SELECT * FROM skills WHERE project=? AND status='verified' AND expires>? "
                                 "ORDER BY created DESC LIMIT 50", (project, time.time()))
         active = {c["id"] for c in self.active_strategies(project)}
@@ -1421,6 +1433,17 @@ class Runtime(Maintenance):
             if evidence.get("candidate") in active and any(t.lower() in lower for t in triggers if t.strip()):
                 eligible.append({"content": r["content"][:2000], "evidence": evidence,
                                  "created": r["created"], "triggers": triggers})
+        if extra:
+            # 候选技能不额外放宽任何条件：并入同一批 eligible 后，由 related() 决定
+            # 是否命中、排序位置以及 limit/字符上限，与已验证技能走同一条规则。
+            for item in extra:
+                triggers = item.get("triggers", [])
+                if not isinstance(triggers, list):
+                    continue
+                eligible.append({"content": str(item.get("content", ""))[:2000],
+                                 "evidence": item.get("evidence", {}),
+                                 "created": item.get("created", time.time()),
+                                 "triggers": [t for t in triggers if isinstance(t, str) and t.strip()]})
         return related(eligible, text)
 
     def invoke(self, role, text, workspace, run):
@@ -1678,9 +1701,11 @@ class Runtime(Maintenance):
                                ("run-stop:" + run["id"], run["id"]))
             self.wake.set()
 
-    def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False):
+    def execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment=False,
+                          experiment_skills=None, baseline_ids=None):
         from .pipeline import execute_candidate
-        return execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment)
+        return execute_candidate(self, run, project, task, source, base, directory, workspace, strategies, experiment,
+                                 experiment_skills, baseline_ids)
 
     def finish_failure(self, run, task, result, config):
         state = "insufficient_evidence" if result["decision"] == "insufficient_evidence" else "failed"
@@ -1950,26 +1975,11 @@ class Runtime(Maintenance):
         if not repo:
             raise ValueError("No GitHub repository configured")
         from .discovery import sync
-        before = {row['id']: row for row in self.store.query(
-            "SELECT id,title,body,evidence FROM tasks WHERE project=? AND source='issue'", (project['id'],))}
-        try:
-            sync(self, project, config, checked, cancel=(lambda: self.is_cancelled(run)) if run else None)
-        finally:
-            import difflib
-            for row in self.store.query("SELECT id,title,body,evidence FROM tasks WHERE project=? AND source='issue'", (project['id'],)):
-                prior = before.get(row['id'])
-                if not prior or (prior['title'], prior['body']) == (row['title'], row['body']):
-                    continue
-                evidence = json.loads(row['evidence'])
-                source = evidence[0] if evidence and isinstance(evidence[0], dict) else {}
-                self.store.event('issue_requirements_diff', 'Synchronized Issue requirements changed', project['id'],
-                    run['id'] if run else None, {'task': row['id'],
-                    'before': {key: prior[key] for key in ('title', 'body', 'evidence')},
-                    'after': {key: row[key] for key in ('title', 'body', 'evidence')},
-                    'source': {key: source.get(key) for key in ('number', 'url', 'updated')},
-                    'observed_at': time.time(), 'authority': 'untrusted_task_data',
-                    'diff': '\n'.join(difflib.unified_diff(prior['body'].splitlines(), row['body'].splitlines(),
-                                                        fromfile='previous', tofile='synchronized', lineterm=''))})
+        # 需求差异审计在 discovery.sync 的每个 Issue 写事务内与任务行一起落库；
+        # 这里只透传 run 归属，不再事后补写，保证审计与任务状态变更同回滚。
+        sync(self, project, config, checked,
+             cancel=(lambda: self.is_cancelled(run)) if run else None,
+             run_id=run["id"] if run else None)
         prs = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
                                   "--json", "number,title,headRefName,url"], timeout=60))
         self.store.put_setting("prs:" + project["id"], prs)

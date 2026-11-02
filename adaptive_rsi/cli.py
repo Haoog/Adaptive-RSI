@@ -163,6 +163,10 @@ def main(argv=None):
     recovery_parser.add_argument("file", type=Path)
     recovery_parser.add_argument("--timeout", type=int, default=10)
     recovery_parser.add_argument("--max-mb", type=int, default=1024)
+    for name in ("rehearse-restore", "rehearse"):
+        rehearse_parser = sub.add_parser(name, help="Exercise isolated database recovery rehearsal and save report")
+        rehearse_parser.add_argument("file", type=Path, nargs="?", default=None, help="Backup file to rehearse (defaults to newest in state backups)")
+        rehearse_parser.add_argument("--report", type=Path, help="Path to write the rehearsal report file")
     for command in ["pause", "resume", "inspect", "issues", "evolve"]:
         p = sub.add_parser(command)
         p.add_argument("project")
@@ -209,6 +213,22 @@ def main(argv=None):
         if args.command == "restore":
             from .storage_tools import restore
             print(json.dumps(restore(args.file, root)))
+            return
+        if args.command in ("rehearse-restore", "rehearse"):
+            from .storage_tools import rehearse_restore, rehearsal_report_path
+            source = args.file
+            if source is None:
+                backups = sorted((p for p in (root / "backups").glob("*.sqlite3")
+                                  if p.is_file() and not p.is_symlink()),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+                if not backups:
+                    raise ValueError("No backup file specified and none found in state backups")
+                source = backups[0]
+            else:
+                source = Path(source).expanduser().resolve()
+            report_file = rehearsal_report_path(source, store=root, report_path=args.report)
+            result = rehearse_restore(source, report_path=report_file, store=root)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
             return
         if args.command == "desktop-runtime":
             from .desktop import run
