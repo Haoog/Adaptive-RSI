@@ -356,6 +356,11 @@ def improvement(results, acceptance):
                     or any(type(rule.get(k)) not in (int, float) or not math.isfinite(rule[k]) for k in ("target", "tolerance"))
                     or rule["tolerance"] < 0):
                 return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
+            if index and (rule["metric"], rule["unit"]) == (threshold["metric"], threshold["unit"]):
+                # Same measurement identity as the primary rule: the primary
+                # samples would satisfy it, so it is no secondary evidence.
+                return {"decision": "insufficient_evidence", "kind": kind,
+                        "basis": "guardrail_must_measure_a_secondary_metric"}
             for load in loads:
                 old, new = measurements(before, rule, load), measurements(after, rule, load)
                 if len(old) != repeats or len(new) != repeats:
@@ -435,6 +440,12 @@ def evidence_contract(task, plan):
                     or any(type(rule.get(k)) not in [int, float] or not math.isfinite(rule[k]) for k in ["target", "tolerance"])
                     or rule["tolerance"] < 0):
                 raise ValueError("Performance guardrails must be finite thresholds with nonnegative tolerance")
+        # Measurements are matched by metric, unit and load, so a guardrail that
+        # repeats the primary identity is scored against the primary samples and
+        # protects no trade-off. It must name a distinct measurement instead.
+        primary = (threshold["metric"], threshold["unit"])
+        if any((rule["metric"], rule["unit"]) == primary for rule in guardrails):
+            raise ValueError("Performance guardrails must measure a secondary metric distinct from the primary threshold")
         contract["threshold"] = threshold
         contract["repetitions"] = repetitions
         contract["load_conditions"] = copy.deepcopy(loads)

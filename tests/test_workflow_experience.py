@@ -964,6 +964,8 @@ class ExperienceTest(unittest.TestCase):
             evidence_contract(task, {**plan, "repetitions": 2})
         with self.assertRaises(ValueError):
             evidence_contract(task, {key: value for key, value in plan.items() if key != "guardrails"})
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {**plan, "guardrails": [dict(threshold)]})
         def sample(value, memory=256):
             return {"passed": True, "stdout": "\n".join(json.dumps(row) for row in [
                 {"metric": "latency", "unit": "ms", "value": value, "load": "idle"},
@@ -974,6 +976,9 @@ class ExperienceTest(unittest.TestCase):
         checks = {"acceptance_baseline": [sample(100), sample(101), sample(102)],
                   "acceptance_candidate": [sample(79), sample(78), sample(77)]}
         self.assertEqual("pass", improvement(checks, acceptance)["decision"])
+        duplicated = {"change_kind": "performance",
+                      "contract": {**contract, "guardrails": [dict(threshold)]}}
+        self.assertEqual("insufficient_evidence", improvement(checks, duplicated)["decision"])
         checks["acceptance_candidate"] = [sample(79, 600), sample(78, 610), sample(77, 620)]
         self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
         checks["acceptance_candidate"] = [sample(99), sample(98), sample(97)]
