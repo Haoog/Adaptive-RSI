@@ -538,7 +538,7 @@ def _held_in_transaction(db, run_id, project):
     return None
 
 
-def _remove_run_artifacts(store, run_id, project, directory):
+def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     """Delete a finished run's own artifacts, one write transaction per artifact.
 
     Re-reading the legal hold under BEGIN IMMEDIATE serialises the check with
@@ -548,6 +548,8 @@ def _remove_run_artifacts(store, run_id, project, directory):
     artifact instead of the whole multi-project cleanup pass.  Once no artifacts
     remain, one final transaction detaches the run's path so later passes filter
     it out through `path IS NOT NULL` instead of re-scanning it forever.
+    ``stored`` is the exact runs.path value from the database, which may differ
+    from the resolved ``directory`` by a symlink layer (e.g. /var on macOS).
     """
     for name in CLEANUP_NAMES:
         target = directory / name
@@ -573,8 +575,8 @@ def _remove_run_artifacts(store, run_id, project, directory):
             return False
         # Match the exact path that was cleaned so a concurrently rewritten
         # path is never detached from artifacts that still exist.
-        db.execute('UPDATE runs SET path=NULL WHERE id=? AND path=?',
-                   (run_id, str(directory)))
+        db.execute('UPDATE runs SET path=NULL WHERE id=? AND path IN (?,?)',
+                   (run_id, str(directory), stored if stored is not None else str(directory)))
     return True
 
 
@@ -686,14 +688,16 @@ class Maintenance:
                                                    "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
                                                    (project["id"], run["id"]))):
                                 continue
-                            directory = Path(run["path"])
-                            runs_root = self.store.root / "runs"
+                            # 存储的 path 与 store.root 可能相差符号链接层（如 macOS
+                            # /var→/private/var）；先规范化再做词法与符号链接检查，
+                            # 否则同一目录会被误判为越界路径、整轮误报调度错误。
+                            directory = Path(run["path"]).resolve()
+                            runs_root = (self.store.root / "runs").resolve()
                             relative = directory.relative_to(runs_root)
-                            # 只清理该运行的直属目录；词法包含检查不能阻止 .. 或祖先符号链接。
+                            # 只清理该运行的直属目录；规范化后的包含检查同样拒绝 .. 与祖先符号链接。
                             if (relative.parts != (run["id"],) or run["id"] in (".", "..") or
                                     any(path.is_symlink() for path in (directory, *directory.parents))):
                                 raise ValueError("Unsafe retention run path")
-                            directory.resolve().relative_to(runs_root.resolve())
                             if run["state"] == "awaiting_approval":
                                 with self.store.connect() as db:
                                     db.execute("BEGIN IMMEDIATE")
@@ -703,7 +707,8 @@ class Maintenance:
                         # 删除仍不持有调度/配置锁，但每个工件在各自的 BEGIN IMMEDIATE 内
                         # 用同一连接重查 hold：预检后提交的 hold 会阻止余下删除，删除期间
                         # 的 hold 写入会等到该事务结束后才提交。
-                        _remove_run_artifacts(self.store, run["id"], project["id"], directory)
+                        _remove_run_artifacts(self.store, run["id"], project["id"], directory,
+                                              stored=run["path"])
                 # Freeze promotion/rollback while choosing and deleting retired candidates.
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
