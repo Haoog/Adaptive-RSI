@@ -84,10 +84,17 @@ def paired_summary(trials):
         if trial.get("case"):
             families.setdefault(trial["case"], []).append(trial)
     wins = losses = ties = 0
+    no_change = 0
     cohorts = {}
     for family, rows in families.items():
         complete = [row for row in rows if "stable" in row and "candidate" in row]
         if not complete:
+            continue
+        if any(row[v].get("no_change") for row in complete for v in ("stable", "candidate")):
+            # 空补丁与 baseline 是同一棵树，记成 win/loss/tie 都会伪造证据。
+            no_change += 1
+            cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
+                               "outcome": "no_change", "repetitions": len(complete)}
             continue
         lost = any(row["stable"]["pass"] and not row["candidate"]["pass"] for row in complete)
         won = not lost and any(not row["stable"]["pass"] and row["candidate"]["pass"] for row in complete)
@@ -97,7 +104,8 @@ def paired_summary(trials):
         cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                            "outcome": "loss" if lost else "win" if won else "tie", "repetitions": len(complete)}
     n = wins + losses
-    summary = {"wins": wins, "losses": losses, "ties": ties, "unit": "independent_case_family",
+    summary = {"wins": wins, "losses": losses, "ties": ties, "no_change": no_change,
+               "unit": "independent_case_family",
                "unknown_identity_trials": sum(not trial.get("case") for trial in trials),
                "estimate": wins / n if n else None, "cohorts": cohorts}
     if n:
@@ -327,6 +335,10 @@ class Evolution:
         for row in rows:
             if not row.get("input") or row.get("variant") not in variants or type(row.get("pass")) is not bool:
                 return {"state": "insufficient_evidence"}
+            if row.get("no_change"):
+                # 空补丁的变体与 baseline 是同一棵树，任何“胜出”都来自空转而非被测因素。
+                return {"state": "insufficient_evidence", "no_change": True,
+                        "reason": "A variant produced no code changes; an empty patch cannot be attributed"}
             group = groups.setdefault(row["input"], {})
             if row["variant"] in group:
                 return {"state": "insufficient_evidence"}
@@ -475,7 +487,10 @@ class Evolution:
             case = trial.get("case")
             if (trial.get("split") != "validation" or case in seen or
                     trial.get("stable", {}).get("pass") is not False or
-                    trial.get("candidate", {}).get("pass") is not True):
+                    trial.get("candidate", {}).get("pass") is not True or
+                    trial.get("stable", {}).get("no_change") or
+                    trial.get("candidate", {}).get("no_change")):
+                # 空转变体（no_change）不是可比较的收益，不能为它补跑消融。
                 continue
             seen.add(case)
             wins.append(trial)
@@ -515,9 +530,12 @@ class Evolution:
                                                     experiment_skills=[skill], baseline_ids=baseline_ids)
                 record["rows"].extend([
                     {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"]},
-                    {"input": trial["case"], "variant": "strategy_only", "pass": strategy_only["pass"]},
-                    {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"]},
-                    {"input": trial["case"], "variant": "combined", "pass": trial["candidate"]["pass"]}])
+                    {"input": trial["case"], "variant": "strategy_only", "pass": strategy_only["pass"],
+                     "no_change": strategy_only.get("no_change", False)},
+                    {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"],
+                     "no_change": skill_only.get("no_change", False)},
+                    {"input": trial["case"], "variant": "combined", "pass": trial["candidate"]["pass"],
+                     "no_change": trial["candidate"].get("no_change", False)}])
                 record["trials"].append({"case": trial["case"], "repetition": trial["repetition"],
                                          "strategy_only": strategy_only, "skill_only": skill_only})
         except Cancelled:
@@ -536,7 +554,8 @@ class Evolution:
             record["attribution"] = self.attribution(record["rows"])
             record["state"] = record["attribution"].get("state", "insufficient_evidence")
             if record["state"] != "complete":
-                record["reason"] = ("Four matched configurations are unavailable for the sampled inputs; " +
+                record["reason"] = (record["attribution"]["reason"] if record["attribution"].get("no_change") else
+                                    "Four matched configurations are unavailable for the sampled inputs; " +
                                     ("the candidate skill is not visible under production retrieval" if invisible
                                      else "the learned skill may not be retrieved by any sampled task"))
         return record
@@ -1038,11 +1057,16 @@ class Evolution:
                                              "limit": config["evolution"]["max_holdout_uses"]}})
         trial_task = {"id": run["task"], "title": spec["task"].splitlines()[0], "body": spec["task"],
                       "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
-        outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
-            trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
-            experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
-        if hasattr(self.runtime, "propagate_deadline"):
-            self.runtime.propagate_deadline(run, trial_run)
+        outcome = None
+        try:
+            outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
+                trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
+                experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
+        finally:
+            # 取消/超时路径同样要把试验的 _timed_out_stage 交给父 run，否则父 run
+            # 只能记为 interrupted，无法区分模型、评估超时与人工取消。
+            if hasattr(self.runtime, "propagate_deadline"):
+                self.runtime.propagate_deadline(run, trial_run)
         # A case overlay is host-owned and remains outside model-visible workspaces.
         if spec.get("overlay") and self.overlay_digest(spec["overlay"]) is None:
             # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
@@ -1058,6 +1082,7 @@ class Evolution:
                 outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
         after = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
         return {"pass": bool(outcome and outcome.get("decision") == "pass"),
+                "no_change": bool((outcome or {}).get("no_change")),
                 "review": (outcome or {}).get("review", {}), "reason": (outcome or {}).get("reason", "No change"),
                 "seconds": time.monotonic() - started, "tokens": after["n"] - before["n"],
                 "usage_known": after["calls"] > before["calls"] and after["unknown"] == before["unknown"],
@@ -1431,6 +1456,10 @@ class Evolution:
     def split_decision(trials, config):
         if not trials or any("stable" not in t or "candidate" not in t for t in trials):
             return {"decision": "insufficient_evidence", "reason": "Incomplete paired trials"}
+        if any(t[v].get("no_change") for t in trials for v in ("stable", "candidate")):
+            # 空转的变体与 baseline 是同一棵树：它既不能证明改进，也不能算作回归。
+            return {"decision": "insufficient_evidence",
+                    "reason": "An experiment variant produced no code changes; an empty patch is not evidence"}
         if any(t["stable"]["pass"] and not t["candidate"]["pass"] for t in trials):
             return {"decision": "fail", "reason": "Candidate regressed on previously passing cases"}
         for split in {t["split"] for t in trials}:

@@ -648,6 +648,42 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['strategy_wins'], [])
         self.assertEqual(Evolution.attribution(rows[:-1])['state'], 'insufficient_evidence')
 
+    def test_attribution_refuses_a_variant_without_code_changes(self):
+        """空补丁变体与 baseline 同树，不能给任何因素记增益。"""
+        rows = [{'input': 'x', 'variant': name, 'pass': passed} for name, passed in
+                [('baseline', False), ('strategy_only', False), ('skill_only', True), ('combined', True)]]
+        rows[2]['no_change'] = True
+        result = Evolution.attribution(rows)
+        self.assertEqual(result['state'], 'insufficient_evidence')
+        self.assertTrue(result['no_change'])
+
+    def test_empty_patch_trial_is_not_a_paired_win_or_loss(self):
+        """试验记录保留 no_change 标记；空转既不算改进也不算回归。"""
+        trials = [{'case': 'x', 'split': 'validation',
+                   'stable': {'pass': True}, 'candidate': {'pass': True, 'no_change': True}}]
+        decision = Evolution.split_decision(trials, self.config)
+        self.assertEqual(decision['decision'], 'insufficient_evidence')
+        summary = paired_summary(trials)
+        self.assertEqual((summary['wins'], summary['losses'], summary['ties'], summary['no_change']), (0, 0, 0, 1))
+        self.assertEqual(summary['cohorts']['x']['outcome'], 'no_change')
+
+    def test_run_configuration_records_no_change_without_a_pass(self):
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import fixture
+        repo = fixture(self.root / 'repo')
+        config = {'evolution': {'max_holdout_uses': 1}, 'checks': []}
+        self.evolution.runtime.execute_candidate = lambda *args, **kwargs: {
+            'decision': 'insufficient_evidence', 'no_change': True,
+            'reason': 'Experiment produced no code changes'}
+        spec = {'task': 'trial task', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': [],
+                'repository': str(repo), 'overlay': None}
+        result = self.evolution.run_configuration(
+            {'id': 'run', 'task': 'task', 'config': encode(config)}, {'id': 'p'},
+            {'id': 'case'}, spec, 'candidate', 0, [], self.root / 'run', 'candidate', config)
+        self.assertFalse(result['pass'])
+        self.assertTrue(result['no_change'])
+        self.assertEqual(result['reason'], 'Experiment produced no code changes')
+
     def test_ablation_is_scheduled_only_when_the_skill_is_retrievable(self):
         proposal = {'kind': 'strategy', 'guidance': 'do x', 'triggers': ['checklist']}
         self.assertTrue(Evolution.ablation_required(proposal))
