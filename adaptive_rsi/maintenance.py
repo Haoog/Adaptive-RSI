@@ -688,16 +688,22 @@ class Maintenance:
                                                    "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
                                                    (project["id"], run["id"]))):
                                 continue
-                            # 存储的 path 与 store.root 可能相差符号链接层（如 macOS
-                            # /var→/private/var）；先规范化再做词法与符号链接检查，
-                            # 否则同一目录会被误判为越界路径、整轮误报调度错误。
-                            directory = Path(run["path"]).resolve()
-                            runs_root = (self.store.root / "runs").resolve()
-                            relative = directory.relative_to(runs_root)
-                            # 只清理该运行的直属目录；规范化后的包含检查同样拒绝 .. 与祖先符号链接。
-                            if (relative.parts != (run["id"],) or run["id"] in (".", "..") or
-                                    any(path.is_symlink() for path in (directory, *directory.parents))):
+                            # 存储的 path 与 store.root 可能相差一层 OS 符号链接（如 macOS
+                            # /var→/private/var），但 store.root 内部不允许任何符号链接：
+                            # runs 目录或运行目录为链接时按越界拒绝，存疑路径保留不修。
+                            directory = Path(run["path"])
+                            runs_root = self.store.root / "runs"
+                            if (runs_root.is_symlink() or directory.is_symlink() or
+                                    Path(run["id"]).parts != (run["id"],) or run["id"] in (".", "..") or
+                                    directory.name != run["id"]):
                                 raise ValueError("Unsafe retention run path")
+                            try:
+                                inside = directory.parent.resolve() == runs_root
+                            except OSError:
+                                inside = False
+                            if not inside:
+                                raise ValueError("Unsafe retention run path")
+                            directory = runs_root / run["id"]
                             if run["state"] == "awaiting_approval":
                                 with self.store.connect() as db:
                                     db.execute("BEGIN IMMEDIATE")
