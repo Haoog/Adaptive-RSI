@@ -6,7 +6,7 @@ Current continuation: the user has authorized work to continue. Read the [curren
 
 The scope is the original 200 items plus validation latency improvements: 201 items. This is an ongoing implementation record, not evidence of full completion or release readiness.
 
-Current ledger: 129 implemented with targeted acceptance, 52 partial, and 20 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
+Current ledger: 130 implemented with targeted acceptance, 51 partial, and 20 pending. See the [JSON ledger](audit-200-implementation-20261028.json) for commands and residual boundaries. The first checkpoint is `cd6e614`; subsequent fixes and remote CI evidence have not been sealed; release readiness remains false.
 
 ## Verified Boundaries
 
@@ -213,7 +213,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 156. **partial** — Export sealed experiment reproduction bundles
 157. **implemented** — Record exact host tool versions
 158. **partial** — Model monorepo check dependencies
-159. **partial** — Separate strategy and skill attribution
+159. **implemented** — Separate strategy and skill attribution
 160. **implemented** — Compare quality, cost and latency jointly
 161. **pending** — Explain merge queue states
 162. **partial** — Inspect GitHub ruleset requirements
