@@ -51,9 +51,23 @@ SCHEMAS = {
 
 # Optional for older adapters; production planners are instructed to return it explicitly.
 SCHEMAS["planning"]["properties"]["change_kind"] = {"type": "string", "enum": ["behavior", "performance", "refactor", "documentation", "configuration", "ui"]}
-SCHEMAS["planning"]["properties"]["performance_threshold"] = object_schema({
+PERFORMANCE_RULE = object_schema({
     "metric": TEXT, "unit": TEXT, "target": {"type": "number"}, "tolerance": {"type": "number"},
     "direction": {"type": "string", "enum": ["lower", "higher"]}})
+SCHEMAS["planning"]["properties"]["performance_threshold"] = PERFORMANCE_RULE
+# Optional measurement-plan fields. Ranges stay in descriptions because OpenAI
+# strict structured output strips numeric bounds; workflow.evidence_contract owns
+# the enforced ranges. check_dependencies is a list here so strict schemas do not
+# need a free-form object map; the contract stores it by package name.
+SCHEMAS["planning"]["properties"].update({
+    "repetitions": {"type": "integer", "description": "Measurements per version and load, 1..100; performance plans require at least 3."},
+    "load_conditions": {"type": "array", "items": TEXT, "description": "Load labels to measure, 1..20; empty or omitted for an unloaded benchmark."},
+    "guardrails": {"type": "array", "items": PERFORMANCE_RULE, "description": "Secondary metrics that must not regress, 1..20 on performance plans."},
+    "required_test_ids": {"type": "array", "items": TEXT, "description": "Exact runner-reported test IDs that must execute."},
+    "check_dependencies": {"type": "array", "items": object_schema({
+        "name": TEXT, "paths": STRINGS, "depends_on": STRINGS, "checks": STRINGS}),
+        "description": "Checked package graph entries; the contract stores them by name."},
+})
 
 
 def validate_output(value, schema):
