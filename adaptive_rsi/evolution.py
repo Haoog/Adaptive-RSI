@@ -1062,24 +1062,23 @@ class Evolution:
             outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
                 trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
                 experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
+            # A case overlay is host-owned and remains outside model-visible workspaces.
+            if spec.get("overlay") and self.overlay_digest(spec["overlay"]) is None:
+                # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
+                # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
+                outcome = {**(outcome or {}), "decision": "error",
+                           "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
+            elif spec.get("overlay") and (trial_dir / "candidate").exists():
+                overlay_result = self.runtime.evaluator.evaluate(
+                    trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
+                    trial_dir / "protected-evaluation", trial_config,
+                    lambda: self.runtime.is_cancelled(trial_run), overlay=spec["overlay"])
+                if overlay_result["decision"] != "pass":
+                    outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
         finally:
-            # 取消/超时路径同样要把试验的 _timed_out_stage 交给父 run，否则父 run
-            # 只能记为 interrupted，无法区分模型、评估超时与人工取消。
+            # 普通执行和保护性补评估的取消/超时都必须传播给父 run。
             if hasattr(self.runtime, "propagate_deadline"):
                 self.runtime.propagate_deadline(run, trial_run)
-        # A case overlay is host-owned and remains outside model-visible workspaces.
-        if spec.get("overlay") and self.overlay_digest(spec["overlay"]) is None:
-            # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
-            # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
-            outcome = {**(outcome or {}), "decision": "error",
-                       "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
-        elif spec.get("overlay") and (trial_dir / "candidate").exists():
-            overlay_result = self.runtime.evaluator.evaluate(
-                trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
-                trial_dir / "protected-evaluation", trial_config,
-                lambda: self.runtime.is_cancelled(run), overlay=spec["overlay"])
-            if overlay_result["decision"] != "pass":
-                outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
         after = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
         return {"pass": bool(outcome and outcome.get("decision") == "pass"),
                 "no_change": bool((outcome or {}).get("no_change")),

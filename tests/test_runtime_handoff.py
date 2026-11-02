@@ -270,6 +270,50 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 异常路径同样要把试验的 _timed_out_stage 交给父 run；否则只能记为 interrupted。
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
 
+    def test_protected_overlay_evaluation_obeys_trial_deadline_and_propagates_it(self):
+        from adaptive_rsi.evolution import Evolution
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        _, parent = self.claim()
+        project, config = self.runtime.project(self.project), self.runtime.config(self.project)
+        overlay = self.root / 'protected-inputs'
+        overlay.mkdir()
+        (overlay / 'test.py').write_text('protected input')
+        spec = {'task': 'trial task', 'base': git(project['path'], 'rev-parse', 'HEAD'),
+                'checks': [], 'repository': project['path'], 'overlay': str(overlay)}
+        clock = [10.0]
+        observed = {}
+        def execute(trial, _project, _task, _repository, _base, directory, *args, **kwargs):
+            self.runtime.begin_phase(trial, 'evaluation')
+            (directory / 'candidate').mkdir()
+            clock[0] += 1
+            return {'decision': 'pass'}
+        def evaluate(_baseline, _candidate, _checks, _directory, _config, cancel, **kwargs):
+            clock[0] = 10.0 + config['deadlines']['evaluation_seconds']
+            observed['cancelled'] = cancel()
+            if observed['cancelled'] and raises:
+                raise Cancelled('Protected evaluation deadline exceeded')
+            return {'decision': 'interrupted' if observed['cancelled'] else 'pass'}
+        for raises in (False, True):
+            with self.subTest(raises=raises):
+                clock[0] = 10.0
+                parent.pop('_timed_out_stage', None)
+                with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(self.runtime, 'execute_candidate', side_effect=execute), \
+                     patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluate):
+                    if raises:
+                        with self.assertRaises(Cancelled):
+                            Evolution(self.runtime).run_configuration(
+                                parent, project, {'id': 'case'}, spec, str(raises), 0, [],
+                                self.root / 'run', 'candidate', config)
+                    else:
+                        result = Evolution(self.runtime).run_configuration(
+                            parent, project, {'id': 'case'}, spec, str(raises), 0, [],
+                            self.root / 'run', 'candidate', config)
+                        self.assertFalse(result['pass'])
+                self.assertTrue(observed['cancelled'])
+                self.assertEqual(parent.get('_timed_out_stage'), 'evaluation')
+
     def test_evaluation_deadline_marks_run_blocked_with_evaluation_stage(self):
         from adaptive_rsi.gitops import git
         from adaptive_rsi.process import Cancelled
