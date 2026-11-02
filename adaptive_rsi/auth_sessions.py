@@ -1124,8 +1124,16 @@ class AuthSessions:
                 with self.lock:
                     self.threads.discard(threading.current_thread())
         thread = threading.Thread(target=run, daemon=True)
-        self.threads.add(thread)
-        thread.start()
+        with self.lock:
+            # 先于 start() 登记，让 close() 能看到即将启动的线程；start 失败则摘除，
+            # 否则 close() 会对一个从未启动的线程 join() 而抛 RuntimeError。
+            self.threads.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self.lock:
+                self.threads.discard(thread)
+            raise
 
     def start(self, backend, provider=None, method=0, inputs=None):
         """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
@@ -1156,6 +1164,13 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            # busy 的非阻塞过期扫描在锁竞争时可能跳过；这里持锁，必须先把同后端
+            # 已过 expires_at 却仍为 ACTIVE 的行收成 expired，否则过期会话会
+            # 在 TTL 内持续 auth_busy。
+            for session_key, item in list(self.sessions.items()):
+                if (item["backend"] == backend and item["state"] in ACTIVE
+                        and self.now() >= item["expires_at"]):
+                    self._update(session_key, state="expired", error="auth_expired")
             if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
             session_id = secrets.token_urlsafe(24)
@@ -1487,6 +1502,12 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
+            # 与 reserve() 同理：锁内的 busy 判定必须先清掉已过期但仍标记
+            # ACTIVE 的同后端行，否则一次过期的尝试会在 TTL 内持续 auth_busy。
+            for session_key, item in list(self.sessions.items()):
+                if (item["backend"] == backend and item["state"] in ACTIVE
+                        and self.now() >= item["expires_at"]):
+                    self._update(session_key, state="expired", error="auth_expired")
             if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
         if not AUTH_LOCK.acquire(blocking=False):

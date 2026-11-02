@@ -1101,6 +1101,47 @@ class AuthSessionTests(unittest.TestCase):
         self.gate.set()
         self.wait_state(session, "completed")
 
+    def test_reserve_sweeps_expired_session_status_could_not_reap(self):
+        # status() 的过期回收走非阻塞 acquire；锁竞争时它直接返回陈旧的
+        # ACTIVE 快照，sessions 里留下一条已过期但仍是 starting 的行。
+        # 之后 reserve() 持锁时必须先扫掉它，否则会把已失效尝试误判为
+        # auth_busy 并在整个 TTL 内拒登录。
+        now = [1000.0]
+        manager = AuthSessions(self.root / "state-expiry", factory=lambda backend: None,
+                               ttl=60, now=lambda: now[0])
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        now[0] = 2000.0  # 已过 expires_at，但行仍未被任何人扫描
+        held, release = threading.Event(), threading.Event()
+        def hold():
+            with manager.lock:
+                held.set()
+                release.wait(2)
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(held.wait(1))
+        try:
+            # 锁被占，status 走非阻塞分支直接返回未扫描的 ACTIVE 快照。
+            self.assertEqual(manager.status(session["id"])["state"], "starting")
+        finally:
+            release.set()
+            thread.join(2)
+        # 锁空闲；reserve 持锁后必须先扫掉这条过期行再判 busy。
+        replacement = manager.reserve("codex")
+        self.assertEqual(replacement["state"], "starting")
+        self.assertEqual(manager.status(session["id"])["state"], "expired")
+
+    def test_thread_start_failure_does_not_leak_unstarted_thread(self):
+        # Thread.start() 抛错时 _thread 必须从 self.threads 摘除；否则 close()
+        # 会对从未启动的线程 join() 而抛 RuntimeError。
+        def boom(self):
+            raise RuntimeError("cannot start")
+        with patch.object(threading.Thread, "start", boom):
+            with self.assertRaises(RuntimeError):
+                self.manager._thread(lambda: None)
+        self.assertEqual(len(self.manager.threads), 0)
+        self.manager.close()  # 必须幂等通过，不因泄漏线程抛错
+
     def test_launch_rejects_unknown_or_terminal_sessions(self):
         with self.assertRaisesRegex(AuthError, "unknown_session"):
             self.manager.launch("missing")

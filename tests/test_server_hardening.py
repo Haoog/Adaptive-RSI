@@ -13,7 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 from adaptive_rsi.catalog import CatalogError
@@ -697,6 +697,18 @@ class ServerHardeningTest(unittest.TestCase):
         result = json.loads(payload)
         self.assertEqual(set(result), {"id", "bytes", "created"})
         self.assertTrue((self.backups / (result["id"] + ".sqlite3")).is_file())
+
+    def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
+        # Thread.start() 抛错时 process_request 必须退还 gate 名额，
+        # 否则反复失败会耗尽信号量并让服务器永久拒接新连接。
+        gate = self.server._connection_gate
+        before = gate._value
+        with patch("socketserver.ThreadingMixIn.process_request", side_effect=RuntimeError("spawn failed")):
+            fake_request = MagicMock()
+            for _ in range(3):
+                with self.assertRaises(RuntimeError):
+                    self.server.process_request(fake_request, ("127.0.0.1", 0))
+        self.assertEqual(gate._value, before)
 
 
 if __name__ == "__main__":
