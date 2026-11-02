@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 from adaptive_rsi import __version__
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
-from adaptive_rsi.updates import RELEASE_API, UpdateManager, atomic_json, commit_installation, installed_root, supervise_restart, valid_backup
+from adaptive_rsi.updates import RELEASE_API, UpdateManager, atomic_json, commit_installation, installed_root, recovery_required, supervise_restart, valid_backup
 
 
 class UpdateJournalRecoveryTest(unittest.TestCase):
@@ -47,6 +47,32 @@ class UpdateJournalRecoveryTest(unittest.TestCase):
     def write_plan(self, phase):
         self.plan["phase"] = phase
         (self.installs / "restart.json").write_text(json.dumps(self.plan))
+
+    def test_supervisor_reuses_one_store_for_the_whole_restart_journal(self):
+        self.write_plan("committed")
+        creations = []
+        real_init = Store.__init__
+
+        def counting(instance, *arguments, **keywords):
+            creations.append(instance)
+            real_init(instance, *arguments, **keywords)
+
+        with patch.object(Store, "__init__", counting), patch("adaptive_rsi.updates.candidate_health", return_value=True):
+            supervise_restart(self.store.root)
+        self.assertEqual(len(creations), 1)
+
+    def test_recovery_status_write_never_opens_a_second_store(self):
+        creations = []
+        real_init = Store.__init__
+
+        def counting(instance, *arguments, **keywords):
+            creations.append(instance)
+            real_init(instance, *arguments, **keywords)
+
+        with patch.object(Store, "__init__", counting):
+            recovery_required(self.store, "Test recovery status without a new handle")
+        self.assertEqual(creations, [])
+        self.assertEqual(self.store.setting("update-status")["state"], "recovery_required")
 
     def test_committed_healthy_candidate_is_adopted_without_restart_or_database_restore(self):
         self.write_plan("committed")
