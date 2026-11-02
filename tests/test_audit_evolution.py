@@ -554,6 +554,29 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(result['valid'])
         self.assertEqual(result['mismatches'], [{'case': 'case', 'fields': ['overlay']}])
 
+    def test_unreadable_overlay_is_rejected_before_sealing_and_verification(self):
+        args = self.setup_proposal()
+        overlay = self.root / 'unreadable-overlay'
+        overlay.mkdir()
+        (overlay / 'marker').write_text('protected')
+        row = self.store.one("SELECT spec FROM cases WHERE id='validation'")
+        spec = {**json.loads(row['spec']), 'overlay': str(overlay)}
+        self.store.execute("UPDATE cases SET spec=? WHERE id='validation'", (encode(spec),))
+        from adaptive_rsi.gitops import git
+        manifest = [{'case': 'validation', 'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                     'tree': git(spec['repository'], 'rev-parse', spec['base'] + '^{tree}'),
+                     'checks': fingerprint(spec['checks']), 'overlay': None}]
+        real_open = Path.open
+        def denied(path, *args, **kwargs):
+            if path == overlay / 'marker':
+                raise PermissionError('fixture unreadable overlay')
+            return real_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', denied):
+            self.assertFalse(self.evolution.verify_inputs('p', manifest)['valid'])
+            result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+
     def test_case_with_unavailable_overlay_is_excluded_before_sealing(self):
         """overlay 被清理的用例不得进入实验：缺失目录只会被静默跳过，试验会缺受保护输入。"""
         args = self.setup_proposal()

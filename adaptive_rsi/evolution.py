@@ -216,7 +216,7 @@ class Evolution:
                 changed = [key for key, value in actual.items() if item.get(key) != value]
                 # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
                 # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
-                if not overlay_available(spec.get("overlay")):
+                if spec.get("overlay") and actual["overlay"] is None:
                     changed = sorted(set(changed) | {"overlay"})
             except (KeyError, ValueError, RuntimeError, OSError):
                 changed = ["unavailable"]
@@ -1006,7 +1006,7 @@ class Evolution:
         if hasattr(self.runtime, "propagate_deadline"):
             self.runtime.propagate_deadline(run, trial_run)
         # A case overlay is host-owned and remains outside model-visible workspaces.
-        if spec.get("overlay") and not overlay_available(spec["overlay"]):
+        if spec.get("overlay") and self.overlay_digest(spec["overlay"]) is None:
             # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
             # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
             outcome = {**(outcome or {}), "decision": "error",
@@ -1050,7 +1050,8 @@ class Evolution:
         # 复制 overlay 时只遍历目录内容，缺失目录不会报错，试验会在没有受保护输入的情况下
         # 照常通过；因此这里先排除，让样本不足如实降级为证据不足。
         unavailable = sorted(case["id"] for case in cases
-                             if not overlay_available((case_spec(case) or {}).get("overlay")))
+                             if (case_spec(case) or {}).get("overlay") and
+                             self.overlay_digest((case_spec(case) or {})["overlay"]) is None)
         if unavailable:
             cases = [case for case in cases if case["id"] not in unavailable]
             self.store.event("evolution_overlay_unavailable",
@@ -1104,12 +1105,15 @@ class Evolution:
             repository, base = spec.get("repository"), spec.get("base")
             if not isinstance(repository, str) or not isinstance(base, str) or not isinstance(spec.get("task"), str):
                 continue
+            overlay = self.overlay_digest(spec.get("overlay"))
+            if spec.get("overlay") and overlay is None:
+                raise RuntimeError("Case overlay became unavailable before input sealing")
             manifest.append({"case": case["id"], "split": case["split"], "source": spec.get("source", "unknown"),
                              "signature": spec.get("signature", ""),
                              "tree": git(repository, "rev-parse", base + "^{tree}"),
                              "checks": fingerprint(spec.get("checks", [])), "family": case["family"],
                              "task": fingerprint(spec["task"]), "spec": fingerprint(spec),
-                             "overlay": self.overlay_digest(spec.get("overlay")),
+                             "overlay": overlay,
                              "environment": fingerprint(config["environment"])})
         # 本函数此前只读取本地状态；预留只覆盖即将开始的付费提案窗口。
         observations = inputs["observations"]
