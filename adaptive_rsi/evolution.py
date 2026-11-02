@@ -373,8 +373,7 @@ class Evolution:
         if not isinstance(config, dict):
             return []
         builtin_providers = {
-            p["id"]: {**p, "env_key": DEFAULT_PROVIDER_ENV_KEYS.get(p["id"], p.get("env_key", ""))}
-            for p in BUILTIN_PROVIDERS if isinstance(p, dict) and p.get("id")
+            p["id"]: p for p in BUILTIN_PROVIDERS if isinstance(p, dict) and p.get("id")
         }
         configured = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
         providers = {**builtin_providers, **configured}

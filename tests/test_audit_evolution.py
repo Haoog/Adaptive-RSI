@@ -1335,7 +1335,7 @@ class AuditEvolutionTest(unittest.TestCase):
         # provider_requirements 内置与上游供应商映射
         from adaptive_rsi.config import DEFAULTS
         self.assertEqual(Evolution.provider_requirements(DEFAULTS),
-                         [{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}])
+                         [{'id': 'openai', 'env_key': ''}])
 
         multi_cfg = {
             'models': {
@@ -1345,7 +1345,7 @@ class AuditEvolutionTest(unittest.TestCase):
             }
         }
         self.assertEqual(Evolution.provider_requirements(multi_cfg), [
-            {'id': 'openai', 'env_key': 'OPENAI_API_KEY'},
+            {'id': 'openai', 'env_key': ''},
             {'id': 'anthropic', 'env_key': 'ANTHROPIC_API_KEY'},
             {'id': 'deepseek', 'env_key': 'DEEPSEEK_API_KEY'},
         ])
@@ -1378,9 +1378,8 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(Evolution.provider_requirements(explicit_openai_local_cfg),
                          [{'id': 'openai', 'env_key': ''}])
 
-    def test_bundle_offline_reproduction_default_builtin_provider_detects_missing_credentials(self):
-        # 当候选未显式记录 providers 时，导出从运行配置推导 provider requirements；
-        # 默认供应商 openai 在空环境由于缺失 OPENAI_API_KEY 判定为不可复现。
+    def test_bundle_offline_reproduction_default_builtin_provider_preserves_login_requirements(self):
+        # 默认 openai 使用 Codex 登录，不得凭供应商 id 推断 API key。
         from adaptive_rsi.config import DEFAULTS
         from tests.test_runtime import fixture
         from adaptive_rsi.gitops import git
@@ -1403,27 +1402,17 @@ class AuditEvolutionTest(unittest.TestCase):
         destination = self.root / 'bundle-default-cred'
         self.evolution.export_bundle('c', destination)
 
-        # 导出的 evidence.json 包含推导的内置供应商需求及其 OPENAI_API_KEY
+        # 导出的凭据需求遵循内置 Codex 登录配置。
         exported = json.loads((destination / 'evidence.json').read_text(encoding='utf-8'))
-        self.assertEqual(exported['providers'], [{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}])
+        self.assertEqual(exported['providers'], [{'id': 'openai', 'env_key': ''}])
 
-        # 在空环境（env={}）下执行离线复现检查：因缺少 OPENAI_API_KEY，reproducible 必须为 False
-        result = Evolution.reproduce_bundle(destination, env={})
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
         self.assertTrue(result['integrity']['valid'])
-        self.assertFalse(result['reproducible'])
-        self.assertIn('OPENAI_API_KEY', [c['name'] for c in result['credentials']['missing']])
-        self.assertTrue(any('Missing credentials: OPENAI_API_KEY' in item for item in result['limitations']))
-
-        # 当环境变量提供对应 API Key 且工具完备时，凭据检查通过且可复现
-        result_with_key = Evolution.reproduce_bundle(
-            destination,
-            env={'OPENAI_API_KEY': 'sk-test', 'PATH': '/usr/bin:/bin'},
-            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None,
-        )
-        self.assertTrue(result_with_key['integrity']['valid'])
-        self.assertEqual(result_with_key['credentials']['missing'], [])
-        self.assertIn('OPENAI_API_KEY', [c['name'] for c in result_with_key['credentials']['available']])
-        self.assertTrue(result_with_key['reproducible'])
+        self.assertEqual(result['credentials']['missing'], [])
+        self.assertEqual(result['credentials']['available'], [])
+        self.assertTrue(result['reproducible'])
 
     def test_save_hotpath_skips_reverification_in_evaluating_state(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
