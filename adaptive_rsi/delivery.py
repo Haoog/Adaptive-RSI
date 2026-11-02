@@ -279,7 +279,7 @@ def publish(runtime, project, task, run, workspace, config):
         if not authorization or authorization[0].get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
         if authorization[0]["authorization"] == "project_policy" and (
-                json.loads(run["config"])["delivery"]["mode"] != "pr" or live["delivery"]["mode"] != "pr"):
+                json.loads(run["config"] or "{}").get("delivery", {}).get("mode") != "pr" or live["delivery"]["mode"] != "pr"):
             raise RuntimeError("Automatic PR authorization was revoked")
         if (live["github"]["repository"] != config["github"]["repository"] or
                 live["delivery"]["base_branch"] != config["delivery"]["base_branch"]):
@@ -287,7 +287,12 @@ def publish(runtime, project, task, run, workspace, config):
     authorize_write()
     if task["source"] == "issue" and not runtime.issue_still_open(project, task, config):
         raise StaleCandidate("Issue closed before delivery; synchronize before retrying")
-    outcome = json.loads(run["result"])
+    try:
+        outcome = json.loads(run["result"] or "{}")
+    except (TypeError, ValueError):
+        outcome = {}
+    if not isinstance(outcome, dict):
+        outcome = {}
     if outcome.get("evaluation", {}).get("decision") != "pass" or outcome.get("review", {}).get("decision") != "pass":
         raise RuntimeError("Delivery gates did not pass")
     repo = config["github"]["repository"]
@@ -583,7 +588,11 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 else:
                     outcome["delivery_status"] = gate
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
-                    authorized = json.loads(run["config"])["delivery"]["auto_merge"] and config["delivery"]["auto_merge"]
+                    try:
+                        run_config = json.loads(run["config"] or "{}")
+                    except (TypeError, ValueError):
+                        run_config = {}
+                    authorized = run_config.get("delivery", {}).get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         _, remote, branch = baseline(runtime, project, config)
@@ -702,7 +711,12 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
     if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
         return
-    saved = json.loads(run["config"])
+    try:
+        saved = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
 
     def missing_artifacts():
         previous = outcome.get("feedback", {})

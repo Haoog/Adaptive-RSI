@@ -323,7 +323,12 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     experiment started, so the four ablation configurations differ only in the
     factor under test.
     """
-    config = json.loads(run["config"])
+    try:
+        config = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
     from .evaluator import checkpoint_reuse_enabled
     checkpoint_reuse = not experiment and checkpoint_reuse_enabled(config)
     from .workflow import change_kind, documentation_only, evidence_contract, supports_test_first

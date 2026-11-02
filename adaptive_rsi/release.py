@@ -242,8 +242,13 @@ def normalized_policy(kind, policy):
 
 
 def pending(runtime, run):
-    saved = json.loads(run["config"])
-    delivery = saved["delivery"]
+    try:
+        saved = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    delivery = saved.get("delivery") or {}
     live = runtime.config(run["project"])
     active = {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning"}
     for kind in KINDS:

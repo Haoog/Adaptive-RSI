@@ -1109,7 +1109,12 @@ class Evolution:
                 "report": str(trial_dir / "evaluation" / "report.json")}
 
     def propose_and_evaluate(self, project, workspace, directory, run, force=False):
-        config = json.loads(run["config"])
+        try:
+            config = json.loads(run["config"] or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
         inputs = self.proposal_inputs(project["id"])
         signature = self.input_signature(project["id"], config, inputs)
         attempt = self.store.setting("evolution-attempt:" + project["id"], {})
