@@ -929,7 +929,10 @@ class AuthSessions:
         thread.start()
 
     def start(self, backend, provider=None, method=0, inputs=None):
-        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。"""
+        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
+
+        reserve 与 launch 之间 ttl 耗尽时返回 expired 终态，不抛 invalid_auth_state。
+        """
         session = self.reserve(backend, provider, method, inputs)
         return self.launch(session["id"], method, inputs)
 
