@@ -1242,9 +1242,10 @@ def retry(runtime, project_id, run_id, kind):
 
         target = data
         rollback = data.get("rollback", {})
-        if kind == "deploy" and (data.get("state") == "rollback_failed" or
+        is_rollback = kind == "deploy" and (data.get("state") == "rollback_failed" or
                 data.get("state") == "rolling_back" and (rollback.get("rerun_pending") or
-                    rollback.get("state") in {"rerunning", "rerun_unknown"})):
+                    rollback.get("state") in {"rerunning", "rerun_unknown"}))
+        if is_rollback:
             target = rollback
             if target.get("state") == "workflow_succeeded":
                 if not _retry_target_allowed(runtime, run, outcome, data, target):
@@ -1260,7 +1261,7 @@ def retry(runtime, project_id, run_id, kind):
             validate_pin(repo, policy)
             authorized(runtime, project, run, kind, policy)
             target.update(state="dispatching", error="", dispatch_receipt="pending")
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rolling_back", rollback=target, error="")
             persist_retry(require_authorization=True)
             try:
@@ -1269,27 +1270,32 @@ def retry(runtime, project_id, run_id, kind):
             except ApiRejected as exc:
                 target.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                               dispatch_http_status=exc.status)
-                if target is not data:
+                if kind == "deploy" and target is not data:
                     data.update(state="rollback_failed", error=target["error"])
                 persist_retry()
                 raise
             except Exception as exc:
                 target.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
-                if target is not data:
+                if kind == "deploy" and target is not data:
                     data.update(state="rolling_back", error=target["error"])
                 persist_retry()
                 runtime.wake.set()
                 raise
             target.update(state="submitted", error="", dispatch_receipt="accepted")
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rolling_back", error="")
             persist_retry()
             runtime.wake.set()
             return data
         unconfirmed_rerun = target.get("rerun_pending") or target.get("state") in {"rerunning", "rerun_unknown"}
         target = reconcile(runtime, run, kind, target, persist=False)
+        if is_rollback:
+            data["rollback"] = target
+        elif target is not data:
+            data.update(target)
+            target = data
         if unconfirmed_rerun:
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rollback_failed" if target["state"] in {"failed", "rerun_unknown"} else "rolling_back", rollback=target, error=target.get("error", ""))
             persist_retry()
             runtime.wake.set()
@@ -1300,19 +1306,21 @@ def retry(runtime, project_id, run_id, kind):
         authorized(runtime, project, run, kind, policy)
         target.update(state="rerunning", error="", previous_attempt=target.get("attempt", 1),
                       rerun_pending=True, rerun_receipt="pending", rerun_requested_at=time.time())
-        if target is not data:
+        if kind == "deploy" and target is not data:
             data.update(state="rolling_back", rollback=target)
         persist_retry(require_authorization=True)
         try:
             api(repo, "actions/runs/" + str(target["workflow_run_id"]) + "/rerun", "POST")
         except ApiRejected as exc:
             target.update(state="failed", error=str(exc)[:500], rerun_pending=False, rerun_receipt="rejected", rerun_http_status=exc.status)
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rollback_failed", error=target["error"], rollback=target)
             persist_retry()
             raise
         except Exception as exc:
-            target.update(error=str(exc)[:500], rerun_receipt="unknown")
+            target.update(state="rerun_unknown", error=str(exc)[:500], rerun_receipt="unknown")
+            if kind == "deploy" and target is not data:
+                data.update(state="rollback_failed", error=target["error"], rollback=target)
             persist_retry()
             runtime.wake.set()
             raise
