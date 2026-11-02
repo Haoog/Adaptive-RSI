@@ -157,6 +157,32 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertFalse((self.store.root / "server.json").is_symlink())
         self.assertEqual(victim.read_text(), "private victim content")
 
+    def patch_run(self, size):
+        identifier = "b" * 16
+        directory = self.store.root / "runs" / identifier
+        directory.mkdir(parents=True)
+        self.store.execute("INSERT INTO runs(id,project,state,path) VALUES (?,?,?,?)",
+                           (identifier, "project", "merged", str(directory)))
+        (directory / "candidate.patch").write_bytes(b"x" * size)
+        return identifier, directory
+
+    def test_oversized_patch_preview_is_not_reported_as_missing_artifacts(self):
+        identifier, directory = self.patch_run(2 * 1024 * 1024 + 10)
+        status, _, body = self.request("/api/patch?id=" + identifier)
+        payload = json.loads(body)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error_code"], "patch_too_large")
+        self.assertIn("2 MiB", payload["error"])
+        self.assertIn("run directory", payload["error"])
+        self.assertNotIn(str(directory), body.decode())
+        status, _, body = self.request("/api/diff-files?id=" + identifier)
+        self.assertEqual((status, json.loads(body)), (400, payload))
+        (directory / "candidate.patch").unlink()
+        for route in ("/api/patch?id=", "/api/diff-files?id="):
+            status, _, body = self.request(route + identifier)
+            self.assertEqual((status, json.loads(body)),
+                             (400, {"error": "Run has no artifacts in this state directory"}))
+
     def test_backup_binary_stream_and_json_chunk_compatibility(self):
         content = bytes(range(256)) * 5000
         self.backup.write_bytes(content)

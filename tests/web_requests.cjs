@@ -37,6 +37,23 @@ test('a generic structured reason preserves existing specific safe guidance',asy
   page.context.fetch=async()=>response({error:"Automation requires the trusted workflow tag's full commit SHA",error_code:'validation_error',reason_code:'config_invalid',field_path:null},400);
   await assert.rejects(page.context.api('config',{values:{}}),error=>error.message.includes('小写'));
 });
+test('oversized patch errors are found by error code and localized in both console languages', async()=>{
+  const message='Candidate patch exceeds the 2 MiB UI size limit; download it from the run directory instead';
+  const page=browser();
+  const i18n=fs.readFileSync(path.join(__dirname,'../adaptive_rsi/web/i18n.js'),'utf8');
+  const english=vm.runInNewContext(i18n.slice(0,i18n.indexOf('let language'))+';english');
+  page.context.fetch=async()=>response({error:message,error_code:'patch_too_large'},400);
+  await assert.rejects(page.context.api('patch?id=run'),error=>{
+    assert.equal(error.code,'patch_too_large');
+    assert.match(error.message,/2 MiB/);
+    assert.match(error.message,/该运行的目录/);
+    return true;
+  });
+  const localized='补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。';
+  page.context.t=value=>english[value]??value;
+  assert.match(page.context.t(localized),/2 MiB preview limit/);
+  assert.match(page.context.t(localized),/download it from the run directory/);
+});
 function descendants(node) {
   return (node.children || []).flatMap(child => [child, ...descendants(child)]);
 }

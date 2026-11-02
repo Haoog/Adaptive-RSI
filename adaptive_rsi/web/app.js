@@ -51,6 +51,7 @@ const configReasonLabels={
  "config_invalid": "设置格式或字段无效，请检查配置后重试。"
 };
 const apiErrors={
+ "patch_too_large":"补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。",
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
  "Split retry preview changed; inspect it again":"任务组或原任务已变化，请重新查看拆分预览。",
@@ -282,7 +283,7 @@ async function sendApi(path,body,signal,{text=false}={}){
  if(!response.ok){
   // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
   const structured=data.reason_code==='config_invalid'?null:configReasonLabels[data.reason_code];
-  const known=structured||apiErrors[data.error]||configReasonLabels[data.reason_code];
+  const known=structured||apiErrors[data.error_code]||apiErrors[data.error]||configReasonLabels[data.reason_code];
   const field=typeof data.field_path==='string'&&/^[a-zA-Z0-9_.]{1,160}$/.test(data.field_path)?data.field_path:null;
   let message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
   if(field)message+=' · '+t('字段')+' '+field;
