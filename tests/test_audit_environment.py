@@ -1,5 +1,7 @@
+import errno
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,11 @@ def exclusive_lock(path):
 
 
 class AuditEnvironmentTest(unittest.TestCase):
+    def setUp(self):
+        # 克隆支持按设备记忆；每个用例都从干净状态开始，避免共享缓存。
+        environment._NO_CLONE_DEVICES.clear()
+        self.addCleanup(environment._NO_CLONE_DEVICES.clear)
+
     def repository(self, root, value='original'):
         repo = root / 'source'
         repo.mkdir()
@@ -73,6 +80,85 @@ class AuditEnvironmentTest(unittest.TestCase):
             (repo / 'deps/value').write_text('new')
             seeded = environment.prepare_cached(repo, root / 'cache', config, {'python': '3.14'})
             self.assertNotEqual(locked['key'], seeded['key'])
+
+    def test_restore_falls_back_to_a_full_copy_and_keeps_copies_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root)
+            (repo / 'deps/link').symlink_to('value')
+            config = self.environment_config()
+            prepared = environment.prepare_cached(repo, root / 'cache', config, {'python': '3.14'})
+            self.addCleanup(environment._NO_CLONE_DEVICES.clear)
+            unsupported = OSError(errno.ENOTSUP, 'clone unsupported')
+            with patch.object(environment, '_clone_file', side_effect=unsupported) as clone:
+                environment.restore(prepared['path'], root / 'one', config)
+                environment.restore(prepared['path'], root / 'two', config)
+            # 一次失败即按设备记忆，后续文件直接复制，不逐文件重试。
+            self.assertEqual(clone.call_count, 1)
+            self.assertEqual((root / 'one/deps/value').read_text(), 'original')
+            (root / 'one/deps/value').write_text('polluted')
+            self.assertEqual((root / 'two/deps/value').read_text(), 'original')
+            self.assertNotEqual(os.stat(root / 'one/deps/value').st_ino,
+                                os.stat(root / 'two/deps/value').st_ino)
+            self.assertEqual(os.readlink(root / 'two/deps/link'), 'value')
+            self.assertTrue(os.access(root / 'two/deps/value', os.W_OK))
+            with self.assertRaisesRegex(RuntimeError, 'Candidate/seed dependency overlap: deps'):
+                environment.restore(prepared['path'], root / 'one', config)
+            self.assertEqual(clone.call_count, 1)
+
+    def test_restore_clones_every_regular_file_when_the_filesystem_allows_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root)
+            (repo / 'deps/script').write_text('#!/bin/sh\n')
+            (repo / 'deps/script').chmod(0o640)
+            (repo / 'deps/link').symlink_to('script')
+            config = self.environment_config()
+            prepared = environment.prepare_cached(repo, root / 'cache', config, {'python': '3.14'})
+            self.addCleanup(environment._NO_CLONE_DEVICES.clear)
+            cloned = []
+            def working_clone(source, target):
+                cloned.append(os.path.basename(str(target)))
+                shutil.copy2(source, target)
+            with patch.object(environment, '_clone_file', working_clone):
+                environment.restore(prepared['path'], root / 'one', config)
+            # 普通文件逐个走克隆，符号链接仍由 copytree 原样重建。
+            self.assertEqual(sorted(cloned), ['script', 'value'])
+            self.assertEqual((root / 'one/deps/script').read_text(), '#!/bin/sh\n')
+            self.assertEqual(os.stat(root / 'one/deps/script').st_mode & 0o777, 0o640)
+            self.assertEqual(os.readlink(root / 'one/deps/link'), 'script')
+            self.assertTrue(os.access(root / 'one/deps/script', os.W_OK))
+
+    def test_stage_copies_share_seed_blocks_only_when_the_filesystem_clones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root)
+            size = 8 * 1024 * 1024
+            (repo / 'deps/blob').write_bytes(b'x' * size)
+            config = self.environment_config()
+            prepared = environment.prepare_cached(repo, root / 'cache', config, {'python': '3.14'})
+            self.addCleanup(environment._NO_CLONE_DEVICES.clear)
+            stages = [root / ('stage' + str(index)) for index in range(5)]
+            usage = lambda: os.statvfs(root).f_bavail * os.statvfs(root).f_frsize
+            before = usage()
+            # 同一 run 的 5 个评估阶段各恢复一次同一份冻结种子。
+            for stage in stages:
+                environment.restore(prepared['path'], stage, config)
+            growth = before - usage()
+            def first_byte(stage):
+                with (stage / 'deps/blob').open('rb') as stream:
+                    return stream.read(1)
+            for stage in stages:
+                self.assertEqual(first_byte(stage), b'x')
+            (stages[0] / 'deps/blob').write_bytes(b'changed')
+            self.assertEqual(first_byte(stages[1]), b'x')
+            self.assertEqual(len({os.stat(stage / 'deps/blob').st_ino for stage in stages}), 5)
+            if environment.clone_supported(root):
+                # 克隆共享未修改的数据块，峰值占用不再随副本数线性增长。
+                self.assertLess(growth, 2 * size)
+            else:
+                # ext4、tmpfs 等不支持克隆的文件系统仍写入真实副本，行为不变。
+                self.assertGreaterEqual(growth, 3 * size)
 
     def test_cache_hit_reuses_entry_without_recapturing_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
