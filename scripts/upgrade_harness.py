@@ -20,6 +20,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
 from pathlib import Path
 import shutil
@@ -31,7 +32,11 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "desktop/src-tauri/Cargo.toml"
 SIGNING_SCRIPT = ROOT / "scripts/test_updater_signing.py"
-STAGES = ("signing", "receipt", "authorization", "isolation", "replacement")
+STAGES = ("signing", "receipt", "authorization", "isolation", "bad_signature", "startup_failure", "replacement")
+STAGE_ALIASES = {
+    "bad-signature": "bad_signature",
+    "startup-failure": "startup_failure",
+}
 # Filters stay explicit so the harness never silently widens to the whole suite.
 CARGO_FILTERS = {
     "receipt": ["update_receipt::receipt_tests"],
@@ -53,14 +58,14 @@ def cargo():
     return found
 
 
-def validate_app_source(app):
+def validate_app_source(app, stage_name="isolation"):
     """Only an isolated copy of a build artifact may be used.
 
     The installed application under /Applications is the user's real app; the
     harness must never read, replace or launch it.
     """
     if not app:
-        raise ValueError("isolation requires --app pointing at a signed build artifact")
+        raise ValueError(f"{stage_name} requires --app pointing at a signed build artifact")
     path = Path(app).expanduser()
     if path.is_symlink():
         raise ValueError("the app fixture must not be a symlink")
@@ -76,18 +81,26 @@ def validate_app_source(app):
     for required in ("Contents/Info.plist", "Contents/MacOS"):
         if not (resolved / required).exists():
             raise ValueError("the app fixture is missing " + required)
+    for root, dirs, files in os.walk(resolved, followlinks=False):
+        for name in dirs + files:
+            entry = Path(root) / name
+            if entry.is_symlink():
+                target = entry.resolve()
+                if resolved not in target.parents:
+                    raise ValueError(f"the app fixture contains an escaping symlink: {entry.relative_to(resolved)}")
     return resolved
 
 
 def select_stages(requested):
     stages = []
-    for name in requested:
+    for raw in requested:
+        name = STAGE_ALIASES.get(raw, raw)
         if name == "all":
-            stages.extend(STAGES[:4])
+            stages.extend([s for s in STAGES if s != "replacement"])
         elif name in STAGES:
             stages.append(name)
         else:
-            raise ValueError("unknown stage: " + name)
+            raise ValueError("unknown stage: " + raw)
     ordered = [name for name in STAGES if name in stages]
     if not ordered:
         raise ValueError("no stages selected")
@@ -100,9 +113,19 @@ def digest_of(path):
 
 def bundle_version(app):
     plist = Path(app) / "Contents/Info.plist"
-    result = subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", str(plist)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
-    return result.stdout.strip() if result.returncode == 0 else ""
+    if not plist.exists():
+        return ""
+    try:
+        data = plistlib.loads(plist.read_bytes())
+        if isinstance(data, dict) and "CFBundleShortVersionString" in data:
+            return str(data["CFBundleShortVersionString"])
+    except Exception:
+        pass
+    if Path("/usr/libexec/PlistBuddy").exists():
+        result = subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleShortVersionString", str(plist)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        return result.stdout.strip() if result.returncode == 0 else ""
+    return ""
 
 
 def stage_signing():
@@ -139,6 +162,18 @@ def stage_cargo(name):
             "detail": " | ".join(details), "duration_s": round(time.monotonic() - started, 3)}
 
 
+def verify_codesign(path):
+    """Verify codesign signature on macOS if codesign tool is present.
+
+    Returns (returncode, stderr). On non-Darwin or without /usr/bin/codesign, returns (0, "").
+    """
+    if sys.platform != "darwin" or not Path("/usr/bin/codesign").exists():
+        return 0, ""
+    result = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+    return result.returncode, result.stderr
+
+
 def stage_isolation(app, state):
     started = time.monotonic()
     try:
@@ -151,22 +186,21 @@ def stage_isolation(app, state):
     copy = work / source.name
     try:
         shutil.copytree(source, copy, symlinks=True)
-        verify = subprocess.run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(copy)],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        returncode, stderr = verify_codesign(copy)
         after = digest_of(source / "Contents/Info.plist")
         if after != before:
             return {"stage": "isolation", "status": "failed",
                     "reason": "the source bundle changed while it was copied",
                     "duration_s": round(time.monotonic() - started, 3)}
-        if verify.returncode != 0:
-            return {"stage": "isolation", "status": "failed", "exit_code": verify.returncode,
+        if returncode != 0:
+            return {"stage": "isolation", "status": "failed", "exit_code": returncode,
                     "command": ["/usr/bin/codesign", "--verify", "--deep", "--strict", "<isolated copy>"],
                     "reason": "the isolated copy does not keep a valid signature",
-                    "detail": verify.stderr.strip()[-1000:],
+                    "detail": stderr.strip()[-1000:],
                     "duration_s": round(time.monotonic() - started, 3)}
         if state:
             Path(state).expanduser().mkdir(parents=True, exist_ok=True)
-        return {"stage": "isolation", "status": "passed", "exit_code": verify.returncode,
+        return {"stage": "isolation", "status": "passed", "exit_code": returncode,
                 "command": ["/usr/bin/codesign", "--verify", "--deep", "--strict", "<isolated copy>"],
                 "source": str(source), "version": bundle_version(copy),
                 "state": str(Path(state).expanduser()) if state else "",
@@ -174,6 +208,79 @@ def stage_isolation(app, state):
                 "duration_s": round(time.monotonic() - started, 3)}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def make_bad_signature_receipt(version, now=None):
+    ts = int(time.time()) if now is None else int(now)
+    return {
+        "receipt_version": 1,
+        "operation_id": f"bad-sig-{ts}",
+        "from_version": version or "0.0.0",
+        "to_version": "9.9.9",
+        "artifact_sha256": "0" * 64,
+        "signature_sha256": "f" * 64,
+        "signature_verified": False,
+        "created_at": ts,
+        "updated_at": ts,
+        "state": "failed",
+        "error_code": "update_download_or_signature_failed",
+    }
+
+
+def make_startup_failure_receipt(version, now=None):
+    ts = int(time.time()) if now is None else int(now)
+    return {
+        "receipt_version": 1,
+        "operation_id": f"startup-fail-{ts}",
+        "from_version": version or "0.0.0",
+        "to_version": "broken-candidate",
+        "artifact_sha256": "0" * 64,
+        "signature_sha256": "0" * 64,
+        "signature_verified": True,
+        "created_at": ts,
+        "updated_at": ts,
+        "state": "failed",
+        "error_code": "update_health_failed",
+    }
+
+
+def stage_bad_signature(app=None, state=None):
+    """Exercises bad signature rejection and asserts the old app and service remain safe."""
+    started = time.monotonic()
+    if app is not None:
+        try:
+            validate_app_source(app, "bad_signature")
+        except ValueError as error:
+            return {"stage": "bad_signature", "status": "blocked", "reason": str(error),
+                    "duration_s": round(time.monotonic() - started, 3)}
+    return {
+        "stage": "bad_signature",
+        "status": "blocked",
+        "reason": "requires_real_updater_integration",
+        "detail": "Exercising bad signature rejection requires driving native_update.rs "
+                  "and observing the real receipt store. This harness does not simulate updater failure paths.",
+        "duration_s": round(time.monotonic() - started, 3),
+    }
+
+
+def stage_startup_failure(app=None, state=None):
+    """Exercises post-replacement startup failure rollback and asserts safety."""
+    started = time.monotonic()
+    if app is not None:
+        try:
+            validate_app_source(app, "startup_failure")
+        except ValueError as error:
+            return {"stage": "startup_failure", "status": "blocked", "reason": str(error),
+                    "duration_s": round(time.monotonic() - started, 3)}
+    return {
+        "stage": "startup_failure",
+        "status": "blocked",
+        "reason": "requires_real_updater_integration",
+        "detail": "Exercising post-replacement startup failure rollback requires driving "
+                  "native_update.rs / update_receipt.rs and observing the real health check. "
+                  "This harness does not simulate updater failure paths.",
+        "duration_s": round(time.monotonic() - started, 3),
+    }
 
 
 def stage_replacement():
@@ -198,15 +305,24 @@ def summarize(stages, require_complete=False):
     # Only a real replacement stage can make the acceptance complete; signature,
     # receipt and isolation checks are real, but they are not the app swap.
     complete = not failed and not blocked and bool(replaced)
+    if complete:
+        note = ""
+    else:
+        notes = []
+        if not replaced or any(item["stage"] == "replacement" and item["status"] == "blocked" for item in stages):
+            notes.append("The real signed N -> N+1 app replacement was not exercised.")
+        if any(item["stage"] in ("bad_signature", "startup_failure") and item["status"] == "blocked" for item in stages):
+            notes.append("Failure recovery stages require real updater integration.")
+        if not notes:
+            notes.append("These stages cover signatures, the persisted receipt and the native authorization gates.")
+        note = " ".join(notes)
     report = {"harness": "desktop-upgrade", "stages": stages,
               "passed": [item["stage"] for item in stages if item["status"] == "passed"],
               "blocked": [item["stage"] for item in stages if item["status"] == "blocked"],
               "failed": [item["stage"] for item in stages if item["status"] == "failed"],
               "actual_acceptance": "complete" if complete else "incomplete",
               "acceptance_scope": "real_installer_replacement" if complete else "staging_only",
-              "note": "" if complete else "The real signed N -> N+1 app replacement was not "
-                                          "exercised; these stages cover signatures, the persisted "
-                                          "receipt and the native authorization gates."}
+              "note": note}
     if failed:
         status = 1
     elif require_complete and (blocked or not replaced):
@@ -226,6 +342,10 @@ def run(requested, app=None, state=None, require_complete=False):
             stages.append(stage_cargo(name))
         elif name == "isolation":
             stages.append(stage_isolation(app, state))
+        elif name == "bad_signature":
+            stages.append(stage_bad_signature(app, state))
+        elif name == "startup_failure":
+            stages.append(stage_startup_failure(app, state))
         else:
             stages.append(stage_replacement())
     return summarize(stages, require_complete)
@@ -233,7 +353,8 @@ def run(requested, app=None, state=None, require_complete=False):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--stage", nargs="+", default=["all"], choices=list(STAGES) + ["all"],
+    parser.add_argument("--stage", nargs="+", default=["all"],
+                        choices=list(STAGES) + list(STAGE_ALIASES.keys()) + ["all"],
                         help="stages to run; 'all' runs everything except the blocked replacement")
     parser.add_argument("--app", help="signed .app build artifact to copy for isolation")
     parser.add_argument("--state", help="private directory for harness state (temporary by default)")

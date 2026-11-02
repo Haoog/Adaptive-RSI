@@ -1,0 +1,89 @@
+{
+ "captured": "2026-11-01T20:31:24Z",
+ "repository": "microsoft/TypeScript",
+ "branch": "main",
+ "endpoint": "repos/microsoft/TypeScript/rules/branches/main",
+ "read_only": true,
+ "command": "gh api repos/microsoft/TypeScript/rules/branches/main --paginate --slurp",
+ "response": [
+  [
+   {
+    "type": "deletion",
+    "ruleset_source_type": "Organization",
+    "ruleset_source": "microsoft",
+    "ruleset_id": 5351760
+   },
+   {
+    "type": "non_fast_forward",
+    "ruleset_source_type": "Organization",
+    "ruleset_source": "microsoft",
+    "ruleset_id": 5351760
+   },
+   {
+    "type": "pull_request",
+    "parameters": {
+     "required_approving_review_count": 1,
+     "dismiss_stale_reviews_on_push": false,
+     "required_reviewers": [],
+     "require_code_owner_review": true,
+     "require_last_push_approval": true,
+     "required_review_thread_resolution": false,
+     "require_extra_approval_for_unattributed_changes": true,
+     "allowed_merge_methods": [
+      "merge",
+      "squash",
+      "rebase"
+     ]
+    },
+    "ruleset_source_type": "Organization",
+    "ruleset_source": "microsoft",
+    "ruleset_id": 5351760
+   },
+   {
+    "type": "merge_queue",
+    "parameters": {
+     "merge_method": "SQUASH",
+     "max_entries_to_build": 5,
+     "min_entries_to_merge": 1,
+     "max_entries_to_merge": 5,
+     "min_entries_to_merge_wait_minutes": 5,
+     "grouping_strategy": "ALLGREEN",
+     "check_response_timeout_minutes": 180
+    },
+    "ruleset_source_type": "Repository",
+    "ruleset_source": "microsoft/TypeScript",
+    "ruleset_id": 23494611
+   },
+   {
+    "type": "required_status_checks",
+    "parameters": {
+     "strict_required_status_checks_policy": false,
+     "do_not_enforce_on_create": false,
+     "required_status_checks": [
+      {
+       "context": "license/cla",
+       "integration_id": 95686
+      },
+      {
+       "context": "required",
+       "integration_id": 15368
+      }
+     ]
+    },
+    "ruleset_source_type": "Repository",
+    "ruleset_source": "microsoft/TypeScript",
+    "ruleset_id": 23494611
+   },
+   {
+    "type": "copilot_code_review",
+    "parameters": {
+     "review_on_push": false,
+     "review_draft_pull_requests": false
+    },
+    "ruleset_source_type": "Repository",
+    "ruleset_source": "microsoft/TypeScript",
+    "ruleset_id": 23494611
+   }
+  ]
+ ]
+}

@@ -152,7 +152,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 95. **implemented** — Use stage-specific deadlines
 96. **partial** — Reuse sealed read-only checkpoints
 97. **implemented** — Capture intervention reasons and outcomes
-98. **partial** — Clarify timezone-aware task scheduling
+98. **implemented** — Clarify timezone-aware task scheduling
 99. **partial** — Add archive restoration and relocation
 100. **implemented** — Explain requirement revisions and rerun impact
 101. **pending** — Stabilize pagination under mutation

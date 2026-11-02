@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -33,6 +34,22 @@ class UsageReportTest(unittest.TestCase):
         self.assertEqual(result['tasks'][1]['background'],1)
         self.assertAlmostEqual(result['summary']['estimated_usd'],.00032)
         self.assertEqual(result['summary']['unpriced_calls'],1)
+
+    def test_recorded_call_has_zero_pending_and_failed_calls(self):
+        self.store.execute("INSERT INTO projects(id,name,path) VALUES ('p-clean','p-clean','/p-clean')")
+        self.store.execute("INSERT INTO tasks(id,project,title,source,state) VALUES ('t-clean','p-clean','T','goal','planning')")
+        self.store.execute("INSERT INTO runs(id,task,project) VALUES ('r-clean','t-clean','p-clean')")
+        config = {'providers': [{'id': 'openai'}], 'limits': {}}
+        call = self.store.reserve_call('p-clean', 'r-clean', 'planner', {'provider': 'openai', 'model': 'model', 'effort': 'high'}, config)
+        self.store.record_usage(call, 'r-clean', {'tokens': 20, 'input_tokens': 20, 'output_tokens': 0,
+                                                  'cache_read_tokens': 0, 'cache_write_tokens': 0, 'usage_known': True}, 1.0)
+        call_row = self.store.one("SELECT state FROM calls WHERE id=?", (call,))
+        assert call_row is not None
+        self.assertEqual(call_row["state"], "completed")
+        rep = report(self.store, {'project': ['p-clean'], 'start': ['0'], 'end': [str(time.time() + 3600)]})
+        self.assertEqual(rep['summary']['calls'], 1)
+        self.assertEqual(rep['summary']['pending_calls'], 0)
+        self.assertEqual(rep['summary']['failed_calls'], 0)
 
     def test_all_report_reads_share_one_snapshot(self):
         original_query, original_stream = self.store.query, self.store.stream

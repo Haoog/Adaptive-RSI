@@ -1797,6 +1797,129 @@ test('revision and backoff messages are mapped and localized for both console la
   assert.match(english[mapped],/Reevaluate/);
 });
 
+test('schedule-time rejections are mapped and localized for both console languages', () => {
+  const i18n=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  const english=vm.runInNewContext(i18n.slice(0, i18n.indexOf('let language')) + ';english');
+  const apiBlock=source.slice(source.indexOf('const apiErrors={'), source.indexOf('function reviseForm'));
+  const apiErrors=JSON.parse('{' + apiBlock.slice(apiBlock.indexOf('{') + 1, apiBlock.lastIndexOf('}')) + '}');
+  const runtime=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/runtime.py'), 'utf8');
+  const emitted=new Set();
+  // 只扫 schedule_task 的方法体：预约拒绝的固定文案由它产生，其他模块的
+  // ValueError 走各自的错误路径，不属于本契约。
+  const start=runtime.indexOf('def schedule_task(');
+  assert.ok(start >= 0, 'runtime.py contains schedule_task');
+  const method=runtime.slice(start, runtime.indexOf('\n    def ', start + 1));
+  for (const match of method.matchAll(/raise ValueError\(\s*'((?:[^'\\]|\\.)*)'\s*\)/g)) emitted.add(match[1]);
+  const server=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/server.py'), 'utf8');
+  assert.ok(server.includes('"/api/task/schedule-time"'), 'schedule-time endpoint must be wired');
+  assert.ok(server.includes('runtime.schedule_task(body.get("task")'), 'endpoint must call schedule_task');
+  for (const message of ['Scheduled local time is nonexistent',
+    'Scheduled local time is ambiguous; specify fold', 'Scheduled time must be in the future',
+    'Use a naive local time and fold 0 or 1', 'Unknown time zone',
+    'Only queued inactive tasks can be scheduled'])
+    assert.ok(emitted.has(message), 'runtime must emit the fixed message: ' + message);
+  for (const message of emitted)
+    assert.ok(Object.hasOwn(apiErrors, message), 'server validation message must be mapped: ' + message);
+  for (const [message, localized] of Object.entries(apiErrors)) {
+    if (!message.includes('Scheduled') && !['Use a naive local time and fold 0 or 1',
+      'Unknown time zone', 'Only queued inactive tasks can be scheduled'].includes(message)) continue;
+    assert.ok(Object.hasOwn(english, localized), 'english dictionary misses: ' + localized);
+  }
+  assert.match(english[apiErrors['Scheduled local time is nonexistent']], /does not exist/);
+  assert.match(english[apiErrors['Scheduled local time is ambiguous; specify fold']], /first or second/);
+  assert.equal(english['已预约'], 'Reserved');
+  assert.equal(english['安排检查：此任务将在指定时刻开始运行。'], 'Schedule check: this task starts at the chosen instant.');
+});
+
+const detailDescendants = node => (node.children || []).flatMap(child => [child, ...detailDescendants(child)]);
+
+test('queued task detail offers a schedule form that posts the chosen wall time and fold', async () => {
+  const page = browser(), posts = [];
+  const task = {id: 'sched-1', project: 'a', title: '预约目标', source: 'goal', state: 'queued', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push({url, body: JSON.parse(options.body)});
+      return response({local_time: '2027-11-07T01:30', timezone: 'Asia/Shanghai', fold: 1, at: 1});
+    }
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  const box = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+  assert.ok(box, 'queued task detail must offer the schedule form');
+  const controls = detailDescendants(box);
+  const time = controls.find(node => node.type === 'datetime-local');
+  const zone = controls.find(node => node.type === 'text');
+  const repeat = controls.find(node => node.tagName === 'SELECT');
+  time.value = '2027-11-07T01:30';
+  zone.value = ' Asia/Shanghai ';
+  repeat.value = '1';
+  const reserve = controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约');
+  reserve.handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/api/task/schedule-time');
+  assert.deepEqual(posts[0].body, {task: 'sched-1', local_time: '2027-11-07T01:30', timezone: 'Asia/Shanghai', fold: 1});
+  assert.match(page.node('toast').textContent, /预约已保存/);
+});
+
+test('schedule form omits fold for a single-occurrence time and rejects empty input locally', async () => {
+  const page = browser(), posts = [];
+  const task = {id: 'sched-2', project: 'a', title: '预约目标二', source: 'goal', state: 'queued', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push({url, body: JSON.parse(options.body)});
+      return response({saved: true});
+    }
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  const box = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+  const controls = detailDescendants(box);
+  const time = controls.find(node => node.type === 'datetime-local');
+  const zone = controls.find(node => node.type === 'text');
+  const repeat = controls.find(node => node.tagName === 'SELECT');
+  time.value = '2027-03-14T02:30';
+  zone.value = 'America/New_York';
+  assert.equal(repeat.value, '', 'single occurrence is the default fold choice');
+  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts[0].body.fold, undefined, 'single occurrence must not send a fold');
+  // 空输入在本地拦截，不发请求。
+  time.value = '';
+  page.node('toast').textContent = '';
+  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts.length, 1, 'empty input must not reach the API');
+  assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
+});
+
+test('server schedule rejections reach the console with localized guidance', async () => {
+  const page = browser();
+  page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
+    error_code: 'validation_error'}, 400), headers: {get: () => '0123456789abcdef'}});
+  await assert.rejects(page.context.api('task/schedule-time', {task: 't', local_time: '2027-03-14T02:30:00',
+    timezone: 'America/New_York'}), error => /夏令时/.test(error.message) && error.code === 'validation_error');
+});
+
+test('non-queued task details offer no schedule form', async () => {
+  const page = browser();
+  const task = {id: 'detail-h2', project: 'a', title: '待交付任务', source: 'goal', state: 'awaiting_approval', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  assert.equal(detailDescendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 0);
+});
+
 function experiencePage({navigation = false} = {}) {
   const page = browser(), ready = [], windowEvents = new Map();
   Object.assign(page.context, {
