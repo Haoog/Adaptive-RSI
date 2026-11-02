@@ -431,6 +431,27 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("Invalid backup ID")
                 path = store.root / "backups" / (identifier + ".sqlite3")
                 self.backup(path, params)
+            elif parsed.path in ("/api/rehearse-restore", "/api/rehearsal"):
+                identifier = params.get("id", [""])[0]
+                reports_dir = store.root / "reports"
+                if identifier:
+                    if len(identifier) != 16 or any(c not in "0123456789abcdef" for c in identifier):
+                        raise RequestError("Invalid backup ID")
+                    report_file = reports_dir / f"rehearsal-{identifier}.json"
+                    if not report_file.exists():
+                        raise RequestError("Rehearsal report not found")
+                    self.respond(json.loads(report_file.read_text(encoding="utf-8")))
+                else:
+                    reports = sorted((p for p in reports_dir.glob("rehearsal-*.json")
+                                      if p.is_file() and not p.is_symlink()),
+                                     key=lambda p: p.stat().st_mtime, reverse=True) if reports_dir.exists() else []
+                    latest = None
+                    if reports:
+                        try:
+                            latest = json.loads(reports[0].read_text(encoding="utf-8"))
+                        except Exception:
+                            pass
+                    self.respond({"reports": [p.name for p in reports[:20]], "latest": latest})
             elif parsed.path == "/api/tasks/batch":
                 project = params.get("project", [""])[0]
                 runtime.project(project)
@@ -584,6 +605,18 @@ class Handler(BaseHTTPRequestHandler):
                             if opening > time.time() + 1:
                                 task.update(wait_reason="working_hours", available=opening)
                     schedules = store.query("SELECT * FROM schedules")
+                    task_schedules = {}
+                    for row in store.query("SELECT key,value FROM settings WHERE key LIKE 'task-schedule:%'"):
+                        data = decode_object(row["value"])
+                        if isinstance(data, dict) and data.get("at") is not None:
+                            task_schedules[row["key"].split(":", 1)[1]] = data
+                    for task in rows["tasks"]:
+                        schedule = task_schedules.get(task["id"])
+                        if (schedule and task.get("state") == "queued"
+                                and (task.get("available") or 0) > 0
+                                and abs((task.get("available") or 0) - schedule.get("at", 0)) < 1e-4
+                                and schedule.get("at") > time.time()):
+                            task["schedule"] = schedule
                     project_by_id = {project["id"]: project for project in projects}
                     for schedule in schedules:
                         project = project_by_id.get(schedule["project"])
@@ -960,12 +993,44 @@ class Handler(BaseHTTPRequestHandler):
                     result = execute(runtime, body.get("project"), body.get("tasks"), body.get("action"),
                                      body.get("request_id"), preview=body.get("preview", True) is not False,
                                      expected=body.get("revision"))
+                elif path == "/api/task/schedule-time":
+                    # 预约是授权一个绝对时刻：DST 缺失小时、重复小时与过去时间
+                    # 都在这里以固定文案拒绝，不静默移动授权时间。
+                    if not isinstance(body.get("local_time"), str) or not isinstance(body.get("timezone"), str):
+                        raise ValueError("Use a naive local time and fold 0 or 1")
+                    result = runtime.schedule_task(body.get("task"), body["local_time"],
+                                                   body["timezone"], body.get("fold"))
                 elif path == "/api/task/schedule":
                     runtime.set_dependency(body["task"], body.get("dependencies", body.get("dependency")), body.get("urgency", 0), body.get("reason"))
                     result = {"saved": True}
                 elif path == "/api/backup":
                     from .storage_tools import backup
                     result = backup(runtime.store)
+                elif path in ("/api/rehearse-restore", "/api/rehearsal"):
+                    from .storage_tools import rehearse_restore, rehearsal_report_path
+                    identifier = body.get("id")
+                    if identifier:
+                        if not isinstance(identifier, str) or len(identifier) != 16 or any(
+                                char not in "0123456789abcdef" for char in identifier):
+                            raise RequestError("Invalid backup ID")
+                        source = runtime.store.root / "backups" / (identifier + ".sqlite3")
+                    elif body.get("path") or body.get("file"):
+                        raw_path = body.get("path") or body.get("file")
+                        source = Path(str(raw_path))
+                    else:
+                        backups = sorted((p for p in (runtime.store.root / "backups").glob("*.sqlite3")
+                                          if p.is_file() and not p.is_symlink()),
+                                         key=lambda p: p.stat().st_mtime, reverse=True)
+                        if not backups:
+                            raise RequestError("No backup available for rehearsal")
+                        source = backups[0]
+                    try:
+                        report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
+                        result = rehearse_restore(source, report_path=report_file, store=runtime.store)
+                    except ValueError as exc:
+                        if "conflicts with database" in str(exc):
+                            raise RequestError("report_conflicts_with_database") from exc
+                        raise RequestError(str(exc)) from exc
                 elif path == "/api/request":
                     result = {"id": runtime.request(body["project"], body["kind"])}
                 elif path == "/api/pause":

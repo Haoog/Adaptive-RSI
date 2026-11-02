@@ -1,6 +1,7 @@
 """Offline regression evidence for runtime handoff boundaries."""
 import datetime
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -339,19 +340,41 @@ class RuntimeHandoffTest(unittest.TestCase):
     def test_issue_sync_retains_original_diff_and_source_without_permission_change(self):
         task = self.store.add_task(self.project, 'issue', 'issue:1', 'Original', 'Original body',
                                    [{'number': 1, 'url': 'https://github.com/a/b/issues/1', 'updated': 'old'}])
-        def sync(*args, **kwargs):
-            self.store.execute('UPDATE tasks SET body=?,evidence=? WHERE id=?',
-                ('New body', encode([{'number': 1, 'url': 'https://github.com/a/b/issues/1', 'updated': 'new'}]), task))
+        issue = {'number': 1, 'title': 'Original', 'body': 'New body', 'labels': [], 'state': 'open',
+                 'updated_at': '2026-11-01T00:00:00Z', 'html_url': 'https://github.com/a/b/issues/1'}
         self.runtime.configure({'github': {'repository': 'a/b'}}, self.project)
-        with patch('adaptive_rsi.discovery.sync', side_effect=sync), patch('adaptive_rsi.runtime.checked', return_value='[]'):
+        with patch('adaptive_rsi.runtime.checked', side_effect=lambda args, **kw: encode([issue]) if args[1] == 'api' else '[]'):
             self.runtime.sync_issues(self.runtime.project(self.project), self.runtime.config(self.project))
-        row = self.store.one("SELECT data FROM events WHERE kind='issue_requirements_diff'")
+        row = self.store.one("SELECT run,data FROM events WHERE kind='issue_requirements_diff'")
         record = json.loads(row['data'])
         self.assertEqual(record['before']['body'], 'Original body')
         self.assertEqual(record['after']['body'], 'New body')
-        self.assertEqual(record['source']['updated'], 'new')
+        self.assertEqual(record['source']['updated'], issue['updated_at'])
         self.assertIn('-Original body', record['diff'])
+        self.assertIsNone(row['run'])
         self.assertEqual(self.runtime.config(self.project)['delivery']['mode'], 'local')
+
+    def test_issue_sync_audit_rolls_back_with_task_write(self):
+        task = self.store.add_task(self.project, 'issue', 'issue:1', 'Original', 'Original body',
+                                   [{'number': 1, 'url': 'https://github.com/a/b/issues/1', 'updated': 'old'}])
+        issue = {'number': 1, 'title': 'Original', 'body': 'New body', 'labels': [], 'state': 'open',
+                 'updated_at': '2026-11-01T00:00:00Z', 'html_url': 'https://github.com/a/b/issues/1'}
+        self.runtime.configure({'github': {'repository': 'a/b'}}, self.project)
+        self.store.execute("CREATE TRIGGER reject_issue_audit BEFORE INSERT ON events "
+                           "WHEN NEW.kind='issue_requirements_diff' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected audit failure'); END")
+        try:
+            with patch('adaptive_rsi.runtime.checked',
+                       side_effect=lambda args, **kw: encode([issue]) if args[1] == 'api' else '[]'):
+                with self.assertRaisesRegex(sqlite3.IntegrityError, 'Injected audit failure'):
+                    self.runtime.sync_issues(self.runtime.project(self.project), self.runtime.config(self.project))
+        finally:
+            self.store.execute("DROP TRIGGER reject_issue_audit")
+        row = self.store.one("SELECT title,body,evidence FROM tasks WHERE id=?", (task,))
+        self.assertEqual((row['title'], row['body'], row['evidence']),
+                         ('Original', 'Original body', encode([{'number': 1, 'url': 'https://github.com/a/b/issues/1', 'updated': 'old'}])))
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE kind='issue_requirements_diff'"))
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE kind='issues'"))
 
     def test_idle_projects_use_deadline_cache_and_wake_invalidates_it(self):
         self.runtime.pause(self.project, False)
