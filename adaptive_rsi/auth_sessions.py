@@ -926,10 +926,15 @@ class AuthSessions:
         count = 0
         for key in ids:
             try:
-                count += self.status(key)["state"] in ACTIVE
+                result = self.status(key)
             except AuthError as exc:
                 if exc.code != "unknown_session":
                     raise
+                continue
+            # status() 的非阻塞回收在锁竞争时可能返回陈旧 ACTIVE 快照；
+            # busy 语义是「仍在进行」，过期行即便尚未被扫描也不再占用名额。
+            if result["state"] in ACTIVE and self.now() < result["expires_at"]:
+                count += 1
         return count
 
     def snapshot(self):

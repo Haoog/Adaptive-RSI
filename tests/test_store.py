@@ -283,6 +283,30 @@ class RecordUsageTest(unittest.TestCase):
         return {"tokens": tokens, "input_tokens": tokens, "output_tokens": 0,
                 "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_known": True}
 
+    def test_defer_only_rewrites_queued_or_deferred_tasks(self):
+        """defer() 是 queued→deferred 与 deferred→deferred 的入口；终态任务不能被
+        一次调用静默改写回 deferred 并污染其决策记录。"""
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',0,0)")
+        for initial in ["queued", "deferred", "merged", "cancelled", "awaiting_approval", "pr_open"]:
+            with self.subTest(initial=initial):
+                task = self.store.add_task("p", "goal", initial + "-defer", "fixture")
+                if initial != "queued":
+                    self.store.execute("UPDATE tasks SET state=? WHERE id=?", (initial, task))
+                changed = self.store.defer(task, {"reason": "seed"})
+                if initial in ("queued", "deferred"):
+                    self.assertTrue(changed)
+                    self.assertEqual("deferred",
+                                     self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+                    self.assertEqual({"reason": "seed"}, json.loads(
+                        self.store.one("SELECT data FROM task_decisions WHERE task=?", (task,))["data"]))
+                else:
+                    # 终态与已认领任务：状态与决定记录都必须保持不变。
+                    self.assertFalse(changed)
+                    self.assertEqual(initial,
+                                     self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"])
+                    self.assertIsNone(
+                        self.store.one("SELECT data FROM task_decisions WHERE task=?", (task,)))
+
     def test_repeated_recording_is_idempotent_for_run_tokens(self):
         self.store.record_usage("call", "run", self.usage(100), 1.0)
         self.store.record_usage("call", "run", self.usage(100), 1.5)
