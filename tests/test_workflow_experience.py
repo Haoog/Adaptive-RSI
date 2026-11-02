@@ -930,18 +930,58 @@ class ExperienceTest(unittest.TestCase):
         self.assertFalse(health.status(config, "openai", self.project)["paused"])
 
     def test_performance_contract_uses_real_measurements_and_tolerance(self):
+        from adaptive_rsi.agent import SCHEMAS, validate_output
         from adaptive_rsi.workflow import evidence_contract, improvement
         task = {"source": "goal", "title": "降低接口延迟"}
         with self.assertRaises(ValueError):
             evidence_contract(task, {"change_kind": "performance"})
-        plan = {"change_kind": "performance", "performance_threshold": {"metric": "latency", "unit": "ms", "target": 80, "tolerance": 2, "direction": "lower"}}
+        threshold = {"metric": "latency", "unit": "ms", "target": 80, "tolerance": 2, "direction": "lower"}
+        guardrail = {"metric": "memory", "unit": "MiB", "target": 512, "tolerance": 16, "direction": "lower"}
+        plan = {"decision": "ready", "reason": "Benchmark shows latency headroom",
+                "scope": ["bench/bench.py"], "acceptance": ["latency improves without memory regression"],
+                "value": {"impact": "medium", "effort": "low", "confidence": "high",
+                          "benefit": "lower latency", "cost": "bounded benchmark", "inaction": "slow calls",
+                          "evidence": ["bench/bench.py reports latency"]},
+                "risk": "medium", "change_kind": "performance", "performance_threshold": threshold,
+                "repetitions": 3, "load_conditions": ["idle"], "guardrails": [guardrail],
+                "required_test_ids": ["tests.test_bench.Bench.test_latency"],
+                "check_dependencies": [{"name": "bench", "paths": ["bench/"],
+                                        "depends_on": [], "checks": ["bench"]}]}
+        validate_output(plan, SCHEMAS["planning"])
         contract = evidence_contract(task, plan)
-        def sample(value):
-            return {"passed": True, "stdout": json.dumps({"metric": "latency", "unit": "ms", "value": value})}
+        self.assertEqual(3, contract["repetitions"])
+        self.assertEqual(["idle"], contract["load_conditions"])
+        self.assertEqual([guardrail], contract["guardrails"])
+        self.assertEqual(["tests.test_bench.Bench.test_latency"], contract["required_test_ids"])
+        self.assertEqual({"bench": {"paths": ["bench/"], "depends_on": [], "checks": ["bench"]}},
+                         contract["check_dependencies"])
+        defaulted = evidence_contract(task, {key: value for key, value in plan.items()
+                                              if key not in ("repetitions", "load_conditions")})
+        self.assertEqual(3, defaulted["repetitions"])
+        self.assertEqual([None], defaulted["load_conditions"])
+        self.assertEqual([None], evidence_contract(task, {**plan, "load_conditions": []})["load_conditions"])
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {**plan, "repetitions": 2})
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {key: value for key, value in plan.items() if key != "guardrails"})
+        with self.assertRaises(ValueError):
+            evidence_contract(task, {**plan, "guardrails": [dict(threshold)]})
+        def sample(value, memory=256):
+            return {"passed": True, "stdout": "\n".join(json.dumps(row) for row in [
+                {"metric": "latency", "unit": "ms", "value": value, "load": "idle"},
+                {"metric": "memory", "unit": "MiB", "value": memory, "load": "idle"}])}
         acceptance = {"change_kind": "performance", "contract": contract}
         checks = {"acceptance_baseline": [sample(100)], "acceptance_candidate": [sample(79)]}
+        self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
+        checks = {"acceptance_baseline": [sample(100), sample(101), sample(102)],
+                  "acceptance_candidate": [sample(79), sample(78), sample(77)]}
         self.assertEqual("pass", improvement(checks, acceptance)["decision"])
-        checks["acceptance_candidate"] = [sample(99)]
+        duplicated = {"change_kind": "performance",
+                      "contract": {**contract, "guardrails": [dict(threshold)]}}
+        self.assertEqual("insufficient_evidence", improvement(checks, duplicated)["decision"])
+        checks["acceptance_candidate"] = [sample(79, 600), sample(78, 610), sample(77, 620)]
+        self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
+        checks["acceptance_candidate"] = [sample(99), sample(98), sample(97)]
         self.assertEqual("insufficient_evidence", improvement(checks, acceptance)["decision"])
 
     def test_metrics_count_logical_interventions_and_same_failure_only(self):

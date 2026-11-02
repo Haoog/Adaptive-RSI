@@ -356,6 +356,11 @@ def improvement(results, acceptance):
                     or any(type(rule.get(k)) not in (int, float) or not math.isfinite(rule[k]) for k in ("target", "tolerance"))
                     or rule["tolerance"] < 0):
                 return {"decision": "insufficient_evidence", "kind": kind, "basis": "invalid_guardrail"}
+            if index and (rule["metric"], rule["unit"]) == (threshold["metric"], threshold["unit"]):
+                # Same measurement identity as the primary rule: the primary
+                # samples would satisfy it, so it is no secondary evidence.
+                return {"decision": "insufficient_evidence", "kind": kind,
+                        "basis": "guardrail_must_measure_a_secondary_metric"}
             for load in loads:
                 old, new = measurements(before, rule, load), measurements(after, rule, load)
                 if len(old) != repeats or len(new) != repeats:
@@ -395,7 +400,7 @@ def evidence_contract(task, plan):
     kind = "refactor" if task["source"] == "rollback" else change_kind(task, plan)
     requirements = {
         "behavior": "Reproduce the reported behavior before the change and demonstrate it works afterward.",
-        "performance": "Emit one JSON measurement per version: metric, unit, value. Use the frozen target and tolerance.",
+        "performance": "Emit one JSON measurement line per version, repetition, load condition and guardrail metric: metric, unit, value and the load label when declared. Use the frozen targets and tolerances.",
         "refactor": "Preserve passing behavior and verify concrete maintainability criteria in independent review.",
         "documentation": "Execute documentation examples, validate local links and demonstrate the requested information is present.",
         "configuration": "Check effective configuration, defaults, invalid inputs and compatibility through public behavior.",
@@ -406,16 +411,43 @@ def evidence_contract(task, plan):
     import copy
     for field in ("required_test_ids", "check_dependencies"):
         if field in plan:
-            contract[field] = copy.deepcopy(plan[field])
+            value = copy.deepcopy(plan[field])
+            if field == "check_dependencies" and isinstance(value, list):
+                value = {entry["name"]: {key: entry[key] for key in ("paths", "depends_on", "checks")}
+                         for entry in value}
+            contract[field] = value
     if kind == "performance":
         threshold = plan.get("performance_threshold")
         if not isinstance(threshold, dict) or not threshold.get("metric") or not threshold.get("unit") or threshold.get("direction") not in ["lower", "higher"]:
             raise ValueError("Performance plan requires a named metric, unit, target, tolerance and direction")
         if any(type(threshold.get(k)) not in [int, float] or not math.isfinite(threshold[k]) for k in ["target", "tolerance"]) or threshold["tolerance"] < 0:
             raise ValueError("Performance threshold must be finite and tolerance nonnegative")
+        repetitions = plan.get("repetitions", 3)
+        loads = plan.get("load_conditions")
+        guardrails = plan.get("guardrails")
+        if type(repetitions) is not int or not 3 <= repetitions <= 100:
+            raise ValueError("Performance plan requires an integer repetition count from 3 to 100")
+        if loads is None or loads == []:
+            loads = [None]
+        elif (not isinstance(loads, list) or not 1 <= len(loads) <= 20 or
+              any(not isinstance(load, str) for load in loads)):
+            raise ValueError("Performance load_conditions must contain 1..20 text labels")
+        if not isinstance(guardrails, list) or not 1 <= len(guardrails) <= 20:
+            raise ValueError("Performance plan requires at least one secondary guardrail")
+        for rule in guardrails:
+            if (not isinstance(rule, dict) or not rule.get("metric") or not rule.get("unit")
+                    or rule.get("direction") not in ["lower", "higher"]
+                    or any(type(rule.get(k)) not in [int, float] or not math.isfinite(rule[k]) for k in ["target", "tolerance"])
+                    or rule["tolerance"] < 0):
+                raise ValueError("Performance guardrails must be finite thresholds with nonnegative tolerance")
+        # Measurements are matched by metric, unit and load, so a guardrail that
+        # repeats the primary identity is scored against the primary samples and
+        # protects no trade-off. It must name a distinct measurement instead.
+        primary = (threshold["metric"], threshold["unit"])
+        if any((rule["metric"], rule["unit"]) == primary for rule in guardrails):
+            raise ValueError("Performance guardrails must measure a secondary metric distinct from the primary threshold")
         contract["threshold"] = threshold
-        for name in ("guardrails", "repetitions", "load_conditions"):
-            if name in plan:
-                import copy
-                contract[name] = copy.deepcopy(plan[name])
+        contract["repetitions"] = repetitions
+        contract["load_conditions"] = copy.deepcopy(loads)
+        contract["guardrails"] = copy.deepcopy(guardrails)
     return contract
