@@ -235,7 +235,7 @@ def codex_models():
             finally:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
                 process.wait()
                 process.stdin.close()
