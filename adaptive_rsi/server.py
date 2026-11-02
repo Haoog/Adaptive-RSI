@@ -95,7 +95,13 @@ class Server(ThreadingHTTPServer):
             except OSError:
                 pass
             return
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # 线程未能启动时 process_request_thread 不会运行，须在此退还名额，
+            # 否则反复失败会把 gate 耗尽并永久拒接新连接。
+            self._connection_gate.release()
+            raise
 
     def process_request_thread(self, request, client_address):
         try:
