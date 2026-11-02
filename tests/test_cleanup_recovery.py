@@ -188,6 +188,56 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         self.assertEqual((source / 'evidence').read_text(), 'original')
         self.assertTrue(target.is_dir())
 
+    def test_linux_rename_fallback_when_libc_lacks_renameat2(self):
+        import sys
+        if sys.platform != 'linux':
+            self.skipTest('Linux-specific fallback test')
+        import ctypes
+        real_cdll = ctypes.CDLL
+
+        class LibcWithoutRenameat2:
+            def __init__(self, lib):
+                self._lib = lib
+            def syscall(self, *args):
+                calls.append(args)
+                orig = getattr(self._lib, 'syscall', None)
+                if orig is not None:
+                    return orig(*args)
+                raise AttributeError('syscall')
+            def __getattr__(self, name):
+                if name == 'renameat2':
+                    raise AttributeError('simulated libc without renameat2')
+                return getattr(self._lib, name)
+
+        calls = []
+        def fake_cdll(name, use_errno=False):
+            return LibcWithoutRenameat2(real_cdll(name, use_errno=use_errno))
+
+        source, target = self.directory / 'workspace', self.directory / 'candidate'
+        target.mkdir()
+        with patch('ctypes.CDLL', side_effect=fake_cdll):
+            with self.assertRaises(FileExistsError):
+                maintenance._rename_cleanup(source, target)
+            self.assertGreater(len(calls), 0)
+            target.rmdir()
+            maintenance._rename_cleanup(source, target)
+            self.assertTrue(target.exists())
+            self.assertEqual((target / 'evidence').read_text(), 'original')
+            self.assertFalse(source.exists())
+            maintenance._rename_cleanup(target, source)
+            self.assertTrue(source.exists())
+
+    def test_linux_rename_unavailable_raises_when_no_primitive(self):
+        import sys
+        if sys.platform != 'linux':
+            self.skipTest('Linux-specific fallback test')
+        class LibcWithoutAny:
+            def __getattr__(self, name):
+                raise AttributeError(name)
+        with patch('ctypes.CDLL', return_value=LibcWithoutAny()):
+            with self.assertRaisesRegex(OSError, 'Atomic no-replace cleanup rename unavailable'):
+                maintenance._rename_cleanup(self.directory / 'workspace', self.directory / 'candidate')
+
     def _make_valid_recycle(self, identifier, committed=True):
         """Rebuild one recycle: durable journal, moved artifact, optionally the committed row."""
         import os
