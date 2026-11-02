@@ -70,14 +70,14 @@ def stop_workers(processes):
     for process in owned:
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     if owned:
         time.sleep(1)
     for process in owned:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     for process in owned:
         process.wait()

@@ -12,6 +12,7 @@ from collections import defaultdict
 import importlib
 import json
 from pathlib import Path
+import signal
 import sys
 import unittest
 
@@ -103,12 +104,22 @@ def main():
             timings = timing_cache(json.loads(args.durations.read_text()))
         except (OSError, ValueError):
             print("Ignoring invalid or unreadable timing cache; all selected tests remain required", file=sys.stderr)
+
+    def cancel(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, cancel)
     try:
         return run_groups(group_by_module(selected, args.workers, timings),
                           timeout=args.timeout, durations_file=args.durations)
+    except KeyboardInterrupt:
+        print("Selected tests cancelled", file=sys.stderr)
+        return 130
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 1
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
