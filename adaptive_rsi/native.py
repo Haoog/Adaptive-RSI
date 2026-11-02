@@ -97,6 +97,16 @@ class ArgumentsError(ValueError):
 # 超过后明确失败并提示缩短/拆分结果，而不是在同一预算上反复请求、反复计费。
 MAX_OUTPUT_LIMIT_REPAIRS = 1
 
+# 每个工具自己的结果预算：在边界处停下并回报续读位置与准确原因，而不是让整条
+# 结果先撞上统一的 128 KB 信封再被整体外置。
+# read_file 的一页保持在 16 KiB 内联阈值以下，否则一页正文会被 compact_result
+# 转成 artifact 预览，模型就拿不到真正的文本页。
+READ_RESULT_BYTES = 16000
+SEARCH_RESULT_BYTES = 96000             # search 单次结果按行累加的字节上限
+SEARCH_SCAN_BYTES = 12 * 1024 * 1024    # search 单次扫描的总字节上限
+READ_LINE_BYTES = 1024 * 1024           # read_file 允许的单行上限
+READ_SCAN_BYTES = 32 * 1024 * 1024      # read_file 为定位范围允许扫描的上限
+
 
 class ModelResponse(dict):
     provider_request_id = None
@@ -249,7 +259,7 @@ def tools_for(role):
                                          limit={"type": "integer"})
     tools = [
         ("list_files", "List source files with optional offset and limit (1..1000); inspect truncation metadata.", listing),
-        ("read_file", "Read at most 500 lines. Paths must be relative to this snapshot.", object_schema({
+        ("read_file", "Read at most 500 lines. Paths must be relative to this snapshot. Oversized results return content with truncated, reason and a next_line cursor.", object_schema({
             "path": TEXT, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}})),
         ("search", "Find text with optional path glob, case_sensitive, regex, limit (1..100), and continuation cursor. Regex has a per-file time limit.", searching),
         ("read_artifact", "Read a byte page of a large tool output stored by this invocation. Use the opaque artifact id from the tool result; offset and limit are bytes (limit at most 32768).", artifact_reader),
@@ -263,6 +273,26 @@ def tools_for(role):
              object_schema({"argv": {"type": "array", "items": TEXT}, "cwd": TEXT})),
         ]
     return tools + [("finish", "Submit the final structured result. Do not combine with other tool calls.", SCHEMAS[role])]
+
+
+# 每个由 tools_for() 注册的工具都必须在这里声明结果预算契约：截断时携带续读位置的
+# 字段名（工具本身受 schema 约束、不可能产生超预算结果时为 None），以及它可能给出的
+# 截断原因集合。新增工具时必须显式补上这一行，否则契约测试会失败——不允许让新工具
+# 悄悄沿用「省略即完成」。
+TOOL_RESULT_BUDGETS = {
+    "list_files": ("next_offset", {"page limit", "index limit"}),
+    "read_file": ("next_line", {"result byte limit", "line limit"}),
+    "search": ("next_cursor", {"match limit", "result byte limit", "search byte limit",
+                               "regex time limit", "regex worker failure",
+                               "index limit", "unreadable or oversized files"}),
+    "read_artifact": ("next_offset", {"page limit"}),
+    "search_artifact": ("next_cursor", {"match limit", "result byte limit", "scan limit"}),
+    # run_command 的大正文会被外置为 artifact，续读位置在 reference 的 next_offset。
+    "run_command": ("next_offset", {"result byte limit"}),
+    "write_file": (None, set()),
+    "replace_text": (None, set()),
+    "finish": (None, set()),
+}
 
 
 class WorkspaceTools:
@@ -475,18 +505,18 @@ class WorkspaceTools:
             nonlocal output_bytes
             row = {"path": file, "line": number, "text": text[:1000]}
             size = len(json.dumps(row).encode())
-            if output_bytes + size > 96000:
+            if output_bytes + size > SEARCH_RESULT_BYTES:
                 return False
             result.append(row)
             output_bytes += size
             return True
         def page(reason=None, file=None, line=1):
             return {"matches": result, "truncated": reason is not None or self.files_truncated or skipped > 0,
-                    "reason": reason or ("file limit" if self.files_truncated else "unreadable or oversized files" if skipped else None),
+                    "reason": reason or ("index limit" if self.files_truncated else "unreadable or oversized files" if skipped else None),
                     "limit": limit, "skipped_files": skipped, "index_source": self.index_source,
                     "next_cursor": json.dumps([signature, file, line]) if file else None}
         needle = args["text"] if args.get("case_sensitive", True) else args["text"].casefold()
-        remaining = 12 * 1024 * 1024
+        remaining = SEARCH_SCAN_BYTES
         try:
             for file in self.files():
                 self.check_cancelled()
@@ -563,7 +593,7 @@ class WorkspaceTools:
             following = offset + limit if offset + limit < len(files) else None
             return {"files": files[offset:offset + limit], "truncated": following is not None or self.files_truncated,
                     "limit": limit, "offset": offset, "next_offset": following,
-                    "reason": "page limit" if following is not None else "file limit" if self.files_truncated else None,
+                    "reason": "page limit" if following is not None else "index limit" if self.files_truncated else None,
                     "index_truncated": self.files_truncated, "index_source": self.index_source,
                     "ignore_rules_applied": self.index_source == "git"}
         if name == "read_file":
@@ -572,6 +602,8 @@ class WorkspaceTools:
                 raise ValueError("Read requires 1-based range of at most 500 lines")
             path = self.path(args["path"])
             rows, scanned = [], 0
+            output_bytes = 0
+            reason = next_line = None
             with self.parent_descriptor(path) as (parent, leaf):
                 fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             with os.fdopen(fd, "rb") as source:
@@ -579,14 +611,31 @@ class WorkspaceTools:
                     raise ValueError("Source must be a regular file")
                 for number in range(1, end + 1):
                     self.check_cancelled()
-                    line = source.readline(1024 * 1024 + 1)
+                    line = source.readline(READ_LINE_BYTES + 1)
                     if not line:
                         break
                     scanned += len(line)
-                    if len(line) > 1024 * 1024 or scanned > 32 * 1024 * 1024:
+                    if len(line) > READ_LINE_BYTES or scanned > READ_SCAN_BYTES:
                         raise ValueError("Source read exceeds scan budget; narrow the range")
-                    if number >= start:
-                        rows.append(str(number) + ": " + line.decode("utf-8").rstrip("\r\n"))
+                    if number < start:
+                        continue
+                    row = str(number) + ": " + line.decode("utf-8").rstrip("\r\n")
+                    row_bytes = len(json.dumps(row).encode())
+                    if output_bytes + row_bytes > READ_RESULT_BYTES:
+                        reason, next_line = "result byte limit", number
+                        if not rows:
+                            # 单行本身超过结果预算：本工具不支持行内游标，只能保留前缀，
+                            # 并把「这一行被截断」作为原因回报，而不是装作整行已读完。
+                            rows.append(_json_prefix(row, READ_RESULT_BYTES))
+                            reason, next_line = "line limit", number + 1
+                        break
+                    rows.append(row)
+                    output_bytes += row_bytes
+            if reason:
+                return {"content": "\n".join(rows), "truncated": True, "reason": reason,
+                        "next_line": next_line, "start_line": start,
+                        "end_line": next_line - 1 if reason == "result byte limit" and next_line else start,
+                        "path": args["path"]}
             return "\n".join(rows)
         if name == "search":
             return self.search(args)
@@ -653,15 +702,62 @@ class WorkspaceTools:
         raise ValueError("Unknown tool")
 
 
+def _json_prefix(text, budget):
+    """Longest prefix of ``text`` whose JSON encoding fits ``budget`` bytes."""
+    data = text.encode("utf-8")
+    size = min(len(data), budget)
+    while size > 0:
+        chunk = data[:size].decode("utf-8", "ignore")
+        if len(json.dumps(chunk).encode()) <= budget:
+            return chunk
+        size = size * 3 // 4
+    return ""
+
+
+def _json_tail(text, budget):
+    """Longest suffix of ``text`` whose JSON encoding fits ``budget`` bytes."""
+    data = text.encode("utf-8")
+    size = min(len(data), budget)
+    while size > 0:
+        chunk = data[-size:].decode("utf-8", "ignore")
+        if len(json.dumps(chunk).encode()) <= budget:
+            return chunk
+        size = size * 3 // 4
+    return ""
+
+
 def _bounded_tool_value(value, error=None):
-    """Legacy bounded fallback used only when external storage is unavailable."""
+    """Legacy bounded fallback used only when external storage is unavailable.
+
+    Without an artifact store the omitted bytes cannot be re-read, so the
+    result reports an empty continuation instead of implying a resumable
+    position, and keeps the tail that carries command error context.
+    """
     detail = {"artifact_error": str(error)} if error else {}
+    reason = {"truncated": True, "reason": "result byte limit",
+              "next_offset": None, "continuation": "unavailable"}
     if isinstance(value, dict) and "exit_code" in value:
-        def tail(body):
-            return body[-24000:] if isinstance(body, str) else body
-        return {**value, "stdout": tail(value.get("stdout", "")),
-                "stderr": tail(value.get("stderr", "")), "truncated": True, **detail}
-    return {"error": "Tool output exceeds limit; narrow the request", **detail}
+        result, omitted = dict(value), 0
+        for key in ("stdout", "stderr"):
+            body = result.get(key)
+            if not isinstance(body, str):
+                continue
+            size = len(body.encode("utf-8"))
+            if size > 24000:
+                tail = _json_tail(body, 24000)
+                omitted += size - len(tail.encode("utf-8"))
+                result[key] = tail
+        if not omitted:
+            # 没有任何字节被丢弃时不要谎报截断/续读位置，只保留 artifact 错误。
+            return {**value, **detail}
+        return {**result, **reason, "omitted_bytes": omitted, **detail}
+    if isinstance(value, str):
+        if len(json.dumps(value).encode()) <= MAX_RESULT_BYTES:
+            return value
+        head = _json_prefix(value, 24000)
+        return {"content": head, "omitted_bytes": len(value.encode("utf-8")) - len(head.encode("utf-8")),
+                **reason, **detail}
+    return {"error": "Tool output exceeds limit; narrow the request", **reason, **detail}
 
 
 def execute_tools(tools, calls):
@@ -830,13 +926,17 @@ class Conversation:
                         # Rewriting an artifact envelope would make its opaque
                         # id unusable after context compression.
                         continue
-                    item["output"] = json.dumps({"truncated": True, "excerpt": str(item["output"])[:500]})
+                    item["output"] = json.dumps({"truncated": True, "reason": "context capacity",
+                                                 "continuation": "unavailable",
+                                                 "excerpt": str(item["output"])[:500]})
                 for part in item.get("parts", []):
                     response = part.get("functionResponse") if isinstance(part, dict) else None
                     if response and len(json.dumps(response.get("response", {}))) > 1000:
                         if _has_artifact_reference(response.get("response")):
                             continue
-                        response["response"] = {"truncated": True, "excerpt": json.dumps(response["response"])[:500]}
+                        response["response"] = {"truncated": True, "reason": "context capacity",
+                                                "continuation": "unavailable",
+                                                "excerpt": json.dumps(response["response"])[:500]}
                 content = item.get("content")
                 if isinstance(content, str) and len(content) > 1000:
                     if _has_artifact_reference(content):

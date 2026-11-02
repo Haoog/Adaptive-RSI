@@ -374,14 +374,14 @@ class OperabilityTest(unittest.TestCase):
         store = self.store
         now = 2_000_000_000
         stale = now - 120 * 86400
-        prefixes = ("run-baseline:", "automation:", "delivery:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:")
         remaining_keys = set()
         unrelated_keys = {"unrelated:%04d" % index for index in range(2000)}
         with store.connect() as db:
             db.executemany("INSERT INTO runs(id,state,started,ended) VALUES (?,'completed',?,?)",
                            [("history-%04d" % index, stale, stale) for index in range(5000)])
             db.executemany("INSERT INTO settings VALUES (?, '{}')", [(key,) for key in unrelated_keys])
-            # 201 runs with all six key shapes: the first pass must still stop at 200 runs.
+            # 201 runs with all eight key shapes: the first pass must still stop at 200 runs.
             for index in range(4799, 5000):
                 for prefix in prefixes:
                     for suffix in ("", ":release"):
@@ -398,16 +398,16 @@ class OperabilityTest(unittest.TestCase):
             with store.connect() as db:
                 plan = [row["detail"] for row in db.execute("EXPLAIN QUERY PLAN " + sql, args)]
                 searches = [detail for detail in plan if "SEARCH s USING" in detail]
-                self.assertEqual(len(searches), 6, plan)
+                self.assertEqual(len(searches), 8, plan)
                 self.assertTrue(all("INDEX" in detail for detail in searches), plan)
                 self.assertFalse(any("SCAN s" in detail for detail in plan), plan)
-                self.assertEqual(sum("key=?" in detail for detail in searches), 3, plan)
-                self.assertEqual(sum("key>? AND key<?" in detail for detail in searches), 3, plan)
+                self.assertEqual(sum("key=?" in detail for detail in searches), 4, plan)
+                self.assertEqual(sum("key>? AND key<?" in detail for detail in searches), 4, plan)
                 plans.append(plan)
                 return [dict(row) for row in db.execute(sql, args)]
 
         with patch.object(store, "query", side_effect=checked_query):
-            for passes, expected in [(0, 6), (1, 0)]:
+            for passes, expected in [(0, 8), (1, 0)]:
                 with self.subTest(passes=passes + 1), patch("adaptive_rsi.runtime.time.time", return_value=now + passes * 3601):
                     self.runtime.maintenance()
                     keys = {row["key"] for row in original_query("SELECT key FROM settings")}
