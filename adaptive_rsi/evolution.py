@@ -4,7 +4,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .config import compatibility, fingerprint, merge, validate
+from .config import BUILTIN_PROVIDERS, compatibility, fingerprint, merge, validate
 from .gitops import git, repository, snapshot
 from .process import Cancelled, scrub_tree
 from .store import encode, uid
@@ -15,6 +15,15 @@ FEEDBACK_LABELS = ("false_positive", "confirmed_regression", "rejected")
 FEEDBACK_SOURCE_PREFIX = "human:"
 # 受控消融沿用 attribution() 的四配置命名，避免报告与试验标签不一致。
 ABLATION_CONFIGURATIONS = ("baseline", "strategy_only", "skill_only", "combined")
+DEFAULT_PROVIDER_ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "opencode_go": "OPENCODE_API_KEY",
+}
 
 
 def human_feedback(store, project=None, candidate=None):
@@ -237,6 +246,15 @@ class Evolution:
 
     @staticmethod
     def attribution(rows):
+        """把四配置结果折算成描述性归因，不做任何自动因果推断。
+
+        前置不变量：``combined`` 行必须来自真正注入了候选技能的初筛候选，
+        ``baseline``/``strategy_only``/``skill_only`` 是同一输入上的对照。
+        只有在这个前提下 ``strategy_wins``/``skill_wins`` 才表示单因子边际收益，
+        ``interaction_only`` 才表示「只有两者同时生效才通过」；若初筛候选仍按
+        strategy_only 运行，采样条件会把 strategy_only 锁成恒真，使
+        interaction_only 永远为空。
+        """
         groups = {}
         variants = {"baseline", "strategy_only", "skill_only", "combined"}
         for row in rows:
@@ -280,13 +298,19 @@ class Evolution:
     def provider_requirements(config):
         """Non-secret provider requirements: provider id plus credential env var name.
 
-        Mirrors readiness semantics: a provider needs an environment credential
-        only when its env_key names one; login-based or local providers carry an
-        empty env_key and must never imply OPENAI_API_KEY.
+        Mirrors readiness semantics by incorporating built-in providers. Upstream
+        providers map deterministically to standard credential environment
+        variables unless overridden; login-based or local providers carry an
+        empty env_key.
         """
         if not isinstance(config, dict):
             return []
-        providers = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
+        builtin_providers = {
+            p["id"]: {**p, "env_key": DEFAULT_PROVIDER_ENV_KEYS.get(p["id"], p.get("env_key", ""))}
+            for p in BUILTIN_PROVIDERS if isinstance(p, dict) and p.get("id")
+        }
+        configured = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
+        providers = {**builtin_providers, **configured}
         requirements = []
         seen = set()
         models = config.get("models")
@@ -301,9 +325,17 @@ class Evolution:
                 if not isinstance(provider_id, str) or provider_id in seen:
                     continue
                 seen.add(provider_id)
-                entry = providers.get(provider_id) or {}
-                env_key = entry.get("env_key")
-                requirements.append({"id": provider_id, "env_key": env_key if isinstance(env_key, str) else ""})
+                if provider_id in providers:
+                    entry = providers[provider_id]
+                    env_key = entry.get("env_key")
+                    if isinstance(env_key, str):
+                        requirements.append({"id": provider_id, "env_key": env_key})
+                    else:
+                        requirements.append({"id": provider_id, "env_key": DEFAULT_PROVIDER_ENV_KEYS.get(provider_id, "")})
+                elif provider_id in DEFAULT_PROVIDER_ENV_KEYS:
+                    requirements.append({"id": provider_id, "env_key": DEFAULT_PROVIDER_ENV_KEYS[provider_id]})
+                else:
+                    requirements.append({"id": provider_id, "env_key": ""})
         return requirements
     @staticmethod
     def ablation_required(proposal):
@@ -328,11 +360,21 @@ class Evolution:
         return any(trigger.lower() in lower for trigger in triggers
                    if isinstance(trigger, str) and trigger.strip())
 
-    def ablate(self, project, directory, run, config, current, proposal, candidate, trials):
-        """在出现组合收益的输入上补跑 skill_only 与 combined 两种配置。
+    @staticmethod
+    def candidate_skill(candidate, proposal, now=None):
+        """构造候选提案对应的临时技能对象，用于初筛配对评估与受控消融。"""
+        guidance = proposal.get("guidance", "") if isinstance(proposal, dict) else ""
+        triggers = proposal.get("triggers", []) if isinstance(proposal, dict) else []
+        return {"content": str(guidance)[:2000],
+                "evidence": {"candidate": candidate, "ablation": True},
+                "triggers": [trigger for trigger in triggers if isinstance(trigger, str)],
+                "created": time.time() if now is None else now}
 
-        配对试验已经按同一输入执行过 baseline（旧策略+旧技能）与 strategy_only
-        （新策略、未带技能），因此只补跑缺少的两种配置，并把四行结果交给
+    def ablate(self, project, directory, run, config, current, proposal, candidate, trials):
+        """在出现组合收益的输入上补跑 strategy_only 与 skill_only 两种配置。
+
+        配对试验已经按同一输入执行过 baseline（旧策略+旧技能）与 combined
+        （新策略+候选技能），因此只补跑缺少的两种单因子配置，并把四行结果交给
         attribution()。任何缺口都保留 insufficient_evidence，不自动归因。
         """
         record = {"state": "insufficient_evidence", "configurations": list(ABLATION_CONFIGURATIONS),
@@ -360,10 +402,7 @@ class Evolution:
         if not wins:
             record["reason"] = "No joint validation gain was observed, so no ablation input was scheduled"
             return record
-        skill = {"content": str(proposal.get("guidance", ""))[:2000],
-                 "evidence": {"candidate": candidate, "ablation": True},
-                 "triggers": [trigger for trigger in proposal["triggers"] if isinstance(trigger, str)],
-                 "created": time.time()}
+        skill = self.candidate_skill(candidate, proposal)
         guide = [c for c in current if c["kind"] != proposal["kind"]] + [
             {"kind": proposal["kind"], "content": proposal}]
         # 四配置的既有技能按实验开始时的基线策略固定，不从各变体的 guide 推导：
@@ -386,21 +425,21 @@ class Evolution:
                     continue
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled")
+                strategy_only = self.run_configuration(run, project, row, spec, "strategy_only", trial["repetition"],
+                                                       guide, directory, candidate, config, branch="ablation",
+                                                       experiment_skills=None, baseline_ids=baseline_ids)
+                if self.runtime.is_cancelled(run):
+                    raise Cancelled("Evolution cancelled")
                 skill_only = self.run_configuration(run, project, row, spec, "skill_only", trial["repetition"],
                                                     current, directory, candidate, config, branch="ablation",
                                                     experiment_skills=[skill], baseline_ids=baseline_ids)
-                if self.runtime.is_cancelled(run):
-                    raise Cancelled("Evolution cancelled")
-                combined = self.run_configuration(run, project, row, spec, "combined", trial["repetition"],
-                                                  guide, directory, candidate, config, branch="ablation",
-                                                  experiment_skills=[skill], baseline_ids=baseline_ids)
                 record["rows"].extend([
                     {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"]},
-                    {"input": trial["case"], "variant": "strategy_only", "pass": trial["candidate"]["pass"]},
+                    {"input": trial["case"], "variant": "strategy_only", "pass": strategy_only["pass"]},
                     {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"]},
-                    {"input": trial["case"], "variant": "combined", "pass": combined["pass"]}])
+                    {"input": trial["case"], "variant": "combined", "pass": trial["candidate"]["pass"]}])
                 record["trials"].append({"case": trial["case"], "repetition": trial["repetition"],
-                                         "skill_only": skill_only, "combined": combined})
+                                         "strategy_only": strategy_only, "skill_only": skill_only})
         except Cancelled:
             raise
         except Exception as exc:
@@ -1078,6 +1117,8 @@ class Evolution:
         # 四配置的既有技能必须来自同一批基线策略：稳定版与候选版 guide 不同，
         # 若各自推导技能集合，strategy_only 会连带丢掉被替换策略的旧技能。
         baseline_ids = {c["id"] for c in current if c.get("id")}
+        candidate_skill = self.candidate_skill(candidate, proposal) if ablation else None
+        experiment_skills = [candidate_skill] if candidate_skill else None
         try:
             for split in ["validation", "holdout"]:
                 selected = selection[split]
@@ -1095,6 +1136,7 @@ class Evolution:
                             guide = current if variant == "stable" else [c for c in current if c["kind"] != proposal["kind"]] + [{"kind": proposal["kind"], "content": proposal}]
                             trial[variant] = self.run_configuration(run, project, case, spec, variant, repetition,
                                                                     guide, directory, candidate, config,
+                                                                    experiment_skills=experiment_skills if variant == "candidate" else None,
                                                                     baseline_ids=baseline_ids)
                         evidence["trials"].append(trial)
                         self.save(candidate, "evaluating", evidence)
