@@ -19,6 +19,15 @@ TERMINAL = {"workflow_succeeded", "failed", "dispatch_unknown", "blocked", "reru
 RERUN_CONFIRM_SECONDS = 300
 RECONCILIATION_UNKNOWN = {"dispatch_unknown", "rerun_unknown"}
 RECONCILIATION_AUDIT_LIMIT = 10
+# A read-only query may read ten 100-run pages. Persist only the bounded
+# evidence reconciliation reads (identity, status, timestamps) and cap the
+# retained list, so one operation's settings never grow with the page size.
+RECONCILIATION_CANDIDATE_LIMIT = 20
+RECONCILIATION_SELECTABLE_LIMIT = 200
+RECONCILIATION_AUDIT_FIELDS = (
+    "at", "source", "selected_run_id", "repository", "workflow", "ref",
+    "operation_id", "sha", "workflow_sha", "candidate_count", "candidates", "previous",
+)
 
 
 class ReconciliationRejected(ValueError):
@@ -325,10 +334,36 @@ def _candidate_identity_mismatch(data, candidate):
     return None
 
 
+def _bounded_candidates(candidates):
+    """Keep the leading candidates from the read-only query within the retained limit."""
+    return [item for item in candidates if isinstance(item, dict)][:RECONCILIATION_CANDIDATE_LIMIT]
+
+
+def _audit_entry(value):
+    """Rebuild one manual-reconciliation audit from the bounded evidence schema.
+
+    Older records also carried the untouched GitHub page; rebuilding the entry
+    drops those raw payloads while keeping identity, status and timestamps.
+    """
+    if not isinstance(value, dict):
+        return None
+    entry = {field: value[field] for field in RECONCILIATION_AUDIT_FIELDS if field in value}
+    candidates = value.get("candidates")
+    candidates = [item for item in candidates if isinstance(item, dict)] if isinstance(candidates, list) else []
+    total = value.get("candidate_count")
+    entry["candidates"] = candidates[:RECONCILIATION_CANDIDATE_LIMIT]
+    entry["candidate_count"] = total if type(total) is int and total >= len(candidates) else len(candidates)
+    previous = value.get("previous")
+    entry["previous"] = previous if isinstance(previous, dict) else {}
+    return entry
+
+
 def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
-    candidates = [item for item in (_candidate(repo, remote) for remote in remotes or []) if item]
+    found = [item for item in (_candidate(repo, remote) for remote in remotes or []) if item]
+    candidates = _bounded_candidates(found)
     data["reconciliation"] = {
         "state": state,
+        "candidate_count": len(found),
         "candidate_run_ids": [item["id"] for item in candidates],
         "candidates": candidates,
         "checked_at": checked_at if checked_at is not None else time.time(),
@@ -369,7 +404,7 @@ def reconcile(runtime, run, kind, data, persist=True):
     remote = (api(repo, "actions/runs/" + str(data["workflow_run_id"])) if data.get("workflow_run_id")
               else find_remote(repo, data))
     if not remote:
-        return data
+        return save(runtime, run, kind, data) if persist else data
     if (remote.get("head_sha") != data["workflow_sha"] or remote.get("display_title") != data["operation_id"] or
             remote.get("event") != "workflow_dispatch" or remote.get("path", "").split("@")[0] != data["workflow"]):
         raise ValueError("Workflow run identity differs from the authorized operation")
@@ -459,9 +494,12 @@ def _require_unknown(target_data):
         raise ReconciliationRejected("Manual reconciliation is only available while a workflow start or retry is unconfirmed")
 
 
-def _reconciliation_view(kind, target, data, repo):
+def _reconciliation_view(kind, target, data, repo, selectable=None):
     reconciliation = data.get("reconciliation") if isinstance(data.get("reconciliation"), dict) else {}
-    return {
+    total = reconciliation.get("candidate_count")
+    if total is None or not isinstance(total, int):
+        total = len(selectable) if isinstance(selectable, list) else len(reconciliation.get("candidates") or [])
+    view = {
         "kind": kind,
         "target": target,
         "state": data.get("state"),
@@ -474,9 +512,13 @@ def _reconciliation_view(kind, target, data, repo):
         "workflow_sha": data.get("workflow_sha"),
         "checked_at": reconciliation.get("checked_at"),
         "reason": reconciliation.get("reason") or data.get("error", ""),
+        "candidate_count": total,
         "candidates": reconciliation.get("candidates") or [],
         "manual_reconciliation": data.get("manual_reconciliation"),
     }
+    if selectable is not None:
+        view["selectable_candidates"] = [item for item in selectable if isinstance(item, dict)][:RECONCILIATION_SELECTABLE_LIMIT]
+    return view
 
 
 def candidates(runtime, project_id, run_id, kind, target="operation"):
@@ -522,8 +564,8 @@ def candidates(runtime, project_id, run_id, kind, target="operation"):
             current_target = current.get("rollback") if target == "rollback" else current
             if not isinstance(current_target, dict):
                 raise ReconciliationRejected("Automation changed during reconciliation; reload before checking again") from None
-            return _reconciliation_view(kind, target, current_target, repo)
-        return _reconciliation_view(kind, target, target_data, repo)
+            return _reconciliation_view(kind, target, current_target, repo, selectable=normalized)
+        return _reconciliation_view(kind, target, target_data, repo, selectable=normalized)
 
 
 def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operation", source="console"):
@@ -575,7 +617,8 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             if attempt is None or attempt <= previous:
                 raise ReconciliationRejected("GitHub has not confirmed a new attempt for this rerun; do not repeat the rerun request")
         now = time.time()
-        audit = {
+        original = encode(data)
+        audit = _audit_entry({
             "at": now,
             "source": origin,
             "selected_run_id": selected,
@@ -585,20 +628,21 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             "operation_id": target_data.get("operation_id"),
             "sha": target_data.get("sha"),
             "workflow_sha": target_data.get("workflow_sha"),
+            "candidate_count": len(normalized),
             "candidates": normalized,
-            "raw_candidates": remotes[:100],
             "previous": {
                 "state": target_data.get("state"),
+                "reconciliation_state": (target_data.get("reconciliation") or {}).get("state"),
                 "error": target_data.get("error", ""),
                 "checked_at": target_data.get("checked_at"),
                 "candidate_run_ids": (target_data.get("reconciliation") or {}).get("candidate_run_ids", []),
             },
-        }
-        original = encode(data)
+        })
         target_data["workflow_run_id"] = selected
         target_data["manual_reconciliation"] = audit
         history = target_data.get("manual_reconciliations")
-        target_data["manual_reconciliations"] = ([*history] if isinstance(history, list) else [])[-(RECONCILIATION_AUDIT_LIMIT - 1):] + [audit]
+        retained = [_audit_entry(item) for item in history] if isinstance(history, list) else []
+        target_data["manual_reconciliations"] = [item for item in retained if item][-(RECONCILIATION_AUDIT_LIMIT - 1):] + [audit]
         _record_reconciliation(target_data, repo, [candidate], "selected",
                                "An operator selected this workflow run from the server-returned candidates. Its status is read from GitHub; this never starts or repeats a run.", checked_at=now)
         try:
