@@ -47,6 +47,8 @@ flowchart TD
 
 The scheduler waits between scans; queued tasks proceed when ready. Delivery defaults to local candidates. Projects explicitly authorize automatic PRs and merging. Missing or failed CI, required reviews, changed commits and conflicts block merging; admin bypass is never used. Release and deployment require separately authorized pinned workflows; selecting them does not change existing PR or merge settings. Merge checks, release, deployment and health checks have distinct outcomes: a successful workflow does not establish verified deployment health. Strategy evolution uses a separate protected experiment loop and cannot rewrite permissions or acceptance rules.
 
+After deployment health checks fail, choose “Recheck health” in task details. This observes the current deployment again without dispatching another workflow. Once healthy, stale rollback warnings are cleared while the existing rollback target is retained.
+
 ## Code quality gates
 
 Implementation and review use separate sessions with different permissions. Review can use a different provider. All six review areas require reasoned assessments; actionable findings include severity, file, line, impact and a suggested change. Reports appear in task details.

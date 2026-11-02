@@ -847,6 +847,8 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
             if observed == "healthy":
+                for field in ("rollback_unavailable", "rollback_blocked_reason", "rollback_recovery_notes"):
+                    data.pop(field, None)
                 stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
                           {"sha": data["sha"], "run": run["id"], "health": report})
                 try:
@@ -1245,7 +1247,8 @@ def retry(runtime, project_id, run_id, kind):
                 raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
             expected_health = encode(data)
             data.update(state="workflow_succeeded", error="", health_attempts=0)
-            for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate"):
+            for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate",
+                          "rollback_unavailable", "rollback_blocked_reason", "rollback_recovery_notes"):
                 data.pop(field, None)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy)

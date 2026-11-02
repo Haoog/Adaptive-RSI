@@ -144,6 +144,9 @@ Explicit confirmation is required to reset invalid project settings
 Project configuration is valid; reset is unavailable
 Project configuration must be a JSON object
 Configuration must be an object
+Post-merge verification must pass for the exact target commit before retrying delivery
+A newer deployment owns this target; stale delivery cannot be retried
+Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation
 """.strip().splitlines())
 
 
