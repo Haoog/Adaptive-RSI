@@ -540,7 +540,9 @@ class StorageAcceptanceTest(unittest.TestCase):
         with redirect_stdout(stdout):
             cli.main(['--state-dir', str(self.store.root), 'rehearse', str(source), '--report', str(custom_report)])
         output = json.loads(stdout.getvalue())
-        self.assertEqual(output['report_path'], str(custom_report))
+        # CLI 返回规范化后的绝对路径；macOS 上 self.root 的 /var 前缀会解析到
+        # /private/var，两者指向同一文件。
+        self.assertEqual(output['report_path'], str(custom_report.resolve()))
         self.assertTrue(custom_report.is_file())
         self.assertEqual(custom_report.stat().st_mode & 0o777, 0o600)
 
@@ -806,7 +808,8 @@ class StorageAcceptanceTest(unittest.TestCase):
                 # Temp file exists, in same directory, with valid new JSON
                 src_path = Path(src)
                 self.assertTrue(src_path.is_file())
-                self.assertEqual(src_path.parent, custom_report.parent)
+                # /var 与 /private/var 在 macOS 指向同一目录；统一规范化后比较父目录。
+                self.assertEqual(src_path.parent.resolve(), custom_report.parent.resolve())
                 self.assertTrue(src_path.name.startswith("."))
                 self.assertTrue(json.loads(src_path.read_text(encoding='utf-8'))['valid'])
                 interception_verified = True
