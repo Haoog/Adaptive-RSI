@@ -1,3 +1,4 @@
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -5,6 +6,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -21,6 +23,13 @@ CACHE_BYTE_LIMIT = 4 * 1024 * 1024 * 1024
 CACHE_IDLE_SECONDS = 24 * 60 * 60
 STAGING_MAX_AGE_SECONDS = 24 * 60 * 60
 SEED_DIGEST_PREFIX = b"adaptive-rsi-dependencies-v2\0"
+# Linux FICLONE clones a file's extents; macOS clonefile(2) does the same on
+# APFS. A clone is a private inode sharing unchanged blocks, so restoring the
+# immutable seed into a workspace costs metadata instead of a full tree write.
+# Filesystems without the feature (ext4, tmpfs, cross-device targets) raise and
+# are remembered here so later files in the same tree take the plain copy path.
+FICLONE = 0x40049409
+_NO_CLONE_DEVICES = set()
 
 
 def _seed_root(source, relative):
@@ -462,6 +471,66 @@ def prepare_cached(source, cache, config, tools):
         _discard(staging)
 
 
+def _clone_file(source, target):
+    """Clone one regular file's blocks into a fresh ``target`` inode.
+
+    Raises OSError when the filesystem or platform cannot clone; the caller
+    then copies the bytes instead. The target never pre-exists, so a failed
+    attempt removes the empty file it created rather than leaving a stub.
+    """
+    if sys.platform == "darwin":
+        library = ctypes.CDLL(None, use_errno=True)
+        if library.clonefile(os.fsencode(str(source)), os.fsencode(str(target)), 0) == 0:
+            return
+        code = ctypes.get_errno()
+        raise OSError(code, "clonefile: " + os.strerror(code))
+    with open(source, "rb") as reader:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fcntl.ioctl(descriptor, FICLONE, reader.fileno())
+        except OSError:
+            os.close(descriptor)
+            os.unlink(target)
+            raise
+        os.close(descriptor)
+
+
+def _clone_or_copy(source, target):
+    """``copytree`` copy function: clone shared blocks, else write a real copy."""
+    if not stat.S_ISREG(os.stat(source).st_mode):
+        # copytree only routes non-directories here; anything that is not a
+        # regular file must keep raising the same SpecialFileError as before.
+        return shutil.copy2(source, target)
+    device = os.stat(os.path.dirname(str(target))).st_dev
+    if device not in _NO_CLONE_DEVICES:
+        try:
+            _clone_file(source, target)
+        except OSError:
+            _NO_CLONE_DEVICES.add(device)
+        else:
+            shutil.copystat(source, target)
+            return target
+    return shutil.copy2(source, target)
+
+
+def clone_supported(directory):
+    """Whether files written under ``directory`` can be cloned copy-on-write."""
+    directory = Path(directory)
+    if directory.stat().st_dev in _NO_CLONE_DEVICES:
+        return False
+    try:
+        with tempfile.TemporaryDirectory(dir=directory) as probe:
+            source, target = Path(probe) / "source", Path(probe) / "target"
+            source.write_bytes(b"adaptive-rsi-clone-probe")
+            try:
+                _clone_file(source, target)
+            except OSError:
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def restore(source, target, config):
     if not source:
         return
@@ -470,7 +539,12 @@ def restore(source, target, config):
         if destination.exists() or destination.is_symlink():
             raise RuntimeError("Candidate/seed dependency overlap: " + relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(Path(source) / relative, destination, symlinks=True)
+        # The seed is immutable for the whole run, so the run workspace and every
+        # evaluation stage may share its blocks. Each destination keeps its own
+        # inode: a write there is allocated on demand and never reaches another
+        # copy, and filesystems without clone support get a full copy.
+        shutil.copytree(Path(source) / relative, destination, symlinks=True,
+                        copy_function=_clone_or_copy)
         # Cache storage is immutable; each workspace owns an independently writable
         # copy. Never hardlink dependency files between tasks.
         for path in [destination] + list(destination.rglob("*")):
