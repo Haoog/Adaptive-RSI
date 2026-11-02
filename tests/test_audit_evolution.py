@@ -456,6 +456,63 @@ class AuditEvolutionTest(unittest.TestCase):
         (overlay / 'empty').mkdir()
         self.assertNotEqual(executable, Evolution.overlay_digest(overlay))
 
+    def test_case_with_unavailable_overlay_is_excluded_before_sealing(self):
+        """overlay 被清理的用例不得进入实验：缺失目录只会被静默跳过，试验会缺受保护输入。"""
+        args = self.setup_proposal()
+        from tests.test_runtime import CHECKS
+        from adaptive_rsi.gitops import git
+        repo = args[1]
+        base = git(repo, 'rev-parse', 'HEAD')
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('missing-overlay', 'p', 'overlay-family', 'validation',
+                            encode({'task': 'overlay task', 'base': base, 'checks': CHECKS,
+                                    'repository': str(repo), 'overlay': str(self.root / 'cleaned-overlay')}), 0, 0))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        events = self.store.query("SELECT data FROM events WHERE kind='evolution_overlay_unavailable'")
+        self.assertEqual([json.loads(row['data'])['cases'] for row in events], [['missing-overlay']])
+        sealed = self.store.one("SELECT evidence FROM candidates WHERE project='p' AND kind='strategy' "
+                                "ORDER BY created DESC LIMIT 1")
+        manifest = json.loads(sealed['evidence'])['dataset']['manifest']
+        self.assertEqual(sorted(item['case'] for item in manifest), ['holdout', 'validation'])
+        self.assertEqual(self.store.one("SELECT uses FROM cases WHERE id='missing-overlay'")['uses'], 0)
+
+    def test_manifest_sealed_while_overlay_was_unavailable_is_not_valid(self):
+        """封存时 overlay 已取不到摘要（None），之后仍是 None 也不等于输入未变。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        missing = self.root / 'cleaned-overlay'
+        spec = {'task': 'fix add', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'repository': str(repo), 'overlay': str(missing)}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case', 'p', 'f', 'holdout', encode(spec), 0, 1))
+        item = {'case': 'case', 'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                'tree': git(repo, 'rev-parse', spec['base'] + '^{tree}'), 'checks': fingerprint(CHECKS),
+                'overlay': None}
+        result = self.evolution.verify_inputs('p', [item])
+        self.assertFalse(result['valid'])
+        self.assertEqual([row['case'] for row in result['mismatches']], ['case'])
+        # 未配置 overlay 的用例不受影响：判为不可用只针对配置了却取不到的目录。
+        plain = {**spec, 'overlay': None}
+        self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(plain), 'case'))
+        self.assertTrue(self.evolution.verify_inputs('p', [{**item, 'spec': fingerprint(plain)}])['valid'])
+
+    def test_trial_with_vanished_overlay_cannot_be_recorded_as_pass(self):
+        """封存后 overlay 才消失时，试验必须判为不可完成，不能沿用候选自身的 pass。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        self.evolution.runtime.execute_candidate = lambda *a, **k: {'decision': 'pass', 'reason': 'ok'}
+        spec = {'task': 'overlay task', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'repository': str(repo), 'overlay': str(self.root / 'cleaned-overlay')}
+        result = self.evolution.run_configuration(
+            {'id': 'run', 'task': 'task'}, {'id': 'p'}, {'id': 'case', 'family': 'f', 'split': 'validation'},
+            spec, 'combined', 0, '', self.root / 'run', 'candidate', {'evolution': {'max_holdout_uses': 1}})
+        self.assertFalse(result['pass'])
+        self.assertEqual(result['review'], {})
+        self.assertIn('overlay is unavailable', result['reason'])
+
     def test_plan_tamper_and_incomplete_execution_are_rejected(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         sealed = {'data': data, 'sha256': fingerprint(data)}
