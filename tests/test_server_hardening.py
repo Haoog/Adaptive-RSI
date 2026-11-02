@@ -9,12 +9,14 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.catalog import CatalogError
+from adaptive_rsi.operations import Operations
 from adaptive_rsi.server import Handler, Server
 from adaptive_rsi.store import Store
 
@@ -26,6 +28,8 @@ class ServerHardeningTest(unittest.TestCase):
         self.store = Store(self.root / "state")
         self.runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
                                        updates=SimpleNamespace(require_ready=lambda: None))
+        self.runtime.operations = Operations(self.runtime)
+        self.addCleanup(self.runtime.operations.close)
         self.server = Server(self.runtime)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
@@ -232,6 +236,50 @@ class ServerHardeningTest(unittest.TestCase):
             gate.release()
             gate.release()
         self.assertEqual(self.request("/api/backup?id=" + self.identifier)[0], 200)
+
+    def test_backup_copy_outside_scheduler_lock_stays_visible_to_update_admission(self):
+        from adaptive_rsi import storage_tools
+        from adaptive_rsi.lifecycle import readiness
+
+        started, release = threading.Event(), threading.Event()
+        pauses, answers = [], []
+
+        def slow_backup(store, **kwargs):
+            started.set()
+            release.wait(5)
+            return {"id": "b" * 16, "bytes": 1, "created": 0.0}
+
+        self.runtime.pause = lambda project, paused: pauses.append((project, paused))
+        self.runtime.model_center = SimpleNamespace(busy=0, catalog_inflight=set())
+        self.runtime.auth_sessions = SimpleNamespace(busy=0)
+        self.runtime.import_in_progress = False
+        self.runtime.maintenance_lock = threading.Lock()
+        self.runtime.updates.desktop_managed = True
+        poster = threading.Thread(target=lambda: answers.append(self.request("/api/backup", "POST")), daemon=True)
+        with patch.object(storage_tools, "backup", slow_backup):
+            poster.start()
+            self.assertTrue(started.wait(5), "备份桩未进入拷贝阶段")
+            try:
+                # 拷贝在 dispatch_lock 之外进行，调度与暂停请求不再被整库拷贝冻结。
+                clock = time.monotonic()
+                status, _, _ = self.request("/api/pause", "POST", {"project": "p", "paused": True})
+                self.assertEqual(status, 200)
+                self.assertLess(time.monotonic() - clock, 1.0, "备份期间 /api/pause 被 dispatch_lock 阻塞")
+                self.assertEqual(pauses, [("p", True)])
+                # 锁外拷贝必须在同一临界区内登记为在办工作，桌面更新不得在它结束前 commit。
+                self.assertTrue(self.runtime.operations.busy())
+                prepared = readiness(self.runtime, "prepare", "9.0.0")
+                self.assertFalse(prepared["ready"])
+                self.assertIn("background_operations", prepared["reasons"])
+                with self.assertRaisesRegex(ValueError, "active operations"):
+                    readiness(self.runtime, "commit", lease=prepared["barrier"]["lease"])
+            finally:
+                release.set()
+            poster.join(5)
+        self.assertEqual(answers[0][0], 200)
+        self.assertFalse(self.runtime.operations.busy())
+        committed = readiness(self.runtime, "commit", lease=prepared["barrier"]["lease"])
+        self.assertEqual(committed["barrier"]["phase"], "installing")
 
     def test_backup_read_and_write_sizes_are_bounded_and_disconnect_releases_gate(self):
         self.backup.write_bytes(b"a" * (192 * 1024))

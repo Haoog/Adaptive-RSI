@@ -750,6 +750,8 @@ class AuthSessions:
         self.discoveries = set()
         self.threads = set()
         self.closed = False
+        # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
+        self._close_error = None
         self.shutdown = threading.Event()
         self.ttl = ttl
         self.config = config
@@ -963,7 +965,13 @@ class AuthSessions:
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
                                          "state": "starting", "expires_at": self.now() + self.ttl, "error": "",
                                          "_reserved": True}
-            self._persist()
+            try:
+                self._persist()
+            except OSError:
+                # 状态文件写失败时不能留下只在内存里的会话：它会让同一后端在 TTL 内
+                # 持续 auth_busy，而调用方只收到一次写入错误。
+                self.sessions.pop(session_id, None)
+                raise
             # 认证状态即将变化，缓存的供应商发现结果不再可靠。
             self._invalidate_caches(backend)
         return self._public(self.sessions[session_id])
@@ -995,16 +1003,29 @@ class AuthSessions:
         self._thread(lambda: self._run(session_id, method, inputs))
         return self.status(session_id)
 
+    @staticmethod
+    def _terminate(item, **values):
+        """就地写入新状态，并在终态清掉只对进行中会话有效的交互字段。"""
+        item.update(values)
+        if item["state"] in TERMINAL:
+            for field in ("verification_url", "user_code", "instructions", "_code"):
+                item.pop(field, None)
+
     def _update(self, session_id, **values):
         with self.lock:
             item = self.sessions[session_id]
             if item["state"] not in ACTIVE:
                 return False
-            item.update(values)
-            if item["state"] in TERMINAL:
-                for field in ("verification_url", "user_code", "instructions", "_code"):
-                    item.pop(field, None)
-            self._persist()
+            previous = dict(item)
+            self._terminate(item, **values)
+            try:
+                self._persist()
+            except OSError:
+                # 写盘失败时把内存回滚到旧值：调用方会收到异常，若内存停在新状态，
+                # busy/准入会按一份从未落盘的状态拒绝后续登录（内存终态、磁盘旧态）。
+                item.clear()
+                item.update(previous)
+                raise
             return True
 
     def _run(self, session_id, method, inputs):
@@ -1237,9 +1258,17 @@ class AuthSessions:
             self.status_cache.clear()
             workers = list(self.workers.values())
             discoveries = list(self.discoveries)
-            for key, item in self.sessions.items():
+            first_error = None
+            for key, item in list(self.sessions.items()):
                 if item["state"] in ACTIVE:
-                    self._update(key, state="interrupted", error="process_interrupted")
+                    try:
+                        self._update(key, state="interrupted", error="process_interrupted")
+                    except OSError as exc:
+                        # 状态文件不可写不能中断关闭：内存就地落到终态（worker 确实被中断），
+                        # 磁盘旧记录交给下次启动把 ACTIVE 归一化为 interrupted。
+                        first_error = first_error or exc
+                        self._terminate(item, state="interrupted", error="process_interrupted")
+            self._close_error = first_error
             threads = list(self.threads)
         for worker, stop in workers:
             stop.set()
