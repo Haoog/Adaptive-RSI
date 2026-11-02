@@ -377,6 +377,28 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"private-secret-field", body)
         self.assertIn(b"core, candidates or analytics", body)
 
+    def test_feedback_overview_is_read_only_and_project_scoped(self):
+        for candidate, project in [("feedback-p", "p"), ("feedback-q", "q")]:
+            self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               (candidate, project, "strategy", "stable", "{}", "{}", 1))
+        self.store.event("monitor_feedback", "fixture", "p", None,
+                         {"candidate": "feedback-p", "label": "false_positive", "source": "human:alice"})
+        self.store.event("monitor_feedback", "fixture", "q", None,
+                         {"candidate": "feedback-q", "label": "rejected", "source": "human:bob"})
+        before = self.store.one("SELECT evidence,status FROM candidates WHERE id=?", ("feedback-p",))
+        status, _, payload = self.request("/api/monitoring-feedback?project=p")
+        self.assertEqual(status, 200)
+        body = json.loads(payload)
+        self.assertEqual(body["samples"], 1)
+        self.assertEqual(body["sources"], {"human:alice": 1})
+        self.assertEqual(body["labeled_candidates"], 1)
+        self.assertFalse(body["automatic_threshold_changes"])
+        self.assertTrue(body["read_only"])
+        after = self.store.one("SELECT evidence,status FROM candidates WHERE id=?", ("feedback-p",))
+        self.assertEqual(after["evidence"], before["evidence"])
+        self.assertEqual(after["status"], before["status"])
+
 
 if __name__ == "__main__":
     unittest.main()
