@@ -1022,7 +1022,10 @@ class Store:
         for row in rows:
             self.transition(row["id"], "interrupted", {"reason": "Runtime restarted; artifacts retained. Retry creates a fresh isolated run."}, True)
         self.execute("UPDATE calls SET state='interrupted' WHERE state='reserved'")
-        self.execute("UPDATE candidates SET status='interrupted' WHERE status IN ('proposing','evaluating')")
+        # 提案预留实际写入 status='reserved'；'proposing' 只为兼容历史数据库保留。
+        # 启动恢复必须一并中断，否则重启后残留预留会阻塞该项目一小时。
+        self.execute("UPDATE candidates SET status='interrupted' "
+                     "WHERE status IN ('reserved','proposing','evaluating')")
         return len(rows)
 
     def catalog_entry(self, project, provider_id, signature, legacy_signature):
