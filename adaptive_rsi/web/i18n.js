@@ -822,6 +822,7 @@ const english = {
   "下载被重定向到非官方地址，已拒绝继续下载。": "Untrusted update redirect",
   "下载新版本超时，已停止下载。请检查网络后重试。": "Release download exceeded the total time budget",
   "更新包超过大小限制，已停止下载。": "Release asset exceeds size limit",
+  "补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。": "The patch exceeds the 2 MiB preview limit; download it from the run directory.",
   "仅支持 x.y.z 形式的正式稳定版本，无法识别该发布的版本号。": "Only stable major.minor.patch releases are supported",
   "该发布缺少插件 ZIP 或 SHA-256 校验文件，无法安装。": "Release is missing its plugin ZIP or SHA-256 file",
   "发布附件不属于官方仓库，已拒绝安装。": "Release assets belong to another repository",
