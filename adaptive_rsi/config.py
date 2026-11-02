@@ -48,7 +48,7 @@ DEFAULTS = {
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
                   "min_cases_per_split": 3, "repeats": 2, "max_calls": 0,
-                  "max_cost_ratio": 1.25, "max_holdout_uses": 3,
+                  "max_cost_ratio": 1.25, "max_holdout_uses": 3, "ablation_cases": 1,
                   "monitor_tasks": 5, "archive_limit": 50},
 }
 
@@ -281,6 +281,9 @@ def validate(config):
                 "max_holdout_uses", "monitor_tasks", "archive_limit"]:
         if not 1 <= evo[key] <= 1000:
             raise ValueError("Invalid evolution limit: " + key)
+    # 0 关闭消融采样；其余与实验规模使用同一上限。
+    if type(evo["ablation_cases"]) is not int or not 0 <= evo["ablation_cases"] <= 1000:
+        raise ValueError("Invalid evolution ablation limit")
     if not 1 <= evo["max_cost_ratio"] <= 10:
         raise ValueError("Invalid evolution cost ratio")
     return config
