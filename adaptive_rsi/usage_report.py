@@ -138,6 +138,8 @@ def report(store, params):
                         JOIN + scope, args)
     try:
         for row in rows:
+            if row["created"] is None:
+                continue
             local = datetime.datetime.fromtimestamp(row["created"], zone).date()
             bucket = buckets.setdefault(local, _bucket())
             bucket["calls"] += 1
@@ -195,7 +197,7 @@ def report(store, params):
     retries_truncated = len(retry_rows) > RETRY_GROUP_LIMIT
     run_retries, task_retries, role_retries, stage_retries = {}, {}, {}, {}
     for row in retry_rows[:RETRY_GROUP_LIMIT]:
-        extra = row["calls"] - 1
+        extra = (row["calls"] or 0) - 1
         run_retries[row["run"]] = run_retries.get(row["run"], 0) + extra
         if row["task"]:
             task_retries[row["task"]] = task_retries.get(row["task"], 0) + extra
@@ -249,8 +251,8 @@ def report(store, params):
             continue
         key = (row["project"], row["kind"], row["role"], row["provider"], row["model"])
         current = reference_groups.setdefault(key, {"calls": 0, "tokens": 0, "model_seconds": 0})
-        current["calls"] += row["calls"]
-        current["tokens"] += row["tokens"]
+        current["calls"] += row["calls"] or 0
+        current["tokens"] += row["tokens"] or 0
         current["model_seconds"] += row["model_seconds"]
     for key, current in sorted(reference_groups.items(), key=lambda item: item[1]["tokens"], reverse=True)[:REFERENCE_GROUPS]:
         project_id, kind, role, provider, model = key

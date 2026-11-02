@@ -314,7 +314,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
                                                     "evidence": json.loads(row["evidence"] or "[]"),
                                                     "acceptance": json.loads(row["acceptance"] or "[]")}
                                                    for row in rows]}]), encode(acceptance),
-                            min(row["priority"] for row in rows), encode(overrides[0]), now, now,
+                            min(row["priority"] or 50 for row in rows), encode(overrides[0]), now, now,
                             max(row["available"] for row in rows), max(row["urgency"] for row in rows)))
                 for row in rows:
                     changed = db.execute("UPDATE tasks SET state='superseded',updated=? WHERE id=? AND state='queued'", (now, row["id"]))

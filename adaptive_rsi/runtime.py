@@ -1608,7 +1608,7 @@ class Runtime(Maintenance):
                     outcome["reason"] = str(exc)
                     # Issue work must wait for synchronization to replace stale evidence.
                     state = "blocked" if source_task["source"] == "issue" else (
-                        "queued" if source_task["attempts"] <= config["limits"]["retries"] else "blocked")
+                        "queued" if (source_task["attempts"] or 0) <= config["limits"]["retries"] else "blocked")
                     with self.store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
                         changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? "
@@ -1779,10 +1779,11 @@ class Runtime(Maintenance):
             if result.get("evaluation", {}).get("improvement", {}).get("decision") == "insufficient_evidence":
                 code = "improvement"
             result = {**result, "failure": {"code": code, "action": "inspect_evidence", "detail": result.get("reason", "")}}
-        retry = state == "failed" and task["attempts"] <= config["limits"]["retries"]
+        attempts = task["attempts"] or 0
+        retry = state == "failed" and attempts <= config["limits"]["retries"]
         task_fields = None
         if retry:
-            delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** task["attempts"])
+            delay = min(FAILURE_BACKOFF_MAX_SECONDS, 60 * 2 ** attempts)
             # run 保留失败证据，任务与退避同事务回队，依赖清理看不到临时 failed。
             task_fields = {"state": "queued", "available": time.time() + delay}
         transitioned = self.store.transition(run["id"], state, result, True, task_fields=task_fields)

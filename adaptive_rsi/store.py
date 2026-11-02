@@ -886,7 +886,14 @@ class Store:
             raise ValueError("Invalid span table")
         for row in db.execute("SELECT id,started FROM " + table + " WHERE run=? AND ended IS NULL", (run,)).fetchall():
             began = self._clock_samples.pop((table, row["id"]), None)
-            elapsed = max(0, time.monotonic() - began if began is not None else now - row["started"])
+            # _clock_samples 命中时用单调时钟；未命中（如重启后）回落到数据库
+            # started 列。两者都为 NULL 时按 0 计，不产生虚假负数时长。
+            if began is not None:
+                elapsed = max(0, time.monotonic() - began)
+            elif row["started"] is not None:
+                elapsed = max(0, now - row["started"])
+            else:
+                elapsed = 0
             db.execute("UPDATE " + table + " SET ended=?,duration=? WHERE id=?", (now, elapsed, row["id"]))
 
     def remote_wait(self, run, reason, now):
