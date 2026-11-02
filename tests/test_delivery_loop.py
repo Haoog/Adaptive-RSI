@@ -549,6 +549,21 @@ print('BOUNDARIES_OK')
         view.assert_not_called()
         remote.assert_not_called()
 
+    def test_schedule_does_not_reset_a_running_delivery_task(self):
+        from adaptive_rsi.delivery import schedule
+        self.tracked_pr()
+        self.store.add_task(self.project, "system_delivery", "system:delivery",
+                            "PR tracking and post-merge verification", priority=110)
+        row = self.store.one("SELECT id FROM tasks WHERE project=? AND fingerprint='system:delivery'", (self.project,))
+        now = time.time()
+        for index, state in enumerate(["executing", "evaluating"]):
+            self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, row["id"]))
+            schedule(self.runtime, now + 61 * index)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], state)
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (row["id"],))
+        schedule(self.runtime, now + 122)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], "queued")
+
     def test_pending_close_does_not_repeat_write_when_remote_state_is_unknown_or_merged(self):
         run = self.tracked_pr()
         outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
