@@ -17,6 +17,7 @@ from unittest.mock import patch
 from urllib.parse import quote
 
 from adaptive_rsi.catalog import CatalogError
+from adaptive_rsi.operations import Operations
 from adaptive_rsi.server import Handler, Server
 from adaptive_rsi.store import Store
 
@@ -28,6 +29,8 @@ class ServerHardeningTest(unittest.TestCase):
         self.store = Store(self.root / "state")
         self.runtime = SimpleNamespace(store=self.store, dispatch_lock=threading.RLock(),
                                        updates=SimpleNamespace(require_ready=lambda: None))
+        self.runtime.operations = Operations(self.runtime)
+        self.addCleanup(self.runtime.operations.close)
         self.server = Server(self.runtime)
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
@@ -538,6 +541,50 @@ class ServerHardeningTest(unittest.TestCase):
             self.assertEqual(json.loads(payload)["error_code"], "update_in_progress")
         self.assertEqual(checked, [True, True])
         self.assertEqual(list(self.backups.glob("*.sqlite3")), [])
+
+    def test_storage_copies_block_update_commit_until_the_request_finishes(self):
+        from adaptive_rsi import storage_tools
+        from adaptive_rsi.lifecycle import readiness
+        from adaptive_rsi.updates import UpdateManager
+        updates = object.__new__(UpdateManager)
+        updates.runtime, updates.store = self.runtime, self.store
+        self.runtime.updates.desktop_managed = True
+        self.runtime.model_center = SimpleNamespace(busy=0, catalog_inflight=())
+        self.runtime.auth_sessions = SimpleNamespace(busy=0)
+        self.runtime.import_in_progress = False
+        self.runtime.maintenance_lock = threading.Lock()
+        self.runtime.wake = threading.Event()
+        for endpoint, function, fails in [('/api/backup', 'backup', False),
+                                           ('/api/rehearse-restore', 'rehearse_restore', True)]:
+            with self.subTest(endpoint=endpoint):
+                entered, release = threading.Event(), threading.Event()
+                responses = []
+                def copy(*args, **kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+                    if fails:
+                        raise ValueError('fixture copy failure')
+                    return {'id': self.identifier}
+                poster = threading.Thread(target=lambda: responses.append(
+                    self.request(endpoint, 'POST', {'id': self.identifier})), daemon=True)
+                with patch.object(storage_tools, function, side_effect=copy):
+                    poster.start()
+                    self.assertTrue(entered.wait(2))
+                    try:
+                        prepared = readiness(self.runtime, 'prepare', '0.5.999')
+                        self.assertFalse(prepared['ready'])
+                        self.assertIn('background_operations', prepared['reasons'])
+                        self.assertTrue(updates.work_busy())
+                        with self.assertRaisesRegex(ValueError, 'active operations'):
+                            readiness(self.runtime, 'commit', lease=prepared['barrier']['lease'])
+                    finally:
+                        release.set()
+                        poster.join(3)
+                self.assertFalse(poster.is_alive())
+                self.assertTrue(readiness(self.runtime)['ready'])
+                self.assertFalse(updates.work_busy())
+                readiness(self.runtime, 'cancel', lease=prepared['barrier']['lease'])
+                self.assertEqual(responses[0][0], 400 if fails else 200)
 
     def test_backup_endpoint_still_publishes_backup_file(self):
         status, _, payload = self.request("/api/backup", "POST")

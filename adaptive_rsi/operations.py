@@ -1,5 +1,6 @@
 """Bounded, inspectable background operations with durable terminal receipts."""
 import concurrent.futures
+import contextlib
 import json
 import logging
 import math
@@ -18,6 +19,7 @@ class Operations:
         self.lock = threading.RLock()
         self.active = {}
         self.progress = {}
+        self.inflight = {}
         self.store.execute("CREATE TABLE IF NOT EXISTS operations "
                            "(id TEXT PRIMARY KEY,kind TEXT,state TEXT,result TEXT,created REAL,ended REAL)")
 
@@ -86,7 +88,28 @@ class Operations:
 
     def busy(self):
         with self.lock:
-            return bool(self.active)
+            return bool(self.active) or bool(self.inflight)
+
+    @contextlib.contextmanager
+    def guard(self, kind):
+        """Register synchronous work that runs outside dispatch_lock.
+
+        Registration happens under dispatch_lock, so no window exists between the
+        admission check and being visible to Updates.work_busy() and
+        lifecycle.readiness(). The finally block clears it even when the work fails,
+        so a failed copy cannot leave the runtime permanently busy.
+        """
+        with self.runtime.dispatch_lock:
+            self.runtime.updates.require_ready()
+            with self.lock:
+                self.inflight[kind] = self.inflight.get(kind, 0) + 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.inflight[kind] -= 1
+                if not self.inflight[kind]:
+                    del self.inflight[kind]
 
     def start(self, kind, parameters):
         if kind not in ("backup", "diagnostics", "probe", "import", "restore-check", "rehearse-restore", "rehearsal"):

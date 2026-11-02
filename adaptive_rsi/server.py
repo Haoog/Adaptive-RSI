@@ -963,37 +963,37 @@ class Handler(BaseHTTPRequestHandler):
                 # 整库页拷贝与恢复演练在几十万任务的库上可持续数十秒。dispatch_lock 只用于
                 # 更新准入检查：backup() 通过 SQLite 在线备份 API 自取一致性快照，不依赖
                 # 应用层锁；若把拷贝留在锁内，调度循环的 claim 与 /api/pause 等请求会被
-                # 一并冻结，直到拷贝结束。
-                with runtime.dispatch_lock:
-                    runtime.updates.require_ready()
-                if path == "/api/backup":
-                    from .storage_tools import backup
-                    result = backup(runtime.store)
-                else:
-                    from .storage_tools import rehearse_restore, rehearsal_report_path
-                    identifier = body.get("id")
-                    if identifier:
-                        if not isinstance(identifier, str) or len(identifier) != 16 or any(
-                                char not in "0123456789abcdef" for char in identifier):
-                            raise RequestError("Invalid backup ID")
-                        source = runtime.store.root / "backups" / (identifier + ".sqlite3")
-                    elif body.get("path") or body.get("file"):
-                        raw_path = body.get("path") or body.get("file")
-                        source = Path(str(raw_path))
+                # 一并冻结，直到拷贝结束。guard() 在同一临界区内登记这段锁外拷贝，使
+                # lifecycle.readiness() 与 Updates.work_busy() 在拷贝期间仍能看到它。
+                with runtime.operations.guard("backup" if path == "/api/backup" else "rehearsal"):
+                    if path == "/api/backup":
+                        from .storage_tools import backup
+                        result = backup(runtime.store)
                     else:
-                        backups = sorted((p for p in (runtime.store.root / "backups").glob("*.sqlite3")
-                                          if p.is_file() and not p.is_symlink()),
-                                         key=lambda p: p.stat().st_mtime, reverse=True)
-                        if not backups:
-                            raise RequestError("No backup available for rehearsal")
-                        source = backups[0]
-                    try:
-                        report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
-                        result = rehearse_restore(source, report_path=report_file, store=runtime.store)
-                    except ValueError as exc:
-                        if "conflicts with database" in str(exc):
-                            raise RequestError("report_conflicts_with_database") from exc
-                        raise RequestError(str(exc)) from exc
+                        from .storage_tools import rehearse_restore, rehearsal_report_path
+                        identifier = body.get("id")
+                        if identifier:
+                            if not isinstance(identifier, str) or len(identifier) != 16 or any(
+                                    char not in "0123456789abcdef" for char in identifier):
+                                raise RequestError("Invalid backup ID")
+                            source = runtime.store.root / "backups" / (identifier + ".sqlite3")
+                        elif body.get("path") or body.get("file"):
+                            raw_path = body.get("path") or body.get("file")
+                            source = Path(str(raw_path))
+                        else:
+                            backups = sorted((p for p in (runtime.store.root / "backups").glob("*.sqlite3")
+                                              if p.is_file() and not p.is_symlink()),
+                                             key=lambda p: p.stat().st_mtime, reverse=True)
+                            if not backups:
+                                raise RequestError("No backup available for rehearsal")
+                            source = backups[0]
+                        try:
+                            report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
+                            result = rehearse_restore(source, report_path=report_file, store=runtime.store)
+                        except ValueError as exc:
+                            if "conflicts with database" in str(exc):
+                                raise RequestError("report_conflicts_with_database") from exc
+                            raise RequestError(str(exc)) from exc
                 self.respond(result)
                 return
             with runtime.dispatch_lock:
