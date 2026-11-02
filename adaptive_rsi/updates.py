@@ -191,6 +191,20 @@ def installed_root(state, fallback):
     return root
 
 
+@contextlib.contextmanager
+def _store_scope(state, store=None):
+    """复用调用方的 Store；仅在独立进程边界自行打开并关闭单个实例。"""
+    if store is not None:
+        yield store
+        return
+    from .store import Store
+    opened = Store(state)
+    try:
+        yield opened
+    finally:
+        opened.close()
+
+
 class UpdateManager:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
@@ -252,7 +266,7 @@ class UpdateManager:
                 return
             if plan is None:
                 self.recovering = False
-                recovery_required(self.store.root, "Restart plan is missing; inspect installations before admitting work")
+                recovery_required(self.store, "Restart plan is missing; inspect installations before admitting work")
             elif self.observe_plan(plan):
                 self.recovering = not supervisor_active(self.store.root)
 
@@ -277,14 +291,14 @@ class UpdateManager:
                     self.recovering = False
                 elif plan is None:
                     self.recovering = False
-                    recovery_required(self.store.root, "Restart plan disappeared before completion; preserve current state and inspect installations")
+                    recovery_required(self.store, "Restart plan disappeared before completion; preserve current state and inspect installations")
                 elif not self.observe_plan(plan):
                     if time.monotonic() >= self.legacy_deadline:
                         latest = self.status()
                         if self.completed(latest):
                             return False
                         if latest.get("state") == "restarting":
-                            recovery_required(self.store.root, "Legacy supervisor did not confirm installation within 90 seconds; preserve current database and inspect installations")
+                            recovery_required(self.store, "Legacy supervisor did not confirm installation within 90 seconds; preserve current database and inspect installations")
                 elif time.time() - float(status.get("checked") or 0) > 5 and not supervisor_active(self.store.root):
                     self.recovering = True
             if self.recovering and self.shutdown is not None:
@@ -562,7 +576,8 @@ def supervise_restart(state):
             return
         if not (installs / "restart.json").exists():
             return
-        _supervise_restart(state)
+        with _store_scope(state) as store:
+            _supervise_restart(state, store)
 
 
 def candidate_health(plan):
@@ -578,10 +593,8 @@ def candidate_health(plan):
 
 
 def complete_rollback(state, plan):
-    from .store import Store
     # 旧运行器仅识别 installed 作为解除屏障的握手；先通过健康检查才发送。
-    store = Store(state)
-    try:
+    with _store_scope(state) as store:
         plan["phase"] = "rollback_ack"
         atomic_json(state / "installations/restart.json", plan)
         status = {"current": __version__, "checked": time.time(),
@@ -603,8 +616,6 @@ def complete_rollback(state, plan):
                 pass
             time.sleep(0.2)
         return False
-    finally:
-        store.close()
 
 
 def process_present(pid):
@@ -619,10 +630,10 @@ def process_present(pid):
         return True
 
 
-def recovery_required(state, reason):
-    from .store import Store
-    Store(state).put_setting("update-status", {"state": "recovery_required", "current": __version__,
-                                              "reason": reason, "checked": time.time()})
+def recovery_required(store, reason):
+    """Record a blocking status on the caller's Store; never open a second handle here."""
+    store.put_setting("update-status", {"state": "recovery_required", "current": __version__,
+                                        "reason": reason, "checked": time.time()})
 
 
 def valid_backup(path):
@@ -644,8 +655,7 @@ def preserve_previous_pointers(state, plan):
     return plan["previous_pointers"]
 
 
-def commit_installation(state, plan):
-    from .store import Store
+def commit_installation(state, plan, store=None):
     installs = state / "installations"
     preserve_previous_pointers(state, plan)
     atomic_json(installs / "active.json", {"path": plan["candidate"], "version": plan["target"], "previous": plan["previous"]})
@@ -655,15 +665,15 @@ def commit_installation(state, plan):
     os.replace(link, installs / "current")
     plan["phase"] = "committed"
     atomic_json(installs / "restart.json", plan)
-    Store(state).put_setting("update-status", {"state": "installed", "current": plan["target"], "checked": time.time()})
+    with _store_scope(state, store) as current:
+        current.put_setting("update-status", {"state": "installed", "current": plan["target"], "checked": time.time()})
     try:
         (state / "update-ready").write_text("ready")
     except OSError:
         pass
 
 
-def _supervise_restart(state):
-    from .store import Store
+def _supervise_restart(state, store):
     import fcntl
     installs = state / "installations"
     plan_path = installs / "restart.json"
@@ -671,9 +681,9 @@ def _supervise_restart(state):
     if plan["pid"] == os.getpid():
         raise RuntimeError("Restart supervisor must be a separate process")
     if plan.get("state_schema", 1) != 1:
-        recovery_required(state, "Unsupported state migration; refusing automatic rollback")
+        recovery_required(store, "Unsupported state migration; refusing automatic rollback")
         return
-    status = Store(state).setting("update-status", {})
+    status = store.setting("update-status", {})
     if status.get("state") == "installed" and plan.get("phase") != "rollback_ack":
         # Work may already have been admitted. An old journal never authorizes rollback.
         plan_path.unlink(missing_ok=True)
@@ -691,31 +701,31 @@ def _supervise_restart(state):
                 if complete_rollback(state, plan):
                     plan_path.unlink(missing_ok=True)
                 else:
-                    recovery_required(state, "Restored service did not acknowledge the health-verified rollback")
+                    recovery_required(store, "Restored service did not acknowledge the health-verified rollback")
                 return
             time.sleep(0.2)
-        recovery_required(state, "Rolled-back service cannot be verified; preserve the database and restart plan")
+        recovery_required(store, "Rolled-back service cannot be verified; preserve the database and restart plan")
         return
     if phase == "committed":
         if candidate_health(plan):
-            commit_installation(state, plan)
+            commit_installation(state, plan, store)
             plan_path.unlink(missing_ok=True)
         else:
-            recovery_required(state, "Committed candidate cannot be verified; preserve current database and inspect the retained restart plan")
+            recovery_required(store, "Committed candidate cannot be verified; preserve current database and inspect the retained restart plan")
         return
     if phase == "health_check" and process_present(plan.get("candidate_pid")):
         deadline = time.monotonic() + RESTART_HEALTH_SECONDS
         while time.monotonic() < deadline and process_present(plan.get("candidate_pid")):
             if candidate_health(plan):
-                commit_installation(state, plan)
+                commit_installation(state, plan, store)
                 plan_path.unlink(missing_ok=True)
                 return
             time.sleep(0.2)
         if process_present(plan.get("candidate_pid")):
-            recovery_required(state, "An unverified candidate is still running; preserve database and inspect the retained restart plan")
+            recovery_required(store, "An unverified candidate is still running; preserve database and inspect the retained restart plan")
             return
     elif phase not in ["prepared", "health_check"]:
-        recovery_required(state, "Unknown restart phase; refusing to overwrite state")
+        recovery_required(store, "Unknown restart phase; refusing to overwrite state")
         return
     # Wait for the old runtime to release its lock, rather than trusting a reused PID.
     with (state / "runtime.lock").open("a+") as lock:
@@ -726,7 +736,7 @@ def _supervise_restart(state):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    recovery_required(state, "A service still owns runtime.lock; inspect the retained restart plan before recovery")
+                    recovery_required(store, "A service still owns runtime.lock; inspect the retained restart plan before recovery")
                     return
                 time.sleep(0.2)
         backup = installs / "state-before-update.sqlite3"
@@ -736,7 +746,7 @@ def _supervise_restart(state):
             plan["backup_ready"] = True
             atomic_json(plan_path, plan)
         if not valid_backup(backup):
-            recovery_required(state, "Recovery backup is missing or corrupt; refusing an unsafe database rollback")
+            recovery_required(store, "Recovery backup is missing or corrupt; refusing an unsafe database rollback")
             return
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -771,11 +781,11 @@ def _supervise_restart(state):
             time.sleep(0.2)
         if not healthy:
             raise RuntimeError("New version failed its startup health check")
-        commit_installation(state, plan)
+        commit_installation(state, plan, store)
     except Exception:
-        if plan.get("phase") == "committed" or Store(state).setting("update-status", {}).get("state") == "installed":
-            if Store(state).setting("update-status", {}).get("state") != "installed":
-                recovery_required(state, "Installation commit was interrupted; preserve current database and restart plan")
+        if plan.get("phase") == "committed" or store.setting("update-status", {}).get("state") == "installed":
+            if store.setting("update-status", {}).get("state") != "installed":
+                recovery_required(store, "Installation commit was interrupted; preserve current database and restart plan")
             return
         if child and child.poll() is None:
             child.terminate()
@@ -796,18 +806,20 @@ def _supervise_restart(state):
             try:
                 fcntl.flock(recovery_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                recovery_required(state, "Another runtime owns the database; recovery plan and database were preserved")
+                recovery_required(store, "Another runtime owns the database; recovery plan and database were preserved")
                 return
             if not valid_backup(backup):
-                recovery_required(state, "Recovery backup is corrupt; current database was preserved")
+                recovery_required(store, "Recovery backup is corrupt; current database was preserved")
                 return
+            # 替换数据库文件前释放监督器连接，避免旧 inode 的 WAL 与恢复文件交错。
+            store.close()
             restore = installs / "state-restore.sqlite3"
             shutil.copy2(backup, restore)
             for suffix in ["-wal", "-shm"]:
                 Path(str(state / "state.sqlite3") + suffix).unlink(missing_ok=True)
             os.replace(restore, state / "state.sqlite3")
         # 健康检查完成前保留调度屏障，避免旧服务启动后提前接纳工作。
-        Store(state).put_setting("update-status", {"state": "restarting", "current": __version__, "version": __version__, "checked": time.time(), "reason": "Verifying restored service"})
+        store.put_setting("update-status", {"state": "restarting", "current": __version__, "version": __version__, "checked": time.time(), "reason": "Verifying restored service"})
         plan.update(phase="rollback_health_check")
         atomic_json(plan_path, plan)
         atomic_json(state / "restart-session.json", session)
@@ -831,13 +843,13 @@ def _supervise_restart(state):
                 pass
             time.sleep(0.2)
         if not previous_healthy:
-            recovery_required(state, "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually")
+            recovery_required(store, "Rolled-back service failed its startup health check; database was restored, inspect server.log and restart manually")
             return
         if not complete_rollback(state, plan):
-            recovery_required(state, "Restored service did not acknowledge the health-verified rollback")
+            recovery_required(store, "Restored service did not acknowledge the health-verified rollback")
             return
     finally:
-        final_state = Store(state).setting("update-status", {}).get("state")
+        final_state = store.setting("update-status", {}).get("state")
         if final_state == "rolled_back" or final_state == "installed" and plan.get("phase") != "rollback_ack":
             plan_path.unlink(missing_ok=True)
         log.close()
