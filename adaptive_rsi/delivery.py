@@ -790,6 +790,12 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     checks = saved["checks"]
     effective = pinned
     output_path("evaluation/report.json")
+    # Post-merge verifications run the project's own fixed checks on committed
+    # trees, so the baseline stage is safe to cache across polls and runs when
+    # the host offers a cross-run execution identity (Docker). Non-Docker hosts
+    # get a None identity and retain today's always-execute behavior.
+    cache_scope = project["id"]
+    cache_base = merged_sha
     reused = previous.get("evaluation") if previous.get("head") == head and isinstance(
         previous.get("evaluation"), dict) else None
     merge_result = None
@@ -809,7 +815,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
                 checks = detect(merge_baseline)["checks"]
             merge_result = runtime.evaluator.evaluate(
                 merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
-                effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[])
+                effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[],
+                cache_scope=cache_scope, cache_base=cache_base)
         merge_record = {"sha": merged_sha,
                         "state": {"pass": "verified", "fail": "regressed"}.get(
                             merge_result["decision"], "insufficient_evidence"),
@@ -824,7 +831,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
                 checks = detect(baseline_tree)["checks"]
             result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
                                                 effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
-                                                changed_files=[])
+                                                changed_files=[], cache_scope=cache_scope, cache_base=cache_base)
     elif reused is not None:
         result = reused
     else:
@@ -843,7 +850,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
             committed = None
         result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
                                             effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
-                                            changed_files=committed)
+                                            changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
