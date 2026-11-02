@@ -525,6 +525,26 @@ class AuthSessionTests(unittest.TestCase):
             manager.close()
         self.assertFalse(manager.status_cache)
 
+    def test_snapshot_reports_container_readiness_for_both_backends(self):
+        for docker, exit_code, error in ((None, 0, 'auth_container_unavailable'),
+                                          ('/fixture/docker', 1, 'auth_worker_image_missing'),
+                                          ('/fixture/docker', 0, None)):
+            with self.subTest(docker=docker, exit_code=exit_code):
+                manager = AuthSessions(self.root / 'readiness', config={'sandbox': {'backend': 'docker'}})
+                try:
+                    with patch('adaptive_rsi.auth_sessions.shutil.which', side_effect=lambda name: docker if name == 'docker' else '/fixture/' + name), \
+                         patch('adaptive_rsi.auth_sessions.run_process', return_value={'exit_code': exit_code, 'error': ''}) as inspect, \
+                         patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                         patch('adaptive_rsi.auth_sessions.auth_providers', return_value=[]):
+                        result = manager.snapshot()
+                    for backend in ('codex', 'opencode'):
+                        self.assertEqual(result[backend]['available'], error is None)
+                        self.assertEqual(result[backend].get('error'), error)
+                        self.assertEqual(result[backend]['transport'], 'docker')
+                    self.assertEqual(inspect.call_count, int(docker is not None))
+                finally:
+                    manager.close()
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
