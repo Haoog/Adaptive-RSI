@@ -217,6 +217,238 @@ class AuthSessionTests(unittest.TestCase):
                 finally:
                     manager.close()
 
+    def test_launch_rejects_unvalidated_or_changed_reserved_inputs_without_spawning(self):
+        inputs = {'region': 'original'}
+        session = self.manager.reserve('opencode', 'openai', method=1, inputs=inputs)
+        inputs['region'] = 'mutated'
+        with patch.object(self.manager, '_thread') as spawn:
+            for invalid in (123, [], {'region': 'x' * 2049}):
+                with self.subTest(inputs=invalid):
+                    with self.assertRaises(AuthError) as caught:
+                        self.manager.launch(session['id'], 1, invalid)
+                    self.assertEqual(caught.exception.code, 'invalid_auth_inputs')
+            with self.assertRaises(AuthError):
+                self.manager.launch(session['id'], 1, {'region': 'changed'})
+            spawn.assert_not_called()
+            self.manager.launch(session['id'], 1, {'region': 'original'})
+            spawn.assert_called_once()
+        self.assertNotIn('region', self.manager.file.read_text())
+
+    def test_concurrent_provider_discovery_starts_one_worker(self):
+        manager = AuthSessions(self.root / 'single-discovery')
+        entered, release = threading.Event(), threading.Event()
+        answers, failures, made = [], [], []
+        def discover():
+            entered.set()
+            release.wait(2)
+            return [{'id': 'openai', 'methods': []}]
+        def factory(backend):
+            worker = FakeAuth(backend)
+            worker.providers = discover
+            made.append(worker)
+            return worker
+        def request():
+            try:
+                answers.append(manager.providers())
+            except Exception as exc:
+                failures.append(exc)
+        threads = [threading.Thread(target=request) for _ in range(3)]
+        try:
+            with patch.object(manager, 'factory', side_effect=factory):
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(entered.wait(1))
+                time.sleep(.05)
+                self.assertEqual(len(made), 1)
+                release.set()
+                for thread in threads:
+                    thread.join(2)
+                self.assertFalse(failures)
+                self.assertEqual(answers, [[{'id': 'openai', 'methods': []}]] * 3)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(2)
+            manager.close()
+            for worker in made:
+                worker.temp.cleanup()
+
+    def test_key_save_uses_one_worker_and_busy_rejects_before_discovery(self):
+        with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None):
+            self.manager.set_api_key('opencode', 'openai', 'fixture-key')
+        self.assertEqual(len(self.created), 1)
+        session = self.manager.reserve('opencode', 'openai')
+        with self.assertRaises(AuthError) as caught:
+            self.manager.set_api_key('opencode', 'openai', 'fixture-key')
+        self.assertEqual(caught.exception.code, 'auth_busy')
+        self.assertEqual(len(self.created), 1)
+        self.manager.cancel(session['id'])
+
+    def test_provider_discovery_failure_releases_waiters_and_allows_retry(self):
+        manager = AuthSessions(self.root / 'failed-flight')
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        def factory(backend):
+            entered.set()
+            release.wait(2)
+            raise AuthError('auth_protocol_error')
+        def request():
+            try:
+                manager.providers()
+            except AuthError as exc:
+                errors.append(exc.code)
+        threads = [threading.Thread(target=request) for _ in range(3)]
+        try:
+            with patch.object(manager, 'factory', side_effect=factory) as create:
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(entered.wait(1))
+                time.sleep(.05)
+                release.set()
+                for thread in threads:
+                    thread.join(2)
+                self.assertEqual(errors, ['auth_protocol_error'] * 3)
+                self.assertEqual(create.call_count, 1)
+                self.assertEqual(manager.provider_flights, {})
+            worker = FakeAuth('opencode')
+            self.created.append(worker)
+            with patch.object(manager, 'factory', return_value=worker):
+                self.assertEqual(manager.providers()[0]['id'], 'openai')
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(2)
+            manager.close()
+
+    def test_key_cleanup_failure_always_releases_credential_lock(self):
+        credential_lock = threading.Lock()
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        with patch.object(self.manager, 'factory', return_value=worker), \
+             patch.object(worker, 'close', side_effect=OSError('cleanup failed')), \
+             patch('adaptive_rsi.auth_sessions.AUTH_LOCK', credential_lock), \
+             patch.object(self.manager, 'snapshot', return_value={}):
+            with self.assertRaises(OSError):
+                self.manager.set_api_key('opencode', 'openai', 'fixture-key')
+            acquired = credential_lock.acquire(blocking=False)
+            if acquired:
+                credential_lock.release()
+            self.assertTrue(acquired)
+
+    def test_key_export_finishing_after_close_cannot_install_credentials(self):
+        entered, release = threading.Event(), threading.Event()
+        installed, errors = [], []
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        worker.capabilities = types.SimpleNamespace(modern=True)
+        worker.set_api_key = lambda *args: None
+        def export(provider):
+            entered.set()
+            release.wait(2)
+            return [{'fixture': True}]
+        worker.export_credential = export
+        worker.install_credential = lambda *args: installed.append(True)
+        def save():
+            try:
+                self.manager.set_api_key('opencode', 'openai', 'fixture-key')
+            except AuthError as exc:
+                errors.append(exc.code)
+        with patch.object(self.manager, 'factory', return_value=worker), \
+             patch.object(self.manager, 'snapshot', return_value={}):
+            thread = threading.Thread(target=save)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.manager.close()
+            finally:
+                release.set()
+                thread.join(2)
+        self.assertEqual(installed, [])
+        self.assertEqual(errors, ['service_closed'])
+
+    def test_discovery_cleanup_error_is_shared_and_not_cached(self):
+        manager = AuthSessions(self.root / 'cleanup-flight')
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        def discover():
+            entered.set()
+            release.wait(2)
+            return [{'id': 'openai', 'methods': []}]
+        def request():
+            try:
+                manager.providers()
+            except OSError:
+                errors.append('cleanup')
+        threads = [threading.Thread(target=request) for _ in range(2)]
+        try:
+            with patch.object(manager, 'factory', return_value=worker) as create, \
+                 patch.object(worker, 'providers', side_effect=discover), \
+                 patch.object(worker, 'close', side_effect=OSError('cleanup failed')):
+                for thread in threads:
+                    thread.start()
+                self.assertTrue(entered.wait(1))
+                time.sleep(.05)
+                release.set()
+                for thread in threads:
+                    thread.join(2)
+                self.assertEqual(errors, ['cleanup', 'cleanup'])
+                self.assertFalse(manager.providers_cache)
+                self.assertFalse(manager.provider_flights)
+                with self.assertRaises(OSError):
+                    manager.providers()
+                self.assertEqual(create.call_count, 2)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(2)
+            manager.close()
+
+    def test_discovery_and_cleanup_failure_share_final_error(self):
+        manager = AuthSessions(self.root / 'double-failure-flight')
+        entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+        errors = []
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        def discover():
+            entered.set()
+            release.wait(2)
+            raise AuthError('auth_protocol_error')
+        def request():
+            try:
+                manager.providers()
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+        leader = threading.Thread(target=request)
+        follower = threading.Thread(target=request)
+        try:
+            with patch.object(manager, 'factory', return_value=worker), \
+                 patch.object(worker, 'providers', side_effect=discover), \
+                 patch.object(worker, 'close', side_effect=OSError('cleanup failed')):
+                leader.start()
+                self.assertTrue(entered.wait(1))
+                event = manager.provider_flights[('opencode', 0)]['done']
+                original_wait = event.wait
+                def wait(timeout=None):
+                    waiting.set()
+                    return original_wait(timeout)
+                with patch.object(event, 'wait', side_effect=wait):
+                    follower.start()
+                    self.assertTrue(waiting.wait(1))
+                    release.set()
+                    leader.join(2)
+                    follower.join(2)
+            self.assertEqual(errors, ['OSError', 'OSError'])
+            self.assertFalse(manager.provider_flights)
+            self.assertFalse(manager.providers_cache)
+        finally:
+            release.set()
+            leader.join(2)
+            if follower.ident is not None:
+                follower.join(2)
+            manager.close()
+
     def test_production_opencode_snapshot_rejects_non_object_legacy_json(self):
         path = auth_sessions.auth_path()
         path.parent.mkdir(parents=True)
@@ -643,7 +875,7 @@ class AuthSessionTests(unittest.TestCase):
         discovered, release, finished = threading.Event(), threading.Event(), threading.Event()
         errors = []
 
-        def providers(backend):
+        def providers():
             discovered.set()
             release.wait(2)
             return [{"id": "openai", "methods": [{"type": "api"}]}]
@@ -655,7 +887,9 @@ class AuthSessionTests(unittest.TestCase):
                 errors.append(exc.code)
             finally:
                 finished.set()
-        with patch.object(self.manager, "providers", providers):
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        with patch.object(self.manager, 'factory', return_value=worker), patch.object(worker, 'providers', providers):
             thread = threading.Thread(target=save)
             thread.start()
             self.assertTrue(discovered.wait(1))
