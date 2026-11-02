@@ -614,7 +614,13 @@ class Evolution:
                 if not case:
                     limitations.append("Missing case " + item["case"])
                     continue
-                spec = json.loads(case["spec"])
+                try:
+                    spec = json.loads(case["spec"] or "{}")
+                except (TypeError, ValueError):
+                    spec = None
+                if not isinstance(spec, dict) or not spec.get("repository") or not spec.get("base"):
+                    limitations.append("Unreadable case " + item["case"])
+                    continue
                 target = root / "cases" / item["case"]
                 target.mkdir(parents=True)
                 snapshot(spec["repository"], target / "repository", spec["base"])
@@ -1622,8 +1628,19 @@ class Evolution:
                 current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
                 if not current:
                     continue
-                evidence = json.loads(current["evidence"])
-                if evidence.get("compatibility") and evidence["compatibility"] != compatibility(json.loads(recorded["config"])):
+                try:
+                    evidence = json.loads(current["evidence"] or "{}")
+                except (TypeError, ValueError):
+                    evidence = {}
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                try:
+                    recorded_config = json.loads(recorded["config"] or "{}")
+                except (TypeError, ValueError):
+                    recorded_config = {}
+                if not isinstance(recorded_config, dict):
+                    recorded_config = {}
+                if evidence.get("compatibility") and evidence["compatibility"] != compatibility(recorded_config):
                     continue
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
@@ -1666,7 +1683,11 @@ class Evolution:
                 db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
             # Roll back learned instructions as well as the strategy pointer.
             for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
-                if json.loads(skill["evidence"]).get("candidate") == candidate:
+                try:
+                    skill_evidence = json.loads(skill["evidence"] or "{}")
+                except (TypeError, ValueError):
+                    skill_evidence = {}
+                if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
                     db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
         self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
 
