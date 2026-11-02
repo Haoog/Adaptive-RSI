@@ -780,9 +780,13 @@ class Maintenance:
                 "CASE WHEN json_valid(value) THEN (json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) ELSE 0 END LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         # Retire stale connection-signature directories after proving they are unused.
+        # 全局 dispatch_lock 只覆盖「配置快照 + 无活跃运行」的判定；候选扫描与批量删除
+        # 都在锁外完成，避免调度主循环在锁内等待数千次独立写事务。
+        keys = set()
+        configs_valid = True
         with self.dispatch_lock:
-            keys = set()
-            configs_valid = True
+            configuration = self.store.query("SELECT id,config FROM projects ORDER BY id")
+            global_configuration = self.store.one("SELECT value FROM settings WHERE key='config'")
             for scope in [None] + [row["id"] for row in self.store.query("SELECT id FROM projects")]:
                 try:
                     config = self.config(scope)
@@ -793,17 +797,34 @@ class Maintenance:
                 keys.update(self.model_center.key(provider, scope) for provider in [*BUILTIN_PROVIDERS, *config["providers"]])
             # Frozen runs can still refer to a retired connection signature.
             active = self.store.one("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1")
-            if configs_valid and not active:
-                for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' "
-                                            "AND json_valid(value) AND json_extract(value,'$.fetched')<? "
-                                            "AND key NOT IN (SELECT value FROM json_each(?)) LIMIT 4000",
-                                            (stale, json.dumps(sorted(keys)))):
-                    try:
-                        fetched = json.loads(row["value"]).get("fetched")
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if row["key"] not in keys and fetched and fetched < stale:
-                        self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        if configs_valid and not active:
+            keep = json.dumps(sorted(keys))
+            doomed = []
+            for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' "
+                                        "AND json_valid(value) AND json_extract(value,'$.fetched')<? "
+                                        "AND key NOT IN (SELECT value FROM json_each(?)) LIMIT 4000",
+                                        (stale, keep)):
+                try:
+                    fetched = json.loads(row["value"]).get("fetched")
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if row["key"] not in keys and fetched and fetched < stale:
+                    doomed.append(row["key"])
+            if doomed:
+                # 单事务批量删除，不再为每行借还连接；重复校验保留键与过期时间，
+                # 避免删除扫描之后刚被刷新的目录。
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current = [dict(row) for row in db.execute("SELECT id,config FROM projects ORDER BY id")]
+                    global_row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+                    current_global = dict(global_row) if global_row else None
+                    # 配置写入和 claim 共用数据库写事务；最终核验与删除不能隔开。
+                    if (current == configuration and current_global == global_configuration and
+                            not db.execute("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1").fetchone()):
+                        db.executemany("DELETE FROM settings WHERE key=? AND json_valid(value) "
+                                       "AND json_extract(value,'$.fetched')<? "
+                                       "AND key NOT IN (SELECT value FROM json_each(?))",
+                                       [(key, stale, keep) for key in doomed])
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))
