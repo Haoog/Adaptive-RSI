@@ -2,6 +2,7 @@
 // 界面文案独立于任务内容；切换语言不会改写用户数据和运行证据。
 const english = {
  "更多导航": "More navigation",
+ "阶段时间": "Phase Timeline",
  "目标已添加": "Goal added",
  "未完成": "Open tasks",
  "查看任务": "View task",
@@ -662,6 +663,10 @@ const english = {
   "合并后自动发布": "Release automatically after merge",
   "发布成功后自动部署": "Deploy automatically after a successful release",
   "可用工作流": "Available workflows",
+  "Worker": "Workers",
+  "可用": "free",
+  "剩余": "free",
+  "资源不足": "Resource pressure",
   "先读取工作流": "Load workflows first",
   "刷新工作流": "Refresh workflows",
   "授权所选工作流用于发布": "Authorize selected workflow for release",
@@ -967,6 +972,8 @@ const english = {
   "这次执行没有完成，请展开运行详情查看原因。": "This run did not complete. Expand the run details for the cause.",
   "判断价值": "Assess value",
   "确定完成标准": "Define completion criteria",
+  "准备环境": "Prepare environment",
+  "代码分析": "Analyze code",
   "修改代码": "Change code",
   "运行检查": "Run checks",
   "为什么值得做": "Why this is worth doing",

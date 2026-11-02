@@ -564,6 +564,37 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/workflow-metrics":
                 from .telemetry import workflow_metrics
                 self.respond(workflow_metrics(store, params.get("project", [None])[0]))
+            elif parsed.path == "/api/sys-metrics":
+                import shutil
+                metrics = {"ts": time.time()}
+                # Worker 并发状态
+                concurrency = 4
+                try:
+                    concurrency = runtime.config().get("limits", {}).get("concurrency", 4)
+                except Exception:
+                    pass
+                active_runs = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
+                metrics["workers"] = {"active": active_runs, "capacity": concurrency}
+                # 内存
+                try:
+                    from .resource_pressure import available_memory
+                    mem_bytes, mem_basis = available_memory()
+                    metrics["memory"] = {"available_bytes": mem_bytes, "basis": mem_basis}
+                except Exception:
+                    metrics["memory"] = {"available_bytes": None, "basis": "unavailable"}
+                # 磁盘（state 目录）
+                try:
+                    disk = shutil.disk_usage(store.root)
+                    metrics["disk"] = {"free_bytes": disk.free, "total_bytes": disk.total}
+                except Exception:
+                    metrics["disk"] = {"free_bytes": None, "total_bytes": None}
+                # 资源准入（任一项目未准入即提示）
+                pressure = getattr(runtime, "resource_pressure", None)
+                reports = list(pressure.projects.values()) if pressure else []
+                blocked = [r for r in reports if not r.get("admitted", True)]
+                metrics["resource_pressure"] = {"admitted": not blocked,
+                                                "reasons": blocked[0].get("reasons", []) if blocked else []}
+                self.respond(metrics)
             elif parsed.path == "/api/state":
                 with store.snapshot():
                     legacy = "sections" not in params

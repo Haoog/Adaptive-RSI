@@ -570,6 +570,28 @@ function render(){
  $('delivery-summary').textContent=t(config.delivery.mode==='local'?'当前交付：保存在本地，确认后创建 PR。':config.delivery.auto_merge?'当前交付：检查和评审通过后自动提交并合并。':'当前交付：检查通过后自动提交修改，等待合并。');
  if(project&&!readinessCache.has(project.id))safe(()=>checkReadiness());else renderReadiness();
  renderTelemetry();renderUpdate();if(['overview','tasks'].includes(view))renderTasks();if(view==='evolution')renderEvolution();if(view==='settings'&&!settingsBaseline)renderSettings();if(view==='models')window.RSIModelCenter?.show($('config-scope').value==='project'?projectId:null);
+ renderSysHUD();
+}
+let sysHudTimer=null,sysHudData=null;
+function bytesToLabel(n){if(n==null)return'?';if(n>=1073741824)return(n/1073741824).toFixed(1)+' GB';if(n>=1048576)return(n/1048576).toFixed(0)+' MB';return(n/1024).toFixed(0)+' KB';}
+async function fetchSysMetrics(){try{sysHudData=await api('sys-metrics');}catch(e){sysHudData=null;}renderSysHUD();}
+function renderSysHUD(){
+ const hud=$('sys-hud');if(!hud)return;
+ if(!state){hud.hidden=true;return;}
+ const d=sysHudData;if(!d){hud.hidden=true;return;}
+ const chips=[];
+ // Worker 并发
+ const active=d.workers?.active??0,cap=d.workers?.capacity??4;
+ const wColor=active>=cap?'hud-chip-warn':'hud-chip-ok';
+ chips.push({cls:wColor,text:'⚙ '+active+' / '+cap+' '+t('Worker')});
+ // 内存
+ if(d.memory?.available_bytes!=null){const mb=Math.round(d.memory.available_bytes/1048576);const mColor=mb<512?'hud-chip-warn':'hud-chip-neutral';chips.push({cls:mColor,text:'🧠 '+bytesToLabel(d.memory.available_bytes)+' '+t('可用')});}
+ // 磁盘
+ if(d.disk?.free_bytes!=null){const dColor=d.disk.free_bytes<1073741824?'hud-chip-warn':'hud-chip-neutral';chips.push({cls:dColor,text:'💾 '+bytesToLabel(d.disk.free_bytes)+' '+t('剩余')});}
+ // 资源准入
+ if(d.resource_pressure&&!d.resource_pressure.admitted){chips.push({cls:'hud-chip-warn',text:'⚠ '+t('资源不足')});}
+ hud.replaceChildren(...chips.map(c=>{const span=el('span',c.text,'hud-chip '+c.cls);return span;}));
+ hud.hidden=chips.length===0;
 }
 function renderTelemetry(){
  const summary=$('quality-summary'),usage=$('usage-summary');summary.replaceChildren();usage.replaceChildren();if(loadedStateSections.analyticsProject!==(projectId||null)){summary.append(el('p',t('打开工作台查看运行统计。'),'muted'));usage.append(el('p',t('打开工作台查看用量统计。'),'muted'));return;}const quality=state.quality?.find(q=>q.project===projectId);
@@ -693,7 +715,9 @@ function renderTasks(){
   else if(task.state==='queued'&&task.wait_reason!=='working_hours'&&task.available>Date.now()/1000)actions.append(action(t('立即重试'),async()=>{await api('retry',{task:task.id});await refresh();},'text-button'));
   actions.append(action(t('查看详情'),()=>showTask(task),'text-button'));
   if(!task.source.startsWith('system_')&&window.RSIBatch)row.append(window.RSIBatch.row(task));
-  row.append(title,badge(task.display_state||task.state),actions);list.append(row);
+  const metrics=el('div',undefined,'task-metrics');
+  if(latest&&latest.ended){const tokens=latest.tokens||0,elapsed=Math.round(latest.ended-latest.started);if(tokens>0)metrics.append(el('span','⚡ '+tokens+' tokens','task-metric-badge task-metric-tokens'));if(elapsed>=1)metrics.append(el('span','⏱ '+elapsed+'s','task-metric-badge task-metric-duration'));}
+  row.append(title,badge(task.display_state||task.state),actions,metrics);list.append(row);
   }
   if(focusedTask){const rows=[...list.querySelectorAll('.task-row')],row=rows.find(item=>item.dataset.taskId===focusedTask)||rows[Math.min(Math.max(0,oldIndex),rows.length-1)],controls=row?[...row.querySelectorAll('button,input,a[href]')].filter(node=>!node.disabled):[];(controls[Math.max(0,Math.min(focusIndex,controls.length-1))]||document.querySelector('[data-task-filter="'+filter+'"]')).focus?.({preventScroll:true});}
   let announcement=$('task-list-announcement');if(!announcement){announcement=el('span');announcement.id='task-list-announcement';announcement.setAttribute('role','status');announcement.setAttribute('aria-live','polite');$('tasks-page').after(announcement);}
@@ -1088,7 +1112,20 @@ function renderReadiness(){
 }
 function stageProgress(data){
  const node=el('ol',undefined,'stage-progress'),done=new Map((data.stages||[]).map(s=>[s.stage,s]));
- for(const [key,title]of [['planning','判断价值'],['acceptance','确定完成标准'],['implementation','修改代码'],['evaluation','运行检查'],['review','代码评审']]){const row=el('li',t(title));row.className=done.has(key)?(['fail','insufficient_evidence'].includes(done.get(key).decision)?'stage-failed':'done'):'';node.append(row);}return node;
+ const phaseMap=new Map((data.phases||[]).filter(p=>p.ended).map(p=>[p.phase,Math.round(p.ended-p.started)]));
+ for(const [key,title]of [['planning','判断价值'],['acceptance','确定完成标准'],['implementation','修改代码'],['evaluation','运行检查'],['review','代码评审']]){
+  const row=el('li',t(title));row.className=done.has(key)?(['fail','insufficient_evidence'].includes(done.get(key).decision)?'stage-failed':'done'):'';
+  if(phaseMap.has(key))row.append(el('small',phaseMap.get(key)+'s','stage-duration'));
+  node.append(row);}
+ const phaseNames={'planning':'判断价值','preparation':'准备环境','analysis':'代码分析','implementation':'修改代码','evaluation':'运行检查','review':'代码评审','acceptance':'确定完成标准'};
+ const phases=(data.phases||[]).filter(p=>p.ended);
+ if(phases.length){const maxT=Math.max(...phases.map(p=>Math.round(p.ended-p.started)),1),timeline=el('div',undefined,'phase-timeline');
+  for(const p of phases){const dur=Math.round(p.ended-p.started),pct=Math.round(dur/maxT*100),row=el('div',undefined,'phase-row');
+   row.append(el('span',t(phaseNames[p.phase]||p.phase),'phase-label'));
+   const bg=el('div',undefined,'phase-bar-bg'),bar=el('div',undefined,'phase-bar');bar.style.width=pct+'%';bg.append(bar);row.append(bg);
+   row.append(el('span',dur+'s','phase-time'));timeline.append(row);}
+  const wrap=el('div',undefined,'stage-progress-wrap');wrap.append(node,timeline);return wrap;}
+ return node;
 }
 $('readiness-check').addEventListener('click',()=>safe(()=>checkReadiness(true)));
 $('tasks-prev').addEventListener('click',()=>{taskOffset=Math.max(0,taskOffset-50);safe(refresh);});
@@ -1459,3 +1496,5 @@ typeof document.addEventListener==='function'&&document.addEventListener('visibi
  else scheduleRefreshPoll();
 });
 typeof window.addEventListener==='function'&&window.addEventListener('focus',()=>{if(state)safe(refresh);});
+
+document.addEventListener('DOMContentLoaded',()=>{fetchSysMetrics();sysHudTimer=setInterval(fetchSysMetrics,30000);});
