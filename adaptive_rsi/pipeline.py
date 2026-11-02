@@ -418,7 +418,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not prior:
             raise RuntimeError("Original run missing")
         prior_result = json.loads(prior["result"])
-        patch_path = Path(prior["path"]) / "candidate.patch"
+        prior_directory = Path(prior["path"]) if prior["path"] else runtime.store.root / "runs" / prior["id"]
+        patch_path = prior_directory / "candidate.patch"
         try:
             git(workspace, "apply", "--reverse", "--check", str(patch_path))
         except RuntimeError as exc:

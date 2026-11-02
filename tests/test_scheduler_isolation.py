@@ -446,6 +446,35 @@ class SchedulerIsolationTest(unittest.TestCase):
             self.runtime.maintenance()
         remove.assert_not_called()
 
+    def test_retained_patch_can_be_reverted_after_run_path_is_cleared(self):
+        from tests.test_runtime import FakeAgent, fixture, CHECKS
+        repo = fixture(self.root / 'healthy')
+        self.runtime.agent = FakeAgent()
+        self.runtime.configure({'checks': CHECKS, 'evolution': {'enabled': False}}, 'healthy')
+        prior = self.historical_run('healthy', 'merged')
+        directory = Path(prior['path'])
+        directory.mkdir(parents=True)
+        (repo / 'calculator.py').write_text('def add(a, b):\n    return a + b\n')
+        (directory / 'candidate.patch').write_text(git(repo, 'diff', '--binary') + '\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'fixed')
+        self.store.execute('UPDATE runs SET result=? WHERE id=?',
+                           (json.dumps({'files': ['calculator.py'], 'monitoring_completed': True}), prior['id']))
+        self.runtime.maintenance()
+        self.assertIsNone(self.store.one('SELECT path FROM runs WHERE id=?', (prior['id'],))['path'])
+        self.assertTrue((directory / 'candidate.patch').is_file())
+        task = self.runtime.revert_code(prior['id'])
+        run = self.store.claim('healthy', self.runtime.config('healthy'))
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+                patch.object(pipeline, '_prepare_environment', return_value=({'sha256': 'fixture'}, directory / 'dependencies')), \
+                patch.object(self.runtime.evaluator, 'evaluate', return_value={'decision': 'pass', 'checks': {}}):
+            self.runtime.process(run)
+        result = self.store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(result['state'], 'awaiting_approval', result['result'])
+        self.assertEqual((Path(result['path']) / 'candidate/calculator.py').read_text(),
+                         'def add(a, b):\n    return a - b\n')
+        self.assertEqual(run['task'], task)
+
     def test_undo_cleanup_rebinds_run_path_cleared_by_retention(self):
         run = self.historical_run("healthy", "completed")
         directory = Path(run["path"])
