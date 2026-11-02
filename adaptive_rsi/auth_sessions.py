@@ -1401,7 +1401,14 @@ class AuthSessions:
         if item["state"] not in ACTIVE or self.now() < item["expires_at"]:
             return item
         if not self.lock.acquire(blocking=False):
-            return item
+            # 锁竞争时不能返回陈旧 ACTIVE 快照——调用方会把它当作仍活跃。
+            # 快照上直接判定过期并同步视图，下次读取不再重复修补。
+            with self.view_lock:
+                if self.public_sessions.get(session_id) is item or (
+                        self.public_sessions.get(session_id, {}).get("state") == item["state"] and
+                        self.public_sessions.get(session_id, {}).get("expires_at") == item["expires_at"]):
+                    self.public_sessions[session_id] = {**item, "state": "expired", "error": "auth_expired"}
+            return {**item, "state": "expired", "error": "auth_expired"}
         try:
             if not isinstance(session_id, str) or session_id not in self.sessions:
                 raise AuthError("unknown_session")
