@@ -84,7 +84,7 @@ window.RSIAuth = (() => {
     }}finally{polling=false;render();schedule();}
   }
   async function completeSession(id,session,code){
-    const next=await mutate('complete',{id:session.id,code});if(sessions.get(id)!==session)return;
+    const next=await mutate('complete',{id:session.id,code,attempt_generation:session.attempt_generation});if(sessions.get(id)!==session)return;
     const updated={...next,refresh:session.refresh,refreshStage:next.state==='completed'?'status':''};sessions.set(id,updated);
     if(updated.refreshStage)await refreshCompleted(id,updated);render();schedule();
   }
@@ -133,13 +133,13 @@ window.RSIAuth = (() => {
         if(session.user_code){const code=el('p',undefined,'mc-auth-code');code.append(text('span','设备验证码'),el('strong',session.user_code));box.append(code);}
         if(session.instructions)box.append(el('p',session.instructions,'mc-secondary'));
         if(session.expires_at)box.append(el('p',t('有效期至 ')+stamp(session.expires_at),'mc-secondary'));
-        if(session.method==='code'){
-          const form=el('form'),label=text('label','粘贴官方页面返回的授权码'),input=el('input');input.autocomplete='off';input.required=true;input.dataset.authField='code:'+session.id;label.append(input);const submit=text('button','完成授权','button primary');submit.type='submit';submit.disabled=pending;form.append(label,submit);
+        if(session.method==='code'&&session.state==='awaiting_authorization'){
+          const form=el('form'),label=text('label','粘贴官方页面返回的授权码'),input=el('input');input.autocomplete='off';input.required=true;input.dataset.authField='code:'+session.id+':'+session.attempt_generation;label.append(input);const submit=text('button','完成授权','button primary');submit.type='submit';submit.disabled=pending;form.append(label,submit);
           form.addEventListener('submit',event=>{event.preventDefault();safe(async()=>{const value=input.value;input.value='';await completeSession(sessionKey,session,value);});});box.append(form);
         }
         const cancel=action(t('取消登录'),async()=>{const next=await mutate('cancel',{id:session.id});sessions.set(sessionKey,{...next,refresh:session.refresh});render();},'text-button');cancel.disabled=pending;box.append(cancel);
       }
-      if(session.error)box.append(el('p',authMessage(session.error,session.error),'mc-error'));
+      if(session.error)box.append(el('p',session.error==='authorization_failed'&&session.state==='awaiting_authorization'?t('授权未完成，请打开新的授权页面后重试。'):authMessage(session.error,session.error),'mc-error'));
     }
     if(running)return;
     if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}

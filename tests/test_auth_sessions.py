@@ -671,6 +671,179 @@ class AuthSessionTests(unittest.TestCase):
             self.manager.start("opencode", "github-copilot")
         self.assertEqual(self.manager.busy, 1)
 
+    def test_confirmed_failed_code_creates_new_attempt_in_same_session(self):
+        class RetryWorker(FakeAuth):
+            def __init__(self, backend):
+                super().__init__(backend, method="code")
+                self.starts = 0
+
+            def start(self, provider=None, method=0, inputs=None):
+                self.starts += 1
+                result = super().start(provider, method, inputs)
+                result["verification_url"] = "https://example.test/attempt/" + str(self.starts)
+                return result
+
+            def complete(self, code="", timeout=600):
+                if code == "wrong":
+                    raise auth_sessions.AuthAttemptFailed()
+                self.gate.set()
+                return super().complete(code, timeout)
+
+        worker = RetryWorker("opencode")
+        self.created.append(worker)
+        self.manager.factory = lambda backend: worker
+        session = self.manager.start("opencode", "openai")
+        first = self.wait_state(session, "awaiting_authorization")
+        self.manager.complete(session["id"], "wrong", first["attempt_generation"])
+        second = self.wait_state(session, "awaiting_authorization")
+        self.assertEqual(second["error"], "authorization_failed")
+        self.assertEqual(second["expires_at"], first["expires_at"])
+        self.assertEqual(second["verification_url"], "https://example.test/attempt/2")
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.complete(session["id"], "stale", first["attempt_generation"])
+        self.manager.complete(session["id"], "correct", second["attempt_generation"])
+        self.wait_state(session, "completed")
+        self.assertEqual(worker.starts, 2)
+
+    def test_confirmed_failures_stop_after_five_attempts(self):
+        class RetryWorker(FakeAuth):
+            def __init__(self):
+                super().__init__("opencode", method="code")
+                self.starts = 0
+                self.completions = 0
+
+            def start(self, provider=None, method=0, inputs=None):
+                self.starts += 1
+                return super().start(provider, method, inputs)
+
+            def complete(self, code="", timeout=600):
+                self.completions += 1
+                raise auth_sessions.AuthAttemptFailed()
+
+        worker = RetryWorker()
+        self.created.append(worker)
+        self.manager.factory = lambda backend: worker
+        self.manager.ttl = 10
+        session = self.manager.start("opencode", "openai")
+        for generation in range(1, 6):
+            current = self.wait_state(session, "awaiting_authorization")
+            self.assertEqual(current["attempt_generation"], generation)
+            self.manager.complete(session["id"], "wrong", generation)
+        self.assertEqual(self.wait_state(session, "failed")["error"], "authorization_failed")
+        self.assertEqual((worker.starts, worker.completions), (5, 5))
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.complete(session["id"], "again", 5)
+
+    def test_atomic_json_write_needs_no_post_replace_chmod(self):
+        path = self.root / "atomic.json"
+        with patch.object(Path, "chmod", side_effect=OSError("fixture")):
+            auth_sessions._write_json(path, {"value": "new"})
+        self.assertEqual(json.loads(path.read_text()), {"value": "new"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_complete_persist_failure_does_not_consume_code(self):
+        self.options["method"] = "code"
+        session = self.manager.start("opencode", "openai")
+        current = self.wait_state(session, "awaiting_authorization")
+        worker = self.created[0]
+        with patch.object(self.manager, "_persist", side_effect=OSError("fixture")):
+            with self.assertRaises(OSError):
+                self.manager.complete(session["id"], "fixture-code", current["attempt_generation"])
+        time.sleep(.2)
+        self.assertIsNone(worker.code)
+        self.assertEqual(self.manager.status(session["id"])["state"], "awaiting_authorization")
+        with self.manager.lock:
+            self.assertNotIn("_code", self.manager.sessions[session["id"]])
+            self.assertNotIn("_retry_capable", self.manager.sessions[session["id"]])
+
+    def test_legacy_client_failure_remains_terminal(self):
+        class RetryWorker(FakeAuth):
+            def __init__(self):
+                super().__init__("opencode", method="code")
+                self.starts = 0
+
+            def start(self, provider=None, method=0, inputs=None):
+                self.starts += 1
+                return super().start(provider, method, inputs)
+
+            def complete(self, code="", timeout=600):
+                raise auth_sessions.AuthAttemptFailed()
+
+        worker = RetryWorker()
+        self.created.append(worker)
+        self.manager.factory = lambda backend: worker
+        session = self.manager.start("opencode", "openai")
+        self.wait_state(session, "awaiting_authorization")
+        self.manager.complete(session["id"], "wrong")
+        self.assertEqual(self.wait_state(session, "failed")["error"], "authorization_failed")
+        self.assertEqual(worker.starts, 1)
+
+    def test_cancel_during_restart_prevents_later_install(self):
+        entered, release, cancelled = threading.Event(), threading.Event(), threading.Event()
+
+        class RetryWorker(FakeAuth):
+            def __init__(self):
+                super().__init__("opencode", method="code")
+                self.starts = 0
+
+            def start(self, provider=None, method=0, inputs=None):
+                self.starts += 1
+                if self.starts == 2:
+                    entered.set()
+                    release.wait(3)
+                return super().start(provider, method, inputs)
+
+            def complete(self, code="", timeout=600):
+                raise auth_sessions.AuthAttemptFailed()
+
+        worker = RetryWorker()
+        self.created.append(worker)
+        self.manager.factory = lambda backend: worker
+        session = self.manager.start("opencode", "openai")
+        first = self.wait_state(session, "awaiting_authorization")
+        self.manager.complete(session["id"], "wrong", first["attempt_generation"])
+        self.assertTrue(entered.wait(2))
+        thread = threading.Thread(target=lambda: (self.manager.cancel(session["id"]), cancelled.set()))
+        thread.start()
+        try:
+            self.assertTrue(cancelled.wait(1))
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertTrue(cancelled.is_set())
+        self.assertEqual(self.manager.status(session["id"])["state"], "cancelled")
+        self.assertEqual(worker.starts, 2)
+        self.assertFalse((self.root / "data/opencode/auth.json").exists())
+
+    def test_restart_does_not_publish_after_original_expiration(self):
+        clock = [1000.0]
+
+        class RetryWorker(FakeAuth):
+            def __init__(self):
+                super().__init__("opencode", method="code")
+                self.starts = 0
+
+            def start(self, provider=None, method=0, inputs=None):
+                self.starts += 1
+                if self.starts == 2:
+                    clock[0] += 3
+                return super().start(provider, method, inputs)
+
+            def complete(self, code="", timeout=600):
+                raise auth_sessions.AuthAttemptFailed()
+
+        worker = RetryWorker()
+        self.created.append(worker)
+        self.manager.factory = lambda backend: worker
+        self.manager.now = lambda: clock[0]
+        session = self.manager.start("opencode", "openai")
+        first = self.wait_state(session, "awaiting_authorization")
+        self.manager.complete(session["id"], "wrong", first["attempt_generation"])
+        result = self.wait_state(session, "expired")
+        self.assertEqual(result["error"], "auth_expired")
+        self.assertNotIn("verification_url", result)
+        self.assertEqual(worker.starts, 2)
+
     def test_busy_expires_without_browser_polling(self):
         self.manager.ttl = 1
         session = self.manager.start("codex")
