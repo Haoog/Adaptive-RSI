@@ -393,9 +393,10 @@ class NativeToolArtifactIntegrationTest(unittest.TestCase):
         self.assertEqual(result["exit_code"], 7)
         self.assertEqual(result["error_kind"], "exit")
         self.assertFalse(result["timed_out"])
-        self.assertTrue(result["truncated"])
+        # 这里 stdout 只有 16 KB，没有跨过回退边界；没有字节被丢弃时不得谎报截断。
+        self.assertNotIn("truncated", result)
         self.assertIn("artifact_error", result)
-        self.assertLess(len(result["stdout"]), 30000)
+        self.assertEqual(len(result["stdout"]), INLINE_BODY_BYTES + 100)
 
     def test_history_trim_keeps_artifact_ids_readable(self):
         tools = self.tools()
