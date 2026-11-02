@@ -887,16 +887,21 @@ print('BOUNDARIES_OK')
         directory.mkdir(parents=True)
         run["path"] = str(directory)
         head = git(self.repo, "rev-parse", "HEAD")
-        self.runtime.configure({"delivery": {"base_branch": "release"}}, self.project)
+        self.runtime.configure({"delivery": {"base_branch": "release"},
+                                "sandbox": {"image": "python:3.11-custom"}}, self.project)
         def pinned_baseline(runtime, project, config):
             self.assertEqual(config["github"]["repository"], "example/project")
             self.assertEqual(config["delivery"]["base_branch"], "main")
             return str(self.repo), head, "main"
         outcome = {"merged_sha": head, "merged_at": time.time()}
-        with patch("adaptive_rsi.delivery.baseline", side_effect=pinned_baseline), patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}):
+        with patch("adaptive_rsi.delivery.baseline", side_effect=pinned_baseline), patch.object(
+                self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}) as evaluate:
             feedback(self.runtime, self.runtime.project(self.project), run, outcome, self.runtime.config(self.project), time.time())
         self.assertEqual(outcome["feedback"]["head"], head)
         self.assertEqual(outcome["feedback"]["state"], "verified")
+        saved_config = json.loads(run["config"])
+        self.assertEqual(evaluate.call_args[0][4]["sandbox"], saved_config["sandbox"])
+        self.assertEqual(evaluate.call_args[0][4]["environment"], saved_config["environment"])
 
     def test_mainline_test_edit_survives_delivery_git_failure_and_reports_real_regression(self):
         from adaptive_rsi.delivery import feedback
