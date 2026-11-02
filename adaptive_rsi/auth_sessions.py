@@ -2,6 +2,7 @@
 import base64
 import copy
 import json
+import logging
 import os
 import queue
 import re
@@ -74,7 +75,7 @@ def _read_json(path):
         return value
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         raise AuthError("invalid_credentials") from None
 
 
@@ -890,7 +891,7 @@ class AuthSessions:
                                                 env=clean_environment())
                                     except (OpenCodeCompatibilityError, OSError):
                                         capabilities = None
-                            providers = auth_providers(None, capabilities)
+                                providers = auth_providers(None, capabilities)
                             with self.lock:
                                 if not self.closed and generation == self.cache_generations[backend]:
                                     self.status_cache[backend] = (time.monotonic() + 25, (capabilities, providers))
@@ -908,6 +909,8 @@ class AuthSessions:
                 if exc.version:
                     result[backend]["version"] = exc.version
             except AuthError:
+                result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
+            except RecursionError:
                 result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
             except RuntimeError as exc:
                 if backend == "opencode" and str(exc).startswith("OpenCode credential listing"):
@@ -1095,12 +1098,19 @@ class AuthSessions:
                 current = self.sessions[session_id]
                 if current["state"] not in ACTIVE:
                     return
-                if not success or self.now() >= item["expires_at"]:
+                if self.now() >= item["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
+                    return
+                if not success:
+                    self._update(session_id, state="failed", error="authorization_failed")
                     return
                 self._update(session_id, state="completing")
             self._save(worker, item["backend"], item["provider"], session_id, stop)
         except Exception as exc:
+            if not isinstance(exc, AuthError):
+                # 不记录异常文本或 traceback，第三方错误中可能包含授权材料。
+                logging.getLogger(__name__).warning("Auth session %s failed unexpectedly: %s",
+                                                    session_id, type(exc).__name__)
             expired = self.now() >= self.sessions[session_id]["expires_at"]
             values = {"state": "expired" if expired else "failed",
                       "error": "auth_expired" if expired else exc.code if isinstance(exc, AuthError) else "auth_protocol_error"}
@@ -1231,17 +1241,17 @@ class AuthSessions:
                         pass
                 else:
                     binary = shutil.which("opencode")
-                    removed_export = remove_auth_export(provider)
+                    remove_auth_export(provider)
                     try:
-                        modern = bool(not self.custom_factory and binary and logout_provider(provider, binary))
+                        if not self.custom_factory and binary:
+                            logout_provider(provider, binary)
                     except (OpenCodeCompatibilityError, RuntimeError):
                         raise AuthError("auth_protocol_error") from None
-                    if not modern or removed_export:
-                        path = auth_path()
-                        data = _read_json_for_write(path)
-                        if provider in data:
-                            data.pop(provider, None)
-                            _write_json(path, data)
+                    path = auth_path()
+                    data = _read_json_for_write(path)
+                    if provider in data:
+                        data.pop(provider, None)
+                        _write_json(path, data)
         finally:
             credential_lock.release()
             for worker, stop in workers:
