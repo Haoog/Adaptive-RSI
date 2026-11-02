@@ -64,6 +64,72 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.commands = []
         self.remote = None
 
+    def test_missing_remote_run_preserves_identity_without_error_events(self):
+        from adaptive_rsi.release import reconcile
+        data = {'state': 'rerun_unknown', 'workflow_run_id': 17, 'repository': 'example/project',
+                'operation_id': 'fixture-operation', 'previous_attempt': 1, 'rerun_pending': True}
+        with patch('adaptive_rsi.release.api', side_effect=ApiRejected('not found', 404)) as api:
+            for _ in range(2):
+                result = reconcile(self.runtime, self.run, 'release', data, persist=False)
+                self.assertEqual(result['workflow_run_id'], 17)
+                self.assertEqual(result['state'], 'rerun_unknown')
+                self.assertEqual(result['remote_visibility']['state'], 'run_not_visible')
+            self.assertEqual(api.call_count, 2)
+
+    def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
+        from adaptive_rsi.release import status
+        for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
+            with self.subTest(raw=raw):
+                self.runtime.store.execute('INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)',
+                                           (key(self.run['id'], 'release'), raw))
+                with patch('adaptive_rsi.release.api') as api:
+                    self.assertFalse(pending(self.runtime, self.run))
+                    result = self.tick()
+                    self.assertEqual(result['release']['receipt_error'], 'invalid_automation_receipt')
+                    self.assertEqual(status(self.runtime, self.project, self.run['id'])['release']['state'], 'blocked')
+                    api.assert_not_called()
+                self.assertEqual(self.runtime.store.one('SELECT value FROM settings WHERE key=?',
+                                 (key(self.run['id'], 'release'),))['value'], raw)
+        events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+        self.assertEqual(len(events), 1)
+        self.runtime.store.put_setting(key(self.run['id'], 'release'), {'state': 'failed'})
+        pending(self.runtime, self.run)
+        self.runtime.store.execute('UPDATE settings SET value=? WHERE key=?', ('[]', key(self.run['id'], 'release')))
+        pending(self.runtime, self.run)
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 2)
+
+    def test_legacy_pin_preserves_cancel_and_backs_off_execution_errors(self):
+        from adaptive_rsi.release import _pin_legacy_feedback
+        from adaptive_rsi.process import Cancelled
+        outcome = {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}
+        with patch('adaptive_rsi.gitops.snapshot', side_effect=Cancelled('fixture paused')):
+            with self.assertRaises(Cancelled):
+                _pin_legacy_feedback(self.runtime, self.run, outcome, MERGED)
+        with patch('adaptive_rsi.gitops.snapshot', side_effect=OSError('fixture disk failure')) as snapshot:
+            for _ in range(2):
+                result = advance(self.runtime, self.runtime.project(self.project), self.run, outcome)
+                self.assertEqual(result['release']['state'], 'blocked')
+                self.assertIn('Legacy release verification could not run locally', result['release']['error'])
+                self.assertIn('fixture disk failure', result['release']['error'])
+            self.assertEqual(snapshot.call_count, 1)
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 1)
+
+    def test_owner_lookup_migrates_empty_history_only_once(self):
+        from adaptive_rsi.release import deployment_owner
+        original = self.runtime.store.query
+        scans = []
+        def query(sql, args=()):
+            if "key LIKE 'deployment-owner:%'" in sql:
+                scans.append(sql)
+            return original(sql, args)
+        with patch.object(self.runtime.store, 'query', side_effect=query):
+            self.assertIsNone(deployment_owner(self.runtime, self.project, 'example/project', self.policy))
+            self.assertIsNone(deployment_owner(self.runtime, self.project, 'example/project', self.policy))
+            self.assertEqual(len(scans), 1)
+            receipt = {'run': self.run['id'], 'sha': MERGED}
+            self.runtime.store.put_setting(owner_key(self.project, 'example/project', self.policy), receipt)
+            self.assertEqual(deployment_owner(self.runtime, self.project, 'example/project', self.policy), receipt)
+
     def test_legacy_deploy_snapshot_keeps_pending_health_tracking(self):
         deploy = {**self.policy, "health_url": "https://service.example/health", "automatic_rollback": False}
         self.runtime.configure({"delivery": {"deploy": deploy}}, self.project)
@@ -535,7 +601,9 @@ class ReleaseAutomationTest(unittest.TestCase):
         active_run = "active-run"
         self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
                                        {"run": active_run, "sha": PREVIOUS})
-        self.runtime.store.put_setting(key(active_run, "deploy"), {"state": "dispatching"})
+        self.runtime.store.put_setting(key(active_run, "deploy"), {"state": "dispatching", "repository": "example/project",
+            "workflow": deploy["workflow"], "ref": deploy["ref"], "workflow_sha": deploy["sha"],
+            "sha": PREVIOUS, "operation_id": "active-fixture"})
         self.commands.clear()
         with patch("adaptive_rsi.release.api", side_effect=self.api):
             with self.assertRaisesRegex(ValueError, "Another deployment is still active on this target"):
@@ -660,6 +728,49 @@ class ReleaseAutomationTest(unittest.TestCase):
                 result = advance(self.runtime, self.runtime.project(self.project), self.run, {"merged_sha": MERGED, "feedback": feedback})
                 self.assertEqual(result["release"]["state"], expected)
                 api.assert_not_called()
+
+    def test_failed_release_blocks_deployment_without_pending_forever(self):
+        self.runtime.configure({"delivery": {"deploy": self.policy}}, self.project)
+        self.run['config'] = encode(self.runtime.config(self.project))
+        self.runtime.store.put_setting(key(self.run['id'], 'release'), {'state': 'failed', 'error': 'fixture failure'})
+        with patch('adaptive_rsi.release.api') as api:
+            result = self.tick()
+        self.assertEqual(result['deploy']['state'], 'blocked')
+        self.assertEqual(result['deploy']['error'], 'Release workflow failed; retry release before deployment')
+        self.assertFalse(pending(self.runtime, self.run))
+        api.assert_not_called()
+        self.runtime.store.put_setting(key(self.run['id'], 'release'), {'state': 'rerun_unknown',
+            'repository': 'example/project', 'workflow': self.policy['workflow'], 'ref': self.policy['ref'],
+            'workflow_sha': self.policy['sha'], 'sha': MERGED, 'operation_id': 'release-fixture'})
+        with patch('adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, data, **kwargs: data):
+            uncertain = self.tick()
+        self.assertEqual(uncertain['deploy']['error'], 'Release rerun result is unconfirmed; reconcile release before deployment')
+        self.runtime.store.put_setting(key(self.run['id'], 'release'), {'state': 'submitted',
+            'repository': 'example/project', 'workflow': self.policy['workflow'], 'ref': self.policy['ref'],
+            'workflow_sha': self.policy['sha'], 'sha': MERGED, 'operation_id': 'release-fixture'})
+        with patch('adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, data, **kwargs: data):
+            result = self.tick()
+        self.assertEqual(result['deploy']['state'], 'waiting_release')
+        self.assertEqual(result['deploy']['error'], '')
+        self.assertTrue(pending(self.runtime, self.run))
+
+    def test_revoked_release_blocks_deployment_and_resumes_after_restoring_authorization(self):
+        self.runtime.configure({'delivery': {'deploy': self.policy}}, self.project)
+        self.run['config'] = encode(self.runtime.config(self.project))
+        self.runtime.configure({'delivery': {'release': {'enabled': False}}}, self.project)
+        with patch('adaptive_rsi.release.api') as api:
+            result = self.tick()
+        self.assertEqual(result['release']['state'], 'blocked')
+        self.assertEqual(result['deploy']['state'], 'blocked')
+        self.assertTrue(result['deploy']['blocked_by_release'])
+        self.assertFalse(pending(self.runtime, self.run))
+        api.assert_not_called()
+        self.runtime.configure({'delivery': {'release': self.policy}}, self.project)
+        self.assertTrue(pending(self.runtime, self.run))
+        with patch('adaptive_rsi.release.api', side_effect=self.api):
+            result = self.tick()
+        self.assertEqual(result['release']['state'], 'submitted')
+        self.assertEqual(result['deploy']['state'], 'waiting_release')
 
     def test_waiting_release_does_not_inherit_stale_verification_error(self):
         # 检查通过后部署转入等待发布；此前等待检查时的提示已过期，不得继续展示。

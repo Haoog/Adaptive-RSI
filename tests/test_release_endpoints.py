@@ -257,6 +257,7 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                 from types import SimpleNamespace
                 operation_lock = threading.RLock()
                 runtime = SimpleNamespace(store=store, dispatch_lock=threading.RLock(), stop=threading.Event(),
+                                          automation_receipt_failures={}, automation_receipt_failures_lock=threading.Lock(),
                                           automation_lock_for=lambda project, kind: operation_lock,
                                           wake=threading.Event(), config=lambda p: config,
                                           project=lambda p: {"id": "project", "path": "unused", "paused": False})
@@ -676,6 +677,51 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
         self.assertEqual(saved["state"], "queued")
         self.assertNotEqual(saved["state"], "workflow_succeeded")
         self.assertEqual(self.posts, [])
+
+    def test_resolve_missing_run_persists_diagnostic_without_success_audit(self):
+        for late in (False, True):
+            with self.subTest(late=late):
+                self.operation(state='rerun_unknown', workflow_run_id=17, attempt=1, previous_attempt=1,
+                               rerun_pending=True, rerun_requested_at=time.time() - 400)
+                lookup = self.api(single=self.remote(17, run_attempt=2, status='in_progress'))
+                calls = []
+                def unavailable(repo, endpoint, method='GET', fields=None):
+                    if endpoint == 'actions/runs/17':
+                        calls.append(endpoint)
+                        if not late or len(calls) == 2:
+                            raise release.ApiRejected('fixture missing', 404)
+                    return lookup(repo, endpoint, method, fields)
+                with patch.object(release, 'api', side_effect=unavailable):
+                    with self.assertRaisesRegex(release.ReconciliationRejected, 'not visible'):
+                        release.resolve(self.runtime, self.project, self.record['id'], 'release', 17)
+                saved = self.saved()
+                self.assertEqual(saved['remote_visibility']['state'], 'run_not_visible')
+                self.assertEqual(saved['workflow_run_id'], 17)
+                self.assertNotIn('manual_reconciliation', saved)
+
+    def test_candidates_refuse_stale_choices_after_receipt_changes(self):
+        self.operation()
+        lookup = self.api(runs=[self.remote(17)])
+        def changed(repo, endpoint, method='GET', fields=None):
+            result = lookup(repo, endpoint, method, fields)
+            self.runtime.store.put_setting(release.key(self.record['id'], 'release'), {'state': 'failed'})
+            return result
+        with patch.object(release, 'api', side_effect=changed):
+            with self.assertRaisesRegex(release.ReconciliationRejected, 'changed'):
+                release.candidates(self.runtime, self.project, self.record['id'], 'release')
+
+    def test_reconciliation_preserves_noncanonical_receipt_cas(self):
+        self.operation(state='rerun_unknown', workflow_run_id=17, attempt=1, previous_attempt=1,
+                       rerun_pending=True, rerun_requested_at=time.time() - 400)
+        name = release.key(self.record['id'], 'release')
+        self.runtime.store.execute('UPDATE settings SET value=? WHERE key=?', (json.dumps(self.saved(), indent=2), name))
+        with patch.object(release, 'api', side_effect=self.api(single=self.remote(17, run_attempt=2, status='in_progress'))):
+            release.candidates(self.runtime, self.project, self.record['id'], 'release')
+        self.assertEqual(self.saved()['reconciliation']['state'], 'rerun_confirmed')
+        self.runtime.store.execute('UPDATE settings SET value=? WHERE key=?', (json.dumps(self.saved(), indent=2), name))
+        with patch.object(release, 'api', side_effect=self.api(single=self.remote(17, run_attempt=2, status='in_progress'))):
+            release.resolve(self.runtime, self.project, self.record['id'], 'release', 17)
+        self.assertEqual(self.saved()['state'], 'running')
 
     def test_rerun_unknown_requires_a_confirmed_new_attempt(self):
         self.operation(state="rerun_unknown", workflow_run_id=17, attempt=1, previous_attempt=1,

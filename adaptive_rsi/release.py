@@ -1,9 +1,11 @@
 """Pinned, explicitly authorized GitHub Actions delivery with durable reconciliation."""
 import base64
+import copy
 import json
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -189,6 +191,52 @@ def key(run_id, kind):
     return "automation:" + run_id + ":" + kind
 
 
+def _read_automation(runtime, run_id, kind):
+    diagnostic = (run_id, kind)
+    row = runtime.store.one("SELECT value FROM settings WHERE key=?", (key(run_id, kind),))
+    if row is None:
+        with runtime.automation_receipt_failures_lock:
+            runtime.automation_receipt_failures.pop(diagnostic, None)
+        return None, None
+    raw = row["value"]
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("state"), str) or not data["state"]:
+            raise ValueError("Invalid automation state")
+        if any(field in data and not isinstance(data[field], dict) for field in ("rollback", "reconciliation")):
+            raise ValueError("Invalid automation details")
+        active = {"dispatching", "submitted", "dispatch_unknown", "queued", "running", "rerunning", "rerun_unknown"}
+        targets = [data] + ([data["rollback"]] if data.get("state") == "rolling_back" and "rollback" in data else [])
+        if data.get("state") == "rolling_back" and "rollback" not in data:
+            raise ValueError("Missing rollback details")
+        for target in targets:
+            if target.get("state") in active and any(not isinstance(target.get(field), str) or not target[field]
+                    for field in ("repository", "workflow", "ref", "sha", "workflow_sha", "operation_id")):
+                raise ValueError("Missing automation identity")
+    except (ValueError, TypeError, RecursionError):
+        data = {"state": "blocked", "receipt_error": "invalid_automation_receipt",
+                "error": "Automation record is unreadable; repair the stored record before continuing"}
+        with runtime.automation_receipt_failures_lock:
+            if diagnostic not in runtime.automation_receipt_failures:
+                run = runtime.store.one("SELECT project FROM runs WHERE id=?", (run_id,))
+                runtime.store.event("automation_error", data["error"], run["project"] if run else None, run_id,
+                                    {"kind": kind, "error_code": data["receipt_error"]})
+                if len(runtime.automation_receipt_failures) >= 128:
+                    runtime.automation_receipt_failures.pop(next(iter(runtime.automation_receipt_failures)))
+                runtime.automation_receipt_failures[diagnostic] = True
+    else:
+        with runtime.automation_receipt_failures_lock:
+            runtime.automation_receipt_failures.pop(diagnostic, None)
+    return data, raw
+
+
+def _require_automation(runtime, run_id, kind):
+    data, _ = _read_automation(runtime, run_id, kind)
+    if data and data.get("receipt_error"):
+        raise ReconciliationRejected(data["error"])
+    return data or {}
+
+
 def normalized_policy(kind, policy):
     return merge(DEFAULTS["delivery"][kind], policy)
 
@@ -201,7 +249,10 @@ def pending(runtime, run):
     for kind in KINDS:
         if not delivery.get(kind, {}).get("enabled"):
             continue
-        data = runtime.store.setting(key(run["id"], kind), {})
+        data, _ = _read_automation(runtime, run["id"], kind)
+        data = data or {}
+        if data.get("receipt_error"):
+            continue
         if (normalized_policy(kind, live["delivery"][kind]) != normalized_policy(kind, delivery[kind]) or live["delivery"]["mode"] != "pr" or
                 live["github"]["repository"] != saved["github"]["repository"]):
             if data.get("state") in active or data.get("state") == "rolling_back" and data.get("rollback", {}).get("state") in active:
@@ -212,7 +263,12 @@ def pending(runtime, run):
         if data.get("state") == "health_failed":
             if data.get("rollback_unavailable") or not delivery[kind].get("automatic_rollback"):
                 continue
-        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "rolled_back", "rollback_failed", "superseded", "rerun_unknown"}:
+        if kind == "deploy" and data.get("state") == "blocked" and data.get("blocked_by_release"):
+            release, _ = _read_automation(runtime, run["id"], "release")
+            release = release or {}
+            if release.get("state") in {"failed", "rerun_unknown", "blocked"}:
+                continue
+        if data.get("state") not in {"workflow_succeeded", "failed", "healthy", "health_unconfirmed", "rollback_health_unconfirmed", "rolled_back", "rollback_failed", "superseded", "rerun_unknown"}:
             return True
     return False
 
@@ -221,7 +277,7 @@ def status(runtime, project_id, run_id):
     run = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (run_id, project_id))
     if not run:
         raise ValueError("Run not found in this project")
-    return {kind: runtime.store.setting(key(run_id, kind), {"state": "not_authorized"}) for kind in KINDS}
+    return {kind: _read_automation(runtime, run_id, kind)[0] or {"state": "not_authorized"} for kind in KINDS}
 
 
 _UNCONDITIONAL = object()
@@ -406,9 +462,26 @@ def find_remote(repo, data):
     return None
 
 
+def _existing_remote(repo, data):
+    try:
+        remote = api(repo, "actions/runs/" + str(data["workflow_run_id"]))
+    except ApiRejected as exc:
+        if exc.status != 404:
+            raise
+        data["remote_visibility"] = {"state": "run_not_visible", "http_status": 404,
+                                     "workflow_run_id": data["workflow_run_id"]}
+        if data.get("state") in {"rerunning", "rerun_unknown"} or data.get("rerun_pending"):
+            data["state"] = "rerun_unknown"
+        elif data.get("state") in {"submitted", "queued", "running", "dispatching", "dispatch_unknown"}:
+            data["state"] = "dispatch_unknown"
+        return None
+    data.pop("remote_visibility", None)
+    return remote
+
+
 def reconcile(runtime, run, kind, data, persist=True):
     repo = data["repository"]
-    remote = (api(repo, "actions/runs/" + str(data["workflow_run_id"])) if data.get("workflow_run_id")
+    remote = (_existing_remote(repo, data) if data.get("workflow_run_id")
               else find_remote(repo, data))
     if not remote:
         return save(runtime, run, kind, data) if persist else data
@@ -472,15 +545,17 @@ def _reconciliation_operation(runtime, project_id, run_id, kind, target):
         policy = saved["delivery"].get(kind, {})
     except (TypeError, ValueError, KeyError, AttributeError):
         raise ReconciliationRejected("This run has no valid delivery authorization to reconcile") from None
-    data = runtime.store.setting(key(run_id, kind), {})
+    data, raw = _read_automation(runtime, run_id, kind)
+    if data and data.get("receipt_error"):
+        raise ReconciliationRejected(data["error"])
     if not isinstance(data, dict) or not data:
         raise ReconciliationRejected("This operation has no delivery record to reconcile")
     if target == "rollback":
         rollback = data.get("rollback")
         if kind != "deploy" or not isinstance(rollback, dict):
             raise ReconciliationRejected("This operation has no rollback record to reconcile")
-        return runtime.project(project_id), run, saved, policy, data, rollback
-    return runtime.project(project_id), run, saved, policy, data, data
+        return runtime.project(project_id), run, saved, policy, data, rollback, raw
+    return runtime.project(project_id), run, saved, policy, data, data, raw
 
 
 def _reconciliation_repository(runtime, project, saved, data):
@@ -534,19 +609,22 @@ def _reconciliation_view(kind, target, data, repo, selectable=None):
 def candidates(runtime, project_id, run_id, kind, target="operation"):
     """Read-only re-query of the runs GitHub already exposes for this operation."""
     with runtime.automation_lock_for(project_id, kind):
-        project, run, saved, policy, data, target_data = _reconciliation_operation(
+        project, run, saved, policy, data, target_data, original = _reconciliation_operation(
             runtime, project_id, run_id, kind, target)
         repo = _reconciliation_repository(runtime, project, saved, target_data)
         _require_unknown(target_data)
         existing = _run_number(target_data.get("workflow_run_id"))
         if existing:
-            remote = api(repo, "actions/runs/" + str(existing))
+            remote = _existing_remote(repo, target_data)
             remotes = [remote] if isinstance(remote, dict) else []
         else:
             remotes = _remote_runs(repo, target_data)
         normalized = [item for item in (_candidate(repo, remote) for remote in remotes) if item]
         previous = _run_number(target_data.get("previous_attempt")) or _run_number(target_data.get("attempt")) or 1
-        if existing:
+        if target_data.get("remote_visibility", {}).get("state") == "run_not_visible":
+            state = "run_not_visible"
+            reason = "Workflow run is not visible; check repository access before reconciling"
+        elif existing:
             attempt = normalized[0].get("attempt") if normalized else None
             if attempt is not None and attempt > previous:
                 state = "rerun_confirmed"
@@ -563,18 +641,11 @@ def candidates(runtime, project_id, run_id, kind, target="operation"):
         else:
             state = "awaiting_remote_visibility"
             reason = "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted."
-        original = encode(data)
         _record_reconciliation(target_data, repo, remotes, state, reason)
         try:
             save(runtime, run, kind, data, expected=original)
         except _AutomationChanged:
-            # A concurrent tracking or retry pass already persisted newer
-            # evidence. Return that view instead of overwriting it.
-            current = runtime.store.setting(key(run_id, kind), {})
-            current_target = current.get("rollback") if target == "rollback" else current
-            if not isinstance(current_target, dict):
-                raise ReconciliationRejected("Automation changed during reconciliation; reload before checking again") from None
-            return _reconciliation_view(kind, target, current_target, repo, selectable=normalized)
+            raise ReconciliationRejected("Automation changed during reconciliation; reload before checking again") from None
         return _reconciliation_view(kind, target, target_data, repo, selectable=normalized)
 
 
@@ -590,8 +661,18 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
         raise ReconciliationRejected("Select a workflow run returned by the current read-only query")
     origin = source if isinstance(source, str) and re.fullmatch(r"[a-z_]{1,32}", source) else "console"
     with runtime.automation_lock_for(project_id, kind):
-        project, run, saved, policy, data, target_data = _reconciliation_operation(
+        project, run, saved, policy, data, target_data, original = _reconciliation_operation(
             runtime, project_id, run_id, kind, target)
+        original_data = copy.deepcopy(data)
+        def reject_missing():
+            original_target = original_data["rollback"] if target == "rollback" else original_data
+            original_target["remote_visibility"] = copy.deepcopy(target_data["remote_visibility"])
+            original_target["state"] = target_data["state"]
+            try:
+                save(runtime, run, kind, original_data, expected=original)
+            except _AutomationChanged:
+                pass
+            raise ReconciliationRejected("Workflow run is not visible; check repository access before reconciling")
         repo = _reconciliation_repository(runtime, project, saved, target_data)
         _require_unknown(target_data)
         try:
@@ -609,7 +690,9 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
                 raise ReconciliationRejected("A newer deployment owns this target; this operation can no longer be reconciled")
         existing = _run_number(target_data.get("workflow_run_id"))
         if existing:
-            remote = api(repo, "actions/runs/" + str(existing))
+            remote = _existing_remote(repo, target_data)
+            if remote is None:
+                reject_missing()
             remotes = [remote] if isinstance(remote, dict) else []
         else:
             remotes = _remote_runs(repo, target_data)
@@ -627,7 +710,6 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             if attempt is None or attempt <= previous:
                 raise ReconciliationRejected("GitHub has not confirmed a new attempt for this rerun; do not repeat the rerun request")
         now = time.time()
-        original = encode(data)
         audit = _audit_entry({
             "at": now,
             "source": origin,
@@ -659,6 +741,8 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             reconciled = reconcile(runtime, run, kind, target_data, persist=False)
         except (ValueError, KeyError, TypeError):
             raise ReconciliationRejected("Workflow run identity differs from the authorized operation") from None
+        if isinstance(reconciled, dict) and reconciled.get("remote_visibility", {}).get("state") == "run_not_visible":
+            reject_missing()
         if not isinstance(reconciled, dict) or reconciled.get("state") in RECONCILIATION_UNKNOWN:
             raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
         if target == "rollback":
@@ -691,7 +775,7 @@ def health_check(url, sha, timeout=15):
     except Cancelled:
         raise
     except (OSError, RuntimeError, ValueError):
-        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": False,
+        return {"url": url, "sha": sha, "checked_at": time.time(), "healthy": None,
                 "error": "Health transport failed or exceeded its total deadline"}
 
 
@@ -723,6 +807,10 @@ def direct_health_check(url, sha, timeout=15):
                 raise ValueError("Health response must confirm the exact deployment SHA and healthy status")
             result["healthy"] = response.status == 200
             result["status_code"] = response.status
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        if not isinstance(exc, urllib.error.HTTPError):
+            result["healthy"] = None
+        result["error"] = str(exc)[:500]
     except Exception as exc:
         result["error"] = str(exc)[:500]
     return result
@@ -749,6 +837,9 @@ def deployment_owner(runtime, project, repo, policy):
         current = runtime.store.setting(name)
         if current:
             return current
+        migration = "deployment-owner-migrated:" + name.split(":", 1)[1]
+        if runtime.store.setting(migration, False):
+            return None
         legacy = []
         for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
             try:
@@ -762,11 +853,14 @@ def deployment_owner(runtime, project, repo, policy):
                 old_name = "deployment-owner:" + fingerprint({"project": run["project"], "repository": previous_repo,
                     "target": previous_policy.get("health_url") or previous_policy["workflow"]})
                 if row["key"] == old_name and owner_key(run["project"], previous_repo, previous_policy) == name:
-                    state = runtime.store.setting(key(receipt["run"], "deploy"), {})
+                    state = _require_automation(runtime, receipt["run"], "deploy")
                     legacy.append((not deployment_terminal(state, previous_policy), run["started"], receipt))
+            except ReconciliationRejected:
+                raise
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
         if not legacy:
+            runtime.store.put_setting(migration, True)
             return None
         if sum(active for active, _, _ in legacy) > 1:
             raise ValueError("Multiple legacy deployments own this target; reconcile them before deploying")
@@ -780,6 +874,8 @@ def deployment_terminal(data, policy):
         return not policy.get("health_url")
     if data.get("state") == "health_failed":
         return not policy.get("automatic_rollback") or data.get("rollback_unavailable", False)
+    if data.get("state") == "health_unconfirmed":
+        return False
     return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded"}
 
 
@@ -789,19 +885,33 @@ def health_sample(policy, sha):
     if len(urls) == 1:
         return health_check(urls[0], sha)
     deadline = time.monotonic() + 15
-    reports = []
-    for url in urls:
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+    def probe(url):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            reports.append({"url": url, "sha": sha, "healthy": False, "error": "Shared health deadline exhausted"})
-        else:
-            reports.append(health_check(url, sha, timeout=remaining))
+            return {"url": url, "sha": sha, "healthy": None, "error": "Shared health deadline exhausted"}
+        return health_check(url, sha, timeout=min(10, remaining))
+    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
+        futures = [executor.submit(copy_context().run, probe, url) for url in urls]
+        reports = [future.result() for future in futures]
     return {"url": urls[0], "sha": sha, "checked_at": time.time(), "checks": reports,
-            "healthy": all(report.get("healthy") is True for report in reports)}
+            "healthy": (False if any(report.get("healthy") is False for report in reports) else
+                        None if any(report.get("healthy") is None for report in reports) else
+                        all(report.get("healthy") is True for report in reports))}
 
 
 def observe_health(data, report, policy, now):
     """Persist bounded observations; successes must be consecutive across ticks."""
+    if report.get("healthy") is None:
+        data["health_successes"] = 0
+        data["health"] = report
+        data["health_observations"] = [*data.get("health_observations", []), report][-10:]
+        first = data.setdefault("health_observation_started_at", now)
+        if now - first >= max(60, policy.get("health_attempts", 1) * (15 + policy.get("health_interval_seconds", 10))):
+            return "health_unconfirmed"
+        data["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+        return "pending"
     data["health_attempts"] = data.get("health_attempts", 0) + 1
     data["health_successes"] = data.get("health_successes", 0) + 1 if report.get("healthy") is True else 0
     data["health"] = report
@@ -819,6 +929,7 @@ def observe_health(data, report, policy, now):
 
 
 def deployment_health(runtime, project, run, data, policy, cancel, persist=save):
+    data = copy.deepcopy(data)
     if not policy.get("health_url"):
         return data
     owner = deployment_owner(runtime, project["id"], data["repository"], policy)
@@ -851,11 +962,7 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                     data.pop(field, None)
                 stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
                           {"sha": data["sha"], "run": run["id"], "health": report})
-                try:
-                    persist(runtime, run, "deploy", data, stable=stable)
-                except TypeError:
-                    persist(runtime, run, "deploy", data)
-                    runtime.store.put_setting(stable[0], stable[1])
+                persist(runtime, run, "deploy", data, stable=stable)
             else:
                 persist(runtime, run, "deploy", data)
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
@@ -921,18 +1028,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                 if observed == "pending":
                     persist(runtime, run, "deploy", data)
                     return data
-                data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
+                if observed == "health_unconfirmed":
+                    rollback["health_unconfirmed"] = True
+                data["state"] = ("rolled_back" if observed == "healthy" else
+                                 "rollback_health_unconfirmed" if observed == "health_unconfirmed" else "rollback_failed")
                 if observed == "healthy":
                     owner_name = owner_key(project["id"], data["repository"], policy)
                     ownership = (owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
                     stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
                               {"sha": rollback["sha"], "run": run["id"], "health": report})
-                    try:
-                        persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
-                    except TypeError:
-                        persist(runtime, run, "deploy", data)
-                        runtime.store.put_setting(owner_name, {"run": run["id"], "sha": rollback["sha"]})
-                        runtime.store.put_setting(stable[0], stable[1])
+                    persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
                 else:
                     persist(runtime, run, "deploy", data)
     return data
@@ -971,6 +1076,12 @@ def feedback_target_status(outcome, target_sha):
     return False, bool(verified and target_sha == outcome.get("merged_sha"))
 
 
+class _PinUnavailable(RuntimeError):
+    def __init__(self, message, deferred=False):
+        super().__init__(message)
+        self.deferred = deferred
+
+
 def _pin_legacy_feedback(runtime, run, outcome, target_sha):
     """Pin a historical verified receipt to the exact merge being published.
 
@@ -1007,6 +1118,10 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
     from .gitops import snapshot
     from .storage_tools import run_artifact_path
     config = json.loads(run["config"])
+    retry_key = "legacy-release-pin:" + run["id"] + ":" + target_sha
+    previous = runtime.store.setting(retry_key, {})
+    if previous.get("retry_at", 0) > time.time():
+        raise _PinUnavailable(previous.get("error", "Legacy release verification could not run locally; retry is temporarily deferred"), deferred=True)
     try:
         source = runtime.project(run["project"])["path"]
         with tempfile.TemporaryDirectory(prefix="legacy-release-", dir=runtime.store.root) as folder:
@@ -1019,8 +1134,12 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
                                                     seeds=seeds, changed_files=[])
             if evaluation.get("decision") != "pass":
                 return False
-    except (ValueError, OSError, RuntimeError):
-        return False
+    except Cancelled:
+        raise
+    except (ValueError, OSError, RuntimeError) as exc:
+        message = ("Legacy release verification could not run locally: " + type(exc).__name__ + ": " + str(exc))[:500]
+        runtime.store.put_setting(retry_key, {"retry_at": time.time() + 600, "error": message})
+        raise _PinUnavailable(message) from exc
     target_layer["head"] = target_sha
     target_layer["head_pinned"] = {"at": time.time(), "basis": "exact_target_fixed_checks", "evaluation": evaluation}
     runtime.store.execute("UPDATE runs SET result=? WHERE id=? AND project=?",
@@ -1058,8 +1177,13 @@ def advance(runtime, project, run, outcome, cancel=None):
     result = {}
     for kind in KINDS:
         policy = saved["delivery"].get(kind, {})
-        data = runtime.store.setting(key(run["id"], kind))
-        expected = encode(data) if data is not None else None
+        data, expected = _read_automation(runtime, run["id"], kind)
+        if data and data.get("receipt_error"):
+            result[kind] = data
+            continue
+        if kind == "deploy" and result.get("release", {}).get("receipt_error"):
+            result[kind] = result["release"].copy()
+            continue
 
         def persist(runtime, run, kind, value, ownership=None, stable=None):
             nonlocal expected
@@ -1108,17 +1232,29 @@ def advance(runtime, project, run, outcome, cancel=None):
                 continue
             if kind == "deploy" and saved["delivery"].get("release", {}).get("enabled"):
                 if result.get("release", {}).get("state") != "workflow_succeeded":
+                    if result.get("release", {}).get("state") in {"failed", "rerun_unknown", "blocked"}:
+                        data = {**(data or {}), "state": "blocked", "blocked_by_release": True,
+                                "error": ("Release rerun result is unconfirmed; reconcile release before deployment"
+                                          if result["release"]["state"] == "rerun_unknown" else
+                                          "Release authorization is blocked; restore it before deployment"
+                                          if result["release"]["state"] == "blocked" else
+                                          "Release workflow failed; retry release before deployment")}
+                        result[kind] = persist(runtime, run, kind, data)
+                        continue
                     # 到达这里说明合并后检查已通过；继承的等待提示已过期，进入等待发布时一并清除。
                     data = {**(data or {}), "state": "waiting_release", "error": ""}
+                    data.pop("blocked_by_release", None)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
             repo = authorized(runtime, project, run, kind, policy, cancel)
+            if data:
+                data.pop("blocked_by_release", None)
             expected_owner = None
             if kind == "deploy":
                 owner = deployment_owner(runtime, project["id"], repo, policy)
                 expected_owner = owner
                 if owner and owner["run"] != run["id"]:
-                    previous = runtime.store.setting(key(owner["run"], "deploy"), {})
+                    previous = _require_automation(runtime, owner["run"], "deploy")
                     if not deployment_terminal(previous, policy):
                         result[kind] = persist(runtime, run, kind, {"state": "waiting_target", "error": "Another deployment is still active on this target"})
                         continue
@@ -1180,7 +1316,7 @@ def advance(runtime, project, run, outcome, cancel=None):
             persist(runtime, run, kind, data)
             runtime.store.event("automation_dispatched", "Authorized " + kind + " workflow submitted", project["id"], run["id"], data)
         except _AutomationChanged:
-            result[kind] = runtime.store.setting(key(run["id"], kind), {})
+            result[kind] = _read_automation(runtime, run["id"], kind)[0] or {}
             continue
         except Cancelled:
             if data and data.get("state") in {"pending", "blocked"}:
@@ -1192,12 +1328,13 @@ def advance(runtime, project, run, outcome, cancel=None):
                 data["error"] = str(exc)[:500]
                 if data["state"] in {"pending", "blocked"}:
                     data["state"] = "blocked"
-            runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], {"kind": kind})
+            if not isinstance(exc, _PinUnavailable) or not exc.deferred:
+                runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], {"kind": kind})
         if data:
             try:
                 result[kind] = persist(runtime, run, kind, data)
             except _AutomationChanged:
-                result[kind] = runtime.store.setting(key(run["id"], kind), {})
+                result[kind] = _read_automation(runtime, run["id"], kind)[0] or {}
     return result
 
 
@@ -1220,8 +1357,10 @@ def retry(runtime, project_id, run_id, kind):
             raise ValueError("Only a verified merged run in this project can be retried")
         policy = json.loads(run["config"])["delivery"].get(kind, {})
         project = runtime.project(project_id)
+        data, raw = _read_automation(runtime, run_id, kind)
+        if data and data.get("receipt_error"):
+            raise ReconciliationRejected(data["error"])
         repo = authorized(runtime, project, run, kind, policy)
-        data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
         if not data.get("operation_id"):
@@ -1242,20 +1381,23 @@ def retry(runtime, project_id, run_id, kind):
             outcome = {}
         if not isinstance(outcome, dict):
             outcome = {}
-        if kind == "deploy" and data.get("state") == "health_failed":
+        if kind == "deploy" and data.get("state") in {"health_failed", "health_unconfirmed"}:
             if not _retry_target_allowed(runtime, run, outcome, data, data):
                 raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
-            expected_health = encode(data)
+            expected_health = raw
             data.update(state="workflow_succeeded", error="", health_attempts=0)
-            for field in ("health_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate",
+            for field in ("health_started_at", "health_observation_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate",
                           "rollback_unavailable", "rollback_blocked_reason", "rollback_recovery_notes"):
                 data.pop(field, None)
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy)
+                owner = deployment_owner(runtime, project_id, repo, policy)
+                if owner and owner["run"] != run_id:
+                    raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
                 save(runtime, run, kind, data, expected=expected_health)
             runtime.wake.set()
             return data
-        expected = encode(data)
+        expected = raw
         expected_owner = None
 
         def persist_retry(require_authorization=False):
@@ -1279,7 +1421,7 @@ def retry(runtime, project_id, run_id, kind):
 
         target = data
         rollback = data.get("rollback", {})
-        is_rollback = kind == "deploy" and (data.get("state") == "rollback_failed" or
+        is_rollback = kind == "deploy" and (data.get("state") in {"rollback_failed", "rollback_health_unconfirmed"} or
                 data.get("state") == "rolling_back" and (rollback.get("rerun_pending") or
                     rollback.get("state") in {"rerunning", "rerun_unknown"}))
         if is_rollback:
@@ -1287,8 +1429,11 @@ def retry(runtime, project_id, run_id, kind):
             if target.get("state") == "workflow_succeeded":
                 if not _retry_target_allowed(runtime, run, outcome, data, target):
                     raise ValueError("Rollback retry requires known healthy target evidence")
+                for field in ("health_started_at", "health_observation_started_at", "health_retry_at", "health_successes", "health_observations", "health_gate", "health_unconfirmed"):
+                    target.pop(field, None)
+                target["health_attempts"] = 0
                 data.update(state="rolling_back", error="")
-                persist_retry()
+                persist_retry(require_authorization=True)
                 runtime.wake.set()
                 return data
         if not _retry_target_allowed(runtime, run, outcome, data, target):
@@ -1298,7 +1443,7 @@ def retry(runtime, project_id, run_id, kind):
             if kind == "deploy":
                 expected_owner = deployment_owner(runtime, project_id, repo, policy)
                 if expected_owner and expected_owner["run"] != run_id:
-                    previous = runtime.store.setting(key(expected_owner["run"], "deploy"), {})
+                    previous = _require_automation(runtime, expected_owner["run"], "deploy")
                     if not deployment_terminal(previous, policy):
                         raise ValueError("Another deployment is still active on this target")
                     comparison = api(repo, "compare/" + expected_owner["sha"] + "..." + target["sha"])

@@ -100,6 +100,8 @@ class Runtime(Maintenance):
         self._future_runs = {}
         self._scheduler_failures = {}
         self._scheduler_failures_lock = threading.Lock()
+        self.automation_receipt_failures = {}
+        self.automation_receipt_failures_lock = threading.Lock()
         self._project_deadlines = {}
         self._config_cache = {}
         self.import_lock = threading.Lock()

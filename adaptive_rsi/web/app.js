@@ -117,6 +117,9 @@ const apiErrors={
  "Pinned workflow does not implement the RSI dispatch contract": "此工作流缺少自动交付输入，请先更新工作流。",
  "Multiple workflow runs match one operation; inspect GitHub before retrying": "有多个工作流执行记录，请先到 GitHub 核对结果。",
  "Project paused or operation cancelled": "项目已暂停或操作已取消，发布暂时停止。",
+ "Release workflow failed; retry release before deployment": "发布工作流失败，请先重试发布再部署。",
+ "Release authorization is blocked; restore it before deployment": "发布授权已受阻，请先恢复授权再部署。",
+ "Release rerun result is unconfirmed; reconcile release before deployment": "发布重试结果尚未确认，请先核对发布记录再部署。",
  "Health response must confirm the exact deployment SHA and healthy status": "健康检查未确认本次部署版本正常，请检查服务返回的版本和状态。",
  "Restore the original authorization and let tracking retry the pending operation": "请恢复原工作流授权，系统会继续跟踪待执行操作。",
  "Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation": "请先到 GitHub 确认工作流结果。只有已确认失败的执行才能重试。",
@@ -1217,6 +1220,8 @@ $('settings-form').addEventListener('submit',event=>{event.preventDefault();safe
 $('case-form').addEventListener('submit',event=>{event.preventDefault();safe(async()=>{if(!projectId)throw Error(t('请先接入项目'));const unchanged=unchangedForm(event.target);await api('cases',{project:projectId,manifest:JSON.parse($('case-json').value)});if(unchanged())$('case-form').reset();await refresh({force:true});toast(t('评估任务已导入'));},event.target);});
 const updateNames={checking:'正在检查更新',recovery_required:'更新恢复需要处理，请检查安装记录后重新启动服务',unchecked:'尚未检查更新',up_to_date:'已是最新稳定版',no_release:'尚无可用的正式发布包',available:'发现可用更新',waiting_idle:'等待任务结束后更新',downloading:'正在下载并校验',restarting:'正在重启服务',installed:'更新已完成',rolled_back:'更新失败，已恢复旧版',error:'更新检查或安装失败'};
 const releaseStates={waiting_verification:'等待合并后检查',blocked_verification:'合并后检查未通过，暂不发布',waiting_target:'等待同一服务的上次部署结束',superseded:'已有更新版本接管部署',healthy:'健康检查通过',health_failed:'上线后健康检查失败',rolling_back:'正在恢复上一正常版本',rolled_back:'已恢复上一正常版本',rollback_failed:'恢复上一正常版本失败',pending:'等待执行',submitted:'工作流已提交',dispatch_unknown:'是否启动仍待确认',running:'工作流执行中',rerunning:'工作流重试中',rerun_unknown:'重试是否启动仍待确认',waiting_release:'等待发布成功',not_authorized:'尚未授权',waiting:'等待前置步骤',dispatching:'正在启动工作流',dispatched:'工作流已启动',queued:'排队中',in_progress:'工作流执行中',workflow_succeeded:'工作流执行成功',workflow_failed:'工作流执行失败',failed:'操作失败',blocked:'发布被阻止',uncertain:'执行结果待确认',cancelled:'工作流已取消',disabled:'已关闭'};
+releaseStates.health_unconfirmed='健康状态未确认';
+releaseStates.rollback_health_unconfirmed='回滚健康状态未确认';
 let releaseWorkflowSequence=0;
 async function loadReleaseWorkflows(){
  const project=projectId,ticket=++releaseWorkflowSequence;if(!project||$('config-scope').value!=='project')return;
@@ -1350,7 +1355,7 @@ async function renderReleaseOutcome(node,run,project){
   if(operation.rollback){const rollback=operation.rollback;row.append(el('p',t('恢复旧版本')+' · '+t(releaseStates[rollback.state]||rollback.state)));}
   if(operation.url&&/^https:\/\/github\.com\//.test(operation.url)){const link=el('a',t('查看 GitHub 工作流'));link.href=operation.url;link.target='_blank';link.rel='noreferrer';row.append(link);}
   if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));
-  const healthRetry=kind==='deploy'&&operation.state==='health_failed';
+  const healthRetry=kind==='deploy'&&['health_failed','health_unconfirmed','rollback_health_unconfirmed'].includes(operation.state);
   if(healthRetry||rerunUnknown||dispatchRejected||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(healthRetry?t('重新检查健康'):rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):dispatchRejected?t('修复权限后重试'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
   if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{closeTaskDetail();changeSettingsScope('project',false);showView('settings');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
   renderReleaseReconciliation(row,operation,project,run,kind,'operation');
