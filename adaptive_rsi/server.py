@@ -267,6 +267,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond({"data": base64.b64encode(chunk).decode("ascii"),
                                   "size": size, "offset": offset, "length": len(chunk)})
                     return
+                self._response_status = 500
+                self._response_error_code = "download_interrupted"
                 self.send_response(200)
                 self.headers_common()
                 self.send_header("Content-Type", "application/vnd.sqlite3")
@@ -285,6 +287,10 @@ class Handler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(chunk)
                         remaining -= len(chunk)
+                    if not remaining:
+                        self.wfile.flush()
+                        self._response_status = 200
+                        self._response_error_code = ""
                 except OSError:
                     pass  # 响应头已发出；断线或磁盘错误时只关闭连接，不再追加 JSON。
                 finally:

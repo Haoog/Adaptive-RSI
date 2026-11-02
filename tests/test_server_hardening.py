@@ -204,6 +204,48 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(json.loads(body)["length"], 0)
         self.assertEqual(status, 200)
 
+    def test_backup_download_records_completed_and_missing_responses(self):
+        self.backup.write_bytes(b'backup payload')
+        self.assertEqual(self.request('/api/backup?id=' + self.identifier)[0], 200)
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/backup'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([(r['status'], r['error_code']) for r in rows], [(200, '')])
+        self.backup.unlink()
+        self.assertEqual(self.request('/api/backup?id=' + self.identifier)[0], 400)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/backup' ORDER BY rowid")
+            if len(rows) == 2:
+                break
+            time.sleep(.01)
+        self.assertEqual([(r['status'], r['error_code']) for r in rows], [(200, ''), (400, 'http_400')])
+
+    def test_interrupted_backup_stream_is_not_logged_as_success(self):
+        self.backup.write_bytes(b'payload')
+        original = Handler.end_headers
+        def truncate_after_headers(handler):
+            original(handler)
+            if handler.path.startswith('/api/backup'):
+                self.backup.write_bytes(b'')
+        with patch.object(Handler, 'end_headers', truncate_after_headers):
+            with self.assertRaises(http.client.IncompleteRead):
+                self.request('/api/backup?id=' + self.identifier)
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status,error_code FROM request_log WHERE path='/api/backup'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([(r['status'], r['error_code']) for r in rows], [(500, 'download_interrupted')])
+        self.assertTrue(self.server._backup_gate.acquire(blocking=False))
+        self.server._backup_gate.release()
+
     def test_backup_rejects_large_files_symlinks_fifo_and_bad_offsets(self):
         with self.backup.open("wb") as stream:
             stream.truncate(1024 * 1024 * 1024 + 1)
@@ -292,9 +334,10 @@ class ServerHardeningTest(unittest.TestCase):
         handler.send_header = lambda *_: None
         handler.end_headers = lambda: None
         writes = []
-        handler.wfile = SimpleNamespace(write=lambda chunk: writes.append(len(chunk)))
+        handler.wfile = SimpleNamespace(write=lambda chunk: writes.append(len(chunk)), flush=lambda: None)
         handler.backup(self.backup, {})
         self.assertEqual(writes, [65536] * 3)
+        self.assertEqual((handler._response_status, handler._response_error_code), (200, ''))
         handler.wfile = SimpleNamespace(write=lambda _: (_ for _ in ()).throw(BrokenPipeError()))
         handler.backup(self.backup, {})
         self.assertTrue(handler.close_connection)
