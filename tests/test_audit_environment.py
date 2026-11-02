@@ -497,6 +497,34 @@ class TestFirstToolScopeTest(unittest.TestCase):
             self.assertNotIn(tool.workspace, writable)
             self.assertEqual(writable, [repo / 'app.py', repo / 'tests'])
 
+    def test_root_unittest_layout_runs_new_regression_without_package_initializer(self):
+        from adaptive_rsi import pipeline
+        from adaptive_rsi.evaluator import _isolated_test_check
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root, {'app.py': 'def add():\n    return 2\n',
+                                          'test_app.py': 'import unittest\n'})
+            test_scope = pipeline._regression_test_scope(str(repo), ['app.py'], allow_colocated=True)
+            target = repo / test_scope / 'test_regression.py'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('import unittest\nfrom app import add\n'
+                              'class Regression(unittest.TestCase):\n'
+                              '    def test_add(self):\n        self.assertEqual(add(), 2)\n')
+            check = _isolated_test_check(
+                [{'name': 'unit', 'cwd': '.', 'argv': [sys.executable, '-m', 'unittest', 'discover', '-s', '.']}],
+                repo, target.relative_to(repo).as_posix())
+            self.assertIsNotNone(check)
+            result = subprocess.run(check['argv'], cwd=repo, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('Ran 1 test', result.stderr)
+            self.assertFalse((target.parent / '__init__.py').exists())
+            explicit = _isolated_test_check(
+                [{'name': 'unit', 'cwd': '.', 'argv': [sys.executable, '-m', 'unittest',
+                  'discover', '-s', '.', '-t', '.']}], repo, target.relative_to(repo).as_posix())
+            self.assertIsNone(explicit, '显式 top-level 不能被静默改写')
+
     def test_tests_directory_layout_is_unchanged(self):
         from adaptive_rsi import pipeline
         with tempfile.TemporaryDirectory() as directory:

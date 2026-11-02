@@ -442,8 +442,19 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
                     if any(path != target for path in target.parent.rglob(target.name) if path.is_file()):
                         continue
                     start_arg = Path(os.path.relpath(target.parent, cwd)).as_posix()
+                    top_arg = original_top
+                    # 根布局中新建 tests/ 不是 Python package。把它作为发现根，
+                    # 保留当前 cwd 的模块导入，同时只执行指定回归文件。
+                    if top_dir == cwd and target.parent != top_dir:
+                        package = target.parent
+                        while package != top_dir and (package / "__init__.py").is_file():
+                            package = package.parent
+                        if package != top_dir:
+                            if options["top"] is not None:
+                                continue
+                            top_arg = start_arg
                     command = (argv[:module_index + 2] + ["discover"] + options["flags"] +
-                               ["-s", start_arg, "-t", original_top, "-p", target.name])
+                               ["-s", start_arg, "-t", top_arg, "-p", target.name])
         if command is None and python_test and "-m" in lower:
             module_index = lower.index("-m")
             if module_index + 1 < len(lower) and lower[module_index + 1] == "pytest":

@@ -701,6 +701,8 @@ class Maintenance:
         keys = set()
         configs_valid = True
         with self.dispatch_lock:
+            configuration = self.store.query("SELECT id,config FROM projects ORDER BY id")
+            global_configuration = self.store.one("SELECT value FROM settings WHERE key='config'")
             for scope in [None] + [row["id"] for row in self.store.query("SELECT id FROM projects")]:
                 try:
                     config = self.config(scope)
@@ -729,10 +731,16 @@ class Maintenance:
                 # 避免删除扫描之后刚被刷新的目录。
                 with self.store.connect() as db:
                     db.execute("BEGIN IMMEDIATE")
-                    db.executemany("DELETE FROM settings WHERE key=? AND json_valid(value) "
-                                   "AND json_extract(value,'$.fetched')<? "
-                                   "AND key NOT IN (SELECT value FROM json_each(?))",
-                                   [(key, stale, keep) for key in doomed])
+                    current = [dict(row) for row in db.execute("SELECT id,config FROM projects ORDER BY id")]
+                    global_row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+                    current_global = dict(global_row) if global_row else None
+                    # 配置写入和 claim 共用数据库写事务；最终核验与删除不能隔开。
+                    if (current == configuration and current_global == global_configuration and
+                            not db.execute("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1").fetchone()):
+                        db.executemany("DELETE FROM settings WHERE key=? AND json_valid(value) "
+                                       "AND json_extract(value,'$.fetched')<? "
+                                       "AND key NOT IN (SELECT value FROM json_each(?))",
+                                       [(key, stale, keep) for key in doomed])
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))

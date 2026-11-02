@@ -495,6 +495,24 @@ class SchedulerIsolationTest(unittest.TestCase):
             self.runtime.maintenance_thread.join(5)
         self.assertEqual(len(entered), 2)
 
+    def test_model_center_cleanup_retains_a_provider_enabled_after_scan(self):
+        provider = {'id': 'rebound', 'name': 'Rebound', 'protocol': 'chat_completions',
+                    'base_url': 'https://example.test/v1', 'env_key': ''}
+        key = self.runtime.model_center.key(provider, None)
+        self.store.put_setting(key, {'fetched': time.time() - 400 * 86400})
+        query = self.store.query
+        changed = []
+        def scan(sql, args=()):
+            rows = query(sql, args)
+            if sql.startswith('SELECT key,value FROM settings WHERE key LIKE') and 'model-center:' in sql:
+                self.runtime.configure({'providers': [provider]})
+                changed.append(True)
+            return rows
+        with patch.object(self.store, 'query', side_effect=scan):
+            self.runtime.maintenance()
+        self.assertEqual(changed, [True])
+        self.assertIsNotNone(self.store.setting(key))
+
     def test_model_center_cleanup_releases_dispatch_lock_before_batch_delete(self):
         stale = time.time() - 400 * 86400
         kept = self.runtime.model_center.key(BUILTIN_PROVIDERS[0], None)
