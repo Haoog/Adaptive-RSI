@@ -812,11 +812,13 @@ class AuthSessions:
 
     def _persist(self):
         recent = set(list(self.sessions)[-30:])
-        self.sessions = {key: item for key, item in self.sessions.items() if key in recent or item["state"] in ACTIVE}
-        rows = list(self.sessions.items())
+        retained = {key: item for key, item in self.sessions.items()
+                    if key in recent or item["state"] in ACTIVE or key in self.workers}
+        rows = list(retained.items())
         _write_json(self.file, {key: {field: value for field, value in item.items()
                                      if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
                                 for key, item in rows})
+        self.sessions = retained
 
     @staticmethod
     def _public(item):
@@ -1098,11 +1100,19 @@ class AuthSessions:
                     return
                 self._update(session_id, state="completing")
             self._save(worker, item["backend"], item["provider"], session_id, stop)
-        except AuthError as exc:
+        except Exception as exc:
             expired = self.now() >= self.sessions[session_id]["expires_at"]
-            self._update(session_id, state="expired" if expired else "failed", error="auth_expired" if expired else exc.code)
-        except Exception:
-            self._update(session_id, state="failed", error="auth_protocol_error")
+            values = {"state": "expired" if expired else "failed",
+                      "error": "auth_expired" if expired else exc.code if isinstance(exc, AuthError) else "auth_protocol_error"}
+            try:
+                self._update(session_id, **values)
+            except OSError:
+                # worker 将退出，已不能重试；写盘失败也必须释放内存中的 busy 会话。
+                # 下次成功写盘会保存该终态，进程重启则沿用 interrupted 恢复规则。
+                with self.lock:
+                    item = self.sessions[session_id]
+                    if item["state"] in ACTIVE:
+                        self._terminate(item, **values)
         finally:
             with self.lock:
                 self.workers.pop(session_id, None)

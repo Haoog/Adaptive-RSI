@@ -399,6 +399,37 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "cancelled")
         self.assertEqual(manager.snapshot()["sessions"][-1]["id"], session["id"])
 
+    def test_failed_terminal_write_preserves_old_session_beyond_history_limit(self):
+        manager = AuthSessions(self.root / 'old-state', factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve('codex')
+        for index in range(31):
+            key = 'history-' + str(index)
+            manager.sessions[key] = {'id': key, 'backend': 'codex', 'state': 'completed',
+                                     'expires_at': time.time() + 600, 'error': ''}
+        with self.state_write_error(manager):
+            manager._run(session['id'], 0, None)
+        self.assertEqual(manager.status(session['id'])['state'], 'failed')
+        self.assertEqual(manager.busy, 0)
+        self.assertTrue(self.created[-1].closed)
+
+    def test_worker_exit_releases_busy_session_after_state_write_failure(self):
+        manager = AuthSessions(self.root / "worker-state", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.state_write_error(manager):
+            try:
+                manager._run(session["id"], 0, None)
+            except OSError:
+                pass
+        self.assertEqual(manager.status(session["id"])["state"], "failed")
+        self.assertEqual(manager.busy, 0)
+        self.assertEqual(manager.workers, {})
+        self.assertTrue(self.created[-1].closed)
+        replacement = manager.reserve("codex")
+        self.assertEqual(replacement["state"], "starting")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "failed")
+
     def test_failed_state_write_does_not_abort_close(self):
         manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
         self.addCleanup(manager.close)
