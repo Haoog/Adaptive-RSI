@@ -328,6 +328,34 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body, {"error": "Invalid origin or CSRF token"})
 
+    def test_sys_metrics_reports_workers_memory_disk_and_pressure(self):
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        self.assertIn("ts", body)
+        workers = body["workers"]
+        self.assertEqual(workers["active"], 0)
+        self.assertIsInstance(workers["capacity"], int)
+        memory = body["memory"]
+        self.assertIsInstance(memory["available_bytes"], int)
+        disk = body["disk"]
+        self.assertIsInstance(disk["free_bytes"], int)
+        self.assertIsInstance(disk["total_bytes"], int)
+        self.assertEqual(body["resource_pressure"], {"admitted": True, "reasons": []})
+
+        task = self.runtime.goal(self.project, "Keep worker active")
+        run = self.runtime.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(run["task"], task)
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["workers"]["active"], 1)
+
+        self.runtime.resource_pressure.projects[self.project] = {
+            "checked_at": time.time(), "admitted": False, "reasons": ["memory"],
+            "min_free_disk_bytes": 0, "min_available_memory_bytes": 0}
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["resource_pressure"], {"admitted": False, "reasons": ["memory"]})
+
 
 class ImportAdmissionTest(unittest.TestCase):
     def setUp(self):

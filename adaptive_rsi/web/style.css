@@ -860,3 +860,26 @@ input:disabled,select:disabled {
 .shutdown-overlay h2{margin:0;font-size:1.1rem}
 .shutdown-overlay p{margin:0;color:#a9b8a6}
 #capability-notice{margin:0 0 12px}
+
+/* ── 任务卡片 Metrics 徽标 ── */
+.task-metrics{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:2px 0;}
+.task-metric-badge{display:inline-flex;align-items:center;gap:3px;font-size:.75rem;line-height:1.4;padding:1px 7px;border-radius:999px;white-space:nowrap;}
+.task-metric-tokens{background:color-mix(in srgb,var(--color-primary,#225d46) 12%,transparent);color:var(--color-primary,#225d46);}
+.task-metric-duration{background:color-mix(in srgb,#888 10%,transparent);color:var(--color-text-muted,#666);}
+
+/* ── 阶段时间流水线 ── */
+.stage-duration{font-size:.72rem;color:var(--color-text-muted,#888);font-weight:normal;margin-left:4px;}
+.phase-timeline{margin-top:10px;display:flex;flex-direction:column;gap:4px;}
+.phase-row{display:grid;grid-template-columns:90px 1fr 36px;align-items:center;gap:6px;font-size:.75rem;}
+.phase-label{color:var(--color-text-muted,#888);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.phase-bar-bg{background:color-mix(in srgb,#888 12%,transparent);border-radius:4px;height:8px;overflow:hidden;}
+.phase-bar{background:var(--color-primary,#225d46);height:100%;border-radius:4px;transition:width .3s;}
+.phase-time{text-align:right;color:var(--color-text-muted,#888);}
+
+/* ── 系统性能 HUD 条 ── */
+.sys-hud{display:flex;gap:6px;flex-wrap:wrap;align-items:center;flex:1;justify-content:center;}
+.hud-chip{display:inline-flex;align-items:center;font-size:.72rem;font-weight:500;padding:2px 9px;border-radius:999px;white-space:nowrap;letter-spacing:.01em;}
+.hud-chip-ok{background:color-mix(in srgb,#27ae60 14%,transparent);color:#1a7a3f;}
+.hud-chip-warn{background:color-mix(in srgb,#e67e22 16%,transparent);color:#b35c00;}
+.hud-chip-neutral{background:color-mix(in srgb,#888 10%,transparent);color:var(--color-text-muted,#666);}
+@media(max-width:700px){.sys-hud{display:none;}}
