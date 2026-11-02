@@ -95,6 +95,37 @@ def _write_json(path, value):
             temporary.unlink()
 
 
+def _quarantine_invalid(path):
+    """把无法解析的旧 auth.json 留档，返回备份路径；原文件不存在时返回 None。"""
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    backup = path.with_name(path.name + ".invalid-" + stamp)
+    suffix = 0
+    while backup.exists():
+        suffix += 1
+        backup = path.with_name(path.name + ".invalid-" + stamp + "-" + str(suffix))
+    try:
+        os.replace(path, backup)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # 留档失败时保持原有失败语义，绝不覆盖可能仍可人工恢复的原始字节。
+        raise AuthError("invalid_credentials") from None
+    try:
+        backup.chmod(0o600)
+    except OSError:
+        pass
+    return backup
+
+
+def _read_json_for_write(path):
+    """写路径读取：损坏的旧文件先留档再视为空，用户仍可覆盖或退出登录。"""
+    try:
+        return _read_json(path)
+    except AuthError:
+        _quarantine_invalid(path)
+        return {}
+
+
 def _codex_path():
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"
 
@@ -929,7 +960,10 @@ class AuthSessions:
         thread.start()
 
     def start(self, backend, provider=None, method=0, inputs=None):
-        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。"""
+        """reserve + launch 的便捷组合；更新准入场景在临界区内只调用 reserve。
+
+        reserve 与 launch 之间 ttl 耗尽时返回 expired 终态，不抛 invalid_auth_state。
+        """
         session = self.reserve(backend, provider, method, inputs)
         return self.launch(session["id"], method, inputs)
 
@@ -1088,7 +1122,7 @@ class AuthSessions:
                 elif modern:
                     worker.install_credential(provider, value)
                 else:
-                    current = _read_json(auth_path())
+                    current = _read_json_for_write(auth_path())
                     current[provider] = value
                     _write_json(auth_path(), current)
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
@@ -1173,7 +1207,7 @@ class AuthSessions:
                         raise AuthError("auth_protocol_error") from None
                     if not modern or removed_export:
                         path = auth_path()
-                        data = _read_json(path)
+                        data = _read_json_for_write(path)
                         if provider in data:
                             data.pop(provider, None)
                             _write_json(path, data)
@@ -1215,7 +1249,7 @@ class AuthSessions:
                     raise AuthError("invalid_credentials")
                 worker.install_credential(provider, credentials)
             else:
-                data = _read_json(auth_path())
+                data = _read_json_for_write(auth_path())
                 data[provider] = {"type": "api", "key": key.strip()}
                 _write_json(auth_path(), data)
         finally:

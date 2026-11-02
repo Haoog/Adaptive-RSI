@@ -8,6 +8,23 @@ from pathlib import Path
 from adaptive_rsi import evaluator, workflow
 
 
+def _config(**recovery):
+    from adaptive_rsi.config import DEFAULTS, merge
+    return merge(DEFAULTS, {'recovery': recovery} if recovery else {})
+
+
+def _stage_runner():
+    """Minimal settings store: the sealed checkpoint layer never needs SQLite."""
+    from adaptive_rsi.evaluator import Evaluator
+
+    class MemoryStore:
+        def __init__(self): self.data = {}
+        def setting(self, key, default=None): return self.data.get(key, default)
+        def put_setting(self, key, value): self.data[key] = value
+    store = MemoryStore()
+    return store, Evaluator(store)
+
+
 class AuditEvaluationTest(unittest.TestCase):
     def test_sealed_read_only_checkpoint_rejects_mutation_or_changed_input(self):
         from adaptive_rsi.evaluator import Evaluator
@@ -25,6 +42,151 @@ class AuditEvaluationTest(unittest.TestCase):
             runner.seal_checkpoint('write', inputs, {}, effect='workspace_write')
         store.data['sealed-read-checkpoint:read']['result']['pass'] = False
         self.assertIsNone(runner.reuse_checkpoint('read', inputs))
+
+    def test_stage_reuse_requires_explicit_opt_in(self):
+        from adaptive_rsi.evaluator import checkpoint_reuse_enabled
+        self.assertFalse(checkpoint_reuse_enabled(_config()))
+        self.assertTrue(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints=True)))
+        # 只有显式 true 才开启；字符串或数字不能悄悄打开复用。
+        self.assertFalse(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints='yes')))
+        self.assertFalse(checkpoint_reuse_enabled(_config(reuse_sealed_checkpoints=1)))
+        self.assertFalse(checkpoint_reuse_enabled({'recovery': None}))
+        store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'generation': len(calls)}
+
+        # 默认关闭：既不复用也不写入检查点。
+        runner.execute_stage('planning', {'tree': 'a'}, action, enabled=False)
+        runner.execute_stage('planning', {'tree': 'a'}, action, enabled=False)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('sealed-read-checkpoint:planning', store.data)
+
+    def test_stage_reuse_returns_sealed_result_and_reports_reuse(self):
+        store, runner = _stage_runner()
+        calls, reused = [], []
+        inputs = {'tree': 'a', 'checks': ['x']}
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'value': {'impact': 'high'}}
+
+        first = runner.execute_stage('planning', inputs, action, enabled=True, on_reuse=reused.append)
+        second = runner.execute_stage('planning', inputs, action, enabled=True, on_reuse=reused.append)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, ['planning'])
+        self.assertIsNotNone(store.data.get('sealed-read-checkpoint:planning'))
+
+    def test_stage_reuse_invalidated_by_changed_input(self):
+        _store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'ready', 'generation': len(calls)}
+
+        first = runner.execute_stage('planning', {'tree': 'a'}, action, enabled=True)
+        second = runner.execute_stage('planning', {'tree': 'b'}, action, enabled=True)
+        self.assertEqual(first['generation'], 1)
+        self.assertEqual(second['generation'], 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_stage_reuse_invalidated_by_tampered_checkpoint(self):
+        store, runner = _stage_runner()
+        calls = []
+
+        def action():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': len(calls)}
+
+        runner.execute_stage('review', {'review_key': 'k'}, action, enabled=True)
+        store.data['sealed-read-checkpoint:review']['result']['decision'] = 'fail'
+        result = runner.execute_stage('review', {'review_key': 'k'}, action, enabled=True)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 2)
+
+    def test_rejected_sealed_review_reruns_stage_without_resealing(self):
+        store, runner = _stage_runner()
+        calls, reused, rejected = [], [], []
+        inputs = {'review_key': 'k', 'patch_hash': 'h'}
+        # 上一轮把一条证据不足的评审结果封存了；审批谓词只接受通过的记录。
+        runner.seal_checkpoint('review', inputs, {'decision': 'insufficient_evidence', 'generation': 1},
+                               effect='read_only')
+        approved = lambda value: value.get('decision') == 'pass'
+
+        def unclear():
+            calls.append(1)
+            return {'decision': 'insufficient_evidence', 'generation': 2}
+
+        result = runner.execute_stage('review', inputs, unclear, enabled=True, accept=approved,
+                                      on_reuse=reused.append, on_reject=rejected.append)
+        # 被拒的封存结果不能顶替真实执行，也不能报告为复用。
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, [])
+        self.assertEqual(rejected, ['review'])
+        # 仍未通过的复查结果不会覆盖封存记录，重试时依旧重新评审。
+        self.assertEqual(runner.reuse_checkpoint('review', inputs),
+                         {'decision': 'insufficient_evidence', 'generation': 1})
+
+        def passing():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': 3}
+
+        runner.execute_stage('review', inputs, passing, enabled=True, accept=approved, on_reuse=reused.append)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(reused, [])
+        # 通过的复查结果照常封存，之后的重试直接复用而不再执行评审。
+        final = runner.execute_stage('review', inputs, passing, enabled=True, accept=approved,
+                                     on_reuse=reused.append)
+        self.assertEqual(final['generation'], 3)
+        self.assertEqual(reused, ['review'])
+        self.assertEqual(len(calls), 2)
+
+    def test_accept_predicate_error_blocks_reuse_and_sealing(self):
+        store, runner = _stage_runner()
+        calls, reused = [], []
+        inputs = {'review_key': 'k'}
+        runner.seal_checkpoint('review', inputs, {'decision': 'insufficient_evidence'}, effect='read_only')
+
+        def broken(_value):
+            raise ValueError('predicate bug')
+
+        def action():
+            calls.append(1)
+            return {'decision': 'pass', 'generation': 2}
+
+        result = runner.execute_stage('review', inputs, action, enabled=True, accept=broken,
+                                      on_reuse=reused.append)
+        # 谓词自身异常视同拒绝：真实执行、不报告复用，也不把新结果写进封存记录。
+        self.assertEqual(result['generation'], 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(reused, [])
+        self.assertEqual(store.data['sealed-read-checkpoint:review']['result'],
+                         {'decision': 'insufficient_evidence'})
+
+    def test_write_and_remote_stages_never_reuse_or_seal_checkpoints(self):
+        store, runner = _stage_runner()
+        for effect in ('workspace_write', 'remote_action'):
+            calls = []
+
+            def action():
+                calls.append(1)
+                return {'effect': effect, 'generation': len(calls)}
+
+            # 即便显式要求复用，写工作区与远端动作也始终真实执行。
+            runner.execute_stage('implementation', {'patch': 'p'}, action, effect=effect, enabled=True)
+            result = runner.execute_stage('implementation', {'patch': 'p'}, action, effect=effect, enabled=True)
+            self.assertEqual(result['generation'], 2)
+            self.assertEqual(len(calls), 2)
+            self.assertNotIn('sealed-read-checkpoint:implementation', store.data)
+        # 写阶段即便被显式要求封存也只允许 read_only，直接拒绝。
+        with self.assertRaises(ValueError):
+            runner.seal_checkpoint('implementation', {'patch': 'p'}, {'ok': True}, effect='workspace_write')
 
     def test_clean_committed_harness_change_cannot_reuse_frozen_regression(self):
         from adaptive_rsi.config import DEFAULTS, merge
@@ -342,8 +504,147 @@ class AuditEvaluationTest(unittest.TestCase):
         graph = {'a': {'paths': ['packages/a/'], 'depends_on': [], 'checks': ['a']},
                  'b': {'paths': ['packages/b/'], 'depends_on': ['a'], 'checks': ['b']}}
         self.assertEqual([c['name'] for c in evaluator.affected_checks(['packages/a/x'], checks, graph)], ['a', 'b'])
+        self.assertEqual([c['name'] for c in evaluator.affected_checks(['packages/b/x'], checks, graph)], ['a', 'b'])
         self.assertEqual(evaluator.affected_checks(['unknown/x'], checks, graph), checks)
         self.assertEqual(evaluator.affected_checks(['packages/a/x'], checks, {'b': graph['b']}), checks)
+
+    def test_check_identity_normalization(self):
+        self.assertEqual(evaluator.check_identity({'name': 'a', 'argv': ['cmd', 'arg']}), ('a', ('cmd', 'arg'), '.'))
+        self.assertEqual(evaluator.check_identity({'name': 'b', 'argv': ('cmd',), 'cwd': 'pkg'}), ('b', ('cmd',), 'pkg'))
+        self.assertEqual(evaluator.check_identity({'name': 'c'}), ('c', (), '.'))
+        self.assertIsNone(evaluator.check_identity(None))
+        self.assertIsNone(evaluator.check_identity('string'))
+
+    def scheduling_fixtures(self, root, graph):
+        source = root / 'source'
+        source.mkdir()
+        for package in ('pkg_a', 'pkg_b', 'pkg_c'):
+            (source / package).mkdir()
+            (source / package / 'value.py').write_text('VALUE = 1\n')
+            (source / package / 'check.py').write_text('print("ok")\n')
+        checks = [{'name': name, 'argv': ['python3', package + '/check.py']}
+                  for name, package in [('check_a', 'pkg_a'), ('check_b', 'pkg_b'), ('check_c', 'pkg_c')]]
+        acceptance = {'hash': 'h', 'change_kind': 'refactor', 'criteria': ['behavior remains preserved'],
+                      'checks': [{'name': 'ac', 'argv': ['python3', '-c', 'print(9)']}],
+                      'spec': {'files': [], 'checks': [{'name': 'ac', 'criteria': [0]}]},
+                      'contract': {'check_dependencies': graph}}
+        return source, checks, acceptance
+
+    def run_scheduled_evaluation(self, root, source, checks, acceptance, changed_files, scheduling=True,
+                                 detected=True, evaluation='evaluation'):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        detected_check = {'name': 'detected', 'argv': ['python3', '-c', 'print(3)']} if detected else None
+        config = merge(DEFAULTS, {'validation': {'affected_check_scheduling': scheduling}})
+        acceptance_baseline = {'decision': 'pass', 'execution_environment': None,
+                               'rows': [{'name': 'ac', 'argv': ['python3', '-c', 'print(9)'], 'passed': True,
+                                         'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}]}
+        calls = []
+        def execute(_sandbox, check, workspace, *args, **kwargs):
+            calls.append((Path(workspace).name, check['name']))
+            return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                    'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+        store = Store(root / ('state-' + evaluation))
+        self.addCleanup(store.close)
+        with patch('adaptive_rsi.evaluator.detect', return_value={'checks': [detected_check] if detected_check else []}), patch(
+                'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+            result = evaluator.Evaluator(store).evaluate(
+                source, source, checks, root / evaluation, config, changed_files=changed_files,
+                acceptance=acceptance, acceptance_baseline=acceptance_baseline)
+        return result, calls
+
+    def test_affected_check_scheduling_runs_graph_closure_and_keeps_full_surface(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'])
+        # 跨包闭包：pkg_a 变更触发自身与依赖方 pkg_b 的检查，无关 pkg_c 留给全量阶段。
+        self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
+        self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate']], ['check_a', 'check_b'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate_full']],
+                         ['check_a', 'check_b', 'check_c', 'detected'])
+        self.assertFalse(result['candidate_full_reused'])
+        self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
+        self.assertEqual(result['decision'], 'pass')
+
+    def test_affected_check_scheduling_runs_prerequisite_closure_in_candidate_stage(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_b/value.py'])
+        # 前置闭包：只改 pkg_b 时，前置包 pkg_a 也在同一 candidate workspace 里先执行。
+        self.assertEqual([name for stage, name in calls if stage == 'candidate'], ['check_a', 'check_b'])
+        self.assertEqual([name for stage, name in calls if stage == 'candidate_full'], ['check_c', 'detected'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate']], ['check_a', 'check_b'])
+        self.assertEqual([row['name'] for row in result['checks']['candidate_full']],
+                         ['check_a', 'check_b', 'check_c', 'detected'])
+        self.assertFalse(result['candidate_full_reused'])
+        self.assertEqual(result['check_dependency_analysis']['scheduled'], ['check_a', 'check_b'])
+        self.assertEqual(result['decision'], 'pass')
+
+    def test_scheduling_fallback_runs_complete_configured_surface(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            # 未知路径：回退完整集合，candidate 阶段执行全部配置检查。
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['docs/readme.md'], detected=False)
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertEqual([stage for stage, _ in calls if stage == 'candidate_full'], [])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+            self.assertEqual(result['decision'], 'pass')
+            calls.clear()
+            # 空 diff 同样回退。
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, [], detected=False, evaluation='evaluation-empty')
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            calls.clear()
+            # 无效 graph（未知依赖）回退。
+            invalid = {'pb': {'paths': ['pkg_b/'], 'depends_on': ['missing'], 'checks': ['check_b']}}
+            acceptance = {**acceptance, 'contract': {'check_dependencies': invalid}}
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_b/value.py'], detected=False,
+                evaluation='evaluation-invalid')
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
+
+    def test_scheduling_requires_opt_in_and_type_checked_config(self):
+        graph = {'pa': {'paths': ['pkg_a/'], 'depends_on': [], 'checks': ['check_a']},
+                 'pb': {'paths': ['pkg_b/'], 'depends_on': ['pa'], 'checks': ['check_b']},
+                 'pc': {'paths': ['pkg_c/'], 'depends_on': [], 'checks': ['check_c']}}
+        from adaptive_rsi.config import DEFAULTS, merge, validate
+        self.assertIs(validate(merge(DEFAULTS, {}))['validation']['affected_check_scheduling'], False)
+        with self.assertRaises(ValueError):
+            validate(merge(DEFAULTS, {'validation': {'affected_check_scheduling': 'yes'}}))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checks, acceptance = self.scheduling_fixtures(root, graph)
+            result, calls = self.run_scheduled_evaluation(
+                root, source, checks, acceptance, ['pkg_a/value.py'], scheduling=False, detected=False)
+            # 默认关闭：调度不改变既有行为，配置检查全部照常执行。
+            self.assertEqual([name for stage, name in calls if stage == 'candidate'],
+                             ['check_a', 'check_b', 'check_c'])
+            self.assertTrue(result['candidate_full_reused'])
+            self.assertIsNone(result['check_dependency_analysis']['scheduled'])
 
     def test_performance_guardrail_blocks_primary_gain(self):
         threshold = {'metric': 'latency', 'unit': 'ms', 'direction': 'lower', 'target': 8, 'tolerance': 0}

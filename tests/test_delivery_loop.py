@@ -549,6 +549,21 @@ print('BOUNDARIES_OK')
         view.assert_not_called()
         remote.assert_not_called()
 
+    def test_schedule_does_not_reset_a_running_delivery_task(self):
+        from adaptive_rsi.delivery import schedule
+        self.tracked_pr()
+        self.store.add_task(self.project, "system_delivery", "system:delivery",
+                            "PR tracking and post-merge verification", priority=110)
+        row = self.store.one("SELECT id FROM tasks WHERE project=? AND fingerprint='system:delivery'", (self.project,))
+        now = time.time()
+        for index, state in enumerate(["executing", "evaluating"]):
+            self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, row["id"]))
+            schedule(self.runtime, now + 61 * index)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], state)
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (row["id"],))
+        schedule(self.runtime, now + 122)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], "queued")
+
     def test_pending_close_does_not_repeat_write_when_remote_state_is_unknown_or_merged(self):
         run = self.tracked_pr()
         outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
@@ -872,16 +887,21 @@ print('BOUNDARIES_OK')
         directory.mkdir(parents=True)
         run["path"] = str(directory)
         head = git(self.repo, "rev-parse", "HEAD")
-        self.runtime.configure({"delivery": {"base_branch": "release"}}, self.project)
+        self.runtime.configure({"delivery": {"base_branch": "release"},
+                                "sandbox": {"image": "python:3.11-custom"}}, self.project)
         def pinned_baseline(runtime, project, config):
             self.assertEqual(config["github"]["repository"], "example/project")
             self.assertEqual(config["delivery"]["base_branch"], "main")
             return str(self.repo), head, "main"
         outcome = {"merged_sha": head, "merged_at": time.time()}
-        with patch("adaptive_rsi.delivery.baseline", side_effect=pinned_baseline), patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}):
+        with patch("adaptive_rsi.delivery.baseline", side_effect=pinned_baseline), patch.object(
+                self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}) as evaluate:
             feedback(self.runtime, self.runtime.project(self.project), run, outcome, self.runtime.config(self.project), time.time())
         self.assertEqual(outcome["feedback"]["head"], head)
         self.assertEqual(outcome["feedback"]["state"], "verified")
+        saved_config = json.loads(run["config"])
+        self.assertEqual(evaluate.call_args[0][4]["sandbox"], saved_config["sandbox"])
+        self.assertEqual(evaluate.call_args[0][4]["environment"], saved_config["environment"])
 
     def test_mainline_test_edit_survives_delivery_git_failure_and_reports_real_regression(self):
         from adaptive_rsi.delivery import feedback

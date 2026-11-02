@@ -110,27 +110,90 @@ def case_spec(case):
     return spec if isinstance(spec, dict) else None
 
 
+def overlay_available(directory):
+    """配置了 overlay 但目录不可用时返回 False；没有配置 overlay 视为可用。
+
+    用例 overlay 位于维护流程会清理的 suite 目录，也可能随工作树或临时导入目录被删除。
+    调度路径把这种情况当成「不可用」继续轮转，但封存、执行与结果校验必须显式拒绝：评估器
+    应用 overlay 时用 ``os.walk()``，缺失目录只会静默产出空集合，试验会在没有受保护输入的
+    情况下照常判定通过。
+    """
+    if not directory:
+        return True
+    try:
+        return Path(directory).is_dir()
+    except (OSError, TypeError, ValueError):
+        # 非路径类型的 overlay 同样属于「配置了却不可用」；调度与封存都不能因此崩溃。
+        return False
+
+
 def case_stratum(case):
     spec = case_spec(case) or {}
     length = len(spec.get("task", ""))
     return (spec.get("source", "unknown"), "small" if length < 1000 else "medium" if length < 10000 else "large")
 
 
+def stratum_quotas(sizes, count):
+    """Allocate `count` samples across strata in proportion to their populations.
+
+    每个非空层先占 1 个名额（`count` 不少于层数时），剩余名额按各层人口占比
+    逐个补给缺口最大的一层；全程用整数缺口计算，结果可复现。配额只取决于
+    各层规模与 `count`：换 seed 只会在层内换序，不会改变每层选中数量。
+    """
+    order = sorted(sizes, key=lambda value: fingerprint({"stratum": value}))
+    total = sum(sizes.values())
+    count = max(0, min(count, total))
+    quotas = {key: 0 for key in order}
+    if count <= len(order):
+        # 层数多于样本量时按固定 hash 顺序整层选取，保证同样的输入得到同样的层集合。
+        for key in order[:count]:
+            quotas[key] = 1
+        return quotas
+    for key in order:
+        quotas[key] = 1
+    remaining = count - len(order)
+    while remaining:
+        best = None
+        for key in order:
+            if quotas[key] >= sizes[key]:
+                continue
+            deficit = count * sizes[key] - quotas[key] * total
+            if best is None or deficit > best[0]:
+                best = (deficit, key)
+        if best is None:
+            break
+        quotas[best[1]] += 1
+        remaining -= 1
+    return quotas
+
+
+def case_allocation(population, selected):
+    """Describe per-stratum population and sampled counts for the sealed plan."""
+    sizes, sampled = {}, {}
+    for case in population:
+        stratum = case_stratum(case)
+        sizes[stratum] = sizes.get(stratum, 0) + 1
+    for case in selected:
+        stratum = case_stratum(case)
+        sampled[stratum] = sampled.get(stratum, 0) + 1
+    return [{"stratum": list(stratum), "population": sizes[stratum], "sampled": sampled.get(stratum, 0)}
+            for stratum in sorted(sizes, key=lambda value: fingerprint({"stratum": value}))]
+
+
 def select_cases(cases, count, seed):
+    """Pick up to `count` cases with traffic-weighted allocation across strata.
+
+    每层按其在候选总体中的占比获得样本，样本数允许时每层至少 1 个；同一
+    `seed` 结果稳定，不同 `seed` 只改变层内挑选顺序，不改变各层配额。
+    """
     strata = {}
     for case in cases:
         strata.setdefault(case_stratum(case), []).append(case)
-    groups = []
-    for stratum in sorted(strata, key=lambda value: fingerprint({"stratum": value, "seed": seed})):
-        groups.append(sorted(strata[stratum], key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed}))))
+    quotas = stratum_quotas({stratum: len(rows) for stratum, rows in strata.items()}, count)
     selected = []
-    while groups and len(selected) < count:
-        for group in groups[:]:
-            selected.append(group.pop(0))
-            if not group:
-                groups.remove(group)
-            if len(selected) == count:
-                break
+    for stratum in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
+        rows = sorted(strata.get(stratum, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
+        selected.extend(rows[:quotas[stratum]])
     return selected
 
 
@@ -151,6 +214,10 @@ class Evolution:
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
                           "overlay": self.overlay_digest(spec.get("overlay"))}
                 changed = [key for key, value in actual.items() if item.get(key) != value]
+                # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
+                # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
+                if not overlay_available(spec.get("overlay")):
+                    changed = sorted(set(changed) | {"overlay"})
             except (KeyError, ValueError, RuntimeError, OSError):
                 changed = ["unavailable"]
             if changed:
@@ -884,9 +951,12 @@ class Evolution:
         cases = []
         for case in inputs["cases"]:
             spec = case_spec(case)
+            overlay = spec.get("overlay") if spec else None
             cases.append({"id": case["id"], "split": case["split"], "family": case["family"],
                           "spec": fingerprint(spec) if spec is not None else None,
-                          "overlay": self.overlay_digest(spec.get("overlay")) if spec else None,
+                          # 不可用的 overlay 与未配置 overlay 一样按 None 计入调度签名；配置项本身
+                          # 已包含在 spec 指纹里，两者仍可区分。签名阶段只负责轮转，不在这里抛错。
+                          "overlay": self.overlay_digest(overlay) if spec and overlay_available(overlay) else None,
                           "active": spec.get("active", True) if spec else None,
                           "available": spec.get("available", True) if spec else None})
         return fingerprint({"build": BUILD_ID, "limits": config["limits"],
@@ -936,7 +1006,12 @@ class Evolution:
         if hasattr(self.runtime, "propagate_deadline"):
             self.runtime.propagate_deadline(run, trial_run)
         # A case overlay is host-owned and remains outside model-visible workspaces.
-        if spec.get("overlay") and (trial_dir / "candidate").exists():
+        if spec.get("overlay") and not overlay_available(spec["overlay"]):
+            # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
+            # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
+            outcome = {**(outcome or {}), "decision": "error",
+                       "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
+        elif spec.get("overlay") and (trial_dir / "candidate").exists():
             overlay_result = self.runtime.evaluator.evaluate(
                 trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
                 trial_dir / "protected-evaluation", trial_config,
@@ -971,6 +1046,16 @@ class Evolution:
                     "code": "evolution_inputs_unchanged"}
         limit = config["evolution"]["max_holdout_uses"]
         cases = self.eligible_cases(project["id"], limit)
+        # 用例导入后 overlay 可能被维护清理或随工作树删除：这类用例不得进入实验。评估器
+        # 复制 overlay 时只遍历目录内容，缺失目录不会报错，试验会在没有受保护输入的情况下
+        # 照常通过；因此这里先排除，让样本不足如实降级为证据不足。
+        unavailable = sorted(case["id"] for case in cases
+                             if not overlay_available((case_spec(case) or {}).get("overlay")))
+        if unavailable:
+            cases = [case for case in cases if case["id"] not in unavailable]
+            self.store.event("evolution_overlay_unavailable",
+                             "Cases with an unavailable overlay were excluded from the experiment",
+                             project["id"], run["id"], {"cases": unavailable})
         minimum = config["evolution"]["min_cases_per_split"]
         validation_cases = [case for case in cases if case["split"] == "validation"]
         # 晋升要求未曝光的 holdout；先按用途过滤新鲜样本，再在新鲜样本内分层选择。
@@ -990,6 +1075,9 @@ class Evolution:
                 shortfalls.append(f"holdout has {len(fresh_holdout)} of {minimum} fresh cases "
                                   f"(short by {holdout_short})")
             counts = " and ".join(shortfalls)
+            if unavailable:
+                counts += (" (excluded cases whose overlay is unavailable: "
+                           + ", ".join(unavailable) + ")")
             if validation_short and holdout_short:
                 reason = ("Fresh validation and holdout cases are required for promotion; " + counts +
                           ". Import new, previously unused cases for both splits (raising "
@@ -1087,9 +1175,13 @@ class Evolution:
         # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。
         selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
                      "holdout": select_cases(fresh_holdout, minimum, run["id"])}
-        plan = {"version": 1, "created": time.time(), "repeats": config["evolution"]["repeats"],
+        plan = {"version": 2, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
+                "selection_policy": "traffic_weighted_min_one_per_stratum",
+                "allocation": {split: {"requested": minimum, "population": len(rows),
+                                       "strata": case_allocation(rows, selection[split])}
+                               for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))},
                 "samples": [{"id": case["id"], "split": split, "stratum": case_stratum(case), "prior_uses": case["uses"]}
                             for split, rows in selection.items() for case in rows],
                 "proposal_hash": fingerprint(proposal), "baseline_hash": fingerprint(current),
@@ -1107,8 +1199,9 @@ class Evolution:
         evidence["promotion_review"] = {
             "baseline": current, "proposal": proposal, "experiment": candidate,
             "changed_kind": proposal["kind"], "plan_hash": fingerprint(plan),
-            "covered_samples": plan["samples"],
+            "covered_samples": plan["samples"], "allocation": plan["allocation"],
             "limitations": ["Only sampled task families, sources and size strata are covered",
+                            "Cases are allocated by each stratum's share of the population with at least one case per non-empty stratum; the floor over-represents rare strata in small samples",
                             "Strategy and retrieved skills are jointly applied; individual causal effects are unproven"],
             "attribution": {"state": "insufficient_evidence",
                             "reason": "Four matched ablation configurations were not executed" if not ablation else

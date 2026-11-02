@@ -348,6 +348,127 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
             self.assertEqual(payload, {"error": "Workflow repository must match the selected project's origin",
                                        "error_code": "validation_error"})
 
+    def test_transient_inspection_failure_is_not_cached_and_recovers_on_refresh(self):
+        import base64
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            repo = fixture(root / "project")
+            git(repo, "remote", "add", "origin", "https://github.com/example-owner/example-repo.git")
+            runtime = Runtime(Store(root / "state"), FakeAgent())
+            self.addCleanup(runtime.close)
+            project = runtime.add_project(repo, "工作流测试项目")
+            runtime.configure({"github": {"repository": "example-owner/example-repo"}}, project)
+            release._workflow_choices_cache.clear()
+            self.addCleanup(release._workflow_choices_cache.clear)
+
+            valid_yaml = (
+                "name: Deploy\n"
+                "run-name: ${{ inputs.rsi_operation_id }}\n"
+                "on:\n"
+                "  workflow_dispatch:\n"
+                "    inputs:\n"
+                "      rsi_operation_id:\n"
+                "        type: string\n"
+                "        required: true\n"
+                "      rsi_sha:\n"
+                "        type: string\n"
+                "        required: true\n"
+            )
+            b64_content = base64.b64encode(valid_yaml.encode("utf-8")).decode("ascii")
+
+            transient_error = True
+
+            def mock_api(repo_name, endpoint, method="GET", fields=None):
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint.startswith("commits/"):
+                    return {"sha": "c" * 40}
+                if endpoint.startswith("actions/workflows"):
+                    return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}]}
+                if endpoint.startswith("contents/"):
+                    if transient_error:
+                        raise RuntimeError("HTTP 429 rate limit")
+                    return {"encoding": "base64", "type": "file", "content": b64_content}
+                raise ValueError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                res1 = release.workflow_choices(runtime, project)
+                self.assertFalse(res1["workflows"][0]["compatible"])
+                self.assertEqual(res1["workflows"][0]["reason"], "Unable to inspect this workflow; refresh before authorizing")
+                self.assertNotIn(("example-owner/example-repo", "c" * 40), release._workflow_choices_cache)
+
+                transient_error = False
+                res2 = release.workflow_choices(runtime, project)
+                self.assertTrue(res2["workflows"][0]["compatible"])
+                self.assertEqual(res2["workflows"][0]["reason"], "")
+                self.assertIn(("example-owner/example-repo", "c" * 40), release._workflow_choices_cache)
+
+                res3 = release.workflow_choices(runtime, project)
+                self.assertIs(res3, res2)
+
+                res4 = release.workflow_choices(runtime, project, refresh=True)
+                self.assertTrue(res4["workflows"][0]["compatible"])
+                self.assertIsNot(res4, res3)
+
+    def test_authorize_workflow_penetrates_cache_with_fresh_validation(self):
+        import base64
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            repo = fixture(root / "project")
+            git(repo, "remote", "add", "origin", "https://github.com/example-owner/example-repo.git")
+            runtime = Runtime(Store(root / "state"), FakeAgent())
+            self.addCleanup(runtime.close)
+            project = runtime.add_project(repo, "工作流授权测试项目")
+            runtime.configure({"github": {"repository": "example-owner/example-repo"}}, project)
+            release._workflow_choices_cache.clear()
+            self.addCleanup(release._workflow_choices_cache.clear)
+
+            valid_yaml = (
+                "name: Deploy\n"
+                "run-name: ${{ inputs.rsi_operation_id }}\n"
+                "on:\n"
+                "  workflow_dispatch:\n"
+                "    inputs:\n"
+                "      rsi_operation_id:\n"
+                "        type: string\n"
+                "        required: true\n"
+                "      rsi_sha:\n"
+                "        type: string\n"
+                "        required: true\n"
+            )
+            b64_content = base64.b64encode(valid_yaml.encode("utf-8")).decode("ascii")
+            commit_sha = "e" * 40
+
+            poisoned_result = {
+                "repository": "example-owner/example-repo",
+                "sha": commit_sha,
+                "workflows": [{"workflow": ".github/workflows/deploy.yml", "name": "Deploy", "compatible": False,
+                               "reason": "Unable to inspect this workflow; refresh before authorizing"}]
+            }
+            release._workflow_choices_cache[("example-owner/example-repo", commit_sha)] = (time.time(), poisoned_result)
+
+            def mock_api(repo_name, endpoint, method="GET", fields=None):
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint.startswith("commits/"):
+                    return {"sha": commit_sha}
+                if endpoint.startswith("actions/workflows"):
+                    return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}]}
+                if endpoint.startswith("contents/"):
+                    return {"encoding": "base64", "type": "file", "content": b64_content}
+                if endpoint.startswith("git/matching-refs/"):
+                    return []
+                if endpoint == "git/refs":
+                    return {}
+                raise ValueError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=mock_api):
+                target = release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                self.assertEqual(target["workflow"], ".github/workflows/deploy.yml")
+                self.assertEqual(target["sha"], commit_sha)
+                self.assertEqual(target["ref"], "rsi-workflow/" + commit_sha)
+                self.assertTrue(target["enabled"])
+
 
 class _ManualReconciliationFixture(unittest.TestCase):
     """Shared real-runtime fixture for manual reconciliation tests."""
@@ -689,6 +810,120 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
             self.assertEqual(saved["reconciliation"]["state"], "matched")
             self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [17])
             self.assertEqual(self.posts, [])
+
+    def test_retry_network_timeout_sets_rerun_unknown_and_enables_immediate_reconciliation(self):
+        self.operation(kind="release", state="failed", workflow_run_id=17, attempt=1,
+                       dispatch_receipt="accepted", error="Previous run failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("ReadTimeout: HTTPSConnectionPool(host='api.github.com', port=443): Read timed out.")
+            return base_api(repo, endpoint, method, fields)
+
+        with patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError) as ctx:
+                release.retry(self.runtime, self.project, self.record["id"], "release")
+            self.assertIn("Read timed out", str(ctx.exception))
+
+        saved = self.saved("release")
+        self.assertEqual(saved["state"], "rerun_unknown")
+        self.assertEqual(saved["rerun_receipt"], "unknown")
+        self.assertTrue(saved.get("rerun_pending"))
+        self.assertNotIn("rollback", saved)
+        self.assertNotEqual(saved["state"], "rolling_back")
+
+        with patch.object(release, "api", side_effect=self.api(single=failed_remote)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(view["state"], "rerun_unknown")
+        self.assertEqual(view["reconciliation_state"], "rerun_unconfirmed")
+        self.assertEqual([c["id"] for c in view["candidates"]], [17])
+
+        confirmed_run = self.remote(17, run_attempt=2, status="in_progress")
+        with patch.object(release, "api", side_effect=self.api(single=confirmed_run)):
+            resolved = release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        self.assertEqual(resolved["state"], "running")
+        saved_after = self.saved("release")
+        self.assertEqual(saved_after["state"], "running")
+        self.assertEqual(saved_after["attempt"], 2)
+
+    def test_release_retry_never_introduces_rolling_back_even_with_new_dict_reference(self):
+        self.operation(kind="release", state="failed", workflow_run_id=17, attempt=1,
+                       dispatch_receipt="accepted", error="Previous run failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("Connection reset by peer")
+            return base_api(repo, endpoint, method, fields)
+
+        orig_reconcile = release.reconcile
+        def copy_reconcile(runtime, run, kind, data, persist=True):
+            return dict(orig_reconcile(runtime, run, kind, data, persist=persist))
+
+        with patch.object(release, "reconcile", side_effect=copy_reconcile), \
+                patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError):
+                release.retry(self.runtime, self.project, self.record["id"], "release")
+
+        saved = self.saved("release")
+        self.assertEqual(saved["state"], "rerun_unknown")
+        self.assertEqual(saved["rerun_receipt"], "unknown")
+        self.assertNotIn("rollback", saved)
+        self.assertNotEqual(saved["state"], "rolling_back")
+
+    def test_deploy_rollback_retry_network_timeout_sets_rerun_unknown_and_enables_reconciliation(self):
+        rollback_data = {
+            **self.operation(kind="deploy"),
+            "sha": self.TRUSTED,
+            "operation_id": "rsi-operation-rollback",
+            "state": "failed",
+            "workflow_run_id": 17,
+            "attempt": 1,
+            "dispatch_receipt": "accepted",
+            "error": "Rollback failed",
+        }
+        self.operation(kind="deploy", state="rollback_failed", rollback=rollback_data,
+                       error="Rollback failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure",
+                                    display_title="rsi-operation-rollback")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("ReadTimeout: Read timed out.")
+            return base_api(repo, endpoint, method, fields)
+
+        with patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError):
+                release.retry(self.runtime, self.project, self.record["id"], "deploy")
+
+        saved = self.saved("deploy")
+        self.assertEqual(saved["state"], "rollback_failed")
+        self.assertEqual(saved["rollback"]["state"], "rerun_unknown")
+        self.assertEqual(saved["rollback"]["rerun_receipt"], "unknown")
+        self.assertTrue(saved["rollback"].get("rerun_pending"))
+
+        with patch.object(release, "api", side_effect=self.api(single=failed_remote)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "deploy", target="rollback")
+        self.assertEqual(view["state"], "rerun_unknown")
+        self.assertEqual(view["target"], "rollback")
+        self.assertEqual(view["reconciliation_state"], "rerun_unconfirmed")
+
+        confirmed_run = self.remote(17, run_attempt=2, status="in_progress",
+                                    display_title="rsi-operation-rollback")
+        with patch.object(release, "api", side_effect=self.api(single=confirmed_run)):
+            resolved = release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17, target="rollback")
+        self.assertEqual(resolved["state"], "running")
+        saved_after = self.saved("deploy")
+        self.assertEqual(saved_after["state"], "rolling_back")
+        self.assertEqual(saved_after["rollback"]["state"], "running")
+        self.assertEqual(saved_after["rollback"]["attempt"], 2)
 
 
 class ReconciliationAuditPayloadTest(_ManualReconciliationFixture):

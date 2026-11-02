@@ -309,6 +309,37 @@ class AuthSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthError, "unsupported_auth_method"):
             self.manager.set_api_key("opencode", "unknown", "key")
 
+    def test_corrupt_legacy_auth_does_not_block_login_and_is_preserved(self):
+        path = self.root / "data/opencode/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{corrupt")
+        self.assertEqual(self.manager.snapshot()["opencode"]["error"], "invalid_credentials")
+        self.assertEqual(list(path.parent.glob("auth.json.invalid-*")), [])
+        self.assertEqual(path.read_text(), "{corrupt")
+        session = self.manager.start("opencode", "openai")
+        self.wait_state(session, "awaiting_authorization")
+        self.gate.set()
+        self.assertEqual(self.wait_state(session, "completed")["state"], "completed")
+        self.assertEqual(json.loads(path.read_text())["openai"]["type"], "oauth")
+        backups = list(path.parent.glob("auth.json.invalid-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), "{corrupt")
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.manager.snapshot()["opencode"]["state"], "authenticated")
+
+    def test_corrupt_legacy_auth_does_not_block_key_save_or_logout(self):
+        path = self.root / "data/opencode/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("{corrupt")
+        self.manager.set_api_key("opencode", "openai", "PRIVATE-KEY")
+        self.assertEqual(json.loads(path.read_text())["openai"]["key"], "PRIVATE-KEY")
+        path.write_text("{corrupt-again")
+        self.manager.logout("opencode", "openai")
+        self.assertFalse(path.exists())
+        self.assertEqual(sorted(item.read_text() for item in path.parent.glob("auth.json.invalid-*")),
+                         ["{corrupt", "{corrupt-again"])
+        self.assertEqual(self.manager.snapshot()["opencode"]["state"], "signed_out")
+
     def test_failure_codes_do_not_reflect_provider_error_or_secrets(self):
         self.options["failure"] = "device_auth_unavailable"
         session = self.manager.start("codex")
@@ -344,6 +375,25 @@ class AuthSessionTests(unittest.TestCase):
     def test_launch_rejects_unknown_or_terminal_sessions(self):
         with self.assertRaisesRegex(AuthError, "unknown_session"):
             self.manager.launch("missing")
+        session = self.manager.reserve("codex")
+        self.manager.close()
+        self.assertEqual(self.manager.status(session["id"])["state"], "interrupted")
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.launch(session["id"])
+
+    def test_start_returns_expired_when_ttl_elapses_within_reserve_launch_window(self):
+        # 确定性复现 3.9 上的时序竞态：expires_at 直接落在过去，
+        # reserve 与 launch 之间不需要真实耗掉任何时间。
+        self.manager.ttl = -1.0
+        session = self.manager.start("codex")
+        self.assertEqual(session["state"], "expired")
+        self.assertEqual(session["error"], "auth_expired")
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.created, [])
+        self.gate.set()
+        self.assertFalse((self.root / "codex/auth.json").exists())
+
+    def test_launch_still_rejects_interrupted_sessions(self):
         session = self.manager.reserve("codex")
         self.manager.close()
         self.assertEqual(self.manager.status(session["id"])["state"], "interrupted")

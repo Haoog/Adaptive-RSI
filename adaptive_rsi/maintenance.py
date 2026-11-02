@@ -1,6 +1,7 @@
 """Background artifact retention and bounded state maintenance."""
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -141,8 +142,29 @@ def _rename_cleanup(source, target):
         library = ctypes.CDLL(None, use_errno=True)
         if sys.platform == 'darwin':
             result = library.renamex_np(os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
-        else:
+        elif hasattr(library, 'renameat2'):
             result = library.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1)
+        elif hasattr(library, 'syscall'):
+            import platform
+            syscall_numbers = {
+                'x86_64': 316,
+                'aarch64': 276,
+                'arm': 382,
+                'armv7l': 382,
+                'armv8l': 382,
+                'i386': 353,
+                'i686': 353,
+                'riscv64': 276,
+                's390x': 347,
+                'ppc64le': 357,
+            }
+            syscall_nr = syscall_numbers.get(platform.machine())
+            if syscall_nr is not None:
+                result = library.syscall(syscall_nr, -100, os.fsencode(source), -100, os.fsencode(target), 1)
+            else:
+                raise OSError('Atomic no-replace cleanup rename unavailable')
+        else:
+            raise OSError('Atomic no-replace cleanup rename unavailable')
         if result:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error), str(target))
@@ -303,7 +325,28 @@ def _recover_cleanup_locked(store):
             except (ValueError, TypeError, KeyError) as error:
                 quarantine(name, journal, error, str(error))
                 continue
-            _place_cleanup(store, receipt, recycled=bool(row))
+            try:
+                _place_cleanup(store, receipt, recycled=bool(row))
+            except ValueError as error:
+                conflict_key = 'cleanup-recovery-conflict:' + name
+                existing_conflict = db.execute('SELECT value FROM settings WHERE key=?',
+                                               (conflict_key,)).fetchone()
+                evidence = {
+                    'folder': name,
+                    'receipt_id': receipt.get('id', name),
+                    'run': receipt.get('run'),
+                    'error_type': type(error).__name__,
+                    'reason': str(error),
+                }
+                serialized = json.dumps(evidence, sort_keys=True)
+                if not existing_conflict or existing_conflict[0] != serialized:
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                               (conflict_key, serialized))
+                    note('cleanup_recovery_conflict',
+                         'Cleanup recovery conflict: ' + name + ' (' + str(error) + ')',
+                         evidence)
+                continue
+            db.execute("DELETE FROM settings WHERE key=?", ('cleanup-recovery-conflict:' + name,))
         # Commit repairs and evidence accumulated after the last note(); the
         # finally below still rolls back an in-flight item that failed.
         db.commit()
@@ -527,7 +570,10 @@ class Maintenance:
 
     def maintenance(self):
         if (self.store.root / 'recycle').exists():
-            recover_cleanup(self.store)
+            try:
+                recover_cleanup(self.store)
+            except Exception as error:
+                logging.getLogger(__name__).warning("Cleanup recovery encountered error: %s", error)
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < 3600:
             return

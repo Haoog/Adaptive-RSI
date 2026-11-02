@@ -51,6 +51,7 @@ const configReasonLabels={
  "config_invalid": "设置格式或字段无效，请检查配置后重试。"
 };
 const apiErrors={
+ "patch_too_large":"补丁超过 2 MiB 的界面预览上限，请到该运行的目录下载完整补丁。",
  "Grouped requirements changed; reconcile revisions before splitting":"任务组的需求已修订，请先核对新增要求的归属，暂不自动拆分。",
  "Wait for the grouped run to stop before splitting":"任务组仍有运行，请先停止并等待运行结束，再拆分重做。",
  "Split retry preview changed; inspect it again":"任务组或原任务已变化，请重新查看拆分预览。",
@@ -282,7 +283,7 @@ async function sendApi(path,body,signal,{text=false}={}){
  if(!response.ok){
   // 已知错误给中文指引；未知技术错误兜底为通用文案，原文留在控制台便于诊断。
   const structured=data.reason_code==='config_invalid'?null:configReasonLabels[data.reason_code];
-  const known=structured||apiErrors[data.error]||configReasonLabels[data.reason_code];
+  const known=structured||apiErrors[data.error_code]||apiErrors[data.error]||configReasonLabels[data.reason_code];
   const field=typeof data.field_path==='string'&&/^[a-zA-Z0-9_.]{1,160}$/.test(data.field_path)?data.field_path:null;
   let message=known?t(known):(data.error?t('操作未完成，请稍后重试。')+(data.error_code?'（'+data.error_code+'）':''):String(response.status));
   if(field)message+=' · '+t('字段')+' '+field;
@@ -849,6 +850,18 @@ function experimentEvidence(card,c){
    detail.append(cohorts);
    const evidence=el('details'),raw=el('pre');evidence.append(el('summary',t('封存计划与输入清单')),raw);
    evidence.addEventListener('toggle',()=>{if(evidence.open&&!raw.textContent)raw.textContent=JSON.stringify({preregistered_plan:data.evidence.preregistered_plan||null,dataset:data.evidence.dataset||null,config_hash:data.evidence.config_hash||null},null,2);});
+   const review=data.evidence.promotion_review;
+   if(review&&typeof review==='object'){const diff=el('details'),body=el('div');diff.append(el('summary',t('晋升评审：策略差异与适用边界')),body);
+    const baseline=Array.isArray(review.baseline)?review.baseline:[],proposal=review.proposal&&typeof review.proposal==='object'?review.proposal:{};
+    const kinds={strategy:t('执行策略'),meta_strategy:t('规划方法'),adapter:t('项目执行说明')};
+    if(baseline.length){for(const entry of baseline){if(!entry||typeof entry!=='object')continue;const content=entry.content&&typeof entry.content==='object'?entry.content:{};
+     body.append(el('strong',t('基线')+' · '+(kinds[entry.kind]||entry.kind||t('未知'))),el('p',typeof content.guidance==='string'&&content.guidance.trim()?content.guidance:t('无说明'),'muted'));}}
+    else body.append(el('p',t('当前没有已启用的基线策略；这次提案将首次建立该类型的策略。'),'muted'));
+    body.append(el('strong',t('提案')+' · '+(kinds[proposal.kind]||proposal.kind||t('未知'))),el('p',typeof proposal.guidance==='string'&&proposal.guidance.trim()?proposal.guidance:t('无说明')));
+    const limitations=Array.isArray(review.limitations)?review.limitations.filter(item=>typeof item==='string'&&item.trim()):[];
+    if(limitations.length){body.append(el('strong',t('适用边界与未覆盖场景')));
+     for(const item of limitations)body.append(el('p',item,'muted'));}
+    detail.append(diff);}
    const download=el('button',t('导出实验依据'),'text-button');download.type='button';download.onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'})),link=el('a');link.href=url;link.download='adaptive-rsi-experiment-'+c.id+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
    detail.append(evidence,download);loaded=true;
   }finally{loading=false;}

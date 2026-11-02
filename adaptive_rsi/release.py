@@ -108,7 +108,7 @@ WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
 
 
-def workflow_choices(runtime, project_id):
+def workflow_choices(runtime, project_id, refresh=False):
     project = runtime.project(project_id)
     repo = runtime.config(project_id)["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
@@ -118,7 +118,7 @@ def workflow_choices(runtime, project_id):
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
     cached = _workflow_choices_cache.get((repo, sha))
     now = time.time()
-    if cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
+    if not refresh and cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
         return cached[1]
     workflows = []
     for page in range(1, 11):
@@ -146,9 +146,13 @@ def workflow_choices(runtime, project_id):
         choices = [row for row in pool.map(inspect, workflows) if row]
     result = {"repository": repo, "sha": sha, "workflows": choices}
     # 缓存绑定精确的默认分支 SHA；分支前进后键自然失效。授权路径始终重新校验，不受缓存影响。
-    if len(_workflow_choices_cache) > 32:
-        _workflow_choices_cache.clear()
-    _workflow_choices_cache[(repo, sha)] = (now, result)
+    has_transient_error = any(item.get("reason", "").startswith("Unable to inspect this workflow") for item in choices)
+    if not has_transient_error:
+        if len(_workflow_choices_cache) > 32:
+            _workflow_choices_cache.clear()
+        _workflow_choices_cache[(repo, sha)] = (now, result)
+    else:
+        _workflow_choices_cache.pop((repo, sha), None)
     return result
 
 
@@ -156,7 +160,7 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
     initial = runtime.config(project_id)
-    choices = workflow_choices(runtime, project_id)
+    choices = workflow_choices(runtime, project_id, refresh=True)
     if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
         raise ValueError("Select a compatible existing workflow from this project")
     repo, sha = choices["repository"], choices["sha"]
@@ -227,7 +231,7 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
-def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
+def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stable=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if expected is not _UNCONDITIONAL:
@@ -240,6 +244,9 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
             if (json.loads(current["value"]) if current else None) != previous:
                 raise _AutomationChanged("Deployment ownership changed during reconciliation")
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (owner_name, encode(owner)))
+        if stable is not None:
+            stable_name, stable_val = stable
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (stable_name, encode(stable_val)))
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
@@ -414,9 +421,12 @@ def reconcile(runtime, run, kind, data, persist=True):
             data.update(rerun_pending=True, checked_at=time.time())
             if time.time() - requested >= RERUN_CONFIRM_SECONDS:
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
-            _record_reconciliation(data, repo, [remote],
-                                   "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
-                                   "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
+            # 只读对账已确认的 rerun_confirmed / manual_inspection_required 证据，
+            # 不能被一次回落到旧 attempt 的轮询覆写。
+            if (data.get("reconciliation") or {}).get("state") not in {"rerun_confirmed", "manual_inspection_required"}:
+                _record_reconciliation(data, repo, [remote],
+                                       "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
+                                       "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
     _record_reconciliation(data, repo, [remote], "matched",
@@ -836,10 +846,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             data["state"] = observed
             if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
-            persist(runtime, run, "deploy", data)
             if observed == "healthy":
-                runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
-                                          {"sha": data["sha"], "run": run["id"], "health": report})
+                stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
+                          {"sha": data["sha"], "run": run["id"], "health": report})
+                try:
+                    persist(runtime, run, "deploy", data, stable=stable)
+                except TypeError:
+                    persist(runtime, run, "deploy", data)
+                    runtime.store.put_setting(stable[0], stable[1])
+            else:
+                persist(runtime, run, "deploy", data)
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
         if policy.get("rollback_data_policy", "manual") != "backward_compatible":
             data.update(rollback_unavailable=True, rollback_blocked_reason="data_compatibility",
@@ -883,10 +899,12 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             data["state"] = "rollback_failed"
             if rollback["state"] == "rerun_unknown":
                 data["error"] = rollback["error"]
+            persist(runtime, run, "deploy", data)
         elif rollback["state"] == "workflow_succeeded":
             now = time.time()
             first = rollback.setdefault("health_started_at", now)
             if now < first + policy.get("health_warmup_seconds", 0) or now < rollback.get("health_retry_at", 0):
+                persist(runtime, run, "deploy", data)
                 return data
             authorized(runtime, project, run, "deploy", policy, cancel)
             report = health_sample(policy, rollback["sha"])
@@ -895,10 +913,26 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                 current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
                 if current_owner and current_owner["run"] != run["id"]:
                     data.update(state="superseded", error="A newer deployment owns this target; old rollback health evidence was discarded")
+                    persist(runtime, run, "deploy", data)
                     return data
                 observed = observe_health(rollback, report, policy, time.time())
-                if observed != "pending":
-                    data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
+                if observed == "pending":
+                    persist(runtime, run, "deploy", data)
+                    return data
+                data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
+                if observed == "healthy":
+                    owner_name = owner_key(project["id"], data["repository"], policy)
+                    ownership = (owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                    stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
+                              {"sha": rollback["sha"], "run": run["id"], "health": report})
+                    try:
+                        persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
+                    except TypeError:
+                        persist(runtime, run, "deploy", data)
+                        runtime.store.put_setting(owner_name, {"run": run["id"], "sha": rollback["sha"]})
+                        runtime.store.put_setting(stable[0], stable[1])
+                else:
+                    persist(runtime, run, "deploy", data)
     return data
 
 
@@ -1025,9 +1059,14 @@ def advance(runtime, project, run, outcome, cancel=None):
         data = runtime.store.setting(key(run["id"], kind))
         expected = encode(data) if data is not None else None
 
-        def persist(runtime, run, kind, value, ownership=None):
+        def persist(runtime, run, kind, value, ownership=None, stable=None):
             nonlocal expected
-            saved = save(runtime, run, kind, value, expected=expected, **({"ownership": ownership} if ownership else {}))
+            extra = {}
+            if ownership is not None:
+                extra["ownership"] = ownership
+            if stable is not None:
+                extra["stable"] = stable
+            saved = save(runtime, run, kind, value, expected=expected, **extra)
             expected = encode(saved)
             return saved
 
@@ -1085,7 +1124,24 @@ def advance(runtime, project, run, outcome, cancel=None):
                     if comparison.get("status") != "ahead":
                         result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
                         continue
-            validate_pin(repo, policy)
+            try:
+                validate_pin(repo, policy)
+            except ApiRejected as exc:
+                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
+                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
+                # 状态被轮询无限重试。
+                identity = {"repository": repo, "workflow": policy["workflow"], "ref": policy["ref"],
+                            "workflow_sha": policy["sha"], "sha": outcome["merged_sha"], "kind": kind}
+                if not data:
+                    data = {"state": "failed", **identity}
+                for field, value in identity.items():
+                    data.setdefault(field, value)
+                data.setdefault("operation_id", "rsi-" + fingerprint(
+                    {"project": project["id"], "run": run["id"], "kind": kind,
+                     "repository": repo, "sha": outcome["merged_sha"]})[:32])
+                data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                            dispatch_http_status=exc.status)
+                raise
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy, cancel)
                 if kind == "deploy" and deployment_owner(runtime, project["id"], repo, policy) != expected_owner:
@@ -1163,15 +1219,21 @@ def retry(runtime, project_id, run_id, kind):
         policy = json.loads(run["config"])["delivery"].get(kind, {})
         project = runtime.project(project_id)
         repo = authorized(runtime, project, run, kind, policy)
-        if kind == "deploy":
-            owner = deployment_owner(runtime, project_id, repo, policy)
-            if owner and owner["run"] != run_id:
-                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
+        is_preflight_rejected = (
+            kind == "deploy" and
+            data.get("state") == "failed" and
+            data.get("dispatch_receipt") == "rejected" and
+            not data.get("workflow_run_id")
+        )
+        if kind == "deploy" and not is_preflight_rejected:
+            owner = deployment_owner(runtime, project_id, repo, policy)
+            if owner and owner["run"] != run_id:
+                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         try:
             outcome = json.loads(run["result"] or "{}")
         except (TypeError, ValueError):
@@ -1191,24 +1253,33 @@ def retry(runtime, project_id, run_id, kind):
             runtime.wake.set()
             return data
         expected = encode(data)
+        expected_owner = None
 
         def persist_retry(require_authorization=False):
             nonlocal expected
             with runtime.dispatch_lock:
                 if require_authorization:
                     authorized(runtime, project, run, kind, policy)
+                ownership = None
                 if require_authorization and kind == "deploy":
-                    owner = deployment_owner(runtime, project_id, repo, policy)
-                    if owner and owner["run"] != run_id:
-                        raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
-                save(runtime, run, kind, data, expected=expected)
+                    if target.get("state") == "dispatching":
+                        if deployment_owner(runtime, project_id, repo, policy) != expected_owner:
+                            raise ValueError("Deployment ownership changed during validation")
+                        ownership = (owner_key(project_id, repo, policy), expected_owner,
+                                     {"run": run_id, "sha": target["sha"]})
+                    else:
+                        owner = deployment_owner(runtime, project_id, repo, policy)
+                        if owner and owner["run"] != run_id:
+                            raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
+                save(runtime, run, kind, data, expected=expected, ownership=ownership)
                 expected = encode(data)
 
         target = data
         rollback = data.get("rollback", {})
-        if kind == "deploy" and (data.get("state") == "rollback_failed" or
+        is_rollback = kind == "deploy" and (data.get("state") == "rollback_failed" or
                 data.get("state") == "rolling_back" and (rollback.get("rerun_pending") or
-                    rollback.get("state") in {"rerunning", "rerun_unknown"})):
+                    rollback.get("state") in {"rerunning", "rerun_unknown"}))
+        if is_rollback:
             target = rollback
             if target.get("state") == "workflow_succeeded":
                 if not _retry_target_allowed(runtime, run, outcome, data, target):
@@ -1221,10 +1292,19 @@ def retry(runtime, project_id, run_id, kind):
             raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
         if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
                 not target.get("workflow_run_id")):
+            if kind == "deploy":
+                expected_owner = deployment_owner(runtime, project_id, repo, policy)
+                if expected_owner and expected_owner["run"] != run_id:
+                    previous = runtime.store.setting(key(expected_owner["run"], "deploy"), {})
+                    if not deployment_terminal(previous, policy):
+                        raise ValueError("Another deployment is still active on this target")
+                    comparison = api(repo, "compare/" + expected_owner["sha"] + "..." + target["sha"])
+                    if comparison.get("status") != "ahead":
+                        raise ValueError("Deployment target already has this or a newer commit; refusing a stale or diverged deployment")
             validate_pin(repo, policy)
             authorized(runtime, project, run, kind, policy)
             target.update(state="dispatching", error="", dispatch_receipt="pending")
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rolling_back", rollback=target, error="")
             persist_retry(require_authorization=True)
             try:
@@ -1233,27 +1313,32 @@ def retry(runtime, project_id, run_id, kind):
             except ApiRejected as exc:
                 target.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                               dispatch_http_status=exc.status)
-                if target is not data:
+                if kind == "deploy" and target is not data:
                     data.update(state="rollback_failed", error=target["error"])
                 persist_retry()
                 raise
             except Exception as exc:
                 target.update(state="dispatch_unknown", error=str(exc)[:500], dispatch_receipt="unknown")
-                if target is not data:
+                if kind == "deploy" and target is not data:
                     data.update(state="rolling_back", error=target["error"])
                 persist_retry()
                 runtime.wake.set()
                 raise
             target.update(state="submitted", error="", dispatch_receipt="accepted")
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rolling_back", error="")
             persist_retry()
             runtime.wake.set()
             return data
         unconfirmed_rerun = target.get("rerun_pending") or target.get("state") in {"rerunning", "rerun_unknown"}
         target = reconcile(runtime, run, kind, target, persist=False)
+        if is_rollback:
+            data["rollback"] = target
+        elif target is not data:
+            data.update(target)
+            target = data
         if unconfirmed_rerun:
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rollback_failed" if target["state"] in {"failed", "rerun_unknown"} else "rolling_back", rollback=target, error=target.get("error", ""))
             persist_retry()
             runtime.wake.set()
@@ -1264,19 +1349,21 @@ def retry(runtime, project_id, run_id, kind):
         authorized(runtime, project, run, kind, policy)
         target.update(state="rerunning", error="", previous_attempt=target.get("attempt", 1),
                       rerun_pending=True, rerun_receipt="pending", rerun_requested_at=time.time())
-        if target is not data:
+        if kind == "deploy" and target is not data:
             data.update(state="rolling_back", rollback=target)
         persist_retry(require_authorization=True)
         try:
             api(repo, "actions/runs/" + str(target["workflow_run_id"]) + "/rerun", "POST")
         except ApiRejected as exc:
             target.update(state="failed", error=str(exc)[:500], rerun_pending=False, rerun_receipt="rejected", rerun_http_status=exc.status)
-            if target is not data:
+            if kind == "deploy" and target is not data:
                 data.update(state="rollback_failed", error=target["error"], rollback=target)
             persist_retry()
             raise
         except Exception as exc:
-            target.update(error=str(exc)[:500], rerun_receipt="unknown")
+            target.update(state="rerun_unknown", error=str(exc)[:500], rerun_receipt="unknown")
+            if kind == "deploy" and target is not data:
+                data.update(state="rollback_failed", error=target["error"], rollback=target)
             persist_retry()
             runtime.wake.set()
             raise
