@@ -93,6 +93,7 @@ class StorePoolTest(unittest.TestCase):
 
     def test_wal_and_foreign_keys_survive_pool_reuse(self):
         self.assertEqual(self.store.query("PRAGMA journal_mode"), [{"journal_mode": "wal"}])
+        self.assertEqual(self.store.query("PRAGMA synchronous"), [{"synchronous": 1}])
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.execute("INSERT INTO tasks(id,project,title,state) VALUES ('t','missing','x','queued')")
         self.assertEqual(self.store.one("SELECT count(*) AS n FROM tasks")["n"], 0)
