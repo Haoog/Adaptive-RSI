@@ -62,6 +62,13 @@ class AuthError(RuntimeError):
         super().__init__("Authentication: " + code)
 
 
+class AuthAttemptFailed(AuthError):
+    """现代 CLI 确认本次 attempt 已失败，但不能推断具体失败原因。"""
+
+    def __init__(self):
+        super().__init__("authorization_failed")
+
+
 AuthenticationError = AuthError
 
 
@@ -90,7 +97,6 @@ def _write_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        path.chmod(0o600)
     finally:
         if temporary and temporary.exists():
             temporary.unlink()
@@ -684,7 +690,7 @@ class OpenCodeAuth(_Process):
                 if status == "complete":
                     return True
                 if status == "failed":
-                    raise AuthError("authorization_failed") from exc
+                    raise AuthAttemptFailed() from exc
                 if status == "expired":
                     raise AuthError("auth_expired") from exc
                 raise
@@ -712,7 +718,7 @@ class OpenCodeAuth(_Process):
                     if status == "complete":
                         return True
                     if status == "failed":
-                        raise AuthError("authorization_failed")
+                        raise AuthAttemptFailed()
                     if status == "expired":
                         raise AuthError("auth_expired")
                     if status != "pending":
@@ -898,7 +904,7 @@ class AuthSessions:
     def _public(item):
         """对外快照按白名单复制稳定字段；私有标记与新增敏感字段默认不离开进程。"""
         return copy.deepcopy({key: item[key] for key in
-                              ("id", "backend", "provider", "state", "expires_at", "error",
+                              ("id", "backend", "provider", "state", "expires_at", "error", "attempt_generation",
                                "method", "verification_url", "user_code", "instructions") if key in item})
 
     def _invalidate_caches(self, backend):
@@ -1208,7 +1214,7 @@ class AuthSessions:
         """就地写入新状态，并在终态清掉只对进行中会话有效的交互字段。"""
         item.update(values)
         if item["state"] in TERMINAL:
-            for field in ("verification_url", "user_code", "instructions", "_code"):
+            for field in ("verification_url", "user_code", "instructions", "_code", "_retry_capable"):
                 item.pop(field, None)
 
     def _update(self, session_id, **values):
@@ -1243,18 +1249,47 @@ class AuthSessions:
                     return
                 self.workers[session_id] = (worker, stop)
             fields = worker.start(item["provider"], method, inputs)
-            if not self._update(session_id, state="awaiting_authorization", **fields):
+            if not self._update(session_id, state="awaiting_authorization", attempt_generation=1, **fields):
                 return
             if item["backend"] == "codex":
                 success = worker.wait(stop, item["expires_at"])
             elif fields["method"] == "auto":
                 success = worker.complete(timeout=max(1, item["expires_at"] - self.now()))
             else:
+                attempts = 0
                 while not stop.wait(0.1) and self.now() < item["expires_at"]:
                     with self.lock:
                         code = self.sessions[session_id].pop("_code", None)
+                        retry_capable = self.sessions[session_id].pop("_retry_capable", False)
                     if code is not None:
-                        success = worker.complete(code, timeout=max(1, item["expires_at"] - self.now()))
+                        try:
+                            success = worker.complete(code, timeout=max(1, item["expires_at"] - self.now()))
+                        except AuthAttemptFailed:
+                            attempts += 1
+                            if attempts >= 5 or not retry_capable:
+                                raise
+                            with self.lock:
+                                current = self.sessions[session_id]
+                                if self.closed or stop.is_set() or current["state"] not in ACTIVE:
+                                    return
+                                if self.now() >= item["expires_at"]:
+                                    self._update(session_id, state="expired", error="auth_expired")
+                                    return
+                                self._update(session_id, state="starting", error="authorization_failed",
+                                             verification_url="", user_code="", instructions="")
+                            fields = worker.start(item["provider"], method, inputs)
+                            with self.lock:
+                                current = self.sessions[session_id]
+                                if self.closed or stop.is_set() or current["state"] not in ACTIVE:
+                                    return
+                                if self.now() >= item["expires_at"]:
+                                    self._update(session_id, state="expired", error="auth_expired")
+                                    return
+                                if fields.get("method") != "code":
+                                    raise AuthError("authorization_failed")
+                                self._update(session_id, state="awaiting_authorization",
+                                             error="authorization_failed", attempt_generation=attempts + 1, **fields)
+                            continue
                         break
                 else:
                     success = False
@@ -1366,7 +1401,7 @@ class AuthSessions:
             expired_worker[0].close()
         return result
 
-    def complete(self, session_id, code=""):
+    def complete(self, session_id, code="", attempt_generation=None):
         if not isinstance(code, str) or len(code) > 8192:
             raise AuthError("invalid_auth_code")
         self.status(session_id)
@@ -1376,10 +1411,14 @@ class AuthSessions:
                 self._update(session_id, state="expired", error="auth_expired")
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
                 raise AuthError("invalid_auth_state")
+            generation = item.get("attempt_generation", 1)
+            if (attempt_generation is None and generation != 1) or (attempt_generation is not None and
+                    (type(attempt_generation) is not int or attempt_generation != generation)):
+                raise AuthError("invalid_auth_state")
             if not code.strip():
                 raise AuthError("invalid_auth_code")
-            self.sessions[session_id]["_code"] = code.strip()
-            self._update(session_id, state="completing")
+            self._update(session_id, state="completing", _code=code.strip(),
+                         _retry_capable=attempt_generation is not None)
         return self.status(session_id)
 
     def cancel(self, session_id):

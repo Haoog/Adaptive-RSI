@@ -759,6 +759,7 @@ const english = {
   "已有登录正在进行，请先完成或取消。": "A sign-in is already running. Complete or cancel it first.",
   "设备登录暂不可用，请在账号设置中启用设备授权后重试。": "Device sign-in is unavailable. Enable device authorization in account settings and try again.",
   "官方授权未完成，请重新登录。": "Official authorization did not complete. Sign in again.",
+  "授权未完成，请打开新的授权页面后重试。": "Authorization did not complete. Open the new authorization page and try again.",
   "登录响应无法识别，请更新运行机器上的工具后重试。": "The sign-in response could not be read. Update the tool on the server and try again.",
   "等待登录超时，请重新登录。": "Sign-in timed out. Start again.",
   "账号凭据失效，请重新登录。": "Account credentials expired. Sign in again.",

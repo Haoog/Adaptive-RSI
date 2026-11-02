@@ -912,7 +912,7 @@ class Handler(BaseHTTPRequestHandler):
                         if path != "/api/auth/cancel":
                             runtime.updates.require_ready()
                     if path == "/api/auth/complete":
-                        result = auth.complete(body.get("id"), body.get("code", ""))
+                        result = auth.complete(body.get("id"), body.get("code", ""), body.get("attempt_generation"))
                     elif path == "/api/auth/cancel":
                         result = auth.cancel(body.get("id"))
                     elif path == "/api/auth/logout":
