@@ -127,6 +127,12 @@ Unknown candidate kind
 Task dependency cycle
 Dependency must be another task in the same project
 Urgency must be 0 or 1
+Only queued inactive tasks can be scheduled
+Scheduled local time is ambiguous; specify fold
+Scheduled local time is nonexistent
+Scheduled time must be in the future
+Use a naive local time and fold 0 or 1
+Unknown time zone
 Only waiting tasks can be scheduled
 Automatic delivery must be explicitly enabled per project
 Parallel project limit is a global setting; select global defaults

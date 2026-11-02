@@ -378,6 +378,7 @@ class _ManualReconciliationFixture(unittest.TestCase):
             "UPDATE runs SET state='merged', result=? WHERE id=?",
             (encode({"merged_sha": self.MERGED, "feedback": {"state": "verified", "head": self.MERGED}}), run["id"]))
         self.record = self.runtime.store.one("SELECT * FROM runs WHERE id=?", (run["id"],))
+        assert self.record is not None
         self.posts = []
 
     def operation(self, kind="release", state="dispatch_unknown", **extra):
@@ -412,12 +413,25 @@ class _ManualReconciliationFixture(unittest.TestCase):
                     return match
                 raise AssertionError("unexpected single-run read")
             if "/runs?" in endpoint:
-                return {"workflow_runs": list(runs or [])}
+                items = list(runs or [])
+                if "page=" in endpoint:
+                    import urllib.parse
+                    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(endpoint).query)
+                    page = int(qs.get("page", [1])[0])
+                    per_page = int(qs.get("per_page", [100])[0])
+                    start = (page - 1) * per_page
+                    return {"workflow_runs": items[start:start + per_page]}
+                return {"workflow_runs": items}
             raise AssertionError(endpoint)
         return handler
 
     def saved(self, kind="release"):
         return self.runtime.store.setting(release.key(self.record["id"], kind))
+
+    def stored_size(self, kind="release"):
+        row = self.runtime.store.one("SELECT value FROM settings WHERE key=?",
+                                     (release.key(self.record["id"], kind),))
+        return len(row["value"])
 
 
 class ManualReconciliationTest(_ManualReconciliationFixture):
@@ -457,7 +471,8 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
                 self.assertEqual(result["state"], expected)
                 saved = self.saved()
                 self.assertEqual(saved["workflow_run_id"], selected)
-                self.assertEqual(saved["manual_reconciliation"]["raw_candidates"], remotes)
+                self.assertEqual([item["id"] for item in saved["manual_reconciliation"]["candidates"]], [101, 102])
+                self.assertEqual(saved["manual_reconciliation"]["previous"]["candidate_run_ids"], [101, 102])
                 self.assertEqual(self.posts, [])
 
     def test_candidates_list_fixed_links_and_explain_absence_without_free_text(self):
@@ -578,6 +593,222 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
         self.assertEqual(self.saved("deploy")["state"], "dispatch_unknown")
         self.assertEqual(self.posts, [])
 
+    def test_delayed_remote_visibility_transition_and_resolution_flow(self):
+        self.operation()
+        # 1. Dispatch just submitted/unknown: remote run has not appeared yet (empty runs).
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            self.assertEqual(view["reconciliation_state"], "awaiting_remote_visibility")
+            self.assertEqual(view["candidates"], [])
+            saved = self.saved()
+            self.assertEqual(saved["state"], "dispatch_unknown")
+            self.assertEqual(saved["reconciliation"]["state"], "awaiting_remote_visibility")
+            self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [])
+            self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+            # Zero redispatch sent.
+            self.assertEqual(self.posts, [])
+
+            # Selecting before visibility is rejected; manual IDs are rejected.
+            with self.assertRaisesRegex(release.ReconciliationRejected, "does not match this operation"):
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+            self.assertEqual(self.posts, [])
+
+        # 2. Delayed appearance: workflow run becomes visible on GitHub.
+        remote_run = self.remote(17, status="in_progress")
+        with patch.object(release, "api", side_effect=self.api(runs=[remote_run])):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            self.assertEqual(view["reconciliation_state"], "matched")
+            self.assertEqual([c["id"] for c in view["candidates"]], [17])
+            saved = self.saved()
+            self.assertEqual(saved["reconciliation"]["state"], "matched")
+            self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [17])
+            self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+            self.assertEqual(self.posts, [])
+
+            # 3. Operator resolves the delayed matching run.
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 17, source="test_delayed")
+            self.assertEqual(result["state"], "running")
+            saved = self.saved()
+            self.assertEqual(saved["state"], "running")
+            self.assertEqual(saved["workflow_run_id"], 17)
+            self.assertEqual(saved["reconciliation"]["state"], "matched")
+            self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+
+            audit = saved["manual_reconciliation"]
+            self.assertEqual(audit["selected_run_id"], 17)
+            self.assertEqual(audit["source"], "test_delayed")
+            self.assertEqual(audit["previous"]["state"], "dispatch_unknown")
+            self.assertEqual(audit["previous"]["reconciliation_state"], "matched")
+            self.assertEqual(audit["previous"]["candidate_run_ids"], [17])
+            self.assertEqual(audit["candidates"][0]["id"], 17)
+            self.assertGreater(audit["at"], 0)
+            self.assertEqual(saved["manual_reconciliations"][-1]["selected_run_id"], 17)
+
+            events = self.runtime.store.query("SELECT kind, data FROM events WHERE run=?", (self.record["id"],))
+            reconciled_events = [e for e in events if e["kind"] == "automation_reconciled"]
+            self.assertEqual(len(reconciled_events), 1)
+
+            # Never redispatches.
+            self.assertEqual(self.posts, [])
+
+    def test_delayed_remote_visibility_direct_resolution_captures_visibility_audit(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(self.saved()["reconciliation"]["state"], "awaiting_remote_visibility")
+
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17, status="in_progress")])):
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 17, source="test_direct")
+        self.assertEqual(result["state"], "running")
+        saved = self.saved()
+        self.assertEqual(saved["manual_reconciliation"]["previous"]["reconciliation_state"], "awaiting_remote_visibility")
+        self.assertEqual(saved["manual_reconciliation"]["previous"]["candidate_run_ids"], [])
+        self.assertEqual(saved["manual_reconciliation"]["selected_run_id"], 17)
+        self.assertEqual(self.posts, [])
+
+    def test_reconcile_persists_delayed_remote_visibility_sequence(self):
+        self.operation()
+        # Programmatic reconcile when remote has not appeared yet.
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            result = release.reconcile(self.runtime, self.record, "release", self.saved(), persist=True)
+            self.assertEqual(result["state"], "dispatch_unknown")
+            saved = self.saved()
+            self.assertEqual(saved["reconciliation"]["state"], "awaiting_remote_visibility")
+            self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [])
+            self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+            self.assertEqual(self.posts, [])
+
+        # Delayed appearance: remote now visible.
+        remote_run = self.remote(17, status="in_progress")
+        with patch.object(release, "api", side_effect=self.api(runs=[remote_run])):
+            result = release.reconcile(self.runtime, self.record, "release", self.saved(), persist=True)
+            self.assertEqual(result["state"], "running")
+            saved = self.saved()
+            self.assertEqual(saved["workflow_run_id"], 17)
+            self.assertEqual(saved["state"], "running")
+            self.assertEqual(saved["reconciliation"]["state"], "matched")
+            self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [17])
+            self.assertEqual(self.posts, [])
+
+
+class ReconciliationAuditPayloadTest(_ManualReconciliationFixture):
+    """Reconciliation keeps bounded evidence instead of the raw GitHub page."""
+
+    FIELDS = {"id", "url", "status", "conclusion", "attempt", "created_at", "updated_at",
+              "head_sha", "head_branch", "display_title", "workflow", "path", "event"}
+    BUDGET = 64 * 1024
+
+    def page(self, count=99):
+        # A real page carries actor, repository and commit objects. Nothing in
+        # them is needed to re-check one selection, so they must not persist.
+        # Pages stay below 100 runs because the stub repeats one page for every
+        # page number, which would otherwise extend the read-only query tenfold.
+        padding = "x" * 4096
+        return [self.remote(1000 + index,
+                            actor={"login": "operator", "avatar_url": "https://avatars.example/" + padding},
+                            repository={"full_name": "example/project", "description": padding},
+                            head_commit={"id": "c" * 40, "message": padding})
+                for index in range(count)]
+
+    def test_large_page_stores_bounded_evidence_and_keeps_the_audit(self):
+        remotes = self.page(99)
+        self.assertGreater(len(encode(remotes)), 1_000_000)
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=remotes)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 1042)
+        self.assertEqual(view["state"], "dispatch_unknown")
+        self.assertEqual(view["candidate_count"], 99)
+        self.assertEqual(len(view["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertEqual(len(view["selectable_candidates"]), 99)
+        self.assertEqual(view["selectable_candidates"][42]["id"], 1042)
+        self.assertEqual(result["state"], "queued")
+        saved = self.saved()
+        self.assertEqual(saved["state"], "queued")
+        audit = saved["manual_reconciliation"]
+        self.assertEqual(set(audit), set(release.RECONCILIATION_AUDIT_FIELDS))
+        self.assertEqual(audit["candidate_count"], 99)
+        self.assertEqual(audit["selected_run_id"], 1042)
+        self.assertEqual([item["id"] for item in audit["candidates"]],
+                         [1000 + index for index in range(release.RECONCILIATION_CANDIDATE_LIMIT)])
+        first = audit["candidates"][0]
+        self.assertEqual(set(first), self.FIELDS)
+        self.assertEqual((first["id"], first["status"]), (1000, "queued"))
+        self.assertEqual((first["created_at"], first["updated_at"]),
+                         ("2026-10-30T00:00:00Z", "2026-10-30T00:00:00Z"))
+        self.assertEqual(first["url"], "https://github.com/example/project/actions/runs/1000")
+        self.assertEqual(first["head_sha"], self.TRUSTED)
+        self.assertEqual(saved["reconciliation"]["candidate_count"], 1)
+        self.assertLess(self.stored_size(), self.BUDGET)
+        self.assertEqual(self.posts, [])
+
+    def test_stored_size_does_not_follow_the_remote_page_size(self):
+        sizes = []
+        for count in (20, 99):
+            self.operation()
+            with patch.object(release, "api", side_effect=self.api(runs=self.page(count))):
+                release.candidates(self.runtime, self.project, self.record["id"], "release")
+                release.resolve(self.runtime, self.project, self.record["id"], "release", 1001)
+            sizes.append(self.stored_size())
+            self.assertLess(sizes[-1], self.BUDGET)
+        self.assertLessEqual(abs(sizes[1] - sizes[0]), 32)
+        self.assertEqual(self.posts, [])
+
+    def test_history_drops_legacy_raw_payloads_and_stays_capped(self):
+        legacy = {"at": 1.0, "source": "console", "selected_run_id": 7,
+                  "candidates": [{"id": 7, "status": "queued"}],
+                  "raw_candidates": self.page(3),
+                  "previous": {"state": "dispatch_unknown"}}
+        self.operation(manual_reconciliations=[dict(legacy) for _ in range(12)])
+        self.assertGreater(self.stored_size(), 4 * self.BUDGET)
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote(17)])):
+            release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        history = self.saved()["manual_reconciliations"]
+        self.assertEqual(len(history), release.RECONCILIATION_AUDIT_LIMIT)
+        self.assertEqual([entry["selected_run_id"] for entry in history][-1], 17)
+        for entry in history:
+            self.assertLessEqual(set(entry), set(release.RECONCILIATION_AUDIT_FIELDS))
+            self.assertLessEqual(len(entry["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertLess(self.stored_size(), self.BUDGET)
+        self.assertEqual(self.posts, [])
+
+    def test_selectable_candidates_exposes_full_range_without_bloating_settings(self):
+        remotes = [self.remote(100 + index) for index in range(25)]
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=remotes)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            saved_before = self.saved()
+            self.assertEqual(saved_before["reconciliation"]["candidate_count"], 25)
+            self.assertEqual(len(saved_before["reconciliation"]["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+            self.assertNotIn("selectable_candidates", saved_before["reconciliation"])
+
+            self.assertEqual(view["candidate_count"], 25)
+            self.assertEqual(len(view["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+            self.assertIn("selectable_candidates", view)
+            self.assertEqual(len(view["selectable_candidates"]), 25)
+            self.assertEqual(view["selectable_candidates"][20]["id"], 120)
+
+            result = release.resolve(self.runtime, self.project, self.record["id"], "release", 120)
+        self.assertEqual(result["state"], "queued")
+        saved_after = self.saved()
+        self.assertEqual(saved_after["workflow_run_id"], 120)
+        audit = saved_after["manual_reconciliation"]
+        self.assertEqual(audit["selected_run_id"], 120)
+        self.assertEqual(audit["candidate_count"], 25)
+        self.assertEqual(len(audit["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertNotIn("selectable_candidates", audit)
+        self.assertLess(self.stored_size(), self.BUDGET)
+        self.assertEqual(self.posts, [])
+
+    def test_selectable_candidates_capped_at_selectable_limit(self):
+        remotes = [self.remote(1000 + index) for index in range(210)]
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=remotes)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(view["candidate_count"], 210)
+        self.assertEqual(len(view["candidates"]), release.RECONCILIATION_CANDIDATE_LIMIT)
+        self.assertEqual(len(view["selectable_candidates"]), release.RECONCILIATION_SELECTABLE_LIMIT)
+
 
 class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
     def test_endpoints_expose_candidates_and_reject_unsafe_ids(self):
@@ -600,6 +831,7 @@ class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
                     connection.close()
                 self.assertEqual(response.status, 200)
                 self.assertEqual([item["id"] for item in payload["candidates"]], [17])
+                self.assertEqual([item["id"] for item in payload.get("selectable_candidates", [])], [17])
                 self.assertEqual(payload["candidates"][0]["url"],
                                  "https://github.com/example/project/actions/runs/17")
 
@@ -622,6 +854,94 @@ class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
             server.server_close()
             thread.join(3)
         self.assertEqual(self.saved()["state"], "dispatch_unknown")
+
+    def test_delayed_appearance_endpoint_sequence_preserves_audit_and_never_redispatches(self):
+        import http.client
+        from adaptive_rsi import server as server_module
+        self.operation()
+        server = server_module.Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            # 1. Phase 1: Status not visible yet on GitHub Actions.
+            with patch.object(release, "api", side_effect=self.api(runs=[])):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("GET", "/api/release-candidates?project=" + self.project +
+                                       "&run=" + self.record["id"] + "&kind=release",
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["reconciliation_state"], "awaiting_remote_visibility")
+                self.assertEqual(payload["candidates"], [])
+                self.assertEqual(self.saved()["reconciliation"]["state"], "awaiting_remote_visibility")
+                self.assertEqual(self.posts, [])
+
+                # Attempting to resolve run 17 before it appears is rejected.
+                body = json.dumps({"project": self.project, "run": self.record["id"], "kind": "release",
+                                   "workflow_run_id": 17}).encode()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("POST", "/api/release-resolve", body, {
+                        "Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                        "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 400)
+                self.assertIn("does not match this operation", payload["error"])
+                self.assertEqual(self.posts, [])
+
+            # 2. Phase 2: Delayed appearance on GitHub Actions.
+            remote_run = self.remote(17, status="in_progress")
+            with patch.object(release, "api", side_effect=self.api(runs=[remote_run])):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("GET", "/api/release-candidates?project=" + self.project +
+                                       "&run=" + self.record["id"] + "&kind=release",
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["reconciliation_state"], "matched")
+                self.assertEqual([item["id"] for item in payload["candidates"]], [17])
+                self.assertEqual(self.saved()["reconciliation"]["state"], "matched")
+                self.assertEqual(self.posts, [])
+
+                # 3. Phase 3: Operator resolves through the endpoint.
+                body = json.dumps({"project": self.project, "run": self.record["id"], "kind": "release",
+                                   "workflow_run_id": 17}).encode()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("POST", "/api/release-resolve", body, {
+                        "Cookie": server.cookie + "=" + server.token, "Origin": server.origin,
+                        "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["state"], "running")
+                self.assertEqual(payload["operation"]["workflow_run_id"], 17)
+
+                saved = self.saved()
+                self.assertEqual(saved["state"], "running")
+                self.assertEqual(saved["workflow_run_id"], 17)
+                self.assertEqual(saved["manual_reconciliation"]["selected_run_id"], 17)
+                self.assertEqual(saved["manual_reconciliation"]["previous"]["reconciliation_state"], "matched")
+                events = self.runtime.store.query("SELECT kind FROM events WHERE run=?", (self.record["id"],))
+                self.assertIn("automation_reconciled", [row["kind"] for row in events])
+                self.assertEqual(self.posts, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
 
 
 if __name__ == "__main__":

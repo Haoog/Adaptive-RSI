@@ -450,9 +450,107 @@ def restore(source, destination):
     return {"restored": True, "paused": True, "artifacts_restored": False}
 
 
+def _protected_database_paths(source, store=None):
+    protected = set()
+
+    def add_with_sidecars(p):
+        if not p:
+            return
+        base = Path(p).expanduser().resolve()
+        protected.add(base)
+        for suffix in ("-wal", "-shm", "-journal"):
+            protected.add(Path(str(base) + suffix))
+
+    if source:
+        add_with_sidecars(source)
+        src = Path(source).expanduser().resolve()
+        if src.parent.name == "backups":
+            candidate_state = src.parent.parent / "state.sqlite3"
+            if candidate_state.exists():
+                add_with_sidecars(candidate_state)
+
+    if store is not None:
+        if hasattr(store, "path"):
+            add_with_sidecars(store.path)
+        root = store if isinstance(store, (str, Path)) else getattr(store, "root", None)
+        if root is not None:
+            root_p = Path(root).expanduser().resolve()
+            if root_p.is_file() and root_p.name.endswith(".sqlite3"):
+                add_with_sidecars(root_p)
+            else:
+                add_with_sidecars(root_p / "state.sqlite3")
+            backups_dir = root_p / "backups"
+            if backups_dir.is_dir():
+                for backup_file in backups_dir.glob("*.sqlite3"):
+                    add_with_sidecars(backup_file)
+    return protected
+
+
+def validate_rehearsal_report_path(destination, source, store=None):
+    if destination is None or destination is False:
+        return
+    target = Path(destination).expanduser().resolve()
+    protected = _protected_database_paths(source, store=store)
+    if target in protected:
+        raise ValueError(f"Rehearsal report destination conflicts with database: {target}")
+
+    try:
+        target_stat = target.stat()
+    except OSError:
+        target_stat = None
+
+    if target_stat is not None:
+        for p in protected:
+            try:
+                p_stat = p.stat()
+            except OSError:
+                continue
+            if (target_stat.st_dev, target_stat.st_ino) == (p_stat.st_dev, p_stat.st_ino):
+                raise ValueError(f"Rehearsal report destination conflicts with database: {target}")
+
+
+def _publish_report_atomically(report_file, encoded):
+    report_file = Path(report_file).expanduser().resolve()
+    report_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    while True:
+        temp_path = report_file.parent / f".{report_file.name}.tmp.{uid()}"
+        try:
+            fd = os.open(temp_path, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    temp_file = temp_path
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_file, report_file)
+        temp_file = None
+        dir_fd = None
+        try:
+            dir_fd = os.open(report_file.parent, os.O_RDONLY)
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
+    finally:
+        if temp_file is not None:
+            temp_file.unlink(missing_ok=True)
+
+
 def rehearsal_report_path(source, store=None, report_path=None):
     if report_path is not None and report_path is not True:
-        return Path(report_path).expanduser().resolve()
+        candidate = Path(report_path).expanduser().resolve()
+        validate_rehearsal_report_path(candidate, source, store=store)
+        return candidate
     source = Path(source).expanduser().resolve()
     if store is not None:
         root = store if isinstance(store, (str, Path)) else getattr(store, "root", store)
@@ -461,21 +559,28 @@ def rehearsal_report_path(source, store=None, report_path=None):
     if root is not None:
         folder = Path(root) / "reports"
         folder.mkdir(mode=0o700, exist_ok=True)
-        return folder / f"rehearsal-{source.stem}.json"
-    if source.parent.name == "backups" and (source.parent.parent / "state.sqlite3").exists():
+        candidate = folder / f"rehearsal-{source.stem}.json"
+    elif source.parent.name == "backups" and (source.parent.parent / "state.sqlite3").exists():
         folder = source.parent.parent / "reports"
         folder.mkdir(mode=0o700, exist_ok=True)
-        return folder / f"rehearsal-{source.stem}.json"
-    return source.parent / f"{source.stem}-rehearsal.json"
+        candidate = folder / f"rehearsal-{source.stem}.json"
+    else:
+        candidate = source.parent / f"{source.stem}-rehearsal.json"
+    validate_rehearsal_report_path(candidate, source, store=store)
+    return candidate
 
 
-def rehearse_restore(source, report_path=None):
+def rehearse_restore(source, report_path=None, store=None):
     """Exercise database recovery in disposable state without constructing a runtime.
 
     Project repositories, credentials and remote APIs are never opened. Missing
     files are reported, not treated as successful artifact recovery.
     """
     source = Path(source).expanduser().resolve()
+    report_file = None
+    if report_path:
+        target_path = None if report_path is True else report_path
+        report_file = rehearsal_report_path(source, store=store, report_path=target_path)
     try:
         verify_backup(source)
     except (ValueError, sqlite3.Error) as exc:
@@ -492,39 +597,28 @@ def rehearse_restore(source, report_path=None):
                           "remote_operations": 0, "error_type": type(exc).__name__,
                           "failure_stage": "restore_execution", "artifacts_restored": False}
             else:
-                store = Store(destination)
+                store_inst = Store(destination)
                 try:
-                    audit = store.relationship_audit()
+                    audit = store_inst.relationship_audit()
                     relationships_valid = not any(value for key, value in audit.items() if not key.startswith('_'))
                     complete = not any(audit['_truncated'].values())
-                    paused = not store.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
-                    active = store.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
-                    cases = store.one("SELECT count(*) AS n FROM cases")["n"]
+                    paused = not store_inst.one("SELECT 1 FROM projects WHERE paused<>1 OR paused IS NULL")
+                    active = store_inst.one("SELECT count(*) AS n FROM runs WHERE ended IS NULL")["n"]
+                    cases = store_inst.one("SELECT count(*) AS n FROM cases")["n"]
                     report = {"valid": relationships_valid and complete and paused and active == 0,
                               "checked_at": time.time(), "scope": "database_only", "remote_operations": 0,
                               "all_projects_paused": paused, "active_runs": active,
-                              "projects": store.one("SELECT count(*) AS n FROM projects")["n"],
-                              "tasks": store.one("SELECT count(*) AS n FROM tasks")["n"],
-                              "runs": store.one("SELECT count(*) AS n FROM runs")["n"],
+                              "projects": store_inst.one("SELECT count(*) AS n FROM projects")["n"],
+                              "tasks": store_inst.one("SELECT count(*) AS n FROM tasks")["n"],
+                              "runs": store_inst.one("SELECT count(*) AS n FROM runs")["n"],
                               "unavailable_cases": cases, "relationship_audit": audit,
                               "artifacts_restored": False, "repository_revalidation_required": True}
                 finally:
-                    store.close()
-    if report_path:
-        target_path = None if report_path is True else report_path
-        report_file = rehearsal_report_path(source, report_path=target_path)
-        report_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    store_inst.close()
+    if report_file:
+        validate_rehearsal_report_path(report_file, source, store=store)
         encoded = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-        fd = os.open(report_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as output:
-                output.write(encoded)
-                output.flush()
-                os.fsync(output.fileno())
-        except BaseException:
-            report_file.unlink(missing_ok=True)
-            raise
+        _publish_report_atomically(report_file, encoded)
         report["report_path"] = str(report_file)
     return report
 

@@ -157,7 +157,7 @@ class Operations:
                     raise ValueError("No backup available for rehearsal")
                 source = backups[0]
             report_file = rehearsal_report_path(source, store=self.store, report_path=parameters.get("report"))
-            result = rehearse_restore(source, report_path=report_file)
+            result = rehearse_restore(source, report_path=report_file, store=self.store)
         else:
             result = {"id": self.runtime.import_project(parameters["url"], parameters.get("directory"))}
         return result

@@ -47,6 +47,8 @@ window.RSIExperience = (() => {
     return [
       t(waiting[task.wait_reason] || task.wait_reason),
       task.queue_position ? t("队列位置") + " " + task.queue_position : "",
+      // 预约任务显示被授权的墙上时刻与它的时区；available 只是同一时刻的秒数。
+      task.schedule ? t("已预约") + " " + scheduleStamp(task.schedule.at, task.schedule.timezone) + " · " + task.schedule.timezone : "",
       task.available > Date.now() / 1000 ? stamp(task.available) : "",
       task.dependency?.title || "",
       task.urgency ? t("紧急") : t("常规"),
