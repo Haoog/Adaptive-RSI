@@ -1,0 +1,11 @@
+{
+ "captured": "2026-11-01T20:31:23Z",
+ "repository": "Haoog/Ours",
+ "branch": "master",
+ "endpoint": "repos/Haoog/Ours/rules/branches/master",
+ "read_only": true,
+ "command": "gh api repos/Haoog/Ours/rules/branches/master --paginate --slurp",
+ "response": [
+  []
+ ]
+}

@@ -1,0 +1,237 @@
+{
+ "scope": "#162 readiness against GitHub rulesets: one read-only verification round",
+ "checked_at": "2026-11-01T20:32:26Z",
+ "account": "Haoog",
+ "token_scopes": [
+  "gist",
+  "read:org",
+  "repo"
+ ],
+ "read_only": true,
+ "write_calls": 0,
+ "commands": [
+  "gh api repos/<repository>",
+  "gh api repos/<repository>/branches/<branch>/protection",
+  "gh api repos/<repository>/rules/branches/<branch> --paginate --slurp",
+  "gh api repos/<repository>/rulesets"
+ ],
+ "observations": [
+  {
+   "repository": "Haoog/Adaptive-RSI",
+   "branch": "main",
+   "role": "managed",
+   "configuration": "classic-only",
+   "repository_ruleset_count": 0,
+   "classic": {
+    "state": "observed",
+    "strict": true,
+    "contexts": [
+     "verify"
+    ],
+    "enforce_admins": true,
+    "required_approving_review_count": 0,
+    "required_conversation_resolution": true
+   },
+   "rulesets": {
+    "state": "observed",
+    "rule_count": 0,
+    "types": [],
+    "strict_policies": [],
+    "merge_queue": false
+   },
+   "merge_protection": {
+    "state": "strict",
+    "strict_checks": true,
+    "branch": "main",
+    "merge_queue": false,
+    "complete": true,
+    "sources": {
+     "classic": "observed",
+     "rulesets": "observed"
+    }
+   },
+   "fixtures": [
+    "tests/fixtures/github_protection/managed-classic-protection.json",
+    "tests/fixtures/github_protection/managed-branch-rules-empty.json"
+   ]
+  },
+  {
+   "repository": "Haoog/Ours",
+   "branch": "master",
+   "role": "managed",
+   "configuration": "no protection configured",
+   "repository_ruleset_count": 0,
+   "classic": {
+    "state": "unreadable",
+    "error": "gh: Branch not protected (HTTP 404)"
+   },
+   "rulesets": {
+    "state": "observed",
+    "rule_count": 0,
+    "types": [],
+    "strict_policies": [],
+    "merge_queue": false
+   },
+   "merge_protection": {
+    "state": "unknown",
+    "strict_checks": null,
+    "branch": "master",
+    "merge_queue": false,
+    "complete": false,
+    "sources": {
+     "classic": "unknown",
+     "rulesets": "observed"
+    }
+   },
+   "fixtures": [
+    "tests/fixtures/github_protection/unprotected-classic-404.json",
+    "tests/fixtures/github_protection/unprotected-branch-rules-empty.json"
+   ]
+  },
+  {
+   "repository": "Haoog/adaptive-rsi-validation-20261020",
+   "branch": "main",
+   "role": "managed",
+   "configuration": "plan-limited private repository",
+   "repository_ruleset_count": "unreadable",
+   "classic": {
+    "state": "unreadable",
+    "error": "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+   },
+   "rulesets": {
+    "state": "unreadable",
+    "error": "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)"
+   },
+   "merge_protection": {
+    "state": "unknown",
+    "strict_checks": null,
+    "branch": "main",
+    "merge_queue": null,
+    "complete": false,
+    "sources": {
+     "classic": "unknown",
+     "rulesets": "unknown"
+    }
+   },
+   "fixtures": [
+    "tests/fixtures/github_protection/plan-forbidden-classic-403.json",
+    "tests/fixtures/github_protection/plan-forbidden-rules-403.json"
+   ]
+  },
+  {
+   "repository": "vercel/next.js",
+   "branch": "canary",
+   "role": "public-reference",
+   "configuration": "ruleset-only with required status checks",
+   "repository_ruleset_count": 12,
+   "classic": {
+    "state": "unreadable",
+    "error": "gh: Not Found (HTTP 404)"
+   },
+   "rulesets": {
+    "state": "observed",
+    "rule_count": 17,
+    "types": [
+     "creation",
+     "deletion",
+     "non_fast_forward",
+     "pull_request",
+     "required_linear_history",
+     "required_signatures",
+     "required_status_checks",
+     "update"
+    ],
+    "strict_policies": [
+     false
+    ],
+    "merge_queue": false
+   },
+   "merge_protection": {
+    "state": "unknown",
+    "strict_checks": null,
+    "branch": "canary",
+    "merge_queue": false,
+    "complete": false,
+    "sources": {
+     "classic": "unknown",
+     "rulesets": "observed"
+    }
+   },
+   "fixtures": [
+    "tests/fixtures/github_protection/reference-classic-404.json",
+    "tests/fixtures/github_protection/reference-ruleset-status-checks.json"
+   ]
+  },
+  {
+   "repository": "microsoft/TypeScript",
+   "branch": "main",
+   "role": "public-reference",
+   "configuration": "ruleset with merge queue",
+   "repository_ruleset_count": 8,
+   "classic": {
+    "state": "unreadable",
+    "error": "gh: Not Found (HTTP 404)"
+   },
+   "rulesets": {
+    "state": "observed",
+    "rule_count": 6,
+    "types": [
+     "copilot_code_review",
+     "deletion",
+     "merge_queue",
+     "non_fast_forward",
+     "pull_request",
+     "required_status_checks"
+    ],
+    "strict_policies": [
+     false
+    ],
+    "merge_queue": true
+   },
+   "merge_protection": {
+    "state": "unknown",
+    "strict_checks": null,
+    "branch": "main",
+    "merge_queue": true,
+    "complete": false,
+    "sources": {
+     "classic": "unknown",
+     "rulesets": "observed"
+    }
+   },
+   "fixtures": [
+    "tests/fixtures/github_protection/reference-classic-404.json",
+    "tests/fixtures/github_protection/reference-ruleset-merge-queue.json"
+   ]
+  }
+ ],
+ "replayed": [
+  {
+   "configuration": "classic + ruleset combined",
+   "live": false,
+   "reason": "No managed repository has both configurations and creating a ruleset is a write operation.",
+   "inputs": [
+    "tests/fixtures/github_protection/managed-classic-protection.json",
+    "tests/fixtures/github_protection/reference-ruleset-merge-queue.json"
+   ],
+   "merge_protection": {
+    "state": "strict",
+    "strict_checks": true,
+    "branch": "main",
+    "merge_queue": true,
+    "complete": true,
+    "sources": {
+     "classic": "observed",
+     "rulesets": "observed"
+    }
+   }
+  }
+ ],
+ "decision_code_changed": false,
+ "limits": [
+  "The managed repository has classic branch protection and no repository ruleset; the combined configuration is replayed from captured live payloads, not accepted live.",
+  "No live repository was observed with strict_required_status_checks_policy=true inside an active ruleset; strictness inside rulesets is covered by the existing offline regression only.",
+  "Captures are point-in-time payloads from public GitHub endpoints; they do not prove GitHub enforces the same policy on later dates.",
+  "A 403 or 404 read is reported as unknown, so readiness never claims mergeability from a failed read."
+ ]
+}
