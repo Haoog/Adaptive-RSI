@@ -245,6 +245,9 @@ class Store:
         try:
             db.identity = self._file_identity()
             db.execute("PRAGMA journal_mode=WAL")
+            # WAL 下 NORMAL 将每笔提交从 FULL fsync 降到 checkpoint 才落盘；
+            # 崩溃只丢最后未 checkpoint 的事务，库不损坏，备份/恢复体系兜底。
+            db.execute("PRAGMA synchronous=NORMAL")
         except BaseException:
             db.close()
             raise
@@ -255,6 +258,7 @@ class Store:
         # 调用方可能在持有期间改过连接级设置，每次借出重新确保生效（PRAGMA 幂等）。
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA synchronous=NORMAL")
         return db
 
     @contextlib.contextmanager
@@ -758,10 +762,25 @@ class Store:
                                        (project, now, now)).fetchone()
                 if not candidate:
                     return None
+                # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
+                # 否则裸解析异常会让项目所有任务永远领不到。
+                try:
+                    evidence = json.loads(candidate["evidence"] or "[]")
+                    if not isinstance(evidence, list):
+                        raise ValueError("Task evidence must be an array")
+                except (ValueError, TypeError) as exc:
+                    reason = str(exc)[:300] or "Invalid task evidence"
+                    db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
+                               (now, candidate["id"]))
+                    db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                               (project, None, "task_configuration_error",
+                                "Task was blocked because its evidence is invalid: " + reason,
+                                encode({"task": candidate["id"], "reason": reason}), now))
+                    continue
                 source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
                 if (source_key and not config["sources"][source_key] and
                         any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
-                            for item in json.loads(candidate["evidence"] or "[]"))):
+                            for item in evidence)):
                     db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (now, candidate["id"]))
                     continue
                 try:

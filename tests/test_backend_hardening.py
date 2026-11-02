@@ -80,6 +80,38 @@ class BackendHardeningTest(unittest.TestCase):
         self.assertNotIn("No/Such_Zone", events[-1]["message"])
         self.assertEqual(json.loads(events[-1]["data"])["task"], bad_timezone)
 
+    def test_claim_blocks_invalid_evidence_and_claims_following_valid_task(self):
+        bad_json = self.store.add_task("project", "system_light", "bad-json", "Bad evidence JSON", priority=100)
+        bad_shape = self.store.add_task("project", "system_light", "bad-shape", "Non-array evidence", priority=99)
+        auto = self.store.add_task("project", "system_light", "auto-scan", "Automatic scan", priority=98,
+                                   evidence=[{"scan_trigger": "automatic"}])
+        good = self.store.add_task("project", "goal", "good", "Valid task", priority=1)
+        self.store.execute("UPDATE tasks SET evidence='not-json' WHERE id=?", (bad_json,))
+        self.store.execute("UPDATE tasks SET evidence='null' WHERE id=?", (bad_shape,))
+
+        run = self.store.claim("project", {"sources": {"inspection": False, "issues": False}})
+
+        self.assertEqual(run["task"], good)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (bad_json,))["state"], "blocked")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (bad_shape,))["state"], "blocked")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (auto,))["state"], "obsolete")
+        events = self.store.query("SELECT message,data FROM events WHERE kind='task_configuration_error' ORDER BY seq")
+        self.assertEqual(len(events), 2)
+        self.assertTrue(events[0]["message"].startswith("Task was blocked because its evidence is invalid: "))
+        self.assertEqual([json.loads(row["data"])["task"] for row in events], [bad_json, bad_shape])
+
+    def test_claim_evidence_guard_matches_overrides_semantics_with_sources_enabled(self):
+        bad = self.store.add_task("project", "system_light", "bad-evidence", "Bad evidence", priority=100)
+        good = self.store.add_task("project", "goal", "good", "Valid task", priority=1)
+        self.store.execute("UPDATE tasks SET evidence='not-json' WHERE id=?", (bad,))
+
+        run = self.store.claim("project", self.runtime.config("project"))
+
+        self.assertEqual(run["task"], good)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (bad,))["state"], "blocked")
+        events = self.store.query("SELECT data FROM events WHERE kind='task_configuration_error'")
+        self.assertEqual([json.loads(row["data"])["task"] for row in events], [bad])
+
     def test_run_directory_creation_error_closes_planning_run(self):
         task = self.store.add_task("project", "goal", "mkdir-error", "A task")
         run = self.store.claim("project", self.runtime.config("project"))
