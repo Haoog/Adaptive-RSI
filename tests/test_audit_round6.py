@@ -405,7 +405,9 @@ class AuditRound6Test(unittest.TestCase):
         receipt = {"run": "old", "sha": "a" * 40}
         legacy = "deployment-owner:" + fingerprint({"project": "p", "repository": "example/a", "target": policy["health_url"]})
         self.store.put_setting(legacy, receipt)
-        self.store.put_setting(key("old", "deploy"), {"state": "running"})
+        self.store.put_setting(key("old", "deploy"), {"state": "running", "repository": "example/a",
+            "workflow": policy["workflow"], "ref": "fixture", "sha": "a" * 40,
+            "workflow_sha": "b" * 40, "operation_id": "fixture"})
         self.assertEqual(owner_key("p", "example/a", policy), owner_key("another", "example/b", policy))
         self.assertEqual(deployment_owner(self.runtime, "another", "example/b", policy), receipt)
         self.assertEqual(self.store.setting(owner_key("p", "example/a", policy)), receipt)

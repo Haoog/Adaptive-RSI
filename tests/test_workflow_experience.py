@@ -428,7 +428,9 @@ class ExperienceTest(unittest.TestCase):
         run, directory, outcome = self.artifact_run()
         self.assertEqual(self.patch_response(self.store, run), (200, b"PRIVATE original patch"))
         remote = {"delivery:" + run["id"]: {"head": "head", "base": "base", "branch": "main"},
-                  "automation:" + run["id"] + ":deploy": {"state": "submitted", "operation_id": "receipt"}}
+                  "automation:" + run["id"] + ":deploy": {"state": "submitted", "operation_id": "receipt",
+                      "repository": "example/project", "workflow": ".github/workflows/deploy.yml",
+                      "ref": "fixture", "sha": "a" * 40, "workflow_sha": "b" * 40}}
         for key, value in remote.items():
             self.store.put_setting(key, value)
         local_keys = [prefix + self.project for prefix in
@@ -650,7 +652,9 @@ class ExperienceTest(unittest.TestCase):
         from adaptive_rsi.store import encode
         self.runtime.configure({"github": {"repository": "example/project"}}, self.project)
         run, directory, outcome = self.artifact_run()
-        receipt = {"state": "submitted", "operation_id": "receipt"}
+        receipt = {"state": "submitted", "operation_id": "receipt", "repository": "example/project",
+                   "workflow": ".github/workflows/deploy.yml", "ref": "fixture",
+                   "sha": "a" * 40, "workflow_sha": "b" * 40}
         self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
         self.store.put_setting("automation:" + run["id"] + ":deploy", receipt)
         acceptance = directory / "acceptance.json"
