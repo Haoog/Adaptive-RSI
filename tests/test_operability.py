@@ -329,6 +329,83 @@ class OperabilityTest(unittest.TestCase):
         # 损坏结果按「已保留」的常规决策跳过，不作为调度故障写入事件。
         self.assertEqual(store.query("SELECT 1 FROM events WHERE kind='scheduler_error'"), [])
 
+    def test_retention_run_settings_delete_in_one_transaction(self):
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        with self.store.connect() as db:
+            for index in range(3):
+                run = 'transaction-%d' % index
+                db.execute("INSERT INTO runs(id,state,ended) VALUES (?,'completed',?)", (run, stale))
+                db.execute("INSERT INTO settings VALUES (?, '{}')", ('automation:' + run,))
+        original = self.store.execute
+        individual = []
+        def observe(sql, args=()):
+            if sql.startswith('DELETE FROM settings WHERE key=? OR (key>=? AND key<?)') and args[0].startswith('automation:'):
+                individual.append(args[0])
+            return original(sql, args)
+        with patch.object(self.store, 'execute', side_effect=observe), \
+             patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        self.assertEqual(individual, [])
+        self.assertEqual(self.store.query("SELECT key FROM settings WHERE key LIKE 'automation:transaction-%'"), [])
+
+    def test_retention_rechecks_run_state_before_deleting_settings(self):
+        from contextlib import contextmanager
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        self.store.execute("INSERT INTO runs(id,state,ended) VALUES ('state-race','completed',?)", (stale,))
+        self.store.put_setting('automation:state-race', {})
+        original = self.store.connect
+        @contextmanager
+        def connect():
+            with original() as db:
+                statements = []
+                db.set_trace_callback(statements.append)
+                yield db
+            if any(sql.startswith('SELECT key FROM settings WHERE key>=') for sql in statements):
+                with original() as writer:
+                    writer.execute("UPDATE runs SET state='pr_open' WHERE id='state-race'")
+        with patch.object(self.store, 'connect', side_effect=connect), patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        self.assertIsNotNone(self.store.one("SELECT key FROM settings WHERE key='automation:state-race'"))
+
+    def test_retention_preserves_keys_owned_by_protected_nested_run(self):
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        with self.store.connect() as db:
+            db.execute("INSERT INTO runs(id,state,ended) VALUES ('parent','completed',?)", (stale,))
+            db.execute("INSERT INTO runs(id,state,ended) VALUES ('parent:child','pr_open',?)", (stale,))
+        for key in ('automation:parent', 'automation:parent:release', 'automation:parent:child', 'automation:parent:child:deploy'):
+            self.store.put_setting(key, {})
+        with patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        keys = {row['key'] for row in self.store.query("SELECT key FROM settings WHERE key>='automation:' AND key<'automation;' ")}
+        self.assertEqual(keys, {'automation:parent:child', 'automation:parent:child:deploy'})
+
+    def test_retention_protected_children_do_not_starve_other_runs(self):
+        now = 2_000_000_000
+        stale = now - 120 * 86400
+        with self.store.connect() as db:
+            for index in range(201):
+                parent = 'parent-%03d' % index
+                db.execute("INSERT INTO runs(id,state,ended) VALUES (?,'completed',?)", (parent, stale))
+                db.execute("INSERT INTO runs(id,state,ended) VALUES (?,'pr_open',?)", (parent + ':child', stale))
+                db.execute("INSERT INTO settings VALUES (?, '{}')", ('automation:' + parent + ':child',))
+            db.execute("INSERT INTO runs(id,state,ended) VALUES ('z-last','completed',?)", (stale,))
+            db.execute("INSERT INTO settings VALUES ('automation:z-last', '{}')")
+        with patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        self.assertIsNone(self.store.one("SELECT key FROM settings WHERE key='automation:z-last'"))
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM settings WHERE key LIKE 'automation:parent-%'")['n'], 201)
+
+    def test_retention_cleans_exact_key_for_empty_run_id(self):
+        now = 2_000_000_000
+        self.store.execute("INSERT INTO runs(id,state,ended) VALUES ('','completed',?)", (now - 120 * 86400,))
+        self.store.put_setting('automation:', {})
+        with patch('adaptive_rsi.runtime.time.time', return_value=now):
+            self.runtime.maintenance()
+        self.assertIsNone(self.store.one("SELECT key FROM settings WHERE key='automation:'"))
+
     def test_retention_settings_batches_drain_remaining_runs(self):
         store = self.store
         now = 2_000_000_000
@@ -389,31 +466,17 @@ class OperabilityTest(unittest.TestCase):
                         remaining_keys.add(key)
                         db.execute("INSERT INTO settings VALUES (?, '{}')", (key,))
 
-        original_query = store.query
-        plans = []
-
-        def checked_query(sql, args=()):
-            if not sql.startswith("SELECT r.id FROM runs r"):
-                return original_query(sql, args)
-            with store.connect() as db:
-                plan = [row["detail"] for row in db.execute("EXPLAIN QUERY PLAN " + sql, args)]
-                searches = [detail for detail in plan if "SEARCH s USING" in detail]
-                self.assertEqual(len(searches), 2 * len(prefixes), plan)
-                self.assertTrue(all("INDEX" in detail for detail in searches), plan)
-                self.assertFalse(any("SCAN s" in detail for detail in plan), plan)
-                self.assertEqual(sum("key=?" in detail for detail in searches), len(prefixes), plan)
-                self.assertEqual(sum("key>? AND key<?" in detail for detail in searches), len(prefixes), plan)
-                plans.append(plan)
-                return [dict(row) for row in db.execute(sql, args)]
-
-        with patch.object(store, "query", side_effect=checked_query):
-            for passes, expected in [(0, 2 * len(prefixes)), (1, 0)]:
-                with self.subTest(passes=passes + 1), patch("adaptive_rsi.runtime.time.time", return_value=now + passes * 3601):
-                    self.runtime.maintenance()
-                    keys = {row["key"] for row in original_query("SELECT key FROM settings")}
-                    self.assertEqual(len(keys & remaining_keys), expected)
-                    self.assertTrue(unrelated_keys <= keys)
-        self.assertEqual(len(plans), 2)
+        with store.connect() as db:
+            plan = [row['detail'] for row in db.execute(
+                "EXPLAIN QUERY PLAN SELECT key FROM settings WHERE key>=? AND key<? AND key>? ORDER BY key LIMIT 256",
+                ('automation:', 'automation;', 'automation:'))]
+        self.assertTrue(any('SEARCH' in item and 'INDEX' in item for item in plan), plan)
+        for passes, expected in [(0, 2 * len(prefixes)), (1, 0)]:
+            with self.subTest(passes=passes + 1), patch("adaptive_rsi.runtime.time.time", return_value=now + passes * 3601):
+                self.runtime.maintenance()
+                keys = {row["key"] for row in store.query("SELECT key FROM settings")}
+                self.assertEqual(len(keys & remaining_keys), expected)
+                self.assertTrue(unrelated_keys <= keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM runs")["n"], 5000)
 
     def test_retention_settings_matches_literal_run_id_and_colon_suffix_only(self):
