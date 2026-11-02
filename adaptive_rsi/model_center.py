@@ -271,6 +271,7 @@ class ModelCenter:
         validate(updated)
         if not project:
             for row in self.store.query("SELECT config FROM projects"):
+                # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
                 validate(merge(updated, json.loads(row["config"])))
         registered = False
         try:

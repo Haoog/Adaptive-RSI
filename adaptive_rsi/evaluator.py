@@ -773,7 +773,10 @@ class Evaluator:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?",
                              ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
-            previous = json.loads(row["value"]) if row else None
+            try:
+                previous = json.loads(row["value"]) if row and row["value"] else None
+            except (TypeError, ValueError):
+                previous = None
             if previous and previous.get("at", 0) > time.time() - 60:
                 return
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
@@ -783,7 +786,13 @@ class Evaluator:
             "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
             ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
         if len(entries) > BASELINE_CACHE_LIMIT:
-            stale = sorted(entries, key=lambda item: json.loads(item["value"]).get("at", 0))
+            def _entry_at(item):
+                try:
+                    value = json.loads(item["value"] or "{}")
+                except (TypeError, ValueError):
+                    value = {}
+                return value.get("at", 0) if isinstance(value, dict) else 0
+            stale = sorted(entries, key=_entry_at)
             for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
                 self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
 

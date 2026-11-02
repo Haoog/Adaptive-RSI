@@ -261,7 +261,10 @@ def publish(runtime, project, task, run, workspace, config):
                          (project["id"], run["id"]))
     if not approval or run["state"] != "awaiting_approval":
         raise RuntimeError("Publishing requires explicit approval or persisted project policy")
-    authorization = json.loads(approval["evidence"])
+    try:
+        authorization = json.loads(approval["evidence"] or "[]")
+    except (TypeError, ValueError):
+        authorization = []
     def authorize_write():
         live = runtime.config(project["id"])
         job = store.one("SELECT * FROM runs WHERE task=? AND ended IS NULL", (approval["id"],))
@@ -279,7 +282,7 @@ def publish(runtime, project, task, run, workspace, config):
         if not authorization or authorization[0].get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
         if authorization[0]["authorization"] == "project_policy" and (
-                json.loads(run["config"])["delivery"]["mode"] != "pr" or live["delivery"]["mode"] != "pr"):
+                json.loads(run["config"] or "{}").get("delivery", {}).get("mode") != "pr" or live["delivery"]["mode"] != "pr"):
             raise RuntimeError("Automatic PR authorization was revoked")
         if (live["github"]["repository"] != config["github"]["repository"] or
                 live["delivery"]["base_branch"] != config["delivery"]["base_branch"]):
@@ -287,7 +290,12 @@ def publish(runtime, project, task, run, workspace, config):
     authorize_write()
     if task["source"] == "issue" and not runtime.issue_still_open(project, task, config):
         raise StaleCandidate("Issue closed before delivery; synchronize before retrying")
-    outcome = json.loads(run["result"])
+    try:
+        outcome = json.loads(run["result"] or "{}")
+    except (TypeError, ValueError):
+        outcome = {}
+    if not isinstance(outcome, dict):
+        outcome = {}
     if outcome.get("evaluation", {}).get("decision") != "pass" or outcome.get("review", {}).get("decision") != "pass":
         raise RuntimeError("Delivery gates did not pass")
     repo = config["github"]["repository"]
@@ -341,7 +349,12 @@ def publish(runtime, project, task, run, workspace, config):
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             original = db.execute("SELECT state,result FROM runs WHERE id=?", (run["id"],)).fetchone()
-            receipt = json.loads(original["result"])
+            try:
+                receipt = json.loads(original["result"] or "{}")
+            except (TypeError, ValueError):
+                receipt = {}
+            if not isinstance(receipt, dict):
+                receipt = {}
             receipt["pr"] = url
             state = "superseded" if original["state"] == "superseded" else "pr_open"
             if state == "superseded":
@@ -558,14 +571,24 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
                         if task and task["source"] == "rollback":
-                            original_id = json.loads(task["evidence"])[0]["run"]
-                            original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
-                            if original:
-                                result = json.loads(original["result"])
-                                result["reverted_by"] = run["id"]
-                                result["feedback"] = {**result.get("feedback", {}), "state": "reverted"}
-                                store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode(result), original_id))
-                                store.execute("UPDATE tasks SET state='reverted',updated=? WHERE id=?", (now, original["task"]))
+                            try:
+                                task_evidence = json.loads(task["evidence"] or "[]")
+                            except (TypeError, ValueError):
+                                task_evidence = []
+                            original_id = task_evidence[0]["run"] if task_evidence else None
+                            if original_id:
+                                original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
+                                if original:
+                                    try:
+                                        result = json.loads(original["result"] or "{}")
+                                    except (TypeError, ValueError):
+                                        result = {}
+                                    if not isinstance(result, dict):
+                                        result = {}
+                                    result["reverted_by"] = run["id"]
+                                    result["feedback"] = {**result.get("feedback", {}), "state": "reverted"}
+                                    store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode(result), original_id))
+                                    store.execute("UPDATE tasks SET state='reverted',updated=? WHERE id=?", (now, original["task"]))
                 elif pr["state"] == "CLOSED":
                     outcome["delivery_status"] = "closed"
                     store.execute("UPDATE runs SET state='pr_closed' WHERE id=?", (run["id"],))
@@ -573,7 +596,11 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 else:
                     outcome["delivery_status"] = gate
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
-                    authorized = json.loads(run["config"])["delivery"]["auto_merge"] and config["delivery"]["auto_merge"]
+                    try:
+                        run_config = json.loads(run["config"] or "{}")
+                    except (TypeError, ValueError):
+                        run_config = {}
+                    authorized = run_config.get("delivery", {}).get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         _, remote, branch = baseline(runtime, project, config)
@@ -608,8 +635,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             live_identity = store.setting("run-baseline:" + run["id"])
                             if (remote == policy["base"] and branch == policy["branch"] and
                                     live_run and live_run["state"] == "pr_open" and
-                                    json.loads(live_run["config"])["delivery"]["auto_merge"] and
-                                    json.loads(live_run["result"]).get("pr") == outcome["pr"] and
+                                    json.loads(live_run["config"] or "{}").get("delivery", {}).get("auto_merge") and
+                                    json.loads(live_run["result"] or "{}").get("pr") == outcome["pr"] and
                                     live_config["delivery"]["mode"] == "pr" and
                                     live_config["delivery"]["auto_merge"] and
                                     live_config["github"]["repository"] == repo and
@@ -692,7 +719,12 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
     if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
         return
-    saved = json.loads(run["config"])
+    try:
+        saved = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
 
     def missing_artifacts():
         previous = outcome.get("feedback", {})

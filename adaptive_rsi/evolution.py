@@ -225,7 +225,12 @@ class Evolution:
         for item in manifest:
             row = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], project))
             try:
-                spec = json.loads(row["spec"]) if row else {}
+                try:
+                    spec = json.loads(row["spec"]) if row else {}
+                except (TypeError, ValueError):
+                    spec = {}
+                if not isinstance(spec, dict):
+                    spec = {}
                 actual = {"spec": fingerprint(spec), "task": fingerprint(spec["task"]),
                           "checks": fingerprint(spec["checks"]),
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
@@ -268,7 +273,12 @@ class Evolution:
                 raise ValueError("Unknown evaluation split")
             if target == "holdout" and row["split"] != "holdout":
                 raise ValueError("A previously classified case cannot become fresh holdout")
-            spec = json.loads(row["spec"])
+            try:
+                spec = json.loads(row["spec"] or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            if not isinstance(spec, dict):
+                spec = {}
             history = spec.setdefault("lifecycle", [])
             history.append({"from": row["split"], "to": target, "active": active, "uses": row["uses"],
                             "source": source, "created": time.time()})
@@ -575,7 +585,12 @@ class Evolution:
             raise ValueError("Candidate not found")
         root = Path(destination)
         root.mkdir(parents=True, exist_ok=False)
-        evidence = json.loads(row["evidence"])
+        try:
+            evidence = json.loads(row["evidence"] or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
         try:
             # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
             # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
@@ -599,7 +614,13 @@ class Evolution:
                 if not case:
                     limitations.append("Missing case " + item["case"])
                     continue
-                spec = json.loads(case["spec"])
+                try:
+                    spec = json.loads(case["spec"] or "{}")
+                except (TypeError, ValueError):
+                    spec = None
+                if not isinstance(spec, dict) or not spec.get("repository") or not spec.get("base"):
+                    limitations.append("Unreadable case " + item["case"])
+                    continue
                 target = root / "cases" / item["case"]
                 target.mkdir(parents=True)
                 snapshot(spec["repository"], target / "repository", spec["base"])
@@ -938,7 +959,13 @@ class Evolution:
         validate(merge(self.runtime.config(project), {"checks": manifest["checks"]}))
         signature = fingerprint({"task": manifest["task"], "tree": git(source, "rev-parse", base + "^{tree}")})
         for row in self.store.query("SELECT family,spec FROM cases WHERE project=?", (project,)):
-            if row["family"] == manifest["family"] or json.loads(row["spec"])["signature"] == signature:
+            try:
+                spec = json.loads(row["spec"] or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            if not isinstance(spec, dict):
+                spec = {}
+            if row["family"] == manifest["family"] or spec.get("signature") == signature:
                 raise ValueError("Same task/defect family cannot enter multiple splits")
         case = uid()
         directory = self.store.root / "suites" / case
@@ -1088,7 +1115,12 @@ class Evolution:
                 "report": str(trial_dir / "evaluation" / "report.json")}
 
     def propose_and_evaluate(self, project, workspace, directory, run, force=False):
-        config = json.loads(run["config"])
+        try:
+            config = json.loads(run["config"] or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
         inputs = self.proposal_inputs(project["id"])
         signature = self.input_signature(project["id"], config, inputs)
         attempt = self.store.setting("evolution-attempt:" + project["id"], {})
@@ -1435,7 +1467,12 @@ class Evolution:
                     or not content["guidance"].strip() or not isinstance(content.get("triggers"), list)):
                 raise ValueError("Candidate content is incomplete")
             # 与 active_strategies 相同：旧证据无兼容指纹时仍可用，有指纹则必须匹配。
-            sealed_evidence = json.loads(row["evidence"])
+            try:
+                sealed_evidence = json.loads(row["evidence"] or "{}")
+            except (TypeError, ValueError):
+                sealed_evidence = {}
+            if not isinstance(sealed_evidence, dict):
+                sealed_evidence = {}
             if sealed_evidence.get("preregistered_plan"):
                 verification = self.verify_plan(sealed_evidence["preregistered_plan"], sealed_evidence.get("trials", []))
                 if not verification["valid"] or not sealed_evidence.get("final_review", {}).get("fresh"):
@@ -1591,8 +1628,19 @@ class Evolution:
                 current = db.execute("SELECT evidence FROM candidates WHERE id=? AND status='stable'", (row["id"],)).fetchone()
                 if not current:
                     continue
-                evidence = json.loads(current["evidence"])
-                if evidence.get("compatibility") and evidence["compatibility"] != compatibility(json.loads(recorded["config"])):
+                try:
+                    evidence = json.loads(current["evidence"] or "{}")
+                except (TypeError, ValueError):
+                    evidence = {}
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                try:
+                    recorded_config = json.loads(recorded["config"] or "{}")
+                except (TypeError, ValueError):
+                    recorded_config = {}
+                if not isinstance(recorded_config, dict):
+                    recorded_config = {}
+                if evidence.get("compatibility") and evidence["compatibility"] != compatibility(recorded_config):
                     continue
                 monitor = evidence.setdefault("monitor", {"passed": 0, "failed": 0})
                 seen = monitor.setdefault("runs", [])
@@ -1635,7 +1683,11 @@ class Evolution:
                 db.execute("UPDATE candidates SET status='stable' WHERE id=?", (row["parent"],))
             # Roll back learned instructions as well as the strategy pointer.
             for skill in db.execute("SELECT id,evidence FROM skills WHERE project=? AND status='verified'", (row["project"],)).fetchall():
-                if json.loads(skill["evidence"]).get("candidate") == candidate:
+                try:
+                    skill_evidence = json.loads(skill["evidence"] or "{}")
+                except (TypeError, ValueError):
+                    skill_evidence = {}
+                if isinstance(skill_evidence, dict) and skill_evidence.get("candidate") == candidate:
                     db.execute("UPDATE skills SET status='invalidated' WHERE id=?", (skill["id"],))
         self.store.event("rollback", "Restored previous stable strategy and invalidated its learned skill", row["project"], data={"candidate": candidate})
 

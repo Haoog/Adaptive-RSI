@@ -197,13 +197,23 @@ class Store:
         migration = db.execute("SELECT 1 FROM settings WHERE key='delivery-policy-v2'").fetchone()
         if not migration:
             for row in db.execute("SELECT id,config FROM projects").fetchall():
-                config = json.loads(row["config"])
+                try:
+                    config = json.loads(row["config"] or "{}")
+                except (TypeError, ValueError):
+                    config = {}
+                if not isinstance(config, dict):
+                    config = {}
                 if "delivery" in config:
                     config["delivery"].update(mode="local", auto_merge=False)
                     db.execute("UPDATE projects SET config=? WHERE id=?", (encode(config), row["id"]))
             row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
             if row:
-                config = json.loads(row["value"])
+                try:
+                    config = json.loads(row["value"] or "{}")
+                except (TypeError, ValueError):
+                    config = {}
+                if not isinstance(config, dict):
+                    config = {}
                 if "delivery" in config:
                     config["delivery"].update(mode="local", auto_merge=False)
                     db.execute("UPDATE settings SET value=? WHERE key='config'", (encode(config),))

@@ -323,7 +323,12 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     experiment started, so the four ablation configurations differ only in the
     factor under test.
     """
-    config = json.loads(run["config"])
+    try:
+        config = json.loads(run["config"] or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
     from .evaluator import checkpoint_reuse_enabled
     checkpoint_reuse = not experiment and checkpoint_reuse_enabled(config)
     from .workflow import change_kind, documentation_only, evidence_contract, supports_test_first
@@ -435,10 +440,22 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     protected_feedback = protected_feedback_values(runtime.store, task["id"])
     context["previous_attempts"] = [retry_feedback(r, protected_feedback) for r in context["previous_attempts"]]
     if task["source"] == "rollback":
-        prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (json.loads(task["evidence"])[0]["run"], project["id"]))
+        try:
+            task_evidence = json.loads(task["evidence"] or "[]")
+        except (TypeError, ValueError):
+            task_evidence = []
+        original_run_id = task_evidence[0]["run"] if task_evidence else None
+        if not original_run_id:
+            raise RuntimeError("Rollback task missing original run reference")
+        prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (original_run_id, project["id"]))
         if not prior:
             raise RuntimeError("Original run missing")
-        prior_result = json.loads(prior["result"])
+        try:
+            prior_result = json.loads(prior["result"] or "{}")
+        except (TypeError, ValueError):
+            prior_result = {}
+        if not isinstance(prior_result, dict):
+            prior_result = {}
         prior_directory = Path(prior["path"]) if prior["path"] else runtime.store.root / "runs" / prior["id"]
         patch_path = prior_directory / "candidate.patch"
         try:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, merge
 from adaptive_rsi.context import terms
-from adaptive_rsi.discovery import related_work, sync
+from adaptive_rsi.discovery import related_task, related_work, sync
 from adaptive_rsi.store import Store, encode
 
 
@@ -26,6 +26,20 @@ class DiscoveryHardeningTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_related_task_tolerates_null_and_invalid_evidence(self):
+        """tasks.evidence 列是 TEXT 未加 NOT NULL；历史数据或手动插入可为 NULL。
+        related_task() 之前对 NULL 裸 json.loads 抛 TypeError，逃出
+        inspection 循环的 except (ValueError, OSError) 围栏，一个坏行终止整次扫描。"""
+        self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,"
+                          "priority,available,created,updated) "
+                          "VALUES('t1','p','inspection','fp1','null-evidence','body',NULL,'queued',50,0,0,0)")
+        self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,"
+                          "priority,available,created,updated) "
+                          "VALUES('t2','p','inspection','fp2','bad-json','body','not-json{','queued',50,0,0,0)")
+        backlog = self.store.query("SELECT * FROM tasks WHERE project='p'")
+        finding = {"title": "new defect", "path": "x.py", "quote": "x", "acceptance": ["test"]}
+        self.assertIsNone(related_task(backlog, finding))
 
     def synchronize(self, rows):
         sync(self.runtime, self.project, self.config, lambda *args, **kwargs: encode(rows))

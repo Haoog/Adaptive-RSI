@@ -70,7 +70,12 @@ def cached(runtime, run, stage, signature, accept=None, normalize=None):
                             "WHERE r.task=? AND s.stage=? AND s.signature=? AND r.id<>? "
                             "ORDER BY s.created DESC LIMIT 1", (run["task"], stage, signature, run["id"]))
     if row:
-        data = json.loads(row["data"])
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
         if normalize is not None:
             try:
                 data = normalize(data)
@@ -115,6 +120,6 @@ def enforce_cached_review(review, config):
 def signature(run, task, base, strategies, configuration=None):
     from .build import BUILD_ID
     return fingerprint({"build": BUILD_ID,
-                        "config": json.loads(run["config"]) if configuration is None else configuration,
+                        "config": json.loads(run["config"] or "{}") if configuration is None else configuration,
                         "base": base, "strategies": strategies,
                         "task": {k: task[k] for k in ["title", "body", "source", "evidence", "acceptance"]}})
