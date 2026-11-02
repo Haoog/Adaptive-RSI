@@ -462,6 +462,89 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_concurrent_snapshot_preserves_failure_cache_shape(self):
+        manager = AuthSessions(self.root / 'racing-status-cache')
+        entered, release = threading.Event(), threading.Event()
+        results, errors = [], []
+        class Cache(dict):
+            reads = 0
+            def get(cache, key, default=None):
+                if threading.current_thread() is thread and key == 'opencode':
+                    cache.reads += 1
+                    if cache.reads == 2:
+                        entered.set()
+                        self.assertTrue(release.wait(2))
+                return super().get(key, default)
+        manager.status_cache = Cache()
+        def request():
+            try:
+                results.append(manager.snapshot()['opencode'])
+            except BaseException as exc:
+                errors.append(exc)
+        thread = threading.Thread(target=request)
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/cli'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', side_effect=RuntimeError('OpenCode credential listing failed')):
+                thread.start()
+                self.assertTrue(entered.wait(2))
+                # Cache.get executes under the manager lock; publish the completed
+                # concurrent discovery directly at this controlled boundary.
+                manager.status_cache['opencode'] = (float('inf'), {
+                    'state': 'signed_out', 'available': True, 'error': 'opencode_error',
+                    'transport': 'host', 'authenticated_providers': []})
+                release.set()
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+                self.assertFalse(errors)
+                self.assertEqual(results[0]['error'], 'opencode_error')
+                self.assertEqual(manager.snapshot()['opencode']['error'], 'opencode_error')
+        finally:
+            release.set()
+            thread.join(2)
+            manager.close()
+
+    def test_failed_snapshot_discovery_is_cached_and_invalidated(self):
+        manager = AuthSessions(self.root / 'failed-status-cache')
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/cli'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))) as detect, \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', side_effect=RuntimeError('OpenCode credential listing failed')) as discover, \
+                 patch('adaptive_rsi.auth_sessions.time.monotonic', return_value=100) as clock:
+                for _ in range(3):
+                    self.assertEqual(manager.snapshot()['opencode']['error'], 'opencode_error')
+                self.assertEqual((detect.call_count, discover.call_count), (1, 1))
+                with manager.lock:
+                    manager._invalidate_caches('opencode')
+                manager.snapshot()
+                self.assertEqual(discover.call_count, 2)
+                clock.return_value = 126
+                manager.snapshot()
+                self.assertEqual(discover.call_count, 3)
+        finally:
+            manager.close()
+        self.assertFalse(manager.status_cache)
+
+    def test_snapshot_reports_container_readiness_for_both_backends(self):
+        for docker, exit_code, error in ((None, 0, 'auth_container_unavailable'),
+                                          ('/fixture/docker', 1, 'auth_worker_image_missing'),
+                                          ('/fixture/docker', 0, None)):
+            with self.subTest(docker=docker, exit_code=exit_code):
+                manager = AuthSessions(self.root / 'readiness', config={'sandbox': {'backend': 'docker'}})
+                try:
+                    with patch('adaptive_rsi.auth_sessions.shutil.which', side_effect=lambda name: docker if name == 'docker' else '/fixture/' + name), \
+                         patch('adaptive_rsi.auth_sessions.run_process', return_value={'exit_code': exit_code, 'error': ''}) as inspect, \
+                         patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                         patch('adaptive_rsi.auth_sessions.auth_providers', return_value=[]):
+                        result = manager.snapshot()
+                    for backend in ('codex', 'opencode'):
+                        self.assertEqual(result[backend]['available'], error is None)
+                        self.assertEqual(result[backend].get('error'), error)
+                        self.assertEqual(result[backend]['transport'], 'docker')
+                    self.assertEqual(inspect.call_count, int(docker is not None))
+                finally:
+                    manager.close()
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
@@ -1126,6 +1209,23 @@ class OpenCodeServeTests(unittest.TestCase):
         worker.capabilities = OpenCodeCapabilities("1.19.3", (1, 19, 3))
         worker.base = "http://127.0.0.1:41001"
         return worker
+
+    def test_auto_poll_retries_transient_errors_with_bounded_failures(self):
+        worker = self.make_worker()
+        worker.provider, worker.attempt_id = 'openai', 'fixture-attempt'
+        for failures in (1, 9, 10):
+            with self.subTest(failures=failures), \
+                 patch.object(worker, 'http', side_effect=[AuthError('auth_protocol_error')] * failures +
+                              [{'data': {'status': 'pending'}}, {'data': {'status': 'complete'}}]) as http, \
+                 patch('adaptive_rsi.auth_sessions.time.sleep'):
+                if failures < 10:
+                    self.assertTrue(worker._v2_complete())
+                    self.assertEqual(http.call_count, failures + 2)
+                else:
+                    with self.assertRaises(AuthError) as caught:
+                        worker._v2_complete()
+                    self.assertEqual(caught.exception.code, 'auth_protocol_error')
+                    self.assertEqual(http.call_count, 10)
 
     def test_dead_process_gets_one_new_port_retry(self):
         worker = self.make_worker()
