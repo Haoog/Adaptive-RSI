@@ -1235,6 +1235,93 @@ class AuditEvolutionTest(unittest.TestCase):
             # 终态清理缓存
             self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
 
+    def test_case_selection_follows_population_share(self):
+        from adaptive_rsi.evolution import case_stratum, select_cases
+        cases = ([{'id': 'small-%03d' % index, 'uses': 0,
+                   'spec': encode({'task': 'short task', 'source': 'real'})} for index in range(900)] +
+                 [{'id': 'large-%03d' % index, 'uses': 0,
+                   'spec': encode({'task': 'x' * 20000, 'source': 'real'})} for index in range(100)])
+        for count, share in ((6, 1), (10, 1), (20, 2)):
+            picked = select_cases(cases, count, 'run-seed')
+            allocation = {size: sum(case_stratum(case)[1] == size for case in picked)
+                          for size in ('small', 'large')}
+            self.assertEqual(len(picked), count)
+            # 稀有层占比 10%，样本分配应贴近总体比例而不是与主流量层等量。
+            self.assertLessEqual(abs(allocation['large'] - share), 1)
+            self.assertGreaterEqual(allocation['small'], 1)
+            self.assertEqual(allocation['small'] + allocation['large'], count)
+
+    def test_case_selection_keeps_exact_count_and_stratum_coverage(self):
+        from adaptive_rsi.evolution import case_stratum, select_cases
+        cases = [{'id': source + '-' + size, 'uses': 0,
+                  'spec': encode({'task': 'x' * length, 'source': source})}
+                 for source, length, size in (('real', 100, 'small'), ('real', 2000, 'medium'),
+                                              ('synthetic', 100, 'small'), ('synthetic', 20000, 'large'))]
+        picked = select_cases(cases, 4, 'seed')
+        self.assertEqual(len(picked), 4)
+        self.assertEqual(len({case['id'] for case in picked}), 4)
+        self.assertEqual(len({case_stratum(case) for case in picked}), 4)
+        # count 超过总体时不能凭空补样本。
+        self.assertEqual(len(select_cases(cases, 9, 'seed')), 4)
+        # 层数多于样本量时按固定 hash 顺序整层选取，同样的输入得到同样的结果。
+        subset = select_cases(cases, 2, 'seed')
+        self.assertEqual(len(subset), 2)
+        self.assertEqual(len({case_stratum(case) for case in subset}), 2)
+        self.assertEqual([case['id'] for case in subset], [case['id'] for case in select_cases(cases, 2, 'seed')])
+
+    def test_case_selection_seed_only_reorders_cases_inside_a_stratum(self):
+        from adaptive_rsi.evolution import case_stratum, select_cases
+        cases = ([{'id': 'small-%02d' % index, 'uses': 0,
+                   'spec': encode({'task': 'short', 'source': 'real'})} for index in range(30)] +
+                 [{'id': 'large-%02d' % index, 'uses': 0,
+                   'spec': encode({'task': 'x' * 20000, 'source': 'real'})} for index in range(6)])
+        def selection(seed):
+            picked = select_cases(cases, 9, seed)
+            tally = {}
+            for case in picked:
+                tally[case_stratum(case)] = tally.get(case_stratum(case), 0) + 1
+            return tally, [case['id'] for case in picked]
+        first, first_ids = selection('seed')
+        repeat, repeat_ids = selection('seed')
+        other, other_ids = selection('other')
+        self.assertEqual(first_ids, repeat_ids)
+        self.assertEqual(first, repeat)
+        # 配额只由各层规模决定；换 seed 只在同名层内部换成员。
+        self.assertEqual(first, other)
+        self.assertNotEqual(first_ids, other_ids)
+
+    def test_plan_records_stratum_population_and_sample_counts(self):
+        args = self.setup_proposal()
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS
+        self.config = merge(DEFAULTS, {'evolution': {'min_cases_per_split': 3, 'repeats': 2}})
+        args[3]['config'] = encode(self.config)
+        repo = args[1]
+        base = git(repo, 'rev-parse', 'HEAD')
+        for case, split, source, length in (('validation-2', 'validation', 'real', 100),
+                                            ('validation-3', 'validation', 'synthetic', 20000),
+                                            ('holdout-2', 'holdout', 'real', 2000),
+                                            ('holdout-3', 'holdout', 'synthetic', 20000)):
+            spec = {'task': 'x' * length, 'base': base, 'checks': CHECKS, 'source': source,
+                    'signature': case, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (case, 'p', case, split, encode(spec), 0, 1))
+        result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        plan = evidence['preregistered_plan']['data']
+        validation = plan['allocation']['validation']
+        self.assertEqual(validation['requested'], 3)
+        self.assertEqual(validation['population'], 3)
+        strata = {tuple(item['stratum']): (item['population'], item['sampled'])
+                  for item in validation['strata']}
+        self.assertEqual(strata, {('real', 'small'): (2, 2), ('synthetic', 'large'): (1, 1)})
+        self.assertEqual(plan['allocation']['holdout']['population'], 3)
+        self.assertEqual(evidence['promotion_review']['allocation'], plan['allocation'])
+        self.assertEqual(plan['selection_policy'], 'traffic_weighted_min_one_per_stratum')
+        self.assertEqual(len(plan['samples']), 6)
+        self.assertIn('share of the population', ' '.join(evidence['promotion_review']['limitations']))
+
 
 if __name__ == '__main__':
     unittest.main()
