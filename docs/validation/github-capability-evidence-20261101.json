@@ -1,0 +1,49 @@
+{
+  "title": "audit-200 #178 real scoped-token capability verification evidence",
+  "captured_at_utc": "2026-11-01T20:51:23Z",
+  "finished_at_utc": "2026-11-01T20:51:24Z",
+  "method": "probe wraps subprocess.Popen to record every process spawned while readiness.github_capabilities runs for real (no mocking); git ls-remote A/B snapshots of remote refs before/after; two runs with identical results",
+  "probe": "python3 -B probe_capability_178.py (scratch tool, read-only wrapper; method documented in github-capability-evidence-20261101.md)",
+  "token_scope_source": "gh auth status (scope names only; token value never read or recorded): 'gist', 'read:org', 'repo'",
+  "read_only_proof": {
+    "diagnostic_spawned_processes": 1,
+    "spawned_argv": ["gh", "api", "repos/Haoog/Adaptive-RSI", "--method", "GET"],
+    "write_method_flags_seen": [],
+    "non_get_requests_observed": 0,
+    "remote_refs_snapshot_sha256_before": "fc10b687a6ab18a9608cfb2f48d5ef01d69447c783316b9908b9637719473727",
+    "remote_refs_snapshot_sha256_after": "fc10b687a6ab18a9608cfb2f48d5ef01d69447c783316b9908b9637719473727",
+    "snapshot_rows": 335,
+    "snapshots_identical": true,
+    "test_write_performed": false
+  },
+  "github_capabilities_result": {
+    "read": "available",
+    "write": "available",
+    "actions_write": "unknown",
+    "pull_requests_write": "unknown",
+    "test_write_performed": false
+  },
+  "server_side_cross_check": {
+    "method": "separate read-only GET gh api repos/Haoog/Adaptive-RSI at 2026-11-01T20:50Z",
+    "permissions": {"admin": true, "maintain": true, "pull": true, "push": true, "triage": true},
+    "interpretation": "permissions.push=true confirms the classic 'repo' scope really grants push; the diagnostic's write=available is a true positive, not a misreport"
+  },
+  "checks": {
+    "exactly_one_gh_spawn": true,
+    "gh_call_is_get": true,
+    "no_write_flags": true,
+    "no_other_subprocess_from_diagnostic": true,
+    "refs_unchanged": true,
+    "test_write_performed_false": true,
+    "fine_grained_capabilities_not_claimed": true,
+    "write_report_consistent_with_scope": true,
+    "all_checks_pass": true
+  },
+  "boundary_notes": {
+    "token_is_not_pure_read_only": "The machine's existing token carries classic 'repo' scope, which grants push (this loop uses it daily to push branches and open PRs). The literal read-only branch (write=unavailable) therefore has fixture evidence only (tests.test_delivery_readiness_audit.CapabilityTest.test_read_only_repository_permissions_never_imply_write); no new credential was created to exercise it live.",
+    "all_delivery_available_not_reported": "Even with push granted, the diagnostic reports actions_write=unknown and pull_requests_write=unknown (adaptive_rsi/readiness.py:33-34), so 'all delivery capabilities available' is never claimed; verified live."
+  },
+  "tests_run": [
+    "python3 -B -m unittest tests.test_delivery_readiness_audit -q"
+  ]
+}

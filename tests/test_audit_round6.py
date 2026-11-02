@@ -1,4 +1,5 @@
 """Regressions for the third audit: exercise failures at their production seams."""
+import contextlib
 import copy
 import errno
 import json
@@ -1128,8 +1129,9 @@ class AuditMigrationHistoryTest(unittest.TestCase):
         from adaptive_rsi.schema_migrations import scripts
         with tempfile.TemporaryDirectory() as directory:
             store = Store(directory)
-            record = next(row for row in store.schema_migrations() if row['version'] == 3)
-            self.assertEqual(record['checksum'], hashlib.sha256(scripts()[0][1]).hexdigest())
+            records = {row['version']: row['checksum'] for row in store.schema_migrations()}
+            for version, content in scripts():
+                self.assertEqual(records[version], hashlib.sha256(content).hexdigest())
             self.assertEqual(store.one('PRAGMA user_version')['user_version'], 2)
             store.close()
             with patch.object(Store, '_bootstrap', side_effect=AssertionError('bootstrap repeated')):
@@ -1140,15 +1142,27 @@ class AuditMigrationHistoryTest(unittest.TestCase):
     def test_changed_migration_content_fails_before_ddl(self):
         from adaptive_rsi.schema_migrations import scripts
         with tempfile.TemporaryDirectory() as directory:
-            store = Store(directory)
+            path = Path(directory)
+            store = Store(path)
             store.execute('CREATE INDEX sentinel_index ON events(created)')
             store.close()
             changed = [(version, content + b'\nDROP INDEX sentinel_index;\n') for version, content in scripts()]
             with patch('adaptive_rsi.schema_migrations.scripts', return_value=changed):
                 with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
-                    Store(directory)
-            with sqlite3.connect(str(Path(directory) / 'state.sqlite3')) as db:
+                    Store(path)
+            with contextlib.closing(sqlite3.connect(str(path / 'state.sqlite3'))) as db:
                 self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='sentinel_index'").fetchone())
+
+            # 锁住每条迁移正文变化均被独立检测
+            for target_version, _ in scripts():
+                with self.subTest(version=target_version):
+                    single_changed = [(v, c + b'\nDROP INDEX sentinel_index;\n' if v == target_version else c)
+                                      for v, c in scripts()]
+                    with patch('adaptive_rsi.schema_migrations.scripts', return_value=single_changed):
+                        with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
+                            Store(path)
+                    with contextlib.closing(sqlite3.connect(str(path / 'state.sqlite3'))) as db:
+                        self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='sentinel_index'").fetchone())
 
     def test_failed_new_migration_rolls_back_ddl_and_history_together(self):
         from adaptive_rsi.schema_migrations import scripts
@@ -1160,6 +1174,149 @@ class AuditMigrationHistoryTest(unittest.TestCase):
             with patch('adaptive_rsi.schema_migrations.scripts', return_value=additions):
                 with self.assertRaises(sqlite3.OperationalError):
                     Store(directory)
-            with sqlite3.connect(str(Path(directory) / 'state.sqlite3')) as db:
+            with contextlib.closing(sqlite3.connect(str(Path(directory) / 'state.sqlite3'))) as db:
                 self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='should_rollback'").fetchone())
                 self.assertIsNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=?', (next_version,)).fetchone())
+
+    @staticmethod
+    def _create_historical_fixture(root, target_version):
+        import hashlib
+        from adaptive_rsi.schema_migrations import BOOTSTRAP_SCHEMA, scripts
+        db_path = root / 'state.sqlite3'
+        root.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(str(db_path))) as db:
+            if target_version == 'legacy_v1':
+                db.executescript("""
+                    CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT,path TEXT,config TEXT,paused INTEGER,created REAL);
+                    CREATE TABLE tasks(id TEXT PRIMARY KEY,project TEXT,source TEXT,fingerprint TEXT,title TEXT,body TEXT,
+                        evidence TEXT,acceptance TEXT,state TEXT,priority INTEGER,attempts INTEGER,overrides TEXT,
+                        available REAL,created REAL,updated REAL,urgency INTEGER,infra_retries INTEGER,budget_waits INTEGER);
+                    CREATE TABLE runs(id TEXT PRIMARY KEY,task TEXT,project TEXT,state TEXT,config TEXT,strategy TEXT,
+                        base TEXT,path TEXT,calls INTEGER,tokens INTEGER,started REAL,ended REAL,result TEXT);
+                    CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
+                    PRAGMA user_version=1;
+                """)
+                db.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+                db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state) "
+                           "VALUES ('t1','p','goal','fp1','Legacy task','Body','[]','[]','queued')")
+                db.commit()
+                return
+
+            db.executescript(BOOTSTRAP_SCHEMA)
+            tasks_cols = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+            for col in ('urgency', 'infra_retries', 'budget_waits'):
+                if col not in tasks_cols:
+                    db.execute(f'ALTER TABLE tasks ADD COLUMN {col} INTEGER DEFAULT 0')
+            calls_cols = {row[1] for row in db.execute('PRAGMA table_info(calls)')}
+            if 'provider' not in calls_cols:
+                db.execute("ALTER TABLE calls ADD COLUMN provider TEXT DEFAULT 'openai'")
+            if 'unit_price' not in calls_cols:
+                db.execute('ALTER TABLE calls ADD COLUMN unit_price REAL')
+            if 'unit' not in calls_cols:
+                db.execute("ALTER TABLE calls ADD COLUMN unit TEXT DEFAULT 'unknown'")
+            for col in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'usage_known'):
+                if col not in calls_cols:
+                    db.execute(f'ALTER TABLE calls ADD COLUMN {col} INTEGER DEFAULT 0')
+            for tbl in ('phase_times', 'remote_waits'):
+                cols = {row[1] for row in db.execute(f'PRAGMA table_info({tbl})')}
+                if 'duration' not in cols:
+                    db.execute(f'ALTER TABLE {tbl} ADD COLUMN duration REAL')
+
+            v1_hash = hashlib.sha256(b'adaptive-rsi-schema-v1').hexdigest()
+            db.execute("INSERT INTO schema_migrations VALUES (1,?,0)", (v1_hash,))
+            db.execute("PRAGMA user_version=1")
+
+            db.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+            db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,state) "
+                       "VALUES ('t1','p','goal','fp1','Fixture task','Body','[]','[]','queued')")
+
+            if target_version == 1:
+                for tbl in ('request_log', 'phase_times', 'remote_waits', 'task_completions'):
+                    db.execute(f'DROP TABLE IF EXISTS {tbl}')
+                db.commit()
+                return
+
+            v2_hash = hashlib.sha256(b'adaptive-rsi-schema-v2').hexdigest()
+            db.execute("INSERT INTO schema_migrations VALUES (2,?,0)", (v2_hash,))
+            db.execute("PRAGMA user_version=2")
+            db.execute("CREATE INDEX IF NOT EXISTS request_log_created ON request_log(started DESC)")
+
+            if target_version == 2:
+                db.commit()
+                return
+
+            for ver, content in scripts():
+                if ver > target_version:
+                    break
+                statement = ""
+                for line in content.decode("utf-8").splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        db.execute(statement)
+                        statement = ""
+                db.execute("INSERT INTO schema_migrations VALUES (?,?,0)",
+                           (ver, hashlib.sha256(content).hexdigest()))
+            db.commit()
+
+    def test_historical_version_fixture_matrix_upgrade_no_rebackfill_and_rejects_future(self):
+        """为每个历史版本 fixture 补「升级 → 二次启动不重复回填 → 更新未来版本被拒」三断言。"""
+        from adaptive_rsi.schema_migrations import heal
+        versions = ['legacy_v1', 1, 2, 3, 4, 5, 6, 7, 8]
+        for target_version in versions:
+            with self.subTest(version=target_version):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory)
+                    self._create_historical_fixture(path, target_version)
+
+                    # 断言 1：从历史 fixture 升级至最新版，保留既有数据
+                    store = Store(path)
+                    try:
+                        applied = [row['version'] for row in store.schema_migrations()]
+                        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8])
+                        uv = store.one("PRAGMA user_version")
+                        self.assertIsNotNone(uv)
+                        assert uv is not None
+                        self.assertEqual(uv['user_version'], 2)
+                        task = store.one("SELECT title, state FROM tasks WHERE id='t1'")
+                        self.assertIsNotNone(task)
+                        assert task is not None
+                        self.assertEqual(task['state'], 'queued')
+                        first_records = store.schema_migrations()
+                    finally:
+                        store.close()
+
+                    # 断言 2：第二次启动不重复回填
+                    healed_results = []
+                    real_heal = heal
+                    def spy_heal(db):
+                        res = real_heal(db)
+                        healed_results.append(res)
+                        return res
+
+                    with patch.object(Store, '_bootstrap', side_effect=AssertionError('bootstrap repeated')), \
+                         patch('adaptive_rsi.schema_migrations.LOGGER.warning', side_effect=AssertionError('heal warning logged')), \
+                         patch('adaptive_rsi.schema_migrations.heal', side_effect=spy_heal):
+                        reopened = Store(path)
+                        try:
+                            second_records = reopened.schema_migrations()
+                        finally:
+                            reopened.close()
+
+                    self.assertEqual(healed_results, [()], "heal backfilled rows on second startup")
+                    self.assertEqual(first_records, second_records, "schema_migrations rows modified on second startup")
+
+                    # 断言 3：更新未来版本被拒
+                    # 3a: 注入未来迁移版本
+                    with contextlib.closing(sqlite3.connect(str(path / 'state.sqlite3'))) as db:
+                        db.execute("INSERT INTO schema_migrations VALUES (999, 'future', 0)")
+                        db.commit()
+                    with self.assertRaisesRegex(RuntimeError, 'newer than this runtime'):
+                        Store(path)
+
+                    # 3b: 未来的 user_version 也被拒
+                    with contextlib.closing(sqlite3.connect(str(path / 'state.sqlite3'))) as db:
+                        db.execute("DELETE FROM schema_migrations WHERE version=999")
+                        db.execute("PRAGMA user_version=3")
+                        db.commit()
+                    with self.assertRaisesRegex(RuntimeError, 'newer than this runtime'):
+                        Store(path)

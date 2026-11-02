@@ -361,3 +361,74 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
             maintenance.recycle_cleanup(self.store, maintenance.preview_cleanup(self.store, 'r'))
         self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
         self.assertEqual((self.directory / 'candidate' / 'evidence').read_text(), 'candidate')
+
+    def _merged_run(self, run_id, result, polls=('1111-aaaa', '2222-bbbb')):
+        """Insert a merged run whose feedback directory holds two poll snapshots."""
+        directory = self.store.root / 'runs' / run_id
+        for name in polls:
+            (directory / 'feedback' / name / 'baseline').mkdir(parents=True)
+            (directory / 'feedback' / name / 'baseline' / 'head').write_text('sha-' + name)
+        (directory / 'workspace').mkdir()
+        (directory / 'workspace' / 'file').write_text('merged evidence')
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES (?,?,?,?,1,?)",
+                           (run_id, 'p', 'merged', str(directory), json.dumps(result)))
+        return directory
+
+    def test_merged_monitoring_completed_feedback_recycles_and_undoes(self):
+        result = {"merged_sha": "a" * 40, "monitoring_completed": True,
+                  "feedback": {"state": "verified", "head": "a" * 40, "checked_at": 1,
+                               "merge": {"sha": "a" * 40, "state": "verified", "checked_at": 1}}}
+        directory = self._merged_run('m1', result)
+        preview = maintenance.preview_cleanup(self.store, 'm1')
+        self.assertEqual([item['name'] for item in preview['objects']], ['workspace', 'feedback'])
+        receipt = maintenance.recycle_cleanup(self.store, preview)
+        self.assertFalse((directory / 'feedback').exists())
+        self.assertFalse((directory / 'workspace').exists())
+        maintenance.undo_cleanup(self.store, receipt['id'])
+        self.assertEqual((directory / 'feedback' / '1111-aaaa' / 'baseline' / 'head').read_text(),
+                         'sha-1111-aaaa')
+        self.assertEqual((directory / 'feedback' / '2222-bbbb' / 'baseline' / 'head').read_text(),
+                         'sha-2222-bbbb')
+        self.assertFalse((self.store.root / 'recycle' / receipt['id']).exists())
+
+    def test_merged_run_without_completed_monitoring_stays_protected(self):
+        result = {"merged_sha": "a" * 40,
+                  "feedback": {"state": "verified", "head": "a" * 40,
+                               "merge": {"sha": "a" * 40, "state": "verified"}}}
+        directory = self._merged_run('m2', result)
+        with self.assertRaises(ValueError):
+            maintenance.preview_cleanup(self.store, 'm2')
+        self.assertTrue((directory / 'feedback' / '1111-aaaa' / 'baseline' / 'head').exists())
+
+    def test_merged_run_with_corrupt_result_stays_protected(self):
+        directory = self.store.root / 'runs' / 'm3'
+        (directory / 'feedback' / 'poll').mkdir(parents=True)
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('m3','p','merged',?,1,'{')",
+                           (str(directory),))
+        with self.assertRaises(ValueError):
+            maintenance.preview_cleanup(self.store, 'm3')
+        self.assertTrue((directory / 'feedback' / 'poll').exists())
+
+    def test_merged_run_with_legal_hold_stays_protected(self):
+        self._merged_run('m4', {"monitoring_completed": True})
+        self.store.put_setting('legal-hold:m4', True)
+        with self.assertRaises(ValueError):
+            maintenance.preview_cleanup(self.store, 'm4')
+        self.store.put_setting('legal-hold:m4', False)
+        preview = maintenance.preview_cleanup(self.store, 'm4')
+        self.assertEqual([item['name'] for item in preview['objects']], ['workspace', 'feedback'])
+
+    def test_merged_expiration_shortcut_result_is_previewable(self):
+        directory = self.store.root / 'runs' / 'm5'
+        (directory / 'feedback' / 'poll').mkdir(parents=True)
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('m5','p','merged',?,1,?)",
+                           (str(directory), json.dumps({"monitoring_completed": True})))
+        preview = maintenance.preview_cleanup(self.store, 'm5')
+        self.assertEqual([item['name'] for item in preview['objects']], ['feedback'])
+
+    def test_new_feedback_poll_between_preview_and_recycle_blocks_recycle(self):
+        preview = maintenance.preview_cleanup(self.store, 'r')
+        (self.directory / 'feedback' / '9999-late').mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, 'preview changed'):
+            maintenance.recycle_cleanup(self.store, preview)
+        self.assertTrue((self.directory / 'feedback' / '9999-late').exists())

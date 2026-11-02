@@ -1222,6 +1222,7 @@ test('core-only state keeps loaded analytics, then evolution requests missing se
 
 function textOf(node){return [node.textContent||'',...(node.children||[]).map(textOf)].filter(Boolean).join(' ');}
 function buttonWith(node,label){return (node.children||[]).map(child=>child.textContent===label?child:buttonWith(child,label)).find(Boolean);}
+function detailsWith(node,label){for(const child of node.children||[]){if(child.textContent===label&&child.tagName==='SUMMARY')return node;const hit=detailsWith(child,label);if(hit)return hit;}return null;}
 
 test('evolution suites show exposure, independent cases and translated controller reasons', () => {
   const page = browser();
@@ -1243,6 +1244,52 @@ test('evolution suites show exposure, independent cases and translated controlle
   assert.match(exhausted, /曝光次数已达上限/);
   assert.match(exhausted, /evolution\.max_holdout_uses/);
   assert.doesNotMatch(exhausted, /Validation or holdout exposure limit reached/);
+});
+
+test('experiment evidence drawer renders the promotion review diff and limitations', async () => {
+  const page = browser();
+  page.context.fetch = async url => {
+    assert.match(String(url), /\/api\/candidate\?id=ready-1&project=a$/);
+    return response({comparison: {cohorts: []},
+      evidence: {preregistered_plan: {data: {}},
+        promotion_review: {baseline: [{id: 'base-1', kind: 'strategy', content: {guidance: 'Old guidance', triggers: []}}],
+          proposal: {kind: 'strategy', guidance: 'New guidance', triggers: []},
+          changed_kind: 'strategy', plan_hash: 'h', covered_samples: [],
+          limitations: ['Only sampled task families, sources and size strata are covered']},
+        dataset: {version: 1}}});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'ready-1',project:'a',kind:'strategy',status:'ready',content:{guidance:'Guide'},reason:'Paired quality improved without observed regressions; usage recorded separately',independent_cases:3,trial_count:12,created:100}]};renderEvolution()`, page.context);
+  const detail = page.node('candidates').children[0].children.find(node => node.tagName === 'DETAILS');
+  detail.open = true; detail.handlers.toggle();
+  await page.context.lastAction;
+  await waitFor(() => detailsWith(detail, '晋升评审：策略差异与适用边界'));
+  const diff = detailsWith(detail, '晋升评审：策略差异与适用边界');
+  assert.ok(diff, 'promotion review diff block is present');
+  const text = textOf(diff);
+  assert.match(text, /基线 · 执行策略/);
+  assert.match(text, /Old guidance/);
+  assert.match(text, /提案 · 执行策略/);
+  assert.match(text, /New guidance/);
+  assert.match(text, /适用边界与未覆盖场景/);
+  assert.match(text, /Only sampled task families, sources and size strata are covered/);
+});
+
+test('promotion review without baseline or limitations states the boundary instead of failing', async () => {
+  const page = browser();
+  page.context.fetch = async url => response({comparison: {cohorts: []},
+    evidence: {promotion_review: {baseline: [], proposal: {kind: 'meta_strategy', guidance: '  '}}}});
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'first-1',project:'a',kind:'meta_strategy',status:'evaluating',content:{guidance:'Guide'},reason:'',independent_cases:0,trial_count:0,created:100}]};renderEvolution()`, page.context);
+  const detail = page.node('candidates').children[0].children.find(node => node.tagName === 'DETAILS');
+  detail.open = true; detail.handlers.toggle();
+  await page.context.lastAction;
+  await waitFor(() => detailsWith(detail, '晋升评审：策略差异与适用边界'));
+  const diff = detailsWith(detail, '晋升评审：策略差异与适用边界');
+  assert.ok(diff, 'promotion review block renders even for a first proposal');
+  const text = textOf(diff);
+  assert.match(text, /当前没有已启用的基线策略；这次提案将首次建立该类型的策略。/);
+  assert.match(text, /提案 · 规划方法/);
+  assert.match(text, /无说明/);
+  assert.doesNotMatch(text, /适用边界与未覆盖场景/);
 });
 
 test('rollback forces candidates and analytics refresh despite the TTL', async () => {
@@ -1748,6 +1795,129 @@ test('revision and backoff messages are mapped and localized for both console la
   const mapped=vm.runInContext(`apiErrors[${JSON.stringify(compatibilityError)}]`,browser().context);
   assert.match(mapped,/重新评估/);
   assert.match(english[mapped],/Reevaluate/);
+});
+
+test('schedule-time rejections are mapped and localized for both console languages', () => {
+  const i18n=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/web/i18n.js'), 'utf8');
+  const english=vm.runInNewContext(i18n.slice(0, i18n.indexOf('let language')) + ';english');
+  const apiBlock=source.slice(source.indexOf('const apiErrors={'), source.indexOf('function reviseForm'));
+  const apiErrors=JSON.parse('{' + apiBlock.slice(apiBlock.indexOf('{') + 1, apiBlock.lastIndexOf('}')) + '}');
+  const runtime=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/runtime.py'), 'utf8');
+  const emitted=new Set();
+  // 只扫 schedule_task 的方法体：预约拒绝的固定文案由它产生，其他模块的
+  // ValueError 走各自的错误路径，不属于本契约。
+  const start=runtime.indexOf('def schedule_task(');
+  assert.ok(start >= 0, 'runtime.py contains schedule_task');
+  const method=runtime.slice(start, runtime.indexOf('\n    def ', start + 1));
+  for (const match of method.matchAll(/raise ValueError\(\s*'((?:[^'\\]|\\.)*)'\s*\)/g)) emitted.add(match[1]);
+  const server=fs.readFileSync(path.join(__dirname, '../adaptive_rsi/server.py'), 'utf8');
+  assert.ok(server.includes('"/api/task/schedule-time"'), 'schedule-time endpoint must be wired');
+  assert.ok(server.includes('runtime.schedule_task(body.get("task")'), 'endpoint must call schedule_task');
+  for (const message of ['Scheduled local time is nonexistent',
+    'Scheduled local time is ambiguous; specify fold', 'Scheduled time must be in the future',
+    'Use a naive local time and fold 0 or 1', 'Unknown time zone',
+    'Only queued inactive tasks can be scheduled'])
+    assert.ok(emitted.has(message), 'runtime must emit the fixed message: ' + message);
+  for (const message of emitted)
+    assert.ok(Object.hasOwn(apiErrors, message), 'server validation message must be mapped: ' + message);
+  for (const [message, localized] of Object.entries(apiErrors)) {
+    if (!message.includes('Scheduled') && !['Use a naive local time and fold 0 or 1',
+      'Unknown time zone', 'Only queued inactive tasks can be scheduled'].includes(message)) continue;
+    assert.ok(Object.hasOwn(english, localized), 'english dictionary misses: ' + localized);
+  }
+  assert.match(english[apiErrors['Scheduled local time is nonexistent']], /does not exist/);
+  assert.match(english[apiErrors['Scheduled local time is ambiguous; specify fold']], /first or second/);
+  assert.equal(english['已预约'], 'Reserved');
+  assert.equal(english['安排检查：此任务将在指定时刻开始运行。'], 'Schedule check: this task starts at the chosen instant.');
+});
+
+const detailDescendants = node => (node.children || []).flatMap(child => [child, ...detailDescendants(child)]);
+
+test('queued task detail offers a schedule form that posts the chosen wall time and fold', async () => {
+  const page = browser(), posts = [];
+  const task = {id: 'sched-1', project: 'a', title: '预约目标', source: 'goal', state: 'queued', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push({url, body: JSON.parse(options.body)});
+      return response({local_time: '2027-11-07T01:30', timezone: 'Asia/Shanghai', fold: 1, at: 1});
+    }
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  const box = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+  assert.ok(box, 'queued task detail must offer the schedule form');
+  const controls = detailDescendants(box);
+  const time = controls.find(node => node.type === 'datetime-local');
+  const zone = controls.find(node => node.type === 'text');
+  const repeat = controls.find(node => node.tagName === 'SELECT');
+  time.value = '2027-11-07T01:30';
+  zone.value = ' Asia/Shanghai ';
+  repeat.value = '1';
+  const reserve = controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约');
+  reserve.handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/api/task/schedule-time');
+  assert.deepEqual(posts[0].body, {task: 'sched-1', local_time: '2027-11-07T01:30', timezone: 'Asia/Shanghai', fold: 1});
+  assert.match(page.node('toast').textContent, /预约已保存/);
+});
+
+test('schedule form omits fold for a single-occurrence time and rejects empty input locally', async () => {
+  const page = browser(), posts = [];
+  const task = {id: 'sched-2', project: 'a', title: '预约目标二', source: 'goal', state: 'queued', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async (url, options) => {
+    if (options?.method === 'POST') {
+      posts.push({url, body: JSON.parse(options.body)});
+      return response({saved: true});
+    }
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  const box = detailDescendants(page.node('detail-body')).find(node => node.className === 'task-schedule-editor');
+  const controls = detailDescendants(box);
+  const time = controls.find(node => node.type === 'datetime-local');
+  const zone = controls.find(node => node.type === 'text');
+  const repeat = controls.find(node => node.tagName === 'SELECT');
+  time.value = '2027-03-14T02:30';
+  zone.value = 'America/New_York';
+  assert.equal(repeat.value, '', 'single occurrence is the default fold choice');
+  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts[0].body.fold, undefined, 'single occurrence must not send a fold');
+  // 空输入在本地拦截，不发请求。
+  time.value = '';
+  page.node('toast').textContent = '';
+  controls.find(node => node.tagName === 'BUTTON' && node.textContent === '预约').handlers.click();
+  await page.context.lastAction;
+  assert.equal(posts.length, 1, 'empty input must not reach the API');
+  assert.match(page.node('toast').textContent, /请填写本地时间和时区/);
+});
+
+test('server schedule rejections reach the console with localized guidance', async () => {
+  const page = browser();
+  page.context.fetch = async () => ({...response({error: 'Scheduled local time is nonexistent',
+    error_code: 'validation_error'}, 400), headers: {get: () => '0123456789abcdef'}});
+  await assert.rejects(page.context.api('task/schedule-time', {task: 't', local_time: '2027-03-14T02:30:00',
+    timezone: 'America/New_York'}), error => /夏令时/.test(error.message) && error.code === 'validation_error');
+});
+
+test('non-queued task details offer no schedule form', async () => {
+  const page = browser();
+  const task = {id: 'detail-h2', project: 'a', title: '待交付任务', source: 'goal', state: 'awaiting_approval', body: 'x', evidence: '[]', updated: 1};
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) return response([]);
+    if (url.includes('/state?')) return response({...snapshot(), tasks: [], runs: [], schedules: []});
+    return response({saved: true});
+  };
+  await page.context.showTask(task);
+  await new Promise(setImmediate);
+  assert.equal(detailDescendants(page.node('detail-body')).filter(node => node.className === 'task-schedule-editor').length, 0);
 });
 
 function experiencePage({navigation = false} = {}) {

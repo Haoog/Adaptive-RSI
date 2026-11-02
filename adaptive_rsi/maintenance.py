@@ -15,11 +15,20 @@ CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiment
                  "dependencies", "acceptance-design", "feedback")
 
 
+def _finished_cleanup_states():
+    """States whose feedback evidence is already terminal for cleanup purposes.
+
+    'merged' only qualifies with completed post-merge monitoring, which
+    preview_cleanup checks separately through _merged_monitoring_completed.
+    """
+    return {'failed', 'cancelled', 'expired', 'rejected', 'obsolete', 'completed', 'verified', 'merged'}
+
+
 def preview_cleanup(store, run_id):
     """Preview only finished, unheld direct run artifacts; never inspect source content."""
     run = store.one("SELECT * FROM runs WHERE id=?", (run_id,))
-    if (not run or run['ended'] is None or run['state'] not in
-            {'failed', 'cancelled', 'expired', 'rejected', 'obsolete', 'completed', 'verified'} or
+    if (not run or run['ended'] is None or run['state'] not in _finished_cleanup_states() or
+            (run['state'] == 'merged' and not _merged_monitoring_completed(run['result'])) or
             retention_hold(store, run_id, run['project']) or
             store.one("SELECT 1 FROM tasks WHERE project=? AND source='system_publish' AND body=? "
                       "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
@@ -602,7 +611,7 @@ class Maintenance:
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
-        prefixes = ("run-baseline:", "automation:", "delivery:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:")
         # 独立的精确键/冒号前缀范围查询可使用 settings 主键索引，避免逐运行全表扫描。
         # ':' 的后继字符是 ';'，二进制排序范围只覆盖该运行的冒号后缀键。
         remaining = " OR ".join(
