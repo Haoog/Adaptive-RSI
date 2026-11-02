@@ -574,7 +574,10 @@ def related_task(backlog, finding):
     for row in backlog:
         if not title:
             continue
-        evidence = json.loads(row["evidence"])
+        try:
+            evidence = json.loads(row["evidence"] or "[]")
+        except (TypeError, ValueError):
+            evidence = []
         same_anchor = any(e.get("path") == finding["path"] and e.get("quote") == finding["quote"] for e in evidence)
         same_path = any(e.get("path") == finding["path"] for e in evidence)
         if title == problem_title(row["title"]) and same_anchor:

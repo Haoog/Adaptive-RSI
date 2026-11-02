@@ -268,7 +268,12 @@ class Evolution:
                 raise ValueError("Unknown evaluation split")
             if target == "holdout" and row["split"] != "holdout":
                 raise ValueError("A previously classified case cannot become fresh holdout")
-            spec = json.loads(row["spec"])
+            try:
+                spec = json.loads(row["spec"] or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            if not isinstance(spec, dict):
+                spec = {}
             history = spec.setdefault("lifecycle", [])
             history.append({"from": row["split"], "to": target, "active": active, "uses": row["uses"],
                             "source": source, "created": time.time()})
@@ -575,7 +580,12 @@ class Evolution:
             raise ValueError("Candidate not found")
         root = Path(destination)
         root.mkdir(parents=True, exist_ok=False)
-        evidence = json.loads(row["evidence"])
+        try:
+            evidence = json.loads(row["evidence"] or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
         try:
             # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
             # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
@@ -938,7 +948,13 @@ class Evolution:
         validate(merge(self.runtime.config(project), {"checks": manifest["checks"]}))
         signature = fingerprint({"task": manifest["task"], "tree": git(source, "rev-parse", base + "^{tree}")})
         for row in self.store.query("SELECT family,spec FROM cases WHERE project=?", (project,)):
-            if row["family"] == manifest["family"] or json.loads(row["spec"])["signature"] == signature:
+            try:
+                spec = json.loads(row["spec"] or "{}")
+            except (TypeError, ValueError):
+                spec = {}
+            if not isinstance(spec, dict):
+                spec = {}
+            if row["family"] == manifest["family"] or spec.get("signature") == signature:
                 raise ValueError("Same task/defect family cannot enter multiple splits")
         case = uid()
         directory = self.store.root / "suites" / case
@@ -1435,7 +1451,12 @@ class Evolution:
                     or not content["guidance"].strip() or not isinstance(content.get("triggers"), list)):
                 raise ValueError("Candidate content is incomplete")
             # 与 active_strategies 相同：旧证据无兼容指纹时仍可用，有指纹则必须匹配。
-            sealed_evidence = json.loads(row["evidence"])
+            try:
+                sealed_evidence = json.loads(row["evidence"] or "{}")
+            except (TypeError, ValueError):
+                sealed_evidence = {}
+            if not isinstance(sealed_evidence, dict):
+                sealed_evidence = {}
             if sealed_evidence.get("preregistered_plan"):
                 verification = self.verify_plan(sealed_evidence["preregistered_plan"], sealed_evidence.get("trials", []))
                 if not verification["valid"] or not sealed_evidence.get("final_review", {}).get("fresh"):

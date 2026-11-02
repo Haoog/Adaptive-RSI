@@ -773,7 +773,10 @@ class Evaluator:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?",
                              ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
-            previous = json.loads(row["value"]) if row else None
+            try:
+                previous = json.loads(row["value"]) if row and row["value"] else None
+            except (TypeError, ValueError):
+                previous = None
             if previous and previous.get("at", 0) > time.time() - 60:
                 return
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
