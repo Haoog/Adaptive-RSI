@@ -1,8 +1,10 @@
 """Cleanup filesystem/SQLite commit boundary regressions; entirely offline."""
 import contextlib
 import json
+import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -131,11 +133,12 @@ class CleanupRecoveryTest(unittest.TestCase):
                 (self.directory / 'workspace' / 'new').write_text('new')
             return recover(store)
         with patch.object(maintenance, '_recover_cleanup_locked', conflict), self.failing_commit():
-            with self.assertRaisesRegex(ValueError, 'conflicts'):
+            with self.assertRaises(sqlite3.OperationalError):
                 maintenance.recycle_cleanup(self.store, maintenance.preview_cleanup(self.store, 'r'))
         journal, = (self.store.root / 'recycle').glob('*/receipt.json')
         self.assertEqual((self.directory / 'workspace' / 'new').read_text(), 'new')
         self.assertEqual((journal.parent / 'workspace' / 'evidence').read_text(), 'original')
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='cleanup_recovery_conflict'"))
         (self.directory / 'workspace' / 'new').unlink()
         (self.directory / 'workspace').rmdir()
         maintenance.recover_cleanup(self.store)
@@ -337,7 +340,7 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         maintenance.undo_cleanup(self.store, identifier)
         self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
 
-    def test_placement_conflict_still_stops_recovery_but_quarantine_persists(self):
+    def test_placement_conflict_is_isolated_and_quarantine_persists(self):
         self._make_valid_recycle('e' * 32, committed=False)
         corrupt = self.store.root / 'recycle' / ('0' * 32)
         corrupt.mkdir()
@@ -348,17 +351,123 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
             (self.directory / 'workspace' / 'new').write_text('new')
             return original(store, receipt, recycled)
         with patch.object(maintenance, '_place_cleanup', conflicting):
-            with self.assertRaisesRegex(ValueError, 'conflicts'):
-                maintenance.recover_cleanup(self.store)
+            maintenance.recover_cleanup(self.store)
         self.assertTrue((self.store.root / 'recycle' / ('e' * 32) / 'receipt.json').exists())
         self.assertEqual((self.directory / 'workspace' / 'new').read_text(), 'new')
         self.assertTrue((self.store.root / 'recycle' / ('receipt.invalid-' + '0' * 32) / 'receipt.json').exists())
         self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
                                             ('cleanup-receipt-quarantine:' + '0' * 32,)))
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('cleanup-recovery-conflict:' + 'e' * 32,)))
+        self.assertEqual(self.store.one("SELECT count(*) AS c FROM events WHERE kind='cleanup_recovery_conflict'")['c'], 1)
         (self.directory / 'workspace' / 'new').unlink()
         (self.directory / 'workspace').rmdir()
         maintenance.recover_cleanup(self.store)
         self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('cleanup-recovery-conflict:' + 'e' * 32,)))
+
+    def test_conflict_isolation_allows_other_receipts_to_recover_and_unblocks_operations(self):
+        d1 = self.directory
+        d2 = self.store.root / 'runs' / 'r2'
+        (d2 / 'workspace').mkdir(parents=True)
+        (d2 / 'workspace' / 'evidence').write_text('evidence-two')
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r2','p','failed',?,1,'{}')", (str(d2),))
+
+        d3 = self.store.root / 'runs' / 'r3'
+        (d3 / 'workspace').mkdir(parents=True)
+        (d3 / 'workspace' / 'evidence').write_text('evidence-three')
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r3','p','failed',?,1,'{}')", (str(d3),))
+
+        d4 = self.store.root / 'runs' / 'r4'
+        (d4 / 'workspace').mkdir(parents=True)
+        (d4 / 'workspace' / 'evidence').write_text('evidence-four')
+        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r4','p','failed',?,1,'{}')", (str(d4),))
+
+        # r1 in recycle (uncommitted), sorted first: '0'*31 + '1'
+        folder1 = self.store.root / 'recycle' / ('0' * 31 + '1')
+        folder1.mkdir(parents=True)
+        p1 = maintenance.preview_cleanup(self.store, 'r')
+        receipt1 = {**p1, 'id': '0' * 31 + '1', 'expires': time.time() + 7 * 86400}
+        (folder1 / 'receipt.json').write_text(json.dumps(receipt1), encoding='utf-8')
+        os.rename(d1 / 'workspace', folder1 / 'workspace')
+
+        # Conflict created at d1 / workspace
+        (d1 / 'workspace').mkdir(parents=True)
+        (d1 / 'workspace' / 'conflict_file').write_text('blocking')
+
+        # r2 in recycle (uncommitted), sorted second: '0'*31 + '2'
+        folder2 = self.store.root / 'recycle' / ('0' * 31 + '2')
+        folder2.mkdir(parents=True)
+        p2 = maintenance.preview_cleanup(self.store, 'r2')
+        receipt2 = {**p2, 'id': '0' * 31 + '2', 'expires': time.time() + 7 * 86400}
+        (folder2 / 'receipt.json').write_text(json.dumps(receipt2), encoding='utf-8')
+        os.rename(d2 / 'workspace', folder2 / 'workspace')
+
+        # r3 in recycle (committed), sorted third: '0'*31 + '3'
+        folder3 = self.store.root / 'recycle' / ('0' * 31 + '3')
+        folder3.mkdir(parents=True)
+        p3 = maintenance.preview_cleanup(self.store, 'r3')
+        receipt3 = {**p3, 'id': '0' * 31 + '3', 'expires': time.time() + 7 * 86400}
+        (folder3 / 'receipt.json').write_text(json.dumps(receipt3), encoding='utf-8')
+        os.rename(d3 / 'workspace', folder3 / 'workspace')
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('recycle:' + receipt3['id'], json.dumps(receipt3)))
+
+        # 1. Recover cleanup isolates r1 conflict, allows r2 to recover, and doesn't crash
+        maintenance.recover_cleanup(self.store)
+        self.assertTrue((folder1 / 'receipt.json').exists())
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('cleanup-recovery-conflict:' + ('0' * 31 + '1'),)))
+        self.assertEqual(self.store.one("SELECT count(*) AS c FROM events WHERE kind='cleanup_recovery_conflict'")['c'], 1)
+        # r2 is successfully recovered back to d2
+        self.assertEqual((d2 / 'workspace' / 'evidence').read_text(), 'evidence-two')
+        self.assertFalse((folder2 / 'receipt.json').exists())
+
+        # 2. Existing conflict doesn't block undo_cleanup of other receipts
+        maintenance.undo_cleanup(self.store, receipt3['id'])
+        self.assertEqual((d3 / 'workspace' / 'evidence').read_text(), 'evidence-three')
+        self.assertFalse((folder3 / 'receipt.json').exists())
+
+        # 3. Existing conflict doesn't block new recycle_cleanup
+        p4 = maintenance.preview_cleanup(self.store, 'r4')
+        new_receipt = maintenance.recycle_cleanup(self.store, p4)
+        self.assertFalse((d4 / 'workspace').exists())
+        self.assertTrue((self.store.root / 'recycle' / new_receipt['id'] / 'receipt.json').exists())
+
+        # 4. Once conflict at d1 is cleared, subsequent recover_cleanup succeeds and clears conflict setting
+        (d1 / 'workspace' / 'conflict_file').unlink()
+        (d1 / 'workspace').rmdir()
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((d1 / 'workspace' / 'evidence').read_text(), 'original')
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('cleanup-recovery-conflict:' + ('0' * 31 + '1'),)))
+
+    def test_maintenance_continues_despite_cleanup_recovery_conflict(self):
+        from adaptive_rsi.runtime import Runtime
+        rt = Runtime(self.store, agent=object())
+        d1 = self.directory
+        folder1 = self.store.root / 'recycle' / ('0' * 31 + '1')
+        folder1.mkdir(parents=True)
+        p1 = maintenance.preview_cleanup(self.store, 'r')
+        receipt1 = {**p1, 'id': '0' * 31 + '1', 'expires': time.time() + 7 * 86400}
+        (folder1 / 'receipt.json').write_text(json.dumps(receipt1), encoding='utf-8')
+        os.rename(d1 / 'workspace', folder1 / 'workspace')
+        (d1 / 'workspace').mkdir(parents=True)
+        (d1 / 'workspace' / 'conflict_file').write_text('conflict')
+
+        # Run maintenance
+        rt.maintenance()
+
+        # Maintenance completed and advanced maintenance-last
+        self.assertGreater(self.store.setting('maintenance-last', 0), 0)
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='cleanup_recovery_conflict'"))
+
+        # Defense-in-depth: even if recover_cleanup raises an unexpected error, maintenance survives
+        self.store.put_setting('maintenance-last', 0)
+        with patch.object(maintenance, 'recover_cleanup', side_effect=RuntimeError('injected recovery failure')):
+            rt.maintenance()
+        self.assertGreater(self.store.setting('maintenance-last', 0), 0)
 
     def test_second_quarantine_of_same_receipt_keeps_both_original_journals(self):
         identifier = '9' * 32
