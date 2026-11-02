@@ -484,6 +484,9 @@ class Handler(BaseHTTPRequestHandler):
                 candidate.update(content=decode_object(candidate["content"]), evidence=evidence,
                                  comparison=comparison(evidence.get("trials", [])))
                 self.respond(candidate)
+            elif parsed.path == "/api/monitoring-feedback":
+                from .evolution import feedback_overview
+                self.respond(feedback_overview(store, params.get("project", [""])[0] or None))
             elif parsed.path == "/api/task-groups":
                 from .task_groups import lineage
                 try:
