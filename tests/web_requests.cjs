@@ -1222,6 +1222,7 @@ test('core-only state keeps loaded analytics, then evolution requests missing se
 
 function textOf(node){return [node.textContent||'',...(node.children||[]).map(textOf)].filter(Boolean).join(' ');}
 function buttonWith(node,label){return (node.children||[]).map(child=>child.textContent===label?child:buttonWith(child,label)).find(Boolean);}
+function detailsWith(node,label){for(const child of node.children||[]){if(child.textContent===label&&child.tagName==='SUMMARY')return node;const hit=detailsWith(child,label);if(hit)return hit;}return null;}
 
 test('evolution suites show exposure, independent cases and translated controller reasons', () => {
   const page = browser();
@@ -1243,6 +1244,52 @@ test('evolution suites show exposure, independent cases and translated controlle
   assert.match(exhausted, /曝光次数已达上限/);
   assert.match(exhausted, /evolution\.max_holdout_uses/);
   assert.doesNotMatch(exhausted, /Validation or holdout exposure limit reached/);
+});
+
+test('experiment evidence drawer renders the promotion review diff and limitations', async () => {
+  const page = browser();
+  page.context.fetch = async url => {
+    assert.match(String(url), /\/api\/candidate\?id=ready-1&project=a$/);
+    return response({comparison: {cohorts: []},
+      evidence: {preregistered_plan: {data: {}},
+        promotion_review: {baseline: [{id: 'base-1', kind: 'strategy', content: {guidance: 'Old guidance', triggers: []}}],
+          proposal: {kind: 'strategy', guidance: 'New guidance', triggers: []},
+          changed_kind: 'strategy', plan_hash: 'h', covered_samples: [],
+          limitations: ['Only sampled task families, sources and size strata are covered']},
+        dataset: {version: 1}}});
+  };
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'ready-1',project:'a',kind:'strategy',status:'ready',content:{guidance:'Guide'},reason:'Paired quality improved without observed regressions; usage recorded separately',independent_cases:3,trial_count:12,created:100}]};renderEvolution()`, page.context);
+  const detail = page.node('candidates').children[0].children.find(node => node.tagName === 'DETAILS');
+  detail.open = true; detail.handlers.toggle();
+  await page.context.lastAction;
+  await waitFor(() => detailsWith(detail, '晋升评审：策略差异与适用边界'));
+  const diff = detailsWith(detail, '晋升评审：策略差异与适用边界');
+  assert.ok(diff, 'promotion review diff block is present');
+  const text = textOf(diff);
+  assert.match(text, /基线 · 执行策略/);
+  assert.match(text, /Old guidance/);
+  assert.match(text, /提案 · 执行策略/);
+  assert.match(text, /New guidance/);
+  assert.match(text, /适用边界与未覆盖场景/);
+  assert.match(text, /Only sampled task families, sources and size strata are covered/);
+});
+
+test('promotion review without baseline or limitations states the boundary instead of failing', async () => {
+  const page = browser();
+  page.context.fetch = async url => response({comparison: {cohorts: []},
+    evidence: {promotion_review: {baseline: [], proposal: {kind: 'meta_strategy', guidance: '  '}}}});
+  vm.runInContext(`language='zh-CN';view='evolution';projectId='a';loadedStateSections.analyticsProject='a';loadedStateSections.analyticsAt=Date.now();loadedStateSections.candidatesProject='a';loadedStateSections.candidatesAt=Date.now();state={...initialState,selected_project:'a',cases:[{project:'a',split:'development',count:4,uses:0}],candidates:[{id:'first-1',project:'a',kind:'meta_strategy',status:'evaluating',content:{guidance:'Guide'},reason:'',independent_cases:0,trial_count:0,created:100}]};renderEvolution()`, page.context);
+  const detail = page.node('candidates').children[0].children.find(node => node.tagName === 'DETAILS');
+  detail.open = true; detail.handlers.toggle();
+  await page.context.lastAction;
+  await waitFor(() => detailsWith(detail, '晋升评审：策略差异与适用边界'));
+  const diff = detailsWith(detail, '晋升评审：策略差异与适用边界');
+  assert.ok(diff, 'promotion review block renders even for a first proposal');
+  const text = textOf(diff);
+  assert.match(text, /当前没有已启用的基线策略；这次提案将首次建立该类型的策略。/);
+  assert.match(text, /提案 · 规划方法/);
+  assert.match(text, /无说明/);
+  assert.doesNotMatch(text, /适用边界与未覆盖场景/);
 });
 
 test('rollback forces candidates and analytics refresh despite the TTL', async () => {
