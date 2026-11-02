@@ -1,0 +1,15 @@
+{
+ "captured": "2026-11-01T20:31:22Z",
+ "repository": "Haoog/Ours",
+ "branch": "master",
+ "endpoint": "repos/Haoog/Ours/branches/master/protection",
+ "read_only": true,
+ "command": "gh api repos/Haoog/Ours/branches/master/protection",
+ "result": {
+  "exit_code": 1,
+  "stdout": "{\"message\":\"Branch not protected\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+  "stderr": "gh: Branch not protected (HTTP 404)\n",
+  "error": null,
+  "error_kind": "exit"
+ }
+}

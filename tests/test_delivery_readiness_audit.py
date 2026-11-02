@@ -3,14 +3,24 @@ import copy
 import json
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi import delivery, readiness, release
 from adaptive_rsi.config import DEFAULTS
+from adaptive_rsi.process import ProcessError
 import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
 from adaptive_rsi.gitops import git
 from adaptive_rsi.store import encode
+
+# 只读抓取的 GitHub 保护规则响应，保留端点与抓取时间；见
+# docs/validation/ruleset-verification-evidence-20261101.md。
+PROTECTION_FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'github_protection'
+
+
+def captured(name):
+    return json.loads((PROTECTION_FIXTURES / name).read_text(encoding='utf-8'))
 
 
 class ClosedPublicationTest(unittest.TestCase):
@@ -100,10 +110,12 @@ class AttributionTest(unittest.TestCase):
         result = delivery.failure_attribution('merged', 'later', {'decision': 'fail', 'checks': {'baseline': [{'passed': True}], 'candidate': [{'passed': False}]}})
         self.assertEqual(result['scope'], 'subsequent_mainline')
         self.assertFalse(result['candidate_regression_proven'])
+        self.assertEqual(result['disclaimer'], 'later-mainline 失败不记候选回归')
 
     def test_unverified_merge_baseline_stays_unknown(self):
         result = delivery.failure_attribution('merged', 'later', {'decision': 'fail', 'checks': {}})
         self.assertEqual(result['scope'], 'unknown')
+        self.assertEqual(result['disclaimer'], '')
 
 
 class ProtectionRulesTest(unittest.TestCase):
@@ -132,6 +144,81 @@ class ProtectionRulesTest(unittest.TestCase):
         self.assertIsNone(result['merge_queue'])
         self.assertFalse(result['complete'])
 
+    def replay(self, *names):
+        """Drive the real decision code with responses captured from live `gh api` reads."""
+        pending = list(names)
+
+        def command(argv, **kwargs):
+            data = captured(pending.pop(0))
+            if 'result' in data:
+                raise ProcessError(data['result'])
+            return json.dumps(data['response'])
+
+        with patch.object(delivery, 'checked', side_effect=command) as invoked:
+            result = delivery.merge_protection(self.config)
+        self.assertEqual(pending, [], 'unused captures: ' + repr(pending))
+        self.assertEqual(invoked.call_count, len(names))
+        return result
+
+    def test_managed_repository_classic_payload_marks_both_sources_observed(self):
+        result = self.replay('managed-classic-protection.json', 'managed-branch-rules-empty.json')
+        self.assertEqual(result['sources'], {'classic': 'observed', 'rulesets': 'observed'})
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['state'], 'strict')
+        self.assertTrue(result['strict_checks'])
+        self.assertFalse(result['merge_queue'])
+
+    def test_unprotected_branch_payload_keeps_state_unknown(self):
+        # Real 404 "Branch not protected" plus an empty rules page: only the
+        # ruleset source is observed, so no strictness or mergeability is claimed.
+        result = self.replay('unprotected-classic-404.json', 'unprotected-branch-rules-empty.json')
+        self.assertEqual(result['sources'], {'classic': 'unknown', 'rulesets': 'observed'})
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['state'], 'unknown')
+        self.assertIsNone(result['strict_checks'])
+        self.assertFalse(result['merge_queue'])
+
+    def test_plan_forbidden_payloads_keep_every_source_unknown(self):
+        # Real 403 "Upgrade to GitHub Pro" on a private repository without branch
+        # rules: permission-limited reads must stay unknown, never "mergeable".
+        result = self.replay('plan-forbidden-classic-403.json', 'plan-forbidden-rules-403.json')
+        self.assertEqual(result['sources'], {'classic': 'unknown', 'rulesets': 'unknown'})
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['state'], 'unknown')
+        self.assertIsNone(result['strict_checks'])
+        self.assertIsNone(result['merge_queue'])
+
+    def test_ruleset_only_payload_never_claims_strict_without_classic_read(self):
+        # A live ruleset-only repository: the classic endpoint 404s, the rules page
+        # carries the required checks without a strict policy.
+        result = self.replay('reference-classic-404.json', 'reference-ruleset-status-checks.json')
+        self.assertEqual(result['sources']['classic'], 'unknown')
+        self.assertEqual(result['sources']['rulesets'], 'observed')
+        self.assertFalse(result['complete'])
+        self.assertEqual(result['state'], 'unknown')
+        self.assertIsNone(result['strict_checks'])
+        self.assertFalse(result['merge_queue'])
+
+    def test_captured_classic_and_ruleset_payloads_combine_only_in_replay(self):
+        """No managed repository has both configurations; this pair is replayed, not live."""
+        result = self.replay('managed-classic-protection.json',
+                             'reference-ruleset-merge-queue.json')
+        self.assertEqual(result['sources'], {'classic': 'observed', 'rulesets': 'observed'})
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['state'], 'strict')
+        self.assertTrue(result['strict_checks'])
+        self.assertTrue(result['merge_queue'])
+
+    def test_captured_fixtures_keep_endpoint_and_time_provenance(self):
+        names = sorted(path.name for path in PROTECTION_FIXTURES.glob('*.json'))
+        self.assertGreaterEqual(len(names), 9)
+        for name in names:
+            data = captured(name)
+            self.assertTrue(data['endpoint'].startswith('repos/'), name)
+            self.assertRegex(data['captured'], r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+            self.assertTrue(data['read_only'], name)
+            self.assertEqual('response' in data, 'result' not in data, name)
+
 
 class CapabilityTest(unittest.TestCase):
     def test_read_only_repository_permissions_never_imply_write(self):
@@ -157,7 +244,44 @@ class RemoteTimingTest(unittest.TestCase):
         self.assertEqual(result['timing']['queue_seconds'], 60)
         self.assertEqual(result['timing']['execution_seconds'], 120)
         self.assertIsNone(result['timing']['build_seconds'])
+        self.assertIsNone(result['timing']['reverification_seconds'])
         self.assertEqual(result['timing']['completed_at_basis'], 'updated_at')
+        self.assertFalse(isinstance(result['timing']['build_seconds'], (int, float)))
+        self.assertFalse(isinstance(result['timing']['reverification_seconds'], (int, float)))
+
+    def test_unavailable_build_phase_never_outputs_numeric_duration(self):
+        data = {'repository': 'example/project', 'workflow_run_id': 12, 'workflow_sha': 'c', 'operation_id': 'op-build', 'workflow': '.github/workflows/release.yml'}
+        remote = {'id': 12, 'head_sha': 'c', 'display_title': 'op-build', 'event': 'workflow_dispatch', 'path': data['workflow'], 'status': 'completed', 'conclusion': 'success',
+                  'created_at': '2026-10-28T01:00:00Z', 'run_started_at': '2026-10-28T01:00:30Z', 'updated_at': '2026-10-28T01:05:00Z'}
+        with patch.object(release, 'api', return_value=remote):
+            result = release.reconcile(None, {}, 'release', data, persist=False)
+        timing = result['timing']
+        for phase in ('queue_seconds', 'execution_seconds', 'build_seconds', 'reverification_seconds'):
+            self.assertIn(phase, timing)
+        self.assertEqual(timing['queue_seconds'], 30)
+        self.assertEqual(timing['execution_seconds'], 270)
+        self.assertIsNone(timing['build_seconds'])
+        self.assertIsNone(timing['reverification_seconds'])
+        self.assertNotEqual(timing['build_seconds'], 0)
+        self.assertNotEqual(timing['reverification_seconds'], 0)
+        self.assertFalse(isinstance(timing['build_seconds'], (int, float)))
+        self.assertFalse(isinstance(timing['reverification_seconds'], (int, float)))
+
+    def test_missing_remote_timestamps_yield_none_rather_than_zero_or_omission(self):
+        data = {'repository': 'example/project', 'workflow_run_id': 15, 'workflow_sha': 'd', 'operation_id': 'op-pending', 'workflow': '.github/workflows/release.yml'}
+        remote = {'id': 15, 'head_sha': 'd', 'display_title': 'op-pending', 'event': 'workflow_dispatch', 'path': data['workflow'], 'status': 'in_progress',
+                  'created_at': '2026-10-28T02:00:00Z', 'run_started_at': None, 'updated_at': '2026-10-28T02:00:10Z'}
+        with patch.object(release, 'api', return_value=remote):
+            result = release.reconcile(None, {}, 'release', data, persist=False)
+        timing = result['timing']
+        for phase in ('queue_seconds', 'execution_seconds', 'build_seconds', 'reverification_seconds'):
+            self.assertIn(phase, timing)
+        self.assertIsNone(timing['queue_seconds'])
+        self.assertIsNone(timing['execution_seconds'])
+        self.assertIsNone(timing['build_seconds'])
+        self.assertIsNone(timing['reverification_seconds'])
+        self.assertNotEqual(timing['queue_seconds'], 0)
+        self.assertNotEqual(timing['execution_seconds'], 0)
 
 
 class AuthorizationReceiptTest(unittest.TestCase):

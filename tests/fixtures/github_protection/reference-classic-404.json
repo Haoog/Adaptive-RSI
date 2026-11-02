@@ -1,0 +1,15 @@
+{
+ "captured": "2026-11-01T20:31:23Z",
+ "repository": "vercel/next.js",
+ "branch": "canary",
+ "endpoint": "repos/vercel/next.js/branches/canary/protection",
+ "read_only": true,
+ "command": "gh api repos/vercel/next.js/branches/canary/protection",
+ "result": {
+  "exit_code": 1,
+  "stdout": "{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/branches/branch-protection#get-branch-protection\",\"status\":\"404\"}",
+  "stderr": "gh: Not Found (HTTP 404)\n",
+  "error": null,
+  "error_kind": "exit"
+ }
+}

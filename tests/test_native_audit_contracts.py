@@ -12,7 +12,8 @@ from email.message import Message
 
 from adaptive_rsi.agent import model_capabilities, request_output_budget
 from adaptive_rsi.config import DEFAULTS
-from adaptive_rsi.native import Conversation, NativeAgent, WorkspaceTools, tools_for, post_json, ProviderUnavailable, execute_tools
+from adaptive_rsi.native import (Conversation, NativeAgent, WorkspaceTools, tools_for, post_json,
+                                 ProviderUnavailable, execute_tools, TOOL_RESULT_BUDGETS)
 from adaptive_rsi.provider_health import ModelFailure
 from adaptive_rsi.recovery import failure
 from adaptive_rsi.store import Store
@@ -164,6 +165,30 @@ class NativeAuditContractsTest(unittest.TestCase):
         second = self.tools.execute("list_files", {"offset": first["next_offset"], "limit": 2})
         self.assertEqual(second["files"], ["c.py"])
         self.assertIsNone(second["next_offset"])
+
+    def test_unicode_read_file_budget_keeps_results_and_continuation(self):
+        (self.root / "unicode_read.py").write_text(("中" * 1000 + "\n") * 100)
+        result = execute_tools(self.tools, [("one", "read_file", {"path": "unicode_read.py", "start_line": 1, "end_line": 100})])[0][2]
+        self.assertGreater(len(result["content"]), 0)
+        self.assertLess(len(json.dumps(result).encode()), 128000)
+        self.assertEqual(result["reason"], "result byte limit")
+        self.assertIsNotNone(result["next_line"])
+        self.assertTrue(result["truncated"])
+
+    def test_read_file_pages_can_be_resumed_without_loss(self):
+        (self.root / "paged.py").write_text(("中" * 1000 + "\n") * 30)
+        lines, cursor = [], 1
+        for _ in range(30):
+            page = self.tools.execute("read_file", {"path": "paged.py", "start_line": cursor, "end_line": 30})
+            if isinstance(page, str):
+                lines += [int(line.split(":")[0]) for line in page.splitlines()]
+                break
+            self.assertTrue(page["truncated"])
+            self.assertEqual(page["reason"], "result byte limit")
+            self.assertGreater(page["next_line"], cursor)
+            lines += [int(line.split(":")[0]) for line in page["content"].splitlines()]
+            cursor = page["next_line"]
+        self.assertEqual(lines, list(range(1, 31)))
 
     def native_store(self, name="state"):
         store = Store(self.root / name)
@@ -358,7 +383,11 @@ class NativeToolArtifactContractsTest(unittest.TestCase):
         tools.execute = original
         self.assertEqual(result["exit_code"], 0)
         self.assertFalse(result["timed_out"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["reason"], "result byte limit")
         self.assertIsInstance(result["stdout"], dict)
+        self.assertEqual(result["stdout"]["reason"], "result byte limit")
+        self.assertEqual(result["stdout"]["next_offset"], 0)
         self.assertNotIn(body, json.dumps(result))
         artifact = result["stdout"]["artifact"]
         pages, offset = [], 0
@@ -367,13 +396,269 @@ class NativeToolArtifactContractsTest(unittest.TestCase):
                                                    "limit": 32768})
             pages.append(page["content"])
             if page["eof"]:
+                self.assertFalse(page["truncated"])
+                self.assertIsNone(page["reason"])
                 break
+            self.assertTrue(page["truncated"])
+            self.assertEqual(page["reason"], "page limit")
             offset = page["next_offset"]
         self.assertEqual("".join(pages), body)
+
+    def test_read_artifact_pages_can_be_resumed_without_loss(self):
+        tools = self.tools()
+        body = "payload-line\n" * 500
+        store = tools.artifact_store()
+        self.assertIsNotNone(store)
+        assert store is not None
+        artifact = store.put("stdout", body)["artifact"]
+        first = tools.execute("read_artifact", {"artifact": artifact, "limit": 200})
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["reason"], "page limit")
+        self.assertIsNotNone(first["next_offset"])
+        second = tools.execute("read_artifact", {"artifact": artifact, "offset": first["next_offset"], "limit": 32768})
+        self.assertFalse(second["truncated"])
+        self.assertIsNone(second["reason"])
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual(first["content"] + second["content"], body)
+
+    def test_search_artifact_budget_keeps_results_and_continuation(self):
+        tools = self.tools()
+        body = "".join(f"line {i:03d} target\n" for i in range(100))
+        store = tools.artifact_store()
+        self.assertIsNotNone(store)
+        assert store is not None
+        artifact = store.put("stdout", body)["artifact"]
+        first = tools.execute("search_artifact", {"artifact": artifact, "text": "target", "limit": 10})
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["reason"], "match limit")
+        self.assertIsNotNone(first["next_cursor"])
+        second = tools.execute("search_artifact", {"artifact": artifact, "text": "target", "limit": 100,
+                                                   "cursor": first["next_cursor"]})
+        self.assertFalse(second["truncated"])
+        self.assertIsNone(second["reason"])
+        self.assertIsNone(second["next_cursor"])
+        self.assertEqual([r["line"] for r in first["matches"]] + [r["line"] for r in second["matches"]],
+                         list(range(1, 101)))
+        unicode_body = ("中" * 1000 + "\n") * 100
+        unicode_art = store.put("stdout", unicode_body)["artifact"]
+        byte_res = tools.execute("search_artifact", {"artifact": unicode_art, "text": "中"})
+        self.assertTrue(byte_res["truncated"])
+        self.assertEqual(byte_res["reason"], "result byte limit")
+        self.assertIsNotNone(byte_res["next_cursor"])
+        self.assertLess(len(json.dumps(byte_res).encode()), 128000)
+
+    def test_run_command_fallback_budget_reports_truncation_reason(self):
+        tools = self.tools()
+        tools._artifact_spec = None
+        tools._artifact_store = None
+        tools.execute = lambda name, args: {"exit_code": 0, "stdout": "x" * 150000, "stderr": "", "error": None}
+        result = execute_tools(tools, [("call", "run_command", {"cwd": ".", "argv": ["x"]})])[0][2]
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["reason"], "result byte limit")
 
     def test_read_artifact_is_not_offered_to_probe(self):
         self.assertNotIn("read_artifact", [name for name, _, _ in tools_for("probe")])
         self.assertIn("read_artifact", [name for name, _, _ in tools_for("review")])
+
+
+class NativeToolBudgetMatrixTest(unittest.TestCase):
+    """#122：逐个工具核对结果预算、续读位置与准确的截断原因。
+
+    契约测试只覆盖「下方表格里的工具」是不够的：新工具一旦注册却没有预算契约，
+    就会重新退化成整条结果撞上统一信封后被整体外置、只留下省略号。因此这里同时
+    核对注册清单、每个工具在边界处的续读字段，以及不截断时不得谎报截断原因。
+    """
+
+    ROLES = ("probe", "planning", "review", "implementation")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.state = self.root / "state"
+        self.state.mkdir()
+
+    def tools(self, role="implementation", invocation="budget-inv"):
+        return WorkspaceTools(self.workspace, role, self.state, {"limits": {"command_seconds": 30}},
+                              None, (), run="budget-run", invocation=invocation,
+                              artifact_root=self.state / "runs" / "budget-run" / "artifacts")
+
+    def test_every_registered_tool_declares_a_budget_contract(self):
+        covered = set()
+        for role in self.ROLES:
+            for name, _, _ in tools_for(role):
+                self.assertIn(name, TOOL_RESULT_BUDGETS,
+                              "%s（角色 %s）缺少结果预算契约" % (name, role))
+                covered.add(name)
+        self.assertEqual(set(TOOL_RESULT_BUDGETS), covered,
+                         "结果预算表里有过期条目：没有任何角色再注册它们")
+
+    def read_file_case(self):
+        (self.workspace / "budget_read.py").write_text(("中" * 1000 + "\n") * 40)
+        return self.tools("review", "read-inv").execute(
+            "read_file", {"path": "budget_read.py", "start_line": 1, "end_line": 40}), None
+
+    def search_case(self):
+        (self.workspace / "budget_search.py").write_text(("中" * 1000 + "\n") * 100)
+        return self.tools("review", "search-inv").execute("search", {"text": "中"}), None
+
+    def list_files_case(self):
+        tools = self.tools("review", "list-inv")
+        tools._file_cache = ["file-%04d.py" % index for index in range(1500)]
+        return tools.execute("list_files", {"limit": 1000}), None
+
+    def read_artifact_case(self):
+        tools = self.tools("review", "artifact-read-inv")
+        store = tools.artifact_store()
+        assert store is not None
+        artifact = store.put("stdout", "page-line\n" * 5000)["artifact"]
+        return tools.execute("read_artifact", {"artifact": artifact, "limit": 200}), None
+
+    def search_artifact_case(self):
+        tools = self.tools("review", "artifact-search-inv")
+        store = tools.artifact_store()
+        assert store is not None
+        artifact = store.put("stdout", "".join("row %03d target\n" % i for i in range(100)))["artifact"]
+        return tools.execute("search_artifact", {"artifact": artifact, "text": "target", "limit": 10}), None
+
+    def run_command_case(self):
+        tools = self.tools("implementation", "command-inv")
+        tools.execute = lambda name, args: {"exit_code": 0, "stdout": "x" * 150000,
+                                            "stderr": "", "error": None}
+        result = execute_tools(tools, [("call", "run_command", {"cwd": ".", "argv": ["x"]})])[0][2]
+        return result, "stdout"
+
+    def test_oversized_results_report_declared_reason_and_continuation(self):
+        cases = [("read_file", self.read_file_case), ("search", self.search_case),
+                 ("list_files", self.list_files_case), ("read_artifact", self.read_artifact_case),
+                 ("search_artifact", self.search_artifact_case),
+                 ("run_command", self.run_command_case)]
+        exercised = {name for name, _ in cases}
+        self.assertEqual(exercised, {name for name, (cursor, _) in TOOL_RESULT_BUDGETS.items() if cursor},
+                         "可超预算的工具都必须被边界用例覆盖")
+        for name, build in cases:
+            with self.subTest(tool=name):
+                cursor_field, reasons = TOOL_RESULT_BUDGETS[name]
+                result, nested = build()
+                self.assertTrue(result["truncated"])
+                self.assertIn(result["reason"], reasons, "%s 的截断原因不在契约内" % name)
+                holder = result[nested] if nested else result
+                self.assertIn(cursor_field, holder)
+                self.assertIsNotNone(holder[cursor_field], "%s 截断时必须给出续读位置" % name)
+                self.assertLess(len(json.dumps(result).encode()), 128000)
+
+    def test_untruncated_results_do_not_claim_a_reason(self):
+        tools = self.tools("review", "small-inv")
+        (self.workspace / "small.py").write_text("alpha\nbeta\n")
+        listing = tools.execute("list_files", {"limit": 10})
+        self.assertFalse(listing["truncated"])
+        self.assertIsNone(listing["reason"])
+        self.assertIsNone(listing["next_offset"])
+        found = tools.execute("search", {"text": "alpha"})
+        self.assertFalse(found["truncated"])
+        self.assertIsNone(found["reason"])
+        self.assertIsNone(found["next_cursor"])
+        store = tools.artifact_store()
+        assert store is not None
+        artifact = store.put("stdout", "page-line\n" * 10)["artifact"]
+        page = tools.execute("read_artifact", {"artifact": artifact, "limit": 32768})
+        self.assertFalse(page["truncated"])
+        self.assertIsNone(page["reason"])
+        self.assertIsNone(page["next_offset"])
+        self.assertTrue(page["eof"])
+        # 未超预算的 read_file 保持旧的纯文本结果，不额外包一层元数据。
+        self.assertEqual(tools.execute("read_file", {"path": "small.py", "start_line": 1, "end_line": 2}),
+                         "1: alpha\n2: beta")
+
+    def test_read_file_line_over_budget_reports_line_limit(self):
+        (self.workspace / "one_line.py").write_text("x" * 200000 + "\n")
+        result = self.tools("review", "line-inv").execute(
+            "read_file", {"path": "one_line.py", "start_line": 1, "end_line": 1})
+        # 单行本身超过结果预算：本工具没有行内游标，只能保留前缀并说明这一行被截断。
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["reason"], "line limit")
+        self.assertEqual(result["next_line"], 2)
+        self.assertEqual(result["end_line"], 1)
+        self.assertGreater(len(result["content"]), 0)
+        self.assertLess(len(json.dumps(result).encode()), 128000)
+
+    def test_read_file_page_stays_inline_and_resumable_with_artifact_storage(self):
+        tools = self.tools("review", "read-inline-inv")
+        (self.workspace / "inline.py").write_text(("中" * 1000 + "\n") * 40)
+        result = execute_tools(tools, [("one", "read_file",
+                                        {"path": "inline.py", "start_line": 1, "end_line": 40})])[0][2]
+        # 一页必须仍是真实文本；如果被 compact_result 转成 artifact 预览，next_line 就没用了。
+        self.assertIsInstance(result["content"], str)
+        self.assertTrue(result["content"].startswith("1: 中"))
+        self.assertEqual(result["reason"], "result byte limit")
+        self.assertGreater(result["next_line"], 1)
+        self.assertNotIn("artifact", result)
+        self.assertLess(len(json.dumps(result).encode()), 128000)
+
+    def test_list_files_index_cap_reports_index_limit(self):
+        tools = self.tools("review", "index-inv")
+        tools._file_cache = ["file-%04d.py" % index for index in range(4001)]
+        tools.files_truncated = True
+        result = tools.execute("list_files", {"offset": 4000, "limit": 1000})
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["reason"], "index limit")
+        self.assertIsNone(result["next_offset"])
+        self.assertTrue(result["index_truncated"])
+
+    def test_oversized_write_is_rejected_instead_of_truncated(self):
+        tools = self.tools("implementation", "write-inv")
+        with self.assertRaisesRegex(ValueError, "1 MiB"):
+            tools.execute("write_file", {"path": "big.py", "content": "x" * (1024 * 1024 + 1)})
+        self.assertFalse((self.workspace / "big.py").exists())
+
+    def test_search_scan_budget_reports_cursor_at_unscanned_file(self):
+        # 扫描预算（12 MiB）耗尽时要报 search byte limit，并把游标落在尚未扫描的文件上；
+        # 续读既不重复也不丢匹配。
+        for index in range(12):
+            (self.workspace / ("bulk-%02d.txt" % index)).write_text(("x" * 1023 + "\n") * 1023)
+        (self.workspace / "bulk-12.txt").write_text("needle here\n" + ("x" * 1023 + "\n") * 1022)
+        tools = self.tools("review", "scan-inv")
+        first = tools.execute("search", {"text": "needle"})
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["reason"], "search byte limit")
+        self.assertEqual(first["matches"], [])
+        self.assertIsNotNone(first["next_cursor"])
+        second = tools.execute("search", {"text": "needle", "cursor": first["next_cursor"]})
+        self.assertEqual([row["path"] for row in second["matches"]], ["bulk-12.txt"])
+        self.assertFalse(second["truncated"])
+
+    def test_search_artifact_scan_limit_reports_cursor(self):
+        tools = self.tools("review", "artifact-scan-inv")
+        store = tools.artifact_store()
+        assert store is not None
+        artifact = store.put("stdout", "".join("row %d\n" % index for index in range(20)))["artifact"]
+        with patch("adaptive_rsi.tool_artifacts.MAX_SEARCH_LINES", 5):
+            first = tools.execute("search_artifact", {"artifact": artifact, "text": "row 1"})
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["reason"], "scan limit")
+        self.assertEqual([row["line"] for row in first["matches"]], [2])
+        self.assertIsNotNone(first["next_cursor"])
+        second = tools.execute("search_artifact", {"artifact": artifact, "text": "row 1",
+                                                   "cursor": first["next_cursor"]})
+        self.assertEqual([row["line"] for row in second["matches"]], list(range(11, 21)))
+        self.assertFalse(second["truncated"])
+        self.assertIsNone(second["next_cursor"])
+
+    def test_bounded_fallback_declares_unavailable_continuation(self):
+        tools = self.tools("implementation", "fallback-inv")
+        tools._artifact_spec = None
+        tools._artifact_store = None
+        tools.execute = lambda name, args: {"exit_code": 0, "stdout": "x" * 150000,
+                                            "stderr": "", "error": None}
+        result = execute_tools(tools, [("call", "run_command", {"cwd": ".", "argv": ["x"]})])[0][2]
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["reason"], "result byte limit")
+        self.assertIsNone(result["next_offset"])
+        self.assertEqual(result["continuation"], "unavailable")
+        self.assertGreater(result["omitted_bytes"], 0)
+        self.assertLess(len(json.dumps(result).encode()), 128000)
 
 
 if __name__ == "__main__":

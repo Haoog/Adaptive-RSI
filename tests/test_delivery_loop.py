@@ -549,6 +549,21 @@ print('BOUNDARIES_OK')
         view.assert_not_called()
         remote.assert_not_called()
 
+    def test_schedule_does_not_reset_a_running_delivery_task(self):
+        from adaptive_rsi.delivery import schedule
+        self.tracked_pr()
+        self.store.add_task(self.project, "system_delivery", "system:delivery",
+                            "PR tracking and post-merge verification", priority=110)
+        row = self.store.one("SELECT id FROM tasks WHERE project=? AND fingerprint='system:delivery'", (self.project,))
+        now = time.time()
+        for index, state in enumerate(["executing", "evaluating"]):
+            self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, row["id"]))
+            schedule(self.runtime, now + 61 * index)
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], state)
+        self.store.execute("UPDATE tasks SET state='queued',available=0 WHERE id=?", (row["id"],))
+        schedule(self.runtime, now + 122)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], "queued")
+
     def test_pending_close_does_not_repeat_write_when_remote_state_is_unknown_or_merged(self):
         run = self.tracked_pr()
         outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
@@ -569,6 +584,82 @@ print('BOUNDARIES_OK')
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertEqual(result["close_status"], "merged")
         self.assertFalse(result["close_pending"])
+
+    def test_merge_intent_reconciliation_distinguishes_local_from_manual_merge(self):
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        # 崩溃前已记录 merge-intent：重启后对账应识别「本进程发起的合并」并收尾。
+        self.store.put_setting("merge-intent:" + run["id"], {"head": "head", "at": 1})
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 120)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertTrue(json.loads(row["result"])["merged_by_local"])
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+        feedback.assert_called_once()
+        # 新一轮自动合并重新记录意图：合并提交后键保留，等待下次对账消费。
+        self.runtime.goal(self.project, "Fix addition again")
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(retried["id"], "pr_open", {"pr": "https://github.com/example/project/pull/2"}, True)
+        self.store.put_setting("delivery:" + retried["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.put_setting("run-baseline:" + retried["id"], {"repository": "example/project", "branch": "main", "sha": "base"})
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), "base", "main")), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as command:
+            tick(self.runtime, 220)
+        command.assert_called_once()
+        self.assertIsNotNone(self.store.setting("merge-intent:" + retried["id"]))
+
+    def test_merge_intent_survives_crash_before_gh_and_mismatched_head_falls_back_to_pr_view(self):
+        run = self.tracked_pr()
+        # merge-intent 在 gh pr merge 之前写入：进程死在 checked 调用中时它仍在。
+        self.store.put_setting("merge-intent:" + run["id"], {"head": "head", "at": 1})
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "other", "mergeCommit": {"oid": "external"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr):
+            tick(self.runtime, 120)
+        # sealed 目标不匹配（baseRefName 缺失）时维持既有 unverified_merge 结论；
+        # 对账只澄清发起者，不推翻结构校验。
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "unverified_merge")
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+
+    def test_manual_merge_without_merge_intent_records_external_source(self):
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        # 人工合并：无 merge-intent，结构校验通过后正常收尾但不宣称本地发起。
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 120)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertFalse(json.loads(row["result"]).get("merged_by_local", False))
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+
+    def test_merge_intent_preserved_if_reconciled_run_update_fails(self):
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        self.store.put_setting("merge-intent:" + run["id"], {"head": "head", "at": 1})
+        # 注入 runs 更新失败：验证意图删除与终态落库原子绑定，失败时不丢失意图证据。
+        self.store.execute("CREATE TRIGGER fail_reconcile_update BEFORE UPDATE OF state ON runs "
+                           "WHEN NEW.id='" + run["id"] + "' "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected reconcile failure'); END")
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr):
+            tick(self.runtime, 120)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertIsNotNone(self.store.setting("merge-intent:" + run["id"]))
+
+        # 故障恢复：清理注入触发器后下一次 tick 重新执行对账，仍能识别本地发起合并。
+        self.store.execute("DROP TRIGGER fail_reconcile_update")
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 240)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertTrue(json.loads(row["result"])["merged_by_local"])
+        self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
+        feedback.assert_called_once()
 
     def test_stale_supersession_and_requeue_roll_back_together(self):
         run = self.tracked_pr()

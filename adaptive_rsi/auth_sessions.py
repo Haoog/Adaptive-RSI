@@ -741,7 +741,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class AuthSessions:
-    def __init__(self, root, factory=None, ttl=600, config=None):
+    def __init__(self, root, factory=None, ttl=600, config=None, now=None):
         self.root = Path(root)
         self.file = self.root / "auth-sessions.json"
         self.lock = threading.RLock()
@@ -753,6 +753,7 @@ class AuthSessions:
         self.shutdown = threading.Event()
         self.ttl = ttl
         self.config = config
+        self.now = now or time.time
         self.custom_factory = factory is not None
         # backend -> (expires_at, rows)；测试注入 factory 时不缓存，便于断言每次真实发现。
         self.providers_cache = {}
@@ -783,6 +784,11 @@ class AuthSessions:
         _write_json(self.file, {key: {field: value for field, value in item.items()
                                      if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
                                 for key, item in rows})
+
+    @staticmethod
+    def _public(item):
+        """对外快照只含稳定字段；以 `_` 开头的内部标记不离开进程。"""
+        return copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
 
     def _invalidate_caches(self, backend):
         # 调用方持有 self.lock；阻止失效前启动的发现任务重新发布旧结果。
@@ -952,19 +958,36 @@ class AuthSessions:
                 raise AuthError("auth_busy")
             session_id = secrets.token_urlsafe(24)
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
-                                         "state": "starting", "expires_at": time.time() + self.ttl, "error": ""}
+                                         "state": "starting", "expires_at": self.now() + self.ttl, "error": "",
+                                         "_reserved": True}
             self._persist()
             # 认证状态即将变化，缓存的供应商发现结果不再可靠。
             self._invalidate_caches(backend)
-        return copy.deepcopy(self.sessions[session_id])
+        return self._public(self.sessions[session_id])
 
     def launch(self, session_id, method=0, inputs=None):
-        """在锁外启动会话 worker；慢操作（握手、凭据写入、complete）不回锁。"""
+        """在锁外启动会话 worker；慢操作（握手、凭据写入、complete）不回锁。
+
+        reserve 与 launch 之间隔着服务端的 dispatch_lock 与调度延迟；若这段时间
+        越过 expires_at，这里看到的唯一变化是 starting→expired。这是正常终态，
+        返回该会话状态即可，不能对刚登记、worker 从未启动的会话抛
+        invalid_auth_state。只 reserve 未 launch 的会话仍由 status()/busy 的
+        过期扫描兜底回收（更新准入可能在登记后拦下 launch）。
+        """
         if not isinstance(method, int) or isinstance(method, bool) or method < 0 or method > 100:
             raise AuthError("invalid_auth_method")
         self.status(session_id)
         with self.lock:
-            if self.sessions[session_id]["state"] not in ACTIVE:
+            item = self.sessions[session_id]
+            # _reserved 在登记时写入、launch 时一次性消费：既标识「worker 尚未派发」，
+            # 也保证同一会话不会被 launch 两次而并行起两个 worker。
+            if not item.pop("_reserved", False):
+                raise AuthError("invalid_auth_state")
+            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
+                self._update(session_id, state="expired", error="auth_expired")
+            if item["state"] == "expired":
+                return self._public(item)
+            if item["state"] != "starting":
                 raise AuthError("invalid_auth_state")
         self._thread(lambda: self._run(session_id, method, inputs))
         return self.status(session_id)
@@ -1001,13 +1024,13 @@ class AuthSessions:
             if item["backend"] == "codex":
                 success = worker.wait(stop, item["expires_at"])
             elif fields["method"] == "auto":
-                success = worker.complete(timeout=max(1, item["expires_at"] - time.time()))
+                success = worker.complete(timeout=max(1, item["expires_at"] - self.now()))
             else:
-                while not stop.wait(0.1) and time.time() < item["expires_at"]:
+                while not stop.wait(0.1) and self.now() < item["expires_at"]:
                     with self.lock:
                         code = self.sessions[session_id].pop("_code", None)
                     if code is not None:
-                        success = worker.complete(code, timeout=max(1, item["expires_at"] - time.time()))
+                        success = worker.complete(code, timeout=max(1, item["expires_at"] - self.now()))
                         break
                 else:
                     success = False
@@ -1015,13 +1038,13 @@ class AuthSessions:
                 current = self.sessions[session_id]
                 if current["state"] not in ACTIVE:
                     return
-                if not success or time.time() >= item["expires_at"]:
+                if not success or self.now() >= item["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
                 self._update(session_id, state="completing")
             self._save(worker, item["backend"], item["provider"], session_id, stop)
         except AuthError as exc:
-            expired = time.time() >= self.sessions[session_id]["expires_at"]
+            expired = self.now() >= self.sessions[session_id]["expires_at"]
             self._update(session_id, state="expired" if expired else "failed", error="auth_expired" if expired else exc.code)
         except Exception:
             self._update(session_id, state="failed", error="auth_protocol_error")
@@ -1057,7 +1080,7 @@ class AuthSessions:
                 current_session = self.sessions[session_id]
                 if self.closed or stop.is_set() or current_session["state"] not in ACTIVE:
                     return
-                if time.time() >= current_session["expires_at"]:
+                if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
                 if backend == "codex":
@@ -1080,7 +1103,7 @@ class AuthSessions:
             if not isinstance(session_id, str) or session_id not in self.sessions:
                 raise AuthError("unknown_session")
             item = self.sessions[session_id]
-            if item["state"] in ACTIVE and time.time() >= item["expires_at"]:
+            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
                 self._update(session_id, state="expired", error="auth_expired")
                 # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
                 # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
@@ -1088,7 +1111,7 @@ class AuthSessions:
                 expired_worker = self.workers.pop(session_id, None)
                 if expired_worker:
                     expired_worker[1].set()
-            result = copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
+            result = self._public(item)
         if expired_worker and expired_worker[0]:
             expired_worker[0].close()
         return result
