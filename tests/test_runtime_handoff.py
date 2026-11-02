@@ -160,6 +160,36 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def test_evaluation_deadline_remains_active_during_model_call(self):
+        _, run = self.claim()
+        clock = [10.0]
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            self.runtime.begin_phase(run, 'evaluation')
+            clock[0] = 20.0
+            def model(*args, **kwargs):
+                clock[0] = 3610.0
+                self.assertTrue(self.runtime.is_cancelled(run))
+                self.assertEqual(run['_timed_out_stage'], 'evaluation')
+                return {}
+            from adaptive_rsi.process import Cancelled
+            with patch.object(self.runtime.agent, 'invoke', side_effect=model), self.assertRaises(Cancelled):
+                self.runtime.invoke('implementation', 'fixture', self.root, run)
+        self.assertNotIn('_evaluation_started', self.runtime.new_trial_context(run))
+
+    def test_model_call_preserves_the_background_evaluation_deadline(self):
+        _, run = self.claim()
+        clock = [10.0]
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            self.runtime.begin_phase(run, 'evaluation')
+            clock[0] = 20.0
+            with patch.object(self.runtime.agent, 'invoke', return_value={}):
+                self.runtime.invoke('implementation', 'fixture', self.root, run)
+            self.assertEqual(run['_deadline_stage'], 'evaluation')
+            self.assertEqual(run['_deadline_started'], 10.0)
+            clock[0] = 3610.0
+            self.assertTrue(self.runtime.is_cancelled(run))
+            self.assertEqual(run['_timed_out_stage'], 'evaluation')
+
     def experiment_inputs(self):
         """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
         from adaptive_rsi.gitops import git, snapshot
