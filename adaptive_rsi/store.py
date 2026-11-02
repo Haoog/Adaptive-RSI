@@ -993,7 +993,16 @@ class Store:
                 elif db.execute("SELECT 1 FROM settings WHERE key=?", ("run-stop:" + run,)).fetchone():
                     state, terminal, task_fields = "interrupted", True, None
                     result = {**(result or {}), "reason": "Project pause requested; retry creates a fresh run"}
-            previous = json.loads(row["result"])
+            # result 列允许 NULL（schema 未加 NOT NULL）；历史写入的 'null'/'[]' 等
+            # 非对象 JSON 也不是 dict。两种都必须降级为空 dict，否则 transition
+            # 抛 TypeError、recover() 在第一行坏数据上中止，剩余待恢复的运行
+            # 永远卡在 planning/executing 并跳过 calls/candidates 中断扫描。
+            try:
+                previous = json.loads(row["result"] or "{}")
+            except (TypeError, ValueError):
+                previous = None
+            if not isinstance(previous, dict):
+                previous = {}
             phase = (result or {}).get("stage", state)
             active_phase = db.execute("SELECT phase FROM phase_times WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if not active_phase or active_phase["phase"] != phase or terminal:

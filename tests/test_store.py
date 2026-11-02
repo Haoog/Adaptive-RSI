@@ -366,6 +366,27 @@ class RecordUsageTest(unittest.TestCase):
         self.assertEqual(call_row["state"], "completed")
         self.assertEqual(in_flight_row["state"], "interrupted")
 
+    def test_transition_tolerates_null_and_non_object_run_result(self):
+        """runs.result 列允许 NULL；非对象 JSON（'null'、'[]'）也必须让 transition
+        降级为空 dict 而不是抛 TypeError，否则 recover() 会在首行坏数据上中止。"""
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',0,0)")
+        task = self.store.add_task("p", "goal", "bad-result", "fixture")
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started) "
+                           "VALUES ('run-bad',?,'p','planning','{}',0)", (task,))
+        self.store.execute("UPDATE runs SET result=NULL WHERE id='run-bad'")
+        self.assertTrue(self.store.transition("run-bad", "interrupted", {}, True))
+        saved = self.store.one("SELECT state,result FROM runs WHERE id='run-bad'")
+        self.assertEqual(saved["state"], "interrupted")
+        self.assertEqual(json.loads(saved["result"]), {})
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started) "
+                           "VALUES ('run-null',?,'p','planning','{}',0)", (task,))
+        self.store.execute("UPDATE runs SET result='null' WHERE id='run-null'")
+        self.assertTrue(self.store.transition("run-null", "interrupted", {}, True))
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started) "
+                           "VALUES ('run-list',?,'p','planning','{}',0)", (task,))
+        self.store.execute("UPDATE runs SET result='[]' WHERE id='run-list'")
+        self.assertTrue(self.store.transition("run-list", "interrupted", {}, True))
+
     def test_recover_interrupts_reserved_candidates_without_touching_settled_ones(self):
         """重启必须清掉提案预留；否则残留的 reserved 会阻塞该项目一小时。"""
         now = time.time()
