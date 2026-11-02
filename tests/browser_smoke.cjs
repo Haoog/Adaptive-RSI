@@ -87,7 +87,7 @@ async function checkAccountAndReleaseUI(browser,url,errors){
   await page.goto(url);await page.waitForFunction(()=>state&&currentProject()?.paused);await page.locator('.sidebar [data-view="overview"]').click();await page.locator('#project-status').filter({hasText:'已暂停'}).waitFor();await page.locator('.sidebar [data-view=models]').click();await page.locator('[data-mc-tab="providers"]').click();await page.locator('#mc-provider-list .mc-provider').filter({hasText:'Codex 登录'}).click();
   await page.getByRole('button',{name:'前往 Codex 官方登录',exact:true}).click();
   await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();
-  const code=page.locator('[data-auth-field="code:browser-auth-session"]');await code.fill('keep-my-code');await code.focus();await page.locator('#mc-auth').filter({hasText:'暂时无法连接，授权状态已保留'}).waitFor();
+  const code=page.locator('[data-auth-field^="code:browser-auth-session:"]');await code.fill('keep-my-code');await code.focus();await page.locator('#mc-auth').filter({hasText:'暂时无法连接，授权状态已保留'}).waitFor();
   await page.waitForTimeout(1650);await page.locator('.mc-auth-code').filter({hasText:'TEST-1234'}).waitFor();assert.equal(authStarts,1);
   assert.equal(await code.inputValue(),'keep-my-code');assert(await code.evaluate(node=>document.activeElement===node));
   if(process.env.RSI_SCREENSHOT_DIR)await page.locator('#mc-auth').screenshot({path:process.env.RSI_SCREENSHOT_DIR+'/account-sign-in.png'});
