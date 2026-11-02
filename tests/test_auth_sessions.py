@@ -449,6 +449,19 @@ class AuthSessionTests(unittest.TestCase):
                 follower.join(2)
             manager.close()
 
+    def test_production_opencode_snapshot_rejects_non_object_legacy_json(self):
+        path = auth_sessions.auth_path()
+        path.parent.mkdir(parents=True)
+        path.write_text('[]')
+        manager = AuthSessions(self.root / 'list-state')
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None), \
+                 patch('adaptive_rsi.opencode.shutil.which', return_value=None):
+                self.assertEqual(manager.snapshot()['opencode']['error'], 'invalid_credentials')
+            self.assertEqual(path.read_text(), '[]')
+        finally:
+            manager.close()
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
