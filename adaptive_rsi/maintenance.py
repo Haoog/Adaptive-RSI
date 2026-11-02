@@ -742,23 +742,59 @@ class Maintenance:
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
         prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
-        # 独立的精确键/冒号前缀范围查询可使用 settings 主键索引，避免逐运行全表扫描。
-        # ':' 的后继字符是 ';'，二进制排序范围只覆盖该运行的冒号后缀键。
-        remaining = " OR ".join(
-            "EXISTS (SELECT 1 FROM settings s WHERE s.key='" + prefix + "'||r.id) OR "
-            "EXISTS (SELECT 1 FROM settings s WHERE s.key>='" + prefix + "'||r.id||':' "
-            "AND s.key<'" + prefix + "'||r.id||';')"
-            for prefix in prefixes)
-        for run in self.store.query(
-                "SELECT r.id FROM runs r WHERE r.ended IS NOT NULL AND r.ended<? AND r.state NOT IN "
-                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
-                "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
-                "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1) AND (" +
-                remaining + ") LIMIT 200", (stale,)):
+        # 在一致读快照中按索引扫描键；最长匹配的运行 ID 拥有该键。
+        runs = set()
+        with self.store.connect() as db:
+            db.execute("BEGIN")
             for prefix in prefixes:
-                key = prefix + run["id"]
-                self.store.execute("DELETE FROM settings WHERE key=? OR (key>=? AND key<?)",
-                                   (key, key + ":", key + ";"))
+                last = prefix[:-1]
+                while len(runs) < 200:
+                    rows = db.execute("SELECT key FROM settings WHERE key>=? AND key<? AND key>? ORDER BY key LIMIT 256",
+                                      (prefix, prefix[:-1] + ";", last)).fetchall()
+                    if not rows:
+                        break
+                    for row in rows:
+                        payload = row["key"][len(prefix):]
+                        candidate = payload
+                        while True:
+                            owner = db.execute(
+                                "SELECT id, ended IS NOT NULL AND ended<? AND state NOT IN "
+                                "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
+                                "AND NOT (state='superseded' AND CASE WHEN json_valid(result) "
+                                "THEN coalesce(json_extract(result,'$.close_pending'),0) ELSE 1 END=1) AS eligible "
+                                "FROM runs WHERE id=?", (stale, candidate)).fetchone()
+                            if owner:
+                                if owner["eligible"]:
+                                    runs.add(owner["id"])
+                                break
+                            if ":" not in candidate:
+                                break
+                            candidate = candidate.rsplit(":", 1)[0]
+                        if len(runs) >= 200:
+                            break
+                    last = rows[-1]["key"]
+                if len(runs) >= 200:
+                    break
+        # 单个有界批次共享事务，避免每个运行的每类键单独提交。
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for run in runs:
+                eligible = db.execute(
+                    "SELECT 1 FROM runs r WHERE r.id=? AND r.ended<? AND r.state NOT IN "
+                    "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
+                    "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
+                    "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1)",
+                    (run, stale)).fetchone()
+                if not eligible:
+                    continue
+                for prefix in prefixes:
+                    key = prefix + run
+                    # 嵌套运行 ID 优先拥有其命名空间，父运行清理不能越界。
+                    db.execute(
+                        "DELETE FROM settings AS s WHERE (s.key=? OR (s.key>=? AND s.key<?)) "
+                        "AND NOT EXISTS (SELECT 1 FROM runs child WHERE child.id>=? AND child.id<? "
+                        "AND (s.key=?||child.id OR (s.key>=?||child.id||':' AND s.key<?||child.id||';')))",
+                        (key, key + ":", key + ";", run + ":", run + ";", prefix, prefix, prefix))
         # 批量初筛决定已直接写入 task_decisions 并随任务持久；这里只清理
         # 升级前遗留的 triage-state 键（存量暂缓任务会在 reassess 中迁移）。
         for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? AND EXISTS "
