@@ -264,11 +264,15 @@ def auth_providers(binary=None, capabilities=None):
         if capabilities and capabilities.modern:
             return sorted({item["integrationID"] for item in load_auth_export()})
         data = json.loads(auth_path().read_text()) if auth_path().is_file() else {}
+        if not isinstance(data, dict):
+            raise ValueError("Invalid OpenCode credentials")
         return sorted(key for key, value in data.items()
                       if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
     capabilities = capabilities or detect_opencode(binary)
     if not capabilities.modern:
         data = json.loads(auth_path().read_text()) if auth_path().is_file() else {}
+        if not isinstance(data, dict):
+            raise ValueError("Invalid OpenCode credentials")
         return sorted(key for key, value in data.items()
                       if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
     result = run_process([binary, "auth", "list", "--format", "json", "--standalone"],
