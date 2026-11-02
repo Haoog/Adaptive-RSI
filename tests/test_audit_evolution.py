@@ -124,6 +124,62 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertIn('kind', json.loads(failed[0]['evidence'])['reason'])
 
+    def test_proposal_missing_guidance_fails_fast_without_running_trials(self):
+        args = self.setup_proposal()
+        for bad_proposal in (
+            {'kind': 'strategy', 'triggers': []},
+            {'kind': 'strategy', 'guidance': '', 'triggers': []},
+            {'kind': 'strategy', 'guidance': '   ', 'triggers': []},
+            {'kind': 'strategy', 'guidance': 123, 'triggers': []},
+        ):
+            self.calls['trial'] = 0
+            self.evolution.runtime.invoke = lambda *unused, **kwargs: bad_proposal
+            with self.assertRaisesRegex(RuntimeError, 'guidance'):
+                self.evolution.propose_and_evaluate(*args, force=True)
+            self.assertEqual(self.calls['trial'], 0)
+            self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+            failed = self.store.query("SELECT evidence FROM candidates WHERE status='insufficient_evidence'")
+            self.assertTrue(failed)
+            self.assertIn('guidance', json.loads(failed[-1]['evidence'])['reason'])
+
+    def test_proposal_missing_triggers_fails_fast_without_running_trials(self):
+        args = self.setup_proposal()
+        for bad_proposal in (
+            {'kind': 'strategy', 'guidance': 'fix'},
+            {'kind': 'strategy', 'guidance': 'fix', 'triggers': 'not-a-list'},
+            {'kind': 'strategy', 'guidance': 'fix', 'triggers': None},
+        ):
+            self.calls['trial'] = 0
+            self.evolution.runtime.invoke = lambda *unused, **kwargs: bad_proposal
+            with self.assertRaisesRegex(RuntimeError, 'triggers'):
+                self.evolution.propose_and_evaluate(*args, force=True)
+            self.assertEqual(self.calls['trial'], 0)
+            self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+            failed = self.store.query("SELECT evidence FROM candidates WHERE status='insufficient_evidence'")
+            self.assertTrue(failed)
+            self.assertIn('triggers', json.loads(failed[-1]['evidence'])['reason'])
+
+    def test_skill_values_safe_against_missing_fields(self):
+        values = Evolution.skill_values('p', 'c', {'kind': 'strategy', 'guidance': 'fix'}, {}, 0)
+        self.assertEqual(json.loads(values[4]), [])
+        self.assertEqual(values[5], 'fix')
+
+        values_no_guidance = Evolution.skill_values('p', 'c', {'kind': 'strategy', 'triggers': ['t']}, {}, 0)
+        self.assertEqual(json.loads(values_no_guidance[4]), ['t'])
+        self.assertEqual(values_no_guidance[5], '')
+
+    def test_auto_promote_with_valid_proposal_promotes_to_stable_and_writes_skills(self):
+        args, observed = self.setup_ablation(auto_promote=True)
+        baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
+        self.evolution.runtime.active_strategies = lambda project: [baseline]
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?',
+                                        (result['candidate'],))['status'], 'stable')
+        skills = self.store.query('SELECT * FROM skills') or []
+        self.assertEqual(len(skills), 1)
+        self.assertEqual(skills[0]['content'], 'small improvement')
+
     def test_stale_reservation_expires_without_blocking_a_new_proposal(self):
         args = self.setup_proposal()
         self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
