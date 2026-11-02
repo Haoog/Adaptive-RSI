@@ -306,6 +306,20 @@ class Evolution:
                 requirements.append({"id": provider_id, "env_key": env_key if isinstance(env_key, str) else ""})
         return requirements
     @staticmethod
+    def validate_proposal(proposal):
+        """校验模型提案结构与必需字段：必须是字典且包含合法 kind、非空 guidance 及 triggers 列表。"""
+        if not isinstance(proposal, dict) or "kind" not in proposal:
+            return False, "Model proposal must be an object with kind and content"
+        if proposal.get("kind") not in ("strategy", "meta_strategy", "adapter"):
+            return False, "Model proposal kind must be strategy, meta_strategy, or adapter"
+        guidance = proposal.get("guidance")
+        if not isinstance(guidance, str) or not guidance.strip():
+            return False, "Model proposal guidance must be a non-empty string"
+        if not isinstance(proposal.get("triggers"), list):
+            return False, "Model proposal triggers must be a list"
+        return True, ""
+
+    @staticmethod
     def ablation_required(proposal):
         """策略候选同时写入可检索技能；引导与触发词都非空时两者才会共同生效。
 
@@ -1009,8 +1023,8 @@ class Evolution:
                 (encode({"reservation": {"holdout": reserved}, "reason": str(exc)}), reservation))
             self.record_attempt(project["id"], signature, "insufficient_evidence", reason=str(exc))
             raise
-        if not isinstance(proposal, dict) or "kind" not in proposal:
-            reason = "Model proposal must be an object with kind and content"
+        valid, reason = self.validate_proposal(proposal)
+        if not valid:
             self.store.execute("UPDATE candidates SET status='insufficient_evidence', evidence=? WHERE id=?",
                 (encode({"reservation": {"holdout": reserved}, "reason": reason}), reservation))
             self.record_attempt(project["id"], signature, "insufficient_evidence", reason=reason)
@@ -1193,7 +1207,9 @@ class Evolution:
     @staticmethod
     def skill_values(project, candidate, content, config, now):
         """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。"""
-        return (uid(), project, None, "verified", encode(content["triggers"]), content["guidance"],
+        triggers = content.get("triggers", []) if isinstance(content, dict) else []
+        guidance = content.get("guidance", "") if isinstance(content, dict) else ""
+        return (uid(), project, None, "verified", encode(triggers), guidance,
                 encode({"candidate": candidate, "config_hash": fingerprint(config)}),
                 now + 30 * 86400, now)
 
