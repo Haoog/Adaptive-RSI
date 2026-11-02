@@ -772,8 +772,7 @@ class OpenCodeAgent:
                 if data is None:
                     raise RuntimeError("OpenCode did not return valid structured output; see the redacted execution record")
                 validate_output(data, SCHEMAS[role])
-                self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                 return data
         except Exception:
-            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=? AND state='reserved'", (time.monotonic() - started, call))
+            self.store.execute("UPDATE calls SET state='failed',seconds=? WHERE id=?", (time.monotonic() - started, call))
             raise
