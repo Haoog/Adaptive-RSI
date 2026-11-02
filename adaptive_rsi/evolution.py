@@ -116,21 +116,67 @@ def case_stratum(case):
     return (spec.get("source", "unknown"), "small" if length < 1000 else "medium" if length < 10000 else "large")
 
 
+def stratum_quotas(sizes, count):
+    """Allocate `count` samples across strata in proportion to their populations.
+
+    每个非空层先占 1 个名额（`count` 不少于层数时），剩余名额按各层人口占比
+    逐个补给缺口最大的一层；全程用整数缺口计算，结果可复现。配额只取决于
+    各层规模与 `count`：换 seed 只会在层内换序，不会改变每层选中数量。
+    """
+    order = sorted(sizes, key=lambda value: fingerprint({"stratum": value}))
+    total = sum(sizes.values())
+    count = max(0, min(count, total))
+    quotas = {key: 0 for key in order}
+    if count <= len(order):
+        # 层数多于样本量时按固定 hash 顺序整层选取，保证同样的输入得到同样的层集合。
+        for key in order[:count]:
+            quotas[key] = 1
+        return quotas
+    for key in order:
+        quotas[key] = 1
+    remaining = count - len(order)
+    while remaining:
+        best = None
+        for key in order:
+            if quotas[key] >= sizes[key]:
+                continue
+            deficit = count * sizes[key] - quotas[key] * total
+            if best is None or deficit > best[0]:
+                best = (deficit, key)
+        if best is None:
+            break
+        quotas[best[1]] += 1
+        remaining -= 1
+    return quotas
+
+
+def case_allocation(population, selected):
+    """Describe per-stratum population and sampled counts for the sealed plan."""
+    sizes, sampled = {}, {}
+    for case in population:
+        stratum = case_stratum(case)
+        sizes[stratum] = sizes.get(stratum, 0) + 1
+    for case in selected:
+        stratum = case_stratum(case)
+        sampled[stratum] = sampled.get(stratum, 0) + 1
+    return [{"stratum": list(stratum), "population": sizes[stratum], "sampled": sampled.get(stratum, 0)}
+            for stratum in sorted(sizes, key=lambda value: fingerprint({"stratum": value}))]
+
+
 def select_cases(cases, count, seed):
+    """Pick up to `count` cases with traffic-weighted allocation across strata.
+
+    每层按其在候选总体中的占比获得样本，样本数允许时每层至少 1 个；同一
+    `seed` 结果稳定，不同 `seed` 只改变层内挑选顺序，不改变各层配额。
+    """
     strata = {}
     for case in cases:
         strata.setdefault(case_stratum(case), []).append(case)
-    groups = []
-    for stratum in sorted(strata, key=lambda value: fingerprint({"stratum": value, "seed": seed})):
-        groups.append(sorted(strata[stratum], key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed}))))
+    quotas = stratum_quotas({stratum: len(rows) for stratum, rows in strata.items()}, count)
     selected = []
-    while groups and len(selected) < count:
-        for group in groups[:]:
-            selected.append(group.pop(0))
-            if not group:
-                groups.remove(group)
-            if len(selected) == count:
-                break
+    for stratum in sorted(quotas, key=lambda value: fingerprint({"stratum": value})):
+        rows = sorted(strata.get(stratum, []), key=lambda case: (case["uses"], fingerprint({"id": case["id"], "seed": seed})))
+        selected.extend(rows[:quotas[stratum]])
     return selected
 
 
@@ -1087,9 +1133,13 @@ class Evolution:
         # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。
         selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
                      "holdout": select_cases(fresh_holdout, minimum, run["id"])}
-        plan = {"version": 1, "created": time.time(), "repeats": config["evolution"]["repeats"],
+        plan = {"version": 2, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
+                "selection_policy": "traffic_weighted_min_one_per_stratum",
+                "allocation": {split: {"requested": minimum, "population": len(rows),
+                                       "strata": case_allocation(rows, selection[split])}
+                               for split, rows in (("validation", validation_cases), ("holdout", fresh_holdout))},
                 "samples": [{"id": case["id"], "split": split, "stratum": case_stratum(case), "prior_uses": case["uses"]}
                             for split, rows in selection.items() for case in rows],
                 "proposal_hash": fingerprint(proposal), "baseline_hash": fingerprint(current),
@@ -1107,8 +1157,9 @@ class Evolution:
         evidence["promotion_review"] = {
             "baseline": current, "proposal": proposal, "experiment": candidate,
             "changed_kind": proposal["kind"], "plan_hash": fingerprint(plan),
-            "covered_samples": plan["samples"],
+            "covered_samples": plan["samples"], "allocation": plan["allocation"],
             "limitations": ["Only sampled task families, sources and size strata are covered",
+                            "Cases are allocated by each stratum's share of the population with at least one case per non-empty stratum; the floor over-represents rare strata in small samples",
                             "Strategy and retrieved skills are jointly applied; individual causal effects are unproven"],
             "attribution": {"state": "insufficient_evidence",
                             "reason": "Four matched ablation configurations were not executed" if not ablation else
