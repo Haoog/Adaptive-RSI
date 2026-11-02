@@ -517,7 +517,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             outcome = parsed_result(run)
             repo = config["github"]["repository"]
             policy = store.setting("delivery:" + run["id"])
-            if not policy or not repo or repo.lower() != origin_repository(project["path"]).lower():
+            if (not policy or not isinstance(policy, dict) or not repo or
+                    repo.lower() != origin_repository(project["path"]).lower()):
+                continue
+            if not all(isinstance(policy.get(key), str) for key in ("branch", "base", "head")):
+                # 交付策略损坏时无法安全判断远端状态；跳过本轮而非终止整个追踪循环。
+                store.event("delivery_policy_invalid", "Stored delivery policy is missing required fields; tracking skipped",
+                            project["id"], run["id"])
                 continue
             identity = store.setting("run-baseline:" + run["id"])
             sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}

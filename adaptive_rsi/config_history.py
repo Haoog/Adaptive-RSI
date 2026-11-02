@@ -134,7 +134,10 @@ def undo(runtime, project, revision, expected):
         current = runtime.store.config_revision(project)
         row = runtime.store.one('SELECT value FROM settings WHERE key=?', (snapshot_key(project, revision),))
         snapshot = decode_snapshot(row['value']) if row else None
-        raw = json.loads(runtime.project(project)['config']) if project else runtime.store.setting('config', {})
+        try:
+            raw = json.loads(runtime.project(project)['config']) if project else runtime.store.setting('config', {})
+        except (TypeError, ValueError):
+            raw = None
         if (current != expected or current != revision or not snapshot or snapshot.get('project') != project or
                 snapshot['revision'] != revision or
                 fingerprint(raw) != snapshot['after_hash']):
