@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import datetime
 import json
 import os
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from adaptive_rsi import maintenance as maintenance_module
 from adaptive_rsi import pipeline
 from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.config import DEFAULTS, merge
+from adaptive_rsi.config import BUILTIN_PROVIDERS, DEFAULTS, merge
 from adaptive_rsi.delivery import schedule as schedule_delivery
 from adaptive_rsi.gitops import git
 from adaptive_rsi.runtime import Runtime
@@ -482,6 +483,70 @@ class SchedulerIsolationTest(unittest.TestCase):
             release.set()
             self.runtime.maintenance_thread.join(5)
         self.assertEqual(len(entered), 2)
+
+    def test_model_center_cleanup_releases_dispatch_lock_before_batch_delete(self):
+        stale = time.time() - 400 * 86400
+        kept = self.runtime.model_center.key(BUILTIN_PROVIDERS[0], None)
+        self.store.put_setting(kept, {"fetched": stale, "models": []})
+        doomed = ["model-center:global:retired:%032x" % index for index in range(200)]
+        for key in doomed:
+            self.store.put_setting(key, {"fetched": stale, "models": []})
+        observed = {"scan_locked": None, "deletes_locked": 0, "connections": set(),
+                    "concurrent_acquire": None, "armed": False}
+        borrows = iter(range(1 << 20))
+        original = self.store.connect
+
+        @contextlib.contextmanager
+        def traced():
+            with original() as db:
+                borrow = next(borrows)
+
+                def trace(sql):
+                    normalized = " ".join(sql.split()).upper()
+                    if not observed["armed"]:
+                        if "MODEL-CENTER:%" in normalized:
+                            observed["armed"] = True
+                            observed["scan_locked"] = self.runtime.dispatch_lock.locked()
+                        return
+                    if not normalized.startswith("DELETE FROM SETTINGS"):
+                        return
+                    observed["connections"].add(borrow)
+                    if self.runtime.dispatch_lock.locked():
+                        observed["deletes_locked"] += 1
+                    if observed["concurrent_acquire"] is None:
+                        observed["concurrent_acquire"] = self.acquire_dispatch_lock_elsewhere()
+
+                db.set_trace_callback(trace)
+                try:
+                    yield db
+                finally:
+                    db.set_trace_callback(None)
+
+        with patch.object(self.store, "connect", traced):
+            self.runtime.maintenance()
+        # 4000 行候选扫描与批量删除都不在 dispatch_lock 内。
+        self.assertIs(observed["scan_locked"], False)
+        self.assertEqual(observed["deletes_locked"], 0)
+        # 删除期间其他线程仍能取得调度锁。
+        self.assertTrue(observed["concurrent_acquire"])
+        # 批量删除只借还一次连接，而不是每行一次自动提交事务。
+        self.assertEqual(len(observed["connections"]), 1)
+        remaining = [row["key"] for row in self.store.query(
+            "SELECT key FROM settings WHERE key LIKE 'model-center:%'")]
+        self.assertEqual(remaining, [kept])
+
+    def acquire_dispatch_lock_elsewhere(self, timeout=2):
+        acquired = []
+
+        def worker():
+            if self.runtime.dispatch_lock.acquire(timeout=timeout):
+                acquired.append(True)
+                self.runtime.dispatch_lock.release()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout + 1)
+        return bool(acquired)
 
     def test_invalid_delivery_run_does_not_block_other_tracking_jobs(self):
         bad = self.historical_run("broken", "merged")

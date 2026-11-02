@@ -368,5 +368,73 @@ class AuditEnvironmentTest(unittest.TestCase):
             self.assertFalse((root / 'run-dependencies').exists())
 
 
+class TestFirstToolScopeTest(unittest.TestCase):
+    """Test-first scope must stay narrower than the checkout, at every layout."""
+
+    def repository(self, root, files):
+        repo = root / 'source'
+        repo.mkdir()
+        git(repo, 'init', '-q')
+        for name, text in files.items():
+            path = repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        git(repo, 'add', '-A')
+        return repo
+
+    def test_root_colocated_tests_do_not_widen_the_approved_tool_scope(self):
+        from adaptive_rsi import pipeline
+        from adaptive_rsi.native import WorkspaceTools
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root, {'app.py': 'def add(a, b):\n    return a + b\n',
+                                          'test_app.py': 'from app import add\n',
+                                          'docs/guide.md': '# guide\n',
+                                          'adaptive_rsi/auth_sessions.py': 'TOKEN = "x"\n'})
+            test_scope = pipeline._regression_test_scope(str(repo), ['app.py'], allow_colocated=True)
+            # 根目录测试没有更窄的目录可命名；"." 会把批准范围放大成整个工作区。
+            self.assertEqual(test_scope, 'tests')
+            tool_scope = pipeline._tool_scope(['app.py'], test_scope)
+            self.assertNotIn('.', tool_scope)
+            self.assertEqual(tool_scope, ['app.py', 'tests'])
+            tool = WorkspaceTools(repo, 'implementation', root / 'state', DEFAULTS, lambda: False, [])
+            tool.scope = tool_scope
+            for path in ['docs/guide.md', 'adaptive_rsi/auth_sessions.py', 'test_app.py']:
+                with self.assertRaises(ValueError):
+                    tool.execute('write_file', {'path': path, 'content': 'x = 1\n'})
+            self.assertEqual(tool.execute('write_file', {'path': 'tests/test_regression.py',
+                                                        'content': 'def test_add():\n    assert True\n'}),
+                             {'written': 'tests/test_regression.py'})
+            self.assertTrue((repo / 'tests' / 'test_regression.py').is_file())
+            # 命令沙箱的 writable 直接取自 scope，工作区根目录不得在其中。
+            writable = [tool.path(item) for item in tool.scope]
+            self.assertNotIn(tool.workspace, writable)
+            self.assertEqual(writable, [repo / 'app.py', repo / 'tests'])
+
+    def test_tests_directory_layout_is_unchanged(self):
+        from adaptive_rsi import pipeline
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = self.repository(root, {'app.py': 'x = 1\n',
+                                          'tests/test_app.py': 'def test_x():\n    assert True\n'})
+            self.assertEqual(pipeline._regression_test_scope(str(repo), ['app.py'], allow_colocated=True), 'tests')
+            self.assertEqual(pipeline._tool_scope(['app.py'], 'tests'), ['app.py', 'tests'])
+
+    def test_repository_wide_plan_scope_is_rejected(self):
+        from adaptive_rsi import pipeline
+        for value in ('.', './', 'docs/*.md'):
+            with self.assertRaises(RuntimeError):
+                pipeline._planned_scope([value])
+        with self.assertRaises(ValueError):
+            pipeline._planned_scope(['../outside.py'])
+        self.assertEqual(pipeline._planned_scope(['./app.py', 'app.py']), ['app.py'])
+
+    def test_tool_scope_falls_back_only_to_the_planned_scope(self):
+        from adaptive_rsi import pipeline
+        self.assertEqual(pipeline._tool_scope(['app.py', '.'], '.'), ['app.py'])
+        self.assertEqual(pipeline._tool_scope(['.'], '.', ['app.py']), ['app.py'])
+        self.assertEqual(pipeline._tool_scope(['.'], None, ['.']), [])
+
+
 if __name__ == '__main__':
     unittest.main()

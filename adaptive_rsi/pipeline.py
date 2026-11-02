@@ -18,7 +18,6 @@ from .store import encode
 def _regression_test_scope(workspace, scope, allow_colocated=False):
     test_dirs = {"test", "tests", "spec", "specs", "__tests__"}
     candidates = set()
-    root_tests = False
     for path in filter(None, git(workspace, "ls-files", "-z").split("\0")):
         parts = Path(path).parts
         in_test_directory = False
@@ -31,10 +30,12 @@ def _regression_test_scope(workspace, scope, allow_colocated=False):
             parent = Path(path).parent
             if parent.parts and allow_colocated and not in_test_directory:
                 candidates.add(parent.as_posix())
-            elif not parent.parts:
-                root_tests = True
     if not candidates:
-        return "." if root_tests and allow_colocated else "tests"
+        # Tests colocated at the repository root have no narrower directory to
+        # name; "." would turn the approved tool scope into the whole checkout
+        # and contradict the plan-scope guard, so new regression tests go under
+        # tests/ instead.
+        return "tests"
     scope_parts = [Path(path).parts for path in scope]
     def rank(candidate):
         parts = Path(candidate).parts
@@ -50,6 +51,26 @@ def _regression_test_scope(workspace, scope, allow_colocated=False):
 
 def _within_scope(path, scope):
     return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
+
+
+def _planned_scope(scope):
+    """Plan scope may only name paths narrower than the whole repository."""
+    from pathlib import PurePosixPath
+    planned = list(dict.fromkeys(str(PurePosixPath(relative_path(path))) for path in scope))
+    for path in planned:
+        relative_path(path)
+        if path == "." or any(char in path for char in [":", "：", "\n", "\r", "\0", "*", "?", "[", "\\"]):
+            raise RuntimeError("Plan must name narrower scope than the entire repository")
+    return planned
+
+
+def _tool_scope(scope, regression_test_scope=None, fallback=None):
+    """Approved tool scope: never widen to the whole checkout via "."."""
+    requested = list(scope) + ([regression_test_scope] if regression_test_scope else [])
+    approved = list(dict.fromkeys(path for path in requested if path and path != "."))
+    if approved:
+        return approved
+    return [path for path in (fallback or []) if path and path != "."]
 
 
 def _uses_test_first(change_type, risk):
@@ -400,12 +421,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         return {"decision": "insufficient_evidence", "reason": plan["reason"]} if experiment else None
     if not plan["scope"] or not plan["acceptance"]:
         raise RuntimeError("Plan lacks scope or acceptance criteria")
-    from pathlib import PurePosixPath
-    plan["scope"] = list(dict.fromkeys(str(PurePosixPath(relative_path(path))) for path in plan["scope"]))
-    for path in plan["scope"]:
-        relative_path(path)
-        if path == "." or any(char in path for char in [":", "：", "\n", "\r", "\0", "*", "?", "[", "\\"]):
-            raise RuntimeError("Plan must name narrower scope than the entire repository")
+    plan["scope"] = _planned_scope(plan["scope"])
     original_scope = list(plan["scope"])
     change_type = "preservation" if task["source"] == "rollback" else change_kind(task, plan)
     test_first_requested = _uses_test_first(change_type, plan["risk"])
@@ -420,7 +436,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             regression_test_scope = test_scope
         elif not covered:
             plan["scope"].append(test_scope)
-    tool_scope = list(plan["scope"]) + ([regression_test_scope] if regression_test_scope else [])
+    tool_scope = _tool_scope(plan["scope"], regression_test_scope, original_scope)
     (directory / "tool-scope.json").write_text(encode(tool_scope), encoding="utf-8")
     (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     if not experiment:
