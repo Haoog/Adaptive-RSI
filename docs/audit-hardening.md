@@ -8,6 +8,7 @@
 
 - `schedule.working_hours` 支持跨午夜，例如 `[22, 6]`；`[0, 24]` 表示全天，起止相同无效。
 - `recovery.provider_retry_minutes` 默认为 `0`，保留人工恢复；设为 `1..1440` 后，暂停连接在等待后允许一次半开尝试。服务的 `Retry-After` 仍优先约束重试。此设置不提供新的调用额度。
+- `recovery.reuse_sealed_checkpoints` 默认为 `false`。设为 `true` 后，规划、独立验收和评审这些只读阶段可复用已封存的检查点结果；构建号、效果、输入指纹或校验和任一不一致即失效重算。实现、工作区写入和远端交付始终真实执行，从不因检查点重放。该开关只减少重复的模型调用，不放宽评估或评审门禁。
 - `delivery.deploy.health_attempts` 默认 `1`，可设 `1..10`；`health_interval_seconds` 默认 `10`，范围 `1..300`；`health_warmup_seconds` 默认 `0`，范围 `0..900`。暖机和尝试间隔内只等待，达到阈值后才判定健康失败或进入已授权回退。人工重试重新计数。旧快照缺少这些字段时使用兼容默认值。
 - `updates.require_provenance` 默认 `false`，兼容未安装 `gh` 的客户端。设为 `true` 后，安装前额外执行 `gh attestation verify`，要求官方仓库、允许的发布工作流、主线来源及非自托管构建；没有可验证证据时拒绝安装。SHA-256 检查继续执行。该选项不代表所有历史版本都有 attestation。
 - 旧额度键 `limits.daily_calls/run_calls/run_seconds/max_changed_files` 和 `evolution.max_calls` 只为历史配置兼容而接受并归零；不限制运行。`limits.command_seconds` 是 `60..86400` 秒的安全超时，原生多轮对话共享这一时限。总 tokens 和费用只记录。
