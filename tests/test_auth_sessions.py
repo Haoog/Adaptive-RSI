@@ -131,6 +131,58 @@ class AuthSessionTests(unittest.TestCase):
                 self.assertEqual(result[broken]["state"], "signed_out")
                 self.assertEqual(result["opencode" if broken == "codex" else "codex"]["state"], "authenticated")
 
+    def test_status_and_busy_return_while_credential_install_is_blocked(self):
+        entered, release, returned = threading.Event(), threading.Event(), threading.Event()
+        session = self.manager.reserve('opencode', 'openai')
+        worker = FakeAuth('opencode')
+        self.created.append(worker)
+        worker.capabilities = types.SimpleNamespace(modern=True)
+        worker.export_credential = lambda provider: [{'fixture': True}]
+        def install(*args):
+            entered.set()
+            release.wait(3)
+        worker.install_credential = install
+        writer = threading.Thread(target=self.manager._save,
+                                  args=(worker, 'opencode', 'openai', session['id'], threading.Event()))
+        results = []
+        def read():
+            results.append((self.manager.status(session['id']), self.manager.busy, self.manager.snapshot()))
+            returned.set()
+        writer.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            reader = threading.Thread(target=read)
+            reader.start()
+            self.assertTrue(returned.wait(1), 'status/busy blocked on credential import')
+            self.assertEqual(results[0][0]['state'], 'starting')
+            self.assertEqual(results[0][1], 1)
+        finally:
+            release.set()
+            writer.join(3)
+            if 'reader' in locals():
+                reader.join(3)
+
+    def test_busy_tolerates_session_pruned_during_status(self):
+        session = self.manager.reserve('opencode', 'openai')
+        original = self.manager.status
+        def status(session_id):
+            with self.manager.lock:
+                self.manager.sessions.pop(session_id)
+                self.manager._publish_sessions()
+            return original(session_id)
+        with patch.object(self.manager, 'status', side_effect=status):
+            self.assertEqual(self.manager.busy, 0)
+
+    def test_complete_rechecks_expiration_under_commit_lock(self):
+        session = self.manager.reserve('opencode', 'openai')
+        self.manager._update(session['id'], state='awaiting_authorization', method='code')
+        with patch.object(self.manager, 'status', return_value={'state': 'awaiting_authorization'}), \
+             patch.object(self.manager, 'now', return_value=session['expires_at'] + 1):
+            with self.assertRaises(AuthError):
+                self.manager.complete(session['id'], 'fixture-code')
+        self.assertEqual(self.manager.status(session['id'])['state'], 'expired')
+        self.assertNotIn('_code', self.manager.sessions[session['id']])
+
     def test_host_snapshot_lists_credentials_once(self):
         manager = AuthSessions(self.root / "host-snapshot")
         try:
@@ -1311,6 +1363,59 @@ class OpenCodeServeTests(unittest.TestCase):
         # 阶梯退避 0.5/1/2/3 封顶；同样 9.5 秒内线性 0.2s 轮询约需 48 次请求。
         self.assertEqual(intervals, [0.5, 1.0, 2.0, 3.0, 3.0])
         self.assertEqual(len(calls), 6)
+
+    def test_v2_complete_verifies_attempt_status_instead_of_trusting_empty_response(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        for status, expected in (("failed", "authorization_failed"), ("expired", "auth_expired")):
+            with self.subTest(status=status), patch.object(worker, "http", side_effect=[None, {"data": {"status": status}}]):
+                with self.assertRaises(AuthError) as caught:
+                    worker._v2_complete("fixture-code", timeout=30)
+                self.assertEqual(caught.exception.code, expected)
+        with patch.object(worker, "http", side_effect=[None, {"data": {"status": "complete"}}]) as http:
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        self.assertEqual([call.args[0] for call in http.call_args_list], ["POST", "GET"])
+        with patch.object(worker, "http", side_effect=[{"error": "bad code"}]):
+            with self.assertRaises(AuthError) as caught:
+                worker._v2_complete("fixture-code", timeout=30)
+            self.assertEqual(caught.exception.code, "authorization_failed")
+
+    def test_v2_complete_checks_attempt_after_post_protocol_error(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        with patch.object(worker, "http", side_effect=[AuthError("auth_protocol_error"),
+                                                       {"data": {"status": "complete"}}]) as http:
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        self.assertEqual([call.args[0] for call in http.call_args_list], ["POST", "GET"])
+        for status, expected in (("failed", "authorization_failed"), ("expired", "auth_expired"),
+                                 ("pending", "auth_protocol_error")):
+            with self.subTest(status=status), patch.object(worker, "http", side_effect=[
+                    AuthError("auth_protocol_error"), {"data": {"status": status}}]):
+                with self.assertRaises(AuthError) as caught:
+                    worker._v2_complete("fixture-code", timeout=30)
+                self.assertEqual(caught.exception.code, expected)
+        with patch.object(worker, "http", side_effect=[AuthError("auth_protocol_error"),
+                                                       AuthError("auth_protocol_error")]):
+            with self.assertRaises(AuthError) as caught:
+                worker._v2_complete("fixture-code", timeout=30)
+            self.assertEqual(caught.exception.code, "auth_protocol_error")
+
+    def test_v2_complete_retries_transient_status_lookup_after_code(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        transient = AuthError("auth_protocol_error")
+        with patch.object(worker, "http", side_effect=[None, transient, {"data": {"status": "pending"}},
+                                                       {"data": {"status": "complete"}}]), \
+             patch("adaptive_rsi.auth_sessions.time.sleep"):
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        with patch.object(worker, "http", side_effect=[None] + [transient] * 3), \
+             patch("adaptive_rsi.auth_sessions.time.sleep"):
+            with self.assertRaises(AuthError) as caught:
+                worker._v2_complete("fixture-code", timeout=30)
+            self.assertEqual(caught.exception.code, "auth_protocol_error")
 
     def test_v2_complete_times_out_at_deadline_with_backoff(self):
         worker = object.__new__(OpenCodeAuth)
