@@ -605,6 +605,18 @@ class Handler(BaseHTTPRequestHandler):
                             if opening > time.time() + 1:
                                 task.update(wait_reason="working_hours", available=opening)
                     schedules = store.query("SELECT * FROM schedules")
+                    task_schedules = {}
+                    for row in store.query("SELECT key,value FROM settings WHERE key LIKE 'task-schedule:%'"):
+                        data = decode_object(row["value"])
+                        if isinstance(data, dict) and data.get("at") is not None:
+                            task_schedules[row["key"].split(":", 1)[1]] = data
+                    for task in rows["tasks"]:
+                        schedule = task_schedules.get(task["id"])
+                        if (schedule and task.get("state") == "queued"
+                                and (task.get("available") or 0) > 0
+                                and abs((task.get("available") or 0) - schedule.get("at", 0)) < 1e-4
+                                and schedule.get("at") > time.time()):
+                            task["schedule"] = schedule
                     project_by_id = {project["id"]: project for project in projects}
                     for schedule in schedules:
                         project = project_by_id.get(schedule["project"])
@@ -981,6 +993,13 @@ class Handler(BaseHTTPRequestHandler):
                     result = execute(runtime, body.get("project"), body.get("tasks"), body.get("action"),
                                      body.get("request_id"), preview=body.get("preview", True) is not False,
                                      expected=body.get("revision"))
+                elif path == "/api/task/schedule-time":
+                    # 预约是授权一个绝对时刻：DST 缺失小时、重复小时与过去时间
+                    # 都在这里以固定文案拒绝，不静默移动授权时间。
+                    if not isinstance(body.get("local_time"), str) or not isinstance(body.get("timezone"), str):
+                        raise ValueError("Use a naive local time and fold 0 or 1")
+                    result = runtime.schedule_task(body.get("task"), body["local_time"],
+                                                   body["timezone"], body.get("fold"))
                 elif path == "/api/task/schedule":
                     runtime.set_dependency(body["task"], body.get("dependencies", body.get("dependency")), body.get("urgency", 0), body.get("reason"))
                     result = {"saved": True}
