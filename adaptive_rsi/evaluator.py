@@ -170,6 +170,16 @@ def collect_test_artifacts(root, maximum=2 * 1024 * 1024):
     return rows
 
 
+def scheduling_scope(config, acceptance, changed_files):
+    """Conservative opt-in gate: scheduling needs config, graph and change evidence."""
+    if not config.get("validation", {}).get("affected_check_scheduling"):
+        return None
+    graph = acceptance.get("contract", {}).get("check_dependencies") if acceptance else None
+    if not isinstance(graph, dict) or not graph or not isinstance(changed_files, list):
+        return None
+    return graph
+
+
 def affected_checks(changed, checks, graph):
     """Close over reverse package dependencies; uncertainty always runs all checks."""
     if not changed or not isinstance(graph, dict) or not graph:
@@ -192,8 +202,21 @@ def affected_checks(changed, checks, graph):
         if expanded == selected:
             break
         selected = expanded
+    while True:
+        expanded = selected | {dep for name in selected for dep in graph[name]["depends_on"]}
+        if expanded == selected:
+            break
+        selected = expanded
     needed = {name for package in selected for name in graph[package]["checks"]}
     return [check for check in checks if check["name"] in needed] or list(checks)
+
+
+def check_identity(row):
+    """Normalized identity tuple (name, argv, cwd) for a check spec or result row."""
+    if not isinstance(row, dict):
+        return None
+    argv = row.get("argv")
+    return (row.get("name"), tuple(argv) if isinstance(argv, (list, tuple)) else (), row.get("cwd") or ".")
 
 
 def structured_test_summary(text):
@@ -934,8 +957,32 @@ class Evaluator:
         # Without a repository the harness comparison cannot prove that the
         # candidate did not rewrite tests, so compare the files that the
         # configured checks actually execute.
-        additions = (full_checks if changed_harness or _harness_differs(baseline, candidate, full_checks) else
+        harness_differs = changed_harness or _harness_differs(baseline, candidate, full_checks)
+        # Opt-in affected-check scheduling: the candidate stage runs only the
+        # checks the dependency graph selects for the changed paths, and the
+        # full candidate stage re-runs the remaining checks on the same
+        # candidate so the executed check surface never shrinks. Any
+        # uncertainty (invalid graph, unknown path, unavailable diff, harness
+        # drift) leaves the complete set, which is behaviorally identical to
+        # scheduling being off.
+        scheduled = None
+        if not harness_differs and not overlay and not test_first:
+            graph = scheduling_scope(config, acceptance, changed_files)
+            if graph is not None:
+                affected = affected_checks(changed_files or [], full_checks, graph)
+                if affected != full_checks:
+                    scheduled = affected
+        additions = (full_checks if harness_differs else
                      [check for check in full_checks if check not in checks])
+        if scheduled is not None:
+            # The candidate stage executes only graph-affected configured
+            # checks; the full candidate stage runs everything the candidate
+            # stage did not (unaffected configured checks and detected-only
+            # checks), so the executed surface stays complete.
+            additions = [check for check in full_checks
+                         if check not in scheduled or check not in checks]
+            if not additions:
+                additions = None
         if test_first and changed_harness:
             return {"decision": "insufficient_evidence",
                     "reason": "Test-first proof cannot modify the existing test harness", "checks": {}}
@@ -950,7 +997,7 @@ class Evaluator:
                         "reason": "Configured test runner cannot execute the new regression test in isolation",
                         "checks": {}}
         reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
-                      not changed_harness)
+                      not changed_harness and scheduled is None)
         baseline_key = None if test_first or overlay else self._cache_key(
             cache_scope, cache_base, checks, execution_config, environment_digest, execution_identity)
         cached_baseline = self._cache_get(cache_scope, baseline_key)
@@ -998,7 +1045,7 @@ class Evaluator:
                 physical, baseline, baseline, acceptance, directory, execution_config, cancel, seeds, hidden)
         stages["candidate"] = lambda: self._standard_stage(
             "candidate", candidate, baseline, candidate, checks, directory, execution_config, cancel, overlay,
-            seeds, hidden, added_tests if test_first else (), test_first_check)
+            seeds, hidden, added_tests if test_first else (), test_first_check, run_checks=scheduled)
         if not reuse_full:
             stages["candidate_full"] = lambda: self._standard_stage(
                 "candidate_full", candidate, baseline, candidate, full_checks, directory, execution_config, cancel,
@@ -1033,11 +1080,9 @@ class Evaluator:
             # Keep full_checks order: reused checks come from the candidate
             # stage, supplement checks from this stage. Names repeat across
             # nested modules, so pair them with argv and cwd.
-            def identity(row):
-                return (row["name"], tuple(row["argv"]), row.get("cwd", "."))
-            own = {identity(row): row for row in results["candidate_full"]}
-            previous = {identity(row): row for row in results.get("candidate", [])}
-            merged = [own.get(identity(check)) or previous.get(identity(check)) for check in full_checks]
+            own = {check_identity(row): row for row in results["candidate_full"]}
+            previous = {check_identity(row): row for row in results.get("candidate", [])}
+            merged = [own.get(check_identity(check)) or previous.get(check_identity(check)) for check in full_checks]
             results["candidate_full"] = [row for row in merged if row]
         if cached_baseline is None and "baseline" in results:
             self._cache_put(cache_scope, baseline_key, results["baseline"])
@@ -1054,10 +1099,11 @@ class Evaluator:
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
-        if (acceptance and acceptance.get("contract", {}).get("check_dependencies")):
+        if acceptance and acceptance.get("contract", {}).get("check_dependencies"):
             data["check_dependency_analysis"] = {
                 "affected": [row["name"] for row in affected_checks(
                     changed_files, checks, acceptance["contract"]["check_dependencies"])],
+                "scheduled": [row["name"] for row in scheduled] if scheduled is not None else None,
                 "execution": "full_checks_retained_until_graph_is_independently_validated"}
         if acceptance:
             from .workflow import improvement

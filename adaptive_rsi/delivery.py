@@ -404,7 +404,8 @@ def schedule(runtime, now=None):
                 continue
             key = "system:delivery"
             task = store.one("SELECT id,state FROM tasks WHERE project=? AND fingerprint=?", (project_id, key))
-            if task and task["state"] in ["queued", "planning"]:
+            from .storage_tools import DELIVERY_ACTIVE
+            if task and task["state"] in DELIVERY_ACTIVE:
                 continue
             if task:
                 store.execute("UPDATE tasks SET state='queued',available=0,updated=? WHERE id=?", (now, task["id"]))

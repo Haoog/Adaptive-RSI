@@ -1063,7 +1063,7 @@
       "implementation": [],
       "validation": []
     },
-        {
+    {
       "id": 64,
       "title": {
         "zh": "已签名更新包持久化缓存与断点续传",
@@ -2114,7 +2114,7 @@
       ],
       "residual": "Restored case paths are invalidated/remapped and isolated database-only business rehearsal checks relationships without remote operations. Periodic scheduling, repository/artifact restoration and business execution remain unverified."
     },
-        {
+    {
       "id": 121,
       "title": {
         "zh": "模型能力元数据加入来源、日期和人工覆盖",
@@ -2253,7 +2253,7 @@
       ],
       "residual": "Path/case/regex search has bounded worker execution, cancellation, continuation and explicit skipped/partial-result reasons."
     },
-        {
+    {
       "id": 129,
       "title": {
         "zh": "大工具输出保留为独立产物引用",
@@ -2393,7 +2393,7 @@
       "implementation": [],
       "validation": []
     },
-        {
+    {
       "id": 137,
       "title": {
         "zh": "费用估计分开输入、输出及缓存价格",
@@ -2414,7 +2414,7 @@
         "python3 -B -m unittest tests.test_model_center.ActiveRunCredentialTest.test_frozen_run_price_uses_its_own_credential_generation_after_rotation"
       ]
     },
-        {
+    {
       "id": 138,
       "title": {
         "zh": "明确费用币种、单位和订阅估值含义",
@@ -2495,7 +2495,7 @@
       ],
       "residual": "Task/spec/tree/overlay/environment identities are sealed and verified; this establishes input integrity, not independent reproduction or causal improvement."
     },
-        {
+    {
       "id": 143,
       "title": {
         "zh": "最终晋升使用未参与候选选择的独立复核集",
@@ -2566,7 +2566,7 @@
       ],
       "residual": "Planned repetitions and load conditions are required; observed ranges/stdev explain measured noise. Synthetic measurements do not prove production improvement or population confidence."
     },
-        {
+    {
       "id": 147,
       "title": {
         "zh": "用固定负例验证检查工具确实能抓到错误",
@@ -2583,7 +2583,7 @@
         "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_fixed_controls_must_be_detected_by_the_real_gate"
       ]
     },
-        {
+    {
       "id": 148,
       "title": {
         "zh": "按验收要求设计反例而非只验证正常路径",
@@ -2636,7 +2636,7 @@
       ],
       "residual": "Standard and acceptance stages collect fixed workspace-relative reports with total byte limits and explicit missing/rejected states; arbitrary host paths and symlinks are rejected."
     },
-        {
+    {
       "id": 151,
       "title": {
         "zh": "缓存不可变的依赖准备环境",
@@ -2768,14 +2768,15 @@
       },
       "source": "adaptive_rsi/evaluator.py",
       "acceptance": "跨包依赖变更触发正确检查，未知影响回退完整集合。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
         "adaptive_rsi/evaluator.py"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_dependency_graph_closes_over_dependents_and_unknown_falls_back"
-      ],
-      "residual": "Dependency graph closure API conservatively falls back to all checks on unknown/invalid impact. Automatic affected-check scheduling is not integrated."
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_dependency_graph_closes_over_dependents_and_unknown_falls_back",
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_affected_check_scheduling_runs_graph_closure_and_keeps_full_surface",
+        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_scheduling_fallback_runs_complete_configured_surface"
+      ]
     },
     {
       "id": 159,
@@ -3119,7 +3120,7 @@
       ],
       "residual": "Read-only permission fixtures distinguish read/write and unknown capabilities without test writes; real scoped-token and user-facing workflow acceptance remain."
     },
-        {
+    {
       "id": 179,
       "title": {
         "zh": "结果未知的远端派发提供人工核对界面",
@@ -3356,7 +3357,7 @@
       ],
       "residual": "Toolchain pins and SOURCE_DATE_EPOCH inventory timestamp are present; full same-input reproducible rebuild comparison remains unverified."
     },
-        {
+    {
       "id": 192,
       "title": {
         "zh": "增加真实签名桌面 N 到 N+1 升级端到端测试",

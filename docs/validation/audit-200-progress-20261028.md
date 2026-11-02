@@ -212,7 +212,7 @@
 155. **implemented** — 按任务家族展示收益异质性
 156. **partial** — 导出可离线复现的封存实验包
 157. **implemented** — 证据记录宿主工具精确版本
-158. **partial** — 建立 monorepo 检查依赖图
+158. **implemented** — 建立 monorepo 检查依赖图
 159. **partial** — 策略和技能共同变化时提供归因分析
 160. **implemented** — 同时展示质量、成本和延迟权衡
 161. **pending** — 区分合并队列入队与实际合并状态
