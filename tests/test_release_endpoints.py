@@ -811,6 +811,120 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
             self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [17])
             self.assertEqual(self.posts, [])
 
+    def test_retry_network_timeout_sets_rerun_unknown_and_enables_immediate_reconciliation(self):
+        self.operation(kind="release", state="failed", workflow_run_id=17, attempt=1,
+                       dispatch_receipt="accepted", error="Previous run failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("ReadTimeout: HTTPSConnectionPool(host='api.github.com', port=443): Read timed out.")
+            return base_api(repo, endpoint, method, fields)
+
+        with patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError) as ctx:
+                release.retry(self.runtime, self.project, self.record["id"], "release")
+            self.assertIn("Read timed out", str(ctx.exception))
+
+        saved = self.saved("release")
+        self.assertEqual(saved["state"], "rerun_unknown")
+        self.assertEqual(saved["rerun_receipt"], "unknown")
+        self.assertTrue(saved.get("rerun_pending"))
+        self.assertNotIn("rollback", saved)
+        self.assertNotEqual(saved["state"], "rolling_back")
+
+        with patch.object(release, "api", side_effect=self.api(single=failed_remote)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(view["state"], "rerun_unknown")
+        self.assertEqual(view["reconciliation_state"], "rerun_unconfirmed")
+        self.assertEqual([c["id"] for c in view["candidates"]], [17])
+
+        confirmed_run = self.remote(17, run_attempt=2, status="in_progress")
+        with patch.object(release, "api", side_effect=self.api(single=confirmed_run)):
+            resolved = release.resolve(self.runtime, self.project, self.record["id"], "release", 17)
+        self.assertEqual(resolved["state"], "running")
+        saved_after = self.saved("release")
+        self.assertEqual(saved_after["state"], "running")
+        self.assertEqual(saved_after["attempt"], 2)
+
+    def test_release_retry_never_introduces_rolling_back_even_with_new_dict_reference(self):
+        self.operation(kind="release", state="failed", workflow_run_id=17, attempt=1,
+                       dispatch_receipt="accepted", error="Previous run failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("Connection reset by peer")
+            return base_api(repo, endpoint, method, fields)
+
+        orig_reconcile = release.reconcile
+        def copy_reconcile(runtime, run, kind, data, persist=True):
+            return dict(orig_reconcile(runtime, run, kind, data, persist=persist))
+
+        with patch.object(release, "reconcile", side_effect=copy_reconcile), \
+                patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError):
+                release.retry(self.runtime, self.project, self.record["id"], "release")
+
+        saved = self.saved("release")
+        self.assertEqual(saved["state"], "rerun_unknown")
+        self.assertEqual(saved["rerun_receipt"], "unknown")
+        self.assertNotIn("rollback", saved)
+        self.assertNotEqual(saved["state"], "rolling_back")
+
+    def test_deploy_rollback_retry_network_timeout_sets_rerun_unknown_and_enables_reconciliation(self):
+        rollback_data = {
+            **self.operation(kind="deploy"),
+            "sha": self.TRUSTED,
+            "operation_id": "rsi-operation-rollback",
+            "state": "failed",
+            "workflow_run_id": 17,
+            "attempt": 1,
+            "dispatch_receipt": "accepted",
+            "error": "Rollback failed",
+        }
+        self.operation(kind="deploy", state="rollback_failed", rollback=rollback_data,
+                       error="Rollback failed")
+        failed_remote = self.remote(17, run_attempt=1, status="completed", conclusion="failure",
+                                    display_title="rsi-operation-rollback")
+        base_api = self.api(single=failed_remote)
+
+        def retry_api(repo, endpoint, method="GET", fields=None):
+            if method == "POST" and endpoint == "actions/runs/17/rerun":
+                raise RuntimeError("ReadTimeout: Read timed out.")
+            return base_api(repo, endpoint, method, fields)
+
+        with patch.object(release, "api", side_effect=retry_api), \
+                patch.object(release, "validate_pin"):
+            with self.assertRaises(RuntimeError):
+                release.retry(self.runtime, self.project, self.record["id"], "deploy")
+
+        saved = self.saved("deploy")
+        self.assertEqual(saved["state"], "rollback_failed")
+        self.assertEqual(saved["rollback"]["state"], "rerun_unknown")
+        self.assertEqual(saved["rollback"]["rerun_receipt"], "unknown")
+        self.assertTrue(saved["rollback"].get("rerun_pending"))
+
+        with patch.object(release, "api", side_effect=self.api(single=failed_remote)):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "deploy", target="rollback")
+        self.assertEqual(view["state"], "rerun_unknown")
+        self.assertEqual(view["target"], "rollback")
+        self.assertEqual(view["reconciliation_state"], "rerun_unconfirmed")
+
+        confirmed_run = self.remote(17, run_attempt=2, status="in_progress",
+                                    display_title="rsi-operation-rollback")
+        with patch.object(release, "api", side_effect=self.api(single=confirmed_run)):
+            resolved = release.resolve(self.runtime, self.project, self.record["id"], "deploy", 17, target="rollback")
+        self.assertEqual(resolved["state"], "running")
+        saved_after = self.saved("deploy")
+        self.assertEqual(saved_after["state"], "rolling_back")
+        self.assertEqual(saved_after["rollback"]["state"], "running")
+        self.assertEqual(saved_after["rollback"]["attempt"], 2)
+
 
 class ReconciliationAuditPayloadTest(_ManualReconciliationFixture):
     """Reconciliation keeps bounded evidence instead of the raw GitHub page."""
