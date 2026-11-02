@@ -502,7 +502,11 @@ class CodexAgent:
                         if login:
                             auth_file = home / ".codex/auth.json"
                             if auth_file.is_file():
-                                auth_secrets += list((json.loads(auth_file.read_text()).get("tokens") or {}).values())
+                                try:
+                                    auth_data = json.loads(auth_file.read_text())
+                                    auth_secrets += list((auth_data.get("tokens") or {}).values())
+                                except (OSError, ValueError, AttributeError):
+                                    pass
                             with CODEX_AUTH_LOCK:
                                 sync_codex_oauth(home, original_auth)
             else:

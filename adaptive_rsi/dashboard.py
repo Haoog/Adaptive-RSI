@@ -51,9 +51,9 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         latest = store.query("SELECT r.id,r.project,r.task,r.state,r.calls,r.tokens,r.started,r.ended,r.base,r.result "
                              "FROM runs r WHERE r.task IN (" + ",".join("?" for _ in task_ids) + ") "
                              "AND r.id=(SELECT id FROM runs WHERE task=r.task ORDER BY started DESC,id LIMIT 1)", task_ids)
-        runs = sorted({r["id"]: r for r in runs + latest}.values(), key=lambda r: r["started"], reverse=True)
+        runs = sorted({r["id"]: r for r in runs + latest}.values(), key=lambda r: r["started"] or 0, reverse=True)
     active = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs WHERE " + clause + " AND ended IS NULL", base_args)
-    runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"], reverse=True)
+    runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"] or 0, reverse=True)
     # 运行中任务可能不在当前分页/分组的任务列表里，标题随运行行一起返回，
     # 避免工作台「当前任务」退化成状态词。只标注未结束的运行，开销有界。
     running_tasks = {row["task"] for row in runs if row["ended"] is None}
