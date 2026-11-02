@@ -21,6 +21,17 @@ from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
 
 
+def lock_held(lock):
+    """RLock 在 Python 3.14 之前没有公开的 locked()；_is_owned() 只对持锁线程返回 True。
+
+    追踪回调里抛异常会被 sqlite 吞掉，断言值就会一直停在哨兵上，所以这里必须先
+    选一条两个版本都成立的取状态路径。
+    """
+    if hasattr(lock, "locked"):
+        return lock.locked()
+    return lock._is_owned()
+
+
 class SchedulerIsolationTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -506,12 +517,12 @@ class SchedulerIsolationTest(unittest.TestCase):
                     if not observed["armed"]:
                         if "MODEL-CENTER:%" in normalized:
                             observed["armed"] = True
-                            observed["scan_locked"] = self.runtime.dispatch_lock.locked()
+                            observed["scan_locked"] = lock_held(self.runtime.dispatch_lock)
                         return
                     if not normalized.startswith("DELETE FROM SETTINGS"):
                         return
                     observed["connections"].add(borrow)
-                    if self.runtime.dispatch_lock.locked():
+                    if lock_held(self.runtime.dispatch_lock):
                         observed["deletes_locked"] += 1
                     if observed["concurrent_acquire"] is None:
                         observed["concurrent_acquire"] = self.acquire_dispatch_lock_elsewhere()
