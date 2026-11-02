@@ -791,6 +791,7 @@ class AuthSessions:
         self.custom_factory = factory is not None
         # backend -> (expires_at, rows)；测试注入 factory 时不缓存，便于断言每次真实发现。
         self.providers_cache = {}
+        self.provider_flights: dict = {}
         # 状态快照的子进程发现结果同样短 TTL 缓存，登录/登出/密钥变更时失效。
         self.status_cache = {}
         self.cache_generations = {backend: 0 for backend in ("codex", "opencode")}
@@ -936,24 +937,56 @@ class AuthSessions:
                 cached = self.providers_cache.get(backend)
                 if cached and cached[0] > time.monotonic():
                     return copy.deepcopy(cached[1])
-        if backend != "opencode":
-            return []
-        worker = self.factory(backend)
+            if backend != "opencode":
+                return []
+            key = (backend, generation)
+            flight = self.provider_flights.get(key)
+            leader = flight is None
+            if leader:
+                flight: dict = {"done": threading.Event()}
+                self.provider_flights[key] = flight
+        if not leader:
+            while not flight["done"].wait(.05):
+                if self.shutdown.is_set():
+                    raise AuthError("service_closed")
+            if self.closed:
+                raise AuthError("service_closed")
+            if "error" in flight:
+                raise flight["error"]
+            return copy.deepcopy(flight["rows"])
+        worker = None
         try:
+            worker = self.factory(backend)
             with self.lock:
                 if self.closed:
                     raise AuthError("service_closed")
                 self.discoveries.add(worker)
             rows = worker.providers()
-        finally:
+            completed_worker, worker = worker, None
             with self.lock:
-                self.discoveries.discard(worker)
-            worker.close()
-        # worker 已关闭，rows 只是纯数据，可安全缓存供短 TTL 内复用。
-        with self.lock:
-            if not self.closed and not self.custom_factory and generation == self.cache_generations[backend]:
-                self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
-        return rows
+                self.discoveries.discard(completed_worker)
+            completed_worker.close()
+            with self.lock:
+                flight["rows"] = copy.deepcopy(rows)
+                if not self.closed and not self.custom_factory and generation == self.cache_generations[backend]:
+                    self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
+            return rows
+        except BaseException as exc:
+            flight["error"] = exc
+            raise
+        finally:
+            try:
+                if worker:
+                    with self.lock:
+                        self.discoveries.discard(worker)
+                    worker.close()
+            except BaseException as exc:
+                flight["error"] = exc
+                raise
+            finally:
+                with self.lock:
+                    self.provider_flights.pop(key, None)
+                    flight["done"].set()
 
     def _thread(self, target):
         def run():
@@ -1000,7 +1033,7 @@ class AuthSessions:
             session_id = secrets.token_urlsafe(24)
             self.sessions[session_id] = {"id": session_id, "backend": backend, "provider": provider,
                                          "state": "starting", "expires_at": self.now() + self.ttl, "error": "",
-                                         "_reserved": True}
+                                         "_reserved": True, "_method": method, "_inputs": copy.deepcopy(inputs)}
             try:
                 self._persist()
             except OSError:
@@ -1023,9 +1056,18 @@ class AuthSessions:
         """
         if not isinstance(method, int) or isinstance(method, bool) or method < 0 or method > 100:
             raise AuthError("invalid_auth_method")
+        if inputs is not None and (not isinstance(inputs, dict) or len(inputs) > 30 or any(
+            not isinstance(key, str) or not isinstance(value, str) or len(key) > 100 or len(value) > 2048
+            for key, value in inputs.items())):
+            raise AuthError("invalid_auth_inputs")
         self.status(session_id)
         with self.lock:
             item = self.sessions[session_id]
+            if method != item.get("_method", method):
+                raise AuthError("invalid_auth_method")
+            if inputs != item.get("_inputs", inputs):
+                raise AuthError("invalid_auth_inputs")
+            inputs = copy.deepcopy(item.get("_inputs", inputs))
             # _reserved 在登记时写入、launch 时一次性消费：既标识「worker 尚未派发」，
             # 也保证同一会话不会被 launch 两次而并行起两个 worker。
             if not item.pop("_reserved", False):
@@ -1268,10 +1310,11 @@ class AuthSessions:
         _identifier(provider)
         if not isinstance(key, str) or not key.strip() or len(key) > 8192:
             raise AuthError("invalid_api_key")
-        if not any(row["id"] == provider and any(item["type"] == "api" and item.get("supported", True)
-                                                 for item in row["methods"])
-                   for row in self.providers(backend)):
-            raise AuthError("unsupported_auth_method")
+        with self.lock:
+            if self.closed:
+                raise AuthError("service_closed")
+            if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+                raise AuthError("auth_busy")
         if not AUTH_LOCK.acquire(blocking=False):
             raise AuthError("auth_credentials_busy")
         worker = None
@@ -1282,23 +1325,48 @@ class AuthSessions:
                 if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                     raise AuthError("auth_busy")
             worker = self.factory(backend)
+            with self.lock:
+                self.discoveries.add(worker)
+            rows = worker.providers()
+            if not any(row["id"] == provider and any(item["type"] == "api" and item.get("supported", True)
+                                                     for item in row["methods"]) for row in rows):
+                raise AuthError("unsupported_auth_method")
+            with self.lock:
+                if self.closed:
+                    raise AuthError("service_closed")
+                if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+                    raise AuthError("auth_busy")
             modern = bool(getattr(getattr(worker, "capabilities", None), "modern", False))
             if modern and hasattr(worker, "set_api_key") and hasattr(worker, "export_credential"):
                 worker.set_api_key(provider, key.strip())
                 credentials = worker.export_credential(provider)
                 if not credentials:
                     raise AuthError("invalid_credentials")
-                worker.install_credential(provider, credentials)
+                with self.lock:
+                    if self.closed:
+                        raise AuthError("service_closed")
+                    if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+                        raise AuthError("auth_busy")
+                    worker.install_credential(provider, credentials)
+                    self._invalidate_caches(backend)
             else:
-                data = _read_json_for_write(auth_path())
-                data[provider] = {"type": "api", "key": key.strip()}
-                _write_json(auth_path(), data)
+                with self.lock:
+                    if self.closed:
+                        raise AuthError("service_closed")
+                    if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
+                        raise AuthError("auth_busy")
+                    data = _read_json_for_write(auth_path())
+                    data[provider] = {"type": "api", "key": key.strip()}
+                    _write_json(auth_path(), data)
+                    self._invalidate_caches(backend)
         finally:
-            if worker:
-                worker.close()
-            AUTH_LOCK.release()
-        with self.lock:
-            self._invalidate_caches(backend)
+            try:
+                if worker:
+                    with self.lock:
+                        self.discoveries.discard(worker)
+                    worker.close()
+            finally:
+                AUTH_LOCK.release()
         return self.snapshot()
 
     def close(self):
