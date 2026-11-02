@@ -973,6 +973,84 @@ Path(%r).write_text('allowed output')
         self.assertEqual(self.runtime.active_strategies(self.project), [])
         self.assertEqual(self.runtime.memories(self.project, "add"), [])
 
+    def test_finish_failure_aligns_regression_attribution_by_check_identity(self):
+        config = self.runtime.config(self.project)
+        check_a = {"name": "check_a", "argv": ["python3", "-c", "print(1)"], "cwd": "."}
+        check_b = {"name": "check_b", "argv": ["python3", "-c", "print(2)"], "cwd": "."}
+
+        # 1. 延迟到 candidate_full 的检查失败，必须正确归因为回归（attributable=True）
+        task_id, run = self.claim("regression deferred to candidate_full")
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        with patch.object(self.runtime, "monitor_strategy") as mock_monitor:
+            result = {
+                "decision": "fail",
+                "reason": "Candidate full check failed",
+                "evaluation": {
+                    "checks": {
+                        "baseline": [{**check_a, "passed": True}, {**check_b, "passed": True}],
+                        "candidate": [{**check_a, "passed": True}],
+                        "candidate_full": [{**check_a, "passed": True}, {**check_b, "passed": False}],
+                    }
+                }
+            }
+            self.runtime.finish_failure(run, task, result, config)
+            mock_monitor.assert_called_once()
+            self.assertIs(mock_monitor.call_args.kwargs["attributable"], True)
+
+        # 2. baseline 顺序打乱与 candidate 行重排：按身份对齐，不把失败比到错误的 baseline 行
+        task_id2, run2 = self.claim("reordered checks without false positive")
+        task2 = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id2,))
+        with patch.object(self.runtime, "monitor_strategy") as mock_monitor2:
+            result2 = {
+                "decision": "fail",
+                "reason": "Existing failure continues",
+                "evaluation": {
+                    "checks": {
+                        "baseline": [{**check_b, "passed": False}, {**check_a, "passed": True}],
+                        "candidate": [{**check_a, "passed": True}, {**check_b, "passed": False}],
+                    }
+                }
+            }
+            self.runtime.finish_failure(run2, task2, result2, config)
+            mock_monitor2.assert_called_once()
+            self.assertIs(mock_monitor2.call_args.kwargs["attributable"], False)
+
+        # 3. 选后面的检查（candidate 只有 check_b）：不与 baseline 较早的行错位对齐
+        task_id3, run3 = self.claim("later check subset does not misalign")
+        task3 = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id3,))
+        with patch.object(self.runtime, "monitor_strategy") as mock_monitor3:
+            result3 = {
+                "decision": "fail",
+                "reason": "Selected later check failed",
+                "evaluation": {
+                    "checks": {
+                        "baseline": [{**check_a, "passed": True}, {**check_b, "passed": False}],
+                        "candidate": [{**check_b, "passed": False}],
+                    }
+                }
+            }
+            self.runtime.finish_failure(run3, task3, result3, config)
+            mock_monitor3.assert_called_once()
+            self.assertIs(mock_monitor3.call_args.kwargs["attributable"], False)
+
+        # 4. 顺序打乱时发现真实回归
+        task_id4, run4 = self.claim("reordered checks detects real regression")
+        task4 = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id4,))
+        with patch.object(self.runtime, "monitor_strategy") as mock_monitor4:
+            result4 = {
+                "decision": "fail",
+                "reason": "check_a regressed",
+                "evaluation": {
+                    "checks": {
+                        "baseline": [{**check_b, "passed": False}, {**check_a, "passed": True}],
+                        "candidate": [{**check_a, "passed": False}, {**check_b, "passed": True}],
+                    }
+                }
+            }
+            self.runtime.finish_failure(run4, task4, result4, config)
+            mock_monitor4.assert_called_once()
+            self.assertIs(mock_monitor4.call_args.kwargs["attributable"], True)
+
 
 class ConfigurationAndAdapterTest(unittest.TestCase):
     def test_existing_call_history_migrates_without_losing_usage(self):

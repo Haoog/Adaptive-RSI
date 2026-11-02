@@ -44,7 +44,7 @@ DEFAULTS = {
                             "health_consecutive_successes": 1, "health_urls": [],
                             "rollback_data_policy": "manual", "rollback_recovery_notes": ""}},
     "checks": [],
-    "validation": {"controls": []},
+    "validation": {"controls": [], "affected_check_scheduling": False},
     "environment": {"seed_paths": [], "setup": [], "max_seed_mb": 1024},
     "evolution": {"enabled": True, "every_completed": 5, "auto_promote": True,
                   "min_cases_per_split": 3, "repeats": 2, "max_calls": 0,
