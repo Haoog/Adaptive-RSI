@@ -271,13 +271,8 @@ class ModelCenter:
         validate(updated)
         if not project:
             for row in self.store.query("SELECT config FROM projects"):
-                try:
-                    project_override = json.loads(row["config"] or "{}")
-                except (TypeError, ValueError):
-                    project_override = {}
-                if not isinstance(project_override, dict):
-                    project_override = {}
-                validate(merge(updated, project_override))
+                # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
+                validate(merge(updated, json.loads(row["config"])))
         registered = False
         try:
             if old and (old.get("secret_ref"), old.get("credential")) != (provider.get("secret_ref"), mode):

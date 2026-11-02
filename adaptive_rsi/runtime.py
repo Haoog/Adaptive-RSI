@@ -130,12 +130,7 @@ class Runtime(Maintenance):
         override = {}
         if project:
             row = self.project(project)
-            try:
-                override = json.loads(row["config"] or "{}")
-            except (TypeError, ValueError):
-                override = {}
-            if not isinstance(override, dict):
-                override = {}
+            override = json.loads(row["config"])
         raw = merge(DEFAULTS, self.store.setting("config", {}), override)
         # 调度循环每 5 秒读取每个项目的配置；validate 是纯函数，按内容指纹缓存校验结果。
         key = fingerprint(raw)
@@ -418,13 +413,8 @@ class Runtime(Maintenance):
             # Global changes must also remain valid for every existing project override.
             for row in projects:
                 if row["id"] in schedules:
-                    try:
-                        project_override = json.loads(row["config"] or "{}")
-                    except (TypeError, ValueError):
-                        project_override = {}
-                    if not isinstance(project_override, dict):
-                        project_override = {}
-                    validate(merge(updated, project_override))
+                    # 写入侧校验：行数据损坏时直接暴露错误，不静默降级通过验证。
+                    validate(merge(updated, json.loads(row["config"])))
         revision_key = "config-revision:" + (project or "global")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1730,22 +1720,13 @@ class Runtime(Maintenance):
             task = self.store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
             if problem["code"] == "provider" and task and not task["source"].startswith("system_"):
                 from .provider_health import ProviderHealth, connection_key, error_code
-                try:
-                    config = json.loads(run["config"] or "{}")
-                except (TypeError, ValueError):
-                    config = {}
-                if not isinstance(config, dict):
-                    config = {}
+                config = json.loads(run["config"])
                 call = self.store.one("SELECT provider FROM calls WHERE run=? ORDER BY created DESC LIMIT 1", (run["id"],))
-                provider = getattr(exc, "provider_id", None) or (call["provider"] if call else
-                                                               config.get("models", {}).get("planning", {}).get("provider", "unknown"))
+                provider = getattr(exc, "provider_id", None) or (call["provider"] if call else config["models"]["planning"]["provider"])
+                problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
                 transient = error_code(exc) in ["rate_limit", "timeout", "connection"]
-                if config.get("providers"):
-                    problem["connection"] = connection_key(config, provider, run["project"], root=self.store.root)
-                    circuit = ProviderHealth(self.store).status(config, provider, run["project"])
-                    problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
-                else:
-                    problem["recoverable"] = transient
+                circuit = ProviderHealth(self.store).status(config, provider, run["project"])
+                problem["recoverable"] = transient or error_code(exc) == "provider_paused" and circuit.get("code") in ["rate_limit", "timeout", "connection"]
                 self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?", (task["id"],))
                 if transient and task["infra_retries"] < 3 and not self.is_cancelled(run):
                     import random
