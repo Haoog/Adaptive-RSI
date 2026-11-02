@@ -290,9 +290,10 @@
       "existing_id": 201,
       "area": "delivery",
       "source_key": "delivery-5",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-009",
-      "assessment_en": "Feedback always creates two snapshots and runs baseline and candidate even for identical SHAs, without baseline-cache inputs. Design a single-execution preservation path for identical immutable inputs; retain conservative host-environment restrictions."
+      "assessment_en": "Feedback always creates two snapshots and runs baseline and candidate even for identical SHAs, without baseline-cache inputs. Design a single-execution preservation path for identical immutable inputs; retain conservative host-environment restrictions.",
+      "resolution_zh": "PR #182：feedback() 三处 evaluate 传入 cache_scope=project/cache_base=merged_sha，Docker 主机基线可跨轮询复用，非 Docker 保持保守逐次执行。"
     },
     {
       "title_zh": "认证快照的 RuntimeError 分支遮蔽 AuthError 恢复逻辑",
@@ -332,9 +333,10 @@
       "existing_id": null,
       "area": "desktop",
       "source_key": "desktop-2",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-011",
-      "assessment_en": "An API-key worker is not tracked by close and does not recheck closed before credential installation. A pure in-memory worker installs after close returns. Track ownership and cancellation and serialize the final commit with shutdown."
+      "assessment_en": "An API-key worker is not tracked by close and does not recheck closed before credential installation. A pure in-memory worker installs after close returns. Track ownership and cancellation and serialize the final commit with shutdown.",
+      "resolution_zh": "auth_sessions.set_api_key 已把临时 worker 登记进 discoveries，每个安装步骤前在锁内复查 closed；close() 会一并关闭 discoveries。由今日已合并 PR 修复。"
     },
     {
       "title_zh": "更新空闲屏障遗漏正在运行的模型目录请求",
@@ -374,9 +376,10 @@
       "existing_id": null,
       "area": "desktop",
       "source_key": "desktop-4",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-013",
-      "assessment_en": "The desktop bootstrap reads one handshake then drops stdout, while the reused Python service emits later rotated handshakes. Other-client session rotation can leave stale desktop credentials. This is code-supported; real desktop integration was not run."
+      "assessment_en": "The desktop bootstrap reads one handshake then drops stdout, while the reused Python service emits later rotated handshakes. Other-client session rotation can leave stale desktop credentials. This is code-supported; real desktop integration was not run.",
+      "resolution_zh": "main.rs bootstrap 已保留握手流并通过常驻线程消费后续 rotated 消息更新凭据。由今日已合并 PR 修复。"
     },
     {
       "title_zh": "更新停止运行器超时后保留已失去控制管道的旧连接",
@@ -647,9 +650,10 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-1",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-026",
-      "assessment_en": "test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full runner. A real isolated parent exits -15 while its detached worker survives. Share bounded signal cleanup and verify actual process termination."
+      "assessment_en": "test_selected lacks the SIGTERM-to-KeyboardInterrupt handler used by the full runner. A real isolated parent exits -15 while its detached worker survives. Share bounded signal cleanup and verify actual process termination.",
+      "resolution_zh": "PR #180 已合并：main() 安装 SIGTERM→KeyboardInterrupt，stop_workers 兼容 macOS EPERM，新增真实子进程回归测试。"
     },
     {
       "title_zh": "空 suite 被选测 worker 标记通过",
@@ -774,9 +778,10 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-7",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-032",
-      "assessment_en": "The browser termination escalation timer is unreferenced. If the leader exits and descendants close stdio while ignoring SIGTERM, the parent can exit before SIGKILL. Track cleanup completion; a real descendant test remains necessary."
+      "assessment_en": "The browser termination escalation timer is unreferenced. If the leader exits and descendants close stdio while ignoring SIGTERM, the parent can exit before SIGKILL. Track cleanup completion; a real descendant test remains necessary.",
+      "resolution_zh": "test_browser.cjs 已有 upgrades/keepAlive/finalizers 机制，close 后仍跟踪进程组清理完成再退出。PR #129 修复。"
     },
     {
       "title_zh": "浏览器测试发现为空仍返回成功",
@@ -817,9 +822,10 @@
       "existing_id": null,
       "area": "data",
       "source_key": "data-5",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-034",
-      "assessment_en": "The intervention query scans unrelated project events. A 10,000-event fixture with zero matches performs about 100,064 VM instructions. Index the validated task identifier and fixed intervention kinds, then verify sparse-history query work."
+      "assessment_en": "The intervention query scans unrelated project events. A 10,000-event fixture with zero matches performs about 100,064 VM instructions. Index the validated task identifier and fixed intervention kinds, then verify sparse-history query work.",
+      "resolution_zh": "task_lifecycle.HISTORY_QUERY 已用 json_extract + events_intervention_task 表达式索引，分页限定工作量。已由今日合并修复。"
     },
     {
       "title_zh": "恢复 validated_candidate 仅复用补丁，仍无条件重跑完整评价",
@@ -838,9 +844,10 @@
       "existing_id": 201,
       "area": "delivery",
       "source_key": "delivery-6",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-035",
-      "assessment_en": "validated_candidate recovery restores the patch but unconditionally reevaluates it. This is a conservative contract, not a correctness defect. Consider a separately sealed evaluation checkpoint only for demonstrably identical execution inputs."
+      "assessment_en": "validated_candidate recovery restores the patch but unconditionally reevaluates it. This is a conservative contract, not a correctness defect. Consider a separately sealed evaluation checkpoint only for demonstrably identical execution inputs.",
+      "resolution_zh": "pipeline.py 恢复 validated_candidate 时以 _reusable_evaluation 校验并复用同树同配置的已存评估，不再无条件重跑完整评价。已由今日合并修复。"
     },
     {
       "source_key": "local-3",
@@ -880,9 +887,10 @@
       "existing_id": 201,
       "area": "validation",
       "source_key": "validation-10",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-037",
-      "assessment_en": "All 12 Python matrix entries repeat complete coverage discovery. Local cost is small; centralize only after preserving interpreter-dependent discovery coverage. This is not a primary wall-clock bottleneck."
+      "assessment_en": "All 12 Python matrix entries repeat complete coverage discovery. Local cost is small; centralize only after preserving interpreter-dependent discovery coverage. This is not a primary wall-clock bottleneck.",
+      "resolution_zh": "PR #181 已合并：check_test_matrix 从十个矩阵作业移到 quick_python 单次运行。"
     },
     {
       "title_zh": "快速测试数量的 sed 转义错误使指标总为零",
@@ -901,9 +909,10 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-11",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-038",
-      "assessment_en": "The literal shell block overescapes sed grouping and records zero quick tests. The parent independently reproduced 32 executed tests yielding an empty count. Use structured counts or correct the expression and retain failing logs."
+      "assessment_en": "The literal shell block overescapes sed grouping and records zero quick tests. The parent independently reproduced 32 executed tests yielding an empty count. Use structured counts or correct the expression and retain failing logs.",
+      "resolution_zh": "PR #181 已合并：sed BRE 分组双重转义修正，本地复算 count=24。"
     },
     {
       "title_zh": "矩阵覆盖检查只做集合包含，漏报组内重复和额外 selector",
@@ -922,9 +931,10 @@
       "existing_id": null,
       "area": "validation",
       "source_key": "validation-9",
-      "status": "open",
+      "status": "fixed_in_working_tree",
       "id": "R4-039",
-      "assessment_en": "The matrix checker reduces a Counter to a set and checks only missing IDs, accepting duplicates and extra IDs. Validate each entry and explicitly account for intended platform/version overlap."
+      "assessment_en": "The matrix checker reduces a Counter to a set and checks only missing IDs, accepting duplicates and extra IDs. Validate each entry and explicitly account for intended platform/version overlap.",
+      "resolution_zh": "check_test_matrix 已检组内重复 Counter 与超出 discovery 的额外 selector。已由今日合并修复。"
     }
   ],
   "reproduction_evidence": {

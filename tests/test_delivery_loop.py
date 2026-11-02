@@ -903,6 +903,28 @@ print('BOUNDARIES_OK')
         self.assertEqual(evaluate.call_args[0][4]["sandbox"], saved_config["sandbox"])
         self.assertEqual(evaluate.call_args[0][4]["environment"], saved_config["environment"])
 
+    def test_postmerge_feedback_passes_baseline_cache_identity_to_evaluator(self):
+        # R4-009：合并后验证对相同主线 SHA 反复执行同一份固定检查，基线阶段结果
+        # 应绑定 (project, merged_sha) 交给评估器缓存；非 Docker 主机会自行放弃复用，
+        # 但参数必须传到位，Docker 主机才能让后续轮询命中既有基线证据。
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        run["path"] = str(directory)
+        head = git(self.repo, "rev-parse", "HEAD")
+        outcome = {"merged_sha": head, "merged_at": time.time()}
+        report = {"decision": "pass", "checks": {}}
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value=report) as evaluate:
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), time.time())
+        self.assertTrue(evaluate.called)
+        kwargs = evaluate.call_args.kwargs
+        self.assertEqual(kwargs["cache_scope"], self.project)
+        self.assertEqual(kwargs["cache_base"], head)
+        self.assertEqual(outcome["feedback"]["state"], "verified")
+
     def test_mainline_test_edit_survives_delivery_git_failure_and_reports_real_regression(self):
         from adaptive_rsi.delivery import feedback
         run = self.tracked_pr()
