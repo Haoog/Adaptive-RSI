@@ -961,7 +961,7 @@ class Store:
                                 encode({"task": candidate["id"], "reason": reason}), now))
                     continue
                 source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
-                if (source_key and not config["sources"][source_key] and
+                if (source_key and not config.get("sources", {}).get(source_key, True) and
                         any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
                             for item in evidence)):
                     db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (now, candidate["id"]))
