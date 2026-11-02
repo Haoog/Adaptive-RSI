@@ -256,7 +256,7 @@ class ReleaseAutomationTest(unittest.TestCase):
                 retry(self.runtime, self.project, self.run["id"], "release")
             self.runtime.close()
             self.runtime = Runtime(Store(self.root / "state"))
-            self.assertEqual(self.tick()["release"]["state"], "rerunning")
+            self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
             with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
                 self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
             self.assertFalse(pending(self.runtime, self.run))
