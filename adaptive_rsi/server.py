@@ -822,8 +822,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not run:
                     raise RequestError("Run has no artifacts")
                 try:
+                    raw = Path(run["path"] or store.root / "runs" / run["id"]) / "candidate.patch"
+                    if raw.is_symlink():
+                        raise ValueError("Missing patch")
                     path = run_artifact_path(store, run, "candidate.patch")
-                    if not path.is_file():
+                    if not path.is_file() or path.is_symlink():
                         raise ValueError("Missing patch")
                     payload = read_patch_preview(path)
                 except (ValueError, OSError, RuntimeError):
@@ -836,6 +839,9 @@ class Handler(BaseHTTPRequestHandler):
                 run = store.one("SELECT id,path FROM runs WHERE id=?", (params.get("id", [""])[0],))
                 if not run:
                     raise RequestError("Run not found")
+                raw = Path(run["path"] or store.root / "runs" / run["id"]) / "candidate.patch"
+                if raw.is_symlink():
+                    raise RequestError("Run has no artifacts in this state directory")
                 path = run_artifact_path(store, run, "candidate.patch")
                 if not path.is_file() or path.is_symlink():
                     raise RequestError("Run has no artifacts in this state directory")
