@@ -74,6 +74,27 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.runtime.store.put_setting(key(run["id"], "deploy"), {"state": "workflow_succeeded"})
         self.assertTrue(pending(self.runtime, run))
 
+    def test_health_retry_clears_stale_rollback_warnings_without_dispatch(self):
+        policy = {**self.policy, 'health_url': 'https://service.example/health'}
+        self.runtime.configure({'delivery': {'deploy': policy}}, self.project)
+        config = self.runtime.config(self.project)
+        self.runtime.store.execute('UPDATE runs SET config=? WHERE id=?', (encode(config), self.run['id']))
+        data = {'state': 'health_failed', 'operation_id': 'fixture-deploy', 'sha': MERGED,
+                'repository': 'example/project', 'rollback_unavailable': True,
+                'rollback_blocked_reason': 'data_compatibility', 'rollback_recovery_notes': 'stale',
+                'rollback_target': {'sha': PREVIOUS}}
+        self.runtime.store.put_setting(key(self.run['id'], 'deploy'), data)
+        with patch('adaptive_rsi.release.authorized', return_value='example/project'), \
+             patch('adaptive_rsi.release.deployment_owner', return_value=None), \
+             patch('adaptive_rsi.release._retry_target_allowed', return_value=True), \
+             patch('adaptive_rsi.release.api') as remote:
+            result = retry(self.runtime, self.project, self.run['id'], 'deploy')
+        remote.assert_not_called()
+        self.assertEqual(result['state'], 'workflow_succeeded')
+        for field in ('rollback_unavailable', 'rollback_blocked_reason', 'rollback_recovery_notes'):
+            self.assertNotIn(field, result)
+        self.assertEqual(result['rollback_target'], {'sha': PREVIOUS})
+
     def test_rejected_retry_receipt_survives_concurrent_authorization_revocation(self):
         from adaptive_rsi.release import save
         data = {"state": "failed", "operation_id": "rsi-release-test", "sha": MERGED,

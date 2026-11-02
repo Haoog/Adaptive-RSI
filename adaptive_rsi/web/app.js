@@ -1350,7 +1350,8 @@ async function renderReleaseOutcome(node,run,project){
   if(operation.rollback){const rollback=operation.rollback;row.append(el('p',t('恢复旧版本')+' · '+t(releaseStates[rollback.state]||rollback.state)));}
   if(operation.url&&/^https:\/\/github\.com\//.test(operation.url)){const link=el('a',t('查看 GitHub 工作流'));link.href=operation.url;link.target='_blank';link.rel='noreferrer';row.append(link);}
   if(rerunUnknown)row.append(el('p',t('GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。'),'muted'));
-  if(rerunUnknown||dispatchRejected||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):dispatchRejected?t('修复权限后重试'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
+  const healthRetry=kind==='deploy'&&operation.state==='health_failed';
+  if(healthRetry||rerunUnknown||dispatchRejected||operation.state==='failed'&&operation.workflow_run_id||operation.state==='rollback_failed')row.append(action(healthRetry?t('重新检查健康'):rerunUnknown?t('重新确认状态'):operation.state==='rollback_failed'?t('重试恢复旧版本'):dispatchRejected?t('修复权限后重试'):t('重试')+' · '+t(title),async()=>{await api('release-retry',{project,run:run.id,kind});if(projectId===project){await refresh();if(detailTask)await showTask(detailTask);}},'text-button'));
   if(['blocked','dispatch_unknown','health_failed','rollback_failed'].includes(operation.state))row.append(action(t('检查发布设置'),()=>{closeTaskDetail();changeSettingsScope('project',false);showView('settings');$('release-settings').scrollIntoView({block:'start'});},'text-button'));
   renderReleaseReconciliation(row,operation,project,run,kind,'operation');
   if(kind==='deploy')renderReleaseReconciliation(row,operation,project,run,kind,'rollback');
