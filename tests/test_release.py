@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from adaptive_rsi.config import DEFAULTS, validate
 from adaptive_rsi.gitops import git
-from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, health_check, key, pending, retry, workflow_choices
+from adaptive_rsi.release import ApiRejected, advance, api as real_api, authorize_workflow, candidates, health_check, key, owner_key, pending, retry, workflow_choices
 from adaptive_rsi.delivery import pr_body
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store, encode
@@ -268,6 +268,57 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertFalse(reconciled["rerun_pending"])
             self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 1)
 
+    def test_reconciliation_evidence_survives_rerun_polling_that_still_sees_the_old_attempt(self):
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, conclusion="failure")
+            self.assertEqual(self.tick()["release"]["state"], "failed")
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerunning")
+            # GitHub 未确认新 attempt：超时后进入 rerun_unknown 的人工对账窗口。
+            with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
+                self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
+            # 只读查询读到新 attempt，记录 rerun_confirmed 证据。
+            self.remote = self.remote_run(first, attempt=2, state="in_progress")
+            view = candidates(self.runtime, self.project, self.run["id"], "release")
+            self.assertEqual(view["reconciliation_state"], "rerun_confirmed")
+            saved = self.runtime.store.setting(key(self.run["id"], "release"))
+            self.assertEqual(saved["reconciliation"]["state"], "rerun_confirmed")
+            # 轮询短暂回落到旧 attempt 时，已确认的证据不得被覆写。
+            self.remote = self.remote_run(first, conclusion="failure")
+            self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
+            saved = self.runtime.store.setting(key(self.run["id"], "release"))
+            self.assertEqual(saved["reconciliation"]["state"], "rerun_confirmed")
+            self.assertEqual([item["id"] for item in saved["reconciliation"]["candidates"]], [17])
+            # 新 attempt 再次可见时轮询才推进状态与证据。
+            self.remote = self.remote_run(first, attempt=2, state="in_progress")
+            self.assertEqual(self.tick()["release"]["state"], "running")
+            saved = self.runtime.store.setting(key(self.run["id"], "release"))
+            self.assertEqual(saved["reconciliation"]["state"], "matched")
+
+    def test_reconciliation_still_lands_after_evidence_recorded(self):
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["release"]
+            self.remote = self.remote_run(first, conclusion="failure")
+            self.assertEqual(self.tick()["release"]["state"], "failed")
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerunning")
+            with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
+                self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
+            self.remote = self.remote_run(first, attempt=2, state="in_progress")
+            candidates(self.runtime, self.project, self.run["id"], "release")
+            saved = self.runtime.store.setting(key(self.run["id"], "release"))
+            self.assertEqual(saved["reconciliation"]["state"], "rerun_confirmed")
+            self.remote = self.remote_run(first, conclusion="failure")
+            with patch("adaptive_rsi.release.time.time", return_value=time.time() + 301):
+                self.assertEqual(self.tick()["release"]["state"], "rerun_unknown")
+            from adaptive_rsi.dashboard import records
+            self.assertFalse(pending(self.runtime, self.run))
+            self.assertEqual(records(self.runtime.store, self.project)["tasks"][0]["display_state"], "release_failed")
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "release")["state"], "rerun_unknown")
+            self.remote = self.remote_run(first, attempt=2)
+            reconciled = retry(self.runtime, self.project, self.run["id"], "release")
+            self.assertEqual(reconciled["state"], "workflow_succeeded")
+            self.assertEqual(sum(item[0].endswith("/rerun") for item in self.commands), 1)
+
     def test_rollback_rerun_rejection_and_unknown_are_not_stuck_rolling_back(self):
         from adaptive_rsi.release import save
         self.setup_deployment(rollback=True)
@@ -354,6 +405,121 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(config), self.run["id"]))
         self.run["config"] = encode(config)
         return deploy
+
+    def test_rejected_preflight_leaves_waiting_release_with_failed_state_and_manual_entry(self):
+        self.runtime.configure({"delivery": {"deploy": self.policy}}, self.project)
+        config = self.runtime.config(self.project)
+        self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(config), self.run["id"]))
+        self.run["config"] = encode(config)
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()
+            self.assertEqual(first["deploy"]["state"], "waiting_release")
+            self.remote = self.remote_run(first["release"])
+            owner = owner_key(self.project, "example/project", self.policy)
+            self.runtime.store.put_setting(owner, {"run": self.run["id"], "sha": MERGED})
+            # Trusted tag lookup 被显式拒绝（404）：dispatch 前的 validate_pin 失败。
+            def rejected(repo, endpoint, method="GET", fields=None):
+                if endpoint.startswith("git/ref/tags/"):
+                    raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+                return self.api(repo, endpoint, method, fields)
+            with patch("adaptive_rsi.release.api", side_effect=rejected):
+                self.tick()
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["dispatch_receipt"], "rejected")
+        self.assertEqual(saved["dispatch_http_status"], 404)
+        self.assertTrue(saved.get("operation_id"))
+        from adaptive_rsi.dashboard import records
+        self.assertFalse(pending(self.runtime, self.run))
+        self.assertEqual(records(self.runtime.store, self.project)["tasks"][0]["display_state"], "deploy_failed")
+        # 人工介入入口：retry 按被拒回执重新派发，且只重发一次。
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            self.assertEqual(retry(self.runtime, self.project, self.run["id"], "deploy")["state"], "submitted")
+        self.assertEqual(sum("/dispatches" in item[0] for item in self.commands), 2)
+
+    def test_rejected_preflight_release_failure_is_terminal_for_its_own_run(self):
+        self.runtime.configure({"delivery": {"deploy": self.policy}}, self.project)
+        config = self.runtime.config(self.project)
+        self.runtime.store.execute("UPDATE runs SET config=? WHERE id=?", (encode(config), self.run["id"]))
+        self.run["config"] = encode(config)
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()
+            self.assertEqual(first["deploy"]["state"], "waiting_release")
+            self.remote = self.remote_run(first["release"])
+            owner = owner_key(self.project, "example/project", self.policy)
+            self.runtime.store.put_setting(owner, {"run": self.run["id"], "sha": MERGED})
+            def rejected(repo, endpoint, method="GET", fields=None):
+                if endpoint.startswith("git/ref/tags/"):
+                    raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+                return self.api(repo, endpoint, method, fields)
+            with patch("adaptive_rsi.release.api", side_effect=rejected):
+                self.tick()
+        saved = self.runtime.store.setting(key(self.run["id"], "deploy"))
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["dispatch_receipt"], "rejected")
+        self.assertTrue(saved.get("operation_id"))
+        from adaptive_rsi.dashboard import records
+        self.assertFalse(pending(self.runtime, self.run))
+        self.assertEqual(records(self.runtime.store, self.project)["tasks"][0]["display_state"], "deploy_failed")
+        # 终态失败只属于本 run：release 仍保持成功状态，不被覆盖。
+        self.assertEqual(self.runtime.store.setting(key(self.run["id"], "release"))["state"], "workflow_succeeded")
+
+    def test_retry_rejected_preflight_without_owner_acquires_deployment_ownership(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", deploy))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["state"], "submitted")
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
+    def test_retry_rejected_preflight_with_terminal_owner_and_ahead_transfers_ownership(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        previous_run = "previous-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": previous_run, "sha": PREVIOUS})
+        self.runtime.store.put_setting(key(previous_run, "deploy"), {"state": "healthy"})
+        def api_ahead(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=api_ahead):
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["state"], "submitted")
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
+    def test_retry_rejected_preflight_refuses_when_another_deployment_active(self):
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        active_run = "active-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": active_run, "sha": PREVIOUS})
+        self.runtime.store.put_setting(key(active_run, "deploy"), {"state": "dispatching"})
+        self.commands.clear()
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            with self.assertRaisesRegex(ValueError, "Another deployment is still active on this target"):
+                retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertFalse(any("/dispatches" in item[0] for item in self.commands))
 
     def test_deploy_success_without_health_target_is_explicitly_unverified(self):
         self.setup_deployment()
