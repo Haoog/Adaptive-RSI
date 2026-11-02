@@ -37,6 +37,9 @@ MAX_PAGE_BYTES = 32 * 1024
 DEFAULT_SEARCH_LIMIT = 50
 MAX_SEARCH_LIMIT = 100
 MAX_SEARCH_LINES = 200000
+# Per-search result budget: stop at a line boundary and report a cursor instead
+# of growing one response until the whole envelope has to be externalized.
+SEARCH_RESULT_BYTES = 96000
 _MAX_METADATA_BYTES = 64 * 1024
 
 
@@ -215,6 +218,8 @@ class ArtifactStore:
             "artifact": artifact, "kind": kind, "bytes": len(data),
             "lines": metadata["lines"], "sha256": digest,
             "preview": _preview(text), "truncated": True,
+            "reason": "result byte limit",
+            "next_offset": 0,
             "summary": "%d bytes / %d lines stored outside the workspace; use read_artifact or search_artifact with this id"
                        % (len(data), metadata["lines"]),
         }
@@ -320,7 +325,9 @@ class ArtifactStore:
         return {"artifact": artifact, "offset": start,
                 "next_offset": None if eof else next_offset, "eof": eof,
                 "bytes": size, "lines": metadata.get("lines", 0),
-                "content": text, "truncated": not eof, "kind": metadata.get("kind"),
+                "content": text, "truncated": not eof,
+                "reason": "page limit" if not eof else None,
+                "kind": metadata.get("kind"),
                 "sha256": metadata["sha256"]}
 
     def search(self, artifact, text, case_sensitive=True, regex=False, cursor=None,
@@ -355,6 +362,7 @@ class ArtifactStore:
         reason = None
         next_line = None
         scanned = 0
+        output_bytes = 0
         for number in range(start_line, len(lines) + 1):
             scanned += 1
             if scanned > MAX_SEARCH_LINES:
@@ -366,7 +374,13 @@ class ArtifactStore:
                 if len(matches) >= limit:
                     reason, next_line = "match limit", number
                     break
-                matches.append({"line": number, "text": line[:1000]})
+                row = {"line": number, "text": line[:1000]}
+                row_bytes = len(json.dumps(row).encode("utf-8"))
+                if output_bytes + row_bytes > SEARCH_RESULT_BYTES:
+                    reason, next_line = "result byte limit", number
+                    break
+                matches.append(row)
+                output_bytes += row_bytes
         return {"artifact": artifact, "matches": matches, "truncated": reason is not None,
                 "reason": reason, "limit": limit, "lines": len(lines),
                 "bytes": metadata["bytes"], "next_cursor":
@@ -397,6 +411,7 @@ def compact_result(store, tool_name, value, inline_bytes=INLINE_BODY_BYTES) -> A
         if changed:
             result["artifacts"] = artifacts
             result["truncated"] = True
+            result["reason"] = "result byte limit"
             return result
         return value
     if isinstance(value, str):
@@ -409,6 +424,7 @@ def compact_result(store, tool_name, value, inline_bytes=INLINE_BODY_BYTES) -> A
         if _encoded_length(result) > MAX_RESULT_BYTES:
             reference = store.put(tool_name + "_result", json.dumps(result, ensure_ascii=False))
             return {**reference, "structure": "json",
+                    "truncated": True, "reason": "result byte limit",
                     "note": "The full structured result is stored as JSON text in this artifact."}
         return result
     if isinstance(value, list):
@@ -416,6 +432,7 @@ def compact_result(store, tool_name, value, inline_bytes=INLINE_BODY_BYTES) -> A
         if _encoded_length(result) > MAX_RESULT_BYTES:
             reference = store.put(tool_name + "_result", json.dumps(result, ensure_ascii=False))
             return {**reference, "structure": "json",
+                    "truncated": True, "reason": "result byte limit",
                     "note": "The full structured result is stored as JSON text in this artifact."}
         return result
     return value
