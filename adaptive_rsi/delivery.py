@@ -762,7 +762,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     identity = runtime.store.setting("run-baseline:" + run["id"])
     if not identity or not identity.get("repository") or not identity.get("branch"):
         raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
-    pinned = merge(config, {"github": {"repository": identity["repository"]},
+    pinned = merge(saved, {"github": {"repository": identity["repository"]},
                             "delivery": {"base_branch": identity["branch"]}})
     source, head, branch = baseline(runtime, project, pinned)
     if branch != identity["branch"]:
@@ -788,7 +788,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if acceptance:
         acceptance["change_kind"] = "preservation"
     checks = saved["checks"]
-    effective = {**config, "environment": saved["environment"]}
+    effective = pinned
     output_path("evaluation/report.json")
     reused = previous.get("evaluation") if previous.get("head") == head and isinstance(
         previous.get("evaluation"), dict) else None
