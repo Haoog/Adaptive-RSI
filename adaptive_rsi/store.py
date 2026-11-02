@@ -598,7 +598,7 @@ class Store:
             return default
 
     def put_namespaced_setting(self, namespace, key, value, version=1, ttl=None):
-        """Explicit opt-in envelope; existing settings retain their wire format."""
+        """Typed and versioned settings envelope with unified wire format."""
         if not isinstance(namespace, str) or not namespace or ':' in namespace:
             raise ValueError("Invalid settings namespace")
         if not isinstance(key, str) or not key or type(version) is not int or version < 1:
@@ -611,22 +611,164 @@ class Store:
             json.dumps(value, allow_nan=False)
         except (ValueError, TypeError) as exc:
             raise ValueError("Settings value must be finite JSON") from exc
-        self.put_setting('namespace:' + namespace + ':' + key,
-                         {"version": version, "type": type(value).__name__, "value": value,
-                          "expires": time.time() + ttl if ttl is not None else None})
+        envelope = {
+            "version": version,
+            "type": type(value).__name__,
+            "value": value,
+            "expires": time.time() + ttl if ttl is not None else None,
+        }
+        legacy_key = namespace + ':' + key
+        envelope_key = 'namespace:' + namespace + ':' + key
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not legacy_key.startswith('namespace:'):
+                db.execute("DELETE FROM settings WHERE key=?", (legacy_key,))
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (envelope_key, encode(envelope)))
 
     def namespaced_setting(self, namespace, key, expected_type, version=1, default=None, now=None):
-        envelope = self.setting('namespace:' + namespace + ':' + key)
-        if not isinstance(envelope, dict) or envelope.get('version') != version:
+        if not isinstance(namespace, str) or not namespace or ':' in namespace:
             return default
-        value = envelope.get('value')
-        if type(value) is not expected_type or envelope.get('type') != expected_type.__name__:
+        if not isinstance(key, str) or not key or type(version) is not int or version < 1:
             return default
-        expires = envelope.get('expires')
-        if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
-                                    expires <= (time.time() if now is None else now)):
+        target_type = type(None) if expected_type is None else expected_type
+        if target_type not in (dict, list, str, int, float, bool, type(None)):
             return default
-        return value
+
+        envelope_key = 'namespace:' + namespace + ':' + key
+        legacy_key = namespace + ':' + key
+        is_legacy_eligible = not legacy_key.startswith('namespace:')
+
+        current_time = time.time() if now is None else now
+
+        def _parse(raw_str):
+            try:
+                raw = json.loads(raw_str)
+            except (ValueError, TypeError):
+                return False, None, False
+            is_env = (
+                isinstance(raw, dict)
+                and set(raw.keys()) <= {"version", "type", "value", "expires"}
+                and "version" in raw
+                and "type" in raw
+                and "value" in raw
+            )
+            return True, raw, is_env
+
+        def _eval_env(env):
+            if not isinstance(env.get("version"), int) or env.get("version") != version:
+                return False, default
+            val = env.get("value")
+            if type(val) is not target_type or env.get("type") != target_type.__name__:
+                return False, default
+            expires = env.get("expires")
+            if expires is not None and (type(expires) not in (int, float) or not math.isfinite(expires) or
+                                        expires <= current_time):
+                return False, default
+            return True, val
+
+        # 1. 读快速路径（无事务）：检查规范信封键
+        row = self.one("SELECT value FROM settings WHERE key=?", (envelope_key,))
+        if row is not None:
+            valid, raw, is_env = _parse(row["value"])
+            if not valid:
+                return default
+            if is_env:
+                ok, val = _eval_env(raw)
+                return val if ok else default
+            # row 存在但非信封格式（存量旧数据直接写入了带 namespace: 前缀键），需锁内就地升级
+
+        # 2. envelope_key 未命中时，无锁探测 legacy_key（若有资格）
+        if row is None:
+            if not is_legacy_eligible:
+                return default
+            leg_peek = self.one("SELECT value FROM settings WHERE key=?", (legacy_key,))
+            if leg_peek is None:
+                return default
+            valid, raw, is_env = _parse(leg_peek["value"])
+            if not valid:
+                return default
+            # 探测命中候选旧数据，进入事务复核并条件迁移
+
+        # 3. 惰性升级/迁移写事务：在 BEGIN IMMEDIATE 内重新 SELECT 目标与源，防止覆盖并发新值
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            cur_env = db.execute("SELECT value FROM settings WHERE key=?", (envelope_key,)).fetchone()
+            if cur_env is not None:
+                valid, cur_raw, cur_is_env = _parse(cur_env["value"])
+                if not valid:
+                    return default
+                if cur_is_env:
+                    # 并发写者已提交新信封，放弃迁移，按当前信封返回值
+                    ok, val = _eval_env(cur_raw)
+                    return val if ok else default
+                else:
+                    # 存量旧格式就地升级
+                    if type(cur_raw) is not target_type:
+                        return default
+                    upgraded = {
+                        "version": version,
+                        "type": target_type.__name__,
+                        "value": cur_raw,
+                        "expires": None,
+                    }
+                    db.execute("UPDATE settings SET value=? WHERE key=? AND value=?",
+                               (encode(upgraded), envelope_key, cur_env["value"]))
+                    return cur_raw
+
+            # envelope_key 仍不存在，检查 legacy_key
+            if not is_legacy_eligible:
+                return default
+
+            cur_leg = db.execute("SELECT value FROM settings WHERE key=?", (legacy_key,)).fetchone()
+            if cur_leg is None:
+                return default
+
+            valid, cur_raw, cur_is_env = _parse(cur_leg["value"])
+            if not valid:
+                return default
+
+            if cur_is_env:
+                ok, val = _eval_env(cur_raw)
+                if not ok:
+                    return default
+                # 条件写入规范信封，并仅在源值一致时删除旧键
+                ins = db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)",
+                                 (envelope_key, encode(cur_raw)))
+                if ins.rowcount == 1:
+                    db.execute("DELETE FROM settings WHERE key=? AND value=?",
+                               (legacy_key, cur_leg["value"]))
+                    return val
+                # 若目标已并发写入，重新按当前目标返回
+                after_env = db.execute("SELECT value FROM settings WHERE key=?", (envelope_key,)).fetchone()
+                if after_env is not None:
+                    v_a, r_a, env_a = _parse(after_env["value"])
+                    if v_a and env_a:
+                        ok_a, val_a = _eval_env(r_a)
+                        return val_a if ok_a else default
+                return default
+            else:
+                if type(cur_raw) is not target_type:
+                    return default
+                upgraded = {
+                    "version": version,
+                    "type": target_type.__name__,
+                    "value": cur_raw,
+                    "expires": None,
+                }
+                ins = db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)",
+                                 (envelope_key, encode(upgraded)))
+                if ins.rowcount == 1:
+                    db.execute("DELETE FROM settings WHERE key=? AND value=?",
+                               (legacy_key, cur_leg["value"]))
+                    return cur_raw
+                # 若目标已并发写入，重新按当前目标返回
+                after_env = db.execute("SELECT value FROM settings WHERE key=?", (envelope_key,)).fetchone()
+                if after_env is not None:
+                    v_a, r_a, env_a = _parse(after_env["value"])
+                    if v_a and env_a:
+                        ok_a, val_a = _eval_env(r_a)
+                        return val_a if ok_a else default
+                return default
 
     def put_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(value)))
