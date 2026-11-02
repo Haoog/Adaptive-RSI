@@ -131,6 +131,105 @@ class AuthSessionTests(unittest.TestCase):
                 self.assertEqual(result[broken]["state"], "signed_out")
                 self.assertEqual(result["opencode" if broken == "codex" else "codex"]["state"], "authenticated")
 
+    def test_host_snapshot_lists_credentials_once(self):
+        manager = AuthSessions(self.root / "host-snapshot")
+        try:
+            with patch("adaptive_rsi.auth_sessions.shutil.which", return_value="/fixture/opencode"), patch(
+                    "adaptive_rsi.auth_sessions.detect_opencode",
+                    return_value=OpenCodeCapabilities("1.19.3", (1, 19, 3))), patch(
+                    "adaptive_rsi.auth_sessions.auth_providers", return_value=["openai"]) as discover:
+                self.assertEqual(manager.snapshot()["opencode"]["authenticated_providers"], ["openai"])
+                discover.assert_called_once()
+                self.assertEqual(discover.call_args.args[0], "/fixture/opencode")
+        finally:
+            manager.close()
+
+    def test_deeply_nested_json_is_rejected_without_breaking_snapshot_or_startup(self):
+        payload = '[' * 100000 + ']' * 100000
+        path = self.root / 'codex/auth.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(payload)
+        with self.assertRaises(AuthError) as caught:
+            auth_sessions._read_json(path)
+        self.assertEqual(caught.exception.code, 'invalid_credentials')
+        self.assertEqual(self.manager.snapshot()['codex']['error'], 'invalid_credentials')
+        state = self.root / 'nested-state'
+        state.mkdir()
+        (state / 'auth-sessions.json').write_text(payload)
+        manager = AuthSessions(state, factory=self.factory)
+        try:
+            self.assertEqual(manager.sessions, {})
+            self.assertEqual((state / 'auth-sessions.json').read_text(), payload)
+        finally:
+            manager.close()
+
+    def test_modern_logout_removes_legacy_provider_without_export(self):
+        path = auth_sessions.auth_path()
+        auth_sessions._write_json(path, {'openai': {'type': 'api', 'key': 'fixture'},
+                                        'other': {'type': 'api', 'key': 'keep'}})
+        manager = AuthSessions(self.root / 'modern-logout')
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider', return_value=True), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=False), \
+                 patch.object(manager, 'snapshot', return_value={}):
+                manager.logout('opencode', 'openai')
+            self.assertEqual(auth_sessions._read_json(path), {'other': {'type': 'api', 'key': 'keep'}})
+        finally:
+            manager.close()
+
+    def test_authorization_rejection_within_ttl_is_not_expiration(self):
+        worker = FakeAuth('opencode', self.gate)
+        self.created.append(worker)
+        with patch.object(worker, 'complete', return_value=False), \
+             patch.object(self.manager, 'factory', return_value=worker):
+            session = self.manager.start('opencode', 'openai')
+            result = self.wait_state(session, 'failed')
+        self.assertEqual(result['error'], 'authorization_failed')
+        self.assertGreater(result['expires_at'], time.time())
+
+    def test_unexpected_worker_error_emits_type_without_sensitive_message(self):
+        with patch.object(self.manager, 'factory', side_effect=ValueError('SECRET-CREDENTIAL')), \
+             self.assertLogs('adaptive_rsi.auth_sessions', level='WARNING') as logs:
+            session = self.manager.start('opencode', 'openai')
+            self.assertEqual(self.wait_state(session, 'failed')['error'], 'auth_protocol_error')
+        self.assertIn('ValueError', '\n'.join(logs.output))
+        self.assertIn(session['id'], '\n'.join(logs.output))
+        self.assertNotIn('SECRET-CREDENTIAL', '\n'.join(logs.output))
+
+    def test_production_opencode_snapshot_rejects_deep_legacy_json(self):
+        path = auth_sessions.auth_path()
+        path.parent.mkdir(parents=True)
+        payload = '[' * 100000 + ']' * 100000
+        path.write_text(payload)
+        for binary in (None, '/fixture/opencode'):
+            with self.subTest(binary=binary):
+                manager = AuthSessions(self.root / ('legacy-host' if binary else 'legacy-fallback'))
+                try:
+                    with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=binary), \
+                         patch('adaptive_rsi.opencode.shutil.which', return_value=binary), \
+                         patch('adaptive_rsi.auth_sessions.detect_opencode',
+                               return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))):
+                        result = manager.snapshot()
+                    self.assertEqual(result['opencode']['error'], 'invalid_credentials')
+                    self.assertEqual(result['codex']['state'], 'signed_out')
+                    self.assertEqual(path.read_text(), payload)
+                finally:
+                    manager.close()
+
+    def test_production_opencode_snapshot_rejects_non_object_legacy_json(self):
+        path = auth_sessions.auth_path()
+        path.parent.mkdir(parents=True)
+        path.write_text('[]')
+        manager = AuthSessions(self.root / 'list-state')
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None), \
+                 patch('adaptive_rsi.opencode.shutil.which', return_value=None):
+                self.assertEqual(manager.snapshot()['opencode']['error'], 'invalid_credentials')
+            self.assertEqual(path.read_text(), '[]')
+        finally:
+            manager.close()
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
