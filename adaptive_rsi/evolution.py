@@ -119,6 +119,23 @@ def case_spec(case):
     return spec if isinstance(spec, dict) else None
 
 
+def overlay_available(directory):
+    """配置了 overlay 但目录不可用时返回 False；没有配置 overlay 视为可用。
+
+    用例 overlay 位于维护流程会清理的 suite 目录，也可能随工作树或临时导入目录被删除。
+    调度路径把这种情况当成「不可用」继续轮转，但封存、执行与结果校验必须显式拒绝：评估器
+    应用 overlay 时用 ``os.walk()``，缺失目录只会静默产出空集合，试验会在没有受保护输入的
+    情况下照常判定通过。
+    """
+    if not directory:
+        return True
+    try:
+        return Path(directory).is_dir()
+    except (OSError, TypeError, ValueError):
+        # 非路径类型的 overlay 同样属于「配置了却不可用」；调度与封存都不能因此崩溃。
+        return False
+
+
 def case_stratum(case):
     spec = case_spec(case) or {}
     length = len(spec.get("task", ""))
@@ -206,6 +223,10 @@ class Evolution:
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),
                           "overlay": self.overlay_digest(spec.get("overlay"))}
                 changed = [key for key, value in actual.items() if item.get(key) != value]
+                # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
+                # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
+                if not overlay_available(spec.get("overlay")):
+                    changed = sorted(set(changed) | {"overlay"})
             except (KeyError, ValueError, RuntimeError, OSError):
                 changed = ["unavailable"]
             if changed:
@@ -969,9 +990,12 @@ class Evolution:
         cases = []
         for case in inputs["cases"]:
             spec = case_spec(case)
+            overlay = spec.get("overlay") if spec else None
             cases.append({"id": case["id"], "split": case["split"], "family": case["family"],
                           "spec": fingerprint(spec) if spec is not None else None,
-                          "overlay": self.overlay_digest(spec.get("overlay")) if spec else None,
+                          # 不可用的 overlay 与未配置 overlay 一样按 None 计入调度签名；配置项本身
+                          # 已包含在 spec 指纹里，两者仍可区分。签名阶段只负责轮转，不在这里抛错。
+                          "overlay": self.overlay_digest(overlay) if spec and overlay_available(overlay) else None,
                           "active": spec.get("active", True) if spec else None,
                           "available": spec.get("available", True) if spec else None})
         return fingerprint({"build": BUILD_ID, "limits": config["limits"],
@@ -1021,7 +1045,12 @@ class Evolution:
         if hasattr(self.runtime, "propagate_deadline"):
             self.runtime.propagate_deadline(run, trial_run)
         # A case overlay is host-owned and remains outside model-visible workspaces.
-        if spec.get("overlay") and (trial_dir / "candidate").exists():
+        if spec.get("overlay") and not overlay_available(spec["overlay"]):
+            # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
+            # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
+            outcome = {**(outcome or {}), "decision": "error",
+                       "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
+        elif spec.get("overlay") and (trial_dir / "candidate").exists():
             overlay_result = self.runtime.evaluator.evaluate(
                 trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
                 trial_dir / "protected-evaluation", trial_config,
@@ -1056,6 +1085,16 @@ class Evolution:
                     "code": "evolution_inputs_unchanged"}
         limit = config["evolution"]["max_holdout_uses"]
         cases = self.eligible_cases(project["id"], limit)
+        # 用例导入后 overlay 可能被维护清理或随工作树删除：这类用例不得进入实验。评估器
+        # 复制 overlay 时只遍历目录内容，缺失目录不会报错，试验会在没有受保护输入的情况下
+        # 照常通过；因此这里先排除，让样本不足如实降级为证据不足。
+        unavailable = sorted(case["id"] for case in cases
+                             if not overlay_available((case_spec(case) or {}).get("overlay")))
+        if unavailable:
+            cases = [case for case in cases if case["id"] not in unavailable]
+            self.store.event("evolution_overlay_unavailable",
+                             "Cases with an unavailable overlay were excluded from the experiment",
+                             project["id"], run["id"], {"cases": unavailable})
         minimum = config["evolution"]["min_cases_per_split"]
         validation_cases = [case for case in cases if case["split"] == "validation"]
         # 晋升要求未曝光的 holdout；先按用途过滤新鲜样本，再在新鲜样本内分层选择。
@@ -1075,6 +1114,9 @@ class Evolution:
                 shortfalls.append(f"holdout has {len(fresh_holdout)} of {minimum} fresh cases "
                                   f"(short by {holdout_short})")
             counts = " and ".join(shortfalls)
+            if unavailable:
+                counts += (" (excluded cases whose overlay is unavailable: "
+                           + ", ".join(unavailable) + ")")
             if validation_short and holdout_short:
                 reason = ("Fresh validation and holdout cases are required for promotion; " + counts +
                           ". Import new, previously unused cases for both splits (raising "
