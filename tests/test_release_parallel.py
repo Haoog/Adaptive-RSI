@@ -219,6 +219,74 @@ class ParallelReleaseTest(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
+    def test_selected_sigterm_returns_130_and_reaps_worker(self):
+        # The spawned unittest worker resolves selectors from the repo root, so
+        # the blocking probe has to live inside the real tests package. It is
+        # removed in finally even if the run fails partway through.
+        root = Path(__file__).resolve().parents[1]
+        probe = root / "tests" / "sigterm_probe_tmp.py"
+        pid_file = root / "tests" / "sigterm_probe_tmp.pid"
+        probe.write_text(
+            "import os, time, unittest\n"
+            "class SigtermProbe(unittest.TestCase):\n"
+            "    def test_wait(self):\n"
+            "        with open({!r}, 'w') as marker:\n"
+            "            marker.write(str(os.getpid()))\n"
+            "        time.sleep(60)\n".format(str(pid_file)))
+        pid_file.unlink(missing_ok=True)
+        spawned = time.time()
+        self.addCleanup(probe.unlink, missing_ok=True)
+        self.addCleanup(pid_file.unlink, missing_ok=True)
+        script = str(root / "scripts" / "test_selected.py")
+        out_file = root / "tests" / "sigterm_probe_tmp.out"
+        out_file.unlink(missing_ok=True)
+        self.addCleanup(out_file.unlink, missing_ok=True)
+        out_fd = open(out_file, "w+b")
+        self.addCleanup(out_fd.close)
+        parent = subprocess.Popen([sys.executable, "-u", script, "tests.sigterm_probe_tmp"],
+                                  cwd=str(root), stdout=out_fd, stderr=subprocess.STDOUT,
+                                  start_new_session=True)
+        worker_pid = None
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if pid_file.exists() and pid_file.stat().st_mtime >= spawned - 1:
+                    worker_pid = int(pid_file.read_text().strip())
+                    break
+                if parent.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(worker_pid,
+                                 "test_selected exited early or never spawned its worker: " +
+                                 (parent.stdout.read().decode(errors="replace") if parent.stdout else "") +
+                                 f" [parent rc={parent.poll()} pid={parent.pid}]")
+            # The SIGTERM handler is installed before the worker spawns, but the
+            # worker writes its marker quickly; settle briefly so the parent is
+            # inside the polling loop rather than the import phase.
+            time.sleep(0.5)
+            if parent.poll() is not None:
+                self.fail(f"parent exited {parent.returncode} before SIGTERM; output: " +
+                          (parent.stdout.read().decode(errors="replace") if parent.stdout else ""))
+            parent.send_signal(signal.SIGTERM)
+            rc = parent.wait(timeout=15)
+            output = parent.stdout.read().decode(errors="replace") if parent.stdout else ""
+            self.assertEqual(rc, 130,
+                             "test_selected should map SIGTERM to exit 130; output: " + output)
+            try:
+                os.kill(worker_pid, 0)
+                self.fail("worker survived parent SIGTERM")
+            except ProcessLookupError:
+                pass
+        finally:
+            if parent.returncode is None:
+                parent.kill()
+                parent.wait(timeout=5)
+            if worker_pid is not None:
+                try:
+                    os.killpg(worker_pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
     def test_release_entrypoints_share_one_immutable_asset_writer(self):
         from tests.test_release import WorkflowConfigurationTest
         workflow = WorkflowConfigurationTest().workflow("release.yml")
