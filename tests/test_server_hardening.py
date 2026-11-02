@@ -9,10 +9,12 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import quote
 
 from adaptive_rsi.catalog import CatalogError
 from adaptive_rsi.server import Handler, Server
@@ -398,6 +400,125 @@ class ServerHardeningTest(unittest.TestCase):
         after = self.store.one("SELECT evidence,status FROM candidates WHERE id=?", ("feedback-p",))
         self.assertEqual(after["evidence"], before["evidence"])
         self.assertEqual(after["status"], before["status"])
+
+    def test_task_run_history_pages_without_loss_or_duplicates(self):
+        self.store.execute("INSERT INTO projects(id,name,path,created) VALUES ('p','P','/tmp/p',0)")
+        self.store.execute("INSERT INTO tasks(id,project,title,created) VALUES ('t','p','Task',0)")
+        # 二十次运行共享同一 started，用于验证游标必须同时比较 id 才能继续翻页。
+        for index in range(60):
+            started = 1000.0 if index < 20 else 1000.0 + index
+            self.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) "
+                               "VALUES (?,?,?,?,?,?,?)",
+                               ("run-%02d" % index, "t", "p", "failed", started, started + 1, "{}"))
+        status, _, payload = self.request("/api/task-runs?task=t&project=p&limit=50")
+        self.assertEqual(status, 200)
+        first = json.loads(payload)
+        self.assertEqual(set(first), {"runs", "has_more", "next_before"})
+        self.assertEqual(len(first["runs"]), 50)
+        self.assertTrue(first["has_more"])
+        last = first["runs"][-1]
+        self.assertEqual(last["id"], "run-10")
+        self.assertEqual(first["next_before"], "%s:%s" % (last["started"], last["id"]))
+
+        status, _, payload = self.request("/api/task-runs?task=t&project=p&limit=50&before=" +
+                                          quote(first["next_before"], safe=""))
+        self.assertEqual(status, 200)
+        second = json.loads(payload)
+        self.assertEqual(len(second["runs"]), 10)
+        self.assertFalse(second["has_more"])
+        self.assertIsNone(second["next_before"])
+        self.assertEqual([row["id"] for row in second["runs"]], ["run-%02d" % index for index in range(9, -1, -1)])
+
+        identifiers = [row["id"] for row in first["runs"] + second["runs"]]
+        self.assertEqual(len(identifiers), len(set(identifiers)))
+        self.assertEqual(set(identifiers), {"run-%02d" % index for index in range(60)})
+
+    def test_backup_copy_runs_outside_dispatch_lock(self):
+        from adaptive_rsi import storage_tools
+
+        started, release = threading.Event(), threading.Event()
+        responses, claims, pauses = [], [], []
+
+        def slow_backup(store, **kwargs):
+            started.set()
+            release.wait(5)
+            return {"id": "b" * 16, "bytes": 1, "created": 0.0}
+
+        def claimed(self, project, config):
+            claims.append(project)
+            return None
+
+        self.runtime.pause = lambda project, paused: pauses.append((project, paused))
+        poster = threading.Thread(target=lambda: responses.append(self.request("/api/backup", "POST")), daemon=True)
+        with patch.object(storage_tools, "backup", slow_backup), patch.object(Store, "claim", claimed):
+            poster.start()
+            self.assertTrue(started.wait(5), "备份桩未进入拷贝阶段")
+            try:
+                clock = time.monotonic()
+                status, _, _ = self.request("/api/pause", "POST", {"project": "p", "paused": True})
+                self.assertEqual(status, 200)
+                self.assertLess(time.monotonic() - clock, 0.2, "备份期间 /api/pause 被 dispatch_lock 阻塞")
+                self.assertEqual(pauses, [("p", True)])
+
+                # 调度循环领取任务同样只需 dispatch_lock：备份期间必须能立即进入。
+                def dispatch_once():
+                    with self.runtime.dispatch_lock:
+                        self.store.claim("p", {})
+
+                dispatcher = threading.Thread(target=dispatch_once, daemon=True)
+                clock = time.monotonic()
+                dispatcher.start()
+                dispatcher.join(0.2)
+                self.assertFalse(dispatcher.is_alive(), "备份期间 dispatch_lock 仍被占用")
+                self.assertLess(time.monotonic() - clock, 0.2)
+                self.assertEqual(claims, ["p"])
+
+                # 只读接口不与拷贝争锁，中位数不应因锁竞争变差。
+                latencies = []
+                for _ in range(3):
+                    clock = time.monotonic()
+                    self.assertEqual(self.request("/api/health")[0], 200)
+                    latencies.append(time.monotonic() - clock)
+                self.assertLess(sorted(latencies)[1], 0.2)
+            finally:
+                release.set()
+            poster.join(5)
+        self.assertFalse(poster.is_alive(), "备份请求未结束")
+        status, _, payload = responses[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), {"id": "b" * 16, "bytes": 1, "created": 0.0})
+
+    def test_backup_and_rehearsal_require_updates_ready_before_copying(self):
+        from adaptive_rsi import storage_tools
+        from adaptive_rsi.updates import UpdateInProgress
+
+        checked = []
+
+        def refuse():
+            checked.append(True)
+            raise UpdateInProgress("Software update in progress")
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("更新期间不得开始拷贝")
+
+        self.runtime.updates.require_ready = refuse
+        with patch.object(storage_tools, "backup", forbidden), \
+                patch.object(storage_tools, "rehearse_restore", forbidden):
+            status, _, payload = self.request("/api/backup", "POST")
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(payload)["error_code"], "update_in_progress")
+            status, _, payload = self.request("/api/rehearse-restore", "POST", {"id": self.identifier})
+            self.assertEqual(status, 503)
+            self.assertEqual(json.loads(payload)["error_code"], "update_in_progress")
+        self.assertEqual(checked, [True, True])
+        self.assertEqual(list(self.backups.glob("*.sqlite3")), [])
+
+    def test_backup_endpoint_still_publishes_backup_file(self):
+        status, _, payload = self.request("/api/backup", "POST")
+        self.assertEqual(status, 200)
+        result = json.loads(payload)
+        self.assertEqual(set(result), {"id", "bytes", "created"})
+        self.assertTrue((self.backups / (result["id"] + ".sqlite3")).is_file())
 
 
 if __name__ == "__main__":

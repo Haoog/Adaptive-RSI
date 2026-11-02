@@ -921,6 +921,8 @@ const english = {
   "需要补充能证明问题已解决的检查。": "Add checks that demonstrate the problem is resolved.",
   "检查过程与运行记录": "Checks and run records",
   "以前的运行": "Earlier runs",
+  "加载更早的运行": "Load earlier runs",
+  "已显示最近 {shown} 次运行": "Showing the most recent {shown} runs",
   "项目扫描频率": "Project scan frequency",
   "项目扫描间隔": "Project scan interval",
   "项目扫描间隔单位": "Project scan interval unit",
