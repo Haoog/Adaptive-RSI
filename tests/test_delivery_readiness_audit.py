@@ -455,7 +455,8 @@ class AuthorizationReceiptTest(unittest.TestCase):
         try:
             target = git(case.repo, 'rev-parse', 'HEAD')
             outcome = {'merged_sha': target, 'feedback': {'state': 'verified'}}
-            with patch.object(release, 'api', side_effect=case.api):
+            with patch.object(release, 'api', side_effect=case.api), \
+                    patch.object(case.runtime.evaluator, 'evaluate', return_value={'decision': 'fail'}):
                 data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
             self.assertEqual(data['release']['state'], 'blocked_verification')
             self.assertNotIn('head', outcome['feedback'])

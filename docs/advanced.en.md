@@ -49,6 +49,8 @@ The scheduler waits between scans; queued tasks proceed when ready. Delivery def
 
 After deployment health checks fail, choose “Recheck health” in task details. This observes the current deployment again without dispatching another workflow. Once healthy, stale rollback warnings are cleared while the existing rollback target is retained.
 
+When a release workflow fails, its dependent deployment shows the blocking reason and stops automatically waiting. Retrying the release resumes waiting for its result.
+
 ## Code quality gates
 
 Implementation and review use separate sessions with different permissions. Review can use a different provider. All six review areas require reasoned assessments; actionable findings include severity, file, line, impact and a suggested change. Reports appear in task details.
@@ -352,6 +354,8 @@ Multi-project scheduling compares completed worker occupancy over the last 24 ho
 The database compatibility format remains v2. Subsequent maintenance migrations store SHA-256 hashes of their actual SQL bytes and validate applied history before changes. Modified migration content, unknown versions or history gaps block ordinary startup; offline diagnostics remain available for the source database. SQL changes and their ledger entry commit together. Legacy migrations 1/2 retain identifier-only checksums, which cannot retrospectively verify the old bootstrap body. Once sealed, startup no longer repeats the full backfill. This does not retroactively make the old bootstrap's transaction-external DDL atomic.
 
 Deployment health policy: `delivery.deploy.health_attempts` is the total round limit (1–10); `health_consecutive_successes` is the required consecutive count (1–round limit, default 1); `health_interval_seconds` is the interval (1–300 seconds); `health_warmup_seconds` is warmup (0–900 seconds). `health_url` is primary and `health_urls` adds up to seven distinct HTTPS URLs without credentials, query or fragment. Each round shares a 15-second total deadline. All endpoints must confirm the target full SHA; failure resets the success streak. Exhausting rounds without the required streak fails the gate. Observations persist across restart, and rollback follows the same policy. A successful individual sample does not by itself satisfy the observation gate.
+
+Multiple endpoints are checked concurrently, each for at most 10 seconds within the shared deadline. Transport failures and endpoints that could not be checked are unconfirmed and do not themselves trigger automatic rollback. When the observation deadline expires, the status is unconfirmed and health can be checked again manually. A confirmed endpoint failure still follows the failure policy.
 
 Data migration rollback protection: `delivery.deploy.rollback_data_policy` defaults to `manual`, including configurations created before this field existed. Only `backward_compatible` declares that the maintainer has verified the older program can read migrated data. Even with `automatic_rollback` enabled, an undeclared policy blocks new rollback dispatch. `rollback_recovery_notes` stores up to 2000 characters of manual instructions displayed verbatim in failure details. Describe database backups, reverse migration steps and compatible program versions; omit credentials. This declaration does not replace migration compatibility testing. Already-dispatched remote rollbacks remain tracked; the system does not pretend to retract an existing side effect.
 

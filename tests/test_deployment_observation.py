@@ -1,5 +1,6 @@
 """Stable health observations apply to all endpoints and both delivery directions."""
 import json
+import threading
 from pathlib import Path
 import tempfile
 import unittest
@@ -43,6 +44,51 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertEqual(stable['sha'], self.data['sha'])
         self.assertEqual(len(self.data['health_observations']), 4)
 
+    def test_unknown_breaks_consecutive_successes(self):
+        self.tick(True, 100)
+        self.tick(None, 110)
+        self.assertEqual(self.tick(True, 120)['state'], 'workflow_succeeded')
+
+    def test_warmup_does_not_consume_unknown_observation_window(self):
+        self.policy['health_warmup_seconds'] = 900
+        self.tick(None, 100)
+        self.assertEqual(self.tick(None, 1000)['state'], 'workflow_succeeded')
+
+    def test_direct_transport_error_is_unconfirmed(self):
+        from adaptive_rsi.release import direct_health_check
+        with patch('urllib.request.build_opener', side_effect=OSError('connection failed')):
+            report = direct_health_check(self.policy['health_url'], self.data['sha'])
+        self.assertIsNone(report['healthy'])
+
+    def test_rollback_unknown_preserves_ownership(self):
+        from adaptive_rsi.release import deployment_terminal
+        self.data.update(state='rolling_back', rollback={'state': 'workflow_succeeded', 'sha': 'c' * 40})
+        with patch('adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, data, **kwargs: data):
+            self.tick(None, 100)
+            result = self.tick(None, 1000)
+        self.assertEqual(result['state'], 'rollback_health_unconfirmed')
+        self.assertFalse(deployment_terminal(result, self.policy))
+
+    def test_health_save_error_does_not_publish_partial_success(self):
+        import copy
+        self.policy['health_consecutive_successes'] = 1
+        for state in ('workflow_succeeded', 'rolling_back'):
+            data = {**self.data, 'state': state}
+            if state == 'rolling_back':
+                data['rollback'] = {'state': 'workflow_succeeded', 'sha': 'c' * 40}
+            original = copy.deepcopy(data)
+            calls = []
+            def persist(runtime, run, kind, value, **kwargs):
+                calls.append(kwargs)
+                raise TypeError('injected internal error')
+            with self.subTest(state=state), patch('adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, value, **kwargs: value), \
+                 patch('adaptive_rsi.release.health_check', return_value={'healthy': True}):
+                with self.assertRaisesRegex(TypeError, 'injected internal error'):
+                    deployment_health(self.runtime, self.project, self.run, data, self.policy, None, persist=persist)
+            self.assertEqual(data, original)
+            self.assertEqual(len(calls), 1)
+            self.assertIn('stable', calls[0])
+
     def test_healthy_observation_clears_stale_rollback_warnings(self):
         self.policy['health_consecutive_successes'] = 1
         self.data.update(rollback_unavailable=True, rollback_blocked_reason='data_compatibility',
@@ -64,6 +110,61 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertTrue(result['health']['healthy'])
         self.assertIsNone(self.store.setting(stable_key('p', 'example/project', self.policy['health_url'])))
 
+    def test_parallel_probes_inherit_context_and_unknown_is_bounded(self):
+        from contextvars import ContextVar
+        from adaptive_rsi.release import observe_health
+        context = ContextVar('fixture_health_context', default=None)
+        token = context.set('operation')
+        try:
+            self.policy['health_urls'] = ['https://eu.example/health']
+            def probe(url, sha, timeout):
+                self.assertEqual(context.get(), 'operation')
+                return {'healthy': True}
+            with patch('adaptive_rsi.release.health_check', side_effect=probe):
+                self.assertTrue(health_sample(self.policy, 'b' * 40)['healthy'])
+        finally:
+            context.reset(token)
+        data = {}
+        for now in (100, 1000):
+            state = observe_health(data, {'healthy': None}, self.policy, now)
+        self.assertEqual(state, 'health_unconfirmed')
+        self.assertLessEqual(len(data['health_observations']), 10)
+
+    def test_health_transport_failure_is_unknown_and_can_be_retried(self):
+        from adaptive_rsi.release import health_check
+        with patch('adaptive_rsi.process.checked', side_effect=OSError('fixture unavailable')):
+            report = health_check(self.policy['health_url'], self.data['sha'])
+        self.assertIsNone(report['healthy'])
+        self.data['state'] = 'health_unconfirmed'
+        self.data.update(operation_id='fixture', health_started_at=1, health_retry_at=100, health_observations=[report])
+        from adaptive_rsi.release import retry
+        with patch.object(self.runtime.store, 'one', return_value={'id': 'run', 'result': '{}', 'config': json.dumps({'delivery': {'deploy': self.policy}})}), \
+             patch.object(self.runtime, 'project', return_value=self.project), \
+             patch('adaptive_rsi.release.authorized', return_value='example/project'), \
+             patch('adaptive_rsi.release._read_automation', return_value=(dict(self.data), '{}')), \
+             patch('adaptive_rsi.release._retry_target_allowed', return_value=True), \
+             patch('adaptive_rsi.release.deployment_owner', return_value=None), \
+             patch('adaptive_rsi.release.save'):
+            result = retry(self.runtime, 'p', 'run', 'deploy')
+        self.assertEqual(result['state'], 'workflow_succeeded')
+        self.assertNotIn('health_started_at', result)
+
+    def test_health_retry_rechecks_owner_after_validation(self):
+        from adaptive_rsi.release import retry
+        for state in ('health_unconfirmed', 'rollback_health_unconfirmed'):
+            data = {**self.data, 'state': state, 'operation_id': 'fixture',
+                    'rollback': {'state': 'workflow_succeeded', 'sha': 'c' * 40}}
+            run = {'id': 'run', 'result': '{}', 'config': json.dumps({'delivery': {'deploy': self.policy}})}
+            with self.subTest(state=state), patch.object(self.runtime.store, 'one', return_value=run), \
+                 patch.object(self.runtime, 'project', return_value=self.project), \
+                 patch('adaptive_rsi.release._read_automation', return_value=(data, '{}')), \
+                 patch('adaptive_rsi.release._retry_target_allowed', return_value=True), \
+                 patch('adaptive_rsi.release.deployment_owner', side_effect=[{'run': 'run'}, {'run': 'newer'}]), \
+                 patch('adaptive_rsi.release.save') as save:
+                with self.assertRaisesRegex(ValueError, 'newer deployment'):
+                    retry(self.runtime, 'p', 'run', 'deploy')
+                save.assert_not_called()
+
     def test_all_endpoints_must_agree_with_shared_deadline(self):
         self.policy['health_urls'] = ['https://eu.example/health', 'https://us.example/health']
         def probe(url, sha, timeout):
@@ -74,11 +175,14 @@ class DeploymentObservationTest(unittest.TestCase):
         self.assertFalse(report['healthy'])
         self.assertEqual(len(report['checks']), 3)
         self.assertEqual(check.call_count, 3)
-        with patch('adaptive_rsi.release.time.monotonic', side_effect=[0, 1, 16, 17]), patch('adaptive_rsi.release.health_check',
-                return_value={'healthy': True}) as check:
+        barrier = threading.Barrier(3)
+        def simultaneous(url, sha, timeout):
+            barrier.wait(timeout=1)
+            return {'url': url, 'healthy': True}
+        with patch('adaptive_rsi.release.health_check', side_effect=simultaneous) as check:
             report = health_sample(self.policy, 'b' * 40)
-        self.assertEqual(check.call_count, 1)
-        self.assertFalse(report['healthy'])
+        self.assertEqual(check.call_count, 3)
+        self.assertTrue(report['healthy'])
         self.assertEqual(len(report['checks']), 3)
 
     def test_rollback_requires_same_consecutive_observation(self):
