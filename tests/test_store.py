@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.store import POOL_SIZE, Store
+from adaptive_rsi.store import POOL_SIZE, Store, encode
 
 
 class StorePoolTest(unittest.TestCase):
@@ -170,6 +170,42 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store.namespaced_setting('broken_ns', 'bad', dict, default='fallback'), 'fallback')
         self.assertEqual(self.store.namespaced_setting('ns', 'overwritten', int, version=2), 12345)
         self.assertEqual(self.store._pool.qsize(), 1)
+
+    def test_namespaced_lazy_migration_loses_to_concurrent_envelope_writer(self):
+        # 线程 B：迁移事务开始前，并发写者已 committed 新的 v2 信封（不经
+        # put_namespaced_setting，legacy 行仍在）。迁移必须基于事务内的重新
+        # SELECT：读者拿到默认值而不是复活旧值，v2 信封不得被 v1 升级覆盖。
+        self.store.execute("INSERT INTO settings VALUES ('ns:item','\"legacy\"')")
+        v2_envelope = {"version": 2, "type": "str", "value": "v2", "expires": None}
+        injected = []
+        store = self.store
+        real_connect = self.store.connect
+
+        @contextlib.contextmanager
+        def racing_connect():
+            with real_connect() as db:
+                class Proxy:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    def execute(self, sql, args=()):
+                        if not injected and sql == "BEGIN IMMEDIATE":
+                            injected.append(True)
+                            # 写者恰在迁移事务前经自己的连接提交 v2 信封。
+                            with contextlib.closing(store._new_connection()) as writer:
+                                writer.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                               ('namespace:ns:item', encode(v2_envelope)))
+                                writer.commit()
+                        return db.execute(sql, args)
+
+                yield Proxy()
+
+        with patch.object(self.store, 'connect', racing_connect):
+            result = self.store.namespaced_setting('ns', 'item', str)
+        self.assertIsNone(result)
+        self.assertTrue(injected)
+        self.assertEqual(self.store.namespaced_setting('ns', 'item', str, version=2), 'v2')
+        self.assertIsNone(self.store.namespaced_setting('ns', 'item', str))
 
     def test_namespaced_setting_lazy_migration_race_protects_concurrent_write(self):
         # 验收标准 1：并发写者在读出 legacy 之后写入 v2 信封 → 最终值必须是 v2（旧值不得复活）
