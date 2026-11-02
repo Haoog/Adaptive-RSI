@@ -891,10 +891,12 @@ window.RSIExperience = (() => {
         }
         return;
       }
-      const history = await api(
+      const page = await api(
         "task-runs?task=" + task.id + "&project=" + task.project + "&limit=50",
       );
       if (!current()) return;
+      // `/api/task-runs` returns a page envelope; keep accepting the old bare array.
+      const history = Array.isArray(page) ? page : (Array.isArray(page?.runs) ? page.runs : []);
       const latest = history[0];
       if (latest) {
         const data = await api("run?id=" + latest.id);

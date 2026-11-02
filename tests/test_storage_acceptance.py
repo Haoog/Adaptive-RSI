@@ -602,6 +602,7 @@ class StorageAcceptanceTest(unittest.TestCase):
     def test_rehearsal_server_endpoints_trigger_and_retrieve_report(self):
         import http.client
         from types import SimpleNamespace
+        from adaptive_rsi.operations import Operations
         from adaptive_rsi.server import Server
 
         self.store.add_task('p', 'manual', 'rehearsal-task', 'task for rehearsal')
@@ -612,6 +613,8 @@ class StorageAcceptanceTest(unittest.TestCase):
                                  updates=SimpleNamespace(require_ready=lambda: None),
                                  wake=threading.Event(),
                                  shutdown_status=lambda: {})
+        runtime.operations = Operations(runtime)
+        self.addCleanup(runtime.operations.close)
         server = Server(runtime)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
@@ -719,6 +722,7 @@ class StorageAcceptanceTest(unittest.TestCase):
 
         # 1. Via Operations execute
         operations = Operations(runtime)
+        runtime.operations = operations
         self.addCleanup(operations.pool.shutdown, False)
 
         with sqlite3.connect(self.store.path) as db:

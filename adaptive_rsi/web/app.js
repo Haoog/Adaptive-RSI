@@ -746,6 +746,7 @@ function valueFeedback(data){
   finally{button.disabled=false;}
  },form);});return form;
 }
+function runPageRows(page){return Array.isArray(page)?page:(Array.isArray(page?.runs)?page.runs:[]);}
 async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&$('detail-dialog').open&&detailTask?.id===task.id&&detailTask?.project===task.project&&projectId===task.project)queueDraft=window.RSIExperience?.queueDraft();const ticket=++detailSequence,project=projectId;detailTask=task;$('detail-title').textContent=task.title;const body=$('detail-body');body.replaceChildren(badge(task.state));
  // A request can finish after the user closed the previous detail view.
  // Only show the dialog after checking that this exact request is still current.
@@ -754,7 +755,10 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
  window.RSIExperience?.taskOpened(task,queueDraft);
  const requirements=el('section',undefined,'task-requirements'),copy=el('p',task.body);copy.id='task-requirements';requirements.append(el('h3',t('任务要求')),copy);body.append(requirements);
  const evidence=lazyEvidence('来源与证据',()=>task.evidence||'');evidence.className='detail-section';body.append(evidence);
- const history=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ const firstPage=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50');if(ticket!==detailSequence||projectId!==project)return;
+ // 响应为分页信封；同时接受旧服务端的裸数组，避免升级期间把历史区显示为空。
+ const history=runPageRows(firstPage);
+ let historyBefore=!Array.isArray(firstPage)&&firstPage?.has_more&&firstPage.next_before?firstPage.next_before:null;
  async function loadRun(run,index,section){const data=await api('run?id='+run.id);if(ticket!==detailSequence||projectId!==project)return;
   section.replaceChildren();
   if(index===0){const outcome=taskOutcome(data);outcome.id='live-task-outcome';body.insertBefore(outcome,evidence);window.RSIExperience?.enhanceOutcome(outcome,data);await renderReleaseOutcome(outcome,run,project);if(ticket!==detailSequence||projectId!==project)return;}
@@ -779,7 +783,7 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
   if(index===0)body.insertBefore(delivery,evidence);else section.append(delivery);
   restoreView?.(body);
   }
- for(const [index,run] of history.entries()){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));body.append(section);
+ function appendRun(run,index,before){const section=el('details',undefined,'detail-section');section.dataset.run=run.id;section.append(el('summary',t(index===0?'检查过程与运行记录':'以前的运行')+' · '+run.id));
   // 加载失败不能让区块永久空白：失败后在区块内给出错误项与重试入口；进行中的请求不重复发起。
   let loaded=false,loading=false;
   const load=async()=>{if(loading||loaded)return;loading=true;
@@ -789,7 +793,25 @@ async function showTask(task,restoreView,queueDraft){if(queueDraft===undefined&&
     section.replaceChildren(section.firstChild,el('p',t('运行记录加载失败。'),'form-error'),action(t('重试'),load,'text-button'));
    }finally{loading=false;}};
   section.addEventListener('toggle',()=>{if(section.open&&!loaded)load();});
-  if(index===0)await load();}
+  if(before)body.insertBefore(section,before);else body.append(section);
+  return load;}
+ for(const [index,run] of history.entries()){const load=appendRun(run,index);if(index===0)await load();}
+
+ let historyMore=null;
+ if(history.length){const footer=el('div',undefined,'task-actions'),count=el('p','','muted');
+  const refreshCount=()=>{count.textContent=t('已显示最近 {shown} 次运行').replace('{shown}',history.length);};
+  refreshCount();
+  const loadEarlier=async()=>{if(!historyBefore||historyMore.disabled)return;historyMore.disabled=true;
+   try{const page=await api('task-runs?task='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project)+'&limit=50&before='+encodeURIComponent(historyBefore));if(ticket!==detailSequence||projectId!==project)return;
+    const runs=runPageRows(page);
+    for(const [offset,run] of runs.entries())appendRun(run,history.length+offset,footer);
+    history.push(...runs);
+    historyBefore=!Array.isArray(page)&&page?.has_more&&page.next_before?page.next_before:null;
+    refreshCount();historyMore.hidden=!historyBefore;
+   }catch(error){if(ticket===detailSequence&&projectId===project)count.textContent=t('运行记录加载失败。');}
+   finally{historyMore.disabled=false;}};
+  historyMore=action(t('加载更早的运行'),loadEarlier,'text-button');historyMore.hidden=!historyBefore;
+  footer.append(count,historyMore);body.append(footer);}
 
  if(ticket!==detailSequence||projectId!==project)return;
  // 与 runtime.cancel_task 的 cancellable 状态保持一致；待批准的候选取消前需确认后果。

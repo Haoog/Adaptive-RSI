@@ -493,13 +493,18 @@ async function checkQueueEditor(page, evidence) {
     const phaseStart = Date.now()/1000-20;
     await page.route("**/api/task-runs?*", async (route) => {
       const response = await route.fetch(),
-        rows = await response.json();
+        page = await response.json(),
+        rows = page.runs;
       await route.fulfill({
-        json: [
-          rows[0],
-          { ...rows[0], id: "old-run-1" },
-          { ...rows[0], id: "old-run-2" },
-        ],
+        json: {
+          runs: [
+            rows[0],
+            { ...rows[0], id: "old-run-1" },
+            { ...rows[0], id: "old-run-2" },
+          ],
+          has_more: false,
+          next_before: null,
+        },
       });
     });
     await page.route("**/api/run?id=*", async (route) => {

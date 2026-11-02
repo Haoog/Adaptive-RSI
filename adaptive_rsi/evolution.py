@@ -4,7 +4,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .config import compatibility, fingerprint, merge, validate
+from .config import BUILTIN_PROVIDERS, compatibility, fingerprint, merge, validate
 from .gitops import git, repository, snapshot
 from .process import Cancelled, scrub_tree
 from .store import encode, uid
@@ -15,6 +15,15 @@ FEEDBACK_LABELS = ("false_positive", "confirmed_regression", "rejected")
 FEEDBACK_SOURCE_PREFIX = "human:"
 # 受控消融沿用 attribution() 的四配置命名，避免报告与试验标签不一致。
 ABLATION_CONFIGURATIONS = ("baseline", "strategy_only", "skill_only", "combined")
+DEFAULT_PROVIDER_ENV_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "opencode_go": "OPENCODE_API_KEY",
+}
 
 
 def human_feedback(store, project=None, candidate=None):
@@ -75,10 +84,17 @@ def paired_summary(trials):
         if trial.get("case"):
             families.setdefault(trial["case"], []).append(trial)
     wins = losses = ties = 0
+    no_change = 0
     cohorts = {}
     for family, rows in families.items():
         complete = [row for row in rows if "stable" in row and "candidate" in row]
         if not complete:
+            continue
+        if any(row[v].get("no_change") for row in complete for v in ("stable", "candidate")):
+            # 空补丁与 baseline 是同一棵树，记成 win/loss/tie 都会伪造证据。
+            no_change += 1
+            cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
+                               "outcome": "no_change", "repetitions": len(complete)}
             continue
         lost = any(row["stable"]["pass"] and not row["candidate"]["pass"] for row in complete)
         won = not lost and any(not row["stable"]["pass"] and row["candidate"]["pass"] for row in complete)
@@ -88,7 +104,8 @@ def paired_summary(trials):
         cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                            "outcome": "loss" if lost else "win" if won else "tie", "repetitions": len(complete)}
     n = wins + losses
-    summary = {"wins": wins, "losses": losses, "ties": ties, "unit": "independent_case_family",
+    summary = {"wins": wins, "losses": losses, "ties": ties, "no_change": no_change,
+               "unit": "independent_case_family",
                "unknown_identity_trials": sum(not trial.get("case") for trial in trials),
                "estimate": wins / n if n else None, "cohorts": cohorts}
     if n:
@@ -216,7 +233,7 @@ class Evolution:
                 changed = [key for key, value in actual.items() if item.get(key) != value]
                 # 配置了 overlay 却已不可用时，封存值与当前值都可能取不到（同为 None）；
                 # 相等不代表输入未变，这类用例必须在封存校验里失败，不能支持晋升。
-                if not overlay_available(spec.get("overlay")):
+                if spec.get("overlay") and actual["overlay"] is None:
                     changed = sorted(set(changed) | {"overlay"})
             except (KeyError, ValueError, RuntimeError, OSError):
                 changed = ["unavailable"]
@@ -304,11 +321,24 @@ class Evolution:
 
     @staticmethod
     def attribution(rows):
+        """把四配置结果折算成描述性归因，不做任何自动因果推断。
+
+        前置不变量：``combined`` 行必须来自真正注入了候选技能的初筛候选，
+        ``baseline``/``strategy_only``/``skill_only`` 是同一输入上的对照。
+        只有在这个前提下 ``strategy_wins``/``skill_wins`` 才表示单因子边际收益，
+        ``interaction_only`` 才表示「只有两者同时生效才通过」；若初筛候选仍按
+        strategy_only 运行，采样条件会把 strategy_only 锁成恒真，使
+        interaction_only 永远为空。
+        """
         groups = {}
         variants = {"baseline", "strategy_only", "skill_only", "combined"}
         for row in rows:
             if not row.get("input") or row.get("variant") not in variants or type(row.get("pass")) is not bool:
                 return {"state": "insufficient_evidence"}
+            if row.get("no_change"):
+                # 空补丁的变体与 baseline 是同一棵树，任何“胜出”都来自空转而非被测因素。
+                return {"state": "insufficient_evidence", "no_change": True,
+                        "reason": "A variant produced no code changes; an empty patch cannot be attributed"}
             group = groups.setdefault(row["input"], {})
             if row["variant"] in group:
                 return {"state": "insufficient_evidence"}
@@ -347,13 +377,18 @@ class Evolution:
     def provider_requirements(config):
         """Non-secret provider requirements: provider id plus credential env var name.
 
-        Mirrors readiness semantics: a provider needs an environment credential
-        only when its env_key names one; login-based or local providers carry an
-        empty env_key and must never imply OPENAI_API_KEY.
+        Mirrors readiness semantics by incorporating built-in providers. Upstream
+        providers map deterministically to standard credential environment
+        variables unless overridden; login-based or local providers carry an
+        empty env_key.
         """
         if not isinstance(config, dict):
             return []
-        providers = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
+        builtin_providers = {
+            p["id"]: p for p in BUILTIN_PROVIDERS if isinstance(p, dict) and p.get("id")
+        }
+        configured = {p.get("id"): p for p in (config.get("providers") or []) if isinstance(p, dict)}
+        providers = {**builtin_providers, **configured}
         requirements = []
         seen = set()
         models = config.get("models")
@@ -368,9 +403,17 @@ class Evolution:
                 if not isinstance(provider_id, str) or provider_id in seen:
                     continue
                 seen.add(provider_id)
-                entry = providers.get(provider_id) or {}
-                env_key = entry.get("env_key")
-                requirements.append({"id": provider_id, "env_key": env_key if isinstance(env_key, str) else ""})
+                if provider_id in providers:
+                    entry = providers[provider_id]
+                    env_key = entry.get("env_key")
+                    if isinstance(env_key, str):
+                        requirements.append({"id": provider_id, "env_key": env_key})
+                    else:
+                        requirements.append({"id": provider_id, "env_key": DEFAULT_PROVIDER_ENV_KEYS.get(provider_id, "")})
+                elif provider_id in DEFAULT_PROVIDER_ENV_KEYS:
+                    requirements.append({"id": provider_id, "env_key": DEFAULT_PROVIDER_ENV_KEYS[provider_id]})
+                else:
+                    requirements.append({"id": provider_id, "env_key": ""})
         return requirements
     @staticmethod
     def validate_proposal(proposal):
@@ -409,11 +452,21 @@ class Evolution:
         return any(trigger.lower() in lower for trigger in triggers
                    if isinstance(trigger, str) and trigger.strip())
 
-    def ablate(self, project, directory, run, config, current, proposal, candidate, trials):
-        """在出现组合收益的输入上补跑 skill_only 与 combined 两种配置。
+    @staticmethod
+    def candidate_skill(candidate, proposal, now=None):
+        """构造候选提案对应的临时技能对象，用于初筛配对评估与受控消融。"""
+        guidance = proposal.get("guidance", "") if isinstance(proposal, dict) else ""
+        triggers = proposal.get("triggers", []) if isinstance(proposal, dict) else []
+        return {"content": str(guidance)[:2000],
+                "evidence": {"candidate": candidate, "ablation": True},
+                "triggers": [trigger for trigger in triggers if isinstance(trigger, str)],
+                "created": time.time() if now is None else now}
 
-        配对试验已经按同一输入执行过 baseline（旧策略+旧技能）与 strategy_only
-        （新策略、未带技能），因此只补跑缺少的两种配置，并把四行结果交给
+    def ablate(self, project, directory, run, config, current, proposal, candidate, trials):
+        """在出现组合收益的输入上补跑 strategy_only 与 skill_only 两种配置。
+
+        配对试验已经按同一输入执行过 baseline（旧策略+旧技能）与 combined
+        （新策略+候选技能），因此只补跑缺少的两种单因子配置，并把四行结果交给
         attribution()。任何缺口都保留 insufficient_evidence，不自动归因。
         """
         record = {"state": "insufficient_evidence", "configurations": list(ABLATION_CONFIGURATIONS),
@@ -434,17 +487,17 @@ class Evolution:
             case = trial.get("case")
             if (trial.get("split") != "validation" or case in seen or
                     trial.get("stable", {}).get("pass") is not False or
-                    trial.get("candidate", {}).get("pass") is not True):
+                    trial.get("candidate", {}).get("pass") is not True or
+                    trial.get("stable", {}).get("no_change") or
+                    trial.get("candidate", {}).get("no_change")):
+                # 空转变体（no_change）不是可比较的收益，不能为它补跑消融。
                 continue
             seen.add(case)
             wins.append(trial)
         if not wins:
             record["reason"] = "No joint validation gain was observed, so no ablation input was scheduled"
             return record
-        skill = {"content": str(proposal.get("guidance", ""))[:2000],
-                 "evidence": {"candidate": candidate, "ablation": True},
-                 "triggers": [trigger for trigger in proposal["triggers"] if isinstance(trigger, str)],
-                 "created": time.time()}
+        skill = self.candidate_skill(candidate, proposal)
         guide = [c for c in current if c["kind"] != proposal["kind"]] + [
             {"kind": proposal["kind"], "content": proposal}]
         # 四配置的既有技能按实验开始时的基线策略固定，不从各变体的 guide 推导：
@@ -467,21 +520,24 @@ class Evolution:
                     continue
                 if self.runtime.is_cancelled(run):
                     raise Cancelled("Evolution cancelled")
+                strategy_only = self.run_configuration(run, project, row, spec, "strategy_only", trial["repetition"],
+                                                       guide, directory, candidate, config, branch="ablation",
+                                                       experiment_skills=None, baseline_ids=baseline_ids)
+                if self.runtime.is_cancelled(run):
+                    raise Cancelled("Evolution cancelled")
                 skill_only = self.run_configuration(run, project, row, spec, "skill_only", trial["repetition"],
                                                     current, directory, candidate, config, branch="ablation",
                                                     experiment_skills=[skill], baseline_ids=baseline_ids)
-                if self.runtime.is_cancelled(run):
-                    raise Cancelled("Evolution cancelled")
-                combined = self.run_configuration(run, project, row, spec, "combined", trial["repetition"],
-                                                  guide, directory, candidate, config, branch="ablation",
-                                                  experiment_skills=[skill], baseline_ids=baseline_ids)
                 record["rows"].extend([
                     {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"]},
-                    {"input": trial["case"], "variant": "strategy_only", "pass": trial["candidate"]["pass"]},
-                    {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"]},
-                    {"input": trial["case"], "variant": "combined", "pass": combined["pass"]}])
+                    {"input": trial["case"], "variant": "strategy_only", "pass": strategy_only["pass"],
+                     "no_change": strategy_only.get("no_change", False)},
+                    {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"],
+                     "no_change": skill_only.get("no_change", False)},
+                    {"input": trial["case"], "variant": "combined", "pass": trial["candidate"]["pass"],
+                     "no_change": trial["candidate"].get("no_change", False)}])
                 record["trials"].append({"case": trial["case"], "repetition": trial["repetition"],
-                                         "skill_only": skill_only, "combined": combined})
+                                         "strategy_only": strategy_only, "skill_only": skill_only})
         except Cancelled:
             raise
         except Exception as exc:
@@ -498,7 +554,8 @@ class Evolution:
             record["attribution"] = self.attribution(record["rows"])
             record["state"] = record["attribution"].get("state", "insufficient_evidence")
             if record["state"] != "complete":
-                record["reason"] = ("Four matched configurations are unavailable for the sampled inputs; " +
+                record["reason"] = (record["attribution"]["reason"] if record["attribution"].get("no_change") else
+                                    "Four matched configurations are unavailable for the sampled inputs; " +
                                     ("the candidate skill is not visible under production retrieval" if invisible
                                      else "the learned skill may not be retrieved by any sampled task"))
         return record
@@ -1000,26 +1057,31 @@ class Evolution:
                                              "limit": config["evolution"]["max_holdout_uses"]}})
         trial_task = {"id": run["task"], "title": spec["task"].splitlines()[0], "body": spec["task"],
                       "source": "evaluation", "evidence": "[]", "acceptance": "[]"}
-        outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
-            trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
-            experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
-        if hasattr(self.runtime, "propagate_deadline"):
-            self.runtime.propagate_deadline(run, trial_run)
-        # A case overlay is host-owned and remains outside model-visible workspaces.
-        if spec.get("overlay") and not overlay_available(spec["overlay"]):
-            # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
-            # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
-            outcome = {**(outcome or {}), "decision": "error",
-                       "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
-        elif spec.get("overlay") and (trial_dir / "candidate").exists():
-            overlay_result = self.runtime.evaluator.evaluate(
-                trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
-                trial_dir / "protected-evaluation", trial_config,
-                lambda: self.runtime.is_cancelled(run), overlay=spec["overlay"])
-            if overlay_result["decision"] != "pass":
-                outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
+        outcome = None
+        try:
+            outcome = self.runtime.execute_candidate(trial_run, {**project, "path": spec["repository"]},
+                trial_task, spec["repository"], spec["base"], trial_dir, worker, guide,
+                experiment=True, experiment_skills=experiment_skills, baseline_ids=baseline_ids)
+            # A case overlay is host-owned and remains outside model-visible workspaces.
+            if spec.get("overlay") and self.overlay_digest(spec["overlay"]) is None:
+                # 封存后 overlay 被清理或删除时，评估器只会跳过缺失目录、不报错；这里显式判为
+                # 不可完成，避免试验在没有受保护输入的情况下被记成通过。
+                outcome = {**(outcome or {}), "decision": "error",
+                           "reason": "Case overlay is unavailable; the trial cannot be reproduced with its protected inputs"}
+            elif spec.get("overlay") and (trial_dir / "candidate").exists():
+                overlay_result = self.runtime.evaluator.evaluate(
+                    trial_dir / "baseline", trial_dir / "candidate", spec["checks"],
+                    trial_dir / "protected-evaluation", trial_config,
+                    lambda: self.runtime.is_cancelled(trial_run), overlay=spec["overlay"])
+                if overlay_result["decision"] != "pass":
+                    outcome = {**(outcome or {}), "decision": overlay_result["decision"]}
+        finally:
+            # 普通执行和保护性补评估的取消/超时都必须传播给父 run。
+            if hasattr(self.runtime, "propagate_deadline"):
+                self.runtime.propagate_deadline(run, trial_run)
         after = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
         return {"pass": bool(outcome and outcome.get("decision") == "pass"),
+                "no_change": bool((outcome or {}).get("no_change")),
                 "review": (outcome or {}).get("review", {}), "reason": (outcome or {}).get("reason", "No change"),
                 "seconds": time.monotonic() - started, "tokens": after["n"] - before["n"],
                 "usage_known": after["calls"] > before["calls"] and after["unknown"] == before["unknown"],
@@ -1050,7 +1112,8 @@ class Evolution:
         # 复制 overlay 时只遍历目录内容，缺失目录不会报错，试验会在没有受保护输入的情况下
         # 照常通过；因此这里先排除，让样本不足如实降级为证据不足。
         unavailable = sorted(case["id"] for case in cases
-                             if not overlay_available((case_spec(case) or {}).get("overlay")))
+                             if (case_spec(case) or {}).get("overlay") and
+                             self.overlay_digest((case_spec(case) or {})["overlay"]) is None)
         if unavailable:
             cases = [case for case in cases if case["id"] not in unavailable]
             self.store.event("evolution_overlay_unavailable",
@@ -1104,12 +1167,15 @@ class Evolution:
             repository, base = spec.get("repository"), spec.get("base")
             if not isinstance(repository, str) or not isinstance(base, str) or not isinstance(spec.get("task"), str):
                 continue
+            overlay = self.overlay_digest(spec.get("overlay"))
+            if spec.get("overlay") and overlay is None:
+                raise RuntimeError("Case overlay became unavailable before input sealing")
             manifest.append({"case": case["id"], "split": case["split"], "source": spec.get("source", "unknown"),
                              "signature": spec.get("signature", ""),
                              "tree": git(repository, "rev-parse", base + "^{tree}"),
                              "checks": fingerprint(spec.get("checks", [])), "family": case["family"],
                              "task": fingerprint(spec["task"]), "spec": fingerprint(spec),
-                             "overlay": self.overlay_digest(spec.get("overlay")),
+                             "overlay": overlay,
                              "environment": fingerprint(config["environment"])})
         # 本函数此前只读取本地状态；预留只覆盖即将开始的付费提案窗口。
         observations = inputs["observations"]
@@ -1220,6 +1286,8 @@ class Evolution:
         # 四配置的既有技能必须来自同一批基线策略：稳定版与候选版 guide 不同，
         # 若各自推导技能集合，strategy_only 会连带丢掉被替换策略的旧技能。
         baseline_ids = {c["id"] for c in current if c.get("id")}
+        candidate_skill = self.candidate_skill(candidate, proposal) if ablation else None
+        experiment_skills = [candidate_skill] if candidate_skill else None
         try:
             for split in ["validation", "holdout"]:
                 selected = selection[split]
@@ -1237,6 +1305,7 @@ class Evolution:
                             guide = current if variant == "stable" else [c for c in current if c["kind"] != proposal["kind"]] + [{"kind": proposal["kind"], "content": proposal}]
                             trial[variant] = self.run_configuration(run, project, case, spec, variant, repetition,
                                                                     guide, directory, candidate, config,
+                                                                    experiment_skills=experiment_skills if variant == "candidate" else None,
                                                                     baseline_ids=baseline_ids)
                         evidence["trials"].append(trial)
                         self.save(candidate, "evaluating", evidence)
@@ -1386,6 +1455,10 @@ class Evolution:
     def split_decision(trials, config):
         if not trials or any("stable" not in t or "candidate" not in t for t in trials):
             return {"decision": "insufficient_evidence", "reason": "Incomplete paired trials"}
+        if any(t[v].get("no_change") for t in trials for v in ("stable", "candidate")):
+            # 空转的变体与 baseline 是同一棵树：它既不能证明改进，也不能算作回归。
+            return {"decision": "insufficient_evidence",
+                    "reason": "An experiment variant produced no code changes; an empty patch is not evidence"}
         if any(t["stable"]["pass"] and not t["candidate"]["pass"] for t in trials):
             return {"decision": "fail", "reason": "Candidate regressed on previously passing cases"}
         for split in {t["split"] for t in trials}:
@@ -1457,6 +1530,14 @@ class Evolution:
 
     @staticmethod
     def overlay_digest(directory):
+        """Fingerprint a sealed overlay, or return None when it is unavailable.
+
+        用例 overlay 位于维护流程会清理的 suite 目录，也可能来自被删除的工作树或临时导入
+        目录。历史用例的归档目录消失属于正常生命周期：调度路径（input_signature /
+        attempt_due）只把它当作「不可用」，不能在周期演化检查里抛未捕获的 OSError。
+        哈希过程中被并发删除或不可读同样降级为 None；overlay 含非常规文件仍显式报错，
+        避免把无法复现的 overlay 当成有效输入。
+        """
         if not directory:
             return None
         import hashlib
@@ -1464,23 +1545,30 @@ class Evolution:
         import stat
         digest = hashlib.sha256()
         root = Path(directory)
-        scrub_tree(root)
+
         def field(value):
             digest.update(len(value).to_bytes(8, "big"))
             digest.update(value)
-        for path in [root] + sorted(root.rglob("*")):
-            info = path.lstat()
-            field(encode({"path": path.relative_to(root).as_posix(), "mode": stat.S_IMODE(info.st_mode),
-                          "type": "link" if path.is_symlink() else "directory" if path.is_dir() else "file"}).encode())
-            if path.is_symlink():
-                field(os.readlink(path).encode("utf-8", "surrogateescape"))
-            elif stat.S_ISREG(info.st_mode):
-                field(str(info.st_size).encode())
-                with path.open("rb") as source:
-                    for block in iter(lambda: source.read(65536), b""):
-                        digest.update(block)
-            elif not path.is_dir():
-                raise ValueError("Overlay must contain regular files and directories")
+
+        try:
+            if not root.is_dir():
+                return None
+            scrub_tree(root)
+            for path in [root] + sorted(root.rglob("*")):
+                info = path.lstat()
+                field(encode({"path": path.relative_to(root).as_posix(), "mode": stat.S_IMODE(info.st_mode),
+                              "type": "link" if path.is_symlink() else "directory" if path.is_dir() else "file"}).encode())
+                if path.is_symlink():
+                    field(os.readlink(path).encode("utf-8", "surrogateescape"))
+                elif stat.S_ISREG(info.st_mode):
+                    field(str(info.st_size).encode())
+                    with path.open("rb") as source:
+                        for block in iter(lambda: source.read(65536), b""):
+                            digest.update(block)
+                elif not path.is_dir():
+                    raise ValueError("Overlay must contain regular files and directories")
+        except OSError:
+            return None
         return digest.hexdigest()
 
     def monitor(self, project, passed, run=None, attributable=False):

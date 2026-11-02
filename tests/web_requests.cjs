@@ -934,6 +934,38 @@ test('out-of-order task details cannot attach cancellation for the previous task
   assert.deepEqual(cancellations, [{task: 'b', cascade: false, revision: 'preview-b', reason: ''}]);
 });
 
+test('task run history loads and appends earlier pages with a visible count', async () => {
+  const page = browser(), requests = [];
+  page.context.fetch = async url => {
+    if (url.includes('task-runs?')) {
+      requests.push(url);
+      if (url.includes('before=')) return response({runs: [{id: 'r1', task: 'a', project: 'a'}],
+        has_more: false, next_before: null});
+      return response({runs: [{id: 'r3', task: 'a', project: 'a'}, {id: 'r2', task: 'a', project: 'a'}],
+        has_more: true, next_before: '1000.5:r2'});
+    }
+    if (url.includes('run?id=')) return response({state: 'failed', config: {models: {}}, result: {reason: 'fixture'}});
+    return response({});
+  };
+  await page.context.showTask({id: 'a', project: 'a', title: 'Task a', body: '', evidence: '[]', state: 'failed'});
+  const body = page.node('detail-body');
+  const runs = () => body.children.filter(node => node.className === 'detail-section' && node.dataset.run)
+    .map(node => node.dataset.run);
+  const shows = text => descendants(body).some(node => node.tagName === 'P' && node.textContent === text);
+  assert.deepEqual(runs(), ['r3', 'r2']);
+  assert.ok(shows('已显示最近 2 次运行'), 'the count states how many runs are shown');
+  const more = descendants(body).find(node => node.tagName === 'BUTTON' && node.textContent === '加载更早的运行');
+  assert.ok(more, 'earlier runs entry is rendered when the server reports more');
+  assert.equal(more.hidden, false);
+  more.handlers.click();
+  await page.context.lastAction;
+  assert.equal(requests.length, 2);
+  assert.ok(requests[1].includes('before=1000.5%3Ar2'), requests[1]);
+  assert.deepEqual(runs(), ['r3', 'r2', 'r1'], 'earlier runs append instead of replacing the first page');
+  assert.ok(shows('已显示最近 3 次运行'));
+  assert.equal(more.hidden, true, 'the entry disappears when no further page remains');
+});
+
 test('closing task details while a response waits keeps the dialog closed', async () => {
   const page = browser();
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}];

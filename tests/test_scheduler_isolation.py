@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import datetime
 import json
 import os
@@ -13,11 +14,22 @@ from unittest.mock import patch
 from adaptive_rsi import maintenance as maintenance_module
 from adaptive_rsi import pipeline
 from adaptive_rsi.agent import CodexAgent
-from adaptive_rsi.config import DEFAULTS, merge
+from adaptive_rsi.config import BUILTIN_PROVIDERS, DEFAULTS, merge
 from adaptive_rsi.delivery import schedule as schedule_delivery
 from adaptive_rsi.gitops import git
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.store import Store
+
+
+def lock_held(lock):
+    """RLock 在 Python 3.14 之前没有公开的 locked()；_is_owned() 只对持锁线程返回 True。
+
+    追踪回调里抛异常会被 sqlite 吞掉，断言值就会一直停在哨兵上，所以这里必须先
+    选一条两个版本都成立的取状态路径。
+    """
+    if hasattr(lock, "locked"):
+        return lock.locked()
+    return lock._is_owned()
 
 
 class SchedulerIsolationTest(unittest.TestCase):
@@ -337,6 +349,7 @@ class SchedulerIsolationTest(unittest.TestCase):
         for name in ("workspace", "candidate"):
             self.assertEqual((directory / name / "keep.txt").read_text(), "retained evidence")
         self.assertTrue(self.store.setting("legal-hold:" + run["id"]))
+        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"], str(directory))
         self.assertEqual(self.errors("maintenance_run"), [])
 
     def test_hold_written_while_an_artifact_is_deleted_waits_for_that_deletion(self):
@@ -424,6 +437,73 @@ class SchedulerIsolationTest(unittest.TestCase):
             outside.chmod(0o755)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "completed")
 
+    def test_automatic_retention_clears_purged_run_path_and_skips_it_next_pass(self):
+        purged = self.historical_run("healthy", "completed")
+        held = self.historical_run("healthy", "awaiting_approval")
+        for run in (purged, held):
+            (Path(run["path"]) / "workspace").mkdir(parents=True)
+            (Path(run["path"]) / "workspace" / "evidence.txt").write_text("run evidence")
+        self.store.put_setting("legal-hold:" + held["id"], True)
+
+        self.runtime.maintenance()
+
+        self.assertFalse((Path(purged["path"]) / "workspace").exists())
+        self.assertIsNone(self.store.one("SELECT path FROM runs WHERE id=?", (purged["id"],))["path"])
+        # 受 hold 保护而未被清理的运行保留路径，下一轮仍可重新评估。
+        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (held["id"],))["path"],
+                         held["path"])
+        # 已解绑路径的运行不再进入下一轮清理循环：不获取 dispatch_lock、不 stat 目录。
+        self.store.put_setting("maintenance-last", 0)
+        with patch.object(maintenance_module, "_remove_run_artifacts") as remove:
+            self.runtime.maintenance()
+        remove.assert_not_called()
+
+    def test_retained_patch_can_be_reverted_after_run_path_is_cleared(self):
+        from tests.test_runtime import FakeAgent, fixture, CHECKS
+        repo = fixture(self.root / 'healthy')
+        self.runtime.agent = FakeAgent()
+        self.runtime.configure({'checks': CHECKS, 'evolution': {'enabled': False}}, 'healthy')
+        prior = self.historical_run('healthy', 'merged')
+        directory = Path(prior['path'])
+        directory.mkdir(parents=True)
+        (repo / 'calculator.py').write_text('def add(a, b):\n    return a + b\n')
+        (directory / 'candidate.patch').write_text(git(repo, 'diff', '--binary') + '\n')
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-qm', 'fixed')
+        self.store.execute('UPDATE runs SET result=? WHERE id=?',
+                           (json.dumps({'files': ['calculator.py'], 'monitoring_completed': True}), prior['id']))
+        self.runtime.maintenance()
+        self.assertIsNone(self.store.one('SELECT path FROM runs WHERE id=?', (prior['id'],))['path'])
+        self.assertTrue((directory / 'candidate.patch').is_file())
+        task = self.runtime.revert_code(prior['id'])
+        run = self.store.claim('healthy', self.runtime.config('healthy'))
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+                patch.object(pipeline, '_prepare_environment', return_value=({'sha256': 'fixture'}, directory / 'dependencies')), \
+                patch.object(self.runtime.evaluator, 'evaluate', return_value={'decision': 'pass', 'checks': {}}):
+            self.runtime.process(run)
+        result = self.store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(result['state'], 'awaiting_approval', result['result'])
+        self.assertEqual((Path(result['path']) / 'candidate/calculator.py').read_text(),
+                         'def add(a, b):\n    return a - b\n')
+        self.assertEqual(run['task'], task)
+
+    def test_undo_cleanup_rebinds_run_path_cleared_by_retention(self):
+        run = self.historical_run("healthy", "completed")
+        directory = Path(run["path"])
+        (directory / "workspace").mkdir(parents=True)
+        (directory / "workspace" / "evidence.txt").write_text("restored evidence")
+        receipt = maintenance_module.recycle_cleanup(
+            self.store, maintenance_module.preview_cleanup(self.store, run["id"]))
+        # 保留周期清理已解绑该运行后再撤销回收：恢复的工件必须重新挂钩，
+        # 否则后续保留策略与手动清理预览都会跳过它。
+        self.store.execute("UPDATE runs SET path=NULL WHERE id=?", (run["id"],))
+
+        maintenance_module.undo_cleanup(self.store, receipt["id"])
+
+        self.assertEqual((directory / "workspace" / "evidence.txt").read_text(), "restored evidence")
+        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"],
+                         str(directory))
+
     def test_invalid_maintenance_project_does_not_block_other_project_cleanup(self):
         run = self.historical_run("healthy", "awaiting_approval")
         (Path(run["path"]) / "candidate").mkdir(parents=True)
@@ -482,6 +562,137 @@ class SchedulerIsolationTest(unittest.TestCase):
             release.set()
             self.runtime.maintenance_thread.join(5)
         self.assertEqual(len(entered), 2)
+
+    def test_failed_maintenance_records_error_and_skips_immediate_retry(self):
+        attempts = []
+
+        def failing(rt):
+            attempts.append(threading.current_thread())
+            raise OSError("maintenance storage unavailable")
+
+        with patch.object(Runtime, "maintenance", failing):
+            self.runtime.maintenance_async()
+            worker = self.runtime.maintenance_thread
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(attempts), 1)
+        self.assertFalse(self.runtime.maintenance_lock.locked())
+        event, = self.store.query("SELECT * FROM events WHERE kind='maintenance_failed'")
+        self.assertIn("OSError: maintenance storage unavailable", event["message"])
+        self.assertEqual(json.loads(event["data"])["error_type"], "OSError")
+        # 崩溃后不得在下一 tick 重新拉起线程：进程内退避与持久化记录都要生效。
+        with patch.object(Runtime, "maintenance", failing):
+            self.runtime.maintenance_async()
+        self.assertIs(self.runtime.maintenance_thread, worker)
+        self.runtime.maintenance_retry_at = 0
+        with patch.object(Runtime, "maintenance", failing):
+            self.runtime.maintenance_async()
+        self.assertIs(self.runtime.maintenance_thread, worker)
+        self.assertEqual(len(attempts), 1)
+
+    def test_maintenance_retries_after_backoff_window(self):
+        with patch.object(Runtime, "maintenance",
+                          side_effect=OSError("maintenance storage unavailable")):
+            self.runtime.maintenance_async()
+            first = self.runtime.maintenance_thread
+            first.join(5)
+        self.assertFalse(first.is_alive())
+        record = self.store.setting("maintenance-retry")
+        self.assertEqual(record["failures"], 1)
+        self.assertGreater(record["retry_at"], time.time())
+        # 退避到期（显式拨回过去）后允许再次触发，成功后清除退避记录。
+        self.store.put_setting("maintenance-retry", dict(record, retry_at=time.time() - 1))
+        self.runtime.maintenance_retry_at = 0
+        with patch.object(Runtime, "maintenance") as maintenance:
+            self.runtime.maintenance_async()
+            retried = self.runtime.maintenance_thread
+        self.assertIsNot(retried, first)
+        retried.join(5)
+        self.assertFalse(retried.is_alive())
+        maintenance.assert_called_once_with()
+        self.assertEqual(self.store.setting("maintenance-retry", {}), {})
+
+    def test_model_center_cleanup_retains_a_provider_enabled_after_scan(self):
+        provider = {'id': 'rebound', 'name': 'Rebound', 'protocol': 'chat_completions',
+                    'base_url': 'https://example.test/v1', 'env_key': ''}
+        key = self.runtime.model_center.key(provider, None)
+        self.store.put_setting(key, {'fetched': time.time() - 400 * 86400})
+        query = self.store.query
+        changed = []
+        def scan(sql, args=()):
+            rows = query(sql, args)
+            if sql.startswith('SELECT key,value FROM settings WHERE key LIKE') and 'model-center:' in sql:
+                self.runtime.configure({'providers': [provider]})
+                changed.append(True)
+            return rows
+        with patch.object(self.store, 'query', side_effect=scan):
+            self.runtime.maintenance()
+        self.assertEqual(changed, [True])
+        self.assertIsNotNone(self.store.setting(key))
+
+    def test_model_center_cleanup_releases_dispatch_lock_before_batch_delete(self):
+        stale = time.time() - 400 * 86400
+        kept = self.runtime.model_center.key(BUILTIN_PROVIDERS[0], None)
+        self.store.put_setting(kept, {"fetched": stale, "models": []})
+        doomed = ["model-center:global:retired:%032x" % index for index in range(200)]
+        for key in doomed:
+            self.store.put_setting(key, {"fetched": stale, "models": []})
+        observed = {"scan_locked": None, "deletes_locked": 0, "connections": set(),
+                    "concurrent_acquire": None, "armed": False}
+        borrows = iter(range(1 << 20))
+        original = self.store.connect
+
+        @contextlib.contextmanager
+        def traced():
+            with original() as db:
+                borrow = next(borrows)
+
+                def trace(sql):
+                    normalized = " ".join(sql.split()).upper()
+                    if not observed["armed"]:
+                        if "MODEL-CENTER:%" in normalized:
+                            observed["armed"] = True
+                            observed["scan_locked"] = lock_held(self.runtime.dispatch_lock)
+                        return
+                    if not normalized.startswith("DELETE FROM SETTINGS"):
+                        return
+                    observed["connections"].add(borrow)
+                    if lock_held(self.runtime.dispatch_lock):
+                        observed["deletes_locked"] += 1
+                    if observed["concurrent_acquire"] is None:
+                        observed["concurrent_acquire"] = self.acquire_dispatch_lock_elsewhere()
+
+                db.set_trace_callback(trace)
+                try:
+                    yield db
+                finally:
+                    db.set_trace_callback(None)
+
+        with patch.object(self.store, "connect", traced):
+            self.runtime.maintenance()
+        # 4000 行候选扫描与批量删除都不在 dispatch_lock 内。
+        self.assertIs(observed["scan_locked"], False)
+        self.assertEqual(observed["deletes_locked"], 0)
+        # 删除期间其他线程仍能取得调度锁。
+        self.assertTrue(observed["concurrent_acquire"])
+        # 批量删除只借还一次连接，而不是每行一次自动提交事务。
+        self.assertEqual(len(observed["connections"]), 1)
+        remaining = [row["key"] for row in self.store.query(
+            "SELECT key FROM settings WHERE key LIKE 'model-center:%'")]
+        self.assertEqual(remaining, [kept])
+
+    def acquire_dispatch_lock_elsewhere(self, timeout=2):
+        acquired = []
+
+        def worker():
+            if self.runtime.dispatch_lock.acquire(timeout=timeout):
+                acquired.append(True)
+                self.runtime.dispatch_lock.release()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout + 1)
+        return bool(acquired)
 
     def test_invalid_delivery_run_does_not_block_other_tracking_jobs(self):
         bad = self.historical_run("broken", "merged")

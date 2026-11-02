@@ -15,6 +15,21 @@ import uuid
 CLEANUP_NAMES = ("workspace", "candidate", "baseline", "evaluation", "experiments",
                  "dependencies", "acceptance-design", "feedback")
 
+# 维护默认每小时一轮；失败后的最短重试间隔按次数指数增长，上限一小时。
+MAINTENANCE_INTERVAL = 3600
+MAINTENANCE_RETRY_SECONDS = 300
+MAINTENANCE_RETRY_MAX_SECONDS = 3600
+
+
+def _retry_deadline(value):
+    """Read the earliest allowed retry from the persisted backoff record."""
+    if not isinstance(value, dict):
+        return 0
+    try:
+        return float(value.get("retry_at", 0))
+    except (TypeError, ValueError):
+        return 0
+
 
 def _finished_cleanup_states():
     """States whose feedback evidence is already terminal for cleanup purposes.
@@ -439,6 +454,10 @@ def undo_cleanup(store, identifier):
                 _write_cleanup_receipt(folder, receipt)
                 for item in receipt['objects']:
                     _rename_cleanup(folder / item['name'], directory / item['name'])
+                # 保留周期清理会置空 runs.path；恢复工件后重新绑定，避免恢复出的
+                # 证据永久脱离后续保留策略与手动清理预览。
+                db.execute('UPDATE runs SET path=? WHERE id=? AND path IS NULL',
+                           (str(directory), receipt['run']))
                 db.execute('DELETE FROM settings WHERE key=?', ('recycle:' + identifier,))
         except BaseException as error:
             try:
@@ -526,7 +545,9 @@ def _remove_run_artifacts(store, run_id, project, directory):
     the unlink/rmdir it authorises: a hold committed first stops the remaining
     deletions, and a hold written during a deletion waits for that transaction
     to finish.  Per-artifact transactions bound the write-lock span to a single
-    artifact instead of the whole multi-project cleanup pass.
+    artifact instead of the whole multi-project cleanup pass.  Once no artifacts
+    remain, one final transaction detaches the run's path so later passes filter
+    it out through `path IS NOT NULL` instead of re-scanning it forever.
     """
     for name in CLEANUP_NAMES:
         target = directory / name
@@ -541,15 +562,37 @@ def _remove_run_artifacts(store, run_id, project, directory):
             if target.is_symlink() or not target.is_dir():
                 continue
             _remove_artifact(directory, name)
+    # All own artifacts are gone (deleted here or already absent). Detach the
+    # run from its path so later passes filter it out via `path IS NOT NULL`
+    # instead of re-opening a write transaction and re-stat'ing an empty
+    # directory for every expired run on every maintenance cycle.  The hold is
+    # re-read inline so a hold committed during the deletions keeps the path.
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if _held_in_transaction(db, run_id, project):
+            return False
+        # Match the exact path that was cleaned so a concurrently rewritten
+        # path is never detached from artifacts that still exist.
+        db.execute('UPDATE runs SET path=NULL WHERE id=? AND path=?',
+                   (run_id, str(directory)))
     return True
 
 
 class Maintenance:
+    # 上一次维护失败后的进程内退避截止时间；数据库不可写时仍能拦住每秒重试。
+    maintenance_retry_at = 0
+
     def maintenance_async(self):
         # maintenance 里的批量删除可能耗时数秒，放到后台线程执行，避免阻塞调度循环；
         # 同一时刻只允许一个清理线程，重入直接跳过，未完成的清理由下一轮调度继续。
         # 线程为 daemon，退出时不残留非守护线程；close() 会等待其收尾。
-        if time.time() - self.store.setting("maintenance-last", 0) < 3600:
+        now = time.time()
+        if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
+            return
+        # 崩溃的清理线程不更新 maintenance-last；若不按退避拦截，调度循环会在
+        # 下一个 tick（约 1 秒）重新拉起一个必然失败的新线程。
+        if now < max(self.maintenance_retry_at,
+                     _retry_deadline(self.store.setting("maintenance-retry", {}))):
             return
         if not self.maintenance_lock.acquire(blocking=False):
             return
@@ -564,9 +607,50 @@ class Maintenance:
     def _maintenance_worker(self):
         try:
             with self.scheduler_scope("maintenance"):
-                self.maintenance()
+                try:
+                    self.maintenance()
+                except Exception as exc:
+                    self._record_maintenance_failure(exc)
+                    raise
+                self._clear_maintenance_failure()
         finally:
             self.maintenance_lock.release()
+
+    def _record_maintenance_failure(self, exc):
+        """Record a failed pass and defer the next attempt instead of retrying each tick."""
+        try:
+            previous = self.store.setting("maintenance-retry", {})
+        except Exception:
+            previous = {}
+        failures = previous.get("failures", 0) if isinstance(previous, dict) else 0
+        if type(failures) is not int or failures < 0:
+            failures = 0
+        failures += 1
+        delay = min(MAINTENANCE_RETRY_SECONDS * 2 ** min(failures - 1, 4),
+                    MAINTENANCE_RETRY_MAX_SECONDS)
+        now = time.time()
+        # 先落到进程内：磁盘满或数据库不可写时，事件与退避记录本身也写不进去。
+        self.maintenance_retry_at = now + delay
+        message = "%s: %s" % (type(exc).__name__, exc)
+        logging.getLogger(__name__).warning("Maintenance failed (%s); retrying in %ss",
+                                            message, delay)
+        try:
+            self.store.event("maintenance_failed", message,
+                             data={"error_type": type(exc).__name__, "failures": failures,
+                                   "retry_at": now + delay, "retry_in": delay})
+            self.store.put_setting("maintenance-retry",
+                                   {"retry_at": now + delay, "failures": failures,
+                                    "error_type": type(exc).__name__, "message": message[:500]})
+        except Exception:
+            logging.getLogger(__name__).exception("Maintenance failure persistence failed")
+
+    def _clear_maintenance_failure(self):
+        """Reset the backoff after a healthy pass; a stale record is harmless once past."""
+        self.maintenance_retry_at = 0
+        try:
+            self.store.execute("DELETE FROM settings WHERE key='maintenance-retry'")
+        except Exception:
+            logging.getLogger(__name__).exception("Maintenance backoff reset failed")
 
     def maintenance(self):
         if (self.store.root / 'recycle').exists():
@@ -575,7 +659,7 @@ class Maintenance:
             except Exception as error:
                 logging.getLogger(__name__).warning("Cleanup recovery encountered error: %s", error)
         now = time.time()
-        if now - self.store.setting("maintenance-last", 0) < 3600:
+        if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
             return
         with self.scheduler_scope("credential_cleanup"):
             self.model_center.cleanup_credentials()
@@ -657,7 +741,7 @@ class Maintenance:
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
-        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
         # 独立的精确键/冒号前缀范围查询可使用 settings 主键索引，避免逐运行全表扫描。
         # ':' 的后继字符是 ';'，二进制排序范围只覆盖该运行的冒号后缀键。
         remaining = " OR ".join(
@@ -696,9 +780,13 @@ class Maintenance:
                 "CASE WHEN json_valid(value) THEN (json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) ELSE 0 END LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         # Retire stale connection-signature directories after proving they are unused.
+        # 全局 dispatch_lock 只覆盖「配置快照 + 无活跃运行」的判定；候选扫描与批量删除
+        # 都在锁外完成，避免调度主循环在锁内等待数千次独立写事务。
+        keys = set()
+        configs_valid = True
         with self.dispatch_lock:
-            keys = set()
-            configs_valid = True
+            configuration = self.store.query("SELECT id,config FROM projects ORDER BY id")
+            global_configuration = self.store.one("SELECT value FROM settings WHERE key='config'")
             for scope in [None] + [row["id"] for row in self.store.query("SELECT id FROM projects")]:
                 try:
                     config = self.config(scope)
@@ -709,17 +797,34 @@ class Maintenance:
                 keys.update(self.model_center.key(provider, scope) for provider in [*BUILTIN_PROVIDERS, *config["providers"]])
             # Frozen runs can still refer to a retired connection signature.
             active = self.store.one("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1")
-            if configs_valid and not active:
-                for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' "
-                                            "AND json_valid(value) AND json_extract(value,'$.fetched')<? "
-                                            "AND key NOT IN (SELECT value FROM json_each(?)) LIMIT 4000",
-                                            (stale, json.dumps(sorted(keys)))):
-                    try:
-                        fetched = json.loads(row["value"]).get("fetched")
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if row["key"] not in keys and fetched and fetched < stale:
-                        self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        if configs_valid and not active:
+            keep = json.dumps(sorted(keys))
+            doomed = []
+            for row in self.store.query("SELECT key,value FROM settings WHERE key LIKE 'model-center:%' "
+                                        "AND json_valid(value) AND json_extract(value,'$.fetched')<? "
+                                        "AND key NOT IN (SELECT value FROM json_each(?)) LIMIT 4000",
+                                        (stale, keep)):
+                try:
+                    fetched = json.loads(row["value"]).get("fetched")
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if row["key"] not in keys and fetched and fetched < stale:
+                    doomed.append(row["key"])
+            if doomed:
+                # 单事务批量删除，不再为每行借还连接；重复校验保留键与过期时间，
+                # 避免删除扫描之后刚被刷新的目录。
+                with self.store.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    current = [dict(row) for row in db.execute("SELECT id,config FROM projects ORDER BY id")]
+                    global_row = db.execute("SELECT value FROM settings WHERE key='config'").fetchone()
+                    current_global = dict(global_row) if global_row else None
+                    # 配置写入和 claim 共用数据库写事务；最终核验与删除不能隔开。
+                    if (current == configuration and current_global == global_configuration and
+                            not db.execute("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1").fetchone()):
+                        db.executemany("DELETE FROM settings WHERE key=? AND json_valid(value) "
+                                       "AND json_extract(value,'$.fetched')<? "
+                                       "AND key NOT IN (SELECT value FROM json_each(?))",
+                                       [(key, stale, keep) for key in doomed])
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))

@@ -104,6 +104,73 @@ class BaselineAndCleanupTest(unittest.TestCase):
         self.assertEqual(command.call_count, 2)
         self.assertTrue(all(len(call.args) == 2 for call in command.call_args_list))
 
+    def test_cleanup_preview_distinguishes_pushed_branch_without_pr(self):
+        branches = [{'name': 'feat/rsi-pushed', 'commit': {'sha': 'pushed_sha'}},
+                    {'name': 'feat/rsi-orphan', 'commit': {'sha': 'orphan_sha'}}]
+        prs = []
+        self.store.put_setting('delivery-push:run-123',
+                               {'branch': 'feat/rsi-pushed', 'head': 'pushed_sha', 'repository': 'example/project'})
+        with patch.object(release, 'api', side_effect=[branches, prs]):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=[], store=self.store)
+        reasons = {item['branch']: item['reason'] for item in result['protected']}
+        self.assertEqual(reasons.get('feat/rsi-pushed'), 'pushed_no_pr')
+        self.assertEqual(reasons.get('feat/rsi-orphan'), 'unverified_ownership')
+
+    def test_publish_persists_push_intent_and_recovers_interrupted_pr_creation(self):
+        push_calls = []
+        intent_at_push = []
+        def fake_push(ws, *args, **kwargs):
+            # 意图必须先于远端写落地，进程在 push 后消失时才留有对账依据。
+            intent_at_push.append(self.store.setting('delivery-push:' + self.run['id']))
+            push_calls.append(args)
+
+        pr_create_count = [0]
+        def fake_checked(argv, **kwargs):
+            if argv[1:3] == ['pr', 'list']:
+                return json.dumps([])
+            if argv[1:3] == ['pr', 'create']:
+                pr_create_count[0] += 1
+                if pr_create_count[0] == 1:
+                    raise ProcessError({'error': 'network timeout on pr create', 'code': 1})
+                return self.url
+            raise AssertionError(f'Unexpected checked argv: {argv}')
+
+        with patch.object(delivery, 'baseline', return_value=('unused', self.run['base'], 'main')), \
+                patch.object(delivery, 'checked', side_effect=fake_checked), \
+                patch.object(delivery, 'github_git', side_effect=fake_push):
+            with self.assertRaises(ProcessError):
+                self.publish()
+
+            intent = self.store.setting('delivery-push:' + self.run['id'])
+            self.assertIsNotNone(intent)
+            expected_branch = 'feat/rsi-' + self.run['id']
+            self.assertEqual(intent['branch'], expected_branch)
+            self.assertEqual(intent['head'], self.head)
+            self.assertEqual(intent['repository'], 'example/project')
+            self.assertIsNone(self.store.setting('delivery:' + self.run['id']))
+            self.assertEqual(len(push_calls), 1)
+            self.assertEqual(push_calls[0], ('push', 'origin', 'HEAD:refs/heads/' + expected_branch))
+            self.assertEqual(intent_at_push, [intent])
+
+            res = self.publish()
+            self.assertEqual(res, self.url)
+            self.assertEqual(self.store.setting('delivery:' + self.run['id'])['head'], self.head)
+            pr_event = self.store.one("SELECT * FROM events WHERE kind='pr' AND run=?", (self.run['id'],))
+            self.assertIsNotNone(pr_event)
+            self.assertEqual({c[2] for c in push_calls}, {'HEAD:refs/heads/' + expected_branch})
+
+    def test_publish_refuses_to_push_over_a_journaled_candidate_and_stays_read_only(self):
+        self.store.put_setting('delivery-push:' + self.run['id'],
+                               {'branch': 'feat/rsi-' + self.run['id'], 'head': 'a' * 40,
+                                'repository': 'example/project'})
+        with patch.object(delivery, 'baseline', return_value=('unused', self.run['base'], 'main')), \
+                patch.object(delivery, 'checked', side_effect=AssertionError('remote read/write attempted')) as command, \
+                patch.object(delivery, 'github_git', side_effect=AssertionError('push attempted')):
+            with self.assertRaisesRegex(RuntimeError, 'different candidate head'):
+                self.publish()
+        self.assertFalse(command.called)
+        self.assertEqual(self.store.setting('delivery-push:' + self.run['id'])['head'], 'a' * 40)
+
 
 class AttributionTest(unittest.TestCase):
     def test_later_mainline_failure_does_not_attribute_candidate_regression(self):

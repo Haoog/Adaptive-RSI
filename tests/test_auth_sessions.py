@@ -13,6 +13,7 @@ from unittest.mock import patch
 import urllib.error
 import urllib.request
 
+from adaptive_rsi import auth_sessions
 from adaptive_rsi.auth_sessions import AuthError, AuthSessions, CodexAuth, OpenCodeAuth
 from adaptive_rsi.cli_worker import CODEX_AUTH_LOCK
 from adaptive_rsi.opencode import AUTH_LOCK, OpenCodeCapabilities, load_auth_export, merge_auth_export
@@ -107,10 +108,11 @@ class AuthSessionTests(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def wait_state(self, session, state):
+    def wait_state(self, session, state, manager=None):
+        manager = manager or self.manager
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            result = self.manager.status(session["id"])
+            result = manager.status(session["id"])
             if result["state"] == state:
                 return result
             time.sleep(0.005)
@@ -355,6 +357,94 @@ class AuthSessionTests(unittest.TestCase):
         self.assertTrue(self.created[0].closed)
         with self.assertRaisesRegex(AuthError, "service_closed"):
             self.manager.start("codex")
+
+    def state_write_error(self, manager):
+        """只让状态文件写入抛 OSError(28)；凭据等其他文件照常写。"""
+        real = auth_sessions._write_json
+
+        def write(path, value):
+            if Path(path) == manager.file:
+                raise OSError(28, "No space left on device")
+            return real(path, value)
+
+        return patch("adaptive_rsi.auth_sessions._write_json", side_effect=write)
+
+    def test_failed_state_write_releases_reserved_session(self):
+        manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        with self.state_write_error(manager):
+            with self.assertRaises(OSError):
+                manager.reserve("codex")
+        # 写盘失败的登记必须回滚：不留幽灵会话，不把后端锁成 auth_busy。
+        self.assertEqual(manager.sessions, {})
+        self.assertEqual(manager.busy, 0)
+        session = manager.reserve("codex")
+        self.assertEqual(session["state"], "starting")
+        self.assertEqual(manager.busy, 1)
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+
+    def test_failed_state_write_restores_previous_session_values(self):
+        manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.state_write_error(manager):
+            with self.assertRaises(OSError):
+                manager.cancel(session["id"])
+        # 拒绝写入时内存回滚到旧值，不能出现「内存已取消、磁盘仍 starting」。
+        self.assertEqual(manager.status(session["id"])["state"], "starting")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "starting")
+        self.assertEqual(manager.busy, 1)
+        # 恢复可写后同一会话照常推进并落盘。
+        self.assertEqual(manager.cancel(session["id"])["state"], "cancelled")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "cancelled")
+        self.assertEqual(manager.snapshot()["sessions"][-1]["id"], session["id"])
+
+    def test_failed_terminal_write_preserves_old_session_beyond_history_limit(self):
+        manager = AuthSessions(self.root / 'old-state', factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve('codex')
+        for index in range(31):
+            key = 'history-' + str(index)
+            manager.sessions[key] = {'id': key, 'backend': 'codex', 'state': 'completed',
+                                     'expires_at': time.time() + 600, 'error': ''}
+        with self.state_write_error(manager):
+            manager._run(session['id'], 0, None)
+        self.assertEqual(manager.status(session['id'])['state'], 'failed')
+        self.assertEqual(manager.busy, 0)
+        self.assertTrue(self.created[-1].closed)
+
+    def test_worker_exit_releases_busy_session_after_state_write_failure(self):
+        manager = AuthSessions(self.root / "worker-state", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.reserve("codex")
+        with self.state_write_error(manager):
+            try:
+                manager._run(session["id"], 0, None)
+            except OSError:
+                pass
+        self.assertEqual(manager.status(session["id"])["state"], "failed")
+        self.assertEqual(manager.busy, 0)
+        self.assertEqual(manager.workers, {})
+        self.assertTrue(self.created[-1].closed)
+        replacement = manager.reserve("codex")
+        self.assertEqual(replacement["state"], "starting")
+        self.assertEqual(json.loads(manager.file.read_text())[session["id"]]["state"], "failed")
+
+    def test_failed_state_write_does_not_abort_close(self):
+        manager = AuthSessions(self.root / "state", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        session = manager.start("codex")
+        self.wait_state(session, "awaiting_authorization", manager)
+        worker = self.created[0]
+        with self.state_write_error(manager):
+            manager.close()
+        # 持久化失败只记录，不影响 workers/线程回收，也不向 Runtime._close 抛出。
+        self.assertTrue(manager.closed)
+        self.assertTrue(worker.closed)
+        self.assertEqual(manager.workers, {})
+        self.assertEqual(manager.threads, set())
+        self.assertIsInstance(manager._close_error, OSError)
+        self.assertEqual(manager.status(session["id"])["state"], "interrupted")
 
     def test_reserve_registers_busy_session_before_any_worker_launch(self):
         session = self.manager.reserve("codex")

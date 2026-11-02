@@ -190,6 +190,21 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT status FROM candidates WHERE id='stale'")['status'], 'interrupted')
         self.assertEqual(self.calls['proposal'], 1)
 
+    def test_restart_recovery_releases_fresh_reservation_before_expiry(self):
+        """崩溃重启后不能等满一小时：recover() 必须中断仍在保留窗口内的预留。"""
+        args = self.setup_proposal()
+        self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
+                           'VALUES (?,?,?,?,?,?,?)',
+                           ('crash-reservation', 'p', 'strategy', 'reserved', '{}', '{}', time.time() - 300))
+        self.store.recover()
+        recovered = self.store.one("SELECT status FROM candidates WHERE id='crash-reservation'")
+        assert recovered is not None
+        self.assertEqual(recovered['status'], 'interrupted')
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertNotEqual(result.get('code'), 'evolution_reservation_busy')
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls['proposal'], 1)
+
     def test_changed_policy_cases_or_strategies_rearm_the_failed_experiment(self):
         args = self.setup_proposal()
         self.evolution.propose_and_evaluate(*args)
@@ -456,6 +471,112 @@ class AuditEvolutionTest(unittest.TestCase):
         (overlay / 'empty').mkdir()
         self.assertNotEqual(executable, Evolution.overlay_digest(overlay))
 
+    def test_missing_overlay_directory_is_unavailable_instead_of_fatal(self):
+        """维护清理或工作树删除后，历史用例的 overlay 目录消失不是调度错误。"""
+        gone = self.root / 'cleaned-overlay'
+        self.assertIsNone(Evolution.overlay_digest(gone))
+        self.assertIsNone(Evolution.overlay_digest(str(gone)))
+        self.assertIsNone(Evolution.overlay_digest(''))
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        digest = str(Evolution.overlay_digest(overlay) or '')
+        self.assertRegex(digest, r'^[0-9a-f]{64}$')
+        shutil.rmtree(overlay)
+        # 先算过摘要的目录被清掉后同样降级，不再抛 FileNotFoundError。
+        self.assertIsNone(Evolution.overlay_digest(overlay))
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        self.assertEqual(digest, Evolution.overlay_digest(overlay))
+        # overlay 必须是目录；路径指向普通文件时同样不可用。
+        self.assertIsNone(Evolution.overlay_digest(overlay / 'case.txt'))
+
+    def test_unreadable_overlay_is_unavailable_while_malformed_content_still_raises(self):
+        import os
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'case.txt').write_text('sealed\n')
+        with patch('pathlib.Path.lstat', side_effect=PermissionError('overlay denied')):
+            self.assertIsNone(Evolution.overlay_digest(overlay))
+        # 非常规文件不是「不可用」而是「不可复现」，仍要显式报错，避免被当成有效输入。
+        os.mkfifo(overlay / 'pipe', 0o600)
+        with self.assertRaisesRegex(ValueError, 'regular files'):
+            Evolution.overlay_digest(overlay)
+
+    def test_missing_overlay_does_not_block_periodic_evolution_attempt(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        missing = self.root / 'missing-overlay'
+        base_spec = {'task': 'historical task', 'repository': str(self.root),
+                     'base': 'HEAD', 'checks': []}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('with-overlay', 'p', 'f1', 'validation',
+                            encode({**base_spec, 'overlay': str(missing)}), 0, 1.0))
+        signature = str(evolution.input_signature('p', config) or '')
+        self.assertRegex(signature, r'^[0-9a-f]{64}$')
+        due, computed, attempt = evolution.attempt_due('p', config)
+        self.assertIs(due, True)
+        self.assertEqual(computed, signature)
+        self.assertEqual(attempt, {})
+        # 缺失的 overlay 不会让签名每次抖动：记录尝试后同一输入不再重复触发。
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+        due_again, again, recorded = evolution.attempt_due('p', config)
+        self.assertFalse(due_again)
+        self.assertEqual(again, signature)
+        self.assertEqual(recorded['status'], 'insufficient_evidence')
+        # overlay 缺失不等同于「没有 overlay」：spec 指纹仍区分两种用例。
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('without-overlay', 'p', 'f2', 'validation',
+                            encode({**base_spec, 'overlay': None}), 0, 2.0))
+        self.assertNotEqual(signature, evolution.input_signature('p', config))
+
+    def test_vanished_overlay_is_reported_as_changed_input_not_a_valid_manifest(self):
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'marker.txt').write_text('sealed\n')
+        spec = {'task': 'fix add', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': CHECKS,
+                'repository': str(repo), 'overlay': str(overlay)}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case', 'p', 'f', 'holdout', encode(spec), 0, 1))
+        item = {'case': 'case', 'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                'tree': git(repo, 'rev-parse', spec['base'] + '^{tree}'), 'checks': fingerprint(CHECKS),
+                'overlay': Evolution.overlay_digest(overlay)}
+        self.assertTrue(self.evolution.verify_inputs('p', [item])['valid'])
+        shutil.rmtree(overlay)
+        result = self.evolution.verify_inputs('p', [item])
+        # 优雅降级只放宽调度，不放宽封存校验：已归档的 overlay 消失仍判为输入变化。
+        self.assertFalse(result['valid'])
+        self.assertEqual(result['mismatches'], [{'case': 'case', 'fields': ['overlay']}])
+
+    def test_unreadable_overlay_is_rejected_before_sealing_and_verification(self):
+        args = self.setup_proposal()
+        overlay = self.root / 'unreadable-overlay'
+        overlay.mkdir()
+        (overlay / 'marker').write_text('protected')
+        row = self.store.one("SELECT spec FROM cases WHERE id='validation'")
+        spec = {**json.loads(row['spec']), 'overlay': str(overlay)}
+        self.store.execute("UPDATE cases SET spec=? WHERE id='validation'", (encode(spec),))
+        from adaptive_rsi.gitops import git
+        manifest = [{'case': 'validation', 'spec': fingerprint(spec), 'task': fingerprint(spec['task']),
+                     'tree': git(spec['repository'], 'rev-parse', spec['base'] + '^{tree}'),
+                     'checks': fingerprint(spec['checks']), 'overlay': None}]
+        real_open = Path.open
+        def denied(path, *args, **kwargs):
+            if path == overlay / 'marker':
+                raise PermissionError('fixture unreadable overlay')
+            return real_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', denied):
+            self.assertFalse(self.evolution.verify_inputs('p', manifest)['valid'])
+            result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+
     def test_case_with_unavailable_overlay_is_excluded_before_sealing(self):
         """overlay 被清理的用例不得进入实验：缺失目录只会被静默跳过，试验会缺受保护输入。"""
         args = self.setup_proposal()
@@ -526,6 +647,42 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['interaction_only'], ['x'])
         self.assertEqual(result['strategy_wins'], [])
         self.assertEqual(Evolution.attribution(rows[:-1])['state'], 'insufficient_evidence')
+
+    def test_attribution_refuses_a_variant_without_code_changes(self):
+        """空补丁变体与 baseline 同树，不能给任何因素记增益。"""
+        rows = [{'input': 'x', 'variant': name, 'pass': passed} for name, passed in
+                [('baseline', False), ('strategy_only', False), ('skill_only', True), ('combined', True)]]
+        rows[2]['no_change'] = True
+        result = Evolution.attribution(rows)
+        self.assertEqual(result['state'], 'insufficient_evidence')
+        self.assertTrue(result['no_change'])
+
+    def test_empty_patch_trial_is_not_a_paired_win_or_loss(self):
+        """试验记录保留 no_change 标记；空转既不算改进也不算回归。"""
+        trials = [{'case': 'x', 'split': 'validation',
+                   'stable': {'pass': True}, 'candidate': {'pass': True, 'no_change': True}}]
+        decision = Evolution.split_decision(trials, self.config)
+        self.assertEqual(decision['decision'], 'insufficient_evidence')
+        summary = paired_summary(trials)
+        self.assertEqual((summary['wins'], summary['losses'], summary['ties'], summary['no_change']), (0, 0, 0, 1))
+        self.assertEqual(summary['cohorts']['x']['outcome'], 'no_change')
+
+    def test_run_configuration_records_no_change_without_a_pass(self):
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import fixture
+        repo = fixture(self.root / 'repo')
+        config = {'evolution': {'max_holdout_uses': 1}, 'checks': []}
+        self.evolution.runtime.execute_candidate = lambda *args, **kwargs: {
+            'decision': 'insufficient_evidence', 'no_change': True,
+            'reason': 'Experiment produced no code changes'}
+        spec = {'task': 'trial task', 'base': git(repo, 'rev-parse', 'HEAD'), 'checks': [],
+                'repository': str(repo), 'overlay': None}
+        result = self.evolution.run_configuration(
+            {'id': 'run', 'task': 'task', 'config': encode(config)}, {'id': 'p'},
+            {'id': 'case'}, spec, 'candidate', 0, [], self.root / 'run', 'candidate', config)
+        self.assertFalse(result['pass'])
+        self.assertTrue(result['no_change'])
+        self.assertEqual(result['reason'], 'Experiment produced no code changes')
 
     def test_ablation_is_scheduled_only_when_the_skill_is_retrievable(self):
         proposal = {'kind': 'strategy', 'guidance': 'do x', 'triggers': ['checklist']}
@@ -611,8 +768,11 @@ class AuditEvolutionTest(unittest.TestCase):
             skills = experiment_skills or []
             strategy = any(isinstance(item.get('content'), dict) and
                            item['content'].get('guidance') == 'small improvement' for item in guide)
+            from pathlib import Path
+            stage = 'ablation' if 'ablation' in str(directory) else 'paired'
+            variant = Path(directory).name
             observed.append({'strategy': strategy, 'skill': bool(skills), 'experiment': experiment,
-                             'baseline_ids': baseline_ids})
+                             'baseline_ids': baseline_ids, 'stage': stage, 'variant': variant})
             # 只有策略能提升；技能单独不生效，两者同时生效时仍通过。
             return {'decision': 'pass' if strategy else 'fail'}
         self.evolution.runtime.execute_candidate = execute
@@ -657,11 +817,15 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(attribution['strategy_wins'], [rows[0]['input']])
         self.assertEqual(evidence['promotion_review']['attribution'], attribution)
         self.assertIn('no automatic attribution', evidence['ablation']['limitation'])
-        # 消融只补跑 skill_only 与 combined，且都走实验路径；没有写技能行。
-        skills = [item for item in observed if item['skill']]
-        self.assertEqual(len(skills), 2)
+        # 消融只补跑 strategy_only 与 skill_only，初筛候选按 combined 评估；都走实验路径，没有写技能行。
+        ablation_runs = [item for item in observed if item['stage'] == 'ablation']
+        self.assertEqual(len(ablation_runs), 2)
+        self.assertEqual([item['variant'] for item in ablation_runs], ['strategy_only', 'skill_only'])
+        self.assertEqual([item['strategy'] for item in ablation_runs], [True, False])
+        self.assertEqual([item['skill'] for item in ablation_runs], [False, True])
         self.assertTrue(all(item['experiment'] for item in observed))
-        self.assertEqual([item['strategy'] for item in skills], [False, True])
+        candidate_runs = [item for item in observed if item['stage'] == 'paired' and item['variant'] == 'candidate']
+        self.assertTrue(all(item['strategy'] and item['skill'] for item in candidate_runs))
         # 四配置的既有技能集合由同一批基线策略固定，不随各变体 guide 漂移。
         self.assertEqual({frozenset(item['baseline_ids']) for item in observed}, {frozenset({'stable-kind'})})
         self.assertEqual(self.store.query('SELECT * FROM skills'), [])
@@ -676,9 +840,90 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(evidence['ablation']['attribution']['state'], 'insufficient_evidence')
         self.assertIn('Four matched configurations', evidence['ablation']['reason'])
         self.assertEqual(evidence['promotion_review']['attribution']['state'], 'insufficient_evidence')
-        # 没有输入命中触发词时不补跑任何配置，也不写技能行。
-        self.assertEqual([item for item in observed if item['skill']], [])
+        # 没有输入命中触发词时不补跑任何消融配置，也不写技能行。
+        self.assertEqual([item for item in observed if item['stage'] == 'ablation'], [])
         self.assertEqual(self.store.query('SELECT * FROM skills'), [])
+
+    def test_joint_gain_proposal_evaluates_combined_and_attributes_to_interaction_only(self):
+        """真正组合增益候选（单策略、单技能均失败，同时生效才通过）在初筛评估 combined 并归因为 interaction_only。"""
+        args, observed = self.setup_ablation()
+        baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
+        self.evolution.runtime.active_strategies = lambda project: [baseline]
+
+        def execute(run, project, task, repository, base, directory, workspace, guide,
+                    experiment=False, experiment_skills=None, baseline_ids=None):
+            skills = experiment_skills or []
+            strategy = any(isinstance(item.get('content'), dict) and
+                           item['content'].get('guidance') == 'small improvement' for item in guide)
+            has_skill = bool(skills)
+            from pathlib import Path
+            stage = 'ablation' if 'ablation' in str(directory) else 'paired'
+            variant = Path(directory).name
+            observed.append({'strategy': strategy, 'skill': has_skill, 'experiment': experiment,
+                             'baseline_ids': baseline_ids, 'stage': stage, 'variant': variant})
+            # 真正组合增益：仅当策略与技能同时存在（combined）时才通过；单独策略或单独技能均失败。
+            return {'decision': 'pass' if (strategy and has_skill) else 'fail'}
+        self.evolution.runtime.execute_candidate = execute
+
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'pass')
+        evidence = self.evidence_of(result['candidate'])
+        self.assertEqual(evidence['ablation']['state'], 'complete')
+        self.assertEqual(evidence['ablation']['sampled'], 1)
+        rows = evidence['ablation']['rows']
+        self.assertEqual(sorted(row['variant'] for row in rows),
+                         ['baseline', 'combined', 'skill_only', 'strategy_only'])
+
+        attribution = evidence['ablation']['attribution']
+        self.assertEqual(attribution['state'], 'complete')
+        self.assertEqual(attribution['interaction_only'], [rows[0]['input']])
+        self.assertEqual(attribution['strategy_wins'], [])
+        self.assertEqual(attribution['skill_wins'], [])
+        self.assertEqual(evidence['promotion_review']['attribution'], attribution)
+
+        # 检查消融执行的两个剥离因子配置与初筛候选配置
+        ablation_runs = [item for item in observed if item['stage'] == 'ablation']
+        self.assertEqual([item['variant'] for item in ablation_runs], ['strategy_only', 'skill_only'])
+        self.assertEqual([item['strategy'] for item in ablation_runs], [True, False])
+        self.assertEqual([item['skill'] for item in ablation_runs], [False, True])
+        candidate_runs = [item for item in observed if item['stage'] == 'paired' and item['variant'] == 'candidate']
+        self.assertTrue(all(item['strategy'] and item['skill'] for item in candidate_runs))
+
+    def test_ablation_attribution_distinguishes_strategy_wins_and_interaction_only(self):
+        """消融归因在多个采样输入中分别识别 strategy_wins 与 interaction_only，解除 100% 锁定。"""
+        spec_1 = {'task': 'secret task 1', 'base': 'HEAD', 'checks': [], 'source': 'real',
+                  'repository': str(self.root), 'overlay': None}
+        spec_2 = {'task': 'secret task 2', 'base': 'HEAD', 'checks': [], 'source': 'real',
+                  'repository': str(self.root), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-strat', 'p', 'case-strat', 'validation', encode(spec_1), 0, 1))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-inter', 'p', 'case-inter', 'validation', encode(spec_2), 0, 1))
+        trials = [
+            {'case': 'case-strat', 'split': 'validation', 'repetition': 0,
+             'stable': {'pass': False}, 'candidate': {'pass': True}},
+            {'case': 'case-inter', 'split': 'validation', 'repetition': 0,
+             'stable': {'pass': False}, 'candidate': {'pass': True}},
+        ]
+        self.evolution.runtime = self.runtime_with([])
+        def run_cfg(*call, **kwargs):
+            case_id = call[2]['id']
+            variant = call[4]
+            # case-strat: strategy_only 单独成功
+            # case-inter: strategy_only 与 skill_only 单独均失败（仅在初筛 combined 成功）
+            passed = (case_id == 'case-strat' and variant == 'strategy_only')
+            return {'pass': passed, 'reason': 'test'}
+        self.evolution.run_configuration = run_cfg
+        config = {'evolution': {'ablation_cases': 2, 'max_holdout_uses': 3}}
+        proposal = {'kind': 'strategy', 'guidance': 'small improvement', 'triggers': ['secret']}
+        record = self.evolution.ablate({'id': 'p'}, self.root, {'id': 'r'}, config, [], proposal, 'cand', trials)
+        self.assertEqual(record['state'], 'complete')
+        self.assertEqual(record['sampled'], 2)
+        attribution = record['attribution']
+        self.assertEqual(attribution['state'], 'complete')
+        self.assertEqual(attribution['strategy_wins'], ['case-strat'])
+        self.assertEqual(attribution['interaction_only'], ['case-inter'])
+        self.assertEqual(attribution['skill_wins'], [])
 
     def test_four_configurations_differ_only_in_the_tested_factor(self):
         """baseline/strategy_only 技能相同；skill_only 恰多一个候选技能；combined 只换引导。"""
@@ -825,7 +1070,7 @@ class AuditEvolutionTest(unittest.TestCase):
         proposal = {'kind': 'strategy', 'guidance': 'small improvement', 'triggers': ['secret']}
         record = self.evolution.ablate({'id': 'p'}, self.root, {'id': 'r'}, config, [], proposal, 'cand', trials)
         # 同一输入的另一次重复不再补跑，否则四配置里会出现重复变体行。
-        self.assertEqual(calls, ['skill_only', 'combined'])
+        self.assertEqual(calls, ['strategy_only', 'skill_only'])
         self.assertEqual(record['sampled'], 1)
         self.assertEqual(record['state'], 'complete')
         self.assertEqual(sorted(row['variant'] for row in record['rows']),
@@ -1243,6 +1488,88 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['credentials']['missing'], [])
         self.assertTrue(result['reproducible'])
         self.assertTrue(result['executed_checks'][0]['passed'])
+
+        # provider_requirements 内置与上游供应商映射
+        from adaptive_rsi.config import DEFAULTS
+        self.assertEqual(Evolution.provider_requirements(DEFAULTS),
+                         [{'id': 'openai', 'env_key': ''}])
+
+        multi_cfg = {
+            'models': {
+                'general': {'provider': 'openai'},
+                'heavy': {'provider': 'anthropic'},
+                'fast': {'provider': 'deepseek'},
+            }
+        }
+        self.assertEqual(Evolution.provider_requirements(multi_cfg), [
+            {'id': 'openai', 'env_key': ''},
+            {'id': 'anthropic', 'env_key': 'ANTHROPIC_API_KEY'},
+            {'id': 'deepseek', 'env_key': 'DEEPSEEK_API_KEY'},
+        ])
+
+        # 本地与显式 env_key='' 行为不受影响
+        local_builtins_cfg = {
+            'models': {
+                'analysis': {'provider': 'ollama'},
+                'planning': {'provider': 'lmstudio'},
+                'implementation': {'provider': 'opencode'},
+            }
+        }
+        self.assertEqual(Evolution.provider_requirements(local_builtins_cfg), [
+            {'id': 'ollama', 'env_key': ''},
+            {'id': 'lmstudio', 'env_key': ''},
+            {'id': 'opencode', 'env_key': ''},
+        ])
+
+        explicit_local_cfg = {
+            'models': {'analysis': {'provider': 'custom_local'}},
+            'providers': [{'id': 'custom_local', 'name': 'local', 'base_url': 'http://localhost:8080', 'env_key': ''}],
+        }
+        self.assertEqual(Evolution.provider_requirements(explicit_local_cfg),
+                         [{'id': 'custom_local', 'env_key': ''}])
+
+        explicit_openai_local_cfg = {
+            'models': {'analysis': {'provider': 'openai'}},
+            'providers': [{'id': 'openai', 'name': 'mock-openai', 'base_url': 'http://localhost:8080', 'env_key': ''}],
+        }
+        self.assertEqual(Evolution.provider_requirements(explicit_openai_local_cfg),
+                         [{'id': 'openai', 'env_key': ''}])
+
+    def test_bundle_offline_reproduction_default_builtin_provider_preserves_login_requirements(self):
+        # 默认 openai 使用 Codex 登录，不得凭供应商 id 推断 API key。
+        from adaptive_rsi.config import DEFAULTS
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        self.config = DEFAULTS
+        repo = fixture(self.root / 'repo-default-cred')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {
+            'task': 'offline reproduction task',
+            'base': base,
+            'checks': [{'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}],
+            'source': 'real',
+            'signature': 'sig-default-cred',
+            'repository': str(repo),
+            'overlay': None,
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-default-cred', 'p', 'family-default-cred', 'validation', encode(spec), 0, time.time()))
+        evidence = {'dataset': {'manifest': [{'case': 'case-default-cred'}]}}
+        self.candidate(evidence)
+        destination = self.root / 'bundle-default-cred'
+        self.evolution.export_bundle('c', destination)
+
+        # 导出的凭据需求遵循内置 Codex 登录配置。
+        exported = json.loads((destination / 'evidence.json').read_text(encoding='utf-8'))
+        self.assertEqual(exported['providers'], [{'id': 'openai', 'env_key': ''}])
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['credentials']['missing'], [])
+        self.assertEqual(result['credentials']['available'], [])
+        self.assertTrue(result['reproducible'])
 
     def test_save_hotpath_skips_reverification_in_evaluating_state(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
