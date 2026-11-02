@@ -46,6 +46,7 @@ const english = {
  "核对时间": "Checked at",
  "只读查询只读取 GitHub 状态，不会启动或重试工作流。": "A read-only query only reads GitHub status; it never starts or retries a workflow.",
  "已知候选工作流记录（只读）：": "Known workflow runs (read-only):",
+ "共 {total} 条，当前展示 {shown} 条": "{total} total, currently showing {shown}",
  "选择要关联的工作流记录": "Select the workflow run to associate",
  "请选择一条工作流记录": "Select a workflow run",
  "关联所选记录": "Associate selected run",

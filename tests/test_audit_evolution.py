@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.config import fingerprint
-from adaptive_rsi.evolution import Evolution, case_spec
+from adaptive_rsi.evolution import Evolution, case_spec, paired_summary
 from adaptive_rsi.store import Store, encode
 
 
@@ -657,6 +657,54 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['credentials']['missing'], [])
         self.assertTrue(result['reproducible'])
         self.assertTrue(result['executed_checks'][0]['passed'])
+
+    def test_save_hotpath_skips_reverification_in_evaluating_state(self):
+        data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
+        plan = {'data': data, 'sha256': fingerprint(data)}
+        evidence = {'preregistered_plan': plan, 'trials': []}
+        self.candidate(evidence)
+
+        with patch.object(self.evolution, 'verify_plan', wraps=self.evolution.verify_plan) as mock_verify, \
+             patch('adaptive_rsi.evolution.paired_summary', wraps=paired_summary) as mock_summary:
+            # 1. 初始 evaluating 态保存：首次验证计划
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+            self.assertEqual(evidence['plan_verification']['analysis'], 'planned_in_progress')
+
+            # 2. 追加 trial 后再次以 evaluating 保存：跳过完整重验，但 trials 正常持久化
+            trial1 = {'case': 'x', 'split': 'validation', 'repetition': 0,
+                      'stable': {'pass': False}, 'candidate': {'pass': True}}
+            evidence['trials'].append(trial1)
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+            row1 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row1 is not None
+            persisted = json.loads(row1['evidence'])
+            self.assertEqual(len(persisted['trials']), 1)
+
+            # 3. 计划变化时：触发重新验证
+            modified_data = {'repeats': 1, 'samples': [{'id': 'x', 'split': 'validation'}]}
+            evidence['preregistered_plan'] = {'data': modified_data, 'sha256': fingerprint(modified_data)}
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 2)
+            self.assertEqual(mock_summary.call_count, 2)
+
+            # 4. 终态保存：触发完整重验
+            trial2 = {'case': 'x', 'split': 'validation', 'repetition': 1,
+                      'stable': {'pass': False}, 'candidate': {'pass': True}}
+            evidence['trials'].append(trial2)
+            self.evolution.save('c', 'ready', evidence)
+            self.assertEqual(mock_verify.call_count, 3)
+            self.assertEqual(mock_summary.call_count, 3)
+            row2 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row2 is not None
+            persisted = json.loads(row2['evidence'])
+            self.assertEqual(len(persisted['trials']), 2)
+            self.assertIn('wilson_95', persisted['win_rate'])
+            # 终态清理缓存
+            self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
 
 
 if __name__ == '__main__':
