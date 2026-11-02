@@ -306,7 +306,12 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stab
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
-            result = json.loads(row["result"])
+            try:
+                result = json.loads(row["result"] or "{}")
+            except (TypeError, ValueError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
             result.setdefault("automation", {})[kind] = data
             db.execute("UPDATE runs SET result=? WHERE id=?", (encode(result), run["id"]))
     return data

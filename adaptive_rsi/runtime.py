@@ -130,7 +130,12 @@ class Runtime(Maintenance):
         override = {}
         if project:
             row = self.project(project)
-            override = json.loads(row["config"])
+            try:
+                override = json.loads(row["config"] or "{}")
+            except (TypeError, ValueError):
+                override = {}
+            if not isinstance(override, dict):
+                override = {}
         raw = merge(DEFAULTS, self.store.setting("config", {}), override)
         # 调度循环每 5 秒读取每个项目的配置；validate 是纯函数，按内容指纹缓存校验结果。
         key = fingerprint(raw)
@@ -413,7 +418,13 @@ class Runtime(Maintenance):
             # Global changes must also remain valid for every existing project override.
             for row in projects:
                 if row["id"] in schedules:
-                    validate(merge(updated, json.loads(row["config"])))
+                    try:
+                        project_override = json.loads(row["config"] or "{}")
+                    except (TypeError, ValueError):
+                        project_override = {}
+                    if not isinstance(project_override, dict):
+                        project_override = {}
+                    validate(merge(updated, project_override))
         revision_key = "config-revision:" + (project or "global")
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2015,7 +2026,10 @@ class Runtime(Maintenance):
 
     def issue_still_open(self, project, task, config):
         from .delivery import StaleCandidate
-        evidence_rows = json.loads(task["evidence"])
+        try:
+            evidence_rows = json.loads(task["evidence"] or "[]")
+        except (TypeError, ValueError):
+            evidence_rows = []
         if not evidence_rows or not isinstance(evidence_rows[0], dict) or "number" not in evidence_rows[0]:
             raise StaleCandidate("Task evidence no longer references its Issue; synchronize Issues before delivering")
         evidence = evidence_rows[0]

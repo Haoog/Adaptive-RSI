@@ -435,10 +435,22 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     protected_feedback = protected_feedback_values(runtime.store, task["id"])
     context["previous_attempts"] = [retry_feedback(r, protected_feedback) for r in context["previous_attempts"]]
     if task["source"] == "rollback":
-        prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (json.loads(task["evidence"])[0]["run"], project["id"]))
+        try:
+            task_evidence = json.loads(task["evidence"] or "[]")
+        except (TypeError, ValueError):
+            task_evidence = []
+        original_run_id = task_evidence[0]["run"] if task_evidence else None
+        if not original_run_id:
+            raise RuntimeError("Rollback task missing original run reference")
+        prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (original_run_id, project["id"]))
         if not prior:
             raise RuntimeError("Original run missing")
-        prior_result = json.loads(prior["result"])
+        try:
+            prior_result = json.loads(prior["result"] or "{}")
+        except (TypeError, ValueError):
+            prior_result = {}
+        if not isinstance(prior_result, dict):
+            prior_result = {}
         prior_directory = Path(prior["path"]) if prior["path"] else runtime.store.root / "runs" / prior["id"]
         patch_path = prior_directory / "candidate.patch"
         try:

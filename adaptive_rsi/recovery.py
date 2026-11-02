@@ -70,7 +70,12 @@ def cached(runtime, run, stage, signature, accept=None, normalize=None):
                             "WHERE r.task=? AND s.stage=? AND s.signature=? AND r.id<>? "
                             "ORDER BY s.created DESC LIMIT 1", (run["task"], stage, signature, run["id"]))
     if row:
-        data = json.loads(row["data"])
+        try:
+            data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
         if normalize is not None:
             try:
                 data = normalize(data)

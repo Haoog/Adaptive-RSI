@@ -14,7 +14,12 @@ def safe_excerpt(value, limit=1200):
 
 
 def retry_feedback(row, protected=()):
-    result = json.loads(row["result"])
+    try:
+        result = json.loads(row["result"] or "{}")
+    except (TypeError, ValueError):
+        result = {}
+    if not isinstance(result, dict):
+        result = {}
     feedback = {key: row.get(key) for key in ["id", "base", "state"]}
     variants = {variant for value in protected for variant in
                 (value, json.dumps(value, ensure_ascii=True)[1:-1], repr(value)[1:-1]) if variant}
@@ -61,7 +66,13 @@ def protected_feedback_values(store, task):
     values = set()
     rows = store.query("SELECT s.data FROM stages s JOIN runs r ON r.id=s.run WHERE r.task=? AND s.stage='acceptance' ORDER BY s.created DESC LIMIT 2", (task,))
     for row in rows:
-        for item in json.loads(row["data"]).get("files", []):
+        try:
+            stage_data = json.loads(row["data"] or "{}")
+        except (TypeError, ValueError):
+            stage_data = {}
+        if not isinstance(stage_data, dict):
+            stage_data = {}
+        for item in stage_data.get("files", []):
             content = item.get("content", "")
             values.update(line.strip() for line in content.splitlines() if len(line.strip()) >= 10)
             try:

@@ -225,7 +225,12 @@ class Evolution:
         for item in manifest:
             row = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], project))
             try:
-                spec = json.loads(row["spec"]) if row else {}
+                try:
+                    spec = json.loads(row["spec"]) if row else {}
+                except (TypeError, ValueError):
+                    spec = {}
+                if not isinstance(spec, dict):
+                    spec = {}
                 actual = {"spec": fingerprint(spec), "task": fingerprint(spec["task"]),
                           "checks": fingerprint(spec["checks"]),
                           "tree": git(spec["repository"], "rev-parse", spec["base"] + "^{tree}"),

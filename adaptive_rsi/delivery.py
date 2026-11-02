@@ -558,14 +558,24 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
                         if task and task["source"] == "rollback":
-                            original_id = json.loads(task["evidence"])[0]["run"]
-                            original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
-                            if original:
-                                result = json.loads(original["result"])
-                                result["reverted_by"] = run["id"]
-                                result["feedback"] = {**result.get("feedback", {}), "state": "reverted"}
-                                store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode(result), original_id))
-                                store.execute("UPDATE tasks SET state='reverted',updated=? WHERE id=?", (now, original["task"]))
+                            try:
+                                task_evidence = json.loads(task["evidence"] or "[]")
+                            except (TypeError, ValueError):
+                                task_evidence = []
+                            original_id = task_evidence[0]["run"] if task_evidence else None
+                            if original_id:
+                                original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
+                                if original:
+                                    try:
+                                        result = json.loads(original["result"] or "{}")
+                                    except (TypeError, ValueError):
+                                        result = {}
+                                    if not isinstance(result, dict):
+                                        result = {}
+                                    result["reverted_by"] = run["id"]
+                                    result["feedback"] = {**result.get("feedback", {}), "state": "reverted"}
+                                    store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode(result), original_id))
+                                    store.execute("UPDATE tasks SET state='reverted',updated=? WHERE id=?", (now, original["task"]))
                 elif pr["state"] == "CLOSED":
                     outcome["delivery_status"] = "closed"
                     store.execute("UPDATE runs SET state='pr_closed' WHERE id=?", (run["id"],))
