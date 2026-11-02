@@ -631,6 +631,60 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(self.runtime.agent.roles, [])
         self.assertEqual(self.store.query("SELECT * FROM calls"), [])
 
+    def no_change_agent(self):
+        class NoChange(FakeAgent):
+            """实现模型声称完成，却没有改动任何文件。"""
+            def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                if role == "implementation":
+                    return {"summary": "Claimed no file needed changing"}
+                return super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+        return NoChange()
+
+    def no_change_inputs(self, text):
+        """真实工作区上直接调用流水线的空补丁输入；不接受模型自报成功。"""
+        task_id, run = self.claim(text)
+        task = self.store.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        project = self.runtime.project(self.project)
+        base = git(project["path"], "rev-parse", "HEAD")
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True, exist_ok=True)
+        return task, run, project, base, directory, snapshot(project["path"], directory / "workspace", base)
+
+    def test_experiment_without_code_changes_is_insufficient_without_evaluation(self):
+        """空补丁在实验里与 baseline 是同一棵树：refactor 验收会空过，不能计为 pass。"""
+        from adaptive_rsi import pipeline
+        self.runtime.agent = self.no_change_agent()
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the calculator helper without changing behavior")
+        trial = self.runtime.new_trial_context(run)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "checks": {}, "improvement": {"decision": "pass"}}) as evaluate:
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project["path"], base, directory, workspace,
+                [], experiment=True)
+        # 报告中的可达输入：计划被判成 refactor（baseline 全过即可 pass 的分支）。
+        self.assertEqual(change_kind(task, json.loads((directory / "plan.json").read_text())), "refactor")
+        # 修复前：空补丁仍进入评估，评估器返回 pass，试验被计为成功。
+        self.assertFalse(evaluate.called)
+        self.assertEqual(outcome["decision"], "insufficient_evidence")
+        self.assertTrue(outcome["no_change"])
+        self.assertEqual(outcome["reason"], "Experiment produced no code changes")
+
+    def test_production_without_code_changes_still_becomes_obsolete(self):
+        """生产路径的空补丁语义不变：记为 obsolete 而不是进入评估。"""
+        from adaptive_rsi import pipeline
+        self.runtime.agent = self.no_change_agent()
+        task, run, project, base, directory, workspace = self.no_change_inputs(
+            "Refactor the calculator helper without changing behavior")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate") as evaluate:
+            outcome = pipeline.execute_candidate(
+                self.runtime, run, project, task, project["path"], base, directory, workspace, [])
+        self.assertIsNone(outcome)
+        self.assertFalse(evaluate.called)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "obsolete")
+
     def test_validation_failure_never_exposes_holdout_and_uses_production_path(self):
         self.import_cases()
         self.runtime.configure({"limits": {"daily_calls": 100}, "evolution": {"min_cases_per_split": 1, "max_calls": 100}}, self.project)

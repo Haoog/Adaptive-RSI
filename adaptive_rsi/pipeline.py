@@ -484,6 +484,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     acceptance_cancel = threading.Event()
     if (saved_candidate is None and task["source"] != "rollback" and acceptance and
             acceptance.get("change_kind") != "performance"):
+        if experiment:
+            # 实验路径的 transition() 不写 runs.state（见本函数开头），后台验收基线
+            # 评估会一直按 preparation 预算计时；评估工作开始前显式切到评估相位。
+            runtime.begin_phase(run, "evaluation")
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         try:
@@ -530,9 +534,17 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                  encode({"plan": plan, **implementation_context}), workspace, run)
         scrub_tree(workspace)
         files, patch = changes(workspace)
-        if not files and not experiment:
-            transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
-            return None
+        if not files:
+            if not experiment:
+                transition("obsolete", {"reason": "No code changes produced", "summary": result["summary"]}, True)
+                return None
+            # 空补丁没有改动任何文件，baseline 与 candidate 是同一棵树；refactor /
+            # preservation 的验收检查会因此无条件通过，评估器再把“全部通过”翻成
+            # pass，把模型空转计成实验成功。实验路径必须显式报告没有改动，不能
+            # 进入评估，否则四配置消融会把差异归因给实际未被执行的因素。
+            return {"decision": "insufficient_evidence", "no_change": True,
+                    "reason": "Experiment produced no code changes", "files": [],
+                    "summary": result["summary"]}
         if change_type == "documentation" and not documentation_only(_touched_paths(workspace) or files):
             # A declared documentation scope must not launder source edits past
             # the normal acceptance gate.  Mixed patches are rejected instead
@@ -563,6 +575,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not experiment:
             save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
         transition("evaluating")
+        if experiment and run.get("_explicit_phase") != "evaluation":
+            # 实验路径没有 runs.state 迁移，必须显式切相位；否则五个评估阶段仍共用
+            # preparation 的 900 秒预算，长评估会被误判超时。验收基线已切过相位时
+            # 不再重置计时，避免同一试验拿到双份评估预算。
+            runtime.begin_phase(run, "evaluation")
         if acceptance_future is not None:
             acceptance_baseline = acceptance_future.result()
             acceptance_executor.shutdown(wait=True)

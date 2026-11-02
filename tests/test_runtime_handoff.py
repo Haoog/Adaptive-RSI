@@ -160,6 +160,103 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def experiment_inputs(self):
+        """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
+        from adaptive_rsi.gitops import git, snapshot
+        task_id, run = self.claim()
+        task = self.store.one('SELECT * FROM tasks WHERE id=?', (task_id,))
+        project, config = self.runtime.project(self.project), self.runtime.config(self.project)
+        base = git(project['path'], 'rev-parse', 'HEAD')
+        directory = self.store.root / 'runs' / run['id']
+        directory.mkdir(parents=True, exist_ok=True)
+        workspace = snapshot(project['path'], directory / 'workspace', base)
+        return run, task, project, config, base, directory, workspace, self.runtime.new_trial_context(run)
+
+    def test_experiment_evaluation_runs_on_the_evaluation_clock(self):
+        """实验路径不写 runs.state，评估阶段仍必须切到 evaluation 预算。"""
+        from adaptive_rsi import pipeline
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        observed = {}
+        def evaluation(_baseline, _candidate, _checks, _target, _config, _cancel, **kwargs):
+            # 901 秒：超过 preparation 的 900 秒，仍在 evaluation 的 3600 秒内。
+            trial['_deadline_started'] -= 901
+            observed['phase'] = trial.get('_explicit_phase')
+            observed['cancelled'] = self.runtime.is_cancelled(trial)
+            observed['timed_out_stage'] = trial.get('_timed_out_stage')
+            return {'decision': 'pass', 'checks': {}, 'improvement': {'decision': 'pass'}}
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluation):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=True)
+        self.assertEqual(outcome['decision'], 'pass')
+        # 试验从不写 runs.state；若评估未切相位，这里会是 preparation 超时。
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'planning')
+        self.assertEqual(observed, {'phase': 'evaluation', 'cancelled': False, 'timed_out_stage': None})
+
+    def test_experiment_acceptance_baseline_runs_on_the_evaluation_clock(self):
+        """后台验收基线线程在提交前就必须处于评估相位，不能继承 preparation 预算。"""
+        from adaptive_rsi import pipeline
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == 'planning' and isinstance(result, dict):
+                    return {**result, 'risk': 'high'}
+                return result
+        self.runtime.agent = HighRisk()
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        observed = {}
+        def baseline(*args, **kwargs):
+            observed['phase'] = trial.get('_explicit_phase')
+            return {'decision': 'pass', 'checks': {}}
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
+             patch.object(self.runtime.evaluator, 'evaluate',
+                          return_value={'decision': 'pass', 'checks': {}, 'improvement': {'decision': 'pass'}}):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=True)
+        self.assertEqual(outcome['decision'], 'pass')
+        self.assertEqual(observed, {'phase': 'evaluation'})
+
+    def test_trial_evaluation_timeout_reaches_parent_when_pipeline_raises(self):
+        from adaptive_rsi.evolution import Evolution
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        _, parent = self.claim()
+        project, config = self.runtime.project(self.project), self.runtime.config(self.project)
+        spec = {'task': 'trial task', 'base': git(project['path'], 'rev-parse', 'HEAD'),
+                'checks': [], 'repository': project['path'], 'overlay': None}
+        def cancel(trial, *args, **kwargs):
+            self.runtime.begin_phase(trial, 'evaluation')
+            trial['_deadline_started'] -= config['deadlines']['evaluation_seconds'] + 1
+            self.assertTrue(self.runtime.is_cancelled(trial))
+            raise Cancelled('Model invocation cancelled or stage deadline exceeded')
+        self.runtime.execute_candidate = cancel
+        with self.assertRaises(Cancelled):
+            Evolution(self.runtime).run_configuration(
+                parent, project, {'id': 'case'}, spec, 'stable', 0, [],
+                self.root / 'run', 'candidate', config)
+        # 异常路径同样要把试验的 _timed_out_stage 交给父 run；否则只能记为 interrupted。
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+
+    def test_evaluation_deadline_marks_run_blocked_with_evaluation_stage(self):
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        _, run = self.claim()
+        project, config = self.runtime.project(self.project), self.runtime.config(self.project)
+        base = git(project['path'], 'rev-parse', 'HEAD')
+        def cancel(run, *args):
+            run['_timed_out_stage'] = 'evaluation'
+            raise Cancelled('Model invocation cancelled or stage deadline exceeded')
+        with patch('adaptive_rsi.delivery.baseline', return_value=(project['path'], base, 'main')), \
+             patch.object(self.runtime, 'execute_candidate', side_effect=cancel):
+            self.runtime.process(run)
+        row = self.store.one('SELECT * FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'blocked')
+        failure = json.loads(row['result'])['failure']
+        self.assertEqual((failure['code'], failure['stage']), ('deadline', 'evaluation'))
+
     def test_postprocess_does_not_reload_completed_history_after_migration(self):
         for index in range(1000):
             self.store.put_setting('postprocess:history-' + str(index), {'state': 'completed', 'steps': []})
