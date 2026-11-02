@@ -668,10 +668,59 @@ class OpenCodeAuth(_Process):
     def _v2_complete(self, code="", timeout=600):
         base = "/api/integration/" + quote(self.provider, safe="") + "/connect/oauth/" + quote(self.attempt_id, safe="")
         if code:
-            result = self.http("POST", base + "/complete", {"code": code}, timeout=timeout)
+            try:
+                result = self.http("POST", base + "/complete", {"code": code}, timeout=timeout)
+            except AuthError as exc:
+                if exc.code != "auth_protocol_error":
+                    raise
+                # POST 的 HTTP 错误和网络失败共用错误码；仅在状态明确时细化，
+                # 查询失败或状态不确定时保留原始错误，绝不重复提交验证码。
+                try:
+                    value = self.http("GET", base, timeout=min(25, max(1, timeout)))
+                except AuthError:
+                    raise exc
+                data = value.get("data") if isinstance(value, dict) else None
+                status = data.get("status") if isinstance(data, dict) else None
+                if status == "complete":
+                    return True
+                if status == "failed":
+                    raise AuthError("authorization_failed") from exc
+                if status == "expired":
+                    raise AuthError("auth_expired") from exc
+                raise
             if result is not None:
                 raise AuthError("authorization_failed")
-            return True
+            # CLI 对失败的 attempt 也可能返回空响应；必须核对 attempt 状态，
+            # 否则会把未完成授权当成成功，随后在导出凭据时才暴露成 invalid_credentials。
+            # 状态推进和查询抖动都按有界退避重试，避免验证码已被消费却因一次瞬时错误失败。
+            deadline = time.monotonic() + max(1, min(timeout, 10))
+            interval = 0.2
+            failures = 0
+            while True:
+                try:
+                    value = self.http("GET", base, timeout=min(25, max(1, deadline - time.monotonic())))
+                except AuthError as exc:
+                    if exc.code != "auth_protocol_error":
+                        raise
+                    failures += 1
+                    if failures >= 3:
+                        raise
+                else:
+                    failures = 0
+                    data = value.get("data") if isinstance(value, dict) else None
+                    status = data.get("status") if isinstance(data, dict) else None
+                    if status == "complete":
+                        return True
+                    if status == "failed":
+                        raise AuthError("authorization_failed")
+                    if status == "expired":
+                        raise AuthError("auth_expired")
+                    if status != "pending":
+                        raise AuthError("invalid_response")
+                if time.monotonic() >= deadline:
+                    raise AuthError("auth_timeout")
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                interval = min(1.0, interval * 2)
         deadline = time.monotonic() + max(1, timeout)
         interval = 0.5
         failures = 0
@@ -789,6 +838,9 @@ class AuthSessions:
         self.root = Path(root)
         self.file = self.root / "auth-sessions.json"
         self.lock = threading.RLock()
+        self.view_lock = threading.Lock()
+        self.cache_lock = threading.RLock()
+        self.public_sessions = {}
         self.sessions = {}
         self.workers = {}
         self.discoveries = set()
@@ -823,6 +875,13 @@ class AuthSessions:
                 self.sessions[session_id] = item
         if previous:
             self._persist()
+        else:
+            self._publish_sessions()
+
+    def _publish_sessions(self):
+        view = {key: self._public(item) for key, item in self.sessions.items()}
+        with self.view_lock:
+            self.public_sessions = view
 
     def _persist(self):
         recent = set(list(self.sessions)[-30:])
@@ -833,17 +892,21 @@ class AuthSessions:
                                      if field in {"id", "backend", "provider", "state", "expires_at", "error"}}
                                 for key, item in rows})
         self.sessions = retained
+        self._publish_sessions()
 
     @staticmethod
     def _public(item):
-        """对外快照只含稳定字段；以 `_` 开头的内部标记不离开进程。"""
-        return copy.deepcopy({key: value for key, value in item.items() if not key.startswith("_")})
+        """对外快照按白名单复制稳定字段；私有标记与新增敏感字段默认不离开进程。"""
+        return copy.deepcopy({key: item[key] for key in
+                              ("id", "backend", "provider", "state", "expires_at", "error",
+                               "method", "verification_url", "user_code", "instructions") if key in item})
 
     def _invalidate_caches(self, backend):
         # 调用方持有 self.lock；阻止失效前启动的发现任务重新发布旧结果。
-        self.cache_generations[backend] += 1
-        self.providers_cache.pop(backend, None)
-        self.status_cache.pop(backend, None)
+        with self.cache_lock:
+            self.cache_generations[backend] += 1
+            self.providers_cache.pop(backend, None)
+            self.status_cache.pop(backend, None)
 
     def _backend(self, backend):
         if not isinstance(backend, str) or backend not in {"codex", "opencode"}:
@@ -852,9 +915,16 @@ class AuthSessions:
 
     @property
     def busy(self):
-        with self.lock:
-            ids = [key for key, item in self.sessions.items() if item["state"] in ACTIVE]
-        return sum(self.status(key)["state"] in ACTIVE for key in ids)
+        with self.view_lock:
+            ids = [key for key, item in self.public_sessions.items() if item["state"] in ACTIVE]
+        count = 0
+        for key in ids:
+            try:
+                count += self.status(key)["state"] in ACTIVE
+            except AuthError as exc:
+                if exc.code != "unknown_session":
+                    raise
+        return count
 
     def snapshot(self):
         self.busy
@@ -879,7 +949,7 @@ class AuthSessions:
         for backend in ("codex", "opencode"):
             available = bool(shutil.which("docker") if container or not shutil.which(backend) else shutil.which(backend))
 
-            with self.lock:
+            with self.cache_lock:
                 generation = self.cache_generations[backend]
                 cached = self.status_cache.get(backend)
             if not self.custom_factory and cached and cached[0] > time.monotonic() and isinstance(cached[1], dict):
@@ -900,7 +970,7 @@ class AuthSessions:
                                            if isinstance(value, dict) and value.get("type") in {"oauth", "api"})
                         capabilities = None
                     else:
-                        with self.lock:
+                        with self.cache_lock:
                             generation = self.cache_generations[backend]
                             cached = self.status_cache.get(backend)
                         if cached and cached[0] > time.monotonic():
@@ -931,7 +1001,7 @@ class AuthSessions:
                                     except (OpenCodeCompatibilityError, OSError):
                                         capabilities = None
                                 providers = auth_providers(None, capabilities)
-                            with self.lock:
+                            with self.cache_lock:
                                 if not self.closed and generation == self.cache_generations[backend]:
                                     self.status_cache[backend] = (time.monotonic() + 25, (capabilities, providers))
                     result[backend] = {"state": "authenticated" if providers else "signed_out",
@@ -961,7 +1031,7 @@ class AuthSessions:
             except (OSError, ValueError):
                 result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
             if backend == "opencode" and not self.custom_factory and result[backend].get("error"):
-                with self.lock:
+                with self.cache_lock:
                     if not self.closed and generation == self.cache_generations[backend]:
                         self.status_cache[backend] = (time.monotonic() + 25, copy.deepcopy(result[backend]))
         if not self.custom_factory:
@@ -972,9 +1042,9 @@ class AuthSessions:
                         result[backend]["available"] = False
                         result[backend]["transport"] = "docker"
                         result[backend].setdefault("error", error)
-        with self.lock:
+        with self.view_lock:
             result["sessions"] = [{key: item.get(key) for key in ("id", "backend", "provider", "state", "expires_at", "error")}
-                                  for item in list(self.sessions.values())[-30:]]
+                                  for item in list(self.public_sessions.values())[-30:]]
         return result
 
     def providers(self, backend="opencode"):
@@ -982,11 +1052,12 @@ class AuthSessions:
         with self.lock:
             if self.closed:
                 raise AuthError("service_closed")
-            generation = self.cache_generations[backend]
-            if not self.custom_factory:
-                cached = self.providers_cache.get(backend)
-                if cached and cached[0] > time.monotonic():
-                    return copy.deepcopy(cached[1])
+            with self.cache_lock:
+                generation = self.cache_generations[backend]
+                if not self.custom_factory:
+                    cached = self.providers_cache.get(backend)
+                    if cached and cached[0] > time.monotonic():
+                        return copy.deepcopy(cached[1])
             if backend != "opencode":
                 return []
             key = (backend, generation)
@@ -1018,8 +1089,9 @@ class AuthSessions:
             completed_worker.close()
             with self.lock:
                 flight["rows"] = copy.deepcopy(rows)
-                if not self.closed and not self.custom_factory and generation == self.cache_generations[backend]:
-                    self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
+                with self.cache_lock:
+                    if not self.closed and not self.custom_factory and generation == self.cache_generations[backend]:
+                        self.providers_cache[backend] = (time.monotonic() + PROVIDERS_CACHE_TTL, copy.deepcopy(rows))
             return rows
         except BaseException as exc:
             flight["error"] = exc
@@ -1215,6 +1287,7 @@ class AuthSessions:
                     item = self.sessions[session_id]
                     if item["state"] in ACTIVE:
                         self._terminate(item, **values)
+                        self._publish_sessions()
         finally:
             with self.lock:
                 self.workers.pop(session_id, None)
@@ -1266,7 +1339,15 @@ class AuthSessions:
 
     def status(self, session_id):
         expired_worker = None
-        with self.lock:
+        with self.view_lock:
+            item = copy.deepcopy(self.public_sessions.get(session_id)) if isinstance(session_id, str) else None
+        if item is None:
+            raise AuthError("unknown_session")
+        if item["state"] not in ACTIVE or self.now() < item["expires_at"]:
+            return item
+        if not self.lock.acquire(blocking=False):
+            return item
+        try:
             if not isinstance(session_id, str) or session_id not in self.sessions:
                 raise AuthError("unknown_session")
             item = self.sessions[session_id]
@@ -1279,6 +1360,8 @@ class AuthSessions:
                 if expired_worker:
                     expired_worker[1].set()
             result = self._public(item)
+        finally:
+            self.lock.release()
         if expired_worker and expired_worker[0]:
             expired_worker[0].close()
         return result
@@ -1289,6 +1372,8 @@ class AuthSessions:
         self.status(session_id)
         with self.lock:
             item = self.sessions[session_id]
+            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
+                self._update(session_id, state="expired", error="auth_expired")
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
                 raise AuthError("invalid_auth_state")
             if not code.strip():
@@ -1423,8 +1508,9 @@ class AuthSessions:
         with self.lock:
             self.closed = True
             self.shutdown.set()
-            self.providers_cache.clear()
-            self.status_cache.clear()
+            with self.cache_lock:
+                self.providers_cache.clear()
+                self.status_cache.clear()
             workers = list(self.workers.values())
             discoveries = list(self.discoveries)
             first_error = None
@@ -1437,6 +1523,7 @@ class AuthSessions:
                         # 磁盘旧记录交给下次启动把 ACTIVE 归一化为 interrupted。
                         first_error = first_error or exc
                         self._terminate(item, state="interrupted", error="process_interrupted")
+                        self._publish_sessions()
             self._close_error = first_error
             threads = list(self.threads)
         for worker, stop in workers:

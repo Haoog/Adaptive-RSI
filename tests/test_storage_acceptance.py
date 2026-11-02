@@ -193,6 +193,7 @@ class StorageAcceptanceTest(unittest.TestCase):
             'expired': {'id': 'expired', 'backend': 'codex', 'state': 'starting', 'expires_at': 0},
             'other': {'id': 'other', 'backend': 'opencode', 'state': 'starting', 'expires_at': time.time() + 60},
         }
+        sessions._publish_sessions()
         sessions.workers['expired'] = (Worker(), threading.Event())
         thread = threading.Thread(target=lambda: sessions.status('expired'))
         thread.start()

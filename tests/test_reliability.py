@@ -943,7 +943,8 @@ class ReliabilityTest(unittest.TestCase):
         (self.repo / "deps/value.txt").write_text("sealed dependency")
         self.runtime.configure({"environment": {"seed_paths": ["deps"]}}, self.project)
         task, run = self.claim("Fix addition")
-        with patch.object(self.runtime.evaluator, "evaluate", return_value={
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}) as evaluate:
             self.runtime.process(run)
             second_task, second_run = self.claim("Correct addition again")
@@ -1151,7 +1152,8 @@ class ReliabilityTest(unittest.TestCase):
                 return super().invoke(role, *args, **kwargs)
         self.runtime.agent = Drift()
         task, run = self.claim("Update usage guide")
-        with patch.object(self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate) as evaluate:
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch.object(self.runtime.evaluator, "evaluate", wraps=self.runtime.evaluator.evaluate) as evaluate:
             self.runtime.process(run)
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         result = json.loads(row["result"])
@@ -1174,7 +1176,8 @@ class ReliabilityTest(unittest.TestCase):
                 return super().invoke(role, *args, **kwargs)
         self.runtime.agent = Docs()
         task, run = self.claim("Update usage guide")
-        with patch.object(self.runtime.evaluator, "evaluate", return_value={
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": [], "checks": CHECKS}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}) as evaluate:
             self.runtime.process(run)
         self.assertEqual(evaluate.call_count, 1)
