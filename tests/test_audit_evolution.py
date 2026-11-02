@@ -124,6 +124,62 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertIn('kind', json.loads(failed[0]['evidence'])['reason'])
 
+    def test_proposal_missing_guidance_fails_fast_without_running_trials(self):
+        args = self.setup_proposal()
+        for bad_proposal in (
+            {'kind': 'strategy', 'triggers': []},
+            {'kind': 'strategy', 'guidance': '', 'triggers': []},
+            {'kind': 'strategy', 'guidance': '   ', 'triggers': []},
+            {'kind': 'strategy', 'guidance': 123, 'triggers': []},
+        ):
+            self.calls['trial'] = 0
+            self.evolution.runtime.invoke = lambda *unused, **kwargs: bad_proposal
+            with self.assertRaisesRegex(RuntimeError, 'guidance'):
+                self.evolution.propose_and_evaluate(*args, force=True)
+            self.assertEqual(self.calls['trial'], 0)
+            self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+            failed = self.store.query("SELECT evidence FROM candidates WHERE status='insufficient_evidence'")
+            self.assertTrue(failed)
+            self.assertIn('guidance', json.loads(failed[-1]['evidence'])['reason'])
+
+    def test_proposal_missing_triggers_fails_fast_without_running_trials(self):
+        args = self.setup_proposal()
+        for bad_proposal in (
+            {'kind': 'strategy', 'guidance': 'fix'},
+            {'kind': 'strategy', 'guidance': 'fix', 'triggers': 'not-a-list'},
+            {'kind': 'strategy', 'guidance': 'fix', 'triggers': None},
+        ):
+            self.calls['trial'] = 0
+            self.evolution.runtime.invoke = lambda *unused, **kwargs: bad_proposal
+            with self.assertRaisesRegex(RuntimeError, 'triggers'):
+                self.evolution.propose_and_evaluate(*args, force=True)
+            self.assertEqual(self.calls['trial'], 0)
+            self.assertEqual(self.store.query("SELECT * FROM candidates WHERE status='reserved'"), [])
+            failed = self.store.query("SELECT evidence FROM candidates WHERE status='insufficient_evidence'")
+            self.assertTrue(failed)
+            self.assertIn('triggers', json.loads(failed[-1]['evidence'])['reason'])
+
+    def test_skill_values_safe_against_missing_fields(self):
+        values = Evolution.skill_values('p', 'c', {'kind': 'strategy', 'guidance': 'fix'}, {}, 0)
+        self.assertEqual(json.loads(values[4]), [])
+        self.assertEqual(values[5], 'fix')
+
+        values_no_guidance = Evolution.skill_values('p', 'c', {'kind': 'strategy', 'triggers': ['t']}, {}, 0)
+        self.assertEqual(json.loads(values_no_guidance[4]), ['t'])
+        self.assertEqual(values_no_guidance[5], '')
+
+    def test_auto_promote_with_valid_proposal_promotes_to_stable_and_writes_skills(self):
+        args, observed = self.setup_ablation(auto_promote=True)
+        baseline = {'id': 'stable-kind', 'kind': 'strategy', 'content': {'guidance': 'old'}}
+        self.evolution.runtime.active_strategies = lambda project: [baseline]
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(result['status'], 'stable')
+        self.assertEqual(self.store.one('SELECT status FROM candidates WHERE id=?',
+                                        (result['candidate'],))['status'], 'stable')
+        skills = self.store.query('SELECT * FROM skills') or []
+        self.assertEqual(len(skills), 1)
+        self.assertEqual(skills[0]['content'], 'small improvement')
+
     def test_stale_reservation_expires_without_blocking_a_new_proposal(self):
         args = self.setup_proposal()
         self.store.execute('INSERT INTO candidates(id,project,kind,status,content,evidence,created) '
@@ -292,6 +348,35 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
         self.assertEqual(result['status'], 'insufficient_evidence')
         self.assertEqual(result['code'], 'evolution_fresh_holdout_required')
+
+    def test_exhausted_validation_split_reports_validation_not_holdout(self):
+        # validation 曝光已用满而 holdout 完全新鲜：原因必须指向 validation，
+        # 并且不能给出“导入新 holdout”这类在该场景下无效的补救建议。
+        args = self.setup_proposal()
+        limit = self.config['evolution']['max_holdout_uses']
+        self.store.execute("UPDATE cases SET uses=? WHERE id='validation'", (limit,))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(result['code'], 'evolution_validation_cases_exhausted')
+        self.assertIn('validation has 0 of 1 required cases', result['reason'])
+        self.assertIn('short by 1', result['reason'])
+        self.assertIn('import new, previously unused validation cases', result['reason'].lower())
+        # 调高上限对本场景有效，因此不能被写成“无用”；holdout 一侧不得被判为不足。
+        self.assertIn('raise evolution.max_holdout_uses', result['reason'])
+        self.assertNotIn('fresh holdout', result['reason'].lower())
+        self.assertEqual(self.store.one("SELECT uses FROM cases WHERE id='holdout'")['uses'], 0)
+
+    def test_both_exhausted_splits_are_reported_together(self):
+        args = self.setup_proposal()
+        limit = self.config['evolution']['max_holdout_uses']
+        self.store.execute("UPDATE cases SET uses=? WHERE id IN ('validation','holdout')", (limit,))
+        result = self.evolution.propose_and_evaluate(*args)
+        self.assertEqual(self.calls, {'proposal': 0, 'trial': 0})
+        self.assertEqual(result['status'], 'insufficient_evidence')
+        self.assertEqual(result['code'], 'evolution_both_splits_exhausted')
+        self.assertIn('validation has 0 of 1 required cases', result['reason'])
+        self.assertIn('holdout has 0 of 1 fresh cases', result['reason'])
 
     def test_long_term_failure_is_detected_after_initial_window(self):
         self.candidate({'monitor': {'passed': 1, 'failed': 0, 'runs': ['old']}})
@@ -1002,8 +1087,8 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual([row['case'] for row in baseline['executed_checks']], ['case-pristine'])
         self.assertTrue(baseline['executed_checks'][0]['passed'])
 
-    def test_bundle_reproduction_applies_sealed_overlay_in_staging_copy(self):
-        # 线程 2：overlay-only 检查在一次性副本中可见并执行，bundle 内文件保持不变。
+    def sealed_overlay_bundle(self):
+        """导出含单个 overlay 用例的封存包，供 overlay 复现测试复用。"""
         from tests.test_runtime import fixture
         from adaptive_rsi.gitops import git
         repo = fixture(self.root / 'repo')
@@ -1036,6 +1121,29 @@ class AuditEvolutionTest(unittest.TestCase):
         self.candidate({'dataset': {'manifest': [{'case': 'case-01'}]}, 'providers': []})
         destination = self.root / 'bundle'
         self.evolution.export_bundle('c', destination)
+        return destination
+
+    def reseal_bundle(self, destination):
+        """按 export_bundle 的规则重算 manifest，但跳过符号链接。
+
+        export_bundle 本身拒绝符号链接；这里显式构造被篡改的包，用来验证复现侧
+        在 integrity 只覆盖登记文件时仍自行拒绝 staging 内的符号链接。
+        """
+        manifest = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))
+        files = {}
+        for path in sorted(destination.rglob('*')):
+            relative = path.relative_to(destination)
+            if relative.as_posix() == 'bundle.json' or '.git' in relative.parts:
+                continue
+            if path.is_symlink() or not path.is_file():
+                continue
+            files[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest['files'] = files
+        (destination / 'bundle.json').write_text(encode(manifest), encoding='utf-8')
+
+    def test_bundle_reproduction_applies_sealed_overlay_in_staging_copy(self):
+        # 线程 2：overlay-only 检查在一次性副本中可见并执行，bundle 内文件保持不变。
+        destination = self.sealed_overlay_bundle()
         files_before = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))['files']
 
         result = Evolution.reproduce_bundle(
@@ -1054,6 +1162,62 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256((destination / relative).read_bytes()).hexdigest(), digest,
                              relative)
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def test_bundle_reproduction_tolerates_symlinked_temp_dir_ancestor(self):
+        # macOS 默认 TMPDIR=/var/folders/... 而 /var 是 private/var 的符号链接；
+        # 这类祖先符号链接属于运行环境，不是 bundle 内容，不得据此判 overlay 逃逸。
+        destination = self.sealed_overlay_bundle()
+        real = self.root / 'real-temp'
+        real.mkdir()
+        link = self.root / 'link-temp'
+        link.symlink_to(real)
+        original = tempfile.tempdir
+        tempfile.tempdir = str(link)
+        try:
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        finally:
+            tempfile.tempdir = original
+
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual([row['check'] for row in result['executed_checks']],
+                         ['sees_staging_copy', 'overlay_only_test'])
+        for row in result['executed_checks']:
+            self.assertTrue(row['passed'], row)
+            self.assertTrue(row['overlay_applied'])
+        # 一次性副本确实建在符号链接临时目录内，并在返回前清理干净。
+        self.assertEqual(list(real.iterdir()), [])
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def test_bundle_reproduction_rejects_overlay_escape_through_symlink(self):
+        # 放行 staging 之上的环境符号链接后，staging 之内的符号链接仍必须拒绝：
+        # overlay 不能借仓库里未登记的符号链接把文件写到一次性副本之外。
+        destination = self.sealed_bundle(repo_name='repo-escape')
+        case_dir = destination / 'cases' / 'case-escape'
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (case_dir / 'repository' / 'vendor').symlink_to(outside)
+        overlay = self.root / 'overlay-escape'
+        (overlay / 'vendor').mkdir(parents=True)
+        (overlay / 'vendor' / 'escaped.txt').write_text('escaped\n')
+        shutil.copytree(overlay, case_dir / 'overlay')
+        spec = json.loads((case_dir / 'case.json').read_text(encoding='utf-8'))
+        spec['overlay'] = 'overlay'
+        (case_dir / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertEqual(row['case'], 'case-escape')
+        self.assertFalse(row['passed'])
+        self.assertIn('Symlink overlaps reproduction overlay', row['error'])
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_bundle_credentials_follow_exported_provider_requirements(self):
         # 线程 3：凭据需求来自导出的非机密 provider 元数据，不再默认 OPENAI_API_KEY。

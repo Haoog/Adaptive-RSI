@@ -306,6 +306,20 @@ class Evolution:
                 requirements.append({"id": provider_id, "env_key": env_key if isinstance(env_key, str) else ""})
         return requirements
     @staticmethod
+    def validate_proposal(proposal):
+        """校验模型提案结构与必需字段：必须是字典且包含合法 kind、非空 guidance 及 triggers 列表。"""
+        if not isinstance(proposal, dict) or "kind" not in proposal:
+            return False, "Model proposal must be an object with kind and content"
+        if proposal.get("kind") not in ("strategy", "meta_strategy", "adapter"):
+            return False, "Model proposal kind must be strategy, meta_strategy, or adapter"
+        guidance = proposal.get("guidance")
+        if not isinstance(guidance, str) or not guidance.strip():
+            return False, "Model proposal guidance must be a non-empty string"
+        if not isinstance(proposal.get("triggers"), list):
+            return False, "Model proposal triggers must be a list"
+        return True, ""
+
+    @staticmethod
     def ablation_required(proposal):
         """策略候选同时写入可检索技能；引导与触发词都非空时两者才会共同生效。
 
@@ -692,7 +706,11 @@ class Evolution:
                 staging_tmp = None
                 try:
                     staging_tmp = tempfile.mkdtemp(prefix="bundle-check-")
-                    staging = Path(staging_tmp) / "repository"
+                    # mkdtemp 沿用 TMPDIR 的原始字符串：macOS 的 /var -> private/var
+                    # 以及其它符号链接型临时目录会让 staging 自带与本进程无关的祖先
+                    # 符号链接。先解析成真实路径，才只拒绝 overlay 写入路径自身的
+                    # 符号链接层，而不是把运行环境的 TMPDIR 布局判成 bundle 逃逸。
+                    staging = (Path(staging_tmp) / "repository").resolve()
                     overlay_applied = False
                     try:
                         shutil.copytree(repo_dir, staging, symlinks=True)
@@ -701,9 +719,16 @@ class Evolution:
                             for parent, dirs, files in os.walk(overlay_dir, followlinks=False):
                                 for name in files:
                                     source = Path(parent) / name
-                                    target = staging / source.relative_to(overlay_dir)
-                                    if target.is_symlink() or any(p.is_symlink() for p in target.parents):
-                                        raise RuntimeError("Symlink overlaps reproduction overlay")
+                                    relative = source.relative_to(overlay_dir)
+                                    target = staging / relative
+                                    # 只检查 staging 根到 target 之间的层：staging 之上
+                                    # 的系统路径不属于 bundle 内容，staging 之下的任何
+                                    # 符号链接（含仓库内原有的）都仍然拒绝。
+                                    probe = staging
+                                    for part in relative.parts:
+                                        probe = probe / part
+                                        if probe.is_symlink():
+                                            raise RuntimeError("Symlink overlaps reproduction overlay")
                                     target.parent.mkdir(parents=True, exist_ok=True)
                                     shutil.copy2(source, target)
                                     overlay_applied = True
@@ -950,14 +975,38 @@ class Evolution:
         validation_cases = [case for case in cases if case["split"] == "validation"]
         # 晋升要求未曝光的 holdout；先按用途过滤新鲜样本，再在新鲜样本内分层选择。
         fresh_holdout = [case for case in cases if case["split"] == "holdout" and case["uses"] == 0]
-        if len(validation_cases) < minimum or len(fresh_holdout) < minimum:
+        validation_short = max(0, minimum - len(validation_cases))
+        holdout_short = max(0, minimum - len(fresh_holdout))
+        if validation_short or holdout_short:
             # 复用过的样本即使仍在 max_holdout_uses 内也必然在最终审核失败，因此在
             # 提案模型调用前直接跳过，不生成无用 candidate，也不消耗付费调用。
-            reason = ("Fresh holdout cases are required for promotion; import new, previously unused cases "
-                      "(raising evolution.max_holdout_uses cannot refresh exposed holdout cases)")
+            # 两个 split 的恢复方式不同：validation 调高上限即可重新入选，holdout 必须
+            # 导入从未曝光的样本，因此分开报告不足项，避免给出在本场景无效的补救建议。
+            shortfalls = []
+            if validation_short:
+                shortfalls.append(f"validation has {len(validation_cases)} of {minimum} required cases "
+                                  f"(short by {validation_short})")
+            if holdout_short:
+                shortfalls.append(f"holdout has {len(fresh_holdout)} of {minimum} fresh cases "
+                                  f"(short by {holdout_short})")
+            counts = " and ".join(shortfalls)
+            if validation_short and holdout_short:
+                reason = ("Fresh validation and holdout cases are required for promotion; " + counts +
+                          ". Import new, previously unused cases for both splits (raising "
+                          "evolution.max_holdout_uses re-admits exposed validation cases, but cannot "
+                          "refresh exposed holdout cases)")
+                code = "evolution_both_splits_exhausted"
+            elif validation_short:
+                reason = ("Fresh validation cases are required for promotion; " + counts +
+                          ". Import new, previously unused validation cases, or raise "
+                          "evolution.max_holdout_uses to re-admit exposed validation cases")
+                code = "evolution_validation_cases_exhausted"
+            else:
+                reason = ("Fresh holdout cases are required for promotion; import new, previously unused cases "
+                          "(raising evolution.max_holdout_uses cannot refresh exposed holdout cases)")
+                code = "evolution_fresh_holdout_required"
             self.record_attempt(project["id"], signature, "insufficient_evidence", reason=reason)
-            return {"reason": reason, "status": "insufficient_evidence",
-                    "code": "evolution_fresh_holdout_required"}
+            return {"reason": reason, "status": "insufficient_evidence", "code": code}
         cases = validation_cases + fresh_holdout
         reserved = sorted(case["id"] for case in fresh_holdout)
         reservation = uid()
@@ -1009,8 +1058,8 @@ class Evolution:
                 (encode({"reservation": {"holdout": reserved}, "reason": str(exc)}), reservation))
             self.record_attempt(project["id"], signature, "insufficient_evidence", reason=str(exc))
             raise
-        if not isinstance(proposal, dict) or "kind" not in proposal:
-            reason = "Model proposal must be an object with kind and content"
+        valid, reason = self.validate_proposal(proposal)
+        if not valid:
             self.store.execute("UPDATE candidates SET status='insufficient_evidence', evidence=? WHERE id=?",
                 (encode({"reservation": {"holdout": reserved}, "reason": reason}), reservation))
             self.record_attempt(project["id"], signature, "insufficient_evidence", reason=reason)
@@ -1193,7 +1242,9 @@ class Evolution:
     @staticmethod
     def skill_values(project, candidate, content, config, now):
         """自动晋升与手动晋升写同一种已验证技能，避免两条路径产生不同字段。"""
-        return (uid(), project, None, "verified", encode(content["triggers"]), content["guidance"],
+        triggers = content.get("triggers", []) if isinstance(content, dict) else []
+        guidance = content.get("guidance", "") if isinstance(content, dict) else ""
+        return (uid(), project, None, "verified", encode(triggers), guidance,
                 encode({"candidate": candidate, "config_hash": fingerprint(config)}),
                 now + 30 * 86400, now)
 
