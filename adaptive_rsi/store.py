@@ -914,8 +914,27 @@ class Store:
         return call
 
     def record_usage(self, call, run, details, seconds):
-        values = details or {"tokens": 0, "input_tokens": 0, "output_tokens": 0,
-                             "cache_read_tokens": 0, "cache_write_tokens": 0, "usage_known": False}
+        raw = details if isinstance(details, dict) else {}
+        counts = {}
+        for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+            val = raw.get(field, 0)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+                counts[field] = int(val)
+            else:
+                counts[field] = 0
+        if "tokens" in raw and raw["tokens"] is not None:
+            val = raw["tokens"]
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+                tokens = int(val)
+            else:
+                tokens = 0
+        else:
+            tokens = sum(counts.values())
+        values = {
+            "tokens": tokens,
+            **counts,
+            "usage_known": 1 if bool(raw.get("usage_known", False)) else 0,
+        }
         fields = ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]
         from .usage import PRICE_FIELDS, estimate, unit_prices
         with self.connect() as db:
@@ -926,8 +945,9 @@ class Store:
                 raise ValueError("Usage call does not belong to run")
             prices = unit_prices({field: previous[field + "_price"] for field in PRICE_FIELDS})
             _, basis = estimate(values, prices, previous["unit_price"])
-            db.execute("UPDATE calls SET " + ",".join(field + "=?" for field in fields) +
+            db.execute("UPDATE calls SET state='completed'," + ",".join(field + "=?" for field in fields) +
                        ",seconds=?,price_basis=? WHERE id=?",
                        (*[values[field] for field in fields], seconds, basis, call))
+            prev_tokens = previous["tokens"] or 0
             db.execute("UPDATE runs SET tokens=max(0,tokens+?) WHERE id=?",
-                       (values["tokens"] - previous["tokens"], run))
+                       (values["tokens"] - prev_tokens, run))

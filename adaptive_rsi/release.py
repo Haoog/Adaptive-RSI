@@ -369,7 +369,7 @@ def reconcile(runtime, run, kind, data, persist=True):
     remote = (api(repo, "actions/runs/" + str(data["workflow_run_id"])) if data.get("workflow_run_id")
               else find_remote(repo, data))
     if not remote:
-        return data
+        return save(runtime, run, kind, data) if persist else data
     if (remote.get("head_sha") != data["workflow_sha"] or remote.get("display_title") != data["operation_id"] or
             remote.get("event") != "workflow_dispatch" or remote.get("path", "").split("@")[0] != data["workflow"]):
         raise ValueError("Workflow run identity differs from the authorized operation")
@@ -586,6 +586,7 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             "raw_candidates": remotes[:100],
             "previous": {
                 "state": target_data.get("state"),
+                "reconciliation_state": (target_data.get("reconciliation") or {}).get("state"),
                 "error": target_data.get("error", ""),
                 "checked_at": target_data.get("checked_at"),
                 "candidate_run_ids": (target_data.get("reconciliation") or {}).get("candidate_run_ids", []),
