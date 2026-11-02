@@ -741,7 +741,7 @@ class Maintenance:
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
         # 与上方目录清理的保护范围保持一致，不做无条件删除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
-        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
         # 独立的精确键/冒号前缀范围查询可使用 settings 主键索引，避免逐运行全表扫描。
         # ':' 的后继字符是 ';'，二进制排序范围只覆盖该运行的冒号后缀键。
         remaining = " OR ".join(

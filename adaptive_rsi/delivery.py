@@ -173,11 +173,38 @@ def baseline_change(source, previous, current):
     return result
 
 
-def branch_cleanup_preview(repo, recovery_refs=None):
+def pushed_branch_journal(repo, store):
+    """Local delivery-push journal: branch -> recorded head SHAs for this repo."""
+    if store is None:
+        return {}
+    rows = []
+    if hasattr(store, "query"):
+        rows = [(row["key"], row["value"]) for row in
+                store.query("SELECT key, value FROM settings WHERE key LIKE 'delivery-push:%'")]
+    elif isinstance(store, dict):
+        rows = list(store.items())
+    journal = {}
+    for _key, raw in rows:
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(value, dict) or not value.get("branch"):
+            continue
+        if value.get("repository") and str(value["repository"]).lower() != repo.lower():
+            continue
+        journal.setdefault(value["branch"], set()).add(value.get("head"))
+    return journal
+
+
+def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     """Read-only, bounded preview. Omitted pages and unknown ownership stay protected.
 
     Callers must supply all retained recovery branch names or commit SHAs. No
     deletion endpoint is provided; candidates must be rechecked before deletion.
+    A pushed branch with no PR at all is reported as `pushed_no_pr` when the local
+    delivery journal still records that push, so an interrupted publish stays
+    distinguishable from a branch of unknown origin.
     """
     from .release import api
     branches = api(repo, "branches?per_page=100")
@@ -187,6 +214,7 @@ def branch_cleanup_preview(repo, recovery_refs=None):
     complete = len(branches) < 100 and len(prs) < 100
     candidates, protected = [], []
     recovery = set(recovery_refs or ())
+    pushed = pushed_branch_journal(repo, store)
     for branch in branches:
         name, sha = branch["name"], branch.get("commit", {}).get("sha")
         matching = [pr for pr in prs if pr.get("head", {}).get("ref") == name]
@@ -203,7 +231,10 @@ def branch_cleanup_preview(repo, recovery_refs=None):
             reason = "open_pr"
         elif not matching or not any(pr.get("state", "").lower() == "closed" and
                                      pr.get("head", {}).get("sha") == sha for pr in matching):
-            reason = "unverified_ownership"
+            if not matching and any(head in (None, sha) for head in pushed.get(name, ())):
+                reason = "pushed_no_pr"
+            else:
+                reason = "unverified_ownership"
         if reason:
             protected.append({"branch": name, "reason": reason})
         else:
@@ -271,6 +302,14 @@ def publish(runtime, project, task, run, workspace, config):
     prefix = "fix" if task["source"] in ["issue", "rollback", "inspection"] else "feat"
     safe_id = re.sub(r"[^a-zA-Z0-9._-]", "-", run["id"])
     branch = prefix + "/rsi-" + safe_id
+    # push 是唯一没有回执的远端写：崩溃可发生在 push 成功之后、PR 创建之前，
+    # 远端会留下没有 PR 的记录。推之前先落盘交付意图，重试与清理预览才能凭本地
+    # 记录判断该分支属于哪次交付，而不是只靠「分支名确定性 + 重新观察远端」。
+    pushed_intent = store.setting("delivery-push:" + run["id"])
+    if not isinstance(pushed_intent, dict):
+        pushed_intent = None
+    if pushed_intent and pushed_intent.get("branch") and pushed_intent["branch"] != branch:
+        raise RuntimeError("Delivery push journal records a different branch; reconcile it before retrying")
     if git(workspace, "branch", "--show-current") != branch:
         # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
         existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
@@ -285,6 +324,9 @@ def publish(runtime, project, task, run, workspace, config):
         git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
             "commit", "-m", "完成任务：" + title)
     sha = git(workspace, "rev-parse", "HEAD")
+    if pushed_intent and pushed_intent.get("head") and pushed_intent["head"] != sha:
+        # 该分支上一次已被推过别的提交；不覆盖远端引用，交人工按意图记录对账。
+        raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
     existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
                                    "--limit", "1", "--json", "url"]))
     if existing:
@@ -317,6 +359,16 @@ def publish(runtime, project, task, run, workspace, config):
             raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
         authorize_write()
+        pushed_intent = pushed_intent or {
+            "branch": branch,
+            "head": sha,
+            "base": run["base"],
+            "repository": repo,
+            "created": time.time(),
+        }
+        # 意图先于远端写落地：进程在 push 后消失时，重试仍能看到同一分支、同一
+        # 提交的既有意图；重复 push 指向同一引用，不会产生第二个远端分支。
+        store.put_setting("delivery-push:" + run["id"], pushed_intent)
         github_git(workspace, "push", "origin", "HEAD:refs/heads/" + branch)
         body = Path(workspace).parent / "pr-body.md"
         body.write_text(pr_body(task, run, outcome), encoding="utf-8")
