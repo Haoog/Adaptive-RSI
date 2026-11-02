@@ -150,7 +150,7 @@ Validation: 17 task-lifecycle regressions passed; 137 combined lifecycle, delive
 93. **partial** — Consider deadline-driven scheduling
 94. **implemented** — Explain graceful shutdown progress
 95. **implemented** — Use stage-specific deadlines
-96. **partial** — Reuse sealed read-only checkpoints
+96. **implemented** — Reuse sealed read-only checkpoints
 97. **implemented** — Capture intervention reasons and outcomes
 98. **implemented** — Clarify timezone-aware task scheduling
 99. **partial** — Add archive restoration and relocation

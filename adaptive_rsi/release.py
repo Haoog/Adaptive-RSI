@@ -414,9 +414,12 @@ def reconcile(runtime, run, kind, data, persist=True):
             data.update(rerun_pending=True, checked_at=time.time())
             if time.time() - requested >= RERUN_CONFIRM_SECONDS:
                 data.update(state="rerun_unknown", error="GitHub has not confirmed a new run attempt; inspect the original run. Reconciliation never repeats an uncertain rerun request.")
-            _record_reconciliation(data, repo, [remote],
-                                   "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
-                                   "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
+            # 只读对账已确认的 rerun_confirmed / manual_inspection_required 证据，
+            # 不能被一次回落到旧 attempt 的轮询覆写。
+            if (data.get("reconciliation") or {}).get("state") not in {"rerun_confirmed", "manual_inspection_required"}:
+                _record_reconciliation(data, repo, [remote],
+                                       "rerun_unconfirmed" if data.get("state") == "rerun_unknown" else "rerun_pending",
+                                       "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.")
             return save(runtime, run, kind, data) if persist else data
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
     _record_reconciliation(data, repo, [remote], "matched",
@@ -1085,7 +1088,24 @@ def advance(runtime, project, run, outcome, cancel=None):
                     if comparison.get("status") != "ahead":
                         result[kind] = persist(runtime, run, kind, {"state": "superseded", "error": "Deployment target already has this or a newer commit; refusing a stale or diverged deployment"})
                         continue
-            validate_pin(repo, policy)
+            try:
+                validate_pin(repo, policy)
+            except ApiRejected as exc:
+                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
+                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
+                # 状态被轮询无限重试。
+                identity = {"repository": repo, "workflow": policy["workflow"], "ref": policy["ref"],
+                            "workflow_sha": policy["sha"], "sha": outcome["merged_sha"], "kind": kind}
+                if not data:
+                    data = {"state": "failed", **identity}
+                for field, value in identity.items():
+                    data.setdefault(field, value)
+                data.setdefault("operation_id", "rsi-" + fingerprint(
+                    {"project": project["id"], "run": run["id"], "kind": kind,
+                     "repository": repo, "sha": outcome["merged_sha"]})[:32])
+                data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
+                            dispatch_http_status=exc.status)
+                raise
             with runtime.dispatch_lock:
                 authorized(runtime, project, run, kind, policy, cancel)
                 if kind == "deploy" and deployment_owner(runtime, project["id"], repo, policy) != expected_owner:
@@ -1163,15 +1183,21 @@ def retry(runtime, project_id, run_id, kind):
         policy = json.loads(run["config"])["delivery"].get(kind, {})
         project = runtime.project(project_id)
         repo = authorized(runtime, project, run, kind, policy)
-        if kind == "deploy":
-            owner = deployment_owner(runtime, project_id, repo, policy)
-            if owner and owner["run"] != run_id:
-                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         data = runtime.store.setting(key(run_id, kind))
         if not data or data.get("state") == "blocked":
             raise ValueError("Restore the original authorization and let tracking retry the pending operation")
         if not data.get("operation_id"):
             raise ValueError("This operation has no failed GitHub workflow to retry")
+        is_preflight_rejected = (
+            kind == "deploy" and
+            data.get("state") == "failed" and
+            data.get("dispatch_receipt") == "rejected" and
+            not data.get("workflow_run_id")
+        )
+        if kind == "deploy" and not is_preflight_rejected:
+            owner = deployment_owner(runtime, project_id, repo, policy)
+            if owner and owner["run"] != run_id:
+                raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
         try:
             outcome = json.loads(run["result"] or "{}")
         except (TypeError, ValueError):
@@ -1191,17 +1217,25 @@ def retry(runtime, project_id, run_id, kind):
             runtime.wake.set()
             return data
         expected = encode(data)
+        expected_owner = None
 
         def persist_retry(require_authorization=False):
             nonlocal expected
             with runtime.dispatch_lock:
                 if require_authorization:
                     authorized(runtime, project, run, kind, policy)
+                ownership = None
                 if require_authorization and kind == "deploy":
-                    owner = deployment_owner(runtime, project_id, repo, policy)
-                    if owner and owner["run"] != run_id:
-                        raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
-                save(runtime, run, kind, data, expected=expected)
+                    if target.get("state") == "dispatching":
+                        if deployment_owner(runtime, project_id, repo, policy) != expected_owner:
+                            raise ValueError("Deployment ownership changed during validation")
+                        ownership = (owner_key(project_id, repo, policy), expected_owner,
+                                     {"run": run_id, "sha": target["sha"]})
+                    else:
+                        owner = deployment_owner(runtime, project_id, repo, policy)
+                        if owner and owner["run"] != run_id:
+                            raise ValueError("A newer deployment owns this target; stale delivery cannot be retried")
+                save(runtime, run, kind, data, expected=expected, ownership=ownership)
                 expected = encode(data)
 
         target = data
@@ -1221,6 +1255,15 @@ def retry(runtime, project_id, run_id, kind):
             raise ValueError("Post-merge verification must pass for the exact target commit before retrying delivery")
         if (target.get("state") == "failed" and target.get("dispatch_receipt") == "rejected" and
                 not target.get("workflow_run_id")):
+            if kind == "deploy":
+                expected_owner = deployment_owner(runtime, project_id, repo, policy)
+                if expected_owner and expected_owner["run"] != run_id:
+                    previous = runtime.store.setting(key(expected_owner["run"], "deploy"), {})
+                    if not deployment_terminal(previous, policy):
+                        raise ValueError("Another deployment is still active on this target")
+                    comparison = api(repo, "compare/" + expected_owner["sha"] + "..." + target["sha"])
+                    if comparison.get("status") != "ahead":
+                        raise ValueError("Deployment target already has this or a newer commit; refusing a stale or diverged deployment")
             validate_pin(repo, policy)
             authorized(runtime, project, run, kind, policy)
             target.update(state="dispatching", error="", dispatch_receipt="pending")

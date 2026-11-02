@@ -1654,14 +1654,18 @@
       },
       "source": "adaptive_rsi/evaluator.py",
       "acceptance": "任一输入变化都失效；写工作区或远端操作不因检查点自动重放。",
-      "status": "partial",
+      "status": "implemented",
       "implementation": [
-        "adaptive_rsi/evaluator.py"
+        "adaptive_rsi/evaluator.py",
+        "adaptive_rsi/pipeline.py",
+        "adaptive_rsi/config.py"
       ],
       "validation": [
-        "python3 -B -m unittest tests.test_audit_evaluation.AuditEvaluationTest.test_sealed_read_only_checkpoint_rejects_mutation_or_changed_input"
+        "python3 -B -m unittest tests.test_audit_evaluation",
+        "python3 -B -m unittest tests.test_reliability.ReliabilityTest.test_resume_reuses_sealed_planning_checkpoint_when_opted_in",
+        "python3 -B -m unittest tests.test_reliability.ReliabilityTest.test_resume_without_opt_in_reruns_planning_instead_of_reusing_checkpoint"
       ],
-      "residual": "Sealed read-only checkpoint API rejects changed inputs/effects and tampering; automatic pipeline scheduling/reuse is not integrated."
+      "residual": "Planning, independent acceptance, review and risk review reuse a sealed checkpoint only when recovery.reuse_sealed_checkpoints is explicitly true; a changed build, effect, input fingerprint or checksum recomputes the stage. Implementation, workspace writes and remote delivery always execute, and a reused record is the previously gated output rather than a fresh enforce_review run."
     },
     {
       "id": 97,
