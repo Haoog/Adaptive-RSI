@@ -829,10 +829,20 @@ class Store:
         return row["id"]
 
     def defer(self, task, decision):
+        """把 queued/deferred 任务置为 deferred 并记录决策；终态或已认领任务拒绝改写。
+
+        守卫与 decide() 的 `state='queued'` 一致：reassess_deferred() 之外也允许
+        从排队态直接挂起，但已 merged/cancelled/awaiting_approval 等状态不能被
+        一次误调用退回暂缓而丢失事实。
+        """
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            changed = db.execute("UPDATE tasks SET state='deferred',updated=? WHERE id=? AND state IN ('queued','deferred')",
+                                 (time.time(), task)).rowcount
+            if not changed:
+                return False
             db.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)", (task, encode(decision), time.time()))
-            db.execute("UPDATE tasks SET state='deferred',updated=? WHERE id=?", (time.time(), task))
+            return True
 
     def decide(self, task, state, decision):
         """批量初筛决定落库：决定与理由写入 task_decisions，状态仅从排队转变。

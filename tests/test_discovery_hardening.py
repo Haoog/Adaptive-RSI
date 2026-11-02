@@ -113,8 +113,10 @@ class DiscoveryHardeningTest(unittest.TestCase):
                                        (state, "issue:" + str(number) if legacy else old["fingerprint"], old["id"]))
                     self.store.execute("INSERT INTO runs(id,task,project,state,result,started,ended) VALUES (?,?,'p','merged','{}',1,2)",
                                        ("run-" + old["id"], old["id"]))
-                    self.store.defer(old["id"], {"reason": "original decision"})
-                    self.store.execute("UPDATE tasks SET state=? WHERE id=?", (state, old["id"]))
+                    # 种子决定行直接写库；store.defer() 已改为只对 queued/deferred
+                    # 任务生效，merged 状态下用它借副作用不会再落库。
+                    self.store.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)",
+                                       (old["id"], encode({"reason": "original decision"}), 0))
                     before = self.store.one("SELECT * FROM tasks WHERE id=?", (old["id"],))
                     self.config["github"]["repository"] = "owner/beta"
                     self.synchronize([beta])
