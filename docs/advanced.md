@@ -284,7 +284,7 @@ python3 scripts/rsi import-case PROJECT_ID case.json
 python3 scripts/rsi evolve PROJECT_ID
 ```
 
-`split` 为 `development`、`validation`、`holdout`。同一家族或同一任务快照不能跨集合；近重复缺陷仍需整理者正确标注家族。默认验证集和最终评估集各至少 3 个家族，最多曝光 3 次。overlay 由控制器保存，仅在独立评估时写入测试目录，不交给候选。合成缺陷只存在于评估副本，不会进入真实项目任务池。这里没有把自动生成的合成任务冒充真实业务证据。导出的封存实验包在离线或隔离机器上的核验与复现步骤见[离线复现操作清单](offline-reproduction.md)。
+`split` 为 `development`、`validation`、`holdout`。同一家族或同一任务快照不能跨集合；近重复缺陷仍需整理者正确标注家族。默认验证集和最终评估集各至少 3 个家族，最多曝光 3 次。曝光用尽时演化会在调用模型前停摆，并按实际不足的集合分别报告差额：validation 通过导入新用例或调高 `evolution.max_holdout_uses` 重新入选；holdout 必须导入从未曝光的用例，调高上限不能刷新已曝光样本。overlay 由控制器保存，仅在独立评估时写入测试目录，不交给候选。合成缺陷只存在于评估副本，不会进入真实项目任务池。这里没有把自动生成的合成任务冒充真实业务证据。导出的封存实验包在离线或隔离机器上的核验与复现步骤见[离线复现操作清单](offline-reproduction.md)。
 
 ## Codex 插件
 
