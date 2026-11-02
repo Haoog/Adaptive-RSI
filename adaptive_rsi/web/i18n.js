@@ -972,6 +972,8 @@ const english = {
   "这次执行没有完成，请展开运行详情查看原因。": "This run did not complete. Expand the run details for the cause.",
   "判断价值": "Assess value",
   "确定完成标准": "Define completion criteria",
+  "准备环境": "Prepare environment",
+  "代码分析": "Analyze code",
   "修改代码": "Change code",
   "运行检查": "Run checks",
   "为什么值得做": "Why this is worth doing",
