@@ -130,6 +130,23 @@ async function main() {
     }
     console.log('ok: all injected states show mapped Chinese copy with the right style');
 
+    const retryPosts = [];
+    await page.route('**/api/release-retry', route => {
+      retryPosts.push(route.request().postDataJSON());
+      statusOverride = {deploy: {state: 'workflow_succeeded'}};
+      return reply(route, statusOverride.deploy);
+    });
+    scenario = 'health_failed';
+    await page.evaluate(() => document.getElementById('detail-dialog').close());
+    await openDetail(page, '查看详情');
+    await page.getByRole('button', {name: '重新检查健康', exact: true}).click();
+    await page.waitForFunction(() => !document.querySelector('#live-task-outcome')?.textContent.includes('重新检查健康'));
+    assert.equal(retryPosts.length, 1);
+    assert.equal(retryPosts[0].kind, 'deploy');
+    assert.ok(retryPosts[0].project && retryPosts[0].run);
+    statusOverride = null;
+    console.log('ok: health retry posts one deploy request and removes the control after refresh');
+
     // 英文界面：等待态与终止失败态的映射文案同步翻译，样式不变。
     scenario = 'waiting_verification';
     await page.locator('#language-select').selectOption('en');
