@@ -108,7 +108,7 @@ WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
 
 
-def workflow_choices(runtime, project_id):
+def workflow_choices(runtime, project_id, refresh=False):
     project = runtime.project(project_id)
     repo = runtime.config(project_id)["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
@@ -118,7 +118,7 @@ def workflow_choices(runtime, project_id):
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
     cached = _workflow_choices_cache.get((repo, sha))
     now = time.time()
-    if cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
+    if not refresh and cached and now - cached[0] < WORKFLOW_CHOICES_TTL:
         return cached[1]
     workflows = []
     for page in range(1, 11):
@@ -146,9 +146,13 @@ def workflow_choices(runtime, project_id):
         choices = [row for row in pool.map(inspect, workflows) if row]
     result = {"repository": repo, "sha": sha, "workflows": choices}
     # 缓存绑定精确的默认分支 SHA；分支前进后键自然失效。授权路径始终重新校验，不受缓存影响。
-    if len(_workflow_choices_cache) > 32:
-        _workflow_choices_cache.clear()
-    _workflow_choices_cache[(repo, sha)] = (now, result)
+    has_transient_error = any(item.get("reason", "").startswith("Unable to inspect this workflow") for item in choices)
+    if not has_transient_error:
+        if len(_workflow_choices_cache) > 32:
+            _workflow_choices_cache.clear()
+        _workflow_choices_cache[(repo, sha)] = (now, result)
+    else:
+        _workflow_choices_cache.pop((repo, sha), None)
     return result
 
 
@@ -156,7 +160,7 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
     initial = runtime.config(project_id)
-    choices = workflow_choices(runtime, project_id)
+    choices = workflow_choices(runtime, project_id, refresh=True)
     if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
         raise ValueError("Select a compatible existing workflow from this project")
     repo, sha = choices["repository"], choices["sha"]
@@ -227,7 +231,7 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
-def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
+def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stable=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
         if expected is not _UNCONDITIONAL:
@@ -240,6 +244,9 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None):
             if (json.loads(current["value"]) if current else None) != previous:
                 raise _AutomationChanged("Deployment ownership changed during reconciliation")
             db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (owner_name, encode(owner)))
+        if stable is not None:
+            stable_name, stable_val = stable
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (stable_name, encode(stable_val)))
         db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key(run["id"], kind), encode(data)))
         row = db.execute("SELECT result FROM runs WHERE id=?", (run["id"],)).fetchone()
         if row:
@@ -836,10 +843,16 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             data["state"] = observed
             if observed == "health_failed":
                 data["rollback_target"] = runtime.store.setting(stable_key(project["id"], data["repository"], policy["health_url"]))
-            persist(runtime, run, "deploy", data)
             if observed == "healthy":
-                runtime.store.put_setting(stable_key(project["id"], data["repository"], policy["health_url"]),
-                                          {"sha": data["sha"], "run": run["id"], "health": report})
+                stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
+                          {"sha": data["sha"], "run": run["id"], "health": report})
+                try:
+                    persist(runtime, run, "deploy", data, stable=stable)
+                except TypeError:
+                    persist(runtime, run, "deploy", data)
+                    runtime.store.put_setting(stable[0], stable[1])
+            else:
+                persist(runtime, run, "deploy", data)
     if data["state"] == "health_failed" and policy.get("automatic_rollback"):
         if policy.get("rollback_data_policy", "manual") != "backward_compatible":
             data.update(rollback_unavailable=True, rollback_blocked_reason="data_compatibility",
@@ -883,10 +896,12 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
             data["state"] = "rollback_failed"
             if rollback["state"] == "rerun_unknown":
                 data["error"] = rollback["error"]
+            persist(runtime, run, "deploy", data)
         elif rollback["state"] == "workflow_succeeded":
             now = time.time()
             first = rollback.setdefault("health_started_at", now)
             if now < first + policy.get("health_warmup_seconds", 0) or now < rollback.get("health_retry_at", 0):
+                persist(runtime, run, "deploy", data)
                 return data
             authorized(runtime, project, run, "deploy", policy, cancel)
             report = health_sample(policy, rollback["sha"])
@@ -895,10 +910,26 @@ def deployment_health(runtime, project, run, data, policy, cancel, persist=save)
                 current_owner = deployment_owner(runtime, project["id"], data["repository"], policy)
                 if current_owner and current_owner["run"] != run["id"]:
                     data.update(state="superseded", error="A newer deployment owns this target; old rollback health evidence was discarded")
+                    persist(runtime, run, "deploy", data)
                     return data
                 observed = observe_health(rollback, report, policy, time.time())
-                if observed != "pending":
-                    data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
+                if observed == "pending":
+                    persist(runtime, run, "deploy", data)
+                    return data
+                data["state"] = "rolled_back" if observed == "healthy" else "rollback_failed"
+                if observed == "healthy":
+                    owner_name = owner_key(project["id"], data["repository"], policy)
+                    ownership = (owner_name, current_owner, {"run": run["id"], "sha": rollback["sha"]})
+                    stable = (stable_key(project["id"], data["repository"], policy["health_url"]),
+                              {"sha": rollback["sha"], "run": run["id"], "health": report})
+                    try:
+                        persist(runtime, run, "deploy", data, ownership=ownership, stable=stable)
+                    except TypeError:
+                        persist(runtime, run, "deploy", data)
+                        runtime.store.put_setting(owner_name, {"run": run["id"], "sha": rollback["sha"]})
+                        runtime.store.put_setting(stable[0], stable[1])
+                else:
+                    persist(runtime, run, "deploy", data)
     return data
 
 
@@ -1025,9 +1056,14 @@ def advance(runtime, project, run, outcome, cancel=None):
         data = runtime.store.setting(key(run["id"], kind))
         expected = encode(data) if data is not None else None
 
-        def persist(runtime, run, kind, value, ownership=None):
+        def persist(runtime, run, kind, value, ownership=None, stable=None):
             nonlocal expected
-            saved = save(runtime, run, kind, value, expected=expected, **({"ownership": ownership} if ownership else {}))
+            extra = {}
+            if ownership is not None:
+                extra["ownership"] = ownership
+            if stable is not None:
+                extra["stable"] = stable
+            saved = save(runtime, run, kind, value, expected=expected, **extra)
             expected = encode(saved)
             return saved
 
