@@ -138,6 +138,9 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    # macOS 对已回收进程组的 killpg 返回 EPERM 而非 ESRCH。
+                    pass
                 break
             # A short command should wake us as soon as it exits. Keep the same
             # upper bound between cancellation, timeout and output-limit checks.
@@ -155,7 +158,7 @@ def run_process(argv, cwd=None, timeout=300, cancel=None, output_mb=12, env=None
         # Kill descendants still in this process group before touching artifacts.
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         def tail(stream):
             stream.seek(max(0, os.fstat(stream.fileno()).st_size - output_mb * 1024 * 1024))
