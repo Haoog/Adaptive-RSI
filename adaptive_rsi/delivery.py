@@ -669,7 +669,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         if tracking_cancelled():
                             return
                         task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
-                        state = "queued" if task["attempts"] <= config["limits"]["retries"] else "blocked"
+                        state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
                             _close_superseded_pr(store, run, outcome, repo,
                                                  pr_view(repo, outcome["pr"]), tracking_cancelled)

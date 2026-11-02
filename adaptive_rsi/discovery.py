@@ -617,7 +617,7 @@ def related_work(store, project, task, limit=12):
             overlap = len(words & terms(row["title"]))
             if not shared and (not words or overlap < 2):
                 continue
-            yield (len(shared) * 10 + overlap, row["updated"],
+            yield (len(shared) * 10 + overlap, row["updated"] or 0,
                    {"id": row["id"], "title": row["title"], "state": row["state"],
                     "shared_paths": shared, "summary": str(result.get("summary", ""))[:1500],
                     "pr": result.get("pr"), "base": result.get("base")})

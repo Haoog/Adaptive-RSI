@@ -545,7 +545,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                                        (project["id"], task["id"], time.time(), task.get("urgency", 0), task.get("urgency", 0), rank))
             if higher:
                 transition("assessed", {"reason": "Value assessment saved; higher-priority work runs first"}, True,
-                           task_fields={"state": "queued", "attempts": max(0, task["attempts"] - 1), "available": 0})
+                           task_fields={"state": "queued", "attempts": max(0, (task["attempts"] or 0) - 1), "available": 0})
                 return None
     if not checks:
         transition("insufficient_evidence", {"reason": "No acceptance checks configured or discovered; implementation held."}, True)
