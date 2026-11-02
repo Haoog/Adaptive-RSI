@@ -1129,7 +1129,6 @@ class NativeAgent:
                 if final:
                     if len(calls) != 1:
                         conversation.results([(call_id, name, {"error": "finish must be called alone without other concurrent tool calls; please execute your other tool calls first and then call finish."}) for call_id, name, _ in calls])
-                        self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                         continue
                     call_id, name, args = final[0]
                     error = str(args) if isinstance(args, ArgumentsError) else None
@@ -1139,7 +1138,6 @@ class NativeAgent:
                         except RuntimeError as exc:
                             error = "finish arguments failed schema validation: " + str(exc)
                     if error is None:
-                        self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                         return args
                     if reason == "output_limit":
                         # 供应商明确说这次响应撞到输出上限：同样的预算再问一次只会再截断再计费。
@@ -1155,13 +1153,11 @@ class NativeAgent:
                             raise problem
                         error += " (the response hit the output token limit; shorten the result or split it)"
                     conversation.results([(call_id, name, {"error": error})])
-                    self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
                     continue
                 tools.trace = lambda detail: self.store.event("native_tool", "Native tool lifecycle", project, run,
                                                              {"call": call, "turn": turn, "role": role, **detail})
                 results = execute_tools(tools, calls)
                 conversation.results(results)
-                self.store.execute("UPDATE calls SET state='completed' WHERE id=?", (call,))
             except ProviderUnavailable as exc:
                 self.store.event("model_transport", "Model request retry safety", project, run,
                                  {"call": call, "request_outcome": exc.request_outcome,

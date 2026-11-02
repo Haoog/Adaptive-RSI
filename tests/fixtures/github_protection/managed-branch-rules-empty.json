@@ -1,0 +1,11 @@
+{
+ "captured": "2026-11-01T20:31:22Z",
+ "repository": "Haoog/Adaptive-RSI",
+ "branch": "main",
+ "endpoint": "repos/Haoog/Adaptive-RSI/rules/branches/main",
+ "read_only": true,
+ "command": "gh api repos/Haoog/Adaptive-RSI/rules/branches/main --paginate --slurp",
+ "response": [
+  []
+ ]
+}

@@ -204,11 +204,58 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(self.manager.busy, 1)
 
     def test_busy_expires_without_browser_polling(self):
-        self.manager.ttl = 0.03
+        self.manager.ttl = 1
         session = self.manager.start("codex")
-        time.sleep(0.05)
+        time.sleep(1.05)
         self.assertEqual(self.manager.busy, 0)
         self.assertEqual(self.manager.status(session["id"])["state"], "expired")
+        self.gate.set()
+        self.assertFalse((self.root / "codex/auth.json").exists())
+
+    def test_start_tolerates_expiry_between_reserve_and_launch(self):
+        # 注入时钟，确定性地复现 reserve→launch 之间 ttl 耗尽的窗口，不依赖 sleep 撞运气。
+        clock = [1000.0]
+        self.manager.now = lambda: clock[0]
+        self.manager.ttl = 5
+        launch = self.manager.launch
+
+        def slow_launch(session_id, method=0, inputs=None):
+            clock[0] += 6  # 调度停顿：launch 之前已越过 expires_at
+            return launch(session_id, method, inputs)
+
+        with patch.object(self.manager, "launch", slow_launch):
+            session = self.manager.start("codex")
+        self.assertEqual((session["state"], session["error"]), ("expired", "auth_expired"))
+        self.assertNotIn("_reserved", session)
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.manager.status(session["id"])["state"], "expired")
+        self.assertEqual(self.created, [])  # worker 从未派发，凭据不会被写入
+        self.gate.set()
+        self.assertFalse((self.root / "codex/auth.json").exists())
+        # 过期会话不能借 complete() 写凭据；既有 invalid_auth_state 语义不变。
+        with self.assertRaisesRegex(AuthError, "invalid_auth_state"):
+            self.manager.complete(session["id"], "SECRET-CODE")
+
+    def test_launch_returns_expired_state_for_unlaunched_reserved_session(self):
+        clock = [2000.0]
+        self.manager.now = lambda: clock[0]
+        self.manager.ttl = 5
+        session = self.manager.reserve("codex")
+        self.assertEqual(self.manager.busy, 1)
+        clock[0] += 6
+        # launch 自己发现窗口已过期：返回终态而不是抛 invalid_auth_state。
+        result = self.manager.launch(session["id"])
+        self.assertEqual((result["state"], result["error"]), ("expired", "auth_expired"))
+        self.assertNotIn("_reserved", result)
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.created, [])
+        # 只 reserve、永远不会 launch 的会话（准入被拦下）仍由过期扫描兜底回收。
+        abandoned = self.manager.reserve("codex")
+        self.assertEqual(self.manager.busy, 1)
+        clock[0] += 6
+        self.assertEqual(self.manager.status(abandoned["id"])["state"], "expired")
+        self.assertEqual(self.manager.busy, 0)
+        self.assertEqual(self.manager.launch(abandoned["id"])["state"], "expired")
         self.gate.set()
         self.assertFalse((self.root / "codex/auth.json").exists())
 

@@ -1,0 +1,15 @@
+{
+ "captured": "2026-11-01T20:31:23Z",
+ "repository": "Haoog/adaptive-rsi-validation-20261020",
+ "branch": "main",
+ "endpoint": "repos/Haoog/adaptive-rsi-validation-20261020/rules/branches/main",
+ "read_only": true,
+ "command": "gh api repos/Haoog/adaptive-rsi-validation-20261020/rules/branches/main --paginate --slurp",
+ "result": {
+  "exit_code": 1,
+  "stdout": "[{\"message\":\"Upgrade to GitHub Pro or make this repository public to enable this feature.\",\"documentation_url\":\"https://docs.github.com/rest/repos/rules#get-rules-for-a-branch\",\"status\":\"403\"}]",
+  "stderr": "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)\n",
+  "error": null,
+  "error_kind": "exit"
+ }
+}

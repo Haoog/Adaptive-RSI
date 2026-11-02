@@ -1,5 +1,7 @@
 """Evidence integrity and dataset lifecycle acceptance without external models."""
+import hashlib
 import json
+import shutil
 import tempfile
 import time
 import unittest
@@ -8,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.config import fingerprint
-from adaptive_rsi.evolution import Evolution, case_spec
+from adaptive_rsi.evolution import Evolution, case_spec, paired_summary
 from adaptive_rsi.store import Store, encode
 
 
@@ -351,6 +353,358 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
+
+    def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo'):
+        """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        suffix = repo_name[5:] if repo_name.startswith('repo-') else repo_name
+        repo = fixture(self.root / repo_name)
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {
+            'task': 'offline reproduction task',
+            'base': base,
+            'checks': checks if checks is not None else [
+                {'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']},
+            ],
+            'source': 'real',
+            'signature': 'sig-' + suffix,
+            'repository': str(repo),
+            'overlay': None,
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-' + suffix, 'p', 'family-' + suffix, 'validation', encode(spec), 0, time.time()))
+        evidence = {'dataset': {'manifest': [{'case': 'case-' + suffix}]},
+                    'providers': providers if providers is not None else [],
+                    **(evidence or {})}
+        if self.store.one("SELECT id FROM candidates WHERE id='c'"):
+            self.store.execute("UPDATE candidates SET evidence=? WHERE id='c'", (encode(evidence),))
+        else:
+            self.candidate(evidence)
+        destination = self.root / ('bundle-' + suffix)
+        self.evolution.export_bundle('c', destination)
+        return destination
+
+    def test_bundle_offline_reproduction_enumerates_dependencies_without_aborting(self):
+        checks = [
+            {'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']},
+            {'name': 'missing_tool_1', 'cwd': '.', 'argv': ['fake-compiler-xyz']},
+            {'name': 'missing_tool_2', 'cwd': '.', 'argv': ['nonexistent-linter-abc', '--check']},
+        ]
+        destination = self.sealed_bundle(checks=checks, providers=[{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}],
+                                        repo_name='repo-deps')
+        result = Evolution.reproduce_bundle(
+            destination,
+            env={'PATH': '/usr/bin:/bin'},  # No model API credentials
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None
+        )
+
+        # 1. Input integrity is verified
+        self.assertTrue(result['valid'])
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['integrity']['mismatches'], [])
+
+        # 2. Reproduction cannot proceed due to missing tools and credentials
+        self.assertFalse(result['reproducible'])
+
+        # 3. Missing tools are enumerated item-by-item instead of failing on the first one
+        missing_tool_names = [item['name'] for item in result['dependencies']['missing']]
+        self.assertIn('fake-compiler-xyz', missing_tool_names)
+        self.assertIn('nonexistent-linter-abc', missing_tool_names)
+        available_tool_names = [item['name'] for item in result['dependencies']['available']]
+        self.assertIn('git', available_tool_names)
+        self.assertIn('python3', available_tool_names)
+
+        # 4. Missing credentials are enumerated
+        missing_cred_names = [item['name'] for item in result['credentials']['missing']]
+        self.assertIn('OPENAI_API_KEY', missing_cred_names)
+
+        # 5. Limitations explicitly declare credentials, tools, and offline environment
+        limitations_text = ' '.join(result['limitations'])
+        self.assertIn('Credentials are excluded', limitations_text)
+        self.assertIn('Missing credentials', limitations_text)
+        self.assertIn('Missing host tools', limitations_text)
+        self.assertIn('Isolated offline environment', limitations_text)
+
+    def test_bundle_offline_reproduction_detects_tampered_bundle(self):
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
+                        'providers': []})
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+        self.assertTrue(Evolution.reproduce_bundle(destination)['integrity']['valid'])
+
+        # Tampering with bundle file invalidates integrity
+        (destination / 'candidate.json').write_text('{"tampered": true}')
+        tampered_result = Evolution.reproduce_bundle(destination)
+        self.assertFalse(tampered_result['valid'])
+        self.assertFalse(tampered_result['integrity']['valid'])
+        self.assertIn('candidate.json', tampered_result['integrity']['mismatches'])
+        self.assertFalse(tampered_result['reproducible'])
+
+    def test_bundle_offline_reproduction_cli_script(self):
+        import subprocess
+        import sys
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
+                        'providers': [{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}]})
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+
+        # Test CLI invocation with --json in clean environment (no API keys)
+        proc = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--json'],
+            capture_output=True,
+            text=True,
+            env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(proc.returncode, 0)
+        cli_data = json.loads(proc.stdout)
+        self.assertTrue(cli_data['valid'])
+        self.assertFalse(cli_data['reproducible'])
+        self.assertIn('OPENAI_API_KEY', [c['name'] for c in cli_data['credentials']['missing']])
+
+        # Test CLI invocation with --strict exits non-zero (2) when dependencies/credentials missing
+        strict_proc = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--strict'],
+            capture_output=True,
+            text=True,
+            env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(strict_proc.returncode, 2)
+        self.assertIn('Sealed Bundle Reproduction Inspection', strict_proc.stdout)
+        self.assertIn('OPENAI_API_KEY', strict_proc.stdout)
+
+    def test_bundle_reproduction_ignores_unmanifested_case_directories(self):
+        # 线程 1：向 bundle 多塞一个未登记用例目录不得被执行，也不得保持 integrity 有效。
+        pristine = self.sealed_bundle(repo_name='repo-pristine')
+        mutated = self.root / 'mutated'
+        shutil.copytree(pristine, mutated)
+
+        (mutated / 'cases' / 'x').mkdir()
+        (mutated / 'cases' / 'x' / 'case.json').write_text(encode({
+            'task': 'smuggled', 'base': 'b', 'source': 'real', 'signature': 'sig-x',
+            'repository': 'repository', 'overlay': None,
+            'checks': [{'name': 'smuggled_check', 'cwd': '.', 'argv': ['python3', '-c',
+                        'open("SMUGGLED_EXECUTED", "w").write("1")']}],
+        }))
+        result = Evolution.reproduce_bundle(
+            mutated, env={'PATH': '/usr/bin:/bin'}, run_checks=True)
+        self.assertFalse(result['integrity']['valid'])
+        self.assertIn('cases/x/case.json', result['integrity']['mismatches'])
+        self.assertFalse(result['valid'])
+        self.assertFalse(result['reproducible'])
+        self.assertEqual(result['executed_checks'], [])
+        self.assertFalse((mutated / 'SMUGGLED_EXECUTED').exists())
+
+        # bundle 内已登记文件未被篡改：与导出原包逐文件比对 SHA-256。
+        original_files = json.loads((pristine / 'bundle.json').read_text(encoding='utf-8'))['files']
+        for relative, digest in original_files.items():
+            self.assertEqual(hashlib.sha256((mutated / relative).read_bytes()).hexdigest(), digest)
+
+        # 符号链接用例目录同样按 verify_bundle 规则拒绝，登记者仍可正常执行。
+        symlinked = self.root / 'symlinked'
+        shutil.copytree(pristine, symlinked)
+        outside = self.root / 'outside'
+        (outside / 'x').mkdir(parents=True)
+        (outside / 'x' / 'case.json').write_text(encode({
+            'task': 'escape', 'base': 'b', 'source': 'real', 'signature': 'sig-y',
+            'repository': 'repository', 'overlay': None,
+            'checks': [{'name': 'escape_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("escape")']}],
+        }))
+        shutil.rmtree(symlinked / 'cases')
+        (symlinked / 'cases').symlink_to(outside)
+        self.assertFalse(Evolution.verify_bundle(symlinked)['valid'])
+        result = Evolution.reproduce_bundle(
+            symlinked, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertFalse(result['integrity']['valid'])
+        self.assertFalse(result['valid'])
+        self.assertEqual(result['executed_checks'], [])
+
+        # 复现扫描自身的符号链接检测：verify_bundle 只查登记文件，会放过 cases/ 内
+        # 未登记的符号链接条目；reproduce 必须主动判失效且不执行其中任何内容。
+        scanned = self.root / 'scanned'
+        shutil.copytree(pristine, scanned)
+        (scanned / 'cases' / 'link').symlink_to(outside / 'x')
+        self.assertTrue(Evolution.verify_bundle(scanned)['valid'])
+        result = Evolution.reproduce_bundle(scanned, env={'PATH': '/usr/bin:/bin'}, run_checks=True)
+        self.assertFalse(result['integrity']['valid'])
+        self.assertIn('cases/link', result['integrity']['mismatches'])
+        self.assertFalse(result['valid'])
+        self.assertEqual(result['executed_checks'], [])
+
+        baseline = Evolution.reproduce_bundle(
+            pristine, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(baseline['integrity']['valid'])
+        self.assertEqual([row['case'] for row in baseline['executed_checks']], ['case-pristine'])
+        self.assertTrue(baseline['executed_checks'][0]['passed'])
+
+    def test_bundle_reproduction_applies_sealed_overlay_in_staging_copy(self):
+        # 线程 2：overlay-only 检查在一次性副本中可见并执行，bundle 内文件保持不变。
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        overlay = self.root / 'overlay'
+        overlay.mkdir()
+        (overlay / 'sealed_marker.txt').write_text('sealed\n')
+        (overlay / 'tests').mkdir()
+        (overlay / 'tests' / 'test_overlay.py').write_text(
+            "import pathlib, unittest\n"
+            "class Overlay(unittest.TestCase):\n"
+            "    def test_marker(self):\n"
+            "        marker = pathlib.Path('sealed_marker.txt').read_text()\n"
+            "        self.assertIn('sealed', marker)\n"
+            "        self.assertFalse(pathlib.Path('OVLAER_RAW').exists())\n")
+        spec = {
+            'task': 'overlay reproduction task',
+            'base': git(repo, 'rev-parse', 'HEAD'),
+            'checks': [
+                {'name': 'sees_staging_copy', 'cwd': '.', 'argv': ['python3', '-c',
+                 'import pathlib, sys; sys.exit(0 if (pathlib.Path("sealed_marker.txt").exists()'
+                 ' and not pathlib.Path("OVLAER_RAW").exists()) else 1)']},
+                {'name': 'overlay_only_test', 'cwd': '.', 'argv': ['python3', '-m', 'unittest',
+                 'discover', '-s', 'tests', '-p', 'test_overlay.py', '-v']},
+            ],
+            'source': 'real', 'signature': 'sig1', 'repository': str(repo),
+            'overlay': str(overlay),
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-01', 'p', 'family-01', 'validation', encode(spec), 0, time.time()))
+        self.candidate({'dataset': {'manifest': [{'case': 'case-01'}]}, 'providers': []})
+        destination = self.root / 'bundle'
+        self.evolution.export_bundle('c', destination)
+        files_before = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))['files']
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 2)
+        for row in result['executed_checks']:
+            self.assertTrue(row['passed'], row)
+            self.assertTrue(row['overlay_applied'])
+        self.assertEqual([row['check'] for row in result['executed_checks']],
+                         ['sees_staging_copy', 'overlay_only_test'])
+        # 覆盖层落盘脚本不在导出目录中：命令确实运行在一次性副本里。
+        self.assertFalse((destination / 'cases' / 'case-01' / 'repository' / 'sealed_marker.txt').exists())
+        for relative, digest in files_before.items():
+            self.assertEqual(hashlib.sha256((destination / relative).read_bytes()).hexdigest(), digest,
+                             relative)
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def test_bundle_credentials_follow_exported_provider_requirements(self):
+        # 线程 3：凭据需求来自导出的非机密 provider 元数据，不再默认 OPENAI_API_KEY。
+        destination = self.sealed_bundle(repo_name='repo-creds')
+        exported = json.loads((destination / 'evidence.json').read_text(encoding='utf-8'))
+        self.assertEqual(exported['providers'], [])
+        result = Evolution.reproduce_bundle(destination, env={'PATH': '/usr/bin:/bin'})
+        self.assertNotIn('OPENAI_API_KEY', [c['name'] for c in result['credentials']['missing']])
+        self.assertNotIn('OPENAI_API_KEY', [c['name'] for c in result['credentials']['available']])
+        # 空列表是明确的「无凭据需求」（如本地模型），环境齐备即可复现。
+        self.assertTrue(result['reproducible'])
+        self.assertFalse(any('provider requirements' in item for item in result['limitations']))
+
+        # 导出裁剪：evidence 里已有 providers 列表时逐项裁为 {id, env_key}，
+        # 任何多余字段（可能夹带密钥值）不得进入 bundle。
+        poisoned = self.sealed_bundle(
+            evidence={'providers': [{'id': 'openai', 'env_key': 'OPENAI_API_KEY',
+                                     'api_key': 'sk-LEAK-123', 'secret': 'hunter2'}]},
+            repo_name='repo-poison')
+        poisoned_evidence = (poisoned / 'evidence.json').read_text(encoding='utf-8')
+        self.assertEqual(
+            json.loads(poisoned_evidence)['providers'],
+            [{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}])
+        self.assertNotIn('sk-LEAK-123', poisoned_evidence)
+        self.assertNotIn('hunter2', poisoned_evidence)
+
+        # 旧格式导出包没有 provider 元数据：凭据可用性无法判定，不得猜测 OPENAI_API_KEY。
+        legacy = self.root / 'legacy'
+        shutil.copytree(destination, legacy)
+        legacy_evidence = json.loads((legacy / 'evidence.json').read_text(encoding='utf-8'))
+        legacy_evidence.pop('providers')
+        (legacy / 'evidence.json').write_text(encode(legacy_evidence), encoding='utf-8')
+        legacy_manifest = json.loads((legacy / 'bundle.json').read_text(encoding='utf-8'))
+        legacy_manifest['files']['evidence.json'] = hashlib.sha256(
+            (legacy / 'evidence.json').read_bytes()).hexdigest()
+        (legacy / 'bundle.json').write_text(encode(legacy_manifest), encoding='utf-8')
+        result = Evolution.reproduce_bundle(legacy, env={'PATH': '/usr/bin:/bin'})
+        self.assertTrue(result['integrity']['valid'])
+        self.assertFalse(result['reproducible'])
+        self.assertEqual(result['credentials']['missing'], [])
+        self.assertTrue(any('provider requirements' in item for item in result['limitations']))
+
+        openai_bundle = self.sealed_bundle(
+            providers=[{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}], repo_name='repo-openai')
+        self.assertEqual(
+            json.loads((openai_bundle / 'evidence.json').read_text(encoding='utf-8'))['providers'],
+            [{'id': 'openai', 'env_key': 'OPENAI_API_KEY'}])
+        result = Evolution.reproduce_bundle(openai_bundle, env={'PATH': '/usr/bin:/bin'})
+        self.assertIn('OPENAI_API_KEY', [c['name'] for c in result['credentials']['missing']])
+
+        custom_bundle = self.sealed_bundle(
+            providers=[{'id': 'custom', 'env_key': 'CUSTOM_TOKEN'}], repo_name='repo-custom')
+        result = Evolution.reproduce_bundle(custom_bundle, env={'PATH': '/usr/bin:/bin'})
+        self.assertIn('CUSTOM_TOKEN', [c['name'] for c in result['credentials']['missing']])
+        self.assertNotIn('OPENAI_API_KEY', [c['name'] for c in result['credentials']['missing']])
+
+        # 显式 required_credentials 覆盖缺省推断：本地免凭据模型可判定为可复现。
+        local = self.sealed_bundle(providers=[{'id': 'ollama', 'env_key': ''}], repo_name='repo-local')
+        result = Evolution.reproduce_bundle(
+            local, env={'PATH': '/usr/bin:/bin'}, required_credentials=[],
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None,
+            run_checks=True)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['credentials']['missing'], [])
+        self.assertTrue(result['reproducible'])
+        self.assertTrue(result['executed_checks'][0]['passed'])
+
+    def test_save_hotpath_skips_reverification_in_evaluating_state(self):
+        data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
+        plan = {'data': data, 'sha256': fingerprint(data)}
+        evidence = {'preregistered_plan': plan, 'trials': []}
+        self.candidate(evidence)
+
+        with patch.object(self.evolution, 'verify_plan', wraps=self.evolution.verify_plan) as mock_verify, \
+             patch('adaptive_rsi.evolution.paired_summary', wraps=paired_summary) as mock_summary:
+            # 1. 初始 evaluating 态保存：首次验证计划
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+            self.assertEqual(evidence['plan_verification']['analysis'], 'planned_in_progress')
+
+            # 2. 追加 trial 后再次以 evaluating 保存：跳过完整重验，但 trials 正常持久化
+            trial1 = {'case': 'x', 'split': 'validation', 'repetition': 0,
+                      'stable': {'pass': False}, 'candidate': {'pass': True}}
+            evidence['trials'].append(trial1)
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+            row1 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row1 is not None
+            persisted = json.loads(row1['evidence'])
+            self.assertEqual(len(persisted['trials']), 1)
+
+            # 3. 计划变化时：触发重新验证
+            modified_data = {'repeats': 1, 'samples': [{'id': 'x', 'split': 'validation'}]}
+            evidence['preregistered_plan'] = {'data': modified_data, 'sha256': fingerprint(modified_data)}
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 2)
+            self.assertEqual(mock_summary.call_count, 2)
+
+            # 4. 终态保存：触发完整重验
+            trial2 = {'case': 'x', 'split': 'validation', 'repetition': 1,
+                      'stable': {'pass': False}, 'candidate': {'pass': True}}
+            evidence['trials'].append(trial2)
+            self.evolution.save('c', 'ready', evidence)
+            self.assertEqual(mock_verify.call_count, 3)
+            self.assertEqual(mock_summary.call_count, 3)
+            row2 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row2 is not None
+            persisted = json.loads(row2['evidence'])
+            self.assertEqual(len(persisted['trials']), 2)
+            self.assertIn('wilson_95', persisted['win_rate'])
+            # 终态清理缓存
+            self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
 
 
 if __name__ == '__main__':
