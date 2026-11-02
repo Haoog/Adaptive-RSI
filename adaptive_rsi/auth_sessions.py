@@ -674,8 +674,20 @@ class OpenCodeAuth(_Process):
             return True
         deadline = time.monotonic() + max(1, timeout)
         interval = 0.5
+        failures = 0
         while time.monotonic() < deadline:
-            value = self.http("GET", base, timeout=min(25, max(1, deadline - time.monotonic())))
+            try:
+                value = self.http("GET", base, timeout=min(25, max(1, deadline - time.monotonic())))
+            except AuthError as exc:
+                if exc.code != "auth_protocol_error":
+                    raise
+                failures += 1
+                if failures >= 10:
+                    raise
+                time.sleep(min(interval, max(0, deadline - time.monotonic())))
+                interval = min(3.0, interval * 2)
+                continue
+            failures = 0
             data = value.get("data") if isinstance(value, dict) else None
             status = data.get("status") if isinstance(data, dict) else None
             if status == "complete":
@@ -851,6 +863,13 @@ class AuthSessions:
         container = config.get("sandbox", {}).get("backend") == "docker"
         for backend in ("codex", "opencode"):
             available = bool(shutil.which("docker") if container or not shutil.which(backend) else shutil.which(backend))
+            with self.lock:
+                generation = self.cache_generations[backend]
+                cached = self.status_cache.get(backend)
+            if not self.custom_factory and cached and cached[0] > time.monotonic() and isinstance(cached[1], dict):
+                result[backend] = copy.deepcopy(cached[1])
+                result[backend]["available"] = available
+                continue
             try:
                 # 凭据写入采用原子替换；状态读取不等待可能持续整个模型调用的 CLI 锁。
                 if backend == "codex":
@@ -869,6 +888,10 @@ class AuthSessions:
                             generation = self.cache_generations[backend]
                             cached = self.status_cache.get(backend)
                         if cached and cached[0] > time.monotonic():
+                            if isinstance(cached[1], dict):
+                                result[backend] = copy.deepcopy(cached[1])
+                                result[backend]["available"] = available
+                                continue
                             capabilities, providers = cached[1]
                         else:
                             binary = shutil.which("opencode")
@@ -922,6 +945,10 @@ class AuthSessions:
                     raise
             except (OSError, ValueError):
                 result[backend] = {"state": "signed_out", "available": available, "error": "invalid_credentials"}
+            if backend == "opencode" and not self.custom_factory and result[backend].get("error"):
+                with self.lock:
+                    if not self.closed and generation == self.cache_generations[backend]:
+                        self.status_cache[backend] = (time.monotonic() + 25, copy.deepcopy(result[backend]))
         with self.lock:
             result["sessions"] = [{key: item.get(key) for key in ("id", "backend", "provider", "state", "expires_at", "error")}
                                   for item in list(self.sessions.values())[-30:]]
