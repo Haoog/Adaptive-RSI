@@ -340,7 +340,28 @@ def _recover_cleanup_locked(store):
             except (ValueError, TypeError, KeyError) as error:
                 quarantine(name, journal, error, str(error))
                 continue
-            _place_cleanup(store, receipt, recycled=bool(row))
+            try:
+                _place_cleanup(store, receipt, recycled=bool(row))
+            except ValueError as error:
+                conflict_key = 'cleanup-recovery-conflict:' + name
+                existing_conflict = db.execute('SELECT value FROM settings WHERE key=?',
+                                               (conflict_key,)).fetchone()
+                evidence = {
+                    'folder': name,
+                    'receipt_id': receipt.get('id', name),
+                    'run': receipt.get('run'),
+                    'error_type': type(error).__name__,
+                    'reason': str(error),
+                }
+                serialized = json.dumps(evidence, sort_keys=True)
+                if not existing_conflict or existing_conflict[0] != serialized:
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                               (conflict_key, serialized))
+                    note('cleanup_recovery_conflict',
+                         'Cleanup recovery conflict: ' + name + ' (' + str(error) + ')',
+                         evidence)
+                continue
+            db.execute("DELETE FROM settings WHERE key=?", ('cleanup-recovery-conflict:' + name,))
         # Commit repairs and evidence accumulated after the last note(); the
         # finally below still rolls back an in-flight item that failed.
         db.commit()
@@ -633,7 +654,10 @@ class Maintenance:
 
     def maintenance(self):
         if (self.store.root / 'recycle').exists():
-            recover_cleanup(self.store)
+            try:
+                recover_cleanup(self.store)
+            except Exception as error:
+                logging.getLogger(__name__).warning("Cleanup recovery encountered error: %s", error)
         now = time.time()
         if now - self.store.setting("maintenance-last", 0) < MAINTENANCE_INTERVAL:
             return
