@@ -191,10 +191,18 @@ class ProviderHealth:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            state = json.loads(row[0]) if row else {"paused": False}
+            try:
+                state = json.loads(row[0]) if row and row[0] else {"paused": False}
+            except (TypeError, ValueError):
+                state = {"paused": False}
+            if not isinstance(state, dict):
+                state = {"paused": False}
             shared = db.execute("SELECT value FROM settings WHERE key=?", (attempt["account_key"],)).fetchone()
             if shared:
-                retry_at = json.loads(shared[0]).get("retry_at", 0)
+                try:
+                    retry_at = json.loads(shared[0]).get("retry_at", 0) if shared[0] else 0
+                except (TypeError, ValueError, AttributeError):
+                    retry_at = 0
                 if retry_at > state.get("retry_at", 0):
                     state["retry_at"] = retry_at
             if state.get("retry_at", 0) > now:
@@ -231,7 +239,12 @@ class ProviderHealth:
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT value FROM settings WHERE key=?", (attempt["key"],)).fetchone()
-            value = json.loads(row[0]) if row else {}
+            try:
+                value = json.loads(row[0]) if row and row[0] else {}
+            except (TypeError, ValueError):
+                value = {}
+            if not isinstance(value, dict):
+                value = {}
             if value.get("half_open_owner") == attempt["id"]:
                 value.pop("half_open_owner", None)
                 value.pop("half_open_until", None)
@@ -257,7 +270,12 @@ class ProviderHealth:
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
                 row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-                old = json.loads(row[0]) if row else {}
+                try:
+                    old = json.loads(row[0]) if row and row[0] else {}
+                except (TypeError, ValueError):
+                    old = {}
+                if not isinstance(old, dict):
+                    old = {}
                 if not error:
                     # A late success from an older attempt cannot clear a newer failure.
                     if (attempt is not None and (attempt.get("generation") != old.get("generation", 0) or
