@@ -145,7 +145,13 @@ def record_pr_feedback(store, run, url, pr):
     actionable = []
     for item in observations:
         # CI 身份按运行区分：同一个 PR 反复观测不会重排，新一轮尝试仍能重排一次。
-        identity_data = ["ci", run["id"], item["name"], item["state"]] if item["kind"] == "ci" else [url, item]
+        # 非 CI 身份用 GitHub 稳定键（review/comment id，退化到 url 或提交时间戳），
+        # 不纳入 body/updated_at：评审者编辑同一条评审不产生新信号，
+        # 只有新评审（新 id）或新失败检查才重排。
+        if item["kind"] == "ci":
+            identity_data = ["ci", run["id"], item["name"], item["state"]]
+        else:
+            identity_data = [item["kind"], item["id"]]
         identity = prefix + hashlib.sha256(encode(identity_data).encode("utf-8")).hexdigest()
         item.update(run=run["id"], pr=url)
         payload = encode(item)
