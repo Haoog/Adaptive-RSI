@@ -36,6 +36,24 @@ def issue_snapshot_pending(db, project, task):
     setting = db.execute("SELECT value FROM settings WHERE key=?", ("issue-sync:" + project,)).fetchone()
     try:
         progress = json.loads(setting["value"]) if setting else {}
+        if not isinstance(progress, dict):
+            progress = None
+    except (TypeError, ValueError):
+        progress = None
+    if setting is not None and progress is None:
+        # 进度行存在但不可解析：pending 集合无法确认，防重复发布必须 fail closed。
+        # 每小时至多记一条事件，否则损坏持续期间每个 claim/deliver tick 都会刷屏；
+        # 修复（重写该行）前的发布阻断不受节流影响。
+        now = time.time()
+        marker = db.execute("SELECT created FROM events WHERE project=? AND kind='issue_sync_progress_corrupt' "
+                            "ORDER BY seq DESC LIMIT 1", (project,)).fetchone()
+        if not marker or now - (marker["created"] or 0) >= 3600:
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                       (project, None, "issue_sync_progress_corrupt",
+                        "Issue sync progress is unreadable; remote publication stays blocked until it is repaired",
+                        encode({"setting": "issue-sync:" + project}), now))
+        return True
+    try:
         pending = progress.get("pending", {})
         repo = progress.get("repository", "")
         prefix = "issue:" + repo.lower() + ":"

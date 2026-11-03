@@ -46,6 +46,37 @@ class StorePoolTest(unittest.TestCase):
         # publication 被 skip 后不进入下一轮候选（仍 queued），也未被无限重领。
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))["state"], "queued")
 
+    def test_corrupt_issue_sync_progress_blocks_publish_and_records_event(self):
+        # issue-sync:<project> 行的默认值语义是「什么都还没发布」：损坏时静默回退
+        # 默认等于摘除防重复闸门。失败方向必须相反——无法确认 pending 即按
+        # pending 处理，publish 任务继续排队，并留一条可观测事件。
+        from adaptive_rsi.config import validate
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        issue = self.store.add_task("p", "issue", "issue:owner/project:7", "Issue 7", priority=1)
+        # 已交付的源任务本身不再参与领取，候选只剩 publish。
+        self.store.execute("UPDATE tasks SET state='merged' WHERE id=?", (issue,))
+        self.store.execute("INSERT INTO settings VALUES ('issue-sync:p','{corrupt json')")
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES ('run7',?,'p','merged','{}',0,1)", (issue,))
+        publication = self.store.add_task("p", "system_publish", "publish:run7", "Publish",
+                                          body="run7", priority=99)
+        with self.store.connect() as db:
+            from adaptive_rsi.store import issue_snapshot_pending
+            self.assertTrue(issue_snapshot_pending(db, "p", issue))
+        # claim 不得放行 publish：无法确认 pending 即按 pending 处理。
+        claimed = self.store.claim("p", validate({}))
+        self.assertIsNone(claimed)
+        row = self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))
+        assert row is not None
+        self.assertEqual(row["state"], "queued")
+        # 同一损坏在 claim 内重复判定时事件节流：同小时内不再追加第二条。
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_progress_corrupt'")["n"], 1)
+        # 进度修复（重新写回合法 JSON）后同一 publish 立即恢复可领取。
+        self.store.put_setting("issue-sync:p", {"repository": "owner/project", "pending": {}})
+        claimed = self.store.claim("p", validate({}))
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["task"], publication)
+
     def test_transition_resolves_stop_before_completion_and_retry_fields(self):
         from adaptive_rsi.config import validate
         self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
