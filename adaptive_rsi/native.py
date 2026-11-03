@@ -552,8 +552,13 @@ class WorkspaceTools:
                                                                             limit - len(result)]}).encode())
                     if outcome["error"] or outcome["exit_code"]:
                         return page("regex time limit" if outcome.get("error_kind") == "timeout" else "regex worker failure", file)
-                    found = json.loads(outcome["stdout"])
-                    for i in found["lines"]:
+                    try:
+                        found = json.loads(outcome["stdout"])
+                    except (ValueError, TypeError):
+                        return page("regex worker failure", file)
+                    if not isinstance(found, dict):
+                        return page("regex worker failure", file)
+                    for i in found.get("lines", []):
                         if not add_match(file, i, lines[i - 1]):
                             return page("result byte limit", file, i)
                     if found["next_line"] is not None:
