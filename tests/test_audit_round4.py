@@ -173,6 +173,14 @@ class AuditRound4Test(unittest.TestCase):
         # TAP 计划行 1..0 是零用例；版本串 "1.0 " 不得误判为空跑。
         self.assertTrue(empty_test_run("TAP version 13\n1..0"))
         self.assertFalse(empty_test_run("gcc 1.0 \nBuild ok"))
+        # 子测试里的 1..0 # SKIP 不能否决外层编号 TAP 结果：ok 2 - actual 是真实执行证据。
+        nested_skip = ("TAP version 13\n# Subtest: empty\n    1..0 # SKIP empty\n"
+                       "ok 1 - empty # SKIP\nok 2 - actual\n1..2\n")
+        self.assertFalse(empty_test_run(nested_skip))
+        # 全部跳过的 TAP 运行仍视为有执行证据（TAP 把 skip 计为已执行测试点）。
+        self.assertFalse(empty_test_run("TAP version 13\nok 1 - x # SKIP\n1..1\n"))
+        # 纯 1..0 外层计划且无任何编号结果时仍是空跑。
+        self.assertTrue(empty_test_run("TAP version 13\n1..0 # SKIP nothing\n"))
 
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {

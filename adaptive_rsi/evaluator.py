@@ -298,6 +298,7 @@ def empty_test_run(text):
     counted = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                         r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
                         r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|"
+                        r"(?:^|\n)\s*(?:not\s+)?ok\s+[1-9]\d*\s|"
                         r"\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
                         r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
     if zero:
