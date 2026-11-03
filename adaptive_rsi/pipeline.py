@@ -450,7 +450,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             task_evidence = json.loads(task["evidence"] or "[]")
         except (TypeError, ValueError):
             task_evidence = []
-        original_run_id = task_evidence[0]["run"] if task_evidence else None
+        if not isinstance(task_evidence, list) or not all(isinstance(item, dict) for item in task_evidence):
+            task_evidence = []
+        original_run_id = task_evidence[0].get("run") if task_evidence else None
         if not original_run_id:
             raise RuntimeError("Rollback task missing original run reference")
         prior = runtime.store.one("SELECT * FROM runs WHERE id=? AND project=?", (original_run_id, project["id"]))
@@ -469,7 +471,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         except RuntimeError as exc:
             raise RuntimeError(f"Cannot cleanly reverse candidate patch: {exc}") from exc
         plan = {"decision": "ready", "reason": "Explicit revert of this runner's own patch", "risk": "medium",
-                "scope": prior_result["files"], "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
+                "scope": prior_result.get("files", []), "acceptance": ["Reverse the specified patch and pass independent regression checks"]}
     else:
         plan = saved_plan
         if plan is None:

@@ -280,6 +280,17 @@ class AuditRegressionTest(unittest.TestCase):
         runtime.store.recover()
         self.assertEqual(runtime.store.one("SELECT state FROM calls WHERE id=?", (call,))["state"], "interrupted")
 
+    def test_reserving_a_call_without_a_model_or_provider_list_does_not_crash(self):
+        runtime = self.runtime()
+        project = runtime.add_project(fixture(self.root / "project"), enabled=True)
+        runtime.goal(project, "audit goal")
+        config = runtime.config(project)
+        run = runtime.store.claim(project, config)
+        partial = {**config, "providers": None}
+        call = runtime.store.reserve_call(project, run["id"], "planning", {"provider": "openai"}, partial)
+        saved = runtime.store.one("SELECT provider,model FROM calls WHERE id=?", (call,))
+        self.assertEqual((saved["provider"], saved["model"]), ("openai", None))
+
     def test_unicode_and_untracked_files_enter_context_index(self):
         repo = fixture(self.root / "project")
         path = repo / "中文.py"
