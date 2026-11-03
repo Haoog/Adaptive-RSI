@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import shutil
 import time
 from pathlib import Path
@@ -24,6 +25,27 @@ DEFAULT_PROVIDER_ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
 }
+
+# 重复抑制签名的失败文本归一化：临时目录、绝对路径、run/case/请求 id、UUID 与
+# 时间戳逐实例变化，但同属一类故障；剥掉这些易变成分后同一根因聚成一个签名，
+# 不再因每次路径不同而反复触发付费 evolve。规则按宽到窄顺序应用，先吃掉最长片段。
+VOLATILE_DETAIL_RULES = [
+    (re.compile(r"(?<![\w.:-])(?:\.{1,2})?/(?:[\w.~-]+/?)+"), "<path>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.]+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\b\d{1,3}:\d{2}(?::\d{2}(?:\.\d+)?)?\b"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<id>"),
+    (re.compile(r"\b(?=\w*\d)(?=\w*[A-Za-z])\w{8,}\b"), "<id>"),
+    (re.compile(r"\b\d{4,}\b"), "<n>"),
+    (re.compile(r"\s+"), " "),
+]
+
+
+def failure_reason_fingerprint(text):
+    """Normalize one failure detail string down to its stable shape."""
+    normalized = str(text or "")
+    for pattern, replacement in VOLATILE_DETAIL_RULES:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized.strip()
 
 
 def human_feedback(store, project=None, candidate=None):
@@ -1103,6 +1125,7 @@ class Evolution:
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
                                         "ORDER BY created DESC LIMIT 10", (project,))
         failures = []
+        seen = set()
         for row in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
                                     "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
                                     "ORDER BY r.started DESC LIMIT 5", (project,)):
@@ -1110,7 +1133,25 @@ class Evolution:
                 result = json.loads(row["result"]) if row["result"] else {}
             except (ValueError, TypeError):
                 result = {}
-            failures.append({"state": row["state"], "reason": result.get("reason", "")[:1000]})
+            if not isinstance(result, dict):
+                result = {}
+            problem = result.get("failure")
+            if not isinstance(problem, dict):
+                problem = {}
+            # 签名只取结构化 code/action 与归一化后的 reason；str(exc) 原文含
+            # 临时路径、run/case id、provider_request_id 等逐实例成分，直接指纹
+            # 会让同一根因的重复故障绕过 attempt_due 去重而反复付费提案。
+            entry = {"state": row["state"], "code": problem.get("code"),
+                     "action": problem.get("action"),
+                     "reason": failure_reason_fingerprint(result.get("reason", ""))[:1000]}
+            key = (entry["state"], entry["code"], entry["action"], entry["reason"])
+            if key not in seen:
+                seen.add(key)
+                failures.append(entry)
+        # 同一根因的 N 次故障实例归并成一条，且按稳定键排序：再发或两类故障交替
+        # 出现都不改变输入签名；真正的新故障类别才会让签名变化。
+        failures.sort(key=lambda item: (item["state"], str(item["code"]),
+                                        str(item["action"]), item["reason"]))
         development = []
         for row in self.store.query("SELECT spec FROM cases WHERE project=? AND split='development' "
                                     "AND (NOT json_valid(spec) OR json_extract(spec,'$.active') IS NOT 0) "
