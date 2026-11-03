@@ -592,9 +592,14 @@ window.RSIExperience = (() => {
       // Resolve seed titles once; subsequent pages pin only the saved and selected parent.
       for (const option of [...select.children]) {
         if (!option.value) continue;
-        const parent = await api("task?id=" + encodeURIComponent(option.value) + "&project=" + encodeURIComponent(task.project));
-        if (!current()) return;
-        option.textContent = parent.title;
+        try {
+          const parent = await api("task?id=" + encodeURIComponent(option.value) + "&project=" + encodeURIComponent(task.project));
+          if (!current()) return;
+          option.textContent = parent.title;
+        } catch {
+          // 已删除或跨项目的前置任务不可解析；保留原始 id 让用户看到并手动移除，
+          // 不能静默丢弃保存过的依赖。
+        }
       }
       await loadCandidates(0);
       if (!current()) return;

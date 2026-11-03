@@ -44,6 +44,7 @@ PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
 # signal; validate these fields once at the POST entry instead. Fields the
 # callee validates itself (enum kinds, bools, ints, nested objects) stay out.
 _POST_FIELD_TYPES = {
+    "/api/operations": {"parameters": dict},
     "/api/operations/cancel": {"id": str},
     "/api/model-center/fetch": {"provider": str, "project": str},
     "/api/model-center/probe": {"provider": str, "model": str, "project": str},
