@@ -283,15 +283,28 @@ def empty_test_run(text):
     structured = structured_test_summary(text)
     if structured is not None:
         return structured["executed"] == 0
+    # zero 是确定性的零计数信号（含 TAP 计划行 1..0）。unittest 的 `Ran 0 tests` 输出
+    # 结尾恒有独立的 OK 行，不能让它否决零计数，否则零用例检查被计为通过。
+    zero = re.search(r"Ran 0 tests|running 0 tests|Total tests: 0|Tests run: 0|# tests 0|"
+                     r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|"
+                     r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
     empty = re.search(r"Ran 0 tests|no tests ran|No tests found|No tests were found|no test files|running 0 tests|"
                       r"No examples found|No tests executed|No test is available|Total tests: 0|Tests run: 0|# tests 0|"
                       r"1\.\.0(?:\s|$)|0 runs, 0 assertions|\b0 (?:tests?|examples?|passing)\b|no tests to run|"
-                      r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
+                      r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+0\b|executed\s+0\s+of\s+0", text, re.I)
     # positive 表示「确实有测试执行过」；覆盖更多框架的通过/失败行，减少把真实运行误判为空跑。
     # 行首锚点用 (?:^|\n) 而不是内联 (?m)：Python 3.11 起禁用位于模式中段的内联旗标。
+    # counted 只含带非零计数或明确结果的证据：裸 ok/PASS/FAIL 行（unittest 结尾恒有）不能否决零计数。
+    counted = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
+                        r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
+                        r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|"
+                        r"\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
+                        r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
+    if zero:
+        return not counted
     positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
-                         r"(?:^|\n)\s*(?:\u2139\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
+                         r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
                          r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
                          r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
     return bool(empty and not positive)

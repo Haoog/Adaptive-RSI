@@ -166,6 +166,14 @@ class AuditRound4Test(unittest.TestCase):
         cargo_fail = "test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s"
         self.assertFalse(empty_test_run(cargo_fail))
 
+    def test_evaluator_empty_test_run_unittest_zero_and_tap(self):
+        # unittest 零发现时结尾恒有 OK 行，裸 OK 不得否决确定性的零计数信号。
+        self.assertTrue(empty_test_run("Ran 0 tests in 0.001s\n\nOK\n"))
+        self.assertFalse(empty_test_run("test_x (m.T) ... ok\n\nRan 1 test in 0.0s\n\nOK\n"))
+        # TAP 计划行 1..0 是零用例；版本串 "1.0 " 不得误判为空跑。
+        self.assertTrue(empty_test_run("TAP version 13\n1..0"))
+        self.assertFalse(empty_test_run("gcc 1.0 \nBuild ok"))
+
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {
             "decision": "pass",
