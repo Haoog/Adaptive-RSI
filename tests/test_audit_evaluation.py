@@ -768,6 +768,24 @@ class AuditEvaluationTest(unittest.TestCase):
         result = workflow.improvement({'acceptance_baseline': [row([10])], 'acceptance_candidate': [row([5])]}, {'change_kind': 'performance', 'contract': contract})
         self.assertEqual(result['decision'], 'insufficient_evidence')
 
+    def test_go_checks_require_test_as_immediate_subcommand(self):
+        # 形如 go build test / go vet ./test 的 argv 把 test 当包参数，不得生成
+        # go build test -run ... 这类畸形隔离命令（_run 只适用于 go test 子命令）。
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for argv in [['go', 'build', 'test'], ['go', 'vet', './test']]:
+                check = {'name': 'go', 'cwd': '.', 'argv': argv}
+                self.assertIsNone(workflow._go_test_options(argv))
+                self.assertIsNone(
+                    evaluator._isolated_test_check([check], root, 'pkg/x_test.go', ('TestX',)),
+                    argv)
+            argv = ['go', 'test', '-tags', 'ci', './...']
+            self.assertIsNotNone(workflow._go_test_options(argv))
+            isolated = evaluator._isolated_test_check(
+                [{'name': 'go', 'cwd': '.', 'argv': argv}], root, 'pkg/x_test.go', ('TestX',))
+            self.assertIsNotNone(isolated)
+            self.assertEqual(isolated['argv'], ['go', 'test', '-tags', 'ci', '-run', '^(TestX)$', './pkg'])
+
 
 if __name__ == '__main__':
     unittest.main()

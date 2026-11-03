@@ -148,11 +148,10 @@ GO_TEST_REJECT_FLAGS = {"-exec", "-bench", "-fuzz", "-list", "-c", "-i", "-n", "
 def _go_test_options(argv):
     lower = [str(item).lower() for item in argv]
     go_index = next((index for index, item in enumerate(lower) if Path(item).name == "go"), None)
-    if go_index is None or "test" not in lower[go_index + 1:]:
+    if go_index is None or go_index + 1 >= len(lower) or lower[go_index + 1] != "test":
         return None
-    test_index = lower.index("test", go_index + 1)
     flags = []
-    args = argv[test_index + 1:]
+    args = argv[go_index + 2:]
     index = 0
     while index < len(args):
         arg = args[index]
