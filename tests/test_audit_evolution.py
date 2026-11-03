@@ -453,6 +453,26 @@ class AuditEvolutionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'family'):
             self.evolution.import_case('p', same_task)
 
+    def test_legacy_inactive_row_holding_family_is_released_during_import(self):
+        """上线前退休或被外部直写 available:false 的遗留行没改过名：import_case 的事务内复检
+        必须在同一事务里把它们释放，否则 INSERT 仍撞 UNIQUE(project,family)。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS, 'available': False,
+                'source': 'real', 'signature': 'sig-legacy', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('legacy', 'p', 'family', 'validation', encode(spec), 2, 1))
+        self.evolution.runtime.project = lambda project: {'id': project}
+        new_id = self.evolution.import_case('p', self.importable_manifest(repo))
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', (new_id,))['family'],
+                         'family')
+        legacy = self.store.one('SELECT family,spec,uses FROM cases WHERE id=?', ('legacy',))
+        self.assertEqual(legacy['family'], 'family-retired-legacy')
+        self.assertEqual(legacy['uses'], 2)
+        self.assertFalse(json.loads(legacy['spec'])['available'])
+
     def test_feedback_is_separate_from_sealed_results(self):
         self.candidate({'trials': [{'case': 'x', 'candidate': {'pass': False}}]})
         self.evolution.record_feedback('c', 'false_positive', 'human:alice', 'late', 'deployment unrelated')
