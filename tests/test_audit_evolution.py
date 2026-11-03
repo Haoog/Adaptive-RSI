@@ -246,6 +246,63 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['cost_state'], 'unknown_usage')
         self.assertTrue(result['cost_warning'])
 
+    def test_partial_usage_tokens_are_a_lower_bound_not_a_cost_ratio(self):
+        """usage_known=False 但 tokens>0 的变体只覆盖了已知调用：cost_ratio 不得据此
+        通过 max_cost_ratio，也不能标记为 cost_state='known'。"""
+        def trials_with(stable, candidate):
+            return [{'case': 'case-' + str(family),
+                     'split': 'validation' if family % 2 else 'holdout',
+                     'repetition': repetition,
+                     'stable': dict(stable), 'candidate': dict(candidate)}
+                    for family in range(5) for repetition in range(2)]
+        config = {'evolution': {'repeats': 2, 'min_cases_per_split': 1, 'max_cost_ratio': 1.25}}
+
+        # 记录到 tokens>0 但显式 usage_known=False：已知部分远低于门槛也不能当全量。
+        result = Evolution.decide(trials_with(
+            {'pass': False, 'tokens': 100, 'usage_known': False},
+            {'pass': True, 'tokens': 10, 'usage_known': False}), config)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertIsNone(result['cost_ratio'])
+        self.assertFalse(result['cost_comparable'])
+        self.assertNotEqual(result['cost_state'], 'known')
+        self.assertIn('lower bound', result['cost_warning'])
+
+        # 缺失 usage_known 键的历史证据同样不得按 tokens>0 兜底成已知成本。
+        result = Evolution.decide(trials_with(
+            {'pass': False, 'tokens': 100},
+            {'pass': True, 'tokens': 10}), config)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertIsNone(result['cost_ratio'])
+        self.assertFalse(result['cost_comparable'])
+        self.assertNotEqual(result['cost_state'], 'known')
+
+        # 部分已知也不能借超支拒绝之外的通道通过：candidate 下界已超 stable 全量
+        # 时仍只按 unknown_usage 处理，不产生 cost_ratio 硬判定。
+        result = Evolution.decide(trials_with(
+            {'pass': False, 'tokens': 10, 'usage_known': True},
+            {'pass': True, 'tokens': 100, 'usage_known': False}), config)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertIsNone(result['cost_ratio'])
+        self.assertFalse(result['cost_comparable'])
+        self.assertNotEqual(result['cost_state'], 'known')
+
+        # 全部 usage_known=True 时行为不变：cost_ratio 正常计算并参与门禁。
+        result = Evolution.decide(trials_with(
+            {'pass': False, 'tokens': 100, 'usage_known': True},
+            {'pass': True, 'tokens': 50, 'usage_known': True}), config)
+        self.assertEqual(result['decision'], 'pass')
+        self.assertEqual(result['cost_state'], 'known')
+        self.assertEqual(result['cost_ratio'], 0.5)
+        self.assertTrue(result['cost_comparable'])
+        self.assertEqual(result['cost_warning'], '')
+
+        # 已知用量下超支仍按原门槛拒绝。
+        result = Evolution.decide(trials_with(
+            {'pass': False, 'tokens': 100, 'usage_known': True},
+            {'pass': True, 'tokens': 200, 'usage_known': True}), config)
+        self.assertEqual(result['decision'], 'insufficient_evidence')
+        self.assertEqual(result['cost_ratio'], 2.0)
+
     def test_repeat_identity_tracks_overlay_contents_and_execution_limits(self):
         args = self.setup_proposal()
         overlay = self.root / 'overlay'
@@ -1381,6 +1438,31 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
+
+    def test_exported_bundle_excludes_git_metadata(self):
+        """导出 bundle 只封存工作树：.git 不随包走（origin 指向的宿主机 suite
+        路径不外泄），cases/ 下出现 .git 由 verify_bundle 判失效而不是静默豁免。"""
+        destination = self.sealed_bundle(repo_name='repo-gitless')
+        repository = destination / 'cases' / 'case-gitless' / 'repository'
+        self.assertTrue(repository.is_dir())
+        self.assertFalse((repository / '.git').exists())
+        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        # 包内任何残留文件都不应包含源仓库的宿主机绝对路径。
+        for path in destination.rglob('*'):
+            if path.is_file() and not path.is_symlink():
+                self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        # 篡改注入：向用例仓库塞回 .git/config（含本地路径）必须被判失效。
+        injected = repository / '.git'
+        injected.mkdir()
+        (injected / 'config').write_text('[remote "origin"]\n\turl = ' + str(self.root) + '/repo-gitless\n')
+        result = Evolution.verify_bundle(destination)
+        self.assertFalse(result['valid'])
+        self.assertIn('cases/case-gitless/repository/.git', result['mismatches'])
+        # reproduce_bundle 的完整性判定同口径拒绝，run_checks 不再走到复制 .git。
+        repro = Evolution.reproduce_bundle(destination)
+        self.assertFalse(repro['integrity']['valid'])
+        self.assertFalse(repro['valid'])
 
     def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo'):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""

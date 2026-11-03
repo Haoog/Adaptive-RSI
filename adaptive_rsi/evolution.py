@@ -711,6 +711,11 @@ class Evolution:
                 target = root / "cases" / item["case"]
                 target.mkdir(parents=True)
                 snapshot(spec["repository"], target / "repository", spec["base"])
+                # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
+                # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
+                # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
+                # 不依赖 git 元数据，导出时整棵删除。
+                shutil.rmtree(target / "repository" / ".git", ignore_errors=True)
                 if spec.get("overlay"):
                     scrub_tree(spec["overlay"])
                     shutil.copytree(spec["overlay"], target / "overlay", symlinks=True)
@@ -743,6 +748,13 @@ class Evolution:
                 mismatches.append(relative)
             elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 mismatches.append(relative)
+        # .git 不再随 bundle 导出，也不是可校验内容：cases/ 下出现的任何 .git
+        # 都属于登记清单之外的注入（旧版导出残留或篡改），按 manifest 缺登记
+        # 的同一语义判失效，不给它 valid=True 的静默豁免。
+        cases_dir = root / "cases"
+        if cases_dir.is_dir() and not cases_dir.is_symlink():
+            for entry in sorted(cases_dir.rglob(".git")):
+                mismatches.append(entry.relative_to(root).as_posix())
         return {"valid": not mismatches, "mismatches": mismatches, "limitations": manifest.get("limitations", [])}
 
     @staticmethod
@@ -1708,17 +1720,23 @@ class Evolution:
         candidate_tokens = sum(trial["candidate"].get("tokens", 0) for trial in trials)
         stable_seconds = sum(trial["stable"].get("seconds", 0) for trial in trials)
         candidate_seconds = sum(trial["candidate"].get("seconds", 0) for trial in trials)
-        cost_known = all(trial[variant].get("usage_known", trial[variant].get("tokens", 0) > 0)
+        # 与 run_configuration / record_usage 同一口径：只有显式 usage_known 的变体
+        # 才计入已知成本。缺失标记但记到 tokens>0 的只是下界（未知用量行记 0），
+        # 不能拿来构造通过 max_cost_ratio 的 cost_ratio。
+        cost_known = all(trial[variant].get("usage_known") is True
                          for trial in trials for variant in ("stable", "candidate"))
         cost_ratio = candidate_tokens / stable_tokens if stable_tokens and cost_known else None
         latency_ratio = candidate_seconds / stable_seconds if stable_seconds else None
         if cost_ratio is not None and cost_ratio > config["evolution"]["max_cost_ratio"]:
             return {"decision": "insufficient_evidence", "reason": "Candidate exceeds the configured token cost ratio",
                     "cost_ratio": cost_ratio, "latency_ratio": latency_ratio}
+        partial_usage = not cost_known and (stable_tokens > 0 or candidate_tokens > 0)
         result = {**result, "cost_ratio": cost_ratio, "latency_ratio": latency_ratio,
                   "cost_comparable": cost_ratio is not None,
                   "cost_state": "known" if cost_ratio is not None else "zero_baseline" if cost_known else "unknown_usage",
-                  "cost_warning": "" if cost_ratio is not None else "Token cost cannot be compared; quality evidence does not establish lower cost"}
+                  "cost_warning": "" if cost_ratio is not None else
+                                  "Recorded tokens cover only calls with known usage; the cost ratio is a lower bound and cannot prove the candidate stays within budget" if partial_usage else
+                                  "Token cost cannot be compared; quality evidence does not establish lower cost"}
         return {**result, "consistent_family_wins": wins, "sign_test_p": probability,
                 "reason": "Repeated paired improvement on both splits without observed regressions"}
 
