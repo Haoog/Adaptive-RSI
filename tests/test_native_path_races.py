@@ -249,3 +249,12 @@ class WorkspaceSignatureRaceTest(unittest.TestCase):
         (self.root / 'kept.py').write_text('changed\n')
         with patch.object(Path, 'open', open_):
             self.assertNotEqual(digest, workspace_signature(self.root, 1 << 20))
+
+    def test_unreadable_file_fails_closed_instead_of_hashing_a_stale_signature(self):
+        from adaptive_rsi.agent import workspace_signature
+        secret = self.root / 'unreadable.py'
+        secret.write_text('secret\n')
+        secret.chmod(0o000)
+        self.addCleanup(secret.chmod, 0o600)
+        with self.assertRaises(OSError):
+            workspace_signature(self.root, 1 << 20)
