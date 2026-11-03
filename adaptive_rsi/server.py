@@ -39,6 +39,46 @@ PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
 PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
                            "download it from the run directory instead")
 
+# POST body fields that reach SQLite bindings must be scalars. A dict/list
+# raises sqlite3.ProgrammingError, which the error boundary keeps as a 500 bug
+# signal; validate these fields once at the POST entry instead. Fields the
+# callee validates itself (enum kinds, bools, ints, nested objects) stay out.
+_POST_FIELD_TYPES = {
+    "/api/operations/cancel": {"id": str},
+    "/api/model-center/fetch": {"provider": str, "project": str},
+    "/api/model-center/probe": {"provider": str, "model": str, "project": str},
+    "/api/model-center/diagnose": {"provider": str, "model": str, "project": str},
+    "/api/model-center/provider": {"provider": dict, "project": str},
+    "/api/model-center/remove": {"provider": str, "project": str},
+    "/api/model-center/model": {"provider": str, "project": str},
+    "/api/model-center/routes": {"models": dict, "project": str, "inherit": list},
+    "/api/model-center/resume": {"provider": str, "project": str},
+    "/api/project/archive": {"project": str, "confirmation": str},
+    "/api/project/restore": {"project": str, "confirmation": str},
+    "/api/config": {"values": dict, "project": str, "inherit": list},
+    "/api/config/undo": {"project": str, "revision": int, "expected": int},
+    "/api/config/repair": {"project": str, "confirmation": str},
+    "/api/config/repair-global": {"confirmation": str},
+    "/api/release-retry": {"project": str, "run": str, "kind": str},
+    "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
+    "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
+    "/api/goal": {"project": str, "text": str, "request_id": str},
+    "/api/task/revise": {"task": str, "supplement": str, "reason": str},
+    "/api/task/value-feedback": {"project": str, "task": str, "run": str, "rating": str, "note": str},
+    "/api/tasks/batch": {"project": str, "tasks": list, "action": str, "request_id": str},
+    "/api/task/schedule-time": {"task": str},
+    "/api/task/schedule": {"task": str, "reason": str},
+    "/api/request": {"project": str, "kind": str},
+    "/api/pause": {"project": str, "paused": bool},
+    "/api/retry": {"task": str, "reason": str, "force": bool},
+    "/api/cancel": {"task": str, "cascade": bool, "reason": str},
+    "/api/deliver": {"run": str, "reason": str},
+    "/api/rollback": {"candidate": str},
+    "/api/evolution/promote": {"candidate": str},
+    "/api/revert-code": {"run": str},
+    "/api/cases": {"project": str, "manifest": dict},
+}
+
 
 def read_patch_preview(path):
     """Read a patch for the console; return None when it exceeds the preview limit."""
@@ -912,6 +952,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("Expected an object")
             runtime = self.server.runtime
             path = urlparse(self.path).path
+            # JSON body values arrive unchecked; a dict/list bound into a SQLite
+            # parameter raises ProgrammingError, which correctly stays a 500 bug
+            # signal. Reject non-scalar values for the identifier fields each
+            # endpoint actually uses before dispatch reaches any SQL binding.
+            for field, expected in _POST_FIELD_TYPES.get(path, {}).items():
+                value = body.get(field)
+                if value is not None and not isinstance(value, expected):
+                    name = {str: "a string", bool: "a boolean", int: "an integer",
+                            dict: "an object", list: "a list"}.get(expected, "a scalar")
+                    raise RequestError(field + " must be " + name)
             if path == "/api/operations":
                 self.respond(runtime.operations.start(body.get("kind"), body.get("parameters", {})))
                 return
