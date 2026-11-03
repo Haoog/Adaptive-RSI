@@ -45,7 +45,10 @@ def codex_home(home):
     if source.is_file():
         shutil.copyfile(source, destination / "auth.json")
         (destination / "auth.json").chmod(0o600)
-        return json.loads(source.read_text())
+        try:
+            return json.loads(source.read_text())
+        except (OSError, ValueError):
+            return {}
     return {}
 
 
@@ -55,7 +58,10 @@ def sync_codex_oauth(home, original):
     target = home / ".codex/auth.json"
     if not original.get("tokens") or not source.is_file() or not target.is_file():
         return
-    current, updated = json.loads(source.read_text()), json.loads(target.read_text())
+    try:
+        current, updated = json.loads(source.read_text()), json.loads(target.read_text())
+    except (OSError, ValueError):
+        return
     tokens = updated.get("tokens")
     if current != original or not isinstance(tokens, dict) or tokens == original["tokens"]:
         return
