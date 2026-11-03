@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.135
+
+<!-- adaptive-rsi-release:0.5.135;base:e89d4602642d4d0adaf9982dc9615a4c77e558c1 -->
+
 - Added opt-in `validation.affected_check_scheduling`: with a monorepo check dependency graph configured, the candidate stage runs only checks affected by the changed paths, and the full candidate stage supplements the remaining checks; an invalid graph, unknown paths or unavailable evidence fall back to the complete check set.
 - Fixed test_selected rejecting exact duplicate selectors: duplicates are now idempotent and run once after deduplication, while class-versus-method containment overlaps and empty selections remain rejected.
 - Fixed discovery `sync()` tolerating a single malformed Issue: a bad row no longer kills the whole sync loop; it records an `issue_sync_error` event and stashes into `pending` for the next cycle instead. The `since` watermark no longer advances when rows are skipped, and the cross-cycle skip count is persisted with the cursor, so a resumed final page can no longer push `since` to the current cycle start and permanently skip the failed row.
