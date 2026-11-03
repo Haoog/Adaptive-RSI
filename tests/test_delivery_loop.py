@@ -1235,6 +1235,59 @@ print('BOUNDARIES_OK')
             saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
             self.assertEqual(saved["feedback"]["state"], "verified")
 
+    def test_tick_shares_baseline_only_within_the_same_target_branch(self):
+        # 评审回归：同项目内 main 的到期监控先执行时，其读数按 (项目, 目标分支)
+        # 缓存；随后面向 release 的就绪 run 必须再取一次 release 的真实读数，
+        # 不能拿 main 的监控结果让「branch == policy[branch]」静默失败、跳过合并。
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"mode": "pr", "auto_merge": True, "feedback_minutes": 5}},
+                               self.project)
+        self.runtime.pause(self.project, False)
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.runtime.goal(self.project, "Monitor main delivery")
+        monitor = self.store.claim(self.project, self.runtime.config(self.project))
+        directory = self.store.root / "runs" / monitor["id"]
+        directory.mkdir(parents=True)
+        (directory / "baseline-marker").write_text("x")
+        self.store.transition(monitor["id"], "merged",
+                              {"merged_sha": head, "merged_at": time.time() - 400}, True)
+        self.store.put_setting("delivery:" + monitor["id"], {"head": "h", "base": "b", "branch": "main"})
+        self.store.put_setting("run-baseline:" + monitor["id"],
+                               {"repository": "example/project", "branch": "main", "sha": "b"})
+        self.runtime.goal(self.project, "Release delivery")
+        ready = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(ready["id"], "pr_open",
+                              {"pr": "https://github.com/example/project/pull/2"}, True)
+        self.store.put_setting("delivery:" + ready["id"], {"head": "h", "base": "b", "branch": "release"})
+        self.store.put_setting("run-baseline:" + ready["id"],
+                               {"repository": "example/project", "branch": "release", "sha": "b"})
+        self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (ready["task"],))
+        self.store.execute("UPDATE runs SET started=? WHERE id=?", (1, monitor["id"]))
+        self.store.execute("UPDATE runs SET started=? WHERE id=?", (2, ready["id"]))
+        pr = {"state": "OPEN", "headRefOid": "h", "baseRefOid": "b", "baseRefName": "release",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+              "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        fetch_calls = []
+
+        def by_branch(runtime, project, config):
+            branch = config["delivery"]["base_branch"]
+            fetch_calls.append(branch)
+            return str(self.repo), head if branch == "main" else "b", branch
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.baseline", side_effect=by_branch), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             return_value={"decision": "pass", "checks": {}}), \
+                patch("adaptive_rsi.delivery.checked", return_value="") as command, \
+                patch("adaptive_rsi.release.advance", return_value={}):
+            tick(self.runtime, time.time())
+        # main 监控读数与 release 准入复核各自真实 fetch 一次，就绪 run 照常合并。
+        self.assertEqual(fetch_calls, ["main", "release"])
+        command.assert_called_once_with(
+            ["gh", "pr", "merge", "https://github.com/example/project/pull/2",
+             "--repo", "example/project", "--squash", "--match-head-commit", "h"])
+
     def test_recovered_publish_recognizes_existing_delivery_without_pushing_again(self):
         self.runtime.pause(self.project, False)
         self.runtime.goal(self.project, "Fix addition")
