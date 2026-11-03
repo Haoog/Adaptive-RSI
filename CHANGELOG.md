@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+## 0.5.135
+
+<!-- adaptive-rsi-release:0.5.135;base:e89d4602642d4d0adaf9982dc9615a4c77e558c1 -->
+
 - 新增 opt-in 的 `validation.affected_check_scheduling`：配置 monorepo 检查依赖图后，候选阶段只执行受变更影响的检查，剩余检查由全量候选阶段补齐；依赖图无效、路径未知或证据不可用时回退完整检查集合。
 - 修复 test_selected 完全重复选择器被误拒的问题：重复选择器按幂等处理、去重后只执行一次，类与方法的包含重叠及空选择仍然拒绝。
 - 修复 discovery `sync()` 对单条坏 Issue 的容错：坏行不再终止整个同步循环，改为记录 `issue_sync_error` 事件并暂存 `pending` 供下周期重试；`since` 水印在有跳过时不推进，跨周期跳过计数随游标持久化，避免续扫末页把 `since` 推进到本轮起点导致被跳过行永久漏读。
