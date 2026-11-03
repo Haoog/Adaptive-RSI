@@ -70,6 +70,30 @@ class StorePoolTest(unittest.TestCase):
                     self.assertFalse(self.store.transition(run["id"], "completed", {}, True))
                     self.store.execute("UPDATE tasks SET state='completed' WHERE id=?", (task,))
 
+    def test_remote_wait_on_ended_run_opens_no_span(self):
+        # 与 phase() 同一守卫：已 ended 的 run 不得再开 remote_waits span。
+        # 否则 ended IS NULL 的孤儿行让 maintenance 清理（要求 ended IS NOT NULL）
+        # 永久跳过，_clock_samples 条目同步泄漏，读模型还会把终态 run 误标为等待中。
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES ('run-ended',NULL,'p','merged','{}',0,1)")
+        now = time.time()
+        self.store.remote_wait("run-ended", "waiting_ci", now)
+        self.store.remote_wait("run-ended", None, now)
+        self.assertFalse(self.store.query("SELECT 1 FROM remote_waits WHERE run='run-ended'"))
+        self.assertFalse(self.store._clock_samples)
+        # 已 ended 但残留 open span（异常路径留下的）仍被正常收尾而非永久挂着：
+        # remote_wait 先把 span 开在 ended 之前，再直接把 run 标记为已结束。
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started) "
+                           "VALUES ('run-live',NULL,'p','pr_open','{}',0)")
+        self.store.remote_wait("run-live", "waiting_ci", now)
+        self.assertTrue(self.store._clock_samples)
+        self.store.execute("UPDATE runs SET ended=? WHERE id='run-live'", (now,))
+        self.store.remote_wait("run-live", "waiting_review", time.time())
+        rows = self.store.query("SELECT * FROM remote_waits WHERE run='run-live'")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["ended"])
+        self.assertFalse(self.store._clock_samples)
+
     def count_new_connections(self):
         """Patch Store._new_connection and return the list of created connections."""
         created = []
