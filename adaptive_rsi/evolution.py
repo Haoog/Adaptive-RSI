@@ -339,11 +339,36 @@ class Evolution:
             spec["active"] = active
             # cases 表有 UNIQUE(project,family) 硬约束：退休行保留行与曝光身份但不再占住
             # family 名，否则同家族修订用例永远无法重新导入（import_case 只按活跃行互斥）。
-            # 改名后原 family 仍可从上条 lifecycle 记录与 -retired-<id> 前缀追溯；重新激活
-            # 不反向改名——那时原名可能已被替代用例占用，反向改名会撞唯一约束。
+            # 改名时把原名记入 spec.origin_family；重新激活反向恢复原名而非沿用
+            # -retired-<id>——否则原名被替代用例占住后再激活会得到两条同一家族
+            # 的活跃行，评估把相关用例当成独立证据。原名被仍活跃行占住时拒绝激活；
+            # 占住行已不活跃则当场改名为它释放（与 import_case 事务内复检同一形式）。
             family = row["family"]
-            if not case_live({**spec, "active": active}) and not family.endswith("-retired-" + case):
-                family = family + "-retired-" + case
+            if not case_live(spec):
+                if not family.endswith("-retired-" + case):
+                    spec.setdefault("origin_family", family)
+                    family = family + "-retired-" + case
+            else:
+                origin = spec.get("origin_family")
+                if not isinstance(origin, str) and family.endswith("-retired-" + case):
+                    origin = family[: -len("-retired-" + case)]
+                if isinstance(origin, str) and origin and origin != family:
+                    holder = db.execute("SELECT id,family,spec FROM cases WHERE project=? AND family=?",
+                                        (project, origin)).fetchone()
+                    if holder and holder["id"] != case:
+                        try:
+                            holder_spec = json.loads(holder["spec"] or "{}")
+                        except (TypeError, ValueError):
+                            holder_spec = {}
+                        if not isinstance(holder_spec, dict):
+                            holder_spec = {}
+                        if case_live(holder_spec):
+                            raise ValueError("Original family occupied by a live replacement case")
+                        if not holder["family"].endswith("-retired-" + holder["id"]):
+                            db.execute("UPDATE cases SET family=? WHERE id=?",
+                                       (holder["family"] + "-retired-" + holder["id"], holder["id"]))
+                    spec.pop("origin_family", None)
+                    family = origin
             db.execute("UPDATE cases SET split=?,family=?,spec=? WHERE id=?",
                        (target, family, encode(spec), case))
             db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",

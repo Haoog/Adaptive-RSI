@@ -473,6 +473,56 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(legacy['uses'], 2)
         self.assertFalse(json.loads(legacy['spec'])['available'])
 
+    def test_reactivation_restores_family_or_rejects_live_replacement(self):
+        """退休改名只释放 family 名，不释放家族身份：原 family 空闲时激活恢复原名；
+        原名已被仍活跃的替代用例占住时拒绝激活，避免同一家族两条活跃行被当成
+        相互独立的评估证据。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': 'sig-old', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('old', 'p', 'family', 'validation', encode(spec), 3, 1))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # 空闲原名：激活直接恢复 family，而不是带着 -retired-<id> 名继续参与调度。
+        self.evolution.update_case('p', 'old', active=True, source='human:review')
+        row = self.store.one('SELECT family,spec FROM cases WHERE id=?', ('old',))
+        self.assertEqual(row['family'], 'family')
+        self.assertNotIn('origin_family', json.loads(row['spec']))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # 原名被替代用例占住：激活必须被拒绝，退休行保持退休。
+        self.evolution.runtime.project = lambda project: {'id': project}
+        self.evolution.import_case('p', self.importable_manifest(repo))
+        with self.assertRaisesRegex(ValueError, 'occupied|family'):
+            self.evolution.update_case('p', 'old', active=True, source='human:review')
+        row = self.store.one('SELECT family,spec FROM cases WHERE id=?', ('old',))
+        self.assertEqual(row['family'], 'family-retired-old')
+        self.assertFalse(json.loads(row['spec'])['active'])
+
+    def test_reactivation_releases_family_from_inactive_holder(self):
+        """激活时原 family 被另一条非活跃行占住：占住行当场改名释放，激活行恢复原名。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': 'sig-old', 'repository': str(repo), 'overlay': None}
+        stale = dict(spec, available=False, signature='sig-stale')
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('old', 'p', 'family', 'validation', encode(spec), 3, 1))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('stale', 'p', 'other', 'validation', encode(stale), 0, 1))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # stale 行不可用却占着 old 的原名：激活时应被改名释放。
+        self.store.execute('UPDATE cases SET family=? WHERE id=?', ('family', 'stale'))
+        self.evolution.update_case('p', 'old', active=True, source='human:review')
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', ('old',))['family'],
+                         'family')
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', ('stale',))['family'],
+                         'family-retired-stale')
+
     def test_feedback_is_separate_from_sealed_results(self):
         self.candidate({'trials': [{'case': 'x', 'candidate': {'pass': False}}]})
         self.evolution.record_feedback('c', 'false_positive', 'human:alice', 'late', 'deployment unrelated')
