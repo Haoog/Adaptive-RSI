@@ -1151,7 +1151,7 @@ class Store:
         now = time.time()
         from .config import BUILTIN_PROVIDERS
         provider_id = route.get("provider", "openai")
-        provider = next((p for p in config["providers"] if p["id"] == provider_id), None)
+        provider = next((p for p in config.get("providers", []) if p["id"] == provider_id), None)
         provider = provider or next((p for p in BUILTIN_PROVIDERS if p["id"] == provider_id), {"id": provider_id})
         # 与模型中心目录使用同一身份（含该供应商自己的凭据代次）；冻结运行仍按
         # 其封存配置里的供应商解析，不套用当前配置的代次。
@@ -1159,7 +1159,7 @@ class Store:
         directory, _ = self.catalog_entry(project, provider_id, signature, provider_identity(provider))
         models = directory.get("models") if isinstance(directory, dict) else None
         entry = next((item for item in (models if isinstance(models, list) else [])
-                      if isinstance(item, dict) and item.get("id") == route["model"]), {})
+                      if isinstance(item, dict) and item.get("id") == route.get("model")), {})
         price = entry.get("unit_price")
         if isinstance(price, (int, float)) and not isinstance(price, bool):
             price = float(price)
@@ -1175,7 +1175,7 @@ class Store:
             db.execute("INSERT INTO calls(id,project,run,role,model,effort,state,created,provider,unit_price,unit,"
                        "input_price,output_price,cache_read_price,cache_write_price,price_basis) "
                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (call, project, run, role, route["model"], route["effort"], "reserved", now, provider_id, price,
+                       (call, project, run, role, route.get("model"), route.get("effort"), "reserved", now, provider_id, price,
                         "opencode_session" if provider.get("protocol") == "opencode" else
                         "codex_session" if provider.get("protocol", "codex") in ["codex", "codex_login"] else "http_request",
                         prices.get("input"), prices.get("output"), prices.get("cache_read"),
@@ -1213,7 +1213,7 @@ class Store:
                                   "cache_read_price,cache_write_price FROM calls WHERE id=?", (call,)).fetchone()
             if previous is None or previous["run"] != run:
                 raise ValueError("Usage call does not belong to run")
-            prices = unit_prices({field: previous[field + "_price"] for field in PRICE_FIELDS})
+            prices = unit_prices({field: (previous[field + "_price"] or 0) for field in PRICE_FIELDS})
             _, basis = estimate(values, prices, previous["unit_price"])
             db.execute("UPDATE calls SET state='completed'," + ",".join(field + "=?" for field in fields) +
                        ",seconds=?,price_basis=? WHERE id=?",
