@@ -925,6 +925,11 @@ class Store:
     def remote_wait(self, run, reason, now):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM runs WHERE id=? AND ended IS NULL", (run,)).fetchone():
+                # 与 phase() 同一守卫：已结束 run 不再开新 span，只顺手收掉残留
+                # 的 open span，否则 ended IS NULL 的孤儿行会让清理逻辑永远跳过。
+                self._end_spans(db, "remote_waits", run, now)
+                return
             active = db.execute("SELECT reason FROM remote_waits WHERE run=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (run,)).fetchone()
             if active and active["reason"] == reason:
                 return
