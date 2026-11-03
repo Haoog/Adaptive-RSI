@@ -527,7 +527,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 continue
             identity = store.setting("run-baseline:" + run["id"])
             sealed_target = identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]}
-            pr = pr_view(repo, outcome["pr"]) if run["state"] in ["pr_open", "superseded"] else None
+            pr_url = outcome.get("pr")
+            if run["state"] in ["pr_open", "superseded"] and not isinstance(pr_url, str):
+                # result 中 pr 字段缺失或类型错误，后续 merge/close 判断无从谈起。
+                continue
+            pr = pr_view(repo, pr_url) if run["state"] in ["pr_open", "superseded"] else None
+            if run["state"] in ["pr_open", "superseded"] and pr is None:
+                continue
             if run["state"] == "pr_open":
                 task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
                 newer = store.one("SELECT 1 FROM runs WHERE task=? AND "
