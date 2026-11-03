@@ -151,6 +151,36 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.assertEqual(snapshot.call_count, 1)
         self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 1)
 
+    def test_legacy_pin_failed_decision_backs_off_until_retry_at(self):
+        # 确定性 decision!="pass" 与执行异常同样走 retry_key 退避：同一 sha 的
+        # 固定 checks 靠每分钟重跑翻转只能靠 flaky，不得每 tick 重新完整评估。
+        outcome = {'merged_sha': MERGED, 'feedback': {'state': 'verified'}}
+        evaluation = {'decision': 'fail'}
+        with patch('adaptive_rsi.gitops.snapshot', side_effect=lambda source, folder, sha: folder) as snapshot, \
+             patch.object(self.runtime.evaluator, 'evaluate', return_value=evaluation) as evaluate:
+            for _ in range(2):
+                result = advance(self.runtime, self.runtime.project(self.project), self.run, outcome)
+                self.assertEqual(result['release']['state'], 'blocked')
+                self.assertIn('Legacy release verification did not pass: fail', result['release']['error'])
+            # 一次 pin 尝试做 baseline+candidate 两份快照；第二个 tick 被 retry_at
+            # 拦截后不得再执行 snapshot/evaluate。
+            self.assertEqual(snapshot.call_count, 2)
+            self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 1)
+        deferred = self.runtime.store.setting('legacy-release-pin:' + self.run['id'] + ':' + MERGED)
+        self.assertGreater(deferred['retry_at'], time.time())
+        # retry_at 到期后允许再次评估，与 _PinUnavailable deferred 语义一致。
+        with patch('adaptive_rsi.release.time.time', return_value=deferred['retry_at'] + 1), \
+             patch('adaptive_rsi.gitops.snapshot', side_effect=lambda source, folder, sha: folder) as snapshot, \
+             patch.object(self.runtime.evaluator, 'evaluate', return_value=evaluation) as evaluate:
+            result = advance(self.runtime, self.runtime.project(self.project), self.run, outcome)
+            self.assertEqual(result['release']['state'], 'blocked')
+            self.assertIn('did not pass', result['release']['error'])
+            self.assertEqual(snapshot.call_count, 2)
+            self.assertEqual(evaluate.call_count, 1)
+        deferred = self.runtime.store.setting('legacy-release-pin:' + self.run['id'] + ':' + MERGED)
+        self.assertGreater(deferred['retry_at'], time.time() + 500)
+
     def test_owner_lookup_migrates_empty_history_only_once(self):
         from adaptive_rsi.release import deployment_owner
         original = self.runtime.store.query
