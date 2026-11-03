@@ -19,6 +19,33 @@ class StorePoolTest(unittest.TestCase):
         self.store = Store(Path(self.temp.name) / "state")
         self.addCleanup(self.store.close)
 
+    def test_claim_skipped_task_keeps_rank_binding_and_excludes_it(self):
+        # skipped 非空时占位符顺序为 project, now(available), *skipped, now(rank)。
+        # 错位绑定会把 skipped 末位 id（文本）交给 rank 的数值参数：age 项
+        # (text-created)/86400 变成 -created/86400，等价于去掉 min(20,·) 上限的
+        # 无限龄期加成；同时 NOT IN 漏排末位 skipped 任务，每轮空转一次重选。
+        from adaptive_rsi.config import validate
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        issue = self.store.add_task("p", "issue", "issue:owner/project:7", "Issue 7", priority=1)
+        self.store.put_setting("issue-sync:p", {"repository": "owner/project", "pending": {"7": {}}})
+        # run 已结束：不进 active_sources 过滤，body=run7 仍可供 publish 反查。
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES ('run7',?,'p','merged','{}',0,1)", (issue,))
+        publication = self.store.add_task("p", "system_publish", "publish:run7", "Publish",
+                                          body="run7", priority=99)
+        now = time.time()
+        # 正解 rank：newer=65+min(20,10)=75，older=50+min(20,30)=70 → newer 胜出。
+        # 错位时 rank 拿到文本 id：newer=65+10·86400/86400≈75，older≈50+30=80 → older 胜出。
+        newer = self.store.add_task("p", "goal", "newer", "Newer", priority=65)
+        older = self.store.add_task("p", "goal", "older", "Older", priority=50)
+        self.store.execute("UPDATE tasks SET created=? WHERE id=?", (now - 10 * 86400, newer))
+        self.store.execute("UPDATE tasks SET created=? WHERE id=?", (now - 30 * 86400, older))
+        run = self.store.claim("p", validate({}))
+        self.assertIsNotNone(run)
+        self.assertEqual(run["task"], newer)
+        # publication 被 skip 后不进入下一轮候选（仍 queued），也未被无限重领。
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))["state"], "queued")
+
     def test_transition_resolves_stop_before_completion_and_retry_fields(self):
         from adaptive_rsi.config import validate
         self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")

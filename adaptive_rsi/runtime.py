@@ -976,7 +976,11 @@ class Runtime(Maintenance):
                 priority = 55 if queued else 90
                 scan = self.request(project, kind, priority=priority, automatic=True)
                 if kind != "issues" or not pending:
-                    self.store.execute("UPDATE tasks SET priority=? WHERE id=? AND state='queued'", (priority, scan))
+                    # request() 对排队任务只按 max() 抬升优先级；手动触发会写入
+                    # scan_trigger=manual，周期重算不能把该提升降回积压深度推导值。
+                    # 自动触发的扫描仍随积压变化双向重算。
+                    self.store.execute("UPDATE tasks SET priority=? WHERE id=? AND state='queued' "
+                                       "AND evidence NOT LIKE '%\"scan_trigger\": \"manual\"%'", (priority, scan))
                 self.store.execute("INSERT INTO schedules(project,kind,due) VALUES (?,?,?) "
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
         key = "deferred-check:" + project
