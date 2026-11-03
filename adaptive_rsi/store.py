@@ -1151,7 +1151,7 @@ class Store:
         now = time.time()
         from .config import BUILTIN_PROVIDERS
         provider_id = route.get("provider", "openai")
-        provider = next((p for p in config.get("providers", []) if p["id"] == provider_id), None)
+        provider = next((p for p in (config.get("providers") or []) if p["id"] == provider_id), None)
         provider = provider or next((p for p in BUILTIN_PROVIDERS if p["id"] == provider_id), {"id": provider_id})
         # 与模型中心目录使用同一身份（含该供应商自己的凭据代次）；冻结运行仍按
         # 其封存配置里的供应商解析，不套用当前配置的代次。
