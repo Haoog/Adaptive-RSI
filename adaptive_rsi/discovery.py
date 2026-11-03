@@ -7,7 +7,7 @@ import logging
 import re
 import time
 
-from .store import encode, issue_snapshot_pending
+from .store import encode, issue_snapshot_pending, record_issue_sync_corrupt
 
 
 ISSUE_COMMENT_TTL = 300
@@ -442,30 +442,40 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
 
     def seal(number, issue):
         """Block candidate authorization while a newer upstream revision is unapplied."""
+        corrupt = False
         with store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             task = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint IN (?,?) ORDER BY fingerprint DESC",
                               (project["id"], "issue:" + repo.lower() + ":" + number, "issue:" + number)).fetchone()
-            if not task or not issue_snapshot_pending(db, project["id"], task["id"]):
-                return
-            active = db.execute("SELECT id FROM runs WHERE task=? AND ended IS NULL", (task["id"],)).fetchone()
-            if not active:
-                return
+            pending = task and issue_snapshot_pending(db, project["id"], task["id"])
+            if pending:
+                corrupt = pending == "corrupt"
+                active = db.execute("SELECT id FROM runs WHERE task=? AND ended IS NULL", (task["id"],)).fetchone()
+                if active:
+                    try:
+                        evidence = json.loads(task["evidence"])
+                        updated = evidence[0].get("updated")
+                    except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+                        updated = None
+                    try:
+                        labels = label_names(issue)
+                        allowed = not set(config["github"]["exclude_labels"]) & labels and (
+                            not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
+                        changed = (updated != issue.get("updated_at")
+                                   or str(issue.get("state", "")).lower() != "open" or not allowed)
+                    except (TypeError, AttributeError):
+                        changed = True
+                    if changed:
+                        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                   ("issue-revision-pending:" + active["id"], encode({"task": task["id"]})))
+        # 损坏诊断走独立连接、在 seal 自身事务之外：与 claim/_deliver 同一保障，
+        # 本事务若因并发失败回滚也不丢证据；节流仍在 record 内判定。
+        if corrupt:
             try:
-                evidence = json.loads(task["evidence"])
-                updated = evidence[0].get("updated")
-            except (TypeError, ValueError, IndexError, KeyError, AttributeError):
-                updated = None
-            try:
-                labels = label_names(issue)
-                allowed = not set(config["github"]["exclude_labels"]) & labels and (
-                    not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
-                changed = updated != issue.get("updated_at") or str(issue.get("state", "")).lower() != "open" or not allowed
-            except (TypeError, AttributeError):
-                changed = True
-            if changed:
-                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                           ("issue-revision-pending:" + active["id"], encode({"task": task["id"]})))
+                record_issue_sync_corrupt(store, project["id"])
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to record corrupt issue sync progress for %s", project["id"])
 
     def apply(issue):
         nonlocal changed

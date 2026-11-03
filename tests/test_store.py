@@ -77,6 +77,38 @@ class StorePoolTest(unittest.TestCase):
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed["task"], publication)
 
+    def test_corrupt_issue_sync_progress_event_survives_deliver_rollback(self):
+        # _deliver 的 pending 拒绝会回滚整个事务：事件若写在借入连接上随之丢失，
+        # 损坏状态没有持久诊断。回归必须覆盖真实事务边界——deliver() 在回滚之后
+        # 用独立连接补写，ValueError 语义不变，同 kind 事件仍然落库且节流。
+        from adaptive_rsi.runtime import Runtime
+        runtime = Runtime(self.store, agent=object())
+        self.addCleanup(runtime.close)
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        issue = self.store.add_task("p", "issue", "issue:owner/project:7", "Issue 7", priority=1)
+        self.store.execute("UPDATE tasks SET state='awaiting_approval' WHERE id=?", (issue,))
+        self.store.execute("INSERT INTO settings VALUES ('issue-sync:p','{corrupt json')")
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started) "
+                           "VALUES ('run1',?,'p','awaiting_approval','{}',0)", (issue,))
+        with self.assertRaises(ValueError):
+            runtime.deliver("run1")
+        # 事件在被回滚的 deliver 事务之外落库：拒绝没有留下半提交痕迹，诊断仍在。
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_progress_corrupt'")["n"], 1)
+        # 再次拒绝仍阻断且不超节流上限（每小时至多一条）。
+        with self.assertRaises(ValueError):
+            runtime.deliver("run1")
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_progress_corrupt'")["n"], 1)
+        # 阻断语义未放松：run 与源任务都停在 awaiting_approval，没有生成 publish 任务。
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id='run1'")["state"], "awaiting_approval")
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='publish:run1'"))
+        # 进度修复后同一候选可以正常交付（门禁结果齐全时）。
+        self.store.put_setting("issue-sync:p", {"repository": "owner/project", "pending": {}})
+        self.store.execute("UPDATE runs SET result=? WHERE id='run1'",
+                           (encode({"evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}),))
+        publication = runtime.deliver("run1")
+        self.assertIsNotNone(publication)
+        self.assertEqual(self.store.one("SELECT source FROM tasks WHERE id=?", (publication,))["source"], "system_publish")
+
     def test_transition_resolves_stop_before_completion_and_retry_fields(self):
         from adaptive_rsi.config import validate
         self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
