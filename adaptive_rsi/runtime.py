@@ -377,6 +377,20 @@ class Runtime(Maintenance):
             raise ValueError("Invalid configuration source")
         if not isinstance(values, dict):
             raise ValueError("Configuration must be an object")
+
+        # 提交体里的对象字段可能是标量或数组；先按模板校验结构，
+        # 否则下面的逐字段检查会对非 dict 调 .get 而抛出 AttributeError（500）。
+        def require_objects(template, source, path=""):
+            for key, expected in template.items():
+                if not isinstance(expected, dict) or key not in source:
+                    continue
+                field = path + key
+                actual = source[key]
+                if not isinstance(actual, dict):
+                    raise ValueError(field + " must be an object")
+                require_objects(expected, actual, field + ".")
+        require_objects(DEFAULTS, values)
+
         allowed = {"schedule.light_minutes", "schedule.issues_minutes", "schedule.deep_minutes",
                    "sources.inspection", "sources.issues"}
         if inherit is None:
@@ -407,7 +421,9 @@ class Runtime(Maintenance):
         updated = copy.deepcopy(values) if replacement else merge(previous, values)
         for path in inherit:
             group, key = path.split(".")
-            updated.get(group, {}).pop(key, None)
+            section = updated.get(group)
+            if isinstance(section, dict):
+                section.pop(key, None)
         validate(merge(self.store.setting("config", {}) if project else {}, updated))
         if not project:
             # Global changes must also remain valid for every existing project override.
