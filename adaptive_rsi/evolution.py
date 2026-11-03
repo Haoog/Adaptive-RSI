@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import shutil
 import time
 from pathlib import Path
@@ -24,6 +25,27 @@ DEFAULT_PROVIDER_ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
 }
+
+# 重复抑制签名的失败文本归一化：临时目录、绝对路径、run/case/请求 id、UUID 与
+# 时间戳逐实例变化，但同属一类故障；剥掉这些易变成分后同一根因聚成一个签名，
+# 不再因每次路径不同而反复触发付费 evolve。规则按宽到窄顺序应用，先吃掉最长片段。
+VOLATILE_DETAIL_RULES = [
+    (re.compile(r"(?<![\w.:-])(?:\.{1,2})?/(?:[\w.~-]+/?)+"), "<path>"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ][0-9:.]+)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
+    (re.compile(r"\b\d{1,3}:\d{2}(?::\d{2}(?:\.\d+)?)?\b"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<id>"),
+    (re.compile(r"\b(?=\w*\d)(?=\w*[A-Za-z])\w{8,}\b"), "<id>"),
+    (re.compile(r"\b\d{4,}\b"), "<n>"),
+    (re.compile(r"\s+"), " "),
+]
+
+
+def failure_reason_fingerprint(text):
+    """Normalize one failure detail string down to its stable shape."""
+    normalized = str(text or "")
+    for pattern, replacement in VOLATILE_DETAIL_RULES:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized.strip()
 
 
 def human_feedback(store, project=None, candidate=None):
@@ -125,6 +147,13 @@ def case_spec(case):
     except (TypeError, ValueError):
         return None
     return spec if isinstance(spec, dict) else None
+
+
+def case_live(spec):
+    """family 占用判定：与 import_case/update_case 共用同一口径——spec 里 active 与
+    available 都为真（缺省视为真）时该行仍占住 family 名；任一显式为假即视为非活跃，
+    不再参与调度也不占 family 槽位。调用方须先把损坏/非 dict spec 归一化为 {}。"""
+    return bool(spec.get("active", True) and spec.get("available", True))
 
 
 def overlay_available(directory):
@@ -238,6 +267,7 @@ class Evolution:
 
     def verify_inputs(self, project, manifest):
         mismatches = []
+        unsampled_mismatches = []
         for item in manifest:
             row = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], project))
             try:
@@ -259,8 +289,16 @@ class Evolution:
             except (KeyError, ValueError, RuntimeError, OSError):
                 changed = ["unavailable"]
             if changed:
-                mismatches.append({"case": item["case"], "fields": changed})
-        return {"valid": bool(manifest) and not mismatches, "mismatches": mismatches}
+                entry = {"case": item["case"], "fields": changed}
+                # 封存覆盖 eligible 全集，但付费试验只执行抽样项：未抽中用例在执行窗口内被
+                # 例行维护（退休、重分类、overlay 过期）改动时只留档，不作废整轮证据；
+                # 抽中项变化仍判无效。无 sampled 标记的旧证据一律按抽中处理，保持严格校验。
+                if item.get("sampled", True):
+                    mismatches.append(entry)
+                else:
+                    unsampled_mismatches.append(entry)
+        return {"valid": bool(manifest) and not mismatches, "mismatches": mismatches,
+                "unsampled_mismatches": unsampled_mismatches}
 
     @staticmethod
     def verify_plan(sealed, trials):
@@ -297,12 +335,45 @@ class Evolution:
                 spec = {}
             history = spec.setdefault("lifecycle", [])
             history.append({"from": row["split"], "to": target, "active": active, "uses": row["uses"],
-                            "source": source, "created": time.time()})
+                            "family": row["family"], "source": source, "created": time.time()})
             spec["active"] = active
-            db.execute("UPDATE cases SET split=?,spec=? WHERE id=?", (target, encode(spec), case))
+            # cases 表有 UNIQUE(project,family) 硬约束：退休行保留行与曝光身份但不再占住
+            # family 名，否则同家族修订用例永远无法重新导入（import_case 只按活跃行互斥）。
+            # 改名时把原名记入 spec.origin_family；重新激活反向恢复原名而非沿用
+            # -retired-<id>——否则原名被替代用例占住后再激活会得到两条同一家族
+            # 的活跃行，评估把相关用例当成独立证据。原名被仍活跃行占住时拒绝激活；
+            # 占住行已不活跃则当场改名为它释放（与 import_case 事务内复检同一形式）。
+            family = row["family"]
+            if not case_live(spec):
+                if not family.endswith("-retired-" + case):
+                    spec.setdefault("origin_family", family)
+                    family = family + "-retired-" + case
+            else:
+                origin = spec.get("origin_family")
+                if not isinstance(origin, str) and family.endswith("-retired-" + case):
+                    origin = family[: -len("-retired-" + case)]
+                if isinstance(origin, str) and origin and origin != family:
+                    holder = db.execute("SELECT id,family,spec FROM cases WHERE project=? AND family=?",
+                                        (project, origin)).fetchone()
+                    if holder and holder["id"] != case:
+                        try:
+                            holder_spec = json.loads(holder["spec"] or "{}")
+                        except (TypeError, ValueError):
+                            holder_spec = {}
+                        if not isinstance(holder_spec, dict):
+                            holder_spec = {}
+                        if case_live(holder_spec):
+                            raise ValueError("Original family occupied by a live replacement case")
+                        if not holder["family"].endswith("-retired-" + holder["id"]):
+                            db.execute("UPDATE cases SET family=? WHERE id=?",
+                                       (holder["family"] + "-retired-" + holder["id"], holder["id"]))
+                    spec.pop("origin_family", None)
+                    family = origin
+            db.execute("UPDATE cases SET split=?,family=?,spec=? WHERE id=?",
+                       (target, family, encode(spec), case))
             db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
                        (project, "case_lifecycle", "Evaluation case retired or reclassified; exposure retained",
-                        encode({"case": case, **history[-1]}), time.time()))
+                        encode({**history[-1], "case": case, "released_family": family}), time.time()))
 
     def eligible_cases(self, project, limit):
         """Fresh-enough cases for one experiment, filtered inside SQLite in one query.
@@ -1021,14 +1092,19 @@ class Evolution:
         base = git(source, "rev-parse", "--verify", manifest["base"] + "^{commit}")
         validate(merge(self.runtime.config(project), {"checks": manifest["checks"]}))
         signature = fingerprint({"task": manifest["task"], "tree": git(source, "rev-parse", base + "^{tree}")})
+        # family 是“同一任务/缺陷家族”的身份：退休或不可用（active/available 显式为假）的
+        # 用例不再参与调度，不应永久占住 family 名迫使用户伪造新家族；损坏或缺省 spec 仍按
+        # 活跃处理，保持严格拦截。signature（同一任务快照）比对不受退休影响——同一快照不
+        # 得借退休重入另一集合。
         for row in self.store.query("SELECT family,spec FROM cases WHERE project=?", (project,)):
             try:
-                spec = json.loads(row["spec"] or "{}")
+                existing = json.loads(row["spec"] or "{}")
             except (TypeError, ValueError):
-                spec = {}
-            if not isinstance(spec, dict):
-                spec = {}
-            if row["family"] == manifest["family"] or spec.get("signature") == signature:
+                existing = {}
+            if not isinstance(existing, dict):
+                existing = {}
+            if (row["family"] == manifest["family"] and case_live(existing)
+                    ) or existing.get("signature") == signature:
                 raise ValueError("Same task/defect family cannot enter multiple splits")
         case = uid()
         directory = self.store.root / "suites" / case
@@ -1048,9 +1124,28 @@ class Evolution:
                     "overlay": str(directory / "overlay") if overlay else None}
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                duplicate = db.execute("SELECT 1 FROM cases WHERE project=? AND (family=? OR "
-                                       "(json_valid(spec) AND json_extract(spec,'$.signature')=?))",
-                                       (project, manifest["family"], signature)).fetchone()
+                # 与上面读侧检查同一口径、同一事务内复检：family 只在行仍活跃/可用时互斥；
+                # 非活跃行占着的 family 在同一事务里改名释放（与 update_case 的退休改名同一
+                # 形式，原 family 留在 -retired- 前缀中可追溯），否则 UNIQUE(project,family)
+                # 硬约束仍会让 INSERT 失败。signature（同一任务快照）不受退休影响。
+                rows = db.execute("SELECT id,family,spec FROM cases WHERE project=? AND (family=? OR "
+                                  "(json_valid(spec) AND json_extract(spec,'$.signature')=?))",
+                                  (project, manifest["family"], signature)).fetchall()
+                duplicate = None
+                for row in rows:
+                    try:
+                        existing = json.loads(row["spec"] or "{}")
+                    except (TypeError, ValueError):
+                        existing = {}
+                    if not isinstance(existing, dict):
+                        existing = {}
+                    if (row["family"] == manifest["family"] and case_live(existing)
+                            ) or existing.get("signature") == signature:
+                        duplicate = row
+                        break
+                    if row["family"] == manifest["family"] and not row["family"].endswith("-retired-" + row["id"]):
+                        db.execute("UPDATE cases SET family=? WHERE id=?",
+                                   (row["family"] + "-retired-" + row["id"], row["id"]))
                 if duplicate:
                     raise ValueError("Same task/defect family cannot enter multiple splits")
                 db.execute("INSERT INTO cases VALUES (?,?,?,?,?,?,?)",
@@ -1067,6 +1162,7 @@ class Evolution:
         observations = self.store.query("SELECT content,evidence,status FROM skills WHERE project=? "
                                         "ORDER BY created DESC LIMIT 10", (project,))
         failures = []
+        seen = set()
         for row in self.store.query("SELECT r.state,r.result FROM runs r JOIN tasks t ON r.task=t.id "
                                     "WHERE r.project=? AND r.state='failed' AND t.source NOT LIKE 'system_%' "
                                     "ORDER BY r.started DESC LIMIT 5", (project,)):
@@ -1074,7 +1170,25 @@ class Evolution:
                 result = json.loads(row["result"]) if row["result"] else {}
             except (ValueError, TypeError):
                 result = {}
-            failures.append({"state": row["state"], "reason": result.get("reason", "")[:1000]})
+            if not isinstance(result, dict):
+                result = {}
+            problem = result.get("failure")
+            if not isinstance(problem, dict):
+                problem = {}
+            # 签名只取结构化 code/action 与归一化后的 reason；str(exc) 原文含
+            # 临时路径、run/case id、provider_request_id 等逐实例成分，直接指纹
+            # 会让同一根因的重复故障绕过 attempt_due 去重而反复付费提案。
+            entry = {"state": row["state"], "code": problem.get("code"),
+                     "action": problem.get("action"),
+                     "reason": failure_reason_fingerprint(result.get("reason", ""))[:1000]}
+            key = (entry["state"], entry["code"], entry["action"], entry["reason"])
+            if key not in seen:
+                seen.add(key)
+                failures.append(entry)
+        # 同一根因的 N 次故障实例归并成一条，且按稳定键排序：再发或两类故障交替
+        # 出现都不改变输入签名；真正的新故障类别才会让签名变化。
+        failures.sort(key=lambda item: (item["state"], str(item["code"]),
+                                        str(item["action"]), item["reason"]))
         development = []
         for row in self.store.query("SELECT spec FROM cases WHERE project=? AND split='development' "
                                     "AND (NOT json_valid(spec) OR json_extract(spec,'$.active') IS NOT 0) "
@@ -1258,6 +1372,12 @@ class Evolution:
         cases = validation_cases + fresh_holdout
         reserved = sorted(case["id"] for case in fresh_holdout)
         reservation = uid()
+        # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。抽样先于封存：
+        # 封存清单仍记录 eligible 全集供导出与审计，但逐项标记是否实际执行，执行期校验
+        # 只约束抽中样本，未抽中项的漂移只计入 unsampled_mismatches 与晋升评审限制。
+        selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
+                     "holdout": select_cases(fresh_holdout, minimum, run["id"])}
+        sampled_ids = {case["id"] for rows in selection.values() for case in rows}
         manifest = []
         for case in cases:
             spec = case_spec(case) or {}
@@ -1272,7 +1392,7 @@ class Evolution:
                              "tree": git(repository, "rev-parse", base + "^{tree}"),
                              "checks": fingerprint(spec.get("checks", [])), "family": case["family"],
                              "task": fingerprint(spec["task"]), "spec": fingerprint(spec),
-                             "overlay": overlay,
+                             "overlay": overlay, "sampled": case["id"] in sampled_ids,
                              "environment": fingerprint(config["environment"])})
         # 本函数此前只读取本地状态；预留只覆盖即将开始的付费提案窗口。
         observations = inputs["observations"]
@@ -1335,9 +1455,6 @@ class Evolution:
             "SELECT count(*) AS n FROM candidates WHERE project=? AND kind=? AND "
             "json_valid(evidence) AND json_extract(evidence,'$.compatibility')=?",
             (project["id"], proposal["kind"], evidence["compatibility"]))["n"] + 1
-        # 新鲜 holdout 已经在上面单独筛出，分层抽样只作用于这组未曝光样本。
-        selection = {"validation": select_cases(validation_cases, minimum, run["id"]),
-                     "holdout": select_cases(fresh_holdout, minimum, run["id"])}
         plan = {"version": 2, "created": time.time(), "repeats": config["evolution"]["repeats"],
                 "metric": "independent_case_family_paired_pass", "max_cost_ratio": config["evolution"]["max_cost_ratio"],
                 "stop_rules": ["validation_failure", "cancelled", "resource_budget", "complete_planned_trials"],
@@ -1428,6 +1545,13 @@ class Evolution:
             evidence["input_verification"] = self.verify_inputs(project["id"], manifest)
             if not evidence["input_verification"]["valid"]:
                 evidence.update(decision="insufficient_evidence", reason="Sealed experiment inputs changed during execution")
+            drifted = evidence["input_verification"].get("unsampled_mismatches") or []
+            review = evidence.get("promotion_review")
+            if drifted and isinstance(review, dict):
+                review.setdefault("limitations", []).append(
+                    "Sealed cases not selected for execution changed during the experiment; "
+                    "recorded in input_verification.unsampled_mismatches, they do not affect "
+                    "validity: " + ", ".join(sorted(row["case"] for row in drifted)))
             if evidence["decision"] == "pass" and not evidence["final_review"]["fresh"]:
                 evidence.update(decision="insufficient_evidence", reason="Final promotion requires previously unexposed holdout cases")
             if "sign_test_p" in evidence:
