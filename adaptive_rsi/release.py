@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import quote, urlsplit
 
 from .config import DEFAULTS, fingerprint, merge
@@ -26,6 +27,15 @@ RECONCILIATION_AUDIT_LIMIT = 10
 # retained list, so one operation's settings never grow with the page size.
 RECONCILIATION_CANDIDATE_LIMIT = 20
 RECONCILIATION_SELECTABLE_LIMIT = 200
+# A 404 on the workflow-scoped runs listing means the authorized workflow file
+# is not resolvable on the default branch (renamed or deleted), not that the
+# matching run is absent. Polling recovers automatically once the file is
+# restored; the recheck is spaced so a missing file cannot flood GitHub or the
+# event log. Operator-driven queries pass force=True and always re-check.
+WORKFLOW_VISIBILITY_RECHECK_SECONDS = 900
+WORKFLOW_NOT_VISIBLE_REASON = ("The authorized workflow file is not visible on the default branch; it may have been "
+                               "renamed or deleted. Restore the file or re-authorize its replacement, then reconcile "
+                               "the returned candidates; selecting never starts or repeats a run.")
 RECONCILIATION_AUDIT_FIELDS = (
     "at", "source", "selected_run_id", "repository", "workflow", "ref",
     "operation_id", "sha", "workflow_sha", "candidate_count", "candidates", "previous",
@@ -458,19 +468,37 @@ def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
     return candidates
 
 
-def _remote_runs(repo, data):
+def _remote_runs(repo, data, force=False):
+    visibility = data.get("remote_visibility") or {}
+    if (not force and visibility.get("state") == "workflow_not_visible"
+            and time.time() < visibility.get("next_check_at", 0)):
+        return None
     endpoint = "actions/workflows/" + quote(data["workflow"].split("/")[-1], safe="") + "/runs?event=workflow_dispatch&per_page=100"
     found = []
-    for page in range(1, 11):
-        runs = api(repo, endpoint + "&page=" + str(page)).get("workflow_runs", [])
-        found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
-        if len(runs) < 100:
-            break
+    try:
+        for page in range(1, 11):
+            runs = api(repo, endpoint + "&page=" + str(page)).get("workflow_runs", [])
+            found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
+            if len(runs) < 100:
+                break
+    except ApiRejected as exc:
+        if exc.status != 404:
+            raise
+        first = visibility.get("checked_at") if visibility.get("state") == "workflow_not_visible" else None
+        data["remote_visibility"] = {"state": "workflow_not_visible", "http_status": 404,
+                                     "workflow": data.get("workflow"), "checked_at": first or time.time(),
+                                     "next_check_at": time.time() + WORKFLOW_VISIBILITY_RECHECK_SECONDS}
+        return None
+    data.pop("remote_visibility", None)
     return found
 
 
 def find_remote(repo, data):
     found = _remote_runs(repo, data)
+    if found is None:
+        _record_reconciliation(data, repo, [], "workflow_not_visible", WORKFLOW_NOT_VISIBLE_REASON,
+                               checked_at=(data.get("remote_visibility") or {}).get("checked_at"))
+        return None
     if len(found) > 1:
         _record_reconciliation(data, repo, found, "manual_inspection_required",
                                "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.")
@@ -640,12 +668,16 @@ def candidates(runtime, project_id, run_id, kind, target="operation"):
             remote = _existing_remote(repo, target_data)
             remotes = [remote] if isinstance(remote, dict) else []
         else:
-            remotes = _remote_runs(repo, target_data)
+            remotes = _remote_runs(repo, target_data, force=True) or []
         normalized = [item for item in (_candidate(repo, remote) for remote in remotes) if item]
         previous = _run_number(target_data.get("previous_attempt")) or _run_number(target_data.get("attempt")) or 1
-        if target_data.get("remote_visibility", {}).get("state") == "run_not_visible":
+        remote_visibility = (target_data.get("remote_visibility") or {}).get("state")
+        if remote_visibility == "run_not_visible":
             state = "run_not_visible"
             reason = "Workflow run is not visible; check repository access before reconciling"
+        elif remote_visibility == "workflow_not_visible":
+            state = "workflow_not_visible"
+            reason = WORKFLOW_NOT_VISIBLE_REASON
         elif existing:
             attempt = normalized[0].get("attempt") if normalized else None
             if attempt is not None and attempt > previous:
@@ -686,7 +718,7 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
         project, run, saved, policy, data, target_data, original = _reconciliation_operation(
             runtime, project_id, run_id, kind, target)
         original_data = copy.deepcopy(data)
-        def reject_missing():
+        def reject_missing() -> NoReturn:
             original_target = original_data["rollback"] if target == "rollback" else original_data
             original_target["remote_visibility"] = copy.deepcopy(target_data["remote_visibility"])
             original_target["state"] = target_data["state"]
@@ -694,6 +726,8 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
                 save(runtime, run, kind, original_data, expected=original)
             except _AutomationChanged:
                 pass
+            if target_data["remote_visibility"].get("state") == "workflow_not_visible":
+                raise ReconciliationRejected(WORKFLOW_NOT_VISIBLE_REASON)
             raise ReconciliationRejected("Workflow run is not visible; check repository access before reconciling")
         repo = _reconciliation_repository(runtime, project, saved, target_data)
         _require_unknown(target_data)
@@ -717,7 +751,9 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
                 reject_missing()
             remotes = [remote] if isinstance(remote, dict) else []
         else:
-            remotes = _remote_runs(repo, target_data)
+            remotes = _remote_runs(repo, target_data, force=True)
+            if remotes is None:
+                reject_missing()
         normalized = [item for item in (_candidate(repo, remote) for remote in remotes) if item]
         exact = [item for item in normalized if item["id"] == selected and
                  _candidate_identity_mismatch(target_data, item) is None]

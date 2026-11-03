@@ -76,6 +76,43 @@ class ReleaseAutomationTest(unittest.TestCase):
                 self.assertEqual(result['remote_visibility']['state'], 'run_not_visible')
             self.assertEqual(api.call_count, 2)
 
+    def test_missing_workflow_listing_backs_off_and_recovers_without_error_events(self):
+        calls = []
+        def uncertain(repo, endpoint, method="GET", fields=None):
+            result = self.api(repo, endpoint, method, fields)
+            if "/dispatches" in endpoint:
+                raise RuntimeError("Network disconnected after GitHub accepted request")
+            return result
+        with patch("adaptive_rsi.release.api", side_effect=uncertain):
+            first = self.tick()["release"]
+            self.assertEqual(first["state"], "dispatch_unknown")
+        events_before = len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"))
+        def missing(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+        with patch("adaptive_rsi.release.api", side_effect=missing):
+            tick = self.tick()["release"]
+            self.assertEqual(tick["state"], "dispatch_unknown")
+            self.assertEqual(tick["remote_visibility"]["state"], "workflow_not_visible")
+            self.assertEqual(tick["reconciliation"]["state"], "workflow_not_visible")
+            calls.clear()
+            for _ in range(2):
+                again = self.tick()["release"]
+                self.assertEqual(again["state"], "dispatch_unknown")
+                self.assertEqual(again["reconciliation"]["state"], "workflow_not_visible")
+            self.assertEqual(calls, [])
+        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
+        self.assertTrue(pending(self.runtime, self.run))
+        # 退避窗口到期后下一次调度轮询自动恢复；把到期时间归零模拟窗口过去。
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        saved["remote_visibility"]["next_check_at"] = 0
+        self.runtime.store.put_setting(key(self.run["id"], "release"), saved)
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            self.remote = self.remote_run(first)
+            result = self.tick()["release"]
+            self.assertEqual(result["state"], "workflow_succeeded")
+            self.assertNotIn("remote_visibility", result)
+
     def test_corrupt_automation_receipt_is_preserved_and_blocks_dispatch(self):
         from adaptive_rsi.release import status
         for raw in ('{broken', '[]', 'null', '{}', '{"state":3}', '{"state":"submitted"}'):
