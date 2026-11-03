@@ -290,7 +290,7 @@ python3 scripts/rsi import-case PROJECT_ID case.json
 python3 scripts/rsi evolve PROJECT_ID
 ```
 
-`split` 为 `development`、`validation`、`holdout`。同一家族或同一任务快照不能跨集合；近重复缺陷仍需整理者正确标注家族。默认验证集和最终评估集各至少 3 个家族，最多曝光 3 次。曝光用尽时演化会在调用模型前停摆，并按实际不足的集合分别报告差额：validation 通过导入新用例或调高 `evolution.max_holdout_uses` 重新入选；holdout 必须导入从未曝光的用例，调高上限不能刷新已曝光样本。验证集和最终评估集按 `(source, 任务长度)` 分层抽样：各层按候选总体中的占比分配样本，样本数允许时每层至少 1 个；分配口径与各层总体数、选中数一并封存在计划的 `allocation` 中，`seed` 只改变层内挑选顺序。overlay 由控制器保存，仅在独立评估时写入测试目录，不交给候选。合成缺陷只存在于评估副本，不会进入真实项目任务池。这里没有把自动生成的合成任务冒充真实业务证据。导出的封存实验包在离线或隔离机器上的核验与复现步骤见[离线复现操作清单](offline-reproduction.md)。
+`split` 为 `development`、`validation`、`holdout`。同一家族或同一任务快照不能跨集合；近重复缺陷仍需整理者正确标注家族。用例退休或标记不可用（`active`/`available` 显式为假）时释放 family 名：行与曝光历史保留，`family` 改名为 `<family>-retired-<id>`（原名留在 lifecycle 记录中可追溯），同家族的修订用例可用原名重新导入；family 上仍有活跃用例或同一任务快照（signature）时仍然互斥。默认验证集和最终评估集各至少 3 个家族，最多曝光 3 次。曝光用尽时演化会在调用模型前停摆，并按实际不足的集合分别报告差额：validation 通过导入新用例或调高 `evolution.max_holdout_uses` 重新入选；holdout 必须导入从未曝光的用例，调高上限不能刷新已曝光样本。验证集和最终评估集按 `(source, 任务长度)` 分层抽样：各层按候选总体中的占比分配样本，样本数允许时每层至少 1 个；分配口径与各层总体数、选中数一并封存在计划的 `allocation` 中，`seed` 只改变层内挑选顺序。overlay 由控制器保存，仅在独立评估时写入测试目录，不交给候选。合成缺陷只存在于评估副本，不会进入真实项目任务池。这里没有把自动生成的合成任务冒充真实业务证据。导出的封存实验包在离线或隔离机器上的核验与复现步骤见[离线复现操作清单](offline-reproduction.md)。
 
 ## Codex 插件
 
