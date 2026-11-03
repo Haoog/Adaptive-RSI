@@ -1488,10 +1488,13 @@ class Runtime(Maintenance):
         if self.stop.is_set():
             return True
         if '_deadline_started' in run:
-            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-            stage = ('model' if run.get('_model_started') is not None else
-                     run.get('_explicit_phase') or
-                     ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
+            if run.get('_model_started') is not None:
+                stage = 'model'
+            elif run.get('_explicit_phase'):
+                stage = run['_explicit_phase']
+            else:
+                state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+                stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
             if run.get('_deadline_stage') != stage:
                 run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
             try:
@@ -1506,10 +1509,12 @@ class Runtime(Maintenance):
             if (run.get('_model_started') is not None and
                     outer_stage in ('preparation', 'evaluation') and outer_started is not None and
                     time.monotonic() - outer_started >= limits[outer_stage + '_seconds']):
-                run['_timed_out_stage'] = outer_stage
+                # 首个超时判定者胜：trial 经 propagate_deadline 上报的阶段（如 evaluation）
+                # 不得被父 run 自身的阶段时钟（如 preparation）覆盖。
+                run.setdefault('_timed_out_stage', outer_stage)
                 return True
             if time.monotonic() - run['_deadline_started'] >= limits[stage + '_seconds']:
-                run['_timed_out_stage'] = stage
+                run.setdefault('_timed_out_stage', stage)
                 return True
         row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
                              "WHERE s.key='run-stop:' || r.id) AS stop_requested "

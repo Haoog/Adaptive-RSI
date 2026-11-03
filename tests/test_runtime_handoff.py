@@ -160,6 +160,41 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def test_propagated_trial_stage_survives_parent_timeout_recheck(self):
+        """propagate_deadline 写入的阶段是首个判定结论；父 run 自身时钟超时不覆盖它。"""
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        _, parent = self.claim()
+        config = self.runtime.config(self.project)
+        # 父 run 的 preparation 时钟从 process() 入口起算，必然已超预算。
+        parent['_deadline_stage'] = 'preparation'
+        parent['_deadline_started'] = time.monotonic() - config['deadlines']['preparation_seconds'] - 1
+        trial = self.runtime.new_trial_context(parent)
+        trial['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, trial)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        # 变体间/交付前的父级 is_cancelled 命中自身超时分支，但不得改写阶段回执。
+        self.assertTrue(self.runtime.is_cancelled(parent))
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        # _process 的 except Cancelled 路径必须按 evaluation 记 failure.stage。
+        # stub 模拟真实顺序：trial 已把 evaluation 结论 propagate 到父 run、
+        # 父 run 自身时钟仍超 preparation 预算，变体间取消复查不得改写它。
+        project = self.runtime.project(self.project)
+        base = git(project['path'], 'rev-parse', 'HEAD')
+        def timed_out(*args):
+            parent['_timed_out_stage'] = 'evaluation'
+            parent['_deadline_started'] = time.monotonic() - config['deadlines']['preparation_seconds'] - 1
+            self.assertTrue(self.runtime.is_cancelled(parent))
+            self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+            raise Cancelled('Model invocation cancelled or stage deadline exceeded')
+        with patch('adaptive_rsi.delivery.baseline', return_value=(project['path'], base, 'main')), \
+             patch.object(self.runtime, 'execute_candidate', side_effect=timed_out):
+            self.runtime.process(parent)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (parent['id'],))
+        self.assertEqual(row['state'], 'blocked')
+        failure = json.loads(row['result'])['failure']
+        self.assertEqual((failure['code'], failure['stage']), ('deadline', 'evaluation'))
+
     def test_evaluation_deadline_remains_active_during_model_call(self):
         _, run = self.claim()
         clock = [10.0]
@@ -927,6 +962,48 @@ class RuntimeHandoffTest(unittest.TestCase):
         run['_deadline_started'] -= 4000
         self.assertTrue(self.runtime.is_cancelled(run))
         self.assertEqual(run['_timed_out_stage'], 'evaluation')
+
+    def test_explicit_phase_skips_the_stage_inference_query(self):
+        """已显式切相时 is_cancelled 不再为推断 stage 查询 runs 表。"""
+        _, run = self.claim()
+        self.runtime.begin_phase(run, 'evaluation')
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?'], [])
+
+    def test_model_call_skips_the_stage_inference_query(self):
+        """模型调用进行中（_model_started）同样不触发 stage 推断查询。"""
+        _, run = self.claim()
+        run['_deadline_started'], run['_deadline_stage'] = time.monotonic(), 'model'
+        run['_model_started'] = time.monotonic()
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?'], [])
+
+    def test_stage_inference_query_runs_only_without_explicit_phase(self):
+        """未切相也未进入模型调用时，仍按 runs.state 推断 evaluation 相位。"""
+        _, run = self.claim()
+        run['_deadline_started'], run['_deadline_stage'] = time.monotonic(), 'preparation'
+        self.store.transition(run['id'], 'evaluating')
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(len([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?']), 1)
+        self.assertEqual(run['_deadline_stage'], 'evaluation')
 
     def test_idle_deadline_selection_scales_to_thousand_projects(self):
         import time as clock
