@@ -43,6 +43,29 @@ class AuditEvaluationTest(unittest.TestCase):
         store.data['sealed-read-checkpoint:read']['result']['pass'] = False
         self.assertIsNone(runner.reuse_checkpoint('read', inputs))
 
+    def test_seed_clear_removes_regular_file_and_symlink_without_crashing(self):
+        # 候选把 seed 路径建成普通文件时，clear=True 不得抛 NotADirectoryError。
+        from adaptive_rsi.config import DEFAULTS, merge
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seeds = root / 'seeds'
+            (seeds / 'deps').mkdir(parents=True)
+            (seeds / 'deps/value').write_text('seeded\n')
+            config = merge(DEFAULTS, {'environment': {'seed_paths': ['deps']}})
+            target = root / 'target'
+            target.mkdir()
+            (target / 'deps').write_text('candidate-file\n')
+            evaluator.Evaluator._seed_target(target, seeds, config, clear=True)
+            self.assertTrue((target / 'deps').is_dir())
+            self.assertEqual((target / 'deps/value').read_text(), 'seeded\n')
+            # 断开的符号链接也按同一清除路径处理，不留给 restore() 的 overlap 检查。
+            import shutil as _shutil
+            _shutil.rmtree(target / 'deps')
+            (target / 'deps').symlink_to('missing')
+            evaluator.Evaluator._seed_target(target, seeds, config, clear=True)
+            self.assertTrue((target / 'deps').is_dir())
+            self.assertEqual((target / 'deps/value').read_text(), 'seeded\n')
+
     def test_stage_reuse_requires_explicit_opt_in(self):
         from adaptive_rsi.evaluator import checkpoint_reuse_enabled
         self.assertFalse(checkpoint_reuse_enabled(_config()))
