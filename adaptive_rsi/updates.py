@@ -183,9 +183,13 @@ def installed_root(state, fallback):
     marker = state / "installations/active.json"
     if not marker.exists():
         return Path(fallback).resolve()
-    data = json.loads(marker.read_text())
-    root = Path(data["path"]).resolve()
-    root.relative_to((state / "installations").resolve())
+    try:
+        data = json.loads(marker.read_text())
+        root = Path(data["path"]).resolve()
+        root.relative_to((state / "installations").resolve())
+    except (OSError, ValueError, KeyError, TypeError):
+        # active.json 损坏与未安装同义；崩溃会楔死每次启动。
+        return None
     if not (root / "adaptive_rsi/cli.py").is_file():
         raise RuntimeError("Managed installation is incomplete; restore the previous installation")
     return root
@@ -585,7 +589,7 @@ def supervise_restart(state):
 def candidate_health(plan):
     session = plan["session"]
     try:
-        request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health",
+        request = urllib.request.Request((session.get("local_origin") or session.get("origin") or "") + "/api/health",
             headers={"Cookie": session["cookie"] + "=" + session["token"]})
         with urllib.request.urlopen(request, timeout=1) as response:
             health = json.load(response)
@@ -606,7 +610,7 @@ def complete_rollback(state, plan):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
-                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/state",
+                request = urllib.request.Request((session.get("local_origin") or session.get("origin") or "") + "/api/state",
                     headers={"Cookie": session["cookie"] + "=" + session["token"]})
                 with urllib.request.urlopen(request, timeout=1) as response:
                     ready = not json.load(response)["update"]["busy"]
@@ -651,8 +655,18 @@ def preserve_previous_pointers(state, plan):
     if "previous_pointers" not in plan:
         installs = state / "installations"
         active, link = installs / "active.json", installs / "current"
-        plan["previous_pointers"] = {"active": json.loads(active.read_text()) if active.exists() else None,
-                                     "current": os.readlink(link) if link.is_symlink() else None}
+        try:
+            previous_active = json.loads(active.read_text()) if active.exists() else None
+            if previous_active is not None and not isinstance(previous_active, dict):
+                previous_active = None
+        except (OSError, ValueError):
+            # 损坏或读取竞争与缺失同义；回滚按“无先前安装”处理。
+            previous_active = None
+        try:
+            previous_link = os.readlink(link) if link.is_symlink() else None
+        except OSError:
+            previous_link = None
+        plan["previous_pointers"] = {"active": previous_active, "current": previous_link}
         atomic_json(installs / "restart.json", plan)
     return plan["previous_pointers"]
 
@@ -679,7 +693,13 @@ def _supervise_restart(state, store):
     import fcntl
     installs = state / "installations"
     plan_path = installs / "restart.json"
-    plan = json.loads(plan_path.read_text())
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (OSError, ValueError):
+        # restart.json 损坏时保留现场；非零退出由外层转 error。
+        raise SystemExit(1)
+    if not isinstance(plan, dict) or "pid" not in plan:
+        raise SystemExit(1)
     if plan["pid"] == os.getpid():
         raise RuntimeError("Restart supervisor must be a separate process")
     if plan.get("state_schema", 1) != 1:
@@ -752,8 +772,19 @@ def _supervise_restart(state, store):
             return
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    session = plan["session"]
-    port = urllib.parse.urlsplit(session.get("local_origin", session["origin"])).port
+    session = plan.get("session")
+    if not isinstance(session, dict):
+        raise SystemExit(1)
+    origin = session.get("local_origin") or session.get("origin")
+    if not isinstance(origin, str) or not origin:
+        raise SystemExit(1)
+    try:
+        port = urllib.parse.urlsplit(origin).port
+    except ValueError:
+        port = None
+    if port is None:
+        raise SystemExit(1)
+    health_url = origin + "/api/health"
     log = (state / "server.log").open("ab")
     (state / "server.log").chmod(0o600)
     active = installs / "active.json"
@@ -772,7 +803,7 @@ def _supervise_restart(state, store):
         healthy = False
         while time.monotonic() < deadline and child.poll() is None:
             try:
-                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health", headers={"Cookie": session["cookie"] + "=" + session["token"]})
+                request = urllib.request.Request(health_url, headers={"Cookie": session["cookie"] + "=" + session["token"]})
                 with urllib.request.urlopen(request, timeout=1) as response:
                     health = json.load(response)
                     healthy = health.get("version") == plan["target"] and health.get("pid") == child.pid
@@ -834,7 +865,7 @@ def _supervise_restart(state, store):
         previous_healthy = False
         while time.monotonic() < deadline and previous_child.poll() is None:
             try:
-                request = urllib.request.Request(session.get("local_origin", session["origin"]) + "/api/health",
+                request = urllib.request.Request(health_url,
                     headers={"Cookie": session["cookie"] + "=" + session["token"]})
                 with urllib.request.urlopen(request, timeout=1) as response:
                     health = json.load(response)
