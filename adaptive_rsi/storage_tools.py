@@ -486,7 +486,7 @@ def _protected_database_paths(source, store=None):
     return protected
 
 
-def validate_rehearsal_report_path(destination, source, store=None):
+def validate_rehearsal_report_path(destination, source, store=None, within=None):
     if destination is None or destination is False:
         return
     target = Path(destination).expanduser().resolve()
@@ -507,6 +507,11 @@ def validate_rehearsal_report_path(destination, source, store=None):
                 continue
             if (target_stat.st_dev, target_stat.st_ino) == (p_stat.st_dev, p_stat.st_ino):
                 raise ValueError(f"Rehearsal report destination conflicts with database: {target}")
+
+    if within is not None:
+        root = Path(within).expanduser().resolve()
+        if target != root and root not in target.parents:
+            raise ValueError("Rehearsal report must stay inside the state directory")
 
 
 def _publish_report_atomically(report_file, encoded):
@@ -546,10 +551,10 @@ def _publish_report_atomically(report_file, encoded):
             temp_file.unlink(missing_ok=True)
 
 
-def rehearsal_report_path(source, store=None, report_path=None):
+def rehearsal_report_path(source, store=None, report_path=None, within=None):
     if report_path is not None and report_path is not True:
         candidate = Path(report_path).expanduser().resolve()
-        validate_rehearsal_report_path(candidate, source, store=store)
+        validate_rehearsal_report_path(candidate, source, store=store, within=within)
         return candidate
     source = Path(source).expanduser().resolve()
     if store is not None:
@@ -566,7 +571,7 @@ def rehearsal_report_path(source, store=None, report_path=None):
         candidate = folder / f"rehearsal-{source.stem}.json"
     else:
         candidate = source.parent / f"{source.stem}-rehearsal.json"
-    validate_rehearsal_report_path(candidate, source, store=store)
+    validate_rehearsal_report_path(candidate, source, store=store, within=within)
     return candidate
 
 

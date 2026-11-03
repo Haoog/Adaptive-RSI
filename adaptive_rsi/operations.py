@@ -179,7 +179,10 @@ class Operations:
                 if not backups:
                     raise ValueError("No backup available for rehearsal")
                 source = backups[0]
-            report_file = rehearsal_report_path(source, store=self.store, report_path=parameters.get("report"))
+            # 与 HTTP 入口同一约束：后台操作的报告文件也只能落在状态目录内。
+            report_file = rehearsal_report_path(source, store=self.store,
+                                                report_path=parameters.get("report"),
+                                                within=self.store.root)
             result = rehearse_restore(source, report_path=report_file, store=self.store)
         else:
             result = {"id": self.runtime.import_project(parameters["url"], parameters.get("directory"))}
