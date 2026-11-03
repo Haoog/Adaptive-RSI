@@ -630,7 +630,8 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
             repo.lower() != origin_repository(project['path']).lower()):
         return
     records = json.loads(checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
-        '--head', branch, '--limit', '100', '--json', 'url,state,headRefOid,headRefName,headRepositoryOwner,baseRefName']))
+        '--head', branch, '--limit', '100', '--json',
+        'url,state,headRefOid,headRefName,headRepositoryOwner,baseRefName,mergeCommit']))
     if not isinstance(records, list) or len(records) >= 100:
         raise ValueError('Incomplete PR recovery response')
     matches = []
@@ -663,6 +664,19 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
             outcome.update(pr=pr['url'], replanned=True, close_pending=pr['state'] == 'OPEN')
             if pr['state'] != 'OPEN':
                 outcome['close_status'] = pr['state'].lower()
+            if pr['state'] == 'MERGED':
+                # 创建成功却被撤销的候选其实已经合入：记下合并事实，避免同一改动
+                # 被重新实现。仍带反馈/过时原因的候选保留重排意图。
+                previous_status = outcome.get('delivery_status')
+                merge_commit = pr.get('mergeCommit')
+                oid = merge_commit.get('oid') if isinstance(merge_commit, dict) else None
+                outcome.update(delivery_status='merged', merged_at=now, close_pending=False)
+                if isinstance(oid, str) and oid:
+                    outcome['merged_sha'] = oid
+                if previous_status not in ('stale', 'feedback_replan'):
+                    db.execute("UPDATE tasks SET state='merged',updated=? WHERE id=? AND state IN ('queued','blocked','obsolete') "
+                               "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND state='awaiting_approval')",
+                               (now, run['task'], run['task']))
             db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('delivery:' + run['id'], encode(
                 {'head': head, 'base': run['base'], 'branch': base_branch, 'repository': repo})))
         db.execute('UPDATE runs SET result=? WHERE id=? AND state=\'superseded\'', (encode(outcome), run['id']))
@@ -760,6 +774,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             if run["state"] in ["pr_open", "superseded"] and not isinstance(pr_url, str):
                 # result 中 pr 字段缺失或类型错误，后续 merge/close 判断无从谈起。
                 continue
+            if run["state"] == "superseded":
+                blocked_at = outcome.get("close_blocked_at")
+                if isinstance(blocked_at, (int, float)) and now - blocked_at < 3600:
+                    # 身份校验失配是可人工修复的状态：退避后再看，不要每个调度
+                    # 周期都查询同一个无法关闭的 PR。
+                    continue
             pr = pr_view(repo, pr_url) if run["state"] in ["pr_open", "superseded"] else None
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
@@ -785,6 +805,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         not isinstance(recovery_intent, dict) or pr.get('headRefName') != recovery_intent.get('branch') or
                         not isinstance(pr.get('headRepositoryOwner'), dict) or
                         str(pr['headRepositoryOwner'].get('login', '')).lower() != repo.split('/')[0].lower()):
+                    outcome['close_blocked_at'] = now
+                    outcome['close_blocked_reason'] = 'recovered PR identity does not match the sealed target'
+                    store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'",
+                                  (encode(outcome), run['id']))
+                    store.event('delivery_close_blocked', outcome['close_blocked_reason'],
+                                project['id'], run['id'])
                     continue
                 _close_superseded_pr(store, run, outcome, repo, pr,
                                      lambda: tracking_cancelled() or runtime.project(project['id'])['paused'])
