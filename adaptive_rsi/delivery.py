@@ -20,12 +20,35 @@ def _public_text(value, limit=4000):
     return text[:limit]
 
 
+def _json_object(raw):
+    """Parse a JSON field that may be missing, malformed, or a non-object value."""
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        value = None
+    return value if isinstance(value, dict) else {}
+
+
+def _dict_field(mapping, key):
+    """Read a dict-valued field; historical rows may store any JSON type there."""
+    value = mapping.get(key) if isinstance(mapping, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
 def pr_body(task, run, outcome):
     """Explain the delivered behavior and evidence without publishing private task text."""
-    value = outcome.get("value") or {}
-    review = outcome.get("review") or {}
-    evaluation = outcome.get("evaluation") or {}
-    files = outcome.get("files") or []
+    value = outcome.get("value")
+    if not isinstance(value, dict):
+        value = {}
+    review = outcome.get("review")
+    if not isinstance(review, dict):
+        review = {}
+    evaluation = outcome.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    files = outcome.get("files")
+    if not isinstance(files, list):
+        files = []
     lines = ["## 解决的问题", "", _public_text(task["title"], 500), ""]
     if value.get("benefit"):
         lines += ["## 预期效果", "", _public_text(value["benefit"]), ""]
@@ -38,7 +61,7 @@ def pr_body(task, run, outcome):
         lines += ["修改文件：", "", *file_lines, ""]
     lines += ["## 验证", "",
               "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
-              "- 独立验收：" + ("通过" if (evaluation.get("improvement") or {}).get("decision") == "pass" else "见运行记录"),
+              "- 独立验收：" + ("通过" if _dict_field(evaluation, "improvement").get("decision") == "pass" else "见运行记录"),
               "- 独立代码评审：" + ("通过" if review.get("decision") == "pass" else "未通过"),
               "", "## 运行信息", "",
               "- 运行：`" + run["id"] + "`",
@@ -216,8 +239,14 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     recovery = set(recovery_refs or ())
     pushed = pushed_branch_journal(repo, store)
     for branch in branches:
-        name, sha = branch["name"], branch.get("commit", {}).get("sha")
-        matching = [pr for pr in prs if pr.get("head", {}).get("ref") == name]
+        if not isinstance(branch, dict):
+            continue
+        name = branch.get("name")
+        commit = branch.get("commit")
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(name, str):
+            continue
+        matching = [pr for pr in prs if isinstance(pr, dict) and _dict_field(pr, "head").get("ref") == name]
         reason = None
         if not re.fullmatch(r"(?:feat|fix)/rsi-[A-Za-z0-9._-]+", name):
             reason = "not_managed"
@@ -227,11 +256,11 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
             reason = "protected_or_recovery"
         elif not complete:
             reason = "incomplete_inventory"
-        elif any(pr.get("state", "").lower() == "open" for pr in matching):
+        elif any(str(pr.get("state", "")).lower() == "open" for pr in matching):
             reason = "open_pr"
-        elif not matching or not any(pr.get("state", "").lower() == "closed" and
-                                     pr.get("head", {}).get("sha") == sha for pr in matching):
-            if not matching and any(head in (None, sha) for head in pushed.get(name, ())):
+        elif not matching or not any(str(pr.get("state", "")).lower() == "closed" and
+                                     sha is not None and _dict_field(pr, "head").get("sha") == sha for pr in matching):
+            if not matching and any(head is not None and head == sha for head in pushed.get(name, ())):
                 reason = "pushed_no_pr"
             else:
                 reason = "unverified_ownership"
@@ -245,8 +274,11 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
 
 def failure_attribution(merged, head, result):
     """A failing later mainline is not evidence that the delivered candidate failed."""
-    checks = result.get("checks") or {}
-    baseline_checks = [check for label, rows in checks.items() if label in ("baseline", "acceptance_baseline") for check in rows]
+    checks = result.get("checks") if isinstance(result, dict) else None
+    if not isinstance(checks, dict):
+        checks = {}
+    baseline_checks = [check for label, rows in checks.items() if label in ("baseline", "acceptance_baseline")
+                       and isinstance(rows, list) for check in rows if isinstance(check, dict)]
     baseline_passed = bool(baseline_checks) and all(check.get("passed") is True for check in baseline_checks)
     scope = "subsequent_mainline" if head != merged and baseline_passed else "unknown"
     return {"merged_sha": merged, "observed_head": head,
@@ -279,11 +311,21 @@ def publish(runtime, project, task, run, workspace, config):
         if not source or source["state"] in ["cancelled", "expired", "obsolete"]:
             # 批准之后、发出外部写操作之前源任务被取消/过期时，授权不再成立。
             raise Cancelled("Source task is cancelled or expired; publishing stopped")
-        if not authorization or authorization[0].get("authorization") not in ["project_policy", "per_candidate"]:
+        grant = authorization[0] if authorization else None
+        if not isinstance(grant, dict) or grant.get("authorization") not in ["project_policy", "per_candidate"]:
             raise RuntimeError("Publishing authorization is missing")
-        if authorization[0]["authorization"] == "project_policy" and (
-                json.loads(run["config"] or "{}").get("delivery", {}).get("mode") != "pr" or live["delivery"]["mode"] != "pr"):
-            raise RuntimeError("Automatic PR authorization was revoked")
+        if grant.get("authorization") == "project_policy":
+            try:
+                run_config = json.loads(run["config"] or "{}")
+            except (TypeError, ValueError):
+                run_config = {}
+            if not isinstance(run_config, dict):
+                run_config = {}
+            run_delivery = run_config.get("delivery")
+            if not isinstance(run_delivery, dict):
+                run_delivery = {}
+            if run_delivery.get("mode") != "pr" or live["delivery"]["mode"] != "pr":
+                raise RuntimeError("Automatic PR authorization was revoked")
         if (live["github"]["repository"] != config["github"]["repository"] or
                 live["delivery"]["base_branch"] != config["delivery"]["base_branch"]):
             raise StaleCandidate("Delivery target changed before publishing")
@@ -296,7 +338,13 @@ def publish(runtime, project, task, run, workspace, config):
         outcome = {}
     if not isinstance(outcome, dict):
         outcome = {}
-    if outcome.get("evaluation", {}).get("decision") != "pass" or outcome.get("review", {}).get("decision") != "pass":
+    evaluation = outcome.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    review = outcome.get("review")
+    if not isinstance(review, dict):
+        review = {}
+    if evaluation.get("decision") != "pass" or review.get("decision") != "pass":
         raise RuntimeError("Delivery gates did not pass")
     repo = config["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
@@ -396,12 +444,15 @@ def publish(runtime, project, task, run, workspace, config):
 
 def monitoring_due(outcome, config, now):
     from .storage_tools import pending_investigation
-    if pending_investigation(outcome.get("feedback", {})) is not None:
+    feedback_record = outcome.get("feedback")
+    if not isinstance(feedback_record, dict):
+        feedback_record = {}
+    if pending_investigation(feedback_record) is not None:
         return True
     if outcome.get("monitoring_completed"):
         return False
     return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
-            now - outcome.get("feedback_polled_at", outcome.get("feedback", {}).get("checked_at", 0)) >=
+            now - outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0)) >=
             config["delivery"]["feedback_minutes"] * 60)
 
 
@@ -559,10 +610,20 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         target_state = "unverified_merge"
                         outcome["delivery_status"] = "unverified_merge"
                     else:
-                        target_state = "merged"
-                        outcome["merged_sha"] = pr["mergeCommit"]["oid"]
-                        outcome["merged_at"] = now
-                        outcome["delivery_status"] = "merged"
+                        merge_commit = pr.get("mergeCommit")
+                        if not isinstance(merge_commit, dict):
+                            merge_commit = {}
+                        merged_oid = merge_commit.get("oid")
+                        if isinstance(merged_oid, str) and merged_oid:
+                            target_state = "merged"
+                            outcome["merged_sha"] = merged_oid
+                            outcome["merged_at"] = now
+                            outcome["delivery_status"] = "merged"
+                        else:
+                            # mergeCommit oid 缺失（merge-queue/GC）时保持 pr_open 重试，
+                            # 避免永久 merged 但 merged_sha 永远为空、反馈循环无法验证。
+                            target_state = "pr_open"
+                            outcome["delivery_status"] = "merge_sha_pending"
                     intent_key = "merge-intent:" + run["id"]
                     with store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
@@ -574,7 +635,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 intent = json.loads(row["value"])
                             except Exception:
                                 intent = None
-                        outcome["merged_by_local"] = bool(intent) and intent.get("head") == policy["head"]
+                        outcome["merged_by_local"] = isinstance(intent, dict) and intent.get("head") == policy["head"]  # type: ignore
                         db.execute("UPDATE runs SET state=?,result=? WHERE id=?", (target_state, encode(outcome), run["id"]))
                     run["state"] = target_state
                     if target_state == "unverified_merge":
@@ -587,7 +648,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 task_evidence = json.loads(task["evidence"] or "[]")
                             except (TypeError, ValueError):
                                 task_evidence = []
-                            original_id = task_evidence[0]["run"] if task_evidence else None
+                            if not isinstance(task_evidence, list):
+                                task_evidence = []
+                            first_evidence = task_evidence[0] if task_evidence else None
+                            original_id = first_evidence.get("run") if isinstance(first_evidence, dict) else None
                             if original_id:
                                 original = store.one("SELECT result,task FROM runs WHERE id=? AND project=?", (original_id, project["id"]))
                                 if original:
@@ -598,7 +662,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     if not isinstance(result, dict):
                                         result = {}
                                     result["reverted_by"] = run["id"]
-                                    result["feedback"] = {**result.get("feedback", {}), "state": "reverted"}
+                                    prior_feedback = result.get("feedback")
+                                    if not isinstance(prior_feedback, dict):
+                                        prior_feedback = {}
+                                    result["feedback"] = {**prior_feedback, "state": "reverted"}
                                     store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode(result), original_id))
                                     store.execute("UPDATE tasks SET state='reverted',updated=? WHERE id=?", (now, original["task"]))
                 elif pr["state"] == "CLOSED":
@@ -612,7 +679,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         run_config = json.loads(run["config"] or "{}")
                     except (TypeError, ValueError):
                         run_config = {}
-                    authorized = run_config.get("delivery", {}).get("auto_merge") and config["delivery"]["auto_merge"]
+                    authorized = _dict_field(run_config, "delivery").get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         _, remote, branch = baseline(runtime, project, config)
@@ -647,8 +714,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                             live_identity = store.setting("run-baseline:" + run["id"])
                             if (remote == policy["base"] and branch == policy["branch"] and
                                     live_run and live_run["state"] == "pr_open" and
-                                    json.loads(live_run["config"] or "{}").get("delivery", {}).get("auto_merge") and
-                                    json.loads(live_run["result"] or "{}").get("pr") == outcome["pr"] and
+                                    _dict_field(_json_object(live_run["config"]), "delivery").get("auto_merge") and
+                                    _json_object(live_run["result"]).get("pr") == outcome["pr"] and
                                     live_config["delivery"]["mode"] == "pr" and
                                     live_config["delivery"]["auto_merge"] and
                                     live_config["github"]["repository"] == repo and
@@ -739,7 +806,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         saved = {}
 
     def missing_artifacts():
-        previous = outcome.get("feedback", {})
+        previous = outcome.get("feedback")
+        if not isinstance(previous, dict):
+            previous = {}
         outcome["feedback_polled_at"] = now
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
@@ -779,11 +848,18 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
                                            "checks": {"type": "array", "items": object_schema({
                                                "name": {"type": "string"}, "argv": {"type": "array", "items": {"type": "string"}},
                                                "cwd": {"type": "string"}})}, "spec": SCHEMAS["acceptance"]}))
-        expected_acceptance = outcome.get("evaluation", {}).get("acceptance_hash")
+        outcome_evaluation = outcome.get("evaluation")
+        if not isinstance(outcome_evaluation, dict):
+            outcome_evaluation = {}
+        expected_acceptance = outcome_evaluation.get("acceptance_hash")
         if expected_acceptance and (not acceptance or acceptance.get("hash") != expected_acceptance):
             raise ValueError(MISSING_ARTIFACTS)
         seeds = run_artifact_path(runtime.store, run, "dependencies")
-        for relative in saved["environment"]["seed_paths"]:
+        saved_environment = saved.get("environment") if isinstance(saved.get("environment"), dict) else {}
+        seed_paths = saved_environment.get("seed_paths")
+        if not isinstance(seed_paths, list):
+            seed_paths = []
+        for relative in seed_paths:
             if not run_artifact_path(runtime.store, run, "dependencies/" + relative).is_dir():
                 raise ValueError(MISSING_ARTIFACTS)
     except (ValueError, OSError, RuntimeError):
@@ -804,7 +880,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
-    if not identity or not identity.get("repository") or not identity.get("branch"):
+    if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
         raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
     pinned = merge(saved, {"github": {"repository": identity["repository"]},
                             "delivery": {"base_branch": identity["branch"]}})
@@ -831,7 +907,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
     from .adapters import detect
     if acceptance:
         acceptance["change_kind"] = "preservation"
-    checks = saved["checks"]
+    checks = saved.get("checks")
+    if not isinstance(checks, list):
+        checks = None
     effective = pinned
     output_path("evaluation/report.json")
     # Post-merge verifications run the project's own fixed checks on committed
@@ -911,23 +989,37 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
 
 def investigate(runtime, project, run, outcome):
     from .storage_tools import pending_investigation
-    feedback_status = outcome["feedback"]
+    feedback_status = outcome.get("feedback")
+    if not isinstance(feedback_status, dict):
+        feedback_status = {}
+        outcome["feedback"] = feedback_status
     report = pending_investigation(feedback_status)
     if report is None:
         return
     failures = []
-    for label, rows in report["evaluation"].get("checks", {}).items():
+    evaluation = report.get("evaluation")
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    report_checks = evaluation.get("checks")
+    if not isinstance(report_checks, dict):
+        report_checks = {}
+    for label, rows in report_checks.items():
+        if not isinstance(rows, list):
+            continue
         for check in rows:
-            if not check.get("passed") and len(failures) < 5:
-                failures.append({"group": label, "name": check.get("name", "")[:200],
-                                 "output": (check.get("stderr", "") + check.get("stdout", ""))[-1200:]})
+            if isinstance(check, dict) and not check.get("passed") and len(failures) < 5:
+                failures.append({"group": label, "name": str(check.get("name", ""))[:200],
+                                 "output": (str(check.get("stderr", "")) + str(check.get("stdout", "")))[-1200:]})
+    report_head = report.get("head")
+    if not isinstance(report_head, str):
+        report_head = "unknown"
     body = "Investigate observed post-merge mainline failure while monitoring run " + run["id"] + ". "
     body += "This does not prove a regression caused by the candidate. Attribution: " + encode(report.get("attribution", {"scope": "unknown"})) + ". "
-    body += "Reproduce and assess value before changing code. Mainline: " + report["head"] + ". "
+    body += "Reproduce and assess value before changing code. Mainline: " + report_head + ". "
     body += "Full evidence is retained in the run's feedback report. Bounded excerpts: " + encode(failures)
-    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + run["id"] + ":" + report["head"],
+    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + run["id"] + ":" + report_head,
                                   "Investigate verified post-merge regression", body,
-                                  evidence=[{"run": run["id"], "head": report["head"], "checks": failures}], priority=100)
+                                  evidence=[{"run": run["id"], "head": report_head, "checks": failures}], priority=100)
     report["investigation_pending"] = False
     report["investigation_task"] = task
     feedback_status.update(investigation_pending=False, investigation_task=task)
