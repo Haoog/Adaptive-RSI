@@ -987,7 +987,11 @@ class Handler(BaseHTTPRequestHandler):
                             result = center.edit_model(body.get("provider"), body.get("model"), project)
                         elif path == "/api/model-center/routes":
                             expected = body.get("revision")
-                            if expected is not None and int(expected) != runtime.store.config_revision(body.get("project")):
+                            try:
+                                expected = int(expected) if expected is not None else None
+                            except (TypeError, ValueError):
+                                raise RequestError("Invalid revision") from None
+                            if expected is not None and expected != runtime.store.config_revision(body.get("project")):
                                 raise RequestError("Configuration changed in another window; reload before saving")
                             result = center.save_routes(body.get("models"), project,
                                                         **({"inherit": body["inherit"]} if "inherit" in body else {}))
