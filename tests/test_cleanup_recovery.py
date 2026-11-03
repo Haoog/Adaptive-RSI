@@ -585,6 +585,44 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         self.assertEqual((self.store.root / 'recycle' / ('receipt.invalid-' + '0' * 32) / 'receipt.json')
                          .read_text(encoding='utf-8'), '{broken')
 
+    def test_deep_nested_dependency_tree_is_removed_without_recursion(self):
+        # 深层嵌套（node_modules 式依赖树）超过默认递归上限；此前递归删除
+        # 触发 RecursionError 且运行永久卡在保留清理里。目录构造与后续删除
+        # 一样走 dir_fd 相对路径，避免绝对路径超出 macOS PATH_MAX。
+        depth = 1200
+        outside = Path(self.temp.name) / 'outside'
+        outside.mkdir()
+        sentinel = outside / 'keep.txt'
+        sentinel.write_text('must remain')
+        (self.directory / 'dependencies').mkdir()
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(self.directory / 'dependencies', flags)
+        try:
+            for level in range(depth):
+                os.mkdir('d', dir_fd=descriptor)
+                deeper = os.open('d', flags, dir_fd=descriptor)
+                if level:
+                    # 除根目录外每层封成只读，覆盖依赖副本冻结读权限的删除路径；
+                    # 下一层目录已经建好才封父目录，构造本身不需要上行。
+                    os.chmod('..', 0o555, dir_fd=deeper)
+                os.close(descriptor)
+                descriptor = deeper
+            fd = os.open('evidence.txt', os.O_CREAT | os.O_WRONLY, 0o644, dir_fd=descriptor)
+            os.close(fd)
+            os.symlink(str(outside), 'link', dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+
+        self.assertTrue(maintenance._remove_run_artifacts(self.store, 'r', 'p', self.directory))
+
+        self.assertFalse((self.directory / 'dependencies').exists())
+        self.assertFalse((self.directory / 'workspace').exists())
+        row = self.store.one('SELECT path FROM runs WHERE id=?', ('r',))
+        self.assertIsNotNone(row)
+        self.assertIsNone(row['path'])
+        # 深层只读树中的符号链接只被解除，不得沿链接修改或删除外部目标。
+        self.assertEqual(sentinel.read_text(), 'must remain')
+
     def test_partial_recycle_move_failure_restores_all_artifacts(self):
         (self.directory / 'candidate').mkdir()
         (self.directory / 'candidate' / 'evidence').write_text('candidate')
