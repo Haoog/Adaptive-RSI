@@ -842,11 +842,14 @@ class Evaluator:
         if clear:
             for relative in config["environment"]["seed_paths"]:
                 seeded = target / relative
-                if seeded.exists():
-                    if seeded.is_symlink():
-                        seeded.unlink()
-                    else:
-                        shutil.rmtree(seeded)
+                if not seeded.exists() and not seeded.is_symlink():
+                    continue
+                if seeded.is_symlink() or not seeded.is_dir():
+                    # 候选在 seed 路径留下的普通文件/符号链接按清除语义移除；
+                    # 只有真实目录才允许 rmtree，否则抛 NotADirectoryError。
+                    seeded.unlink()
+                else:
+                    shutil.rmtree(seeded)
         restore(seeds, target, config)
 
     def _standard_stage(self, label, source, baseline, candidate, checks, directory, config, cancel,
