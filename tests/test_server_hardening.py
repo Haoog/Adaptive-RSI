@@ -698,6 +698,33 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(set(result), {"id", "bytes", "created"})
         self.assertTrue((self.backups / (result["id"] + ".sqlite3")).is_file())
 
+    def test_rehearsal_report_path_is_confined_to_state_directory(self):
+        from adaptive_rsi import storage_tools
+
+        snapshot = storage_tools.backup(self.store)
+        victim = self.root / "victim.txt"
+        victim.write_text("ORIGINAL CONTENT")
+        cases = [
+            # 状态目录之外的绝对路径与相对逃逸都不得写文件。
+            str(victim),
+            str(self.store.root / "reports" / ".." / ".." / "victim.txt"),
+        ]
+        for destination in cases:
+            status, _, body = self.request("/api/rehearse-restore", "POST",
+                                           {"id": snapshot["id"], "report": destination})
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(body)["error"], "report_outside_state_directory")
+        self.assertEqual(victim.read_text(), "ORIGINAL CONTENT")
+
+        # 状态目录内的合法目标（reports/ 与 backups/ 下）仍然允许。
+        for destination in (str(self.store.root / "reports" / "api-rehearsal.json"),
+                            str(self.store.root / "backups" / "api-rehearsal.json")):
+            status, _, body = self.request("/api/rehearse-restore", "POST",
+                                           {"id": snapshot["id"], "report": destination})
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)["valid"])
+            self.assertTrue(Path(destination).is_file())
+
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，
         # 否则反复失败会耗尽信号量并让服务器永久拒接新连接。
