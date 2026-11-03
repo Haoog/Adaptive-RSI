@@ -1918,7 +1918,12 @@ class Runtime(Maintenance):
         key = "inspection-head:" + project["id"] + ":" + kind
         ci = self.store.setting("ci:" + project["id"], [])
         modules = detect(workspace)
-        rotation = int(self.store.setting("rotation:" + project["id"], 0))
+        rotation = self.store.setting("rotation:" + project["id"], 0)
+        if not isinstance(rotation, int) or isinstance(rotation, bool) or rotation < 0:
+            self.store.event("inspection_rotation_reset",
+                             "Stored module rotation is invalid; restarting from the first module",
+                             project["id"], run["id"], {"stored": rotation})
+            rotation = 0
         selected = modules["modules"][rotation % len(modules["modules"])] if modules["modules"] else None
         selected_key = key + ":" + fingerprint(selected)
         module_head_key = selected_key + ":head"
