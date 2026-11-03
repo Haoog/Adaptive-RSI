@@ -1440,9 +1440,12 @@ class Runtime(Maintenance):
             # 因此每步先按「持久效果已存在」判定：已生效则跳过调用，未生效才真正执行，
             # 保证 at-least-once 且重放不产生重复副作用。
             if step == 'delivery':
+                # 只有当 publish 任务仍在办时 deliver 才是纯只读空转；处于 failed/
+                # blocked/cancelled 的既有任务会被 deliver 重新入队，不能按「存在」跳过。
                 if (config['delivery']['mode'] == 'pr' and self.config(run['project'])['delivery']['mode'] == 'pr'
                         and run['state'] == 'awaiting_approval' and not self.store.one(
-                            'SELECT 1 FROM tasks WHERE project=? AND fingerprint=?',
+                            "SELECT 1 FROM tasks WHERE project=? AND fingerprint=? "
+                            "AND state IN ('queued','planning','executing','evaluating')",
                             (run['project'], 'publish:' + run['id']))):
                     self.deliver(run['id'], automatic=True)
             elif step == 'observation':

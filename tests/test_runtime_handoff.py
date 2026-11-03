@@ -549,6 +549,44 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(len(self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
                                               (project, 'publish:' + run['id']))), 1)
 
+    def test_postprocess_evolution_enqueued_task_survives_watermark_loss(self):
+        # maybe_evolve 先入队 system_evolve 任务再写 last-evolution: 水位；崩溃落在
+        # 两者之间时任务已持久化而水位丢失。下一轮 drain 重放必须归还既有任务并补写
+        # 水位，不能因水位已写而永久丢失这次进化机会（旧顺序的失败模式）。
+        project = self.runtime.add_project(fixture(self.root / 'evolve-watermark'))
+        self.runtime.configure({'evolution': {'enabled': True, 'every_completed': 1}}, project)
+        self.runtime.pause(project, False)
+        self.runtime.goal(project, 'Evolution watermark loss')
+        run = self.store.claim(project, self.runtime.config(project))
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {'summary': 'Verified outcome'}, True)
+
+        stamp_key = 'last-evolution:' + project
+        original = self.store.put_setting
+        def lose_watermark(key, value):
+            if key == stamp_key:
+                raise OSError('crash before watermark write')
+            return original(key, value)
+        with patch.object(self.store, 'put_setting', side_effect=lose_watermark):
+            self.runtime.drain_postprocess()
+        # 任务已入队但水位未写：恰好是 kill -9 落在崩溃窗口留下的中间态。
+        # （scheduler_scope 记录错误并吞掉异常，drain 本身不向上传播。）
+        evolve = self.store.query("SELECT id,state FROM tasks WHERE project=? AND source='system_evolve'",
+                                  (project,))
+        self.assertEqual(len(evolve), 1)
+        self.assertIsNone(self.store.setting(stamp_key))
+
+        # 重放：任务指纹去重不产生第二条，水位补写，回执完成。
+        self.runtime.drain_postprocess()
+        evolve = self.store.query("SELECT id FROM tasks WHERE project=? AND source='system_evolve'",
+                                  (project,))
+        self.assertEqual(len(evolve), 1)
+        self.assertEqual(self.store.setting(stamp_key), 1)
+        self.assertEqual(self.store.setting('postprocess:' + run['id'])['state'], 'completed')
+        self.runtime.drain_postprocess()
+        self.assertEqual(len(self.store.query(
+            "SELECT id FROM tasks WHERE project=? AND source='system_evolve'", (project,))), 1)
+
     def test_postprocess_monitor_crash_before_and_after_recovers_without_duplicates(self):
         for boundary in ('before', 'after'):
             with self.subTest(boundary=boundary):
