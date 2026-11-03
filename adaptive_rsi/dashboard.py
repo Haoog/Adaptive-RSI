@@ -64,6 +64,15 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
         for row in runs:
             if row["ended"] is None:
                 row["task_title"] = titles.get(row["task"])
+        active_ids = [row["id"] for row in runs if row["ended"] is None]
+        calls = store.query("SELECT run,role,provider,model FROM calls WHERE state='reserved' AND run IN (" +
+                            ",".join("?" for _ in active_ids) + ") ORDER BY created DESC,id DESC", active_ids)
+        current_models = {}
+        for call in calls:
+            current_models.setdefault(call["run"], {key: call[key] for key in ("role", "provider", "model")})
+        for row in runs:
+            if row["ended"] is None:
+                row["current_model"] = current_models.get(row["id"])
     if runs:
         stage_rows = store.query(
             "SELECT s.run,s.stage,s.created,json_extract(CASE WHEN json_valid(s.data) THEN s.data ELSE '{}' END,'$.decision') AS decision "

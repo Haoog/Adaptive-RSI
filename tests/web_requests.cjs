@@ -2012,6 +2012,31 @@ function revisionMetadataPage(task, metadata) {
   return page;
 }
 
+test('an active task accepts a supplement and reports its pending application', async () => {
+  for (const state of ['planning', 'executing', 'evaluating', 'awaiting_approval']) {
+    const task = fixtureTask('active-' + state, state), posts = [];
+    const page = revisionMetadataPage(task, {...task, available: 0, revisions: []});
+    page.context.fetch = async (url, options) => {
+      if (options?.method === 'POST') {
+        posts.push(JSON.parse(options.body));
+        return response({saved: true, pending: state !== 'awaiting_approval'});
+      }
+      if (url.includes('/task-runs?')) return response([]);
+      if (url.includes('/task?')) return response({...task, available: 0, revisions: []});
+      return response({tasks: []});
+    };
+    const controls = await openExperienceTask(page, task);
+    const form = supplementForm(controls);
+    assert.ok(form, `supplement form available during ${state}`);
+    form.children[0].children[0].value = 'Extra requirement';
+    form.onsubmit({preventDefault() {}});
+    await page.context.lastAction;
+    assert.equal(posts[0].supplement, 'Extra requirement');
+    assert.match(page.node('toast').textContent,
+      state === 'awaiting_approval' ? /已保存/ : /已收到.*下一轮/);
+  }
+});
+
 test('detail retry is offered only for a queued task waiting on backoff', async () => {
   for (const [offset, expected] of [[3600, true], [0, false]]) {
     const task = fixtureTask('child', 'queued');
@@ -2800,6 +2825,16 @@ function modelScopePage(savedDrafts = new Map()) {
     hold(){holdNext=true;},failProbe(){probeFailure=true;},release(){assert(held);release();}
   };
 }
+
+test('Magpie preset fills the local OpenAI-compatible gateway without a credential', async()=>{
+  const page=modelScopePage();await page.show('a');
+  page.node('mc-provider-preset').value='magpie';
+  page.node('mc-provider-preset').handlers.change();
+  assert.equal(page.node('mc-input-name').value,'Magpie');
+  assert.equal(page.node('mc-input-url').value,'http://127.0.0.1:3425/v1');
+  assert.equal(page.node('mc-input-protocol').value,'chat_completions');
+  assert.equal(page.node('mc-input-auth').value,'none');
+});
 
 for(const length of [160,161,256])for(const name of ['', '短显示名'])test(`custom model form preserves ${length}-character ID with ${name?'explicit':'blank'} name`,async()=>{
   const page=modelScopePage();await page.show('a');

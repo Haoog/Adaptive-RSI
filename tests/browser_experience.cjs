@@ -682,6 +682,11 @@ async function checkQueueEditor(page, evidence) {
     });
     await page.locator('[data-mc-tab="providers"]').click();
     await page.locator('#mc-add-provider').click();
+    await page.locator('#mc-provider-preset').selectOption('magpie');
+    assert.equal(await page.locator('#mc-input-name').inputValue(),'Magpie');
+    assert.equal(await page.locator('#mc-input-url').inputValue(),'http://127.0.0.1:3425/v1');
+    assert.equal(await page.locator('#mc-input-protocol').inputValue(),'chat_completions');
+    assert.equal(await page.locator('#mc-input-auth').inputValue(),'none');
     await page.locator('#mc-provider-preset').selectOption('opencode_go');
     assert.equal(await page.locator('#mc-input-name').inputValue(),'OpenCode Go');
     assert.equal(await page.locator('#mc-input-url').inputValue(),'');

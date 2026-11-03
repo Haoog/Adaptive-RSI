@@ -178,6 +178,116 @@ class RuntimeTest(unittest.TestCase):
             runs = list(pool.map(lambda _: self.store.claim(self.project, self.runtime.config(self.project)), range(4)))
         self.assertEqual(sum(r is not None for r in runs), 1)
 
+    def test_issue_sync_can_overlap_one_task_and_pause_stops_both(self):
+        self.runtime.configure({"limits": {"concurrency": 2}})
+        self.runtime.configure({"github": {"repository": "owner/project"}}, self.project)
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Fix addition")
+        sync_task = self.runtime.request(self.project, "issues")
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        guard = threading.Lock()
+
+        def worker(run):
+            with guard:
+                calls.append(run)
+                if len(calls) == 2:
+                    entered.set()
+            release.wait(10)
+
+        try:
+            with patch.object(self.runtime, "process", side_effect=worker):
+                self.runtime.dispatch([(self.runtime.project(self.project), self.runtime.config(self.project))])
+                self.assertTrue(entered.wait(5), "Issue synchronization and task should overlap")
+                self.assertEqual({run["task"] for run in calls}, {task, sync_task})
+                self.runtime.goal(self.project, "Another code task")
+                self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+                self.runtime.pause(self.project, True)
+                self.assertTrue(all(self.runtime.is_cancelled(run) for run in calls))
+        finally:
+            release.set()
+            for future in list(self.runtime.futures):
+                future.result(timeout=5)
+
+    def test_issue_sync_does_not_overtake_pending_publish(self):
+        self.runtime.configure({"github": {"repository": "owner/project"}}, self.project)
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Fix addition")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        self.runtime.deliver(run["id"])
+        self.runtime.request(self.project, "issues")
+        publishing = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(self.store.one("SELECT source FROM tasks WHERE id=?", (publishing["task"],)),
+                         {"source": "system_publish"})
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+
+    def test_issue_sync_is_single_claim_and_blocks_delivery_in_both_orders(self):
+        self.runtime.configure({"github": {"repository": "owner/project"}}, self.project)
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Fix addition")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        sync = self.runtime.request(self.project, "issues", priority=200)
+        self.runtime.deliver(run["id"])
+        self.runtime.request(self.project, "issues", priority=200)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            runs = list(pool.map(lambda _: self.store.claim(self.project, self.runtime.config(self.project)), range(4)))
+        active = [item for item in runs if item is not None]
+        self.assertEqual([item["task"] for item in active], [sync])
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+        self.runtime.pause(self.project, True)
+        self.store.recover()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (active[0]["id"],)),
+                         {"state": "interrupted"})
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+
+    def test_held_issue_feedback_is_rescheduled_before_pending_publish(self):
+        self.runtime.configure({"github": {"repository": "owner/project"}}, self.project)
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, "Fix addition")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        self.runtime.deliver(run["id"])
+        self.store.put_setting("issue-sync:" + str(self.project), {"pending": {"1": {"number": 1}}})
+        original = self.runtime.config(self.project)
+        self.runtime.schedule(self.project, original, now=100)
+        sync_task = self.store.one("SELECT state,priority FROM tasks WHERE project=? AND source='system_issues'",
+                                   (self.project,))
+        self.assertEqual(sync_task, {"state": "queued", "priority": 1000})
+
+    def test_held_issue_feedback_is_claimed_before_urgent_publish(self):
+        self.runtime.configure({"github": {"repository": "owner/project"}}, self.project)
+        self.runtime.pause(self.project, False)
+        self.runtime.goal(self.project, "Fix addition")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        self.store.execute("UPDATE tasks SET urgency=1 WHERE id=?", (publication,))
+        self.store.put_setting("issue-sync:" + str(self.project), {"pending": {"1": {"number": 1}}})
+        self.runtime.schedule(self.project, self.runtime.config(self.project))
+        selected = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(self.store.one("SELECT source FROM tasks WHERE id=?", (selected["task"],)),
+                         {"source": "system_issues"})
+
+    def test_issue_sync_does_not_keep_replay_priority_for_later_periodic_scans(self):
+        self.runtime.configure({"github": {"repository": "owner/project"},
+                                "sources": {"issues": True}}, self.project)
+        self.runtime.pause(self.project, False)
+        self.store.put_setting("issue-sync:" + str(self.project), {"pending": {"1": {"number": 1}}})
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100)
+        sync_run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(sync_run["id"], "completed", {}, True)
+        self.store.put_setting("issue-sync:" + str(self.project), {"pending": {}})
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100000)
+        sync_task = self.store.one("SELECT priority,urgency FROM tasks WHERE id=?", (sync_run["task"],))
+        self.assertEqual(sync_task, {"priority": 90, "urgency": 0})
+
     def test_resume_coalesces_missed_intervals(self):
         self.runtime.configure({"sources": {"inspection": True}}, self.project)
         config = self.runtime.config(self.project)
@@ -349,6 +459,60 @@ class RuntimeTest(unittest.TestCase):
         self.runtime.process(run)
         self.assertEqual(sum(r[0] == "analysis" for r in self.agent.roles), 1)
         self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='inspection'")), 1)
+
+    def test_scheduled_inspection_without_goals_queues_a_discovery_for_planning(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        self.runtime.pause(self.project, False)
+        config = self.runtime.config(self.project)
+        self.runtime.schedule(self.project, config, now=100)
+        scan = self.store.claim(self.project, config)
+        assert scan is not None
+        self.runtime.process(scan)
+        discovery = self.store.one("SELECT * FROM tasks WHERE project=? AND source='inspection'", (self.project,))
+        assert discovery is not None
+        self.assertEqual((discovery["title"], discovery["state"]), ("Addition subtracts", "queued"))
+        self.assertEqual(json.loads(discovery["evidence"])[0]["quote"], "return a - b")
+        self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='goal'"), [])
+
+        seen = []
+
+        def planning(role, prompt, *args, **kwargs):
+            self.assertEqual(role, "planning")
+            seen.append(json.loads(prompt.split("\n")[-1])["task"])
+            return {"decision": "deferred", "reason": "Fixture stops after planning", "scope": [],
+                    "acceptance": [], "risk": "low", "value": {
+                        "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Fixture",
+                        "cost": "Fixture", "inaction": "Fixture", "evidence": ["Observed defect"]}}
+
+        run = self.store.claim(self.project, config)
+        assert run is not None
+        self.assertEqual(run["task"], discovery["id"])
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                patch.object(self.runtime, "invoke", side_effect=planning):
+            self.runtime.process(run)
+        self.assertEqual(seen[0]["source"], "inspection")
+        self.assertEqual(seen[0]["body"], "add(2, 3) returns -1")
+        result = self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(result, {"state": "deferred"})
+
+    def test_empty_inspection_does_not_stop_future_cycles(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        self.runtime.pause(self.project, False)
+        config = self.runtime.config(self.project)
+        with patch.object(self.runtime, "invoke", return_value={"findings": []}) as invoke:
+            self.runtime.schedule(self.project, config, now=100)
+            first = self.store.claim(self.project, config)
+            assert first is not None
+            self.runtime.process(first)
+            self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='inspection'"), [])
+            self.runtime.schedule(self.project, config, now=100 + config["schedule"]["light_minutes"] * 60)
+            second = self.store.claim(self.project, config)
+            assert second is not None
+            self.runtime.process(second)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],)), {"state": "completed"})
+        self.assertEqual(invoke.call_count, 1)
+        self.assertTrue(self.store.query("SELECT seq FROM events WHERE kind='inspection_skip'"))
 
     def test_rediscovered_failure_requeues_instead_of_being_suppressed(self):
         from adaptive_rsi.discovery import finding_identity

@@ -29,6 +29,32 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def issue_snapshot_pending(db, project, task):
+    row = db.execute("SELECT fingerprint,source FROM tasks WHERE id=? AND project=?", (task, project)).fetchone()
+    if not row or row["source"] != "issue":
+        return False
+    setting = db.execute("SELECT value FROM settings WHERE key=?", ("issue-sync:" + project,)).fetchone()
+    try:
+        progress = json.loads(setting["value"]) if setting else {}
+        pending = progress.get("pending", {})
+        repo = progress.get("repository", "")
+        prefix = "issue:" + repo.lower() + ":"
+        if not isinstance(pending, dict):
+            return False
+        if row["fingerprint"].startswith(prefix):
+            return row["fingerprint"][len(prefix):] in pending
+        if row["fingerprint"].startswith("issue:"):
+            number = row["fingerprint"][len("issue:"):]
+            evidence = db.execute("SELECT evidence FROM tasks WHERE id=?", (task,)).fetchone()
+            data = json.loads(evidence["evidence"])
+            return (number in pending and data[0].get("number") == int(number) and
+                    str(data[0].get("url", "")).lower().rstrip("/") ==
+                    "https://github.com/" + repo.lower() + "/issues/" + number)
+        return False
+    except (TypeError, ValueError, AttributeError, IndexError, KeyError):
+        return False
+
+
 def decode_object(value):
     """Isolate malformed historical read-model evidence without rewriting it."""
     try:
@@ -923,14 +949,41 @@ class Store:
                 "(SELECT 1 FROM task_dependencies d LEFT JOIN tasks p ON p.id=d.dependency "
                 "WHERE d.task=tasks.id AND (p.id IS NULL OR p.state<>'merged'))")
 
+    @staticmethod
+    def compatible_source_clause(active_sources):
+        if len(active_sources) >= 2:
+            return None
+        if not active_sources:
+            return ""
+        # Remote delivery and Issue synchronization share candidate state; serialize
+        # them, while allowing Issue polling beside work in an isolated snapshot.
+        if active_sources[0] in ("system_publish", "system_delivery"):
+            return None
+        return (" AND source NOT IN ('system_issues','system_publish','system_delivery')"
+                if active_sources[0] == "system_issues" else " AND source='system_issues'")
+
+    @staticmethod
+    def compatible_source(active_sources, source):
+        if len(active_sources) >= 2:
+            return False
+        if not active_sources:
+            return True
+        active = active_sources[0]
+        return ((active == "system_issues" and source not in ("system_issues", "system_publish", "system_delivery")) or
+                (source == "system_issues" and active not in ("system_issues", "system_publish", "system_delivery")))
+
     def claim(self, project, config):
         now = time.time()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
-            busy = db.execute("SELECT 1 FROM runs WHERE project=? AND ended IS NULL", (project,)).fetchone()
+            active = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                                "WHERE r.project=? AND r.ended IS NULL", (project,)).fetchall()
             archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
-            if not p or p["paused"] or busy or archived:
+            # At most one Issue synchronization may overlap one ordinary task;
+            # two code/delivery/inspection workers remain mutually exclusive.
+            source_filter = self.compatible_source_clause([row["source"] for row in active])
+            if not p or p["paused"] or archived or source_filter is None:
                 return None
             from .config import merge, validate
             task = None
@@ -939,12 +992,19 @@ class Store:
                                 "WHERE r.project=? ORDER BY r.started DESC,r.id DESC LIMIT 3", (project,)).fetchall()
             fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
                           len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
+            skipped = []
             while True:
-                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() + " "
-                                       "ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
-                                       (project, now, now)).fetchone()
+                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
+                                       source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
+                                       " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
+                                       (project, now, now, *skipped)).fetchone()
                 if not candidate:
                     return None
+                if candidate["source"] == "system_publish":
+                    source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
+                    if source and issue_snapshot_pending(db, project, source["task"]):
+                        skipped.append(candidate["id"])
+                        continue
                 # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
                 # 否则裸解析异常会让项目所有任务永远领不到。
                 try:
@@ -1002,6 +1062,10 @@ class Store:
             if not row or row["ended"] is not None:
                 return False
             task = db.execute("SELECT state FROM tasks WHERE id=?", (row["task"],)).fetchone()
+            revision_key = "revision-pending:" + run
+            revision_pending = db.execute("SELECT 1 FROM settings WHERE key=?", (revision_key,)).fetchone()
+            issue_revision_key = "issue-revision-pending:" + run
+            issue_revision_pending = db.execute("SELECT 1 FROM settings WHERE key=?", (issue_revision_key,)).fetchone()
             # 已发出的远端操作保留事实；其余状态和自动重试必须服从同事务读取的停止请求。
             if state not in ["merged", "pr_open"]:
                 if task and task["state"] == "cancelled":
@@ -1010,6 +1074,17 @@ class Store:
                 elif db.execute("SELECT 1 FROM settings WHERE key=?", ("run-stop:" + run,)).fetchone():
                     state, terminal, task_fields = "interrupted", True, None
                     result = {**(result or {}), "reason": "Project pause requested; retry creates a fresh run"}
+                elif revision_pending or issue_revision_pending:
+                    state, terminal = "superseded", True
+                    task_fields = {"state": "blocked" if issue_revision_pending else "queued", "available": 0, "attempts": 0,
+                                   "infra_retries": 0, "budget_waits": 0}
+                    reason = ("Issue changed; synchronize before fresh planning" if issue_revision_pending else
+                              "Requirements changed; fresh run scheduled")
+                    result = {**(result or {}), "reason": reason}
+            if terminal and revision_pending:
+                db.execute("DELETE FROM settings WHERE key=?", (revision_key,))
+            if terminal and issue_revision_pending:
+                db.execute("DELETE FROM settings WHERE key=?", (issue_revision_key,))
             # result 列允许 NULL（schema 未加 NOT NULL）；历史写入的 'null'/'[]' 等
             # 非对象 JSON 也不是 dict。两种都必须降级为空 dict，否则 transition
             # 抛 TypeError、recover() 在第一行坏数据上中止，剩余待恢复的运行

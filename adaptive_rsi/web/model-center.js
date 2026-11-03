@@ -2,6 +2,7 @@
 window.RSIModelCenter = (() => {
   const presets = {
     custom: {name:'我的中转站',protocol:'chat_completions',base_url:'',env_key:'MODEL_API_KEY'},
+    magpie: {name:'Magpie',protocol:'chat_completions',base_url:'http://127.0.0.1:3425/v1',env_key:''},
     opencode_go: {name:'OpenCode Go',protocol:'chat_completions',base_url:'',env_key:'OPENCODE_API_KEY'},
     openai: {name:'OpenAI API',protocol:'responses',base_url:'https://api.openai.com/v1',env_key:'OPENAI_API_KEY'},
     anthropic: {name:'Anthropic',protocol:'anthropic',base_url:'https://api.anthropic.com/v1',env_key:'ANTHROPIC_API_KEY'},

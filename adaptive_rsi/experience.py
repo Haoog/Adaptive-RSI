@@ -94,7 +94,9 @@ def protected_feedback_values(store, task):
 def queue_status(store, project):
     now = time.time()
     paused = store.one("SELECT paused FROM projects WHERE id=?", (project,))
-    busy = store.one("SELECT id FROM runs WHERE project=? AND ended IS NULL", (project,))
+    active = store.query("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                         "WHERE r.project=? AND r.ended IS NULL", (project,))
+    active_sources = [row["source"] for row in active]
     rows = store.query("SELECT * FROM tasks WHERE project=? AND state='queued' ORDER BY " + store.queue_order(), (project, now))
     # 一次 JOIN 取回全部排队任务的依赖，避免逐条查询。
     dependencies = {}
@@ -106,9 +108,10 @@ def queue_status(store, project):
     for row in rows:
         parents = dependencies.get(row["id"], [])
         dependency = next((parent for parent in parents if parent["state"] != "merged"), parents[0] if parents else None)
+        busy = not store.compatible_source(active_sources, row["source"])
         reason = "dependency" if dependency and dependency["state"] != "merged" else "backoff" if row["available"] > now else "paused" if paused and paused["paused"] else "running" if busy else "ready"
-        if reason in ["running", "ready"]:
+        if reason == "ready":
             ready += 1
-        row.update(wait_reason=reason, queue_position=ready if reason in ["running", "ready"] else None,
+        row.update(wait_reason=reason, queue_position=ready if reason == "ready" else None,
                    dependency=dependency, dependencies=parents)
     return rows

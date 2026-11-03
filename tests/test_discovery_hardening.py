@@ -606,6 +606,9 @@ class IssueRequirementsTest(unittest.TestCase):
 
     def test_remote_updates_and_revisions_reach_actual_planning_input(self):
         from adaptive_rsi.gitops import git
+        from adaptive_rsi.delivery import record_pr_feedback
+        record_pr_feedback(self.store, {"id": "prior-run", "project": self.project_id, "task": self.task_id},
+                           "https://example/pr/1", {"reviews": [{"id": "R1", "body": "Add regression coverage"}]})
         self.runtime.revise_task(self.task_id, "Mandatory: reject negative inputs")
         self.update("upstream v2")
         self.runtime.revise_task(self.task_id, "Keep zero valid")
@@ -639,6 +642,7 @@ class IssueRequirementsTest(unittest.TestCase):
             self.runtime.process(run)
         self.assertEqual(len(prompts), 1)
         self.assertEqual(prompts[0]["task"]["body"], expected)
+        self.assertEqual(prompts[0]["untrusted_pr_feedback"][0]["body"], "Add regression coverage")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "deferred")
 
     def test_legacy_intact_and_lost_additions_migrate_once_on_unchanged_source(self):
@@ -724,23 +728,257 @@ class IssueRequirementsTest(unittest.TestCase):
         self.update("replacement")
         self.assertEqual(self.task()["body"], "replacement\n\nsame text\n\nsame text")
 
-    def test_active_and_stopping_runs_keep_sealed_input_until_finished(self):
+    def test_active_issue_supplement_and_remote_revision_preserve_both_requirements(self):
         self.runtime.revise_task(self.task_id, "local")
         self.runtime.pause(self.project_id, False)
         run = self.store.claim(self.project_id, self.config)
         before = self.task()
         self.update("new upstream")
         self.assertEqual(self.task(), before)
-        with self.assertRaisesRegex(ValueError, "active run"):
-            self.runtime.revise_task(self.task_id, "forbidden while active")
+        receipt = self.runtime.revise_task(self.task_id, "added while active")
+        self.assertTrue(receipt["pending"])
+        self.assertEqual(self.task()["body"], before["body"] + "\n\nadded while active")
         self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (self.task_id,))
         failed = self.task()
         self.synchronize([])
         self.assertEqual(self.task(), failed)
-        self.store.execute("UPDATE runs SET state='failed',ended=1 WHERE id=?", (run["id"],))
+        self.store.transition(run["id"], "failed", {}, True)
         self.synchronize([])
-        self.assertEqual((self.task()["state"], self.task()["body"]), ("queued", "new upstream\n\nlocal"))
+        self.assertEqual((self.task()["state"], self.task()["body"]),
+                         ("queued", "new upstream\n\nlocal\n\nadded while active"))
         self.assertEqual(self.store.setting("issue-sync:" + self.project_id)["pending"], {})
+
+    def test_parallel_issue_sync_is_consumed_after_running_issue_completes(self):
+        import threading
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="new feedback while working", updated_at=self.issue["updated_at"] + "1")
+        sync_task = self.runtime.request(self.project_id, "issues")
+        sync_run = self.store.claim(self.project_id, self.config)
+        assert sync_run is not None
+        self.assertEqual(sync_run["task"], sync_task)
+        calls = []
+
+        def remote(args, **kwargs):
+            calls.append(args)
+            return encode([self.issue]) if args[1] == "api" else "[]"
+
+        with patch("adaptive_rsi.runtime.checked", side_effect=remote):
+            worker = threading.Thread(target=self.runtime.process, args=(sync_run,))
+            worker.start()
+            worker.join(10)
+            self.assertFalse(worker.is_alive())
+        self.assertTrue(calls)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (sync_run["id"],)),
+                         {"state": "completed"})
+        active_task = self.task()
+        assert active_task is not None
+        self.assertEqual(active_task["body"], "owner/project body")
+        progress = self.store.setting("issue-sync:" + str(self.project_id))
+        assert isinstance(progress, dict)
+        self.assertIn("7", progress["pending"])
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        self.synchronize([])
+        updated_task = self.task()
+        assert updated_task is not None
+        self.assertEqual((updated_task["state"], updated_task["body"]),
+                         ("queued", "new feedback while working"))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "superseded"})
+
+    def test_parallel_sync_finishing_after_candidate_applies_update_without_another_poll(self):
+        import threading
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="feedback received during candidate finish", updated_at=self.issue["updated_at"] + "1")
+        self.runtime.request(self.project_id, "issues")
+        sync_run = self.store.claim(self.project_id, self.config)
+        assert sync_run is not None
+        entered, resume = threading.Event(), threading.Event()
+
+        def remote(args, **kwargs):
+            if args[1] == "api":
+                entered.set()
+                self.assertTrue(resume.wait(10))
+                return encode([self.issue])
+            return "[]"
+
+        try:
+            with patch("adaptive_rsi.runtime.checked", side_effect=remote):
+                worker = threading.Thread(target=self.runtime.process, args=(sync_run,))
+                worker.start()
+                self.assertTrue(entered.wait(5))
+                self.store.transition(run["id"], "awaiting_approval", {
+                    "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+                resume.set()
+                worker.join(10)
+                self.assertFalse(worker.is_alive())
+        finally:
+            resume.set()
+        updated = self.task()
+        assert updated is not None
+        self.assertEqual((updated["state"], updated["body"]),
+                         ("queued", "feedback received during candidate finish"))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "superseded"})
+
+    def test_active_issue_finish_requeues_held_feedback_before_publish(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="new pending requirement", updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "superseded"})
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                         {"state": "blocked"})
+        self.synchronize([])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                         {"state": "queued"})
+
+    def test_held_feedback_waits_for_running_issue_before_replaying(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="updated while working", updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+        self.runtime.schedule(self.project_id, self.config)
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_issues'",
+                                         (self.project_id,)))
+        self.store.transition(run["id"], "awaiting_approval", {}, True)
+        self.runtime.schedule(self.project_id, self.config)
+        sync_run = self.store.claim(self.project_id, self.config)
+        assert sync_run is not None
+        with patch("adaptive_rsi.runtime.checked", return_value="[]"):
+            self.runtime.process(sync_run)
+        task = self.task()
+        assert task is not None
+        self.assertEqual((task["state"], task["body"]), ("queued", "updated while working"))
+        progress = self.store.setting("issue-sync:" + str(self.project_id))
+        assert isinstance(progress, dict)
+        self.assertEqual(progress["pending"], {})
+
+    def test_cancelling_active_issue_keeps_held_feedback_without_restarting_it(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="new requirement", updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+        self.runtime.cancel_task(self.task_id)
+        self.store.transition(run["id"], "interrupted", {}, True)
+        self.synchronize()
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                         {"state": "cancelled"})
+        progress = self.store.setting("issue-sync:" + str(self.project_id))
+        assert isinstance(progress, dict)
+        self.assertIn("7", progress["pending"])
+        self.runtime.schedule(self.project_id, self.config)
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_issues'",
+                                         (self.project_id,)))
+
+    def test_pause_keeps_held_feedback_until_explicit_issue_retry(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="updated requirement", updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+        self.runtime.pause(self.project_id, True)
+        self.store.transition(run["id"], "awaiting_approval", {}, True)
+        self.runtime.pause(self.project_id, False)
+        self.runtime.schedule(self.project_id, self.config)
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                         {"state": "interrupted"})
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_issues'",
+                                         (self.project_id,)))
+        self.runtime.retry(self.task_id)
+        self.runtime.schedule(self.project_id, self.config)
+        sync_run = self.store.claim(self.project_id, self.config)
+        assert sync_run is not None
+        with patch("adaptive_rsi.runtime.checked", return_value="[]"):
+            self.runtime.process(sync_run)
+        task = self.task()
+        assert task is not None
+        self.assertEqual((task["state"], task["body"]), ("queued", "updated requirement"))
+
+    def test_updated_issue_replans_awaiting_candidate_and_revokes_queued_delivery(self):
+        self.runtime.revise_task(self.task_id, "local requirement")
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        self.update("updated issue requirements")
+        updated = self.task()
+        assert updated is not None
+        self.assertEqual((updated["state"], updated["body"]),
+                         ("queued", "updated issue requirements\n\nlocal requirement"))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "superseded"})
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,)),
+                         {"state": "cancelled"})
+        fresh = self.store.claim(self.project_id, self.config)
+        self.assertEqual(fresh["task"], self.task_id)
+        self.assertNotEqual(fresh["id"], run["id"])
+
+    def test_closed_or_excluded_issue_revokes_awaiting_candidate(self):
+        self.runtime.pause(self.project_id, False)
+        for index, change in enumerate(("closed", "excluded"), 8):
+            with self.subTest(change=change):
+                self.issue = DiscoveryHardeningTest.issue(number=index)
+                self.synchronize()
+                row = self.store.one("SELECT id FROM tasks WHERE fingerprint=?",
+                                     ("issue:owner/project:" + str(index),))
+                assert row is not None
+                self.task_id = row["id"]
+                # Leave other queued Issues out of the claim for this scenario.
+                self.store.execute("UPDATE tasks SET state='cancelled' WHERE id<>? AND source='issue'", (self.task_id,))
+                run = self.store.claim(self.project_id, self.config)
+                self.store.transition(run["id"], "awaiting_approval", {
+                    "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+                publication = self.runtime.deliver(run["id"])
+                if change == "closed":
+                    self.issue["state"] = "closed"
+                else:
+                    self.issue["labels"] = [self.config["github"]["exclude_labels"][0]]
+                self.issue["updated_at"] += "1"
+                self.synchronize()
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                                 {"state": "obsolete"})
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                                 {"state": "superseded"})
+                self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,)),
+                                 {"state": "cancelled"})
+                if change == "excluded":
+                    self.issue["labels"] = []
+                    self.synchronize()
+                    self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                                     {"state": "queued"})
+                    self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                                     {"state": "superseded"})
+
+    def test_issue_update_rolls_back_candidate_revocation_if_task_write_fails(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        original = self.task()
+        self.store.execute("CREATE TRIGGER reject_issue_update BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected issue write failure'); END")
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "Injected issue write failure"):
+                self.update("changed upstream")
+        finally:
+            self.store.execute("DROP TRIGGER reject_issue_update")
+        self.assertEqual(self.task(), original)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "awaiting_approval"})
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,)),
+                         {"state": "queued"})
+        self.synchronize()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                         {"state": "superseded"})
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (self.task_id,)),
+                         {"state": "queued"})
 
     def test_cancelled_run_waits_for_end_and_requires_explicit_revision(self):
         self.runtime.revise_task(self.task_id, "local")
@@ -790,6 +1028,87 @@ class IssueRequirementsTest(unittest.TestCase):
         self.synchronize()
         self.assertEqual(self.task(), before)
         self.assertEqual(json.loads(self.store.one("SELECT data FROM task_decisions WHERE task=?", (self.task_id,))["data"]), {"reason": "held"})
+
+    def test_pending_is_committed_before_the_next_row(self):
+        from adaptive_rsi.discovery import _issue_task
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.issue.update(body="new", updated_at=self.issue["updated_at"] + "1")
+        other = DiscoveryHardeningTest.issue(number=8)
+        def lookup(db, project, repo, number):
+            if number == 8:
+                self.assertIn("7", self.store.setting("issue-sync:" + self.project_id)["pending"])
+                self.assertIsNotNone(self.store.setting("issue-revision-pending:" + run["id"]))
+            return _issue_task(db, project, repo, number)
+        with patch("adaptive_rsi.discovery._issue_task", side_effect=lookup):
+            self.synchronize([self.issue, other])
+
+    def test_pending_survives_policy_change(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.update("held change")
+        self.store.transition(run["id"], "awaiting_approval", {}, True)
+        self.config["github"]["labels"] = ["new-policy"]
+        self.synchronize([])
+        self.assertEqual(self.task()["state"], "obsolete")
+
+    def test_excluded_candidate_is_requeued_when_policy_restored(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {}, True)
+        self.config["github"]["labels"] = ["new-policy"]
+        self.synchronize()
+        self.config["github"]["labels"] = []
+        self.synchronize()
+        self.assertEqual(self.task()["state"], "queued")
+
+    def test_failed_update_blocks_candidate_before_failure_is_reported(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        self.store.execute("CREATE TRIGGER reject_issue_update BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected issue write failure'); END")
+        original_event = self.store.event
+        observed = []
+
+        def event(kind, *args, **kwargs):
+            if kind == "issue_sync_error":
+                try:
+                    self.runtime.deliver(run["id"])
+                    approved = True
+                except ValueError:
+                    approved = False
+                claimed = self.store.claim(self.project_id, self.config)
+                observed.append((approved, claimed and claimed["task"] == publication))
+            return original_event(kind, *args, **kwargs)
+
+        try:
+            with patch.object(self.store, "event", side_effect=event):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.update("changed")
+        finally:
+            self.store.execute("DROP TRIGGER reject_issue_update")
+        self.assertEqual(observed, [(False, None)])
+
+    def test_failed_snapshot_blocks_approval_and_publish_claim(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        self.store.execute("CREATE TRIGGER reject_issue_update BEFORE UPDATE OF body ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'Injected issue write failure'); END")
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.update("changed")
+            with self.assertRaises(ValueError):
+                self.runtime.deliver(run["id"])
+            claimed = self.store.claim(self.project_id, self.config)
+            self.assertTrue(claimed is None or claimed["task"] != publication)
+        finally:
+            self.store.execute("DROP TRIGGER reject_issue_update")
 
     def test_oversized_pending_keeps_snapshot_and_fetches_remote_recovery(self):
         self.runtime.revise_task(self.task_id, "local")
@@ -892,13 +1211,14 @@ class IssueRequirementsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "30000"):
             self.update("x" * 30000)
         self.assertEqual(self.task(), before)
-        # 任务与游标业务字段（since/page/pending/policy）随写入回滚不变；唯一新增的是
-        # failures 审计计数——本次跳过被持久化，下一轮 sync() 读到 prior_failures 后
-        # 继续回退 since 水印重读该行，这正是跨周期漏读防护要的效果。
+        # The cursor stays put, while the failed snapshot remains sealed until
+        # a later upstream revision can be applied.
         after = dict(self.store.setting("issue-sync:" + self.project_id))
         self.assertEqual(after.pop("failures"), progress.get("failures", 0) + 1)
+        self.assertEqual(after.pop("pending")["7"]["body"], "x" * 30000)
         expected = dict(progress)
         expected.pop("failures", None)
+        expected.pop("pending", None)
         self.assertEqual(after, expected)
         self.update("shortened")
         self.assertEqual(self.task()["body"], "shortened\n\nlocal")

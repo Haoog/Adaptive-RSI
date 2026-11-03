@@ -21,13 +21,18 @@ async function checkCurrentWork(browser, url, errors, server) {
     assert.equal(await page.locator('.task-row').filter({ hasText: title }).count(), 0,
       'running task must be off page 1');
     await page.locator('#current-work').filter({ hasText: title }).waitFor({ timeout: 10000 });
+    await page.locator('#current-work-detail').filter({ hasText: 'simple-linguangchat/swe-2' }).waitFor();
 
     // 运行行携带任务标题（分页无法藏住当前任务）。
     const project = await page.locator('#project-select').inputValue();
     const state = await (await page.context().request.get(
       new URL('/api/state?limit=50&offset=0&filter=active&system=true', url).href)).json();
-    assert.equal(state.runs.find(run => !run.ended)?.task_title, title,
+    const active = state.runs.filter(run => !run.ended);
+    assert.equal(active.length, 2);
+    assert.equal(active[0].task_title, '同步 Issue', 'later issue sync must be first');
+    assert.equal(active[1]?.task_title, title,
       'open run row must carry the task title');
+    assert.equal(active[1]?.current_model?.provider, 'magpie');
 
     // 分组筛选把运行中任务从列表排除后，标题仍然显示。
     for (const filter of ['attention', 'history', 'active']) {
@@ -48,6 +53,9 @@ async function checkCurrentWork(browser, url, errors, server) {
 
     // 运行结束：卡片回退到等待文案，不再显示标题或状态词。
     server.stdin.write('end-current-work-run\n');
+    await page.locator('#current-work').filter({ hasText: '同步 Issue' }).waitFor({ timeout: 20000 });
+    assert.ok(!(await page.locator('#current-work-detail').textContent()).includes('simple-linguangchat/swe-2'));
+    server.stdin.write('end-current-issues-run\n');
     await page.locator('#current-work').filter({ hasText: pausedCopy }).waitFor({ timeout: 20000 });
     assert.equal(await page.locator('#current-work').textContent(), pausedCopy);
     console.log('Current work browser passed: running task title survives deep queues, group filters and project switches; the card falls back once the run ends.');

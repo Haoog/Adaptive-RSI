@@ -7,7 +7,7 @@ import logging
 import re
 import time
 
-from .store import encode
+from .store import encode, issue_snapshot_pending
 
 
 ISSUE_COMMENT_TTL = 300
@@ -319,6 +319,15 @@ def _diff_audit(db, project, run, task_id, prior, row):
     return True
 
 
+def label_names(issue):
+    """Tolerate every label shape observed from the API or a broken cache."""
+    labels = issue["labels"]
+    if not isinstance(labels, list):
+        return set()
+    return {name for name in (label.get("name") if isinstance(label, dict) else label
+                              for label in labels) if isinstance(name, str) and name}
+
+
 def _issue_task(db, project, repository, number):
     """Adopt a legacy key only when its evidence proves the repository identity."""
     key = "issue:" + repository.lower() + ":" + str(number)
@@ -353,7 +362,8 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
     from .config import fingerprint
     policy = fingerprint({"labels": config["github"]["labels"], "exclude": config["github"]["exclude_labels"]})
     if progress.get("repository") != repo or progress.get("policy") != policy:
-        progress = {"repository": repo, "policy": policy}
+        retained = progress.get("pending", {}) if progress.get("repository") == repo else {}
+        progress = {"repository": repo, "policy": policy, "pending": retained}
     if not progress.get("started"):
         progress.update(started=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), page=1)
     changed, complete = 0, False
@@ -368,6 +378,9 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         pending = {}
     prior_failures = progress.get("failures", 0)
     failures = []
+    # 本轮为防止并发授权而预先密封的 Issue；它们不是上一周期遗留的快照，
+    # 不能用来抑制本次的变更事件。
+    sealed_now = set()
 
     def note_failure(issue, exc):
         """Record one skipped Issue without masking the original error."""
@@ -382,16 +395,25 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
 
     def hold_failed(issue):
         """Stash a failed remote row in pending so the next cycle retries it."""
+        try:
+            _hold_failed(issue)
+        except Exception:
+            # 暂存只是重试优化；任何畸形行都不得中断整页同步。
+            logging.getLogger(__name__).exception("Failed to hold a malformed Issue snapshot")
+
+    def _hold_failed(issue):
         if not isinstance(issue, dict):
+            return
+        try:
+            number = str(int(issue["number"]))
+        except (TypeError, ValueError, KeyError):
             return
         # 与 apply_existing 暂存活跃修订相同的裁剪形状。apply() 需要这些键：
         # 结构不完整的行无法暂存重试，记录错误后等下一次远端刷新再读原文。
         required = ("number", "updated_at", "html_url", "state", "labels", "title", "body")
         if any(key not in issue for key in required):
-            return
-        try:
-            number = str(int(issue["number"]))
-        except (TypeError, ValueError):
+            # 行本身不完整时仍要挡住旧候选：远端确实有更新，只是本地无法解析。
+            seal(number, issue)
             return
         entry = {key: issue[key] for key in ["number", "updated_at", "html_url", "state", "labels"]}
         # 远端每次刷新都会重投同一条失败行：保留既有 attempts，否则确定性坏行
@@ -404,6 +426,39 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         entry.update(title=str(issue.get("title") or "")[:300],
                      body=str(issue.get("body") or "")[:30000], attempts=attempts)
         pending[number] = entry
+        sealed_now.add(number)
+        progress["pending"] = pending
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
+        seal(number, issue)
+
+    def seal(number, issue):
+        """Block candidate authorization while a newer upstream revision is unapplied."""
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            task = db.execute("SELECT * FROM tasks WHERE project=? AND fingerprint IN (?,?) ORDER BY fingerprint DESC",
+                              (project["id"], "issue:" + repo.lower() + ":" + number, "issue:" + number)).fetchone()
+            if not task or not issue_snapshot_pending(db, project["id"], task["id"]):
+                return
+            active = db.execute("SELECT id FROM runs WHERE task=? AND ended IS NULL", (task["id"],)).fetchone()
+            if not active:
+                return
+            try:
+                evidence = json.loads(task["evidence"])
+                updated = evidence[0].get("updated")
+            except (TypeError, ValueError, IndexError, KeyError, AttributeError):
+                updated = None
+            try:
+                labels = label_names(issue)
+                allowed = not set(config["github"]["exclude_labels"]) & labels and (
+                    not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
+                changed = updated != issue.get("updated_at") or str(issue.get("state", "")).lower() != "open" or not allowed
+            except (TypeError, AttributeError):
+                changed = True
+            if changed:
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("issue-revision-pending:" + active["id"], encode({"task": task["id"]})))
 
     def apply(issue):
         nonlocal changed
@@ -422,20 +477,40 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                     row = db.execute("SELECT id,title,body,evidence FROM tasks WHERE id=?",
                                      (existing["id"],)).fetchone()
                     _diff_audit(db, project["id"], run_id, existing["id"], prior, dict(row))
+                progress["pending"] = pending
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
+                if str(number) in pending:
+                    active = db.execute("SELECT id FROM runs WHERE task=? AND ended IS NULL", (existing["id"],)).fetchone()
+                    if active:
+                        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                   ("issue-revision-pending:" + active["id"], encode({"task": existing["id"]})))
                 return
-        labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
+        labels = label_names(issue)
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
             not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
         if issue["state"].lower() == "open" and allowed:
             evidence = [{"number": number, "url": issue["html_url"], "updated": issue["updated_at"],
                          "state": issue["state"], "comments": int(issue.get("comments") or 0)}]
             store.add_task(project["id"], "issue", task_key, issue["title"], issue["body"] or "", evidence, priority=60)
+            pending.pop(str(number), None)
             changed += 1
+        else:
+            pending.pop(str(number), None)
+
+    def revoke_candidate(existing, db):
+        db.execute("UPDATE tasks SET state='cancelled',updated=? WHERE project=? "
+                   "AND source='system_publish' AND state='queued' AND body IN "
+                   "(SELECT id FROM runs WHERE task=? AND state='awaiting_approval')",
+                   (time.time(), project["id"], existing["id"]))
+        db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'",
+                   (existing["id"],))
 
     def apply_existing(issue, existing, db):
         number = int(issue["number"])
         held = pending.pop(str(number), None)
-        active = db.execute("SELECT 1 FROM runs WHERE task=? AND ended IS NULL", (existing["id"],)).fetchone()
+        if str(number) in sealed_now:
+            held = None
+        active = db.execute("SELECT id FROM runs WHERE task=? AND ended IS NULL", (existing["id"],)).fetchone()
         try:
             previous = json.loads(existing["evidence"]) if existing else []
         except (TypeError, ValueError):
@@ -444,14 +519,16 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             previous = []
         revised = not previous or previous[0].get("updated") != issue["updated_at"]
         exclusion = previous[0].get("sync_exclusion") if previous else None
-        labels = {label["name"] if isinstance(label, dict) else label for label in issue["labels"]}
+        labels = label_names(issue)
         allowed = not set(config["github"]["exclude_labels"]) & labels and (
             not config["github"]["labels"] or set(config["github"]["labels"]) <= labels)
         if issue["state"].lower() != "open" or not allowed:
-            if not active and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]:
+            if not active and existing["state"] in ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]:
                 excluded_at = time.time()
                 excluded_evidence = [dict(previous[0]), *previous[1:]] if previous else [{}]
                 excluded_evidence[0]["sync_exclusion"] = {"state": existing["state"], "at": excluded_at}
+                if existing["state"] == "awaiting_approval":
+                    revoke_candidate(existing, db)
                 db.execute("UPDATE tasks SET state='obsolete',evidence=?,updated=? WHERE id=? AND state=?",
                               (encode(excluded_evidence), excluded_at, existing["id"], existing["state"]))
                 return True
@@ -495,17 +572,21 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         if existing:
             if (not active and existing["state"] == "obsolete" and not revised and isinstance(exclusion, dict) and
                     exclusion.get("at") == existing["updated"] and exclusion.get("state") in
-                    ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted"]):
+                    ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]):
                 # Restore the prior decision, including deferral, rather than paying to plan it again.
                 restored_evidence = [dict(previous[0]), *previous[1:]]
                 restored_evidence[0].pop("sync_exclusion", None)
                 db.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
-                              (exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
+                              ("queued" if exclusion["state"] == "awaiting_approval" else exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
                 return True
-            if not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted"] and revised:
+            if not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"] and revised:
                 requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}
                 evidence[0]["requirements"] = requirements
                 body = issue_requirements_body(requirements)
+                if existing["state"] == "awaiting_approval":
+                    # A changed Issue invalidates the candidate before the updated
+                    # requirements are queued, in the same transaction.
+                    revoke_candidate(existing, db)
                 db.execute("UPDATE tasks SET title=?,body=?,evidence=?,state='queued',available=0,updated=? WHERE id=?",
                     (issue["title"][:300], body, encode(evidence), time.time(), existing["id"]))
                 db.execute("DELETE FROM settings WHERE key=?", ("task-schedule:" + existing["id"],))
@@ -612,17 +693,22 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             raise RuntimeError("Unexpected GitHub Issue response")
         for issue in rows:
             try:
+                # Seal the observed revision before attempting its update. If the
+                # update rolls back, candidate authorization remains blocked.
+                if isinstance(issue, dict) and "pull_request" not in issue:
+                    hold_failed(issue)
                 apply(issue)
             except IssueRequirementsTooLong as exc:
-                # 组合需求超限时保留任务原有快照，跳过该行继续整页；记录证据并
-                # 计入失败汇总，靠保留的 since 水印在下个周期重试，不进 pending。
+                # apply_existing removes the in-memory entry before validation;
+                # preserve it after rollback so the final progress write cannot clear it.
+                pending[str(int(issue["number"]))] = issue
                 note_failure(issue, exc)
                 continue
             except Exception as exc:
                 # 单个坏 Issue 不杀掉整页：其任务/审计写入已随事务回滚，记录
                 # 证据并暂存 pending 供下周期重试；首个异常在本周期汇总后抛出。
-                note_failure(issue, exc)
                 hold_failed(issue)
+                note_failure(issue, exc)
                 continue
         progress["page"] += 1
         pages_read += 1
@@ -643,7 +729,33 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # 只保留本周期计数：旧失败已靠 since 水印获得重读机会。
             progress["failures"] = len(failures) or prior_failures
         progress["pending"] = pending
-        store.put_setting(key, progress)
+        # Publish the held snapshot and its active-run marker together. The
+        # dispatcher's replay handles a worker that ended before this transaction.
+        with store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, encode(progress)))
+            held_ids = set()
+            for number, snapshot in pending.items():
+                if not isinstance(snapshot, dict):
+                    continue
+                try:
+                    task_key = "issue:" + repo.lower() + ":" + str(int(number))
+                except (TypeError, ValueError):
+                    continue
+                held_ids.add(task_key)
+                run = db.execute("SELECT r.id,t.id AS task FROM tasks t JOIN runs r ON r.task=t.id "
+                                 "WHERE t.project=? AND t.fingerprint=? AND r.ended IS NULL",
+                                 (project["id"], task_key)).fetchone()
+                if run:
+                    db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                               ("issue-revision-pending:" + run["id"], encode({"task": run["task"]})))
+            # 政策收紧后又恢复、或更新已成功应用时，这块标记必须随之消失，
+            # 否则下一次状态转换会把任务永久置为 blocked 且无人重放。
+            for row in db.execute("SELECT r.id,t.fingerprint FROM runs r JOIN tasks t ON t.id=r.task "
+                                  "WHERE r.project=? AND r.ended IS NULL AND t.source='issue'", (project["id"],)):
+                if row["fingerprint"] not in held_ids:
+                    db.execute("DELETE FROM settings WHERE key=?",
+                               ("issue-revision-pending:" + row["id"],))
         if complete:
             break
     if failures:
