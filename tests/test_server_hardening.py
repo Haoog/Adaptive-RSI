@@ -725,6 +725,24 @@ class ServerHardeningTest(unittest.TestCase):
             self.assertTrue(json.loads(body)["valid"])
             self.assertTrue(Path(destination).is_file())
 
+    def test_rehearsal_default_report_path_rejects_symlinked_reports_dir(self):
+        from adaptive_rsi import storage_tools
+
+        snapshot = storage_tools.backup(self.store)
+        # 默认路径分支（report 省略或为 true）经 reports/ 目录；它是指向状态目录
+        # 外部的符号链接时同样不得写出界外文件。
+        outside = self.root / "escaped-reports"
+        outside.mkdir()
+        reports_link = self.store.root / "reports"
+        reports_link.symlink_to(outside, target_is_directory=True)
+        escaped = outside / f"rehearsal-{snapshot['id']}.json"
+
+        for body in ({"id": snapshot["id"]}, {"id": snapshot["id"], "report": True}):
+            status, _, payload = self.request("/api/rehearse-restore", "POST", body)
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(payload)["error"], "report_outside_state_directory")
+            self.assertFalse(escaped.exists())
+
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，
         # 否则反复失败会耗尽信号量并让服务器永久拒接新连接。

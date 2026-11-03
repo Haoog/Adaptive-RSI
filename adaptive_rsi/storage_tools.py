@@ -571,7 +571,7 @@ def rehearsal_report_path(source, store=None, report_path=None, within=None):
         candidate = folder / f"rehearsal-{source.stem}.json"
     else:
         candidate = source.parent / f"{source.stem}-rehearsal.json"
-    validate_rehearsal_report_path(candidate, source, store=store)
+    validate_rehearsal_report_path(candidate, source, store=store, within=within)
     return candidate
 
 
