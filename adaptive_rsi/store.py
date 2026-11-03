@@ -940,12 +940,16 @@ class Store:
             raise ValueError("Invalid span table")
         for row in db.execute("SELECT id,started FROM " + table + " WHERE run=? AND ended IS NULL", (run,)).fetchall():
             began = self._clock_samples.pop((table, row["id"]), None)
-            # _clock_samples 命中时用单调时钟；未命中（如重启后）回落到数据库
-            # started 列。两者都为 NULL 时按 0 计，不产生虚假负数时长。
+            # _clock_samples 命中时用单调时钟。未命中（重启后由新进程收尾、或跨进程
+            # 代收尾）时 span 的真实执行时长无法还原：started 到 death 之间夹了进程
+            # 停机窗口，墙钟差必然高估。phase_times 记 -1 作为「未测量」标记——
+            # 读模型用 max(0,duration) 折算为 0 贡献，phase_seconds 不被停机时长
+            # 抬高；duration<0 可机器判别。remote_waits 语义不同：远端在停机期间
+            # 确实仍在等待，保留墙钟差。started 为 NULL 时按 0 计，不虚构时长。
             if began is not None:
                 elapsed = max(0, time.monotonic() - began)
             elif row["started"] is not None:
-                elapsed = max(0, now - row["started"])
+                elapsed = -1 if table == "phase_times" else max(0, now - row["started"])
             else:
                 elapsed = 0
             db.execute("UPDATE " + table + " SET ended=?,duration=? WHERE id=?", (now, elapsed, row["id"]))
