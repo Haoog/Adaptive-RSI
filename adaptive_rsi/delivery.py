@@ -94,6 +94,8 @@ def baseline(runtime, project, config):
                 lock.unlink()
             except OSError:
                 pass
+        # 同一 tick 内的共享读数由调用方经 tick_baselines/shared 传入；本函数始终实时
+        # fetch，保证 publish 密封判定与自动合并准入复核永不错过远端变更。
         github_git(cache, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
             "+refs/heads/" + branch + ":refs/heads/rsi-baseline", timeout=180)
         sha = git(cache, "rev-parse", "refs/heads/rsi-baseline")
@@ -747,6 +749,11 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
+    # 同一 tick 内多个就绪 PR / 到期监控共享同一份基线读数：首个调用触发一次
+    # 真实 fetch，其余直接复用。publish 不在此路径；合并准入/监控的密封目标
+    # 仍逐 run 对共享值复核 sha/branch，字典随 tick 结束丢弃，不读跨 tick 陈旧值。
+    tick_baselines = {}
+
     for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR "
                            "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")" +
                            (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
@@ -915,7 +922,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     authorized = _dict_field(run_config, "delivery").get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
-                        _, remote, branch = baseline(runtime, project, config)
+                        # 同一 tick 内的就绪 run 共享一次真实 fetch：首个准入复核
+                        # （或更早的监控观测）留下的本轮读数直接复用，密封判定
+                        # 仍逐 run 对共享值复核 sha/branch，不读跨 tick 陈旧值。
+                        cached_base = tick_baselines.get(project["id"])
+                        if cached_base:
+                            _, remote, branch = cached_base
+                        else:
+                            source, remote, branch = baseline(runtime, project, config)
+                            tick_baselines[project["id"]] = (source, remote, branch)
                         if remote == policy["base"] and branch == policy["branch"]:
                             task = store.one("SELECT * FROM tasks WHERE id=?", (run["task"],))
                             if task and task["source"] == "issue":
@@ -986,7 +1001,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             if outcome.get("merged_sha"):
                 active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
                 feedback(runtime, project, run, outcome, config, now,
-                         (lambda: runtime.is_cancelled(active)) if active else None)
+                         (lambda: runtime.is_cancelled(active)) if active else None,
+                         shared=tick_baselines)
                 from .release import advance
                 outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
             store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
@@ -1014,7 +1030,7 @@ def parsed_result(run):
     return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
 
 
-def feedback(runtime, project, run, outcome, config, now, cancel=None):
+def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=None):
     if not monitoring_due(outcome, config, now):
         return
     from .storage_tools import pending_investigation
@@ -1117,7 +1133,15 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None):
         raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
     pinned = merge(saved, {"github": {"repository": identity["repository"]},
                             "delivery": {"base_branch": identity["branch"]}})
-    source, head, branch = baseline(runtime, project, pinned)
+    cached = shared.get(project["id"]) if isinstance(shared, dict) else None
+    if cached and cached[2] == identity["branch"]:
+        source, head, branch = cached
+    else:
+        # 本轮首个监控观测触发一次真实 fetch，结果供同 tick 其余监控复用；
+        # 该读数只用于观测，密封目标仍以 run-baseline 身份键为准。
+        source, head, branch = baseline(runtime, project, pinned)
+        if isinstance(shared, dict):
+            shared[project["id"]] = (source, head, branch)
     if branch != identity["branch"]:
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
     if previous.get("head") == head and merge_current:
