@@ -1488,10 +1488,13 @@ class Runtime(Maintenance):
         if self.stop.is_set():
             return True
         if '_deadline_started' in run:
-            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-            stage = ('model' if run.get('_model_started') is not None else
-                     run.get('_explicit_phase') or
-                     ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
+            if run.get('_model_started') is not None:
+                stage = 'model'
+            elif run.get('_explicit_phase'):
+                stage = run['_explicit_phase']
+            else:
+                state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+                stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
             if run.get('_deadline_stage') != stage:
                 run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
             try:

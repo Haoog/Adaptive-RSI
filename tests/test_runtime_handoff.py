@@ -963,6 +963,48 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertTrue(self.runtime.is_cancelled(run))
         self.assertEqual(run['_timed_out_stage'], 'evaluation')
 
+    def test_explicit_phase_skips_the_stage_inference_query(self):
+        """已显式切相时 is_cancelled 不再为推断 stage 查询 runs 表。"""
+        _, run = self.claim()
+        self.runtime.begin_phase(run, 'evaluation')
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?'], [])
+
+    def test_model_call_skips_the_stage_inference_query(self):
+        """模型调用进行中（_model_started）同样不触发 stage 推断查询。"""
+        _, run = self.claim()
+        run['_deadline_started'], run['_deadline_stage'] = time.monotonic(), 'model'
+        run['_model_started'] = time.monotonic()
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?'], [])
+
+    def test_stage_inference_query_runs_only_without_explicit_phase(self):
+        """未切相也未进入模型调用时，仍按 runs.state 推断 evaluation 相位。"""
+        _, run = self.claim()
+        run['_deadline_started'], run['_deadline_stage'] = time.monotonic(), 'preparation'
+        self.store.transition(run['id'], 'evaluating')
+        original = self.store.one
+        statements = []
+        def observe(sql, *args, **kwargs):
+            statements.append(sql)
+            return original(sql, *args, **kwargs)
+        with patch.object(self.store, 'one', side_effect=observe):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(len([sql for sql in statements if sql == 'SELECT state FROM runs WHERE id=?']), 1)
+        self.assertEqual(run['_deadline_stage'], 'evaluation')
+
     def test_idle_deadline_selection_scales_to_thousand_projects(self):
         import time as clock
         now = clock.time()
