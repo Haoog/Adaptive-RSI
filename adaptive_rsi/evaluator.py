@@ -482,7 +482,7 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
             flags = _go_test_options(argv)
             if names and flags is not None:
                 go_index = next(index for index, item in enumerate(lower) if Path(item).name == "go")
-                runner = lower.index("test", go_index)
+                runner = go_index + 1
                 parent = Path(relative).parent.as_posix()
                 package = "." if parent == "." else "./" + parent
                 pattern = "^(" + "|".join(re.escape(name) for name in sorted(names)) + ")$"
