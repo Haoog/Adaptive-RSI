@@ -147,7 +147,13 @@ def record_pr_feedback(store, run, url, pr):
     actionable = []
     for item in observations:
         # CI 身份按运行区分：同一个 PR 反复观测不会重排，新一轮尝试仍能重排一次。
-        identity_data = ["ci", run["id"], item["name"], item["state"]] if item["kind"] == "ci" else [url, item]
+        # 非 CI 身份用 GitHub 稳定键（review/comment id，退化到 url 或提交时间戳），
+        # 不纳入 body/updated_at：评审者编辑同一条评审不产生新信号，
+        # 只有新评审（新 id）或新失败检查才重排。
+        if item["kind"] == "ci":
+            identity_data = ["ci", run["id"], item["name"], item["state"]]
+        else:
+            identity_data = [item["kind"], item["id"]]
         identity = prefix + hashlib.sha256(encode(identity_data).encode("utf-8")).hexdigest()
         item.update(run=run["id"], pr=url)
         payload = encode(item)
@@ -586,9 +592,16 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled):
     store.remote_wait(run["id"], None, time.time())
 
 
+# 对账放弃后该运行永久退出恢复候选：退避只限频，尝试次数上限才让无果的
+# 恢复收敛，也让 maintenance 的清理豁免同步放开 delivery-push 等键。
 _RECOVERY_CANDIDATE = ("(r.state='superseded' AND CASE WHEN json_valid(r.result) "
     "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
+    "AND CASE WHEN json_valid(r.result) "
+    "THEN coalesce(json_extract(r.result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
     "AND EXISTS (SELECT 1 FROM settings s WHERE s.key='delivery-push:'||r.id))")
+
+# 900s 退避下约 3 天仍查不到回执的推送视为已被人工处置，不再每小时追问远端。
+RECOVERY_ATTEMPT_LIMIT = 72
 
 
 def _recovery_due(outcome, now):
@@ -599,6 +612,23 @@ def _recovery_due(outcome, now):
     return now - last >= (wait if isinstance(wait, (int, float)) and wait > 0 else 3600)
 
 
+def _abandon_recovery(store, run, now, reason):
+    """Mark recovery terminal so the run leaves the candidate query and its keys age out."""
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
+        if not row or row['state'] != 'superseded':
+            return
+        outcome = parsed_result(row)
+        if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
+            return
+        outcome['delivery_recovery_abandoned'] = reason
+        outcome['delivery_recovery_at'] = now
+        db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run['id']))
+    store.event('recovery_abandoned', 'Superseded delivery reconciliation stopped: ' + reason,
+                run['project'], run['id'])
+
+
 def _stamp_recovery(store, run_id, now, wait):
     """Record the attempt before any remote read so failures also back off."""
     with store.connect() as db:
@@ -607,23 +637,45 @@ def _stamp_recovery(store, run_id, now, wait):
         if not row or row['state'] != 'superseded':
             return
         outcome = parsed_result(row)
-        if outcome.get('pr'):
+        if outcome.get('pr') or outcome.get('delivery_recovery_abandoned'):
             return
         outcome['delivery_recovery_at'] = now
         outcome['delivery_recovery_retry'] = wait
+        attempts = outcome.get('delivery_recovery_attempts', 0)
+        outcome['delivery_recovery_attempts'] = (attempts if isinstance(attempts, int) else 0) + 1
+        abandoned = outcome['delivery_recovery_attempts'] >= RECOVERY_ATTEMPT_LIMIT
+        if abandoned:
+            outcome['delivery_recovery_abandoned'] = 'exhausted %s attempts without a matching PR' % RECOVERY_ATTEMPT_LIMIT
         db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run_id))
+        return outcome, abandoned
 
 
 def _recover_superseded_receipt(runtime, project, run, config, now):
     """Observe a journaled publication without relying on its workspace."""
     store = runtime.store
     # 失败的远端读取同样要退避，否则每个调度周期都会重新发起查询。
-    _stamp_recovery(store, run['id'], now, 900)
-    intent = store.setting('delivery-push:' + run['id'])
+    stamped = _stamp_recovery(store, run['id'], now, 900)
+    if stamped is None:
+        return
+    outcome, abandoned = stamped
+    if abandoned:
+        store.event('recovery_abandoned',
+                    'Superseded delivery reconciliation stopped: ' + outcome['delivery_recovery_abandoned'],
+                    project['id'], run['id'])
+        return
+    intent_key = 'delivery-push:' + run['id']
+    intent = store.setting(intent_key)
+    if not isinstance(intent, dict):
+        row = store.one('SELECT value FROM settings WHERE key=?', (intent_key,))
+        if row is not None:
+            # 日志存在但不可解析：损坏的意图永远匹配不到回执，重试只会按退避
+            # 无限刷写；落终态并停止查询远端。
+            _abandon_recovery(store, run, now, 'push journal is not a readable object')
+        return
     identity = store.setting('run-baseline:' + run['id'])
     task = store.one('SELECT source FROM tasks WHERE id=? AND project=?', (run['task'], run['project']))
     repo = config['github']['repository']
-    if not isinstance(intent, dict) or not isinstance(identity, dict) or not task or not isinstance(repo, str):
+    if not isinstance(identity, dict) or not task or not isinstance(repo, str):
         return
     prefix = 'fix' if task['source'] in ['issue', 'rollback', 'inspection'] else 'feat'
     branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run['id'])

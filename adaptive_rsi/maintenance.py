@@ -778,6 +778,8 @@ class Maintenance:
                                 "THEN coalesce(json_extract(result,'$.close_pending'),0) ELSE 1 END=1) "
                                 "AND NOT (state='superseded' AND CASE WHEN json_valid(result) "
                                 "THEN coalesce(json_extract(result,'$.pr'),'') ELSE 'x' END='' "
+                                "AND CASE WHEN json_valid(result) "
+                                "THEN coalesce(json_extract(result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
                                 "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) AS eligible "
                                 "FROM runs WHERE id=?", (stale, candidate)).fetchone()
                             if owner:
@@ -803,6 +805,8 @@ class Maintenance:
                     "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1) "
                     "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
                     "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
+                    "AND CASE WHEN json_valid(r.result) "
+                    "THEN coalesce(json_extract(r.result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
                     "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id))",
                     (run, stale)).fetchone()
                 if not eligible:

@@ -1,4 +1,5 @@
 import json
+import time
 from unittest.mock import patch
 
 from adaptive_rsi import delivery
@@ -140,6 +141,47 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
             self.assertEqual(command.call_args.args[0][1:3], ['pr', 'close'])
         self.assertFalse(json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])['close_pending'])
         self.assertEqual(self.store.one('SELECT * FROM tasks WHERE id=?', (self.task['id'],)), before)
+
+    def test_bounded_attempts_abandon_recovery_and_release_keys_to_cleanup(self):
+        self.prepare()
+        with patch.object(delivery, 'RECOVERY_ATTEMPT_LIMIT', 3), \
+                patch.object(delivery, 'checked', return_value='[]') as command:
+            for step in range(3):
+                delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
+            result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+            self.assertEqual(result['delivery_recovery_attempts'], 3)
+            self.assertIn('exhausted', result['delivery_recovery_abandoned'])
+            # 第 3 次尝试在远端读取前就达到上限：只查询 2 次后落终态。
+            self.assertEqual(command.call_count, 2)
+            # 终态后退出恢复候选：不再发起远端查询。
+            for step in range(3, 5):
+                delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
+            self.assertEqual(command.call_count, 2)
+            delivery.schedule(self.runtime, now=10000018000)
+            self.assertIsNone(self.store.one("SELECT 1 FROM tasks WHERE source='system_delivery' AND project=? "
+                                             "AND state IN ('queued','planning','executing','evaluating','waiting_budget')",
+                                             (self.project,)))
+        # 已放弃的运行不再占用清理豁免：delivery-push 等键随保留期回收。
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('delivery-push:' + self.run['id'],)))
+        self.store.execute('UPDATE runs SET ended=? WHERE id=?', (time.time() - 91 * 86400, self.run['id']))
+        self.runtime.maintenance()
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('delivery-push:' + self.run['id'],)))
+
+    def test_corrupt_push_journal_is_terminal_after_one_event(self):
+        self.prepare()
+        self.store.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ('delivery-push:' + self.run['id'], '{not json'))
+        with patch.object(delivery, 'checked') as command:
+            for step in range(3):
+                delivery.tick(self.runtime, now=10000000000 + step * 3600, project_id=self.project)
+        command.assert_not_called()
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        self.assertIn('journal', result['delivery_recovery_abandoned'])
+        events = self.store.query("SELECT kind FROM events WHERE kind='recovery_abandoned' AND run=?",
+                                  (self.run['id'],))
+        self.assertEqual(len(events), 1)
 
     def test_untrusted_intent_never_queries_remote(self):
         self.prepare()
