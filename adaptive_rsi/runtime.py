@@ -2014,7 +2014,15 @@ class Runtime(Maintenance):
         recurrences = 0
         rediscoveries = 0
         contents = {}
-        for item in findings["findings"]:
+        # analysis 输出契约依赖适配器自觉遵守；截断或越界的响应可能缺 findings
+        # 键或返回非 dict/非数组，不能让 KeyError/TypeError 把整个巡检 run 变成失败。
+        items = findings.get("findings") if isinstance(findings, dict) else None
+        if not isinstance(items, list):
+            self.store.event("inspection_malformed",
+                             "Analysis output missing a findings array; treating as no findings",
+                             project["id"], run["id"])
+            items = []
+        for item in items:
             try:
                 relative_path(item["path"])
                 path = (workspace / item["path"]).resolve()

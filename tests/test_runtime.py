@@ -554,6 +554,19 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(invoke.call_count, 1)
         self.assertTrue(self.store.query("SELECT seq FROM events WHERE kind='inspection_skip'"))
 
+    def test_malformed_analysis_output_falls_back_to_empty_findings(self):
+        for malformed in [{}, {"findings": None}, None, "truncated"]:
+            with self.subTest(malformed=malformed):
+                # 相同上下文会命中 inspection_skip 短路；清掉巡检签名让每次都真正调用 invoke。
+                self.store.execute("DELETE FROM settings WHERE key LIKE 'inspection-head:%'", ())
+                with patch.object(self.runtime, "invoke", return_value=malformed):
+                    self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                         {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        # 畸形响应按空 findings 走完巡检并留下可诊断事件，不产生任何巡检任务。
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection'")), 4)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection_malformed'")), 4)
+        self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='inspection'"), [])
+
     def test_rediscovered_failure_requeues_instead_of_being_suppressed(self):
         from adaptive_rsi.discovery import finding_identity
         finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
