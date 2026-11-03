@@ -1099,11 +1099,16 @@ class Handler(BaseHTTPRequestHandler):
                                 raise RequestError("No backup available for rehearsal")
                             source = backups[0]
                         try:
-                            report_file = rehearsal_report_path(source, store=runtime.store, report_path=body.get("report"))
+                            # API 请求只允许把演练报告写进状态目录；CLI 才保留任意路径。
+                            report_file = rehearsal_report_path(source, store=runtime.store,
+                                                                report_path=body.get("report"),
+                                                                within=runtime.store.root)
                             result = rehearse_restore(source, report_path=report_file, store=runtime.store)
                         except ValueError as exc:
                             if "conflicts with database" in str(exc):
                                 raise RequestError("report_conflicts_with_database") from exc
+                            if "must stay inside the state directory" in str(exc):
+                                raise RequestError("report_outside_state_directory") from exc
                             raise RequestError(str(exc)) from exc
                 self.respond(result)
                 return
