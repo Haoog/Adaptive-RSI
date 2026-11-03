@@ -338,14 +338,22 @@ def workspace_signature(workspace, max_bytes):
             raise RuntimeError("Workspace contains a symlink escaping the snapshot: " + name) from None
         if not resolved.is_file():
             continue
-        digest.update(str(resolved.stat().st_mode & 0o777).encode())
-        size = resolved.stat().st_size
+        try:
+            digest.update(str(resolved.stat().st_mode & 0o777).encode())
+            size = resolved.stat().st_size
+        except OSError:
+            # stat() 与 is_file() 之间文件被删——TOCTOU 竞态，跳过该文件。
+            continue
         if size > remaining:
             raise RuntimeError("Workspace output is too large to compare safely before fallback")
         remaining -= size
-        with resolved.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        try:
+            with resolved.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            # open() 与 stat() 之间文件被删——同样跳过。
+            continue
     return digest.hexdigest()
 
 
