@@ -394,8 +394,15 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         except (TypeError, ValueError):
             return
         entry = {key: issue[key] for key in ["number", "updated_at", "html_url", "state", "labels"]}
+        # 远端每次刷新都会重投同一条失败行：保留既有 attempts，否则确定性坏行
+        # 的计数永远被覆写回 0、到不了隔离上限，sync 仍会被永久 wedge。
+        previous = pending.get(number)
+        attempts = 0
+        if isinstance(previous, dict) and previous.get("updated_at") == issue["updated_at"]:
+            existing = previous.get("attempts", 0)
+            attempts = existing if isinstance(existing, int) and existing >= 0 else 0
         entry.update(title=str(issue.get("title") or "")[:300],
-                     body=str(issue.get("body") or "")[:30000], attempts=0)
+                     body=str(issue.get("body") or "")[:30000], attempts=attempts)
         pending[number] = entry
 
     def apply(issue):
@@ -542,17 +549,19 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                                 encode({"task": existing["id"], "updated": issue["updated_at"]}), time.time()))
         return False
 
-    for issue in list(pending.values()):
+    for pending_key, issue in list(pending.items()):
         try:
             issue_number = str(int(issue["number"])) if isinstance(issue, dict) else None
         except (TypeError, ValueError, KeyError):
             issue_number = None
         if issue_number is None:
             # 暂存条目缺 number 或不可转 int：handler 内 int() 会穿透出 sync()。
-            # 记事件后丢弃，不再暂存。
+            # 记事件后把原键从 pending 摘除——只 continue 会让它每周期重复
+            # 进入这个分支、无限追加 quarantine 事件。
             store.event("issue_sync_quarantined",
                         "Issue sync dropped a malformed pending snapshot",
                         project["id"], run_id, data={"issue": issue if isinstance(issue, dict) else None})
+            pending.pop(pending_key, None)
             continue
         try:
             apply(issue)

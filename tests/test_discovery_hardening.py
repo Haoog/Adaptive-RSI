@@ -418,6 +418,55 @@ class DiscoveryHardeningTest(unittest.TestCase):
         self.assertIsNotNone(self.store.one(
             "SELECT 1 FROM tasks WHERE fingerprint='issue:owner/project:7'"))
 
+    def test_remote_refetched_broken_issue_accumulates_attempts_toward_quarantine(self):
+        # 与「pending replay 计数」互补：本条钉住「远端每周期重投同一条坏行」路径。
+        # 坏行经远端扫描进来、apply() 失败、hold_failed() 暂存；若 hold_failed 把
+        # attempts 覆写回 0，确定性坏行永远到不了隔离上限、sync 仍被 wedge。
+        # 修复后 hold_failed 对相同 number+updated_at 保留既有 attempts 继续累加。
+        from adaptive_rsi.discovery import ISSUE_SYNC_PENDING_MAX_ATTEMPTS
+        broken = {"number": 42, "title": "broken", "body": "broken", "labels": [],
+                  "state": 123, "updated_at": "2026-11-01T00:00:00Z",
+                  "html_url": "https://github.com/owner/project/issues/42"}
+        key = "issue-sync:p"
+        # 远端每周期重投同一条坏行：apply 失败→hold_failed 暂存。hold_failed 只负责
+        # 暂存、不计 attempts（自增在下一周期 pending replay 做）。回归前 hold_failed
+        # 每次覆写 attempts=0，pending replay 拿到的永远是 0 → 永远到不了隔离上限。
+        # 修复后 hold_failed 对相同 number+updated_at 保留既有 attempts，pending replay
+        # 才能继续累加。第 1 周期首次暂存为 0；第 N 周期 pending replay 先累加到 N-1。
+        for cycle in range(1, ISSUE_SYNC_PENDING_MAX_ATTEMPTS + 1):
+            with self.assertRaises(AttributeError):
+                self.synchronize([broken])
+            self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], cycle - 1)
+        # attempts 已累到上限-1；下一周期 pending replay 推到上限即隔离。本周期远端不再
+        # 重投该行（传 []），隔离的 pop 才不会被同一次远端扫描立即以 attempts=0 重新暂存。
+        with self.assertRaises(AttributeError):
+            self.synchronize([])
+        self.assertNotIn("42", self.store.setting(key)["pending"])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='issue_sync_quarantined'"))
+        # 隔离后远端再重投同一修订：作为新暂存重新计数（attempts 重置），不复活旧隔离计数。
+        with self.assertRaises(AttributeError):
+            self.synchronize([broken])
+        self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], 0)
+
+    def test_malformed_pending_entry_is_removed_not_requarantined_each_cycle(self):
+        # pending 条目缺 number 或不可转 int：除记 issue_sync_quarantined 外还必须把
+        # 原键摘除，否则每周期重复进同一分支、无限追加 quarantine 事件。
+        from adaptive_rsi.config import fingerprint
+        key = "issue-sync:p"
+        policy = fingerprint({"labels": self.config["github"]["labels"],
+                              "exclude": self.config["github"]["exclude_labels"]})
+        self.store.put_setting(key, {"repository": "owner/project", "policy": policy, "page": 1,
+                                     "pending": {"bad": {"updated_at": "2026-11-01T00:00:00Z"}}})
+        self.synchronize([self.issue(number=1)])
+        self.assertNotIn("bad", self.store.setting(key)["pending"])
+        # 第二周期远端不再返回坏条目时，pending 里也不应再出现它（只 quarantine 一次）。
+        before = self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_quarantined'")["n"]
+        self.synchronize([self.issue(number=1)])
+        after = self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_quarantined'")["n"]
+        self.assertEqual(after, before)
+        self.assertNotIn("bad", self.store.setting(key)["pending"])
+
     def test_malformed_pending_shape_is_repaired_not_escaping(self):
         # 历史/损坏进度里 pending 可能是 list 等非 dict 形状；旧代码 .values() 直接
         # AttributeError 穿透出 sync()。回归修复后：重置为空、记 issue_sync_progress_repaired，
