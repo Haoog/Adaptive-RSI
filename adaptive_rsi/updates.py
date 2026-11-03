@@ -231,7 +231,9 @@ class UpdateManager:
     def restart_plan(self):
         try:
             return json.loads((self.store.root / "installations/restart.json").read_text())
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
+            # restart.json 损坏与缺失同义——restart 阶段必须能恢复，
+            # 否则 plan 永远 None 导致 restarting 状态楔死。
             return None
 
     def observe_plan(self, plan):
