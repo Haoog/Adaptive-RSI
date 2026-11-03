@@ -272,8 +272,9 @@ def clarity_test_summary(text):
     """Recognize bounded pytest CLI summaries without parsing arbitrary output.
 
     pytest 7+ prints failures first (``== 2 failed, 3 passed in 1.00s ==``), so
-    fields are captured by name instead of position."""
-    line = re.search(r"(?m)^=+ (.+) in [\d.]+s *=+$", text)
+    fields are captured by name instead of position. Runs of 60+ seconds append
+    a humanized duration (``in 65.00s (0:01:05)``), which stays optional."""
+    line = re.search(r"(?m)^=+ (.+) in [\d.]+s(?: \([^)]*\))? *=+$", text)
     if not line:
         return None
     fields = {}
@@ -289,9 +290,14 @@ def clarity_test_summary(text):
         return None
     passed = fields["passed"]
     failed = fields.get("failed", 0) + fields.get("errors", 0)
-    skipped = fields.get("skipped", 0) + fields.get("deselected", 0)
-    return {"format": "pytest_cli", "executed": passed + failed + skipped,
-            "passed": passed, "failed": failed, "skipped": skipped}
+    # Deselected tests were filtered out before execution; keep them out of the
+    # executed/skipped totals so the summary does not overstate coverage.
+    skipped = fields.get("skipped", 0)
+    summary = {"format": "pytest_cli", "executed": passed + failed + skipped,
+             "passed": passed, "failed": failed, "skipped": skipped}
+    if fields.get("deselected"):
+        summary["deselected"] = fields["deselected"]
+    return summary
 
 
 def empty_test_run(text):

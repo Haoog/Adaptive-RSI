@@ -182,8 +182,17 @@ class AuditRound4Test(unittest.TestCase):
         summary = clarity_test_summary("==== 1 error, 4 passed, 2 deselected in 0.50s ====")
         self.assertIsNotNone(summary)
         self.assertEqual(summary["failed"], 1)
-        self.assertEqual(summary["skipped"], 2)
-        self.assertEqual(summary["executed"], 7)
+        # Deselected tests never ran: they stay out of executed/skipped and are
+        # reported separately so evidence does not overstate coverage.
+        self.assertEqual(summary["skipped"], 0)
+        self.assertEqual(summary["executed"], 5)
+        self.assertEqual(summary["deselected"], 2)
+
+    def test_clarity_test_summary_accepts_humanized_duration(self):
+        # pytest prints ``in 65.00s (0:01:05)`` for runs of 60+ seconds.
+        summary = clarity_test_summary("===== 3 passed in 65.00s (0:01:05) =====")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["executed"], 3)
 
     def test_clarity_test_summary_rejects_zero_passed(self):
         self.assertIsNone(clarity_test_summary("===== 0 passed, 1 failed in 0.10s ====="))
