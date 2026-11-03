@@ -1092,6 +1092,22 @@ Path(%r).write_text('allowed output')
             self.runtime.sync_issues(self.runtime.project(self.project), config)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE source='issue'")["state"], "obsolete")
 
+    def test_pr_metadata_failure_keeps_cache_and_does_not_fail_issue_sync(self):
+        config = merge(self.runtime.config(self.project), {"github": {"repository": "owner/repo"}})
+        self.store.put_setting("prs:" + self.project, [{"number": 7, "title": "cached"}])
+        def gh(args, **kwargs):
+            if args[:3] == ["gh", "pr", "list"]:
+                raise RuntimeError("gh: rate limited")
+            return "[]"
+        with patch("adaptive_rsi.runtime.checked", side_effect=gh):
+            self.runtime.sync_issues(self.runtime.project(self.project), config)
+        # Issue 同步已成功落库；PR 缓存保留旧值并记录不可用事件，run 不被判失败。
+        self.assertTrue(self.store.setting("issue-sync:" + self.project)["since"])
+        self.assertEqual(self.store.setting("prs:" + self.project), [{"number": 7, "title": "cached"}])
+        events = self.store.query("SELECT message FROM events WHERE kind='prs_unavailable'")
+        self.assertEqual(len(events), 1)
+        self.assertIn("rate limited", events[0]["message"])
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_paired_evolution_promotes_retrieves_and_rolls_back_verified_guidance(self):
         second = fixture(self.root / "multiply")
