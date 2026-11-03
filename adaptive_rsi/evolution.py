@@ -146,7 +146,12 @@ def overlay_available(directory):
 
 def case_stratum(case):
     spec = case_spec(case) or {}
-    length = len(spec.get("task", ""))
+    # 历史数据或绕过 import_case 写入的 spec 可能把 task 存成非字符串；
+    # len() 会直接 TypeError，这类用例归入 unknown 层而不是让调度崩溃。
+    task = spec.get("task")
+    if not isinstance(task, str):
+        return ("unknown", "unknown")
+    length = len(task)
     return (spec.get("source", "unknown"), "small" if length < 1000 else "medium" if length < 10000 else "large")
 
 
@@ -692,6 +697,10 @@ class Evolution:
             manifest = json.loads(bundle_file.read_text(encoding="utf-8"))
         except Exception:
             pass
+        # bundle.json 可能是合法的 JSON 标量/数组而非对象：manifest.get 会抛
+        # AttributeError，这里显式拒绝并归入完整性失败之外的输入错误。
+        if not isinstance(manifest, dict):
+            raise ValueError("bundle.json must contain a JSON object manifest")
 
         limitations = list(manifest.get("limitations") or integrity.get("limitations") or [])
 
@@ -755,7 +764,14 @@ class Evolution:
 
         seen_tools = {}
         for case_id, case_entry, spec in case_items:
-            for check in spec.get("checks", []):
+            checks = spec.get("checks")
+            if not isinstance(checks, list):
+                continue
+            for check in checks:
+                # checks 可能是字符串/数字等非对象条目：check.get 会抛
+                # AttributeError，bundle 内容不可信，逐条跳过。
+                if not isinstance(check, dict):
+                    continue
                 argv = check.get("argv", [])
                 if not argv or not isinstance(argv, list):
                     continue
@@ -883,7 +899,12 @@ class Evolution:
                             "exit_code": -1, "passed": False, "error": str(exc),
                         })
                         continue
-                    for check in spec.get("checks", []):
+                    checks = spec.get("checks")
+                    if not isinstance(checks, list):
+                        checks = []
+                    for check in checks:
+                        if not isinstance(check, dict):
+                            continue
                         argv = check.get("argv", [])
                         if not argv:
                             continue
@@ -952,6 +973,10 @@ class Evolution:
             raise ValueError("Unknown evaluation split")
         if manifest["source"] not in ["real", "synthetic"]:
             raise ValueError("Case source must be real or synthetic")
+        # task 必须是字符串：case_stratum 与下游 len()/splitlines() 都按 str 处理，
+        # int/float/bool 会在调度路径抛 TypeError，导入时就要拒绝。
+        if not isinstance(manifest["task"], str):
+            raise ValueError("Case task must be a string")
         if not manifest["family"] or not manifest["task"] or not manifest["checks"]:
             raise ValueError("Empty evaluation case")
         source = repository(manifest["repository"])
