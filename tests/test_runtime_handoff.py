@@ -209,7 +209,9 @@ class RuntimeHandoffTest(unittest.TestCase):
             from adaptive_rsi.process import Cancelled
             with patch.object(self.runtime.agent, 'invoke', side_effect=model), self.assertRaises(Cancelled):
                 self.runtime.invoke('implementation', 'fixture', self.root, run)
-        self.assertNotIn('_evaluation_started', self.runtime.new_trial_context(run))
+        trial = self.runtime.new_trial_context(run)
+        self.assertNotIn('_outer_deadline_stage', trial)
+        self.assertNotIn('_outer_deadline_started', trial)
 
     def test_model_call_preserves_the_background_evaluation_deadline(self):
         _, run = self.claim()
@@ -224,6 +226,45 @@ class RuntimeHandoffTest(unittest.TestCase):
             clock[0] = 3610.0
             self.assertTrue(self.runtime.is_cancelled(run))
             self.assertEqual(run['_timed_out_stage'], 'evaluation')
+
+    def test_model_call_preserves_the_background_preparation_deadline(self):
+        """preparation 时钟在模型调用后按原起点恢复：T+M 与预算比较，不退回模型耗时。"""
+        from adaptive_rsi.process import Cancelled
+        _, run = self.claim()
+        clock = [10.0]
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            self.runtime.begin_phase(run, 'preparation')
+            clock[0] = 810.0
+            observed = {}
+            def model(*args, **kwargs):
+                observed['during'] = self.runtime.is_cancelled(run)
+                clock[0] = 1010.0
+                return {}
+            with patch.object(self.runtime.agent, 'invoke', side_effect=model):
+                # prep 已耗 800s、调用再耗 200s：1000s >= 900s，调用内即按 preparation 超时取消。
+                with self.assertRaises(Cancelled):
+                    self.runtime.invoke('planning', 'work', self.root, run)
+            self.assertFalse(observed['during'])
+            self.assertEqual(run['_deadline_stage'], 'preparation')
+            self.assertEqual(run['_deadline_started'], 10.0)
+            self.assertEqual(run['_timed_out_stage'], 'preparation')
+            self.assertNotIn('_outer_deadline_stage', run)
+            self.assertNotIn('_outer_deadline_started', run)
+
+    def test_model_call_within_preparation_budget_does_not_restart_the_clock(self):
+        """T+M 未超预算时调用正常返回，时钟保持调用前起点而非重置到返回时刻。"""
+        _, run = self.claim()
+        clock = [10.0]
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            self.runtime.begin_phase(run, 'preparation')
+            clock[0] = 310.0
+            with patch.object(self.runtime.agent, 'invoke', side_effect=lambda *a, **k: clock.__setitem__(0, 610.0) or {}):
+                self.runtime.invoke('planning', 'work', self.root, run)
+            self.assertEqual(run['_deadline_stage'], 'preparation')
+            self.assertEqual(run['_deadline_started'], 10.0)
+            clock[0] = 920.0
+            self.assertTrue(self.runtime.is_cancelled(run))
+            self.assertEqual(run['_timed_out_stage'], 'preparation')
 
     def experiment_inputs(self):
         """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
