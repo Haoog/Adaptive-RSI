@@ -241,14 +241,15 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
             with self.assertRaisesRegex(OSError, 'Atomic no-replace cleanup rename unavailable'):
                 maintenance._rename_cleanup(self.directory / 'workspace', self.directory / 'candidate')
 
-    def _make_valid_recycle(self, identifier, committed=True):
+    def _make_valid_recycle(self, identifier, committed=True, expires=None):
         """Rebuild one recycle: durable journal, moved artifact, optionally the committed row."""
         import os
         import time
         preview = maintenance.preview_cleanup(self.store, 'r')
         folder = self.store.root / 'recycle' / identifier
         folder.mkdir(parents=True, mode=0o700)
-        receipt = {**preview, 'id': identifier, 'expires': time.time() + 7 * 86400}
+        receipt = {**preview, 'id': identifier,
+                   'expires': expires if expires is not None else time.time() + 7 * 86400}
         (folder / 'receipt.json').write_text(json.dumps(receipt), encoding='utf-8')
         os.rename(self.directory / 'workspace', folder / 'workspace')
         if committed:
@@ -652,3 +653,101 @@ recycle_cleanup(store, preview_cleanup(store, 'r'))
         with self.assertRaisesRegex(ValueError, 'preview changed'):
             maintenance.recycle_cleanup(self.store, preview)
         self.assertTrue((self.directory / 'feedback' / '9999-late').exists())
+
+    def test_expired_recycle_purges_artifacts_and_row_but_keeps_journal(self):
+        identifier = 'a' * 32
+        receipt = self._make_valid_recycle(identifier, expires=time.time() - 1)
+        folder = self.store.root / 'recycle' / identifier
+        maintenance.recover_cleanup(self.store)
+        self.assertFalse((folder / 'workspace').exists())
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('recycle:' + identifier,)))
+        # receipt.json stays behind as the audit trail distinguishing "purged"
+        # from "never recycled".
+        self.assertTrue((folder / 'receipt.json').exists())
+        event = self.store.one("SELECT message,data FROM events WHERE kind='recycle_purged'")
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['receipt_id'], identifier)
+        # Purging is idempotent: a second pass removes nothing else and emits
+        # no duplicate evidence.
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual(self.store.one("SELECT count(*) AS c FROM events "
+                                        "WHERE kind='recycle_purged'")['c'], 1)
+        self.assertTrue((folder / 'receipt.json').exists())
+        # Undo still refuses the expired identifier even though the receipt
+        # journal is retained on disk.
+        with self.assertRaisesRegex(ValueError, 'missing or expired'):
+            maintenance.undo_cleanup(self.store, receipt['id'])
+
+    def test_unexpired_recycle_untouched_by_purge_and_undoable(self):
+        identifier = 'b' * 32
+        receipt = self._make_valid_recycle(identifier)
+        folder = self.store.root / 'recycle' / identifier
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((folder / 'workspace' / 'evidence').read_text(), 'original')
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('recycle:' + identifier,)))
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE kind='recycle_purged'"))
+        maintenance.undo_cleanup(self.store, receipt['id'])
+        self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
+
+    def test_expired_uncommitted_recycle_removes_artifacts_silently(self):
+        # Crash remnant: journal and artifacts committed to disk, settings row
+        # never committed.  The declared TTL still applies, so the pass drops
+        # the artifacts instead of resurrecting them into the run directory.
+        identifier = 'c' * 32
+        self._make_valid_recycle(identifier, committed=False, expires=time.time() - 1)
+        folder = self.store.root / 'recycle' / identifier
+        maintenance.recover_cleanup(self.store)
+        self.assertFalse((folder / 'workspace').exists())
+        self.assertTrue((folder / 'receipt.json').exists())
+        self.assertFalse((self.directory / 'workspace').exists())
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE kind='recycle_purged'"))
+
+    def test_expired_recycle_artifact_mismatch_blocks_purge(self):
+        import shutil
+        identifier = 'd' * 32
+        self._make_valid_recycle(identifier, expires=time.time() - 1)
+        folder = self.store.root / 'recycle' / identifier
+        # Someone swapped the recorded artifact for a different directory:
+        # the inode no longer matches the receipt, so nothing may be deleted.
+        shutil.rmtree(folder / 'workspace')
+        (folder / 'workspace').mkdir()
+        (folder / 'workspace' / 'foreign').write_text('not ours')
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual((folder / 'workspace' / 'foreign').read_text(), 'not ours')
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('recycle:' + identifier,)))
+        evidence = self.store.one('SELECT value FROM settings WHERE key=?',
+                                  ('recycle-purge-blocked:' + identifier,))
+        self.assertIsNotNone(evidence)
+        self.assertEqual(json.loads(evidence['value'])['blocked_on'], 'workspace')
+        maintenance.recover_cleanup(self.store)
+        self.assertEqual(self.store.one("SELECT count(*) AS c FROM events "
+                                        "WHERE kind='recycle_purge_blocked'")['c'], 1)
+        # Once the foreign directory is removed by hand, the next pass purges.
+        shutil.rmtree(folder / 'workspace')
+        maintenance.recover_cleanup(self.store)
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('recycle:' + identifier,)))
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('recycle-purge-blocked:' + identifier,)))
+        self.assertTrue((folder / 'receipt.json').exists())
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='recycle_purged'"))
+
+    def test_expired_orphan_receipt_row_removed_when_folder_absent(self):
+        # Rows whose folder was already deleted (or never created) carry no
+        # artifacts; they are metadata-only residue and are swept directly.
+        gone, live = 'e' * 32, 'f' * 32
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('recycle:' + gone, json.dumps({'id': gone, 'run': 'r', 'objects': [],
+                                                           'expires': time.time() - 1})))
+        self.store.execute("INSERT INTO settings VALUES (?,?)",
+                           ('recycle:' + live, json.dumps({'id': live, 'run': 'r', 'objects': [],
+                                                           'expires': time.time() + 7 * 86400})))
+        maintenance.recover_cleanup(self.store)
+        self.assertIsNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                         ('recycle:' + gone,)))
+        self.assertIsNotNone(self.store.one('SELECT 1 FROM settings WHERE key=?',
+                                            ('recycle:' + live,)))
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='recycle_purged'"))

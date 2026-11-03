@@ -340,6 +340,68 @@ def _recover_cleanup_locked(store):
             except (ValueError, TypeError, KeyError) as error:
                 quarantine(name, journal, error, str(error))
                 continue
+            expired = (isinstance(receipt.get('expires'), (int, float)) and
+                       receipt['expires'] <= time.time())
+            if expired:
+                # The receipt declares its own retention deadline; past it the
+                # recycle is no longer undoable, so the artifacts would sit in
+                # the folder forever (each pass re-stats them) and the settings
+                # row leaks. Purge the verified artifact subtrees, keep
+                # receipt.json as the audit trail, and delete the row so a
+                # later pass does not re-scan.  Anything that does not match
+                # the recorded device/inode pair (tampering or an unexpected
+                # live artifact moved in by hand) blocks the purge instead of
+                # being deleted; a recycle-purge-blocked evidence row marks the
+                # folder for manual review and the folder is left intact.
+                folder = store.root / 'recycle' / receipt['id']
+                blocked = None
+                for item in receipt['objects']:
+                    target = folder / item['name']
+                    if target.is_symlink():
+                        blocked = item['name']
+                        break
+                    if not target.exists():
+                        continue
+                    info = target.stat()
+                    # Device/inode alone cannot distinguish a rebuilt directory
+                    # from the recorded one: filesystems recycle inode numbers.
+                    # The preview also stamped mtime_ns, which survives renames
+                    # but never survives delete+recreate.
+                    if ((info.st_dev, info.st_ino, info.st_mtime_ns) !=
+                            (item['device'], item['inode'], item.get('modified_ns'))):
+                        blocked = item['name']
+                        break
+                if blocked is not None:
+                    evidence = {'folder': name, 'receipt_id': receipt['id'],
+                                'run': receipt.get('run'), 'blocked_on': blocked}
+                    serialized = json.dumps(evidence, sort_keys=True)
+                    blocked_key = 'recycle-purge-blocked:' + name
+                    existing = db.execute('SELECT value FROM settings WHERE key=?',
+                                          (blocked_key,)).fetchone()
+                    if not existing or existing[0] != serialized:
+                        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                                   (blocked_key, serialized))
+                        note('recycle_purge_blocked',
+                             'Recycle purge blocked by unexpected artifact: ' + name +
+                             ' (' + blocked + ')', evidence)
+                    continue
+                for item in receipt['objects']:
+                    _remove_artifact(folder, item['name'])
+                db.execute("DELETE FROM settings WHERE key=?",
+                           ('recycle-purge-blocked:' + name,))
+                if row:
+                    db.execute("DELETE FROM settings WHERE key=?",
+                               ('recycle:' + receipt['id'],))
+                    note('recycle_purged',
+                         'Expired recycle receipt purged: ' + name,
+                         {'folder': name, 'receipt_id': receipt['id'],
+                          'run': receipt.get('run'),
+                          'objects': [item['name'] for item in receipt['objects']]})
+                # Row already absent: uncommitted crash remnant.  Artifacts are
+                # deleted silently above; keep the journal so the folder is
+                # still identifiable instead of an anonymous empty directory.
+                _sync_directory(folder)
+                continue
             try:
                 _place_cleanup(store, receipt, recycled=bool(row))
             except ValueError as error:
@@ -362,6 +424,32 @@ def _recover_cleanup_locked(store):
                          evidence)
                 continue
             db.execute("DELETE FROM settings WHERE key=?", ('cleanup-recovery-conflict:' + name,))
+        # Sweep expired receipt rows whose folder is already gone (or was never
+        # created): without the folder there is no artifact to purge, so the row
+        # is metadata-only residue and the hourly purge loop above can never
+        # reach it.  Live rows and rows for folders that still exist are left
+        # to the per-folder path, which re-validates before deleting anything.
+        recycle_root = recycle
+        for stale_key, _stale_value in db.execute(
+                "SELECT key,value FROM settings WHERE key LIKE 'recycle:%' AND "
+                "json_valid(value) AND json_extract(value,'$.expires') IS NOT NULL AND "
+                "json_extract(value,'$.expires')<=?", (time.time(),)).fetchall():
+            identifier = stale_key.split(':', 1)[1]
+            # Same shape rule as _cleanup_paths: a malformed suffix is corrupt
+            # data and fails closed (left for review) rather than being trusted
+            # as a directory name.
+            if (len(identifier) != 32 or
+                    any(c not in '0123456789abcdef' for c in identifier)):
+                continue
+            folder = recycle_root / identifier
+            if folder.exists() or folder.is_symlink():
+                continue
+            db.execute("DELETE FROM settings WHERE key=?", (stale_key,))
+            db.execute("DELETE FROM settings WHERE key=?",
+                       ('recycle-purge-blocked:' + identifier,))
+            note('recycle_purged',
+                 'Expired recycle receipt row removed; folder already absent: ' + identifier,
+                 {'folder': identifier, 'receipt_id': identifier})
         # Commit repairs and evidence accumulated after the last note(); the
         # finally below still rolls back an in-flight item that failed.
         db.commit()
@@ -393,7 +481,9 @@ def recover_cleanup(store):
     """Reconcile interrupted cleanup/undo from durable receipts after restart.
 
     Database unavailability or path conflicts leave the disk receipt intact for retry.
-    Expiry never discards the only copy of an artifact.
+    Receipts past their declared ``expires`` are no longer undoable: each pass
+    purges their verified artifacts and settings row while keeping receipt.json
+    as the audit trail, and drops expired rows whose folders are already gone.
     """
     with _cleanup_lock(store):
         _recover_cleanup_locked(store)
