@@ -791,8 +791,8 @@ class Maintenance:
                                (row["key"], row["key"] + ":", row["key"] + ";"))
         self.store.execute("DELETE FROM settings WHERE key LIKE 'provider-account-health:%' AND json_valid(value) "
                            "AND json_extract(value,'$.retry_at')<?", (now - 7 * 86400,))
-        self.store.execute("DELETE FROM skills WHERE expires<?", (now - 30 * 86400,))
-        self.store.execute("DELETE FROM request_log WHERE started<?", (now - 7 * 86400,))
+        self.store.execute("DELETE FROM skills WHERE rowid IN (SELECT rowid FROM skills WHERE expires<? LIMIT 500)", (now - 30 * 86400,))
+        self.store.execute("DELETE FROM request_log WHERE rowid IN (SELECT rowid FROM request_log WHERE started<? LIMIT 500)", (now - 7 * 86400,))
         self.store.execute("DELETE FROM phase_times WHERE id IN (SELECT id FROM phase_times WHERE ended IS NOT NULL AND ended<? AND run IN "
                            "(SELECT id FROM runs WHERE ended IS NOT NULL AND ended<?) LIMIT 500)", (stale, stale))
         self.store.execute("DELETE FROM remote_waits WHERE id IN (SELECT id FROM remote_waits WHERE ended IS NOT NULL AND ended<? AND run IN "
