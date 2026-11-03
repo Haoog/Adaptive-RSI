@@ -937,7 +937,11 @@ class Evolution:
                         git_error = None
                         for git_argv in (
                             ["git", "-c", "init.defaultBranch=main", "init", "--quiet", "."],
-                            ["git", "add", "-A"],
+                            # 封存树里可能含「已被跟踪但同时命中 .gitignore」的文件：忽略规则
+                            # 不会取消原仓库里的既有跟踪项，但新索引上的 add -A 会按规则把它们
+                            # 静默丢掉，ls-files 类检查得到不完整的文件集而误判通过。重建索引
+                            # 必须保留封存基线的全部已登记文件，用 --force 强制加入。
+                            ["git", "add", "-A", "--force"],
                             ["git", "-c", "user.name=Adaptive RSI", "-c", "user.email=bundle@localhost",
                              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull,
                              "commit", "--quiet", "--allow-empty", "-m", "sealed bundle reproduction"],

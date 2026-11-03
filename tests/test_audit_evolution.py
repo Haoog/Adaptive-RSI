@@ -1143,12 +1143,18 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
-    def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo'):
-        """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
+    def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo',
+                      repo_setup=None):
+        """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。
+
+        repo_setup：可选回调，在 fixture 建好后、记录 base 前对源仓库做追加提交
+        （例如塞入命中 .gitignore 的已跟踪文件），让封存快照携带特定基线内容。"""
         from tests.test_runtime import fixture
         from adaptive_rsi.gitops import git
         suffix = repo_name[5:] if repo_name.startswith('repo-') else repo_name
         repo = fixture(self.root / repo_name)
+        if repo_setup:
+            repo_setup(repo)
         base = git(repo, 'rev-parse', 'HEAD')
         spec = {
             'task': 'offline reproduction task',
@@ -1752,7 +1758,18 @@ class AuditEvolutionTest(unittest.TestCase):
             {'name': 'git_ls_files', 'cwd': '.', 'argv': ['git', 'ls-files']},
             {'name': 'git_status', 'cwd': '.', 'argv': ['git', 'status', '--porcelain']},
         ]
-        destination = self.sealed_bundle(checks=checks, repo_name='repo-gitctx')
+        def add_ignored_tracked(repo):
+            # 封存基线里放一个「已被跟踪但命中 .gitignore」的文件：忽略规则不会取消
+            # 原仓库里的既有跟踪项，重建索引时若只用 add -A 会把它静默丢掉（评审复现的
+            # 漏洞），重建后的 ls-files 必须仍包含它。
+            from adaptive_rsi.gitops import git as _git
+            (repo / '.gitignore').write_text('*.log\n')
+            (repo / 'debug.log').write_text('sealed but ignored\n')
+            _git(repo, 'add', '-f', '-A')
+            _git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+                 'commit', '--quiet', '-m', 'tracked ignored file')
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-gitctx',
+                                         repo_setup=add_ignored_tracked)
         repository = destination / 'cases' / 'case-gitctx' / 'repository'
         # 模拟新格式 bundle：封存树不带 .git（manifest 本就不登记它，完整性不受影响）。
         shutil.rmtree(repository / '.git')
@@ -1763,9 +1780,11 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(len(result['executed_checks']), 3)
         for row in result['executed_checks']:
             self.assertTrue(row['passed'], row)
-        # 重建出的仓库确实把封存文件登记为已跟踪内容。
+        # 重建出的仓库确实把封存文件登记为已跟踪内容：含命中 .gitignore 的已跟踪文件，
+        # 该文件在原仓库里是合法跟踪项，重建索引不得因忽略规则把它丢掉。
         ls_files = next(row for row in result['executed_checks'] if row['check'] == 'git_ls_files')
         self.assertIn('calculator.py', ls_files['stdout'])
+        self.assertIn('debug.log', ls_files['stdout'])
         # 重建只发生在一次性 staging：bundle 本体仍不带 .git，登记文件也未被改写。
         self.assertFalse((repository / '.git').exists())
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
