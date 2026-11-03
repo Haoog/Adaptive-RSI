@@ -298,6 +298,27 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(len(self.store.query("SELECT * FROM schedules")), 1)
 
+    def test_manual_scan_trigger_survives_scheduled_backlog_recompute(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        self.runtime.request(self.project, "light", priority=90)
+        # 非系统任务构成修复积压，让本轮周期调度为扫描算出更低优先级。
+        self.runtime.goal(self.project, "Backlog finding")
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100)
+        row = self.store.one("SELECT evidence,priority FROM tasks WHERE fingerprint='system:light'")
+        self.assertEqual(row["priority"], 90)
+        self.assertEqual(json.loads(row["evidence"]), [{"scan_trigger": "manual"}])
+
+    def test_automatic_scan_priority_still_tracks_backlog_depth(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        config = self.runtime.config(self.project)
+        self.runtime.schedule(self.project, config, now=100)
+        self.assertEqual(self.store.one("SELECT priority FROM tasks WHERE fingerprint='system:light'"),
+                         {"priority": 90})
+        self.runtime.goal(self.project, "Backlog finding")
+        self.runtime.schedule(self.project, config, now=1000000)
+        self.assertEqual(self.store.one("SELECT priority FROM tasks WHERE fingerprint='system:light'"),
+                         {"priority": 55})
+
     def test_recovery_retains_artifacts_and_requires_fresh_retry(self):
         task, run = self.claim()
         self.assertEqual(self.store.recover(), 1)

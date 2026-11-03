@@ -997,7 +997,7 @@ class Store:
                 candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
                                        source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
                                        " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
-                                       (project, now, now, *skipped)).fetchone()
+                                       (project, now, *skipped, now)).fetchone()
                 if not candidate:
                     return None
                 if candidate["source"] == "system_publish":
