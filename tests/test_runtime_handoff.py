@@ -512,6 +512,43 @@ class RuntimeHandoffTest(unittest.TestCase):
                     self.assertEqual(len(publish_tasks), 1)
                     self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills WHERE task=?', (task,))['n'], 1)
 
+    def test_postprocess_delivery_effect_committed_marker_lost_is_not_reexecuted(self):
+        # 副作用已落库、步骤标记未提交的崩溃窗口内，下一轮 drain 按持久效果
+        # （publish:<run_id> 任务存在）跳过 deliver 调用，而不是再次执行副作用。
+        project = self.runtime.add_project(fixture(self.root / 'delivery-effect'))
+        self.runtime.configure({'delivery': {'mode': 'pr'}, 'evolution': {'enabled': False}}, project)
+        self.runtime.pause(project, False)
+        self.runtime.goal(project, 'Delivery durable effect')
+        run = self.store.claim(project, self.runtime.config(project))
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {
+            'summary': 'Verified outcome',
+            'evaluation': {'decision': 'pass'},
+            'review': {'decision': 'pass'},
+        }, True)
+
+        calls = []
+        original = self.runtime.deliver
+        def deliver_then_crash(run_id, automatic=False):
+            calls.append(run_id)
+            original(run_id, automatic=automatic)
+            raise RuntimeError('crash after effect committed')
+        with patch.object(self.runtime, 'deliver', side_effect=deliver_then_crash):
+            self.runtime.drain_postprocess()
+        self.assertEqual(calls, [run['id']])
+        self.assertNotIn('delivery', self.store.setting('postprocess:' + run['id'])['steps'])
+
+        # 第二轮 drain 仍挂着崩溃 mock：若再次调用 deliver 会追加调用并抛错；
+        # 持久效果已存在时只能走 durable-guard 跳过，回执补齐标记并完成。
+        with patch.object(self.runtime, 'deliver', side_effect=deliver_then_crash):
+            self.runtime.drain_postprocess()
+        self.assertEqual(calls, [run['id']])
+        record = self.store.setting('postprocess:' + run['id'])
+        self.assertEqual(record['state'], 'completed')
+        self.assertIn('delivery', record['steps'])
+        self.assertEqual(len(self.store.query('SELECT id FROM tasks WHERE project=? AND fingerprint=?',
+                                              (project, 'publish:' + run['id']))), 1)
+
     def test_postprocess_monitor_crash_before_and_after_recovers_without_duplicates(self):
         for boundary in ('before', 'after'):
             with self.subTest(boundary=boundary):

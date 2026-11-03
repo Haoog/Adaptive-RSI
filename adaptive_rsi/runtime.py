@@ -1436,19 +1436,28 @@ class Runtime(Maintenance):
         for step in ('delivery', 'observation', 'monitor', 'evolution'):
             if step in record['steps']:
                 continue
+            # 副作用提交与步骤标记落库是两个事务；崩溃落在两者之间时本轮会重放该步。
+            # 因此每步先按「持久效果已存在」判定：已生效则跳过调用，未生效才真正执行，
+            # 保证 at-least-once 且重放不产生重复副作用。
             if step == 'delivery':
-                if config['delivery']['mode'] == 'pr' and self.config(run['project'])['delivery']['mode'] == 'pr' and run['state'] == 'awaiting_approval':
+                if (config['delivery']['mode'] == 'pr' and self.config(run['project'])['delivery']['mode'] == 'pr'
+                        and run['state'] == 'awaiting_approval' and not self.store.one(
+                            'SELECT 1 FROM tasks WHERE project=? AND fingerprint=?',
+                            (run['project'], 'publish:' + run['id']))):
                     self.deliver(run['id'], automatic=True)
             elif step == 'observation':
                 identifier = hashlib.sha256(('observation:' + run['id']).encode()).hexdigest()[:16]
-                self.store.execute('INSERT OR IGNORE INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
-                    (identifier, run['project'], run['task'], 'observation',
-                     encode([self.store.one('SELECT title FROM tasks WHERE id=?', (run['task'],))['title']]),
-                     outcome.get('summary', ''), encode({'run': run['id'], 'base': run['base']}),
-                     run['ended'] + 30 * 86400, run['ended']))
+                if not self.store.one('SELECT 1 FROM skills WHERE id=?', (identifier,)):
+                    self.store.execute('INSERT OR IGNORE INTO skills VALUES (?,?,?,?,?,?,?,?,?)',
+                        (identifier, run['project'], run['task'], 'observation',
+                         encode([self.store.one('SELECT title FROM tasks WHERE id=?', (run['task'],))['title']]),
+                         outcome.get('summary', ''), encode({'run': run['id'], 'base': run['base']}),
+                         run['ended'] + 30 * 86400, run['ended']))
             elif step == 'monitor':
+                # monitor 内部按 run['id'] 在 candidates.evidence.monitor.runs 去重，重放是只读空转。
                 self.monitor_strategy(run['project'], True, run)
             else:
+                # maybe_evolve 内部用持久化的 last-evolution: 计数与 evolution-attempt: 签名去重。
                 self.maybe_evolve(run['project'], config)
             record['steps'].append(step)
             self.store.put_setting(key, record)
@@ -2216,10 +2225,10 @@ class Runtime(Maintenance):
         interval = config["evolution"]["every_completed"]
         if count // interval <= previous // interval:
             return
-        self.store.put_setting("last-evolution:" + project, count)
         from .evolution import Evolution
         due, signature, attempt = Evolution(self).attempt_due(project, self.config(project))
         if not due:
+            self.store.put_setting("last-evolution:" + project, count)
             # 相同真实输入已经评估过且没有晋升；自动调度不再重复付费，直到证据、
             # 样本、策略或策略参数变化，或用户显式 force 重试。
             self.store.event("evolution_not_repeated",
@@ -2228,6 +2237,9 @@ class Runtime(Maintenance):
                                             "previous": attempt.get("status") if isinstance(attempt, dict) else None})
             return
         self.request(project, "evolve", priority=30)
+        # 入队先于水位落库：水位标记丢失时重放会重新判定（attempt_due 未变仍 due，
+        # request 以 system:evolve 指纹去重返回既有任务），不丢一次应得的进化尝试。
+        self.store.put_setting("last-evolution:" + project, count)
 
     def monitor_strategy(self, project, passed, run=None, attributable=False):
         from .evolution import Evolution
