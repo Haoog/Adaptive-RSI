@@ -1743,6 +1743,53 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(len(plan['samples']), 6)
         self.assertIn('share of the population', ' '.join(evidence['promotion_review']['limitations']))
 
+    def test_bundle_reproduction_rebuilds_sanitized_git_context_in_staging(self):
+        # 评审修复：导出不再随包携带 .git 后，依赖 Git 元数据的检查不能盲挂——
+        # reproduce_bundle 在一次性 staging 里重建无 remote 的干净仓库，
+        # git rev-parse / ls-files 类检查看到的封存树与原始评估一致。
+        checks = [
+            {'name': 'git_head', 'cwd': '.', 'argv': ['git', 'rev-parse', '--verify', 'HEAD']},
+            {'name': 'git_ls_files', 'cwd': '.', 'argv': ['git', 'ls-files']},
+            {'name': 'git_status', 'cwd': '.', 'argv': ['git', 'status', '--porcelain']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-gitctx')
+        repository = destination / 'cases' / 'case-gitctx' / 'repository'
+        # 模拟新格式 bundle：封存树不带 .git（manifest 本就不登记它，完整性不受影响）。
+        shutil.rmtree(repository / '.git')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 3)
+        for row in result['executed_checks']:
+            self.assertTrue(row['passed'], row)
+        # 重建出的仓库确实把封存文件登记为已跟踪内容。
+        ls_files = next(row for row in result['executed_checks'] if row['check'] == 'git_ls_files')
+        self.assertIn('calculator.py', ls_files['stdout'])
+        # 重建只发生在一次性 staging：bundle 本体仍不带 .git，登记文件也未被改写。
+        self.assertFalse((repository / '.git').exists())
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def test_bundle_reproduction_reports_git_reconstruction_failure(self):
+        # staging 里 git init 失败时记录为该用例的执行错误，不静默跳过也不崩溃。
+        checks = [{'name': 'noop', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-gitfail')
+        shutil.rmtree(destination / 'cases' / 'case-gitfail' / 'repository' / '.git')
+        real_run = __import__('subprocess').run
+        def broken_git(argv, *args, **kwargs):
+            if argv[:2] == ['git', 'add']:
+                return __import__('subprocess').CompletedProcess(argv, 128, '', 'index lock failed')
+            return real_run(argv, *args, **kwargs)
+        with patch('subprocess.run', side_effect=broken_git):
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertFalse(row['passed'])
+        self.assertIn('git context', row['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

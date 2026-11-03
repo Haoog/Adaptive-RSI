@@ -925,6 +925,39 @@ class Evolution:
                             "exit_code": -1, "passed": False, "error": str(exc),
                         })
                         continue
+                    # bundle 不再随包导出 .git（宿主机路径泄漏 + manifest 校验盲区），但
+                    # git ls-files / rev-parse 这类检查依赖 Git 元数据：在一次性 staging
+                    # 里重建一个无 remote 的干净仓库，让检查看到的封存树与原始评估一致。
+                    # 已有 .git 的旧版导出包维持原样；重建只发生在 staging，不回写 bundle。
+                    if not (staging / ".git").exists():
+                        git_env = dict(env_dict)
+                        git_env["GIT_CONFIG_NOSYSTEM"] = "1"
+                        git_env["GIT_CONFIG_GLOBAL"] = os.devnull
+                        git_env["GIT_TERMINAL_PROMPT"] = "0"
+                        git_error = None
+                        for git_argv in (
+                            ["git", "-c", "init.defaultBranch=main", "init", "--quiet", "."],
+                            ["git", "add", "-A"],
+                            ["git", "-c", "user.name=Adaptive RSI", "-c", "user.email=bundle@localhost",
+                             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull,
+                             "commit", "--quiet", "--allow-empty", "-m", "sealed bundle reproduction"],
+                        ):
+                            try:
+                                proc = subprocess.run(git_argv, cwd=staging, capture_output=True,
+                                                      text=True, timeout=60, env=git_env)
+                            except Exception as exc:
+                                git_error = str(exc)
+                                break
+                            if proc.returncode != 0:
+                                git_error = (proc.stderr or proc.stdout or "git setup failed").strip()[-400:]
+                                break
+                        if git_error is not None:
+                            executed_checks.append({
+                                "case": case_id, "check": None, "argv": [],
+                                "exit_code": -1, "passed": False,
+                                "error": "Sanitized git context reconstruction failed: " + git_error,
+                            })
+                            continue
                     checks = spec.get("checks")
                     if not isinstance(checks, list):
                         checks = []
