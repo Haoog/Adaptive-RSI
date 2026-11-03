@@ -224,9 +224,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            # Aborted browser fetches are normal during navigation; do not retry a response to a closed socket.
+        except OSError:
+            # Aborted browser fetches are normal during navigation; socket write
+            # timeouts on slow clients are OSError subclasses as well. Do not
+            # retry a response to a dead socket, and mark the delivery as
+            # interrupted so request_log does not record it as a real success.
             self.close_connection = True
+            self._response_status = 500
+            self._response_error_code = "response_interrupted"
 
     def api_error(self, exc):
         if isinstance(exc, RequestError):

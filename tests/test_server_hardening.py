@@ -422,6 +422,54 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(handler.wfile.getvalue(), b"")
         self.assertTrue(handler.close_connection)
 
+    def test_respond_treats_socket_write_timeout_as_client_disconnect(self):
+        # 慢读客户端会让 wfile.write 抛 TimeoutError（OSError 子类）；它与断管
+        # 一样是死连接：关闭连接、request_log 记中断而不是从未送达的 200，
+        # 异常不再上抛给 except Exception → api_error 对同一 socket 二次响应。
+        def disconnected(handler):
+            handler.server = self.server
+            handler.send_response = lambda _: None
+            handler.headers_common = lambda: None
+            handler.send_header = lambda *_: None
+            handler.end_headers = lambda: None
+            handler.close_connection = False
+            handler._request_id = "fixture-request"
+            return handler
+
+        handler = disconnected(object.__new__(Handler))
+        writes = []
+        handler.wfile = SimpleNamespace(write=lambda _: (_ for _ in ()).throw(TimeoutError()))
+        handler.api_error = lambda exc: writes.append("api_error")
+        try:
+            # Mirror the _do_GET/_do_POST boundary: respond() must swallow the
+            # write failure, so api_error is never reached for this request.
+            try:
+                handler.respond({"ok": True})
+            except Exception as exc:
+                handler.api_error(exc)
+        finally:
+            del handler.api_error
+        self.assertEqual(writes, [])
+        self.assertTrue(handler.close_connection)
+        self.assertEqual((handler._response_status, handler._response_error_code),
+                         (500, "response_interrupted"))
+
+        # api_error itself must also survive a dead socket instead of raising
+        # into handle_error's stderr traceback for a second futile respond().
+        Handler.api_error(handler, RuntimeError("boom"))
+        self.assertTrue(handler.close_connection)
+        self.assertEqual((handler._response_status, handler._response_error_code),
+                         (500, "response_interrupted"))
+
+        # Other OSError write failures keep the same closed-socket semantics.
+        handler = disconnected(object.__new__(Handler))
+        handler.wfile = SimpleNamespace(
+            write=lambda _: (_ for _ in ()).throw(ConnectionResetError()))
+        handler.respond({"error": "x"}, 404)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual((handler._response_status, handler._response_error_code),
+                         (500, "response_interrupted"))
+
     def test_auth_failure_limit_is_thread_safe_and_valid_clients_bypass_it(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             responses = list(pool.map(lambda _: self.request(authenticated=False), range(42)))
