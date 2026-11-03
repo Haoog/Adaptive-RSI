@@ -151,9 +151,11 @@ def record_pr_feedback(store, run, url, pr):
         payload = encode(item)
         key = prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
         store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
-        # 只有客观信号才重排：失败检查，或人类明确请求修改。普通评论（包括
-        # 「LGTM」这类赞许）只作为后续规划的上下文，不能关掉本可合并的 PR。
-        if item["kind"] == "ci" or (item["kind"] == "review" and item.get("state") == "CHANGES_REQUESTED"):
+        # 只有客观信号才重排：失败检查，或仍未被后续批准覆盖的修改请求。
+        # 普通评论（包括「LGTM」这类赞许）只作为后续规划的上下文。
+        if item["kind"] == "ci" or (item["kind"] == "review" and
+                                    item.get("state") == "CHANGES_REQUESTED" and
+                                    pr.get("reviewDecision") != "APPROVED"):
             actionable.append(identity)
     return actionable
 

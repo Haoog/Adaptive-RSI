@@ -581,10 +581,11 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                     exclusion.get("at") == existing["updated"] and exclusion.get("state") in
                     ["queued", "deferred", "blocked", "waiting_budget", "rejected", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"]):
                 # Restore the prior decision, including deferral, rather than paying to plan it again.
+                # 因 Issue 同步被压成 blocked 的任务不会自己恢复，恢复政策后必须回到队列。
                 restored_evidence = [dict(previous[0]), *previous[1:]]
                 restored_evidence[0].pop("sync_exclusion", None)
                 db.execute("UPDATE tasks SET state=?,evidence=?,updated=? WHERE id=? AND state='obsolete' AND updated=?",
-                              ("queued" if exclusion["state"] == "awaiting_approval" else exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
+                              ("queued" if exclusion["state"] in ("awaiting_approval", "blocked") else exclusion["state"], encode(restored_evidence), time.time(), existing["id"], existing["updated"]))
                 return True
             if not active and existing["state"] in ["queued", "deferred", "obsolete", "rejected", "blocked", "waiting_budget", "insufficient_evidence", "failed", "interrupted", "awaiting_approval"] and revised:
                 requirements = {**requirements, "upstream_body": (issue["body"] or "")[:30000]}

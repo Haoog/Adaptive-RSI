@@ -66,6 +66,18 @@ class PRFeedbackContextTest(unittest.TestCase):
             self.assertEqual(len(store.query("SELECT value FROM settings WHERE key LIKE 'pr-feedback:%'")), 25)
             store.close()
 
+    def test_change_request_superseded_by_approval_is_not_actionable(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(Path(root))
+            run = {"id": "r", "task": "t", "project": "p"}
+            pr = {"reviewDecision": "APPROVED", "reviews": [
+                {"id": "R1", "body": "", "state": "CHANGES_REQUESTED", "author": {"login": "alice"}},
+                {"id": "R2", "body": "ok", "state": "APPROVED", "author": {"login": "alice"}}]}
+            self.assertEqual(record_pr_feedback(store, run, "pr", pr), [])
+            pr["reviewDecision"] = "CHANGES_REQUESTED"
+            self.assertTrue(record_pr_feedback(store, run, "pr", pr))
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
