@@ -612,27 +612,57 @@ class Evaluator:
     def __init__(self, store):
         self.store = store
 
-    def validate_controls(self, source, checks, controls, directory, config, cancel=None, seeds=None):
-        """Execute host-owned criterion counterexamples through the same sandbox gate."""
+    def validate_controls(self, source, checks, controls, directory, config, cancel=None, seeds=None,
+                          baseline=None, hidden=()):
+        """Execute host-owned criterion counterexamples through the same sandbox gate.
+
+        Controls prove the baseline harness itself detects a counterexample, so
+        each control target freezes the baseline harness before fixtures land;
+        candidate-authored tests cannot decide whether the fixture was caught.
+        ``baseline=None`` keeps the legacy caller path (no freeze) for callers
+        that have no baseline, which cannot prove harness sensitivity.
+        """
         from .config import relative_path
         if not controls or len(controls) > 32 or not checks:
             return {"decision": "insufficient_evidence", "controls": []}
         root = Path(directory).resolve()
         root.mkdir(parents=True, exist_ok=False)
+        baseline_files = set()
+        if baseline is not None:
+            for parent, dirs, files in os.walk(baseline, followlinks=False):
+                dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
+                for name in files:
+                    baseline_files.add((Path(parent) / name).relative_to(baseline))
+        def freeze(target):
+            if baseline is None:
+                return []
+            protected = freeze_harness(baseline, target, checks)
+            # Detection must come from the host-owned harness alone: test files
+            # the candidate added (absent from the baseline) never run inside a
+            # control, so they cannot decide whether a fixture was caught.
+            for parent, dirs, files in os.walk(target, followlinks=False):
+                dirs[:] = [d for d in dirs if d not in {".git", ".rsi-agent", ".rsi-home"}]
+                for name in files:
+                    path = Path(parent) / name
+                    relative = path.relative_to(target)
+                    if test_path(relative) and relative not in baseline_files:
+                        path.unlink()
+            return protected
         sandbox = Sandbox(self.store.root, config)
-        def execute(target):
+        def execute(target, protected):
             self._seed_target(target, seeds, config)
             rows = []
             for setup in config["environment"]["setup"]:
-                result = sandbox.check(setup, target, cancel)
+                result = sandbox.check(setup, target, cancel, protected, hidden)
                 if result["error"] or result["exit_code"]:
                     return [], False
             for check in checks:
-                result = sandbox.check(check, target, cancel)
+                result = sandbox.check(check, target, cancel, protected, hidden)
                 result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(result["stdout"] + result["stderr"])
                 rows.append(result)
             return rows, True
-        positive, ready = execute(copy_source(source, root / "positive"))
+        positive_target = copy_source(source, root / "positive")
+        positive, ready = execute(positive_target, freeze(positive_target))
         outcomes = []
         seen = set()
         for index, control in enumerate(controls):
@@ -641,6 +671,7 @@ class Evaluator:
                 raise ValueError("Controls require unique IDs, source, criterion and bounded fixture files")
             seen.add(control["id"])
             target = copy_source(source, root / str(index))
+            protected = freeze(target)
             total = 0
             for item in control["files"]:
                 path = target / relative_path(item["path"])
@@ -651,7 +682,8 @@ class Evaluator:
                     raise ValueError("Control fixture too large")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(item["content"], encoding="utf-8")
-            rows, prepared = execute(target)
+                protected.append(path)
+            rows, prepared = execute(target, protected)
             detected = prepared and any(row["exit_code"] not in (None, 0) and not row["error"]
                                         and not environment_failure(row) for row in rows)
             outcomes.append({"id": control["id"], "source": control["source"], "criterion": control["criterion"],
@@ -1210,7 +1242,8 @@ class Evaluator:
                     control_dir = Path(directory) / ("controls-" + str(time.time_ns()))
                 try:
                     outcome = self.validate_controls(candidate, checks, controls, control_dir,
-                                                     execution_config, cancel, seeds=seeds)
+                                                     execution_config, cancel, seeds=seeds,
+                                                     baseline=baseline, hidden=hidden)
                 except ValueError as exc:
                     outcome = {"decision": "insufficient_evidence", "reason": str(exc), "controls": []}
                 data["controls"] = outcome

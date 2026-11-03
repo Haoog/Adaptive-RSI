@@ -475,6 +475,107 @@ class AuditEvaluationTest(unittest.TestCase):
                 runner.evaluate(source, source, [check], root / 'no-controls', merge(DEFAULTS, {}), changed_files=[])
             validate.assert_not_called()
 
+    def test_controls_strip_candidate_added_tests_and_protect_fixtures(self):
+        """Candidate-added test files cannot decide whether a control fixture was caught."""
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            # Host-owned harness asserts the real behavior; the counterexample
+            # fixture flips VALUE so detection must come from this file alone.
+            (source / 'test_value.py').write_text(
+                'from value import VALUE\nassert VALUE == 1\n')
+            check = {'name': 'criterion', 'argv': ['python3', 'test_value.py']}
+            control = {'id': 'wrong_value', 'criterion': 'value remains one',
+                       'source': 'host:fixture',
+                       'files': [{'path': 'value.py', 'content': 'VALUE = 2\n'}]}
+            # Candidate adds a hostile test that fails whenever the fixture is
+            # applied; under the unfrozen harness it would make ``detected``
+            # unconditionally true.
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            (candidate / 'value.py').write_text('VALUE = 1\n')
+            (candidate / 'test_value.py').write_text(
+                'from value import VALUE\nassert VALUE == 1\n')
+            (candidate / 'test_forged.py').write_text(
+                'from pathlib import Path\nassert "VALUE = 1" in Path("value.py").read_text()\n'
+                'assert "VALUE = 1" in Path("test_forged.py").read_text() or True\n'
+                'import sys; sys.exit(0 if "VALUE = 1" in Path("value.py").read_text() else 1)\n')
+            workspaces = []
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                workspaces.append(Path(workspace))
+                forged = Path(workspace, 'test_forged.py').exists()
+                value_one = 'VALUE = 1' in Path(workspace, 'value.py').read_text()
+                # A forged run would always "detect" because the hostile file
+                # fails on the fixture; the frozen harness detects only via the
+                # baseline test asserting VALUE == 1.
+                return {'name': check['name'], 'argv': check['argv'],
+                        'exit_code': 0 if value_one else 1,
+                        'stdout': 'Ran 1 test\n' if value_one else '',
+                        'stderr': '' if value_one else 'AssertionError',
+                        'error': None, 'seconds': 0.1,
+                        'forged_present': forged}
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            runner = evaluator.Evaluator(store)
+            config = merge(DEFAULTS, {'validation': {'controls': [control]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = runner.evaluate(source, candidate, [check], root / 'evaluation',
+                                         config, changed_files=[])
+            self.assertEqual(result['decision'], 'pass')
+            self.assertEqual(result['controls']['decision'], 'pass')
+            self.assertTrue(result['controls']['controls'][0]['detected'])
+            control_targets = [p for p in workspaces
+                               if p.parent.name.startswith('controls')]
+            self.assertTrue(control_targets)
+            for target in control_targets:
+                self.assertFalse((target / 'test_forged.py').exists(),
+                                 'candidate-added test must not run inside a control')
+                self.assertTrue((target / 'test_value.py').is_file())
+
+    def test_controls_pass_protected_and_hidden_to_sandbox(self):
+        """sandbox.check must receive non-empty protected/hidden in control runs."""
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            (source / 'test_value.py').write_text('assert True\n')
+            check = {'name': 'criterion', 'argv': ['python3', 'test_value.py']}
+            control = {'id': 'c', 'criterion': 'x', 'source': 'host:fixture',
+                       'files': [{'path': 'value.py', 'content': 'VALUE = 2\n'}]}
+            seen = []
+            def execute(_sandbox, check, workspace, cancel=None, protected=(), hidden=(), **kwargs):
+                seen.append((Path(workspace).name, list(protected), list(hidden)))
+                value_one = 'VALUE = 1' in Path(workspace, 'value.py').read_text()
+                return {'name': check['name'], 'argv': check['argv'],
+                        'exit_code': 0 if value_one else 1,
+                        'stdout': 'Ran 1 test\n' if value_one else '',
+                        'stderr': '' if value_one else 'AssertionError',
+                        'error': None}
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            store.execute("INSERT INTO projects(id, path, created) VALUES (?,?,?)",
+                          ('p1', str(root / 'other-project'), 0.0))
+            config = merge(DEFAULTS, {'validation': {'controls': [control]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                evaluator.Evaluator(store).evaluate(
+                    source, source, [check], root / 'evaluation', config, changed_files=[])
+            control_calls = [row for row in seen if row[0].isdigit() or row[0] == 'positive']
+            self.assertTrue(control_calls)
+            for _name, protected, hidden in control_calls:
+                self.assertTrue(protected, 'protected must cover harness/fixture paths')
+                self.assertTrue(hidden, 'hidden must cover other project paths')
+
     def test_required_test_identity_cannot_be_satisfied_by_unrelated_tests(self):
         required = ['target.test_regression']
         unrelated = [{'test_identities': {'state': 'reported', 'executed': ['other.test_pass'], 'skipped': []}}]
