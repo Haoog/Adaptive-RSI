@@ -270,7 +270,19 @@ class DeliveryLoopTest(unittest.TestCase):
                               ({"mergeable": "CONFLICTING"}, "waiting"), ({"reviewDecision": "REVIEW_REQUIRED"}, "waiting_review"),
                               ({"statusCheckRollup": []}, "waiting_ci"),
                               ({"statusCheckRollup": [{"conclusion": "FAILURE"}]}, "ci_failed"),
-                              ({"statusCheckRollup": [{"status": "IN_PROGRESS"}]}, "waiting_ci")]:
+                              ({"statusCheckRollup": [{"status": "IN_PROGRESS"}]}, "waiting_ci"),
+                              # 全 SKIPPED/NEUTRAL 且远端已裁决可合：以 mergeable/CLEAN 为准放行。
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"}]}, "ready"),
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"},
+                                                      {"conclusion": "NEUTRAL"}]}, "ready"),
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"}, {"conclusion": "SUCCESS"}]}, "ready"),
+                              # 全 SKIPPED 但远端尚未放行：仍等待；评审门禁不受影响。
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"}],
+                                "mergeable": "UNKNOWN"}, "waiting_ci"),
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"}],
+                                "mergeStateStatus": "BLOCKED"}, "waiting_ci"),
+                              ({"statusCheckRollup": [{"conclusion": "SKIPPED"}],
+                                "reviewDecision": "REVIEW_REQUIRED"}, "waiting_review")]:
             with self.subTest(values=values):
                 self.assertEqual(merge_gate({**good, **values}, "head", "base"), state)
 

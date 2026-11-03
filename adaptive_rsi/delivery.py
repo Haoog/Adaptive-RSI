@@ -245,7 +245,12 @@ def merge_gate(pr, head, base):
     if statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}:
         return "waiting_ci"
     if not any((c.get("conclusion") or c.get("state")) == "SUCCESS" for c in checks):
-        return "waiting_ci"
+        # 全部检查终结于 SKIPPED/NEUTRAL（路径过滤、可选矩阵）且远端已裁决
+        # mergeable=MERGEABLE + mergeStateStatus=CLEAN 时，以分支保护为准继续
+        # 评审与合并判定；否则远端尚未给出可合结论，继续等待。保持「无 SUCCESS
+        # 且远端未放行」停在 waiting_ci，避免无限等待后被判 stale 关闭重排。
+        if pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") != "CLEAN":
+            return "waiting_ci"
     if pr.get("reviewDecision") not in ["", "APPROVED", None]:
         return "waiting_review"
     if pr.get("isDraft") or pr.get("mergeable") != "MERGEABLE" or pr.get("mergeStateStatus") != "CLEAN":
