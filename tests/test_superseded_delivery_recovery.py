@@ -62,7 +62,9 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
         self.assertEqual(result['pr'], self.url)
         self.assertEqual(result['close_status'], 'merged')
-        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (self.task['id'],))['state'], 'queued')
+        # 已合入的改动不再重新实现：任务随恢复对账进入终态。
+        self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (self.task['id'],))['state'], 'merged')
+        self.assertEqual(result['delivery_status'], 'merged')
 
     def test_no_pr_or_mismatched_pr_waits_without_remote_writes(self):
         for records in ([], [{'url': 'https://evil.test/pull/1', 'state': 'OPEN',
@@ -127,9 +129,14 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
                 patch.object(delivery, 'checked') as command:
             delivery.tick(self.runtime, now=10000000100, project_id=self.project)
             command.assert_not_called()
+        # 失配后短期退避，不再每个调度周期查询同一个无法关闭的 PR。
+        with patch.object(delivery, 'pr_view') as view:
+            delivery.tick(self.runtime, now=10000000200, project_id=self.project)
+            view.assert_not_called()
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='delivery_close_blocked'"))
         with patch.object(delivery, 'pr_view', return_value=pr), \
                 patch.object(delivery, 'checked', return_value='') as command:
-            delivery.tick(self.runtime, now=10000000200, project_id=self.project)
+            delivery.tick(self.runtime, now=10000004000, project_id=self.project)
             self.assertEqual(command.call_args.args[0][1:3], ['pr', 'close'])
         self.assertFalse(json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])['close_pending'])
         self.assertEqual(self.store.one('SELECT * FROM tasks WHERE id=?', (self.task['id'],)), before)
