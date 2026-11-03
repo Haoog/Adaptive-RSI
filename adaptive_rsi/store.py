@@ -3,6 +3,7 @@ import contextvars
 from collections import deque
 import hashlib
 import json
+import logging
 import math
 import queue
 import re
@@ -36,6 +37,17 @@ def issue_snapshot_pending(db, project, task):
     setting = db.execute("SELECT value FROM settings WHERE key=?", ("issue-sync:" + project,)).fetchone()
     try:
         progress = json.loads(setting["value"]) if setting else {}
+        if not isinstance(progress, dict):
+            progress = None
+    except (TypeError, ValueError):
+        progress = None
+    if setting is not None and progress is None:
+        # 进度行存在但不可解析：pending 集合无法确认，防重复发布必须 fail closed。
+        # 这里只读判定并返回 "corrupt" 哨兵——借入的 db 可能随调用方回滚
+        # （_deliver 的拒绝事务），损坏事件由调用方在各自事务外经
+        # record_issue_sync_corrupt 持久化；阻断不依赖事件落库。
+        return "corrupt"
+    try:
         pending = progress.get("pending", {})
         repo = progress.get("repository", "")
         prefix = "issue:" + repo.lower() + ":"
@@ -53,6 +65,26 @@ def issue_snapshot_pending(db, project, task):
         return False
     except (TypeError, ValueError, AttributeError, IndexError, KeyError):
         return False
+
+
+def record_issue_sync_corrupt(store, project):
+    """在调用方事务之外记录损坏的 issue-sync 进度行（每项目每小时至多一条）。
+
+    issue_snapshot_pending 只读判定；诊断事件必须在可能回滚的借入事务之外提交，
+    否则 _deliver 拒绝交付时事件随之回滚、损坏状态没有持久证据。
+    修复（重写该行）前的发布阻断不受节流影响。
+    """
+    now = time.time()
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        marker = db.execute("SELECT created FROM events WHERE project=? AND kind='issue_sync_progress_corrupt' "
+                            "ORDER BY seq DESC LIMIT 1", (project,)).fetchone()
+        if marker and now - (marker["created"] or 0) < 3600:
+            return
+        db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                   (project, None, "issue_sync_progress_corrupt",
+                    "Issue sync progress is unreadable; remote publication stays blocked until it is repaired",
+                    encode({"setting": "issue-sync:" + project}), now))
 
 
 def decode_object(value):
@@ -1030,18 +1062,23 @@ class Store:
             fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
                           len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
             skipped = []
+            corrupt_sync = False
             while True:
                 candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
                                        source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
                                        " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
                                        (project, now, *skipped, now)).fetchone()
                 if not candidate:
-                    return None
+                    break
                 if candidate["source"] == "system_publish":
                     source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
-                    if source and issue_snapshot_pending(db, project, source["task"]):
-                        skipped.append(candidate["id"])
-                        continue
+                    if source:
+                        pending = issue_snapshot_pending(db, project, source["task"])
+                        if pending == "corrupt":
+                            corrupt_sync = True
+                        if pending:
+                            skipped.append(candidate["id"])
+                            continue
                 # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
                 # 否则裸解析异常会让项目所有任务永远领不到。
                 try:
@@ -1082,12 +1119,24 @@ class Store:
                             "Task was blocked because its configuration overrides are invalid: " + reason,
                             encode({"task": candidate["id"], "reason": reason}), now))
                 continue
-            run = uid()
-            db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
-            db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
-                       (run, task["id"], project, "planning", encode(effective), now))
-            cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
-            self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
+            run = None
+            if task is not None:
+                run = uid()
+                db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
+                db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                           (run, task["id"], project, "planning", encode(effective), now))
+                cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
+                self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
+        # 损坏事件用独立连接在 claim 事务之外落库：阻塞语义不变，事件不再依赖
+        # 借入事务的命运（与 _deliver 回滚后仍能留下诊断同一条路径）。
+        if corrupt_sync:
+            try:
+                record_issue_sync_corrupt(self, project)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Failed to record corrupt issue sync progress for %s", project)
+        if run is None:
+            return None
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
     def transition(self, run, state, result=None, terminal=False, task_fields=None):
