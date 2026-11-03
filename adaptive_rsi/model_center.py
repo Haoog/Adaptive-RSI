@@ -56,8 +56,9 @@ class ModelCenter:
     def _save_directory(self, key, provider, project, directory):
         fields = {"id", "name", "name_override", "enabled", "manual", "favorite", "unit_price", "prices",
                   "capability_override"}
+        raw_models = directory.get("models")
         preferences = {"models": [{name: value for name, value in model.items() if name in fields}
-                                  for model in directory.get("models", [])],
+                                  for model in raw_models if isinstance(model, dict)] if isinstance(raw_models, list) else [],
                        "fetched": None, "truncated": directory.get("truncated", False)}
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -74,9 +75,12 @@ class ModelCenter:
         if value is not None and legacy:
             value = copy.deepcopy(value)
             value["fetched"] = None
-            for model in value.get("models", []):
-                for key in ("verified", "probes", "last_attempt"):
-                    model.pop(key, None)
+            models = value.get("models")
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict):
+                        for key in ("verified", "probes", "last_attempt"):
+                            model.pop(key, None)
         return copy.deepcopy(value or {"models": [], "fetched": None, "truncated": False})
 
     def _capability(self, provider, model):
@@ -102,14 +106,15 @@ class ModelCenter:
         items = []
         for provider in [*BUILTINS, *config["providers"]]:
             directory = self.directory(provider, project)
-            known = {m["id"] for m in directory["models"]}
+            known = {m["id"] for m in directory.get("models", []) if isinstance(m, dict) and "id" in m}
             for route in config["models"].values():
                 for item in [route, route.get("fallback")]:
                     if item and item.get("provider", "openai") == provider["id"] and item["model"] not in known:
-                        directory["models"].append({"id": item["model"], "name": item["model"], "enabled": True,
-                                                    "manual": False, "missing": bool(directory["fetched"]), "configured": True})
+                        directory.setdefault("models", []).append(
+                            {"id": item["model"], "name": item["model"], "enabled": True,
+                             "manual": False, "missing": bool(directory["fetched"]), "configured": True})
                         known.add(item["model"])
-            for model in directory["models"]:
+            for model in directory.get("models", []):
                 if isinstance(model, dict):
                     # 只在本快照中附加解析结果，不写回目录，避免把推导值固化。
                     model["capabilities"] = self._capability(provider, model)
@@ -300,7 +305,7 @@ class ModelCenter:
             preferences = [{k: v for k, v in model.items() if k in ["id", "name", "name_override", "enabled", "manual",
                                                                       "favorite", "unit_price", "prices",
                                                                       "capability_override"]}
-                           for model in previous["models"]]
+                           for model in previous.get("models", []) if isinstance(model, dict)]
             for model in preferences:
                 model["missing"] = not model.get("manual", False)
             self._save_directory(self.key(provider, project), provider, project, {"models": preferences, "fetched": None, "truncated": False})
@@ -377,9 +382,11 @@ class ModelCenter:
             if self.signature(self.provider(provider_id, project)) != signature:
                 raise CenterError("connection_changed")
             previous = self.directory(provider, project, cache_key=key)
-            before = {m["id"]: m for m in previous["models"]}
+            before = {m["id"]: m for m in previous.get("models", []) if isinstance(m, dict) and "id" in m}
             models = []
-            for model in result["models"]:
+            for model in result.get("models", []):
+                if not isinstance(model, dict) or "id" not in model:
+                    continue
                 old = before.pop(model["id"], {})
                 custom_name = self._has_custom_name(old)
                 models.append({**model, "enabled": old.get("enabled", model.get("kind") not in NON_AGENT),
@@ -396,7 +403,7 @@ class ModelCenter:
                                for m in retained[max(0, 2000 - len(models)):]):
                 raise CenterError("too_many_models")
             models.extend({**model, "missing": not model.get("manual", False)} for model in retained[:max(0, 2000 - len(models))])
-            directory = {"models": models, "fetched": time.time(), "truncated": result["truncated"] or omitted}
+            directory = {"models": models, "fetched": time.time(), "truncated": result.get("truncated", False) or omitted}
             self._save_directory(key, provider, project, directory)
         return directory
 
@@ -459,7 +466,9 @@ class ModelCenter:
             provider = self.provider(provider_id, project)
             key = self.key(provider, project)
             directory = self.directory(provider, project, cache_key=key)
-            model = next((m for m in directory["models"] if m["id"] == data["id"]), None)
+            if not isinstance(directory.get("models"), list):
+                directory["models"] = []
+            model = next((m for m in directory["models"] if isinstance(m, dict) and m.get("id") == data["id"]), None)
             if not model:
                 if len(directory["models"]) >= 1500:
                     raise CenterError("too_many_models")
@@ -590,7 +599,10 @@ class ModelCenter:
                     raise CenterError("connection_changed")
                 self.edit_model(provider_id, {"id": model_id}, project)
                 directory = self.directory(provider, project, cache_key=key)
-                model = next(m for m in directory["models"] if m["id"] == model_id)
+                model = next((m for m in directory.get("models", []) if isinstance(m, dict) and m.get("id") == model_id), None)
+                if model is None:
+                    model = {"id": model_id, "name": model_id}
+                    directory.setdefault("models", []).append(model)
                 model["verified"] = {"at": time.time(), "effort": effort, "kind": "structured_tool",
                                      "version": __version__, "compatibility": compatibility(config)}
                 model.pop("last_attempt", None)
@@ -604,7 +616,10 @@ class ModelCenter:
                     if self.signature(self.provider(provider_id, project)) == signature:
                         self.edit_model(provider_id, {"id": model_id}, project)
                         directory = self.directory(provider, project, cache_key=key)
-                        model = next(m for m in directory["models"] if m["id"] == model_id)
+                        model = next((m for m in directory.get("models", []) if isinstance(m, dict) and m.get("id") == model_id), None)
+                        if model is None:
+                            model = {"id": model_id, "name": model_id}
+                            directory.setdefault("models", []).append(model)
                         proof = {"at": time.time(), "effort": effort, "state": "fail", "code": code}
                         if code in ["budget_exhausted", "provider_paused", "missing_key", "keychain_locked", "keychain_unavailable", "keychain_failed", "default_effort_required"]:
                             model["last_attempt"] = proof

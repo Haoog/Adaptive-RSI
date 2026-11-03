@@ -1,10 +1,12 @@
 """Read model directories without starting inference or storing credentials."""
+import http.client
 import json
 import os
 import re
 import selectors
 import shutil
 import signal
+import ssl
 import subprocess
 import tempfile
 import time
@@ -95,6 +97,8 @@ def get_json(url, headers, deadline):
         raise CatalogError(code) from None
     except TimeoutError:
         raise CatalogError("timeout") from None
+    except (http.client.HTTPException, ssl.SSLError):
+        raise CatalogError("connection") from None
     except (urllib.error.URLError, OSError):
         raise CatalogError("connection") from None
     except (ValueError, UnicodeError):
@@ -103,8 +107,12 @@ def get_json(url, headers, deadline):
 
 def _official_go_directory(base):
     endpoint = urllib.parse.urlsplit(base)
+    try:
+        port = endpoint.port
+    except ValueError:
+        return False
     return (endpoint.scheme == "https" and endpoint.hostname == "opencode.ai" and
-            endpoint.port in (None, 443) and not endpoint.username and not endpoint.password and
+            port in (None, 443) and not endpoint.username and not endpoint.password and
             not endpoint.query and not endpoint.fragment and endpoint.path.rstrip("/") in {
                 "/inference/go/openai/v1", "/inference/go/anthropic/v1", "/inference/go/google/v1beta"})
 
@@ -238,7 +246,11 @@ def codex_models():
                 except (ProcessLookupError, PermissionError):
                     pass
                 process.wait()
-                process.stdin.close()
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                except OSError:
+                    pass
                 process.stdout.close()
 
 
@@ -385,7 +397,10 @@ def parse_opencode_v1_models(text):
                 text = ""
                 continue
             raise ValueError("invalid OpenCode metadata") from None
-        if not isinstance(metadata, dict) or metadata.get("capabilities", {}).get("toolcall") is False:
+        if not isinstance(metadata, dict):
+            continue
+        capabilities = metadata.get("capabilities", {})
+        if isinstance(capabilities, dict) and capabilities.get("toolcall") is False:
             continue
         variants = metadata.get("variants", {})
         efforts = sorted(variants) if isinstance(variants, dict) else []
