@@ -289,12 +289,19 @@ def clarity_test_summary(text):
         # that as no executed summary instead of fabricating an empty run.
         return None
     passed = fields["passed"]
-    failed = fields.get("failed", 0) + fields.get("errors", 0)
+    # Errors overlap passed/failed when fixture setup or teardown fails for a
+    # test whose body already reported an outcome (``1 passed, 1 error``).
+    # Merging them into ``failed`` double-counts that test in ``executed``, so
+    # errors stay a separate field and ``executed`` only sums mutually
+    # exclusive test-body outcomes.
+    failed = fields.get("failed", 0)
+    skipped = fields.get("skipped", 0)
     # Deselected tests were filtered out before execution; keep them out of the
     # executed/skipped totals so the summary does not overstate coverage.
-    skipped = fields.get("skipped", 0)
     summary = {"format": "pytest_cli", "executed": passed + failed + skipped,
              "passed": passed, "failed": failed, "skipped": skipped}
+    if fields.get("errors"):
+        summary["errors"] = fields["errors"]
     if fields.get("deselected"):
         summary["deselected"] = fields["deselected"]
     return summary

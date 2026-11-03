@@ -181,12 +181,24 @@ class AuditRound4Test(unittest.TestCase):
     def test_clarity_test_summary_counts_errors_and_deselected(self):
         summary = clarity_test_summary("==== 1 error, 4 passed, 2 deselected in 0.50s ====")
         self.assertIsNotNone(summary)
-        self.assertEqual(summary["failed"], 1)
+        # Errors are reported separately instead of inflating ``failed``: the
+        # error may share a test with ``passed`` (fixture teardown), so merging
+        # it would double-count that test in ``executed``.
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["errors"], 1)
         # Deselected tests never ran: they stay out of executed/skipped and are
         # reported separately so evidence does not overstate coverage.
         self.assertEqual(summary["skipped"], 0)
-        self.assertEqual(summary["executed"], 5)
+        self.assertEqual(summary["executed"], 4)
         self.assertEqual(summary["deselected"], 2)
+
+    def test_clarity_test_summary_teardown_error_not_double_counted(self):
+        # A test whose body passed but whose fixture teardown failed reports
+        # ``1 passed, 1 error`` for a single collected test.
+        summary = clarity_test_summary("===== 1 passed, 1 error in 0.30s =====")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["executed"], 1)
+        self.assertEqual(summary["errors"], 1)
 
     def test_clarity_test_summary_accepts_humanized_duration(self):
         # pytest prints ``in 65.00s (0:01:05)`` for runs of 60+ seconds.
