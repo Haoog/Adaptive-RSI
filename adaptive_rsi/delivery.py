@@ -259,8 +259,8 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
         elif any(str(pr.get("state", "")).lower() == "open" for pr in matching):
             reason = "open_pr"
         elif not matching or not any(str(pr.get("state", "")).lower() == "closed" and
-                                     _dict_field(pr, "head").get("sha") == sha for pr in matching):
-            if not matching and any(head in (None, sha) for head in pushed.get(name, ())):
+                                     sha is not None and _dict_field(pr, "head").get("sha") == sha for pr in matching):
+            if not matching and any(head is not None and head == sha for head in pushed.get(name, ())):
                 reason = "pushed_no_pr"
             else:
                 reason = "unverified_ownership"
@@ -610,14 +610,20 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         target_state = "unverified_merge"
                         outcome["delivery_status"] = "unverified_merge"
                     else:
-                        target_state = "merged"
                         merge_commit = pr.get("mergeCommit")
                         if not isinstance(merge_commit, dict):
                             merge_commit = {}
                         merged_oid = merge_commit.get("oid")
-                        outcome["merged_sha"] = merged_oid if isinstance(merged_oid, str) else ""
-                        outcome["merged_at"] = now
-                        outcome["delivery_status"] = "merged"
+                        if isinstance(merged_oid, str) and merged_oid:
+                            target_state = "merged"
+                            outcome["merged_sha"] = merged_oid
+                            outcome["merged_at"] = now
+                            outcome["delivery_status"] = "merged"
+                        else:
+                            # mergeCommit oid 缺失（merge-queue/GC）时保持 pr_open 重试，
+                            # 避免永久 merged 但 merged_sha 永远为空、反馈循环无法验证。
+                            target_state = "pr_open"
+                            outcome["delivery_status"] = "merge_sha_pending"
                     intent_key = "merge-intent:" + run["id"]
                     with store.connect() as db:
                         db.execute("BEGIN IMMEDIATE")
