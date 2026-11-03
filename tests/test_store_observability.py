@@ -117,6 +117,36 @@ class StoreObservabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT data FROM stages')['data'], 'data')
         self.assertFalse(self.store.query('SELECT * FROM relationship_quarantine'))
 
+    def test_dependency_quarantine_restores_readiness_and_preserves_evidence(self):
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
+        task = self.store.add_task('p', 'goal', 'dep-key', 'title', 'body')
+        with self.store.connect() as db:
+            db.execute('PRAGMA foreign_keys=OFF')
+            db.execute("INSERT INTO task_dependencies VALUES (?,'deleted-dep')", (task,))
+            db.execute("INSERT INTO task_dependencies VALUES ('ghost-task','ghost-dep')")
+        ready = 'SELECT id FROM tasks WHERE id=? AND ' + self.store.ready_clause()
+        # p.id IS NULL 分支把任务永久挡在 ready 之外。
+        self.assertIsNone(self.store.one(ready, (task, 0)))
+        result = self.store.quarantine_orphans()
+        self.assertEqual(result['invalid_dependencies'], 2)
+        self.assertFalse(result['has_more'])
+        self.assertFalse(self.store.query('SELECT * FROM task_dependencies'))
+        rows = self.store.query("SELECT table_name,data FROM relationship_quarantine ORDER BY id")
+        self.assertEqual([row['table_name'] for row in rows], ['task_dependencies'] * 2)
+        evidence = sorted((json.loads(row['data'])['task'], json.loads(row['data'])['dependency'])
+                          for row in rows)
+        self.assertEqual(evidence, sorted([(task, 'deleted-dep'), ('ghost-task', 'ghost-dep')]))
+        events = self.store.query("SELECT project,data FROM events "
+                                  "WHERE kind='dependency_orphan_quarantined' ORDER BY seq")
+        self.assertEqual(len(events), 2)
+        by_task = {json.loads(row['data'])['task']: row for row in events}
+        self.assertEqual(by_task[task]['project'], 'p')
+        self.assertIsNone(by_task['ghost-task']['project'])
+        self.assertEqual(self.store.one(ready, (task, 0))['id'], task)
+        again = self.store.quarantine_orphans()
+        self.assertEqual(again['invalid_dependencies'], 0)
+        self.assertFalse(again['has_more'])
+
     def test_relationship_audit_covers_evidence_links_and_narrow_probe_exceptions(self):
         with self.store.connect() as db:
             db.execute('PRAGMA foreign_keys=OFF')
@@ -198,6 +228,40 @@ class StoreObservabilityTest(unittest.TestCase):
         report = self.store.metrics()['slow_queries'][-1]
         self.assertEqual(report['context'], {'request': identity})
         self.assertNotIn('private-query', json.dumps(report))
+
+    def test_restart_span_close_marks_phase_duration_unmeasured_but_keeps_remote_wait(self):
+        # 重启后 _clock_samples 丢失：phase span 的真实执行时长无法从墙钟差还原
+        # （含进程停机窗口），duration 落 -1「未测量」标记，telemetry 的
+        # max(0,duration) 折算为 0 贡献而不是把停机时长计入阶段耗时。
+        # remote_waits 语义不同：远端在停机期间确实仍在等待，保留墙钟差。
+        from adaptive_rsi.telemetry import workflow_metrics
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',1,1)")
+        task = self.store.add_task('p', 'goal', 'restart-span', 'fixture')
+        began = time.time()
+        self.store.execute("INSERT INTO runs(id,task,project,state,started) VALUES ('r1',?,'p','executing',?)", (task, began - 7200))
+        self.store.execute("INSERT INTO runs(id,task,project,state,started) VALUES ('r2',?,'p','executing',?)", (task, began))
+        # r1 的 phase/wait 行不经 phase()/remote_wait() 写入：没有单调时钟样本，
+        # 模拟上一进程留下的 open span。
+        self.store.execute("INSERT INTO phase_times(run,phase,started) VALUES ('r1','executing',?)", (began - 7200,))
+        self.store.execute("INSERT INTO remote_waits(run,reason,started) VALUES ('r1','waiting_ci',?)", (began - 3600,))
+        # r2 的 span 有单调时钟样本（本进程写入），收尾后仍是正常非负时长，作为对照。
+        self.store.phase('r2', 'executing')
+        self.assertEqual(self.store.recover(), 2)
+        span = self.store.one("SELECT ended,duration FROM phase_times WHERE run='r1'")
+        self.assertIsNotNone(span)
+        self.assertIsNotNone(span['ended'])
+        self.assertEqual(span['duration'], -1)
+        wait = self.store.one("SELECT ended,duration FROM remote_waits WHERE run='r1'")
+        self.assertIsNotNone(wait)
+        self.assertIsNotNone(wait['ended'])
+        self.assertGreaterEqual(wait['duration'], 3600)
+        control = self.store.one("SELECT duration FROM phase_times WHERE run='r2'")
+        self.assertIsNotNone(control)
+        self.assertGreaterEqual(control['duration'], 0)
+        metrics = workflow_metrics(self.store)
+        # 停机 7200s 没有计入；只剩 r2 正常收尾的毫秒级样本。
+        self.assertLess(metrics['phase_seconds'].get('executing', 0), 1)
+        self.assertGreaterEqual(metrics['remote_wait_seconds'].get('waiting_ci', 0), 3600)
 
     def test_light_metrics_do_not_scan_large_history_but_explicit_integrity_finds_orphans(self):
         self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
