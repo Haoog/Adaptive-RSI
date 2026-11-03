@@ -815,6 +815,20 @@ class Maintenance:
                         "AND NOT EXISTS (SELECT 1 FROM runs child WHERE child.id>=? AND child.id<? "
                         "AND (s.key=?||child.id OR (s.key>=?||child.id||':' AND s.key<?||child.id||';')))",
                         (key, key + ":", key + ";", run + ":", run + ";", prefix, prefix, prefix))
+        # pr-feedback:<sha256([project,task])>: 观测键与 handled:<identity> 核销键按
+        # 任务前缀索引而非运行，上面的运行级清理永远碰不到它们，只增不减。
+        # _supersede_pr 只在任务处于 pr_open 时读 handled:；任务进入终态后无论是否
+        # 被重新打开（updated 会刷新而不再陈旧），都不可能再有 supersede 判读，键对
+        # 新 PR 也不会命中（观测身份包含 PR URL/运行 ID），同批删除两类键是安全的。
+        from .delivery import _pr_feedback_prefix
+        for task in self.store.query(
+                "SELECT id,project FROM tasks WHERE updated<? AND state IN "
+                "('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed') "
+                "LIMIT 200", (stale,)):
+            prefix = _pr_feedback_prefix(task["project"], task["id"])
+            self.store.execute(
+                "DELETE FROM settings WHERE (key>=? AND key<?) OR (key>=? AND key<?)",
+                (prefix, prefix + "~", "handled:" + prefix, "handled:" + prefix + "~"))
         # 批量初筛决定已直接写入 task_decisions 并随任务持久；这里只清理
         # 升级前遗留的 triage-state 键（存量暂缓任务会在 reassess 中迁移）。
         for task in self.store.query("SELECT id FROM tasks WHERE state<>'deferred' AND updated<? AND EXISTS "
