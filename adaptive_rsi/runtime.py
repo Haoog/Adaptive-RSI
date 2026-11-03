@@ -1500,10 +1500,12 @@ class Runtime(Maintenance):
             limits = merge(DEFAULTS['deadlines'], (run_config if isinstance(run_config, dict) else {}).get('deadlines', {}))
             evaluation_started = run.get('_evaluation_started')
             if evaluation_started is not None and time.monotonic() - evaluation_started >= limits['evaluation_seconds']:
-                run['_timed_out_stage'] = 'evaluation'
+                # 首个超时判定者胜：trial 经 propagate_deadline 上报的阶段（如 evaluation）
+                # 不得被父 run 自身的阶段时钟（如 preparation）覆盖。
+                run.setdefault('_timed_out_stage', 'evaluation')
                 return True
             if time.monotonic() - run['_deadline_started'] >= limits[stage + '_seconds']:
-                run['_timed_out_stage'] = stage
+                run.setdefault('_timed_out_stage', stage)
                 return True
         row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
                              "WHERE s.key='run-stop:' || r.id) AS stop_requested "

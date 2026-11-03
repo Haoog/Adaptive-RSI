@@ -160,6 +160,41 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def test_propagated_trial_stage_survives_parent_timeout_recheck(self):
+        """propagate_deadline 写入的阶段是首个判定结论；父 run 自身时钟超时不覆盖它。"""
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        _, parent = self.claim()
+        config = self.runtime.config(self.project)
+        # 父 run 的 preparation 时钟从 process() 入口起算，必然已超预算。
+        parent['_deadline_stage'] = 'preparation'
+        parent['_deadline_started'] = time.monotonic() - config['deadlines']['preparation_seconds'] - 1
+        trial = self.runtime.new_trial_context(parent)
+        trial['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, trial)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        # 变体间/交付前的父级 is_cancelled 命中自身超时分支，但不得改写阶段回执。
+        self.assertTrue(self.runtime.is_cancelled(parent))
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        # _process 的 except Cancelled 路径必须按 evaluation 记 failure.stage。
+        # stub 模拟真实顺序：trial 已把 evaluation 结论 propagate 到父 run、
+        # 父 run 自身时钟仍超 preparation 预算，变体间取消复查不得改写它。
+        project = self.runtime.project(self.project)
+        base = git(project['path'], 'rev-parse', 'HEAD')
+        def timed_out(*args):
+            parent['_timed_out_stage'] = 'evaluation'
+            parent['_deadline_started'] = time.monotonic() - config['deadlines']['preparation_seconds'] - 1
+            self.assertTrue(self.runtime.is_cancelled(parent))
+            self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+            raise Cancelled('Model invocation cancelled or stage deadline exceeded')
+        with patch('adaptive_rsi.delivery.baseline', return_value=(project['path'], base, 'main')), \
+             patch.object(self.runtime, 'execute_candidate', side_effect=timed_out):
+            self.runtime.process(parent)
+        row = self.store.one('SELECT state,result FROM runs WHERE id=?', (parent['id'],))
+        self.assertEqual(row['state'], 'blocked')
+        failure = json.loads(row['result'])['failure']
+        self.assertEqual((failure['code'], failure['stage']), ('deadline', 'evaluation'))
+
     def test_evaluation_deadline_remains_active_during_model_call(self):
         _, run = self.claim()
         clock = [10.0]
