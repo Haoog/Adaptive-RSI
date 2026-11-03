@@ -999,6 +999,95 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
         self.assertEqual(saved_after["rollback"]["attempt"], 2)
 
 
+class ReleaseRetryEndpointTest(_ManualReconciliationFixture):
+    """Every fixed retry rejection must reach the console verbatim, not Invalid request."""
+
+    def setUp(self):
+        super().setUp()
+        from adaptive_rsi import server as server_module
+        self.server = server_module.Server(self.runtime)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.thread.join, 3)
+
+    def post_retry(self, kind="release", run=None):
+        import http.client
+        body = json.dumps({"project": self.project, "run": run or self.record["id"],
+                           "kind": kind}).encode()
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            connection.request("POST", "/api/release-retry", body, {
+                "Cookie": self.server.cookie + "=" + self.server.token,
+                "Origin": self.server.origin, "X-RSI-CSRF": self.server.csrf,
+                "Content-Type": "application/json"})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def assert_rejected(self, message, kind="release", run=None, error_code="validation_error"):
+        status, payload = self.post_retry(kind, run)
+        self.assertEqual(status, 400)
+        expected = {"error": message}
+        if error_code is not None:
+            expected["error_code"] = error_code
+        self.assertEqual(payload, expected)
+
+    def test_every_reachable_rejection_surfaces_the_release_message(self):
+        # kind 白名单外：固定 kind 校验文案，不是 Invalid request。
+        self.assert_rejected("Unknown automation kind", kind="bogus")
+        # 目标 run 未合并：跨项目或缺失 run 走同一固定文案。
+        self.assert_rejected("Only a verified merged run in this project can be retried", run="missing-run")
+
+        # blocked 记录：要求恢复原授权让跟踪继续，不是模糊失败。
+        self.operation(state="blocked")
+        self.assert_rejected("Restore the original authorization and let tracking retry the pending operation")
+        # 无 operation_id：没有可重试的 GitHub workflow。
+        self.operation(state="failed", operation_id=None)
+        self.assert_rejected("This operation has no failed GitHub workflow to retry")
+
+        # 回滚没有已知健康目标证据：merge 证据不能替代 known-healthy 回滚契约。
+        deploy_policy = json.loads(self.record["config"])["delivery"]["deploy"]
+        rollback = {"state": "workflow_succeeded", "sha": "c" * 40,
+                    "repository": "example/project", "workflow": deploy_policy["workflow"],
+                    "ref": deploy_policy["ref"], "workflow_sha": deploy_policy["sha"],
+                    "operation_id": "rsi-rollback", "attempt": 1}
+        self.operation(kind="deploy", state="rollback_failed", rollback=rollback, sha="b" * 40)
+        self.assert_rejected("Rollback retry requires known healthy target evidence", kind="deploy")
+
+        # 部署目标被其他 run 持有：stale delivery 拒绝。
+        policy = self.runtime.config(self.project)["delivery"]["deploy"]
+        self.runtime.store.put_setting(release.owner_key(self.project, "example/project", policy),
+                                       {"run": "other-run", "sha": self.MERGED})
+        self.assert_rejected("A newer deployment owns this target; stale delivery cannot be retried",
+                             kind="deploy")
+        self.runtime.store.execute("DELETE FROM settings WHERE key=?",
+                                   (release.owner_key(self.project, "example/project", policy),))
+
+        # 损坏的自动化回执：ReconciliationRejected 也必须带出原文。
+        self.runtime.store.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",
+                                   (release.key(self.record["id"], "release"), "{broken"))
+        self.assert_rejected("Automation record is unreadable; repair the stored record before continuing",
+                             error_code=None)
+
+    def test_release_status_reports_missing_run_with_fixed_message(self):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            connection.request("GET", "/api/release-status?project=" + self.project + "&run=missing",
+                               headers={"Cookie": self.server.cookie + "=" + self.server.token})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+        finally:
+            connection.close()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(payload, {"error": "Run not found in this project",
+                                   "error_code": "validation_error"})
+
+
 class ReconciliationAuditPayloadTest(_ManualReconciliationFixture):
     """Reconciliation keeps bounded evidence instead of the raw GitHub page."""
 

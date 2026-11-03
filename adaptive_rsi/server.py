@@ -1143,7 +1143,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/config/repair-global":
                     result = runtime.repair_global_config(body.get("confirmation"))
                 elif path == "/api/release-retry":
-                    result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
+                    try:
+                        result = runtime.retry_release(body.get("project"), body.get("run"), body.get("kind"))
+                    except ReconciliationRejected as exc:
+                        raise RequestError(str(exc)) from None
                 elif path == "/api/release-resolve":
                     try:
                         result = runtime.resolve_release(body.get("project"), body.get("run"), body.get("kind"),

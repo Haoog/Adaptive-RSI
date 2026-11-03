@@ -147,6 +147,21 @@ Configuration must be an object
 Post-merge verification must pass for the exact target commit before retrying delivery
 A newer deployment owns this target; stale delivery cannot be retried
 Only a confirmed failed workflow run can be retried; uncertain dispatches require reconciliation
+Unknown automation kind
+Only a verified merged run in this project can be retried
+Run not found in this project
+Automation record is unreadable; repair the stored record before continuing
+Release/deploy authorization revoked or target changed
+Restore the original authorization and let tracking retry the pending operation
+This operation has no failed GitHub workflow to retry
+Multiple legacy deployments own this target; reconcile them before deploying
+Deployment ownership changed during validation
+Rollback retry requires known healthy target evidence
+Another deployment is still active on this target
+Deployment target already has this or a newer commit; refusing a stale or diverged deployment
+Trusted workflow tag changed; authorize the workflow again
+Pinned workflow does not implement the RSI dispatch contract
+Workflow run identity differs from the authorized operation
 """.strip().splitlines())
 
 
