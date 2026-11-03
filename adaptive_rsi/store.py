@@ -1213,7 +1213,7 @@ class Store:
                                   "cache_read_price,cache_write_price FROM calls WHERE id=?", (call,)).fetchone()
             if previous is None or previous["run"] != run:
                 raise ValueError("Usage call does not belong to run")
-            prices = unit_prices({field: (previous[field + "_price"] or 0) for field in PRICE_FIELDS})
+            prices = unit_prices({field: previous[field + "_price"] for field in PRICE_FIELDS})
             _, basis = estimate(values, prices, previous["unit_price"])
             db.execute("UPDATE calls SET state='completed'," + ",".join(field + "=?" for field in fields) +
                        ",seconds=?,price_basis=? WHERE id=?",
