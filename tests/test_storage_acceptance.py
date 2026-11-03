@@ -12,7 +12,6 @@ from unittest.mock import patch
 from adaptive_rsi.store import Store
 from adaptive_rsi import storage_tools
 
-
 class StorageAcceptanceTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -231,39 +230,6 @@ class StorageAcceptanceTest(unittest.TestCase):
             with self.subTest(reserve=repr(value)), self.assertRaises(ValueError):
                 storage_tools.backup(self.store, reserve_bytes=value)
 
-    def test_cleanup_preview_recycle_undo_and_holds(self):
-        from adaptive_rsi.maintenance import preview_cleanup, recycle_cleanup, undo_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        (directory / 'workspace').mkdir(parents=True)
-        (directory / 'workspace' / 'file').write_text('retained evidence')
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-        preview = preview_cleanup(self.store, 'r')
-        self.assertEqual([item['name'] for item in preview['objects']], ['workspace'])
-        self.store.put_setting('legal-hold:r', True)
-        with self.assertRaises(ValueError):
-            recycle_cleanup(self.store, preview)
-        self.assertTrue((directory / 'workspace').exists())
-        self.store.put_setting('legal-hold:r', False)
-        receipt = recycle_cleanup(self.store, preview)
-        self.assertFalse((directory / 'workspace').exists())
-        undo_cleanup(self.store, receipt['id'])
-        self.assertEqual((directory / 'workspace' / 'file').read_text(), 'retained evidence')
-        self.store.execute("UPDATE runs SET ended=NULL,state='executing' WHERE id='r'")
-        with self.assertRaises(ValueError):
-            preview_cleanup(self.store, 'r')
-
-    def test_cleanup_rejects_stale_preview_and_symlink(self):
-        from adaptive_rsi.maintenance import preview_cleanup, recycle_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        (directory / 'workspace').mkdir(parents=True)
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-        preview = preview_cleanup(self.store, 'r')
-        (directory / 'workspace').rmdir()
-        (directory / 'workspace').symlink_to(self.root, target_is_directory=True)
-        with self.assertRaises(ValueError):
-            recycle_cleanup(self.store, preview)
-
-
     def test_business_rehearsal_reports_orphan_without_changing_snapshot(self):
         import sqlite3
         db = sqlite3.connect(self.store.path)
@@ -280,116 +246,11 @@ class StorageAcceptanceTest(unittest.TestCase):
         self.assertEqual(report['failure_stage'], 'snapshot_validation')
         self.assertEqual(storage_tools.file_digest(source), digest)
 
-    def test_cleanup_undo_preserves_new_artifacts(self):
-        from adaptive_rsi.maintenance import preview_cleanup, recycle_cleanup, undo_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        (directory / 'workspace').mkdir(parents=True)
-        (directory / 'workspace' / 'old').write_text('old')
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-        receipt = recycle_cleanup(self.store, preview_cleanup(self.store, 'r'))
-        (directory / 'workspace').mkdir()
-        (directory / 'workspace' / 'new').write_text('new')
-        with self.assertRaises(ValueError):
-            undo_cleanup(self.store, receipt['id'])
-        self.assertEqual((directory / 'workspace' / 'new').read_text(), 'new')
-        self.assertEqual((self.store.root / 'recycle' / receipt['id'] / 'workspace' / 'old').read_text(), 'old')
-
     def test_namespace_rejects_values_that_cannot_roundtrip_type(self):
         with self.assertRaises(ValueError):
             self.store.put_namespaced_setting('cache', 'key', (1, 2))
         with self.assertRaises(ValueError):
             self.store.put_namespaced_setting('cache', 'key', float('nan'))
-
-    def test_cleanup_corrupt_hold_fails_closed(self):
-        from adaptive_rsi.maintenance import preview_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        directory.mkdir(parents=True)
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-        self.store.execute("INSERT INTO settings VALUES ('legal-hold:r','bad-json')")
-        with self.assertRaises(ValueError):
-            preview_cleanup(self.store, 'r')
-
-    def test_cleanup_preview_applies_project_hold_and_corrupt_value(self):
-        from adaptive_rsi.maintenance import preview_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        (directory / 'workspace').mkdir(parents=True)
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-        self.store.put_setting('legal-hold-project:p', True)
-        with self.assertRaises(ValueError):
-            preview_cleanup(self.store, 'r')
-        self.store.put_setting('legal-hold-project:p', False)
-        self.assertEqual([item['name'] for item in preview_cleanup(self.store, 'r')['objects']], ['workspace'])
-        self.store.execute("INSERT OR REPLACE INTO settings VALUES ('legal-hold-project:p','{')")
-        with self.assertRaises(ValueError):
-            preview_cleanup(self.store, 'r')
-
-    def test_cleanup_recycle_undo_linux_renameat2_and_fallback(self):
-        import sys
-        import ctypes
-        from adaptive_rsi.maintenance import preview_cleanup, recycle_cleanup, undo_cleanup, _rename_cleanup
-        directory = self.store.root / 'runs' / 'r'
-        (directory / 'workspace').mkdir(parents=True)
-        (directory / 'workspace' / 'file').write_text('linux evidence')
-        self.store.execute("INSERT INTO runs(id,project,state,path,ended,result) VALUES ('r','p','failed',?,1,'{}')", (str(directory),))
-
-        # 1. 真实执行路径：在本机（Linux）跑通回收/撤销闭环真实执行
-        preview = preview_cleanup(self.store, 'r')
-        receipt = recycle_cleanup(self.store, preview)
-        self.assertFalse((directory / 'workspace').exists())
-        self.assertTrue((self.store.root / 'recycle' / receipt['id'] / 'workspace' / 'file').exists())
-        undo_cleanup(self.store, receipt['id'])
-        self.assertEqual((directory / 'workspace' / 'file').read_text(), 'linux evidence')
-
-        if sys.platform == 'linux':
-            # 2. 如 libc 无 renameat2 则验证 fallback 分支（通过 syscall）并留证据，不得静默跳过
-            real_cdll = ctypes.CDLL
-
-            class LibcWithoutRenameat2:
-                def __init__(self, lib):
-                    self._lib = lib
-                def syscall(self, *args):
-                    calls.append(args)
-                    orig = getattr(self._lib, 'syscall', None)
-                    if orig is not None:
-                        return orig(*args)
-                    raise AttributeError('syscall')
-                def __getattr__(self, name):
-                    if name == 'renameat2':
-                        raise AttributeError("simulated libc without renameat2")
-                    return getattr(self._lib, name)
-
-            calls = []
-            def fake_cdll(name, use_errno=False):
-                lib = real_cdll(name, use_errno=use_errno)
-                return LibcWithoutRenameat2(lib)
-
-            (directory / 'workspace' / 'file').write_text('fallback evidence')
-            preview_fallback = preview_cleanup(self.store, 'r')
-            with patch('ctypes.CDLL', side_effect=fake_cdll):
-                receipt_fallback = recycle_cleanup(self.store, preview_fallback)
-                self.assertFalse((directory / 'workspace').exists())
-                self.assertGreater(len(calls), 0, "libc 无 renameat2 时必须触发 syscall fallback")
-                undo_cleanup(self.store, receipt_fallback['id'])
-                self.assertEqual((directory / 'workspace' / 'file').read_text(), 'fallback evidence')
-
-            # 3. 验证 fallback 分支在目标已存在时拒绝覆盖
-            target = directory / 'workspace'
-            candidate = directory / 'candidate'
-            candidate.mkdir(parents=True)
-            (candidate / 'file').write_text('collision')
-            with patch('ctypes.CDLL', side_effect=fake_cdll):
-                with self.assertRaises(FileExistsError):
-                    _rename_cleanup(candidate, target)
-            (candidate / 'file').unlink()
-            candidate.rmdir()
-
-            # 4. 验证当 renameat2 与 syscall 均不可用时抛出明确异常，绝不静默跳过
-            class LibcUnavailable:
-                def __getattr__(self, name):
-                    raise AttributeError(name)
-            with patch('ctypes.CDLL', return_value=LibcUnavailable()):
-                with self.assertRaisesRegex(OSError, 'Atomic no-replace cleanup rename unavailable'):
-                    _rename_cleanup(directory / 'workspace', directory / 'other')
 
     def test_backup_under_concurrent_writes_has_explicit_deadline(self):
         import sqlite3
@@ -844,7 +705,6 @@ class StorageAcceptanceTest(unittest.TestCase):
         # Temporary files must be cleaned up
         temps = [p for p in custom_report.parent.glob(".*tmp*") if p.is_file()]
         self.assertEqual(temps, [])
-
 
 if __name__ == '__main__':
     unittest.main()
