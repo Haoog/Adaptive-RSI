@@ -581,6 +581,182 @@ class RuntimeSafetyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "awaiting approval"):
             self.runtime.deliver(pending["id"])
 
+    def test_active_revision_is_saved_then_replanned_before_candidate_delivery(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        base = git(self.repo, "rev-parse", "HEAD")
+
+        def finish_old_candidate(active, project, original, *args):
+            receipt = self.runtime.revise_task(task, "Also cover negative inputs")
+            self.assertEqual(receipt, {"saved": True, "pending": True})
+            self.assertEqual(original["body"], "Original requirements")
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "planning")
+            return {"decision": "pass", "summary": "Old requirements only",
+                    "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}
+
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch.object(self.runtime, "execute_candidate", side_effect=finish_old_candidate), \
+                patch.object(self.runtime, "deliver") as deliver:
+            self.runtime.process(run)
+        deliver.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+        saved = self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,))
+        self.assertEqual(saved, {"state": "queued", "body": "Original requirements\n\nAlso cover negative inputs"})
+        self.assertFalse(self.store.query("SELECT * FROM tasks WHERE source='system_publish'"))
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(fresh["task"], task)
+        self.assertNotEqual(fresh["id"], run["id"])
+
+    def test_active_revision_waits_until_stage_boundary_and_survives_restart(self):
+        task = self.runtime.goal(self.project, "Original")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.revise_task(task, "First addition")
+        self.runtime.revise_task(task, "Second addition")
+        self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "planning")
+        self.store.recover()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "queued", "body": "Original\n\nFirst addition\n\nSecond addition"})
+        self.assertEqual(len(self.store.query("SELECT * FROM task_revisions WHERE task=?", (task,))), 2)
+
+    def test_active_revision_reaches_next_real_planning_context(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        first = self.store.claim(self.project, self.runtime.config(self.project))
+        prompts = []
+        base = git(self.repo, "rev-parse", "HEAD")
+
+        def planning(role, prompt, *args, **kwargs):
+            self.assertEqual(role, "planning")
+            prompts.append(json.loads(prompt.split("\n")[-1]))
+            if len(prompts) == 1:
+                self.runtime.revise_task(task, "Also handle negative inputs")
+            return {"decision": "deferred", "reason": "Stop after planning", "scope": [],
+                    "acceptance": [], "risk": "low", "value": {
+                        "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Fixture",
+                        "cost": "Fixture", "inaction": "Fixture", "evidence": ["User requirements"]}}
+
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                patch.object(self.runtime, "invoke", side_effect=planning):
+            self.runtime.process(first)
+            self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (first["id"],))["state"], "superseded")
+            second = self.store.claim(self.project, self.runtime.config(self.project))
+            self.runtime.process(second)
+        self.assertEqual([item["task"]["body"] for item in prompts],
+                         ["Original requirements", "Original requirements\n\nAlso handle negative inputs"])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (second["id"],))["state"], "deferred")
+
+    def test_pause_or_cancel_at_planning_transition_prevents_next_model_call(self):
+        base = git(self.repo, "rev-parse", "HEAD")
+        for stop in ["pause", "cancel"]:
+            with self.subTest(stop=stop):
+                task = self.runtime.goal(self.project, "Fix addition " + stop)
+                run = self.store.claim(self.project, self.runtime.config(self.project))
+                transition = self.store.transition
+                roles = []
+
+                def stop_before_transition(run_id, state, *args, **kwargs):
+                    if state == "planning" and not roles:
+                        self.fail("planning model did not run")
+                    if state == "planning" and roles:
+                        if stop == "pause":
+                            self.runtime.pause(self.project, True)
+                            self.runtime.pause(self.project, False)
+                        else:
+                            self.runtime.cancel_task(task)
+                    return transition(run_id, state, *args, **kwargs)
+
+                def invoke(role, *args, **kwargs):
+                    roles.append(role)
+                    if role != "planning":
+                        raise AssertionError("model invoked after stop: " + role)
+                    return {"decision": "ready", "reason": "Concrete defect", "scope": ["calculator.py", "tests"],
+                            "acceptance": ["2 + 3 equals 5"], "risk": "high", "value": {
+                                "impact": "medium", "effort": "low", "confidence": "high", "benefit": "Fix",
+                                "cost": "Small", "inaction": "Wrong result", "evidence": ["subtraction"]}}
+
+                with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                        patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                        patch("adaptive_rsi.pipeline.snapshot", wraps=snapshot) as snapshots, \
+                        patch.object(self.store, "transition", side_effect=stop_before_transition), \
+                        patch.object(self.runtime, "invoke", side_effect=invoke):
+                    self.runtime.process(run)
+                self.assertEqual(roles, ["planning"])
+                self.assertFalse(any(Path(call.args[1]).name == "acceptance-design" for call in snapshots.call_args_list))
+                expected = "interrupted" if stop == "pause" else "cancelled"
+                self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)),
+                                 {"state": expected})
+
+    def test_revision_during_first_review_prevents_second_review(self):
+        task = self.runtime.goal(self.project, "Fix addition with high risk")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        agent = self.runtime.agent
+        calls = []
+        base = git(self.repo, "rev-parse", "HEAD")
+
+        def invoke(role, prompt, workspace, run_arg, **kwargs):
+            calls.append(role)
+            config = json.loads(run_arg["config"])
+            config["models"].setdefault("acceptance", config["models"]["planning"])
+            result = agent.invoke(role, prompt, workspace, self.runtime.project(self.project), run_arg,
+                                  config)
+            assert result is not None
+            if role == "planning":
+                result["risk"] = "high"
+                result["scope"] = ["calculator.py", "auth.py", "tests"]
+            if role == "implementation":
+                (workspace / "auth.py").write_text("PERMISSION_BOUNDARY = 'owner'\n")
+            if role == "review" and calls.count("review") == 1:
+                self.runtime.revise_task(task, "Add a permission boundary test")
+            return result
+
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base, "main")), \
+                patch("adaptive_rsi.readiness.inspect", return_value={"ready": True}), \
+                patch.object(self.runtime, "invoke", side_effect=invoke), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "pass", "checks": {}}), \
+                patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", return_value={"decision": "fail"}):
+            self.runtime.process(run)
+        result = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(calls.count("review"), 1, (calls, result))
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],)), {"state": "superseded"})
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,)), {"state": "queued"})
+
+    def test_cancellation_wins_over_pending_active_revision(self):
+        task = self.runtime.goal(self.project, "Original")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.revise_task(task, "Also cover negative inputs")
+        self.runtime.cancel_task(task)
+        self.store.transition(run["id"], "awaiting_approval", {}, True)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "cancelled")
+        self.assertEqual(self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "cancelled", "body": "Original\n\nAlso cover negative inputs"})
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+
+    def test_pause_and_restart_preserve_pending_revision_without_auto_requeue(self):
+        task = self.runtime.goal(self.project, "Original")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.runtime.revise_task(task, "Also cover negative inputs")
+        self.runtime.pause(self.project, True)
+        self.store.recover()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "interrupted")
+        self.assertEqual(self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "interrupted", "body": "Original\n\nAlso cover negative inputs"})
+        self.assertIsNone(self.store.claim(self.project, self.runtime.config(self.project)))
+
+    def test_supplement_of_awaiting_candidate_revokes_its_queued_delivery(self):
+        task = self.runtime.goal(self.project, "Original requirements")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "awaiting_approval", {
+            "evaluation": {"decision": "pass"}, "review": {"decision": "pass"}}, True)
+        publication = self.runtime.deliver(run["id"])
+        receipt = self.runtime.revise_task(task, "Cover negative inputs")
+        self.assertEqual(receipt, {"saved": True, "pending": False})
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))["state"], "cancelled")
+        self.assertEqual(self.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "queued", "body": "Original requirements\n\nCover negative inputs"})
+
     def test_revision_invalidation_rolls_back_with_requirement_update(self):
         task = self.runtime.goal(self.project, "Original requirements")
         run = self.store.claim(self.project, self.runtime.config(self.project))

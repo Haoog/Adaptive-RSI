@@ -777,6 +777,42 @@ class CliAndRepositoryErrorTest(unittest.TestCase):
             self.assertEqual((status, body["error"], body["error_code"]),
                              (400, message, "validation_error"))
 
+    def test_active_revision_http_receipt_matches_next_run_input(self):
+        import http.client
+
+        runtime = Runtime(Store(self.root / "state"), object())
+        self.addCleanup(runtime.close)
+        project = runtime.add_project(fixture(self.root / "project"))
+        runtime.pause(project, False)
+        task = runtime.goal(project, "Original requirement")
+        run = runtime.store.claim(project, runtime.config(project))
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+        try:
+            data = json.dumps({"task": task, "supplement": "Additional requirement"}).encode()
+            connection.request("POST", "/api/task/revise", body=data, headers={
+                "Content-Type": "application/json", "Content-Length": str(len(data)),
+                "Origin": server.origin, "X-RSI-CSRF": server.csrf,
+                "Cookie": server.cookie + "=" + server.token})
+            response = connection.getresponse()
+            self.assertEqual((response.status, json.loads(response.read())),
+                             (200, {"saved": True, "pending": True}))
+            connection.request("GET", "/api/task?id=" + task + "&project=" + project, headers={
+                "Cookie": server.cookie + "=" + server.token})
+            detail = connection.getresponse()
+            self.assertTrue(json.loads(detail.read())["revision_pending"])
+        finally:
+            connection.close()
+        runtime.store.transition(run["id"], "planning", {})
+        self.assertEqual(runtime.store.one("SELECT state,body FROM tasks WHERE id=?", (task,)),
+                         {"state": "queued", "body": "Original requirement\n\nAdditional requirement"})
+        self.assertEqual(runtime.store.claim(project, runtime.config(project))["task"], task)
+
     def test_cli_api_surfaces_fixed_server_messages(self):
         import io
         import urllib.error

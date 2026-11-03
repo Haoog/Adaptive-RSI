@@ -41,6 +41,8 @@ For example, the current official list assigns `gpt-6-luna` to Responses, `kimi-
 
 Choose the service, enter its endpoint and key, then save and fetch models. Local services without authentication can select **No key**. Services without OAuth use API-key setup instead of a nonfunctional login button.
 
+The Magpie preset defaults to `http://127.0.0.1:3425/v1` on the runtime machine without a key. Edit the address or authentication before saving if the gateway differs. After fetching the catalog, choose a model by its returned ID, such as `simple-linguangchat/swe-2`; roles remain independently configurable. A readable catalog does not establish that tool calls or a real coding task have passed.
+
 ## Storage and recovery
 
 - Successful login refreshes the model directory without automatically running potentially paid model tests. A manually opened model test uses the project scope captured when it opened. Switching projects or settings scopes closes the old dialog, and late results cannot replace feedback in the new project.

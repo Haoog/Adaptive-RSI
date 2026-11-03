@@ -154,6 +154,15 @@ def main():
                         "INSERT INTO task_revisions(task,previous_body,supplement,created) VALUES (?,?,?,?)",
                         (revised, long_body if index == 0 else long_body + "\n\n" + "X" * 700,
                          supplement, now + index))
+            if os.environ.get("RSI_BROWSER_ACTIVE_REVISION"):
+                runtime.store.execute("UPDATE tasks SET state='merged' WHERE project=? AND title LIKE '历史任务 %'", (project,))
+                active = runtime.store.add_task(project, "goal", "active-revision", "运行中补充需求任务",
+                                                "最初要求", priority=200)
+                runtime.store.execute("UPDATE tasks SET state='executing',updated=? WHERE id=?", (time.time() + 60, active))
+                runtime.store.execute("INSERT INTO runs(id,task,project,state,config,started,result) "
+                                      "VALUES (?,?,?,'executing',?,?,?)",
+                                      ("browser-active-revision", active, project,
+                                       json.dumps(runtime.config(project)), time.time(), "{}"))
             if os.environ.get("RSI_BROWSER_TASK_DETAIL"):
                 # 任务详情专项：多运行历史懒加载、待交付取消、等待额度/过时任务详情内重试。
                 now = time.time()
@@ -208,6 +217,15 @@ def main():
                     "INSERT INTO runs(id,task,project,state,config,base,path,calls,tokens,started,ended,result) "
                     "VALUES ('browser-current-work',?,?,'executing','{}','basemain',NULL,2,900,?,?,'{}')",
                     (running_task, project, now - 300, None))
+                runtime.store.execute("INSERT INTO calls(id,project,run,role,provider,model,effort,state,created) "
+                                      "VALUES ('browser-current-call',?,'browser-current-work','implementation',"
+                                      "'magpie','simple-linguangchat/swe-2','default','reserved',?)", (project, now))
+                issue_task = runtime.store.add_task(project, "system_issues", "current-work-issues", "同步 Issue")
+                runtime.store.execute("UPDATE tasks SET state='executing' WHERE id=?", (issue_task,))
+                runtime.store.execute(
+                    "INSERT INTO runs(id,task,project,state,config,started,result) "
+                    "VALUES ('browser-current-issues',?,?,'executing','{}',?,'{}')",
+                    (issue_task, project, now - 30))
             if os.environ.get("RSI_BROWSER_TRIAGE_VISIBILITY"):
                 # 批量初筛决定可见性：新决定直接落库 task_decisions；
                 # 存量 triage-state 键经 reassess 迁移后同样可见。全程无模型调用。
@@ -315,6 +333,10 @@ def main():
                 if line.strip() == "end-current-work-run":
                     # 当前任务标题专项：关闭注入的运行，验证卡片回退到等待文案。
                     runtime.store.execute("UPDATE runs SET ended=? WHERE id='browser-current-work'", (time.time(),))
+                    print(json.dumps({"ok": True}, ensure_ascii=False), flush=True)
+                    continue
+                if line.strip() == "end-current-issues-run":
+                    runtime.store.execute("UPDATE runs SET ended=? WHERE id='browser-current-issues'", (time.time(),))
                     print(json.dumps({"ok": True}, ensure_ascii=False), flush=True)
                     continue
                 texts = json.loads(line)["goal_evidence"]

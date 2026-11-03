@@ -117,7 +117,7 @@ jobs:
             modules: tests.test_runtime_safety tests.test_scheduler_isolation tests.test_schedule_consistency tests.test_experience tests.test_workflow_experience
           - name: 交付循环
             os: ubuntu-latest
-            modules: tests.test_delivery_loop
+            modules: tests.test_delivery_loop tests.test_superseded_delivery_recovery tests.test_pr_feedback_context
           - name: 发布与数据
             os: ubuntu-latest
             modules: tests.test_audit_ledger tests.test_error_details tests.test_blocking_causes tests.test_history_budget tests.test_resource_pressure tests.test_resource_priority tests.test_deployment_observation tests.test_release tests.test_release_parallel tests.test_validation_planning tests.test_release_endpoints tests.test_release_smoke tests.test_data_hardening tests.test_store tests.test_comprehensive_audit tests.test_audit_round3 tests.test_audit_round4 tests.test_audit_round5 tests.test_audit_round6 tests.test_task_lifecycle tests.test_task_groups tests.test_update_admission tests.test_dependency_dag tests.test_experiment_report tests.test_native_path_races tests.test_store_observability tests.test_config_history
@@ -126,7 +126,7 @@ jobs:
             modules: tests.test_model_center tests.test_reliability tests.test_recovery tests.test_task_value_feedback tests.test_tool_artifacts
           - name: 运营、发现与文档
             os: ubuntu-latest
-            modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report
+            modules: tests.test_backend_hardening tests.test_catalog tests.test_docs tests.test_discovery_hardening tests.test_operability tests.test_usage_report tests.test_legacy_queue_import
 
           - name: 服务器、协议与集成
             os: ubuntu-latest

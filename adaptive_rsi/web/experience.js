@@ -388,6 +388,8 @@ window.RSIExperience = (() => {
     );
     if (!current()) return;
     const controls = el("section", undefined, "task-controls");
+    if (metadata.revision_pending)
+      controls.append(el("p", t("补充已收到，将在当前阶段结束后带入下一轮。"), "muted"));
     const waitReason = metadata.wait_reason || task.wait_reason ||
       (["queued", "blocked", "deferred", "waiting_budget", "interrupted"].includes(metadata.state) && currentProject()?.paused ? "paused" : null);
     if (waitReason) controls.append(el("p", t(waiting[waitReason] || waitReason), "task-wait-context"));
@@ -459,6 +461,10 @@ window.RSIExperience = (() => {
     if (
       [
         "queued",
+        "planning",
+        "executing",
+        "evaluating",
+        "awaiting_approval",
         "deferred",
         "blocked",
         "failed",
@@ -497,12 +503,13 @@ window.RSIExperience = (() => {
           if (!value.trim()) throw Error(t("补充需求不能为空，请输入需要保留或补充的要求。"));
           submit.disabled = true;
           try {
-            await api("task/revise", {
+            const receipt = await api("task/revise", {
               task: task.id,
               supplement: value,
               reason: reason.value,
             });
             if (draftStore.get('task-supplement', task.id) === value) draftStore.remove('task-supplement', task.id);
+            toast(t(receipt.pending ? "补充已收到，将在当前阶段结束后带入下一轮。" : "补充已保存，将重新评估。"));
             await refreshTaskDetail();
           } finally {
             submit.disabled = false;

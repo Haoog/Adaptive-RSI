@@ -463,6 +463,90 @@ print('BOUNDARIES_OK')
         self.store.put_setting("run-baseline:" + run["id"], {"repository": "example/project", "branch": "main", "sha": "base"})
         return run
 
+    def test_tracking_feedback_requeues_once_and_preserves_evidence(self):
+        from adaptive_rsi.delivery import pr_feedback_context
+        run = self.tracked_pr()
+        self.runtime.configure({"limits": {"retries": 3}}, self.project)
+        before = self.store.one("SELECT evidence FROM tasks WHERE id=?", (run["task"],))["evidence"]
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base",
+              "comments": [{"id": "c1", "body": "Please add a test"}],
+              "reviews": [{"id": "r1", "body": "Fix edge case", "state": "CHANGES_REQUESTED"}],
+              "statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE"}]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), patch("adaptive_rsi.delivery.checked", return_value="") as remote:
+            tick(self.runtime, 1000)
+            tick(self.runtime, 1061)
+        self.assertEqual(len(pr_feedback_context(self.store, self.project, run["task"])), 3)
+        task = self.store.one("SELECT state,evidence FROM tasks WHERE id=?", (run["task"],))
+        self.assertEqual(task["state"], "queued")
+        self.assertEqual(task["evidence"], before)
+        saved = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(saved["state"], "superseded")
+        self.assertEqual(json.loads(saved["result"])["delivery_status"], "feedback_replan")
+        self.assertEqual(remote.call_count, 1)
+        fresh = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(fresh["task"], run["task"])
+        self.assertEqual(len(pr_feedback_context(self.store, self.project, fresh["task"])), 3)
+
+    def test_feedback_types_and_deduplication_across_observations(self):
+        from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
+        run = self.tracked_pr()
+        # 普通评论只作为上下文，赞许或说明不能关掉本可合并的 PR。
+        self.assertFalse(record_pr_feedback(self.store, run, "pr", {
+            "comments": [{"id": "c", "body": "LGTM, thanks!"}]}))
+        for feedback in (
+            {"reviews": [{"id": "r", "body": "", "state": "CHANGES_REQUESTED"}]},
+            {"statusCheckRollup": [{"name": "tests", "conclusion": "FAILURE"}]},
+        ):
+            self.assertTrue(record_pr_feedback(self.store, run, "pr", feedback))
+        self.assertFalse(record_pr_feedback(self.store, run, "pr", {
+            "reviews": [{"id": "approved", "body": "Looks good", "state": "APPROVED"}]}))
+        keys = record_pr_feedback(self.store, run, "pr", {
+            "reviews": [{"id": "r", "body": "", "state": "CHANGES_REQUESTED"}]})
+        self.assertTrue(keys)
+        self.assertTrue(_supersede_pr(self.store, run, {"pr": "pr"}, "queued", 1000, keys))
+        # The same observation from another run is still already handled.
+        other = dict(run, id="another-run")
+        self.assertEqual(keys, record_pr_feedback(self.store, other, "pr", {
+            "reviews": [{"id": "r", "body": "", "state": "CHANGES_REQUESTED"}]}))
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM settings WHERE key=?", ("handled:" + keys[0],)))
+
+    def test_new_attempt_with_the_same_failing_check_still_replans_once(self):
+        from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
+        run = self.tracked_pr()
+        failure = {"statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE"}]}
+        first = record_pr_feedback(self.store, run, "pr-1", failure)
+        self.assertTrue(_supersede_pr(self.store, run, {"pr": "pr-1"}, "queued", 1000, first))
+        retry = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(retry)
+        self.store.execute("UPDATE runs SET state='pr_open' WHERE id=?", (retry["id"],))
+        second = record_pr_feedback(self.store, dict(retry), "pr-2", failure)
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+
+    def test_feedback_replan_transaction_rolls_back_on_task_failure(self):
+        from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
+        run = self.tracked_pr()
+        keys = record_pr_feedback(self.store, run, "pr", {
+            "statusCheckRollup": [{"name": "verify", "conclusion": "FAILURE"}]})
+        self.assertTrue(keys)
+        self.store.execute("CREATE TRIGGER reject_feedback BEFORE UPDATE OF state ON tasks "
+                           "BEGIN SELECT RAISE(ABORT, 'failure'); END")
+        with self.assertRaises(Exception):
+            _supersede_pr(self.store, run, {"pr": "pr"}, "queued", 1000, keys)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key=?", ("handled:" + keys[0],)))
+
+    def test_record_failure_does_not_prevent_merged_reconciliation(self):
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.record_pr_feedback", side_effect=RuntimeError("record failure")), \
+                patch("adaptive_rsi.delivery.feedback"):
+            tick(self.runtime, time.time())
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertEqual(json.loads(row["result"])["merged_sha"], "merged-sha")
+
     def test_feedback_failure_preserves_merge_metadata_for_retry(self):
         run = self.tracked_pr()
         pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}

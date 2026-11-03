@@ -772,7 +772,10 @@ class Maintenance:
                                 "SELECT id, ended IS NOT NULL AND ended<? AND state NOT IN "
                                 "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
                                 "AND NOT (state='superseded' AND CASE WHEN json_valid(result) "
-                                "THEN coalesce(json_extract(result,'$.close_pending'),0) ELSE 1 END=1) AS eligible "
+                                "THEN coalesce(json_extract(result,'$.close_pending'),0) ELSE 1 END=1) "
+                                "AND NOT (state='superseded' AND CASE WHEN json_valid(result) "
+                                "THEN coalesce(json_extract(result,'$.pr'),'') ELSE 'x' END='' "
+                                "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) AS eligible "
                                 "FROM runs WHERE id=?", (stale, candidate)).fetchone()
                             if owner:
                                 if owner["eligible"]:
@@ -794,7 +797,10 @@ class Maintenance:
                     "SELECT 1 FROM runs r WHERE r.id=? AND r.ended<? AND r.state NOT IN "
                     "('pr_open','merged','unverified_merge','releasing','deploying','pr_closed') "
                     "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
-                    "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1)",
+                    "THEN coalesce(json_extract(r.result,'$.close_pending'),0) ELSE 1 END=1) "
+                    "AND NOT (r.state='superseded' AND CASE WHEN json_valid(r.result) "
+                    "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
+                    "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id))",
                     (run, stale)).fetchone()
                 if not eligible:
                     continue

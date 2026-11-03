@@ -1,5 +1,6 @@
 import json
 import html
+import hashlib
 import re
 import time
 from pathlib import Path
@@ -102,7 +103,79 @@ def baseline(runtime, project, config):
 
 def pr_view(repo, url):
     return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json",
-        "url,state,headRefOid,baseRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft"]))
+        "url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews"]))
+
+
+def _pr_feedback_prefix(project, task):
+    identity = encode([project, task]).encode("utf-8")
+    return "pr-feedback:" + hashlib.sha256(identity).hexdigest() + ":"
+
+
+BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot-pull-request-reviewer",
+              "copilot", "codex", "chatgpt-codex-connector"}
+
+
+def record_pr_feedback(store, run, url, pr):
+    """Append distinct observations without changing task state or run evidence."""
+    observations = []
+    for field, kind in (("comments", "comment"), ("reviews", "review")):
+        for row in pr.get(field) or []:
+            if isinstance(row, dict) and isinstance(row.get("body"), str):
+                author = row.get("author") or {}
+                login = author.get("login", "").lower() if isinstance(author, dict) else ""
+                # 自动账号的评论与评审都不能驱动重排，否则一个自动评审机器人
+                # 就能反复关掉交付 PR；人类反馈照常处理。
+                if (login.endswith("[bot]") or login in BOT_LOGINS or
+                        "<!-- gh-aw-agentic-workflow:" in row["body"]):
+                    continue
+                fallback = row.get("url") or encode([author, row.get("createdAt"), row.get("submittedAt"), row.get("commit")])
+                observations.append({"kind": kind, "id": row.get("id") or fallback, "body": row["body"],
+                                     "state": row.get("state"), "url": row.get("url"),
+                                     "author": row.get("author"), "updated_at": row.get("updatedAt")})
+    for row in pr.get("statusCheckRollup") or []:
+        if not isinstance(row, dict) or (row.get("conclusion") or row.get("state")) not in ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STALE"):
+            continue
+        if not (row.get("name") or row.get("context")):
+            continue
+        observations.append({"kind": "ci", "name": row.get("name") or row.get("context"),
+                             "state": row.get("conclusion") or row.get("state"),
+                             "url": row.get("detailsUrl") or row.get("targetUrl"),
+                             "head": pr.get("headRefOid")})
+    prefix = _pr_feedback_prefix(run["project"], run["task"])
+    actionable = []
+    for item in observations:
+        # CI 身份按运行区分：同一个 PR 反复观测不会重排，新一轮尝试仍能重排一次。
+        identity_data = ["ci", run["id"], item["name"], item["state"]] if item["kind"] == "ci" else [url, item]
+        identity = prefix + hashlib.sha256(encode(identity_data).encode("utf-8")).hexdigest()
+        item.update(run=run["id"], pr=url)
+        payload = encode(item)
+        key = prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
+        # 只有客观信号才重排：失败检查，或仍未被后续批准覆盖的修改请求。
+        # 普通评论（包括「LGTM」这类赞许）只作为后续规划的上下文。
+        if item["kind"] == "ci" or (item["kind"] == "review" and
+                                    item.get("state") == "CHANGES_REQUESTED" and
+                                    pr.get("reviewDecision") != "APPROVED"):
+            actionable.append(identity)
+    return actionable
+
+
+def pr_feedback_context(store, project, task):
+    prefix = _pr_feedback_prefix(project, task)
+    rows = store.query("SELECT value FROM settings WHERE key>=? AND key<? ORDER BY rowid DESC LIMIT 20", (prefix, prefix + "~"))
+    result = []
+    for row in reversed(rows):
+        try:
+            item = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("body"), str) and len(item["body"]) > 4000:
+            item["body"] = item["body"][:4000]
+            item["truncated"] = True
+        result.append(item)
+    return result
 
 
 _PROTECTION_CACHE = {}
@@ -464,11 +537,19 @@ def _update_pr_task(store, run, state, now):
                   (state, now, run["task"], run["task"], run["started"], run["started"], run["id"]))
 
 
-def _supersede_pr(store, run, outcome, task_state, now):
+def _supersede_pr(store, run, outcome, task_state, now, feedback_keys=None):
     """Detach tracking from the task and persist close intent before remote writes."""
     outcome.update(replanned=True, close_pending=True)
     with store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
+        if feedback_keys is not None:
+            eligible = db.execute("SELECT 1 FROM tasks WHERE id=? AND state='pr_open' AND NOT EXISTS "
+                                  "(SELECT 1 FROM runs WHERE task=? AND (started>? OR (started=? AND id>?)))",
+                                  (run["task"], run["task"], run["started"], run["started"], run["id"])).fetchone()
+            unseen = [key for key in feedback_keys if not db.execute(
+                "SELECT 1 FROM settings WHERE key=?", ("handled:" + key,)).fetchone()]
+            if not eligible or not unseen:
+                return False
         changed = db.execute("UPDATE runs SET state='superseded',result=? WHERE id=? AND state='pr_open'",
                              (encode(outcome), run["id"])).rowcount
         if changed:
@@ -478,6 +559,8 @@ def _supersede_pr(store, run, outcome, task_state, now):
                        (task_state, now, run["task"], run["task"], run["started"], run["started"], run["id"]))
             # 转为关闭流程：此前记录的自动合并意图随之作废，同事务内清理。
             db.execute("DELETE FROM settings WHERE key=?", ("merge-intent:" + run["id"],))
+            for key in feedback_keys or []:
+                db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", ("handled:" + key, encode(now)))
     return bool(changed)
 
 
@@ -496,6 +579,95 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled):
     store.remote_wait(run["id"], None, time.time())
 
 
+_RECOVERY_CANDIDATE = ("(r.state='superseded' AND CASE WHEN json_valid(r.result) "
+    "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
+    "AND EXISTS (SELECT 1 FROM settings s WHERE s.key='delivery-push:'||r.id))")
+
+
+def _recovery_due(outcome, now):
+    last = outcome.get('delivery_recovery_at')
+    if not isinstance(last, (int, float)):
+        return True
+    wait = outcome.get('delivery_recovery_retry')
+    return now - last >= (wait if isinstance(wait, (int, float)) and wait > 0 else 3600)
+
+
+def _stamp_recovery(store, run_id, now, wait):
+    """Record the attempt before any remote read so failures also back off."""
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT state,result FROM runs WHERE id=?', (run_id,)).fetchone()
+        if not row or row['state'] != 'superseded':
+            return
+        outcome = parsed_result(row)
+        if outcome.get('pr'):
+            return
+        outcome['delivery_recovery_at'] = now
+        outcome['delivery_recovery_retry'] = wait
+        db.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run_id))
+
+
+def _recover_superseded_receipt(runtime, project, run, config, now):
+    """Observe a journaled publication without relying on its workspace."""
+    store = runtime.store
+    # 失败的远端读取同样要退避，否则每个调度周期都会重新发起查询。
+    _stamp_recovery(store, run['id'], now, 900)
+    intent = store.setting('delivery-push:' + run['id'])
+    identity = store.setting('run-baseline:' + run['id'])
+    task = store.one('SELECT source FROM tasks WHERE id=? AND project=?', (run['task'], run['project']))
+    repo = config['github']['repository']
+    if not isinstance(intent, dict) or not isinstance(identity, dict) or not task or not isinstance(repo, str):
+        return
+    prefix = 'fix' if task['source'] in ['issue', 'rollback', 'inspection'] else 'feat'
+    branch = prefix + '/rsi-' + re.sub(r'[^a-zA-Z0-9._-]', '-', run['id'])
+    head = intent.get('head')
+    base_branch = identity.get('branch')
+    if (not isinstance(head, str) or not re.fullmatch(r'[0-9a-fA-F]{40}', head) or
+            not isinstance(base_branch, str) or not base_branch or
+            intent.get('branch') != branch or intent.get('repository') != repo or
+            intent.get('base') != run['base'] or identity != {
+                'repository': repo, 'branch': base_branch, 'sha': run['base']} or
+            repo.lower() != origin_repository(project['path']).lower()):
+        return
+    records = json.loads(checked(['gh', 'pr', 'list', '--repo', repo, '--state', 'all',
+        '--head', branch, '--limit', '100', '--json', 'url,state,headRefOid,headRefName,headRepositoryOwner,baseRefName']))
+    if not isinstance(records, list) or len(records) >= 100:
+        raise ValueError('Incomplete PR recovery response')
+    matches = []
+    for pr in records:
+        if not isinstance(pr, dict):
+            raise ValueError('Invalid PR recovery response')
+        url = pr.get('url')
+        if (isinstance(url, str) and re.fullmatch(r'https://github\.com/' + re.escape(repo) + r'/pull/[1-9][0-9]*', url, re.I)
+                and pr.get('headRefName') == branch and pr.get('headRefOid') == head
+                and isinstance(pr.get('headRepositoryOwner'), dict)
+                and str(pr['headRepositoryOwner'].get('login', '')).lower() == repo.split('/')[0].lower()
+                and pr.get('baseRefName') == base_branch and pr.get('state') in ('OPEN', 'CLOSED', 'MERGED')):
+            matches.append(pr)
+    if len(matches) > 1:
+        raise ValueError('Ambiguous PR recovery response')
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT state,result FROM runs WHERE id=?', (run['id'],)).fetchone()
+        saved_intent = db.execute('SELECT value FROM settings WHERE key=?', ('delivery-push:' + run['id'],)).fetchone()
+        if not row or row['state'] != 'superseded' or not saved_intent or json.loads(saved_intent['value']) != intent:
+            return
+        outcome = json.loads(row['result'] or '{}')
+        if not isinstance(outcome, dict) or outcome.get('pr'):
+            return
+        outcome['delivery_recovery_at'] = now
+        outcome['delivery_recovery_retry'] = 3600
+        if matches:
+            outcome['delivery_recovery_checked'] = True
+            pr = matches[0]
+            outcome.update(pr=pr['url'], replanned=True, close_pending=pr['state'] == 'OPEN')
+            if pr['state'] != 'OPEN':
+                outcome['close_status'] = pr['state'].lower()
+            db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('delivery:' + run['id'], encode(
+                {'head': head, 'base': run['base'], 'branch': base_branch, 'repository': repo})))
+        db.execute('UPDATE runs SET result=? WHERE id=? AND state=\'superseded\'', (encode(outcome), run['id']))
+
+
 def schedule(runtime, now=None):
     now = now or time.time()
     store = runtime.store
@@ -506,9 +678,11 @@ def schedule(runtime, now=None):
     from .release import pending
     for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
                            "WHERE p.paused=0 AND (r.state IN ('pr_open','merged') OR "
-                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1))"):
+                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")"):
         with runtime.scheduler_scope("delivery_run", run["project"], run["id"]):
             outcome = parsed_result(run)
+            if run['state'] == 'superseded' and not outcome.get('pr') and not _recovery_due(outcome, now):
+                continue
             if "restore_invalidation" in outcome:
                 # Keep scanning other runs: the scheduler scope records this run's
                 # error once and clears it when the row becomes readable again.
@@ -554,9 +728,9 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         current = store.one("SELECT * FROM runs WHERE id=?", (active_run,))
         return not current or runtime.is_cancelled(current)
 
-    for run in store.query("SELECT * FROM runs WHERE (state IN ('pr_open','merged') OR "
-                           "(state='superseded' AND json_valid(result) AND json_extract(result,'$.close_pending')=1))" +
-                           (" AND project=?" if project_id else "") + " ORDER BY started",
+    for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR "
+                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")" +
+                           (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
                            (project_id,) if project_id else ()):
         if tracking_cancelled():
             return
@@ -566,6 +740,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
         try:
             config = runtime.config(project["id"])
             outcome = parsed_result(run)
+            if run['state'] == 'superseded' and not outcome.get('pr'):
+                if _recovery_due(outcome, now):
+                    _recover_superseded_receipt(runtime, project, run, config, now)
+                continue
             repo = config["github"]["repository"]
             policy = store.setting("delivery:" + run["id"])
             if (not policy or not isinstance(policy, dict) or not repo or
@@ -585,7 +763,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             pr = pr_view(repo, pr_url) if run["state"] in ["pr_open", "superseded"] else None
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
+            feedback_keys = []
             if run["state"] == "pr_open":
+                try:
+                    feedback_keys = record_pr_feedback(store, run, pr_url, pr)
+                except Exception as exc:
+                    store.event("pr_feedback_error", str(exc), project["id"], run["id"])
                 task = store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))
                 newer = store.one("SELECT 1 FROM runs WHERE task=? AND "
                                   "(started>? OR (started=? AND id>?))",
@@ -595,7 +778,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     if _supersede_pr(store, run, outcome, task["state"] if task else "blocked", now):
                         run["state"] = "superseded"
             if run["state"] == "superseded":
-                _close_superseded_pr(store, run, outcome, repo, pr, tracking_cancelled)
+                recovery_intent = store.setting('delivery-push:' + run['id'])
+                if outcome.get('delivery_recovery_checked') and (
+                        not sealed_target or pr.get('headRefOid') != policy['head'] or
+                        pr.get('baseRefName') != policy['branch'] or
+                        not isinstance(recovery_intent, dict) or pr.get('headRefName') != recovery_intent.get('branch') or
+                        not isinstance(pr.get('headRepositoryOwner'), dict) or
+                        str(pr['headRepositoryOwner'].get('login', '')).lower() != repo.split('/')[0].lower()):
+                    continue
+                _close_superseded_pr(store, run, outcome, repo, pr,
+                                     lambda: tracking_cancelled() or runtime.project(project['id'])['paused'])
                 continue
             if run["state"] == "pr_open":
                 gate = merge_gate(pr, policy["head"], policy["base"])
@@ -673,6 +865,16 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     store.execute("UPDATE runs SET state='pr_closed' WHERE id=?", (run["id"],))
                     _update_pr_task(store, run, "pr_closed", now)
                 else:
+                    if feedback_keys and not tracking_cancelled():
+                        task = store.one("SELECT attempts FROM tasks WHERE id=?", (run["task"],))
+                        state = "queued" if task and (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
+                        previous = dict(outcome)
+                        outcome["delivery_status"] = "feedback_replan"
+                        if _supersede_pr(store, run, outcome, state, now, feedback_keys):
+                            _close_superseded_pr(store, run, outcome, repo, pr,
+                                                 lambda: tracking_cancelled() or runtime.project(project["id"])["paused"])
+                            continue
+                        outcome = previous
                     outcome["delivery_status"] = gate
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
                     try:

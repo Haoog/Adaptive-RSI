@@ -601,6 +601,9 @@ class Handler(BaseHTTPRequestHandler):
                 revisions = revision_page(store, task["id"], task["project"])
                 task.update(revisions=revisions["revisions"], revisions_has_more=revisions["has_more"],
                             revisions_next_before=revisions["next_before"])
+                task["revision_pending"] = bool(store.one(
+                    "SELECT 1 FROM runs r JOIN settings s ON s.key='revision-pending:' || r.id "
+                    "WHERE r.task=? AND r.ended IS NULL", (task["id"],)))
                 task["decision"] = store.one("SELECT data,created FROM task_decisions WHERE task=?", (task["id"],))
                 task["dependencies"] = store.query("SELECT dependency FROM task_dependencies WHERE task=? ORDER BY dependency", (task["id"],))
                 task["dependency"] = task["dependencies"][0] if task["dependencies"] else None
@@ -1142,8 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif path == "/api/goal":
                     result = {"id": runtime.goal(body["project"], body["text"], body.get("overrides"), body.get("request_id"))}
                 elif path == "/api/task/revise":
-                    runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
-                    result = {"saved": True}
+                    result = runtime.revise_task(body["task"], body["supplement"], body.get("reason"))
                 elif path == "/api/task/value-feedback":
                     from .task_feedback import save as save_value_feedback
                     result = save_value_feedback(runtime.store, body.get("project"), body.get("task"),

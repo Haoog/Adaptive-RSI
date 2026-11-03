@@ -148,6 +148,50 @@ class RelatedWorkTest(unittest.TestCase):
                     self.assertEqual(records(store, "first", group="active")["tasks"][0]["display_state"], "deploying")
                     self.assertEqual(records(store, "first", group="history")["tasks"], [])
 
+    def test_dashboard_shows_actual_active_call_route_instead_of_configured_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.store(directory)
+            task = store.add_task("first", "goal", "active", "Observe model")
+            store.execute("UPDATE tasks SET state='executing' WHERE id=?", (task,))
+            store.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES ('active-run',?,'first','executing','{}',10)", (task,))
+            store.execute("INSERT INTO calls(id,project,run,role,provider,model,effort,state,created) "
+                          "VALUES ('done','first','active-run','planning','configured','planner','default','completed',11)")
+            store.execute("INSERT INTO calls(id,project,run,role,provider,model,effort,state,created) "
+                          "VALUES ('current','first','active-run','implementation','magpie','simple-linguangchat/swe-2','default','reserved',12)")
+            current = records(store, "first")["runs"][0]["current_model"]
+            self.assertEqual(current, {"role": "implementation", "provider": "magpie",
+                                       "model": "simple-linguangchat/swe-2"})
+            store.execute("UPDATE calls SET state='completed' WHERE id='current'")
+            self.assertIsNone(records(store, "first")["runs"][0]["current_model"])
+
+    def test_queue_status_does_not_mark_task_blocked_by_compatible_issue_sync(self):
+        from adaptive_rsi.experience import queue_status
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.store(directory)
+            store.execute("UPDATE projects SET paused=0 WHERE id='first'")
+            sync_task = store.add_task("first", "system_issues", "sync", "Sync")
+            store.execute("UPDATE tasks SET state='planning' WHERE id=?", (sync_task,))
+            store.execute("INSERT INTO runs(id,task,project,state,started) VALUES ('sync-run',?,'first','planning',10)",
+                          (sync_task,))
+            queued = store.add_task("first", "goal", "goal", "Fix issue")
+            self.assertEqual(next(row for row in queue_status(store, "first") if row["id"] == queued)["wait_reason"],
+                             "ready")
+
+    def test_queue_position_counts_only_tasks_compatible_with_active_run(self):
+        from adaptive_rsi.experience import queue_status
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.store(directory)
+            self.addCleanup(store.close)
+            store.execute("UPDATE projects SET paused=0 WHERE id='first'")
+            sync = store.add_task("first", "system_issues", "sync-active", "Active sync")
+            store.execute("UPDATE tasks SET state='planning' WHERE id=?", (sync,))
+            store.execute("INSERT INTO runs(id,task,project,state,started) VALUES ('sync-run',?,'first','planning',10)", (sync,))
+            waiting = store.add_task("first", "system_issues", "sync-waiting", "Waiting sync", priority=100)
+            ready = store.add_task("first", "goal", "goal-ready", "Ready goal", priority=50)
+            rows = {row["id"]: row for row in queue_status(store, "first")}
+            self.assertEqual((rows[waiting]["wait_reason"], rows[waiting]["queue_position"]), ("running", None))
+            self.assertEqual((rows[ready]["wait_reason"], rows[ready]["queue_position"]), ("ready", 1))
+
     def test_dashboard_exposes_latest_stage_and_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self.store(directory)
