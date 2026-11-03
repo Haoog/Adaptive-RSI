@@ -219,6 +219,17 @@ def select_cases(cases, count, seed):
     return selected
 
 
+def _stale_running_attempt(attempt):
+    """进程在 ``record_attempt(..., "running")`` 后崩溃/中断时，这条记录再也不会被
+    终态覆盖：in_flight 一小时后虽变假，signature 匹配却把重复抑制永久锁死。
+    与 candidates 预留行同一个 3600s 过期时钟，把过期的 running 记录视为陈旧，
+    不计为「已评估过相同输入」，让正常重试路径接管。"""
+    if not isinstance(attempt, dict) or attempt.get("status") != "running":
+        return False
+    started = attempt.get("at")
+    return not isinstance(started, (int, float)) or time.time() - started > 3600
+
+
 class Evolution:
     def __init__(self, runtime):
         self.runtime = runtime
@@ -1096,7 +1107,8 @@ class Evolution:
     def attempt_due(self, project, config):
         signature = self.input_signature(project, config)
         attempt = self.store.setting("evolution-attempt:" + project, {})
-        return not (isinstance(attempt, dict) and attempt.get("signature") == signature), signature, attempt
+        return not (isinstance(attempt, dict) and attempt.get("signature") == signature
+                    and not _stale_running_attempt(attempt)), signature, attempt
 
     def record_attempt(self, project, signature, status, candidate=None, reason=None):
         self.store.put_setting("evolution-attempt:" + project, {
@@ -1167,7 +1179,8 @@ class Evolution:
         started = attempt.get("at") if isinstance(attempt, dict) else None
         in_flight = (isinstance(attempt, dict) and attempt.get("status") == "running"
                      and isinstance(started, (int, float)) and time.time() - started <= 3600)
-        if not force and not in_flight and isinstance(attempt, dict) and attempt.get("signature") == signature:
+        if not force and not in_flight and isinstance(attempt, dict) and \
+                attempt.get("signature") == signature and not _stale_running_attempt(attempt):
             reason = ("Identical experiment inputs were already evaluated with status "
                       + str(attempt.get("status", "insufficient_evidence")) +
                       "; change evidence, cases, policy or strategies, or retry explicitly with force")

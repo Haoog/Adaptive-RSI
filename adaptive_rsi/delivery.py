@@ -640,7 +640,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     run["state"] = target_state
                     if target_state == "unverified_merge":
                         _update_pr_task(store, run, "blocked", now)
-                    else:
+                    elif target_state == "merged":
                         _update_pr_task(store, run, "merged", now)
                         task = store.one("SELECT source,evidence FROM tasks WHERE id=?", (run["task"],))
                         if task and task["source"] == "rollback":

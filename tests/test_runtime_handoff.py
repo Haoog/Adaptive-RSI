@@ -743,6 +743,72 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT value FROM settings WHERE key='postprocess:0000000000000000'")['value'], '{')
         self.assertIsNone(self.store.setting('postprocess-pending:0000000000000000'))
 
+    def test_postprocess_deterministic_failure_escapes_to_failed_after_cap(self):
+        # _postprocess_run 恒抛（确定性失败，如损坏 config/永久 ValueError）时：
+        # 无尝试计数/终态会让 record 保持 pending+marker 每 ~5s 热循环（settings 写事务 +
+        # WAL 增长 + CPU）。回归修复后：每次失败计入 attempts，达到
+        # POSTPROCESS_MAX_ATTEMPTS 置 failed 终态、摘 marker、记 postprocess_abandoned，
+        # 之后 drain 不再调用 _postprocess_run。
+        from adaptive_rsi import runtime as runtime_module
+        task, run = self.claim()
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {'summary': 'Verified'}, True)
+
+        calls = []
+        def always_fails(key, identifier, record):
+            calls.append(identifier)
+            raise ValueError('permanent failure: corrupted config')
+        self.runtime._postprocess_run = always_fails
+
+        marker = 'postprocess-pending:' + run['id']
+        key = 'postprocess:' + run['id']
+        # 每个调度节拍重试一次：未达上限保持 pending+marker，达上限置 failed 终态。
+        for _ in range(runtime_module.POSTPROCESS_MAX_ATTEMPTS):
+            self.runtime.drain_postprocess()
+        record = self.store.setting(key)
+        self.assertEqual(record['state'], 'failed')
+        self.assertEqual(record['attempts'], runtime_module.POSTPROCESS_MAX_ATTEMPTS)
+        self.assertIn('corrupted config', record['last_error'])
+        self.assertIn('abandoned', record['reason'])
+        # 终态逃逸：marker 摘除、写放弃事件、不再热循环。
+        self.assertIsNone(self.store.setting(marker))
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='postprocess_abandoned' AND run=?", (run['id'],)))
+        # 后续 drain 不再调用 _postprocess_run，也不再改写这条 record。
+        before = len(calls)
+        self.runtime.drain_postprocess()
+        self.runtime.drain_postprocess()
+        self.assertEqual(len(calls), before)
+        self.assertEqual(self.store.setting(key)['state'], 'failed')
+
+    def test_postprocess_failure_retries_immediately_until_cap(self):
+        # 未达上限的失败保持 pending+marker 供下一节拍即时重试：重试节奏由调度循环
+        # 自身的 ~5s 间隔承担，瞬态失败不人为延迟。成功后 marker 摘除、state completed。
+        task, run = self.claim()
+        self.runtime.queue_postprocess(run)
+        self.store.transition(run['id'], 'awaiting_approval', {'summary': 'Verified'}, True)
+
+        calls = []
+        def fails_once_then_succeeds(key, identifier, record):
+            calls.append(identifier)
+            if len(calls) == 1:
+                raise ValueError('transient failure')
+            self.store.put_setting(key, {**record, 'state': 'completed'})
+        self.runtime._postprocess_run = fails_once_then_succeeds
+
+        key = 'postprocess:' + run['id']
+        self.runtime.drain_postprocess()
+        self.assertEqual(len(calls), 1)
+        record = self.store.setting(key)
+        self.assertEqual(record['state'], 'pending')
+        self.assertEqual(record['attempts'], 1)
+        self.assertIsNotNone(self.store.setting('postprocess-pending:' + run['id']))
+        # 下一节拍立刻重试（不附加墙钟退避），成功后摘除 marker。
+        self.runtime.drain_postprocess()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.store.setting(key)['state'], 'completed')
+        self.assertIsNone(self.store.setting('postprocess-pending:' + run['id']))
+
     def test_operation_crash_after_effect_is_unknown_and_never_reexecuted(self):
         operation = '0123456789abcdef'
         self.store.execute("INSERT INTO operations VALUES (?,?,?,'{}',?,NULL)",

@@ -343,6 +343,148 @@ class DiscoveryHardeningTest(unittest.TestCase):
             self.assertEqual(self.store.setting(key)["failures"], 0)
         self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='issue:owner/project:52'"))
 
+    def test_interrupted_continuation_page_preserves_prior_failures_for_since(self):
+        # 区别于已有 complete-重建用例：本条钉住「中间页覆写」路径。周期1在末页前
+        # 跳过一行后按页预算中断；周期2续扫到的仍是满页（非末页），本周期无新失败——
+        # 此时 else 分支若无条件 progress[\"failures\"]=len(failures) 会把上周期带入的
+        # prior_failures 覆写为0；周期3到末页时 has_failures 变假、since 被本周期
+        # started 覆盖，周期1被跳过的行（updated_at 早于新水印）永久漏读。
+        key = "issue-sync:p"
+        self.synchronize([self.issue(number=1)])
+        watermark = self.store.setting(key)["since"]  # 周期0完成时落库的水印
+
+        def make(number):
+            return {"number": number, "title": "Issue " + str(number), "body": "body",
+                    "labels": [], "state": "open", "updated_at": "2026-11-01T00:00:00Z",
+                    "html_url": "https://github.com/owner/project/issues/" + str(number)}
+        bad = make(101)
+        del bad["labels"]  # apply() 内 issue["labels"] 迭代 → KeyError；缺键不进 pending
+        # 三个满页中夹一个末页：周期1页1(满+坏)、周期2页2(满+干净仍按预算中断)、周期3页3(末页)。
+        pages = {1: [make(n) for n in range(2, 101)] + [bad],
+                 2: [make(n) for n in range(102, 202)],
+                 3: [make(n) for n in range(202, 204)]}
+        def checked(args, **kwargs):
+            page = int(next(v.split("=", 1)[1] for v in args if v.startswith("page=")))
+            return encode(pages.get(page, []))
+        with patch("adaptive_rsi.discovery.ISSUE_SYNC_MAX_PAGES", 1):
+            with self.assertRaises(KeyError):
+                sync(self.runtime, self.project, self.config, checked)  # 周期1：page1 满页中断
+            self.assertEqual(self.store.setting(key)["failures"], 1)
+            self.assertEqual(self.store.setting(key)["page"], 2)
+            # 周期2：page2 是干净满页，仍按预算中断——prior_failures 必须带进下一周期。
+            sync(self.runtime, self.project, self.config, checked)
+            second = self.store.setting(key)
+            self.assertEqual(second["failures"], 1)  # 回归前此处被覆写为 0
+            self.assertEqual(second["page"], 3)
+            # 周期3：末页 complete；has_failures 仍真 → since 保持旧水印而非本周期 started。
+            sync(self.runtime, self.project, self.config, checked)
+            third = self.store.setting(key)
+            self.assertEqual(third["page"], 1)
+            self.assertEqual(third["since"], watermark)
+
+    def test_deterministically_broken_pending_entry_is_quarantined_after_cap(self):
+        # pending 暂存行语义损坏但形状合法时，每周期 replay 必然再失败→failures 非空→
+        # sync() 末抛 failures[0]，prs:/ci: 刷新与 summary event 永久 wedge。回归修复后：
+        # 重试计入 attempts，超 ISSUE_SYNC_PENDING_MAX_ATTEMPTS 从 pending 移除并记
+        # issue_sync_quarantined，不再让整个 sync 被单行楔死。
+        from adaptive_rsi.discovery import ISSUE_SYNC_PENDING_MAX_ATTEMPTS
+        from adaptive_rsi.config import fingerprint
+        key = "issue-sync:p"
+        # state 非 str → apply_existing/apply 内 issue[\"state\"].lower() AttributeError，确定性。
+        broken = {"number": 42, "updated_at": "2026-11-01T00:00:00Z",
+                  "html_url": "https://github.com/owner/project/issues/42",
+                  "state": 123, "labels": [], "title": "broken", "body": "broken"}
+        policy = fingerprint({"labels": self.config["github"]["labels"],
+                              "exclude": self.config["github"]["exclude_labels"]})
+        progress = self.store.setting(key, {})
+        progress.update(repository="owner/project", policy=policy, page=1, pending={"42": broken})
+        self.store.put_setting(key, progress)
+        good = self.issue(number=7)
+        # 前 MAX-1 周期：坏行 replay 失败计入 attempts，sync 仍抛首个失败但远端行照常处理。
+        for cycle in range(ISSUE_SYNC_PENDING_MAX_ATTEMPTS - 1):
+            with self.assertRaises(AttributeError):
+                self.synchronize([good])
+            self.assertIn("42", self.store.setting(key)["pending"])
+            self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], cycle + 1)
+        # 达到上限的 replay 仍把本周期失败如实抛给调用方（证据不静默），同时把坏行
+        # 从 pending 隔离并记 issue_sync_quarantined——楔死的是 entry 而不是整个 sync。
+        with self.assertRaises(AttributeError):
+            self.synchronize([good])
+        self.assertNotIn("42", self.store.setting(key)["pending"])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='issue_sync_quarantined'"))
+        # 下一周期坏行不再 replay：sync 完整走完远端读取并写 issues summary event。
+        self.synchronize([good])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM tasks WHERE fingerprint='issue:owner/project:7'"))
+
+    def test_remote_refetched_broken_issue_accumulates_attempts_toward_quarantine(self):
+        # 与「pending replay 计数」互补：本条钉住「远端每周期重投同一条坏行」路径。
+        # 坏行经远端扫描进来、apply() 失败、hold_failed() 暂存；若 hold_failed 把
+        # attempts 覆写回 0，确定性坏行永远到不了隔离上限、sync 仍被 wedge。
+        # 修复后 hold_failed 对相同 number+updated_at 保留既有 attempts 继续累加。
+        from adaptive_rsi.discovery import ISSUE_SYNC_PENDING_MAX_ATTEMPTS
+        broken = {"number": 42, "title": "broken", "body": "broken", "labels": [],
+                  "state": 123, "updated_at": "2026-11-01T00:00:00Z",
+                  "html_url": "https://github.com/owner/project/issues/42"}
+        key = "issue-sync:p"
+        # 远端每周期重投同一条坏行：apply 失败→hold_failed 暂存。hold_failed 只负责
+        # 暂存、不计 attempts（自增在下一周期 pending replay 做）。回归前 hold_failed
+        # 每次覆写 attempts=0，pending replay 拿到的永远是 0 → 永远到不了隔离上限。
+        # 修复后 hold_failed 对相同 number+updated_at 保留既有 attempts，pending replay
+        # 才能继续累加。第 1 周期首次暂存为 0；第 N 周期 pending replay 先累加到 N-1。
+        for cycle in range(1, ISSUE_SYNC_PENDING_MAX_ATTEMPTS + 1):
+            with self.assertRaises(AttributeError):
+                self.synchronize([broken])
+            self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], cycle - 1)
+        # attempts 已累到上限-1；下一周期 pending replay 推到上限即隔离。本周期远端不再
+        # 重投该行（传 []），隔离的 pop 才不会被同一次远端扫描立即以 attempts=0 重新暂存。
+        with self.assertRaises(AttributeError):
+            self.synchronize([])
+        self.assertNotIn("42", self.store.setting(key)["pending"])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='issue_sync_quarantined'"))
+        # 隔离后远端再重投同一修订：作为新暂存重新计数（attempts 重置），不复活旧隔离计数。
+        with self.assertRaises(AttributeError):
+            self.synchronize([broken])
+        self.assertEqual(self.store.setting(key)["pending"]["42"]["attempts"], 0)
+
+    def test_malformed_pending_entry_is_removed_not_requarantined_each_cycle(self):
+        # pending 条目缺 number 或不可转 int：除记 issue_sync_quarantined 外还必须把
+        # 原键摘除，否则每周期重复进同一分支、无限追加 quarantine 事件。
+        from adaptive_rsi.config import fingerprint
+        key = "issue-sync:p"
+        policy = fingerprint({"labels": self.config["github"]["labels"],
+                              "exclude": self.config["github"]["exclude_labels"]})
+        self.store.put_setting(key, {"repository": "owner/project", "policy": policy, "page": 1,
+                                     "pending": {"bad": {"updated_at": "2026-11-01T00:00:00Z"}}})
+        self.synchronize([self.issue(number=1)])
+        self.assertNotIn("bad", self.store.setting(key)["pending"])
+        # 第二周期远端不再返回坏条目时，pending 里也不应再出现它（只 quarantine 一次）。
+        before = self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_quarantined'")["n"]
+        self.synchronize([self.issue(number=1)])
+        after = self.store.one("SELECT count(*) AS n FROM events WHERE kind='issue_sync_quarantined'")["n"]
+        self.assertEqual(after, before)
+        self.assertNotIn("bad", self.store.setting(key)["pending"])
+
+    def test_malformed_pending_shape_is_repaired_not_escaping(self):
+        # 历史/损坏进度里 pending 可能是 list 等非 dict 形状；旧代码 .values() 直接
+        # AttributeError 穿透出 sync()。回归修复后：重置为空、记 issue_sync_progress_repaired，
+        # 本周期远端读取照常进行。
+        from adaptive_rsi.config import fingerprint
+        key = "issue-sync:p"
+        policy = fingerprint({"labels": self.config["github"]["labels"],
+                              "exclude": self.config["github"]["exclude_labels"]})
+        self.store.put_setting(key, {"repository": "owner/project", "policy": policy,
+                                     "page": 1, "pending": [{"number": 1}]})  # list 而非 dict
+        self.synchronize([self.issue(number=1)])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='issue_sync_progress_repaired'"))
+        # pending 已被规范化为 dict 并随本周期写回。
+        self.assertIsInstance(self.store.setting(key)["pending"], dict)
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM tasks WHERE fingerprint='issue:owner/project:1'"))
+
     def add_related(self, task_id, title, paths, result=None, updated=1, state="merged"):
         self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,updated) "
                            "VALUES (?,'p','inspection',?,?,'',?,?,?)",

@@ -42,6 +42,10 @@ FAILURE_BACKOFF_MAX_SECONDS = 21600
 # 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度锁。
 POSTPROCESS_BATCH = 20
 
+# 后处理确定性失败的重试上限：attempts 达到上限后置 failed 终态并摘除待办索引，
+# 不再每 5 秒热循环。重试节奏由调度节拍本身（~5s）承担，瞬时失败保持即时重试契约。
+POSTPROCESS_MAX_ATTEMPTS = 5
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -1311,10 +1315,27 @@ class Runtime(Maintenance):
                 if marker:
                     self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
                 return
+            attempts = record.get('attempts', 0)
+            if not isinstance(attempts, int) or attempts < 0:
+                attempts = 0
             try:
                 self._postprocess_run(key, identifier, record)
             except Exception as exc:
-                record.update(last_error=str(exc), last_failed=time.time())
+                attempts += 1
+                record.update(attempts=attempts, last_error=str(exc)[:400], last_failed=time.time())
+                if attempts >= POSTPROCESS_MAX_ATTEMPTS:
+                    # 终态逃逸：损坏/确定性失败的回执不再每 5 秒热循环，摘除待办索引并
+                    # 记录放弃原因；原始回执连同 attempts/last_error 保留在 postprocess: 命名空间。
+                    record.update(state='failed', ended=time.time(),
+                                  reason='Postprocessing abandoned after %d attempts' % attempts)
+                    self.store.put_setting(key, record)
+                    if marker:
+                        self.store.execute('DELETE FROM settings WHERE key=?', (marker,))
+                    self.store.event('postprocess_abandoned',
+                                     'Postprocessing gave up after %d attempts: %s' % (attempts, str(exc)[:300]),
+                                     run=identifier, data={'key': key, 'attempts': attempts,
+                                                          'last_error': str(exc)[:400]})
+                    return
                 self.store.put_setting(key, record)
                 raise
         # 成功/obsolete 后移除索引；瞬时失败仍保持 pending 与索引，下一轮重试。
