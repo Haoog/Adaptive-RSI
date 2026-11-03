@@ -458,6 +458,25 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (deferred["id"],))["state"], "queued")
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (rejected["id"],))["state"], "rejected")
 
+    def test_corrupt_module_rotation_resets_to_zero_instead_of_failing_the_scan(self):
+        with patch.object(self.runtime, "invoke", return_value={"findings": []}):
+            for stored in ["bad", True, 1.7, -3, {"n": 2}, [1]]:
+                with self.subTest(stored=stored):
+                    self.store.put_setting("rotation:" + self.project, stored)
+                    self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                         {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+                    # 损坏值按 0 处理并正常写回下一轮游标，不会让 system_light 持续失败。
+                    self.assertEqual(self.store.setting("rotation:" + self.project), 1)
+        resets = self.store.query("SELECT kind,data FROM events WHERE kind='inspection_rotation_reset'")
+        self.assertEqual(len(resets), 6)
+        self.assertEqual(json.loads(resets[0]["data"]), {"stored": "bad"})
+        # 合法值继续生效：第二轮巡检仍从存储的游标推进，不被误判为损坏。
+        with patch.object(self.runtime, "invoke", return_value={"findings": []}):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection2", "config": encode(self.runtime.config(self.project))}, [])
+        self.assertEqual(self.store.setting("rotation:" + self.project), 2)
+        self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='inspection_rotation_reset'")), 6)
+
     def test_calls_are_recorded_without_daily_quotas(self):
         config = merge(self.runtime.config(self.project), {"limits": {"daily_calls": 1}})
         route = config["models"]["planning"]
