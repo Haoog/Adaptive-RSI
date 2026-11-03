@@ -106,7 +106,8 @@ def test_identities(text):
             event = json.loads(line)
         except ValueError:
             event = None
-        if isinstance(event, dict) and event.get("Test") and event.get("Package"):
+        if (isinstance(event, dict) and event.get("Test") and event.get("Package")
+                and isinstance(event["Package"], str) and isinstance(event["Test"], str)):
             identity = event["Package"] + "/" + event["Test"]
             if event.get("Action") in ("pass", "fail"):
                 executed.append(identity)
@@ -480,7 +481,9 @@ def _isolated_test_check(checks, root, filename, regression_symbols=()):
         if command is None and Path(lower[0]).name == "npm" and lower[1:] in (["test"], ["run", "test"]):
             package = root / check.get("cwd", ".") / "package.json"
             try:
-                script = json.loads(package.read_text(encoding="utf-8")).get("scripts", {}).get("test", "")
+                package_data = json.loads(package.read_text(encoding="utf-8"))
+                scripts = package_data.get("scripts", {}) if isinstance(package_data, dict) else {}
+                script = scripts.get("test", "") if isinstance(scripts, dict) else ""
                 runner = npm_test_runner(script)
             except (OSError, ValueError, TypeError):
                 runner = None
