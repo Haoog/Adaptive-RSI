@@ -978,85 +978,117 @@ class Store:
                 (source == "system_issues" and active not in ("system_issues", "system_publish", "system_delivery")))
 
     def claim(self, project, config):
-        now = time.time()
+        # 候选扫描与状态改写分段：队列被坏任务污染时，单次 claim 若在同一个
+        # BEGIN IMMEDIATE 内逐条拉黑全部坏任务，写锁持有时间会随坏任务数线性
+        # 增长（实测 60 条约 33ms），期间所有其他写者被 busy-timeout 挡住。
+        # 改为只读快照扫描 + 每条坏任务一个条件写的短事务：拉黑与事件落库
+        # 语义不变，但每段写锁持有有上界，其他连接的写入可以插进分段间隙。
+        from .config import merge, validate
         with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
-            active = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
-                                "WHERE r.project=? AND r.ended IS NULL", (project,)).fetchall()
-            archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
-            # At most one Issue synchronization may overlap one ordinary task;
-            # two code/delivery/inspection workers remain mutually exclusive.
-            source_filter = self.compatible_source_clause([row["source"] for row in active])
-            if not p or p["paused"] or archived or source_filter is None:
-                return None
-            from .config import merge, validate
-            task = None
-            effective = None
-            recent = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
-                                "WHERE r.project=? ORDER BY r.started DESC,r.id DESC LIMIT 3", (project,)).fetchall()
-            fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
-                          len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
-            skipped = []
             while True:
-                candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
-                                       source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
-                                       " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
-                                       (project, now, *skipped, now)).fetchone()
-                if not candidate:
+                now = time.time()
+                p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
+                active = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                                    "WHERE r.project=? AND r.ended IS NULL", (project,)).fetchall()
+                archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
+                # At most one Issue synchronization may overlap one ordinary task;
+                # two code/delivery/inspection workers remain mutually exclusive.
+                source_filter = self.compatible_source_clause([row["source"] for row in active])
+                if not p or p["paused"] or archived or source_filter is None:
                     return None
-                if candidate["source"] == "system_publish":
-                    source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
-                    if source and issue_snapshot_pending(db, project, source["task"]):
-                        skipped.append(candidate["id"])
+                task = None
+                effective = None
+                recent = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                                    "WHERE r.project=? ORDER BY r.started DESC,r.id DESC LIMIT 3", (project,)).fetchall()
+                fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
+                              len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
+                skipped = []
+                while True:
+                    candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
+                                           source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
+                                           " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
+                                           (project, now, *skipped, now)).fetchone()
+                    if not candidate:
+                        return None
+                    if candidate["source"] == "system_publish":
+                        source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
+                        if source and issue_snapshot_pending(db, project, source["task"]):
+                            skipped.append(candidate["id"])
+                            continue
+                    # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
+                    # 否则裸解析异常会让项目所有任务永远领不到。
+                    try:
+                        evidence = json.loads(candidate["evidence"] or "[]")
+                        if not isinstance(evidence, list):
+                            raise ValueError("Task evidence must be an array")
+                    except (ValueError, TypeError) as exc:
+                        reason = str(exc)[:300] or "Invalid task evidence"
+                        self._block_candidate(db, project, candidate["id"],
+                                              "Task was blocked because its evidence is invalid: ", reason)
                         continue
-                # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
-                # 否则裸解析异常会让项目所有任务永远领不到。
-                try:
-                    evidence = json.loads(candidate["evidence"] or "[]")
-                    if not isinstance(evidence, list):
-                        raise ValueError("Task evidence must be an array")
-                except (ValueError, TypeError) as exc:
-                    reason = str(exc)[:300] or "Invalid task evidence"
-                    db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
-                               (now, candidate["id"]))
-                    db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
-                               (project, None, "task_configuration_error",
-                                "Task was blocked because its evidence is invalid: " + reason,
-                                encode({"task": candidate["id"], "reason": reason}), now))
+                    source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
+                    if (source_key and not config.get("sources", {}).get(source_key, True) and
+                            any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
+                                for item in evidence)):
+                        db.execute("BEGIN IMMEDIATE")
+                        db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=? AND state='queued'",
+                                   (time.time(), candidate["id"]))
+                        db.commit()
+                        continue
+                    try:
+                        overrides = json.loads(candidate["overrides"])
+                        if not isinstance(overrides, dict):
+                            raise ValueError("Task configuration overrides must be an object")
+                        effective = validate(merge(config, overrides))
+                    except ZoneInfoNotFoundError:
+                        reason = "Unknown schedule timezone"
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        reason = str(exc)[:300] or "Invalid task configuration overrides"
+                    else:
+                        task = candidate
+                        break
+                    self._block_candidate(db, project, candidate["id"],
+                                          "Task was blocked because its configuration overrides are invalid: ", reason)
                     continue
-                source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
-                if (source_key and not config.get("sources", {}).get(source_key, True) and
-                        any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
-                            for item in evidence)):
-                    db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=?", (now, candidate["id"]))
+                # 扫描与认领之间写锁已让出：paused/archived/active sources/依赖
+                # 可能已变化，必须在短事务内复核再条件 UPDATE；更新未命中说明
+                # 已被并发认领或不再 ready，回滚后用全新快照重扫而不是误报空。
+                db.execute("BEGIN IMMEDIATE")
+                now = time.time()
+                p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
+                archived = db.execute("SELECT 1 FROM settings WHERE key=?", ("project-archived:" + project,)).fetchone()
+                active = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
+                                    "WHERE r.project=? AND r.ended IS NULL", (project,)).fetchall()
+                if (not p or p["paused"] or archived or
+                        not self.compatible_source([row["source"] for row in active], task["source"])):
+                    db.rollback()
                     continue
-                try:
-                    overrides = json.loads(candidate["overrides"])
-                    if not isinstance(overrides, dict):
-                        raise ValueError("Task configuration overrides must be an object")
-                    effective = validate(merge(config, overrides))
-                except ZoneInfoNotFoundError:
-                    reason = "Unknown schedule timezone"
-                except (ValueError, TypeError, AttributeError) as exc:
-                    reason = str(exc)[:300] or "Invalid task configuration overrides"
-                else:
-                    task = candidate
-                    break
-                db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
-                           (now, candidate["id"]))
-                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
-                           (project, None, "task_configuration_error",
-                            "Task was blocked because its configuration overrides are invalid: " + reason,
-                            encode({"task": candidate["id"], "reason": reason}), now))
-                continue
-            run = uid()
-            db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? WHERE id=?", (now, task["id"]))
-            db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
-                       (run, task["id"], project, "planning", encode(effective), now))
-            cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
-            self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
+                claimed = db.execute("UPDATE tasks SET state='planning',attempts=attempts+1,updated=? "
+                                     "WHERE id=? AND project=? AND " + self.ready_clause(),
+                                     (now, task["id"], project, now))
+                if not claimed.rowcount:
+                    db.rollback()
+                    continue
+                run = uid()
+                db.execute("INSERT INTO runs(id,task,project,state,config,started) VALUES (?,?,?,?,?,?)",
+                           (run, task["id"], project, "planning", encode(effective), now))
+                cursor = db.execute("INSERT INTO phase_times(run,phase,started) VALUES (?,?,?)", (run, "planning", now))
+                self._clock_samples[("phase_times", cursor.lastrowid)] = time.monotonic()
+                db.commit()
+                break
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
+
+    def _block_candidate(self, db, project, task, message, reason):
+        """一条坏任务一个短写事务：条件 UPDATE 命中才补事件，保证不整段持锁。"""
+        now = time.time()
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
+                             (now, task))
+        if changed.rowcount:
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                       (project, None, "task_configuration_error", message + reason,
+                        encode({"task": task, "reason": reason}), now))
+        db.commit()
 
     def transition(self, run, state, result=None, terminal=False, task_fields=None):
         """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
