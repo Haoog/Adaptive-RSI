@@ -347,13 +347,9 @@ def workspace_signature(workspace, max_bytes):
         if size > remaining:
             raise RuntimeError("Workspace output is too large to compare safely before fallback")
         remaining -= size
-        try:
-            with resolved.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            # open() 与 stat() 之间文件被删——同样跳过。
-            continue
+        with resolved.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
     return digest.hexdigest()
 
 
