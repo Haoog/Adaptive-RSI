@@ -213,43 +213,39 @@ class WorkspaceSignatureRaceTest(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         (self.root / 'kept.py').write_text('kept\n')
-        (self.root / 'vanished.py').write_text('vanished\n')
+        self.vanished = self.root / 'vanished.py'
+        self.vanished.write_text('vanished\n')
+        self.original_exists, self.original_is_file = Path.exists, Path.is_file
 
-    def signature(self, stat_hook=None, open_hook=None):
-        from adaptive_rsi.agent import workspace_signature
-        patches = []
-        if stat_hook:
-            patches.append(patch.object(Path, 'stat', stat_hook))
-        if open_hook:
-            patches.append(patch.object(Path, 'open', open_hook))
-        with contextlib.ExitStack() as stack:
-            for item in patches:
-                stack.enter_context(item)
-            return workspace_signature(self.root, 1 << 20)
+    def claims_present(self):
+        # 目录列举与 is_file() 仍认为文件存在，随后真实的 stat/open 会失败。
+        vanished = self.vanished
+        original_exists, original_is_file = self.original_exists, self.original_is_file
+        return (patch.object(Path, 'exists', lambda path: True if path == vanished else original_exists(path)),
+                patch.object(Path, 'is_file', lambda path: True if path == vanished else original_is_file(path)))
 
     def test_file_deleted_between_validation_and_stat_is_skipped(self):
-        original, calls = Path.stat, {}
-
-        def stat(path, *args, **kwargs):
-            if path.name == 'vanished.py':
-                calls[path.name] = calls.get(path.name, 0) + 1
-                if calls[path.name] >= 3:  # exists() 与 is_file() 之后的那次 stat
-                    raise FileNotFoundError(path)
-            return original(path, *args, **kwargs)
-
-        digest = self.signature(stat_hook=stat)
-        # 稳定文件仍参与指纹：改内容会改变结果。
+        from adaptive_rsi.agent import workspace_signature
+        self.vanished.unlink()
+        exists, is_file = self.claims_present()
+        with exists, is_file:
+            digest = workspace_signature(self.root, 1 << 20)
+        self.assertEqual(len(digest), 64)
         (self.root / 'kept.py').write_text('changed\n')
-        self.assertNotEqual(digest, self.signature(stat_hook=stat))
+        with exists, is_file:
+            self.assertNotEqual(digest, workspace_signature(self.root, 1 << 20))
 
     def test_file_deleted_between_stat_and_open_is_skipped(self):
-        original = Path.open
+        from adaptive_rsi.agent import workspace_signature
+        vanished, original = self.vanished, Path.open
 
         def open_(path, *args, **kwargs):
-            if path.name == 'vanished.py':
+            if path == vanished:
                 raise FileNotFoundError(path)
             return original(path, *args, **kwargs)
 
-        digest = self.signature(open_hook=open_)
+        with patch.object(Path, 'open', open_):
+            digest = workspace_signature(self.root, 1 << 20)
         (self.root / 'kept.py').write_text('changed\n')
-        self.assertNotEqual(digest, self.signature(open_hook=open_))
+        with patch.object(Path, 'open', open_):
+            self.assertNotEqual(digest, workspace_signature(self.root, 1 << 20))
