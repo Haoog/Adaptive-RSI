@@ -601,15 +601,16 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         store.put_setting(key, progress)
         if complete:
             break
+    if failures:
+        # 页内其余行已照常处理、游标与 pending 均已落库；此刻把首个失败还给
+        # 调用方，保留「任务/审计写入不回滚、异常可见」的原有契约。summary event
+        # 在 raise 前不写：有跳过时扫描不完整，不应记录 kind='issues'。
+        raise failures[0]
     store.event("issues", "Scanned %d Issues; %d updates synchronized%s" % (
                     len(seen), changed, "" if complete else "; sync continues next cycle"), project["id"],
                 data={"complete": complete, "scanned": len(seen), "changed": changed,
                       "skipped": len(failures),
                       "next_page": progress["page"], "pages_read": pages_read})
-    if failures:
-        # 页内其余行已照常处理、游标与 pending 均已落库；此刻把首个失败还给
-        # 调用方，保留「任务/审计写入不回滚、异常可见」的原有契约。
-        raise failures[0]
 
 
 def problem_title(title):
