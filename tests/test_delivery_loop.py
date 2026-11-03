@@ -217,6 +217,30 @@ class DeliveryLoopTest(unittest.TestCase):
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), original)
         self.assertEqual((self.repo / "notes.txt").read_text(), "user draft")
 
+    def test_stale_ref_lock_in_baseline_cache_does_not_stall_fetch(self):
+        # 进程在 fetch 中途被杀时，锁文件留在缓存仓库的 refs/heads/ 子目录，
+        # 顶层 *.lock 清理碰不到它；此后每次 fetch 都 cannot lock ref，基线永久停摆。
+        remote = fixture(self.root / "upstream")
+        git(remote, "branch", "-M", "main")
+        expected = git(remote, "rev-parse", "HEAD")
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        config = merge(self.runtime.config(self.project), {"github": {"repository": "example/project"}, "delivery": {"base_branch": "main"}})
+        cache = self.store.root / "remotes" / self.project
+        cache.mkdir(parents=True)
+        git(cache, "init", "--bare", "--quiet")
+        (cache / "refs/heads").mkdir(parents=True, exist_ok=True)
+        (cache / "refs/heads/rsi-baseline.lock").write_text("")
+        # 顶层锁与引用子目录锁都是崩溃残留，一并清掉。
+        (cache / "stale-top.lock").write_text("")
+        def fetch(root, *args, timeout=None):
+            argv = [str(remote) if a == "https://github.com/example/project.git" else a for a in args]
+            return git(root, *argv)
+        with patch("adaptive_rsi.delivery.github_git", side_effect=fetch):
+            source, actual, _ = baseline(self.runtime, self.runtime.project(self.project), config)
+        self.assertEqual(actual, expected)
+        self.assertEqual(git(source, "rev-parse", "rsi-baseline"), expected)
+        self.assertFalse(list(Path(cache).glob("**/*.lock")))
+
     def overlapping_baseline_fetches(self, names):
         """对给定项目并发调用 baseline，返回同时处于 fetch 内的最大并发数。"""
         repos = {}
