@@ -730,6 +730,9 @@ class Maintenance:
         # 数据保留：清理过期技能、已结束运行的派生数据及其 settings 键；
         # 每类带 LIMIT，首次升级后由后续周期逐步追平历史积压。
         stale = now - 90 * 86400
+        # relationship_audit 只报告不处置；孤儿行按类 LIMIT 分批隔离，失效
+        # task_dependencies 清除后被 p.id IS NULL 挡住的任务恢复可调度。
+        self.store.quarantine_orphans()
         if self.store.one("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"):
             self.store.execute("DELETE FROM operations WHERE id IN (SELECT id FROM operations WHERE ended<? "
                                "AND state IN ('completed','failed','cancelled') LIMIT 500)", (stale,))
@@ -831,6 +834,16 @@ class Maintenance:
         for row in self.store.query(
                 "SELECT key FROM settings WHERE key LIKE 'issue-comments:%' AND "
                 "CASE WHEN json_valid(value) THEN (json_extract(value,'$.checked_at') IS NULL OR json_extract(value,'$.checked_at')<?) ELSE 0 END LIMIT 400", (stale,)):
+            self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
+        # case-exposure 预留键按「实验×案例」永久累积；仅在候选已离开 evaluating
+        # （归档、删除或落定）且超过保留期后删除。仍在评估中的候选保留键，
+        # 保证重试/重复调用时 reserve_case_exposure 的幂等语义不变。
+        for row in self.store.query(
+                "SELECT key FROM settings WHERE key LIKE 'case-exposure:%' AND "
+                "json_valid(value) AND json_extract(value,'$.created')<? AND "
+                "NOT EXISTS (SELECT 1 FROM candidates WHERE "
+                "id=json_extract(settings.value,'$.experiment') AND status='evaluating') "
+                "LIMIT 400", (stale,)):
             self.store.execute("DELETE FROM settings WHERE key=?", (row["key"],))
         # Retire stale connection-signature directories after proving they are unused.
         # 全局 dispatch_lock 只覆盖「配置快照 + 无活跃运行」的判定；候选扫描与批量删除

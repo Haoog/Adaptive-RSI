@@ -336,6 +336,53 @@ class AuditProcessBoundariesTest(unittest.TestCase):
                         ["type=bind", "src=" + str(workspace), "dst=/workspace"],
                         ["type=bind", "src=" + str(protected), 'dst=/workspace/protected,"path', "readonly"]])
 
+    def test_docker_sandbox_deduplicates_mounts_by_destination(self):
+        # A host fixture that lands on an already-protected path must not emit
+        # a second --mount at the same container destination: Docker refuses
+        # to start the container and the control never measures sensitivity.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            protected = workspace / "test_value.py"
+            protected.write_text("assert True\n")
+            writable = workspace / "writable"
+            writable.write_text("data\n")
+            sandbox = Sandbox(root / "state", copy.deepcopy(DEFAULTS))
+            with patch.object(sandbox, "backend", return_value="docker"), \
+                    patch("adaptive_rsi.process.shutil.which", return_value="/fake/docker"), \
+                    patch("adaptive_rsi.process._cached_probe", return_value={"exit_code": 0}):
+                argv, _ = sandbox.command(
+                    ["true"], workspace,
+                    protected=[protected, workspace / "./test_value.py"],
+                    writable=[writable, writable])
+            destinations = [row[2] for row in self.mounts(argv)]
+            self.assertEqual(len(destinations), len(set(destinations)), destinations)
+            mounted = {row[2]: row for row in self.mounts(argv)}
+            self.assertEqual(mounted["dst=/workspace/test_value.py"],
+                             ["type=bind", "src=" + str(protected),
+                              "dst=/workspace/test_value.py", "readonly"])
+            self.assertEqual(mounted["dst=/workspace/writable"],
+                             ["type=bind", "src=" + str(writable), "dst=/workspace/writable"])
+
+    def test_docker_protected_mount_stays_read_only_over_writable(self):
+        # A writable request for a protected destination must not weaken the
+        # read-only seal or produce a duplicate mount point.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            sealed = workspace / "harness.py"
+            sealed.write_text("assert True\n")
+            sandbox = Sandbox(root / "state", copy.deepcopy(DEFAULTS))
+            with patch.object(sandbox, "backend", return_value="docker"), \
+                    patch("adaptive_rsi.process.shutil.which", return_value="/fake/docker"), \
+                    patch("adaptive_rsi.process._cached_probe", return_value={"exit_code": 0}):
+                argv, _ = sandbox.command(["true"], workspace, protected=[sealed], writable=[sealed])
+            mounted = [row for row in self.mounts(argv) if row[2] == "dst=/workspace/harness.py"]
+            self.assertEqual(mounted, [["type=bind", "src=" + str(sealed),
+                                        "dst=/workspace/harness.py", "readonly"]])
+
     def test_cli_worker_mounts_round_trip_csv_and_preserve_role_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

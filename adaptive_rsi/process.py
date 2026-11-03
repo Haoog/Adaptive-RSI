@@ -326,14 +326,23 @@ class Sandbox:
                     "-w", "/workspace/" + cwd]
             import uuid
             command += ["--name", "adaptive-rsi-check-" + uuid.uuid4().hex[:16]]
-            if writes is not None:
-                for item in writes:
-                    if item.exists():
-                        command += ["--mount", docker_mount(item, "/workspace/" + item.relative_to(workspace).as_posix())]
+            # Docker rejects a second mount registered at the same container
+            # path, so mounts are deduplicated by destination; protected
+            # entries stay read-only and win over writable mounts.
+            protected_mounts = {}
             for item in protected:
                 item = Path(item).resolve()
                 relative = item.relative_to(workspace).as_posix()
-                command += ["--mount", docker_mount(item, "/workspace/" + relative, read_only=True)]
+                protected_mounts[relative] = docker_mount(item, "/workspace/" + relative, read_only=True)
+            if writes is not None:
+                mounted = set()
+                for item in writes:
+                    relative = item.relative_to(workspace).as_posix()
+                    if item.exists() and relative not in protected_mounts and relative not in mounted:
+                        mounted.add(relative)
+                        command += ["--mount", docker_mount(item, "/workspace/" + relative)]
+            for mount in protected_mounts.values():
+                command += ["--mount", mount]
             return command + [image] + list(argv), None
         # Read only toolchains/system files; tests get no network, credentials, or controller data.
         allowed = ["/System", "/Library", "/usr", "/bin", "/sbin", "/opt", "/dev", "/private/var/db", "/private/var/select",
