@@ -56,6 +56,8 @@ DEFAULTS = {
 def merge(*layers):
     result = {}
     for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("Configuration layer must be an object")
         for key, value in layer.items():
             if isinstance(value, dict) and isinstance(result.get(key), dict):
                 result[key] = merge(result[key], value)
