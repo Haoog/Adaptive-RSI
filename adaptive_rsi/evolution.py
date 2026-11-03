@@ -848,11 +848,26 @@ class Evolution:
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
 
+        malformed_checks = []
+        for case_id, case_entry, spec in case_items:
+            checks = spec.get("checks")
+            if not isinstance(checks, list):
+                malformed_checks.append(f"Case {case_id}: checks is not a list")
+                continue
+            for i, check in enumerate(checks):
+                if not isinstance(check, dict):
+                    malformed_checks.append(f"Case {case_id}: checks[{i}] is not an object")
+        if malformed_checks:
+            msg = f"Malformed check specifications: {'; '.join(malformed_checks)}"
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+
         is_reproducible = (
             bool(integrity.get("valid")) and
             len(missing_tools) == 0 and
             len(missing_creds) == 0 and
-            credential_limitation is None
+            credential_limitation is None and
+            len(malformed_checks) == 0
         )
 
         # 5. Optional check execution
