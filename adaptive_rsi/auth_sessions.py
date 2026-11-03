@@ -1210,7 +1210,9 @@ class AuthSessions:
             raise AuthError("invalid_auth_inputs")
         self.status(session_id)
         with self.lock:
-            item = self.sessions[session_id]
+            item = self.sessions.get(session_id)
+            if item is None:
+                raise AuthError("unknown_session")
             if method != item.get("_method", method):
                 raise AuthError("invalid_auth_method")
             if inputs != item.get("_inputs", inputs):
@@ -1239,7 +1241,9 @@ class AuthSessions:
 
     def _update(self, session_id, **values):
         with self.lock:
-            item = self.sessions[session_id]
+            item = self.sessions.get(session_id)
+            if item is None:
+                raise AuthError("unknown_session")
             if item["state"] not in ACTIVE:
                 return False
             previous = dict(item)
@@ -1260,12 +1264,14 @@ class AuthSessions:
             item = self.status(session_id)
             stop = threading.Event()
             with self.lock:
-                if self.sessions[session_id]["state"] not in ACTIVE:
+                entry = self.sessions.get(session_id)
+                if entry is None or entry["state"] not in ACTIVE:
                     return
                 self.workers[session_id] = (None, stop)
             worker = self.factory(item["backend"]) if self.custom_factory else self.factory(item["backend"], stop)
             with self.lock:
-                if self.sessions[session_id]["state"] not in ACTIVE:
+                entry = self.sessions.get(session_id)
+                if entry is None or entry["state"] not in ACTIVE:
                     return
                 self.workers[session_id] = (worker, stop)
             fields = worker.start(item["provider"], method, inputs)
@@ -1279,8 +1285,11 @@ class AuthSessions:
                 attempts = 0
                 while not stop.wait(0.1) and self.now() < item["expires_at"]:
                     with self.lock:
-                        code = self.sessions[session_id].pop("_code", None)
-                        retry_capable = self.sessions[session_id].pop("_retry_capable", False)
+                        entry = self.sessions.get(session_id)
+                        if entry is None:
+                            return
+                        code = entry.pop("_code", None)
+                        retry_capable = entry.pop("_retry_capable", False)
                     if code is not None:
                         try:
                             success = worker.complete(code, timeout=max(1, item["expires_at"] - self.now()))
@@ -1289,7 +1298,9 @@ class AuthSessions:
                             if attempts >= 5 or not retry_capable:
                                 raise
                             with self.lock:
-                                current = self.sessions[session_id]
+                                current = self.sessions.get(session_id)
+                                if current is None:
+                                    return
                                 if self.closed or stop.is_set() or current["state"] not in ACTIVE:
                                     return
                                 if self.now() >= item["expires_at"]:
@@ -1299,7 +1310,9 @@ class AuthSessions:
                                              verification_url="", user_code="", instructions="")
                             fields = worker.start(item["provider"], method, inputs)
                             with self.lock:
-                                current = self.sessions[session_id]
+                                current = self.sessions.get(session_id)
+                                if current is None:
+                                    return
                                 if self.closed or stop.is_set() or current["state"] not in ACTIVE:
                                     return
                                 if self.now() >= item["expires_at"]:
@@ -1314,7 +1327,9 @@ class AuthSessions:
                 else:
                     success = False
             with self.lock:
-                current = self.sessions[session_id]
+                current = self.sessions.get(session_id)
+                if current is None:
+                    return
                 if current["state"] not in ACTIVE:
                     return
                 if self.now() >= item["expires_at"]:
@@ -1330,7 +1345,10 @@ class AuthSessions:
                 # 不记录异常文本或 traceback，第三方错误中可能包含授权材料。
                 logging.getLogger(__name__).warning("Auth session %s failed unexpectedly: %s",
                                                     session_id, type(exc).__name__)
-            expired = self.now() >= self.sessions[session_id]["expires_at"]
+            entry = self.sessions.get(session_id)
+            if entry is None:
+                return
+            expired = self.now() >= entry["expires_at"]
             values = {"state": "expired" if expired else "failed",
                       "error": "auth_expired" if expired else exc.code if isinstance(exc, AuthError) else "auth_protocol_error"}
             try:
@@ -1339,7 +1357,9 @@ class AuthSessions:
                 # worker 将退出，已不能重试；写盘失败也必须释放内存中的 busy 会话。
                 # 下次成功写盘会保存该终态，进程重启则沿用 interrupted 恢复规则。
                 with self.lock:
-                    item = self.sessions[session_id]
+                    item = self.sessions.get(session_id)
+                    if item is None:
+                        return
                     if item["state"] in ACTIVE:
                         self._terminate(item, **values)
                         self._publish_sessions()
@@ -1368,11 +1388,15 @@ class AuthSessions:
         credential_lock = CODEX_AUTH_LOCK if backend == "codex" else AUTH_LOCK
         # 执行器可能长时间持锁；等待期间仍允许取消、过期和关闭服务。
         while not credential_lock.acquire(timeout=0.05):
-            if stop.is_set() or self.status(session_id)["state"] not in ACTIVE:
+            with self.lock:
+                entry = self.sessions.get(session_id)
+            if stop.is_set() or entry is None or entry["state"] not in ACTIVE:
                 return
         try:
             with self.lock:
-                current_session = self.sessions[session_id]
+                current_session = self.sessions.get(session_id)
+                if current_session is None:
+                    return
                 if self.closed or stop.is_set() or current_session["state"] not in ACTIVE:
                     return
                 if self.now() >= current_session["expires_at"]:
@@ -1403,9 +1427,9 @@ class AuthSessions:
         if not self.lock.acquire(blocking=False):
             return item
         try:
-            if not isinstance(session_id, str) or session_id not in self.sessions:
+            item = self.sessions.get(session_id) if isinstance(session_id, str) else None
+            if item is None:
                 raise AuthError("unknown_session")
-            item = self.sessions[session_id]
             if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
                 self._update(session_id, state="expired", error="auth_expired")
                 # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
@@ -1426,7 +1450,9 @@ class AuthSessions:
             raise AuthError("invalid_auth_code")
         self.status(session_id)
         with self.lock:
-            item = self.sessions[session_id]
+            item = self.sessions.get(session_id)
+            if item is None:
+                raise AuthError("unknown_session")
             if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
                 self._update(session_id, state="expired", error="auth_expired")
             if item["state"] != "awaiting_authorization" or item.get("method") != "code":
