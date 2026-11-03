@@ -46,6 +46,11 @@ POSTPROCESS_BATCH = 20
 # 不再每 5 秒热循环。重试节奏由调度节拍本身（~5s）承担，瞬时失败保持即时重试契约。
 POSTPROCESS_MAX_ATTEMPTS = 5
 
+# close() 等待后台维护线程收尾的上限：回收目录落在 NFS/坏盘上时维护可能永久
+# 卡在 flock/fsync，join 不设界会让整个进程关不掉；超时记 maintenance_timed_out
+# 后放行（线程为 daemon，不阻止进程退出）。
+MAINTENANCE_JOIN_TIMEOUT = 30
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -95,7 +100,8 @@ class Runtime(Maintenance):
         self.store = store
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
-        self._shutdown = {"phase": "running", "started": None, "ended": None}
+        self._shutdown = {"phase": "running", "started": None, "ended": None,
+                          "maintenance_timed_out": False}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -927,7 +933,14 @@ class Runtime(Maintenance):
             self._reconcile_unstarted_workers()
         self._shutdown['phase'] = 'maintenance'
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
-            self.maintenance_thread.join()
+            # 维护线程是 daemon，但它可能卡在 NFS/坏盘上的 flock 或 fsync 里
+            # 永不返回；join 必须限时，超时后记录证据放行 close，进程退出不受阻。
+            self.maintenance_thread.join(MAINTENANCE_JOIN_TIMEOUT)
+            self._shutdown['maintenance_timed_out'] = self.maintenance_thread.is_alive()
+            if self._shutdown['maintenance_timed_out']:
+                logging.getLogger(__name__).warning(
+                    "Maintenance thread did not stop within %ss; proceeding with shutdown",
+                    MAINTENANCE_JOIN_TIMEOUT)
         self._shutdown['phase'] = 'storage'
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
         self.store.close()
