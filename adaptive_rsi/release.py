@@ -67,7 +67,10 @@ def api(repo, endpoint, method="GET", fields=None):
         if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
             raise ApiRejected(str(exc), int(status[1])) from exc
         raise
-    return json.loads(output) if output.strip() else {}
+    try:
+        return json.loads(output) if output.strip() else {}
+    except ValueError:
+        raise RuntimeError("gh api returned non-JSON output") from None
 
 
 def workflow_content(repo, workflow, sha):
@@ -259,7 +262,7 @@ def pending(runtime, run):
         if data.get("receipt_error"):
             continue
         if (normalized_policy(kind, live["delivery"][kind]) != normalized_policy(kind, delivery[kind]) or live["delivery"]["mode"] != "pr" or
-                live["github"]["repository"] != saved["github"]["repository"]):
+                live["github"]["repository"] != saved.get("github", {}).get("repository")):
             if data.get("state") in active or data.get("state") == "rolling_back" and data.get("rollback", {}).get("state") in active:
                 return True
             continue
@@ -343,8 +346,8 @@ def authorized(runtime, project, run, kind, policy, cancel=None):
     effective = normalized_policy(kind, policy)
     if (live["delivery"]["mode"] != "pr" or not policy.get("enabled") or
             normalized_policy(kind, live["delivery"][kind]) != effective or
-            normalized_policy(kind, saved["delivery"].get(kind, {})) != effective or
-            repo != saved["github"]["repository"] or repo != identity.get("repository", repo) or
+            normalized_policy(kind, saved.get("delivery", {}).get(kind, {})) != effective or
+            repo != saved.get("github", {}).get("repository") or repo != identity.get("repository", repo) or
             repo.lower() != origin_repository(project["path"]).lower()):
         raise ValueError("Release/deploy authorization revoked or target changed")
     return repo
