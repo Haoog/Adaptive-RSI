@@ -2181,9 +2181,12 @@ class Runtime(Maintenance):
         sync(self, project, config, checked,
              cancel=(lambda: self.is_cancelled(run)) if run else None,
              run_id=run["id"] if run else None)
-        prs = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
-                                  "--json", "number,title,headRefName,url"], timeout=60))
-        self.store.put_setting("prs:" + project["id"], prs)
+        try:
+            prs = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                                      "--json", "number,title,headRefName,url"], timeout=60))
+            self.store.put_setting("prs:" + project["id"], prs)
+        except RuntimeError as exc:
+            self.store.event("prs_unavailable", "PR metadata unavailable: " + str(exc), project["id"])
         try:
             ci = json.loads(checked(["gh", "run", "list", "--repo", repo, "--limit", "10",
                                      "--json", "databaseId,name,status,conclusion,headSha,url"], timeout=60))
