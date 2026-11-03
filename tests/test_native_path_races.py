@@ -206,3 +206,55 @@ with patch('adaptive_rsi.native.Credentials') as credentials,patch('adaptive_rsi
                 with patch.object(self.tools, 'execute', return_value={'exit_code': exit_code, 'error': error, 'stdout': '', 'stderr': ''}):
                     execute_tools(self.tools, [('call', 'run_command', {'argv': ['fixture'], 'cwd': '.'})])
                 self.assertEqual(trace[-1]['state'], expected)
+
+class WorkspaceSignatureRaceTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        (self.root / 'kept.py').write_text('kept\n')
+        self.vanished = self.root / 'vanished.py'
+        self.vanished.write_text('vanished\n')
+        self.original_exists, self.original_is_file = Path.exists, Path.is_file
+
+    def claims_present(self):
+        # 目录列举与 is_file() 仍认为文件存在，随后真实的 stat/open 会失败。
+        vanished = self.vanished
+        original_exists, original_is_file = self.original_exists, self.original_is_file
+        return (patch.object(Path, 'exists', lambda path: True if path == vanished else original_exists(path)),
+                patch.object(Path, 'is_file', lambda path: True if path == vanished else original_is_file(path)))
+
+    def test_file_deleted_between_validation_and_stat_is_skipped(self):
+        from adaptive_rsi.agent import workspace_signature
+        self.vanished.unlink()
+        exists, is_file = self.claims_present()
+        with exists, is_file:
+            digest = workspace_signature(self.root, 1 << 20)
+        self.assertEqual(len(digest), 64)
+        (self.root / 'kept.py').write_text('changed\n')
+        with exists, is_file:
+            self.assertNotEqual(digest, workspace_signature(self.root, 1 << 20))
+
+    def test_file_deleted_between_stat_and_open_is_skipped(self):
+        from adaptive_rsi.agent import workspace_signature
+        vanished, original = self.vanished, Path.open
+
+        def open_(path, *args, **kwargs):
+            if path == vanished:
+                raise FileNotFoundError(path)
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, 'open', open_):
+            digest = workspace_signature(self.root, 1 << 20)
+        (self.root / 'kept.py').write_text('changed\n')
+        with patch.object(Path, 'open', open_):
+            self.assertNotEqual(digest, workspace_signature(self.root, 1 << 20))
+
+    def test_unreadable_file_fails_closed_instead_of_hashing_a_stale_signature(self):
+        from adaptive_rsi.agent import workspace_signature
+        secret = self.root / 'unreadable.py'
+        secret.write_text('secret\n')
+        secret.chmod(0o000)
+        self.addCleanup(secret.chmod, 0o600)
+        with self.assertRaises(OSError):
+            workspace_signature(self.root, 1 << 20)

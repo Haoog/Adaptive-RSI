@@ -341,15 +341,20 @@ def workspace_signature(workspace, max_bytes):
         try:
             digest.update(str(resolved.stat().st_mode & 0o777).encode())
             size = resolved.stat().st_size
-        except OSError:
+        except FileNotFoundError:
             # stat() 与 is_file() 之间文件被删——TOCTOU 竞态，跳过该文件。
+            # 其他 OSError（如权限不足）仍要抛出：读不到内容就不能声称指纹一致。
             continue
         if size > remaining:
             raise RuntimeError("Workspace output is too large to compare safely before fallback")
         remaining -= size
-        with resolved.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        try:
+            with resolved.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except FileNotFoundError:
+            # open() 与 stat() 之间文件被删——同样跳过。
+            continue
     return digest.hexdigest()
 
 
