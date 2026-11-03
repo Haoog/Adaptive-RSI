@@ -1160,7 +1160,13 @@ def _pin_legacy_feedback(runtime, run, outcome, target_sha):
             evaluation = runtime.evaluator.evaluate(baseline, candidate, checks, folder / "evaluation", config,
                                                     seeds=seeds, changed_files=[])
             if evaluation.get("decision") != "pass":
-                return False
+                # 确定性失败与本地执行异常同样退避：固定 checks 对同一目标
+                # sha 名义确定，靠每分钟重跑翻转结果只能靠 flaky，不能留在
+                # blocked_verification 被下个 tick 立即再次完整评估。
+                message = ("Legacy release verification did not pass: " +
+                           str(evaluation.get("decision") or "unknown"))[:500]
+                runtime.store.put_setting(retry_key, {"retry_at": time.time() + 600, "error": message})
+                raise _PinUnavailable(message)
     except Cancelled:
         raise
     except (ValueError, OSError, RuntimeError) as exc:
