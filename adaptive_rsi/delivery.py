@@ -89,7 +89,9 @@ def baseline(runtime, project, config):
         cache = runtime.store.root / "remotes" / project["id"]
         if not cache.exists():
             checked(["git", "init", "--bare", "--quiet", str(cache)])
-        for lock in cache.glob("*.lock"):
+        # fetch 更新引用时锁文件在子目录（如 refs/heads/rsi-baseline.lock），
+        # 顶层 *.lock 匹配不到；残留锁会让该项目每次 fetch 都 cannot lock ref。
+        for lock in cache.glob("**/*.lock"):
             try:
                 lock.unlink()
             except OSError:
