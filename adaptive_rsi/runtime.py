@@ -976,7 +976,11 @@ class Runtime(Maintenance):
                 priority = 55 if queued else 90
                 scan = self.request(project, kind, priority=priority, automatic=True)
                 if kind != "issues" or not pending:
-                    self.store.execute("UPDATE tasks SET priority=? WHERE id=? AND state='queued'", (priority, scan))
+                    # 手动触发的扫描（evidence 标记 scan_trigger='manual'）保留其优先级，
+                    # 与 request() 只升不降的合并语义一致；自动扫描仍按本轮队列深度重写。
+                    self.store.execute("UPDATE tasks SET priority=? WHERE id=? AND state='queued' "
+                                       "AND NOT EXISTS(SELECT 1 FROM json_each(evidence) "
+                                       "WHERE json_extract(value,'$.scan_trigger')='manual')", (priority, scan))
                 self.store.execute("INSERT INTO schedules(project,kind,due) VALUES (?,?,?) "
                                    "ON CONFLICT(project,kind) DO UPDATE SET due=excluded.due", (project, kind, now + interval))
         key = "deferred-check:" + project

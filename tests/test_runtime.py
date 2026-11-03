@@ -288,6 +288,24 @@ class RuntimeTest(unittest.TestCase):
         sync_task = self.store.one("SELECT priority,urgency FROM tasks WHERE id=?", (sync_run["task"],))
         self.assertEqual(sync_task, {"priority": 90, "urgency": 0})
 
+    def test_scheduled_scan_rewrite_preserves_manual_priority_boost(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        config = self.runtime.config(self.project)
+        interval = config["schedule"]["light_minutes"] * 60
+        self.runtime.schedule(self.project, config, now=100)
+        scan = self.store.one("SELECT id,priority,evidence FROM tasks WHERE fingerprint='system:light'")
+        self.assertEqual((scan["priority"], json.loads(scan["evidence"])), (90, [{"scan_trigger": "automatic"}]))
+        # 有排队积压时自动扫描按本轮队列深度降到 55，让修复任务先跑。
+        self.runtime.goal(self.project, "queued repair work")
+        self.runtime.schedule(self.project, config, now=100 + interval)
+        self.assertEqual(self.store.one("SELECT priority FROM tasks WHERE id=?", (scan["id"],))["priority"], 55)
+        # 同一任务被手动再次触发后（request 只升不降并标记 manual），后续调度不得把它写回计算值。
+        self.assertEqual(self.runtime.request(self.project, "light", priority=90), scan["id"])
+        self.runtime.schedule(self.project, config, now=100 + 2 * interval)
+        row = self.store.one("SELECT priority,evidence FROM tasks WHERE id=?", (scan["id"],))
+        self.assertGreaterEqual(row["priority"], 90)
+        self.assertEqual(json.loads(row["evidence"]), [{"scan_trigger": "manual"}])
+
     def test_resume_coalesces_missed_intervals(self):
         self.runtime.configure({"sources": {"inspection": True}}, self.project)
         config = self.runtime.config(self.project)
@@ -297,6 +315,20 @@ class RuntimeTest(unittest.TestCase):
         rows = self.store.query("SELECT * FROM tasks WHERE source LIKE 'system_%'")
         self.assertEqual(len(rows), 1)
         self.assertEqual(len(self.store.query("SELECT * FROM schedules")), 1)
+
+    def test_scheduled_scan_never_downgrades_a_manually_boosted_scan(self):
+        self.runtime.configure({"sources": {"inspection": True}}, self.project)
+        scan = self.runtime.request(self.project, "light", priority=90)
+        # 修复积压存在时本轮算出 55；回写只允许提升，不得覆盖手动提升的 90。
+        self.store.add_task(self.project, "goal", "backlog", "Existing repair backlog")
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=100)
+        self.assertGreaterEqual(self.store.one("SELECT priority FROM tasks WHERE id=?", (scan,))["priority"], 90)
+        # 对照：该扫描进入终态后，自动周期重排仍按本轮积压算出的 55 写回。
+        self.store.execute("UPDATE tasks SET state='completed' WHERE fingerprint='system:light'")
+        self.store.execute("DELETE FROM schedules")
+        self.runtime.schedule(self.project, self.runtime.config(self.project), now=200)
+        rebuilt = self.store.one("SELECT priority FROM tasks WHERE fingerprint='system:light'")
+        self.assertEqual(rebuilt["priority"], 55)
 
     def test_recovery_retains_artifacts_and_requires_fresh_retry(self):
         task, run = self.claim()

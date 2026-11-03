@@ -268,6 +268,61 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store.namespaced_setting('cache', 'legacy_item', str), 'raw_cache')
 
 
+class ClaimSkippedTest(unittest.TestCase):
+    """claim() 领取循环里 skipped 非空时，id NOT IN 的占位符必须排在 rank 时间参数之前。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(Path(self.temp.name) / "state")
+        self.addCleanup(self.store.close)
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+
+    def test_skipped_publish_is_excluded_and_rank_binds_numeric_now(self):
+        from adaptive_rsi.config import validate
+        from adaptive_rsi import store as store_module
+        now = time.time()
+        issue = self.store.add_task("p", "issue", "issue:org/repo:42", "issue task")
+        self.store.put_setting("issue-sync:p", {"repository": "org/repo", "pending": {"42": True}})
+        self.store.execute("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES ('pub-src',?,'p','merged','{}',?,?)", (issue, now - 10, now - 9))
+        publish = self.store.add_task("p", "system_publish", "pub-fp", "publish", body="pub-src",
+                                      priority=200)
+        # rank = priority + min(20, 天数)。aged 的 10 天加成(99+10=109)压过 fresh 的 100；
+        # 若 rank 的 ? 错绑成 skipped 里的任务 id（文本→0），排序退化为 priority-created，
+        # fresh(-20550) 会错排到 aged(-20600) 之前。
+        aged = self.store.add_task("p", "code", "aged-fp", "aged", priority=99)
+        fresh = self.store.add_task("p", "code", "fresh-fp", "fresh", priority=100)
+        self.store.execute("UPDATE tasks SET created=? WHERE id=?", (now - 10 * 86400, aged))
+
+        checks = []
+        real_pending = store_module.issue_snapshot_pending
+
+        def counting_pending(db, project, task):
+            checks.append(task)
+            return real_pending(db, project, task)
+
+        with patch("adaptive_rsi.store.issue_snapshot_pending", counting_pending):
+            run = self.store.claim("p", validate({}))
+            self.assertIsNotNone(run)
+            self.assertEqual(run["task"], aged)
+            # skipped=['publish'] 时该任务不得再次出现在候选里：NOT IN 若错绑成
+            # now（数字与文本 id 永不相等），publish 会被重复取出并二次计入 checks。
+            self.assertEqual(checks, [issue])
+            # 被跳过的 publish 任务绝不返回、也不进入无限循环。
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publish,))["state"],
+                             "queued")
+
+            # 结束首个 run 后再领：进行中任务会触发 source 互斥过滤而非本测试目标。
+            self.store.execute("UPDATE runs SET ended=? WHERE id=?", (time.time(), run["id"]))
+            run = self.store.claim("p", validate({}))
+            self.assertIsNotNone(run)
+            self.assertEqual(run["task"], fresh)
+            self.assertEqual(checks, [issue, issue])
+            self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publish,))["state"],
+                             "queued")
+
+
 class RecordUsageTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
