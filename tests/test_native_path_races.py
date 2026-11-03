@@ -206,3 +206,50 @@ with patch('adaptive_rsi.native.Credentials') as credentials,patch('adaptive_rsi
                 with patch.object(self.tools, 'execute', return_value={'exit_code': exit_code, 'error': error, 'stdout': '', 'stderr': ''}):
                     execute_tools(self.tools, [('call', 'run_command', {'argv': ['fixture'], 'cwd': '.'})])
                 self.assertEqual(trace[-1]['state'], expected)
+
+class WorkspaceSignatureRaceTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        (self.root / 'kept.py').write_text('kept\n')
+        (self.root / 'vanished.py').write_text('vanished\n')
+
+    def signature(self, stat_hook=None, open_hook=None):
+        from adaptive_rsi.agent import workspace_signature
+        patches = []
+        if stat_hook:
+            patches.append(patch.object(Path, 'stat', stat_hook))
+        if open_hook:
+            patches.append(patch.object(Path, 'open', open_hook))
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            return workspace_signature(self.root, 1 << 20)
+
+    def test_file_deleted_between_validation_and_stat_is_skipped(self):
+        original, calls = Path.stat, {}
+
+        def stat(path, *args, **kwargs):
+            if path.name == 'vanished.py':
+                calls[path.name] = calls.get(path.name, 0) + 1
+                if calls[path.name] >= 3:  # exists() 与 is_file() 之后的那次 stat
+                    raise FileNotFoundError(path)
+            return original(path, *args, **kwargs)
+
+        digest = self.signature(stat_hook=stat)
+        # 稳定文件仍参与指纹：改内容会改变结果。
+        (self.root / 'kept.py').write_text('changed\n')
+        self.assertNotEqual(digest, self.signature(stat_hook=stat))
+
+    def test_file_deleted_between_stat_and_open_is_skipped(self):
+        original = Path.open
+
+        def open_(path, *args, **kwargs):
+            if path.name == 'vanished.py':
+                raise FileNotFoundError(path)
+            return original(path, *args, **kwargs)
+
+        digest = self.signature(open_hook=open_)
+        (self.root / 'kept.py').write_text('changed\n')
+        self.assertNotEqual(digest, self.signature(open_hook=open_))
