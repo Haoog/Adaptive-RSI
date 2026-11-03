@@ -188,8 +188,9 @@ def installed_root(state, fallback):
         root = Path(data["path"]).resolve()
         root.relative_to((state / "installations").resolve())
     except (OSError, ValueError, KeyError, TypeError):
-        # active.json 损坏与未安装同义；崩溃会楔死每次启动。
-        return None
+        # active.json 损坏时回退到调用方给定的路径（仓库根/源码 checkout），
+        # 而不是返回 None 让下游 sys.path.insert/Popen(cwd=None) 崩。
+        return Path(fallback).resolve()
     if not (root / "adaptive_rsi/cli.py").is_file():
         raise RuntimeError("Managed installation is incomplete; restore the previous installation")
     return root
