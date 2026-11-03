@@ -1392,6 +1392,9 @@ class AuthSessions:
                 entry = self.sessions.get(session_id)
             if stop.is_set() or entry is None or entry["state"] not in ACTIVE:
                 return
+            if self.now() >= entry["expires_at"]:
+                self._update(session_id, state="expired", error="auth_expired")
+                return
         try:
             with self.lock:
                 current_session = self.sessions.get(session_id)
