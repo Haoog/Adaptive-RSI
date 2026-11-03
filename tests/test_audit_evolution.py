@@ -533,6 +533,55 @@ class AuditEvolutionTest(unittest.TestCase):
                             encode({**base_spec, 'overlay': None}), 0, 2.0))
         self.assertNotEqual(signature, evolution.input_signature('p', config))
 
+    def test_failure_reasons_with_volatile_details_share_one_suppression_signature(self):
+        # 同一根因的两次故障只在临时路径 / run id / provider_request_id 上不同：
+        # 归一化后 input_signature 一致，attempt_due 不再为每次新实例反复付费提案。
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        task = self.store.add_task('p', 'goal', 'same-fault', 'Same fault', 'same fault')
+
+        def failed_run(run_id, reason, code='execution', action='inspect_details'):
+            self.store.execute('INSERT INTO runs(id,task,project,state,config,started,result) '
+                               'VALUES (?,?,?,?,?,?,?)',
+                               (run_id, task, 'p', 'failed', encode(config), time.time(),
+                                encode({'reason': reason,
+                                        'failure': {'code': code, 'action': action, 'detail': reason}})))
+
+        failed_run('run-a', 'Controlled ablation did not complete: FileNotFoundError: '
+                            '/tmp/bundle-check-Ab3xK9/workspace/case-9f8e7d6c5b4a3f21 missing',
+                   code='environment', action='check_environment')
+        baseline_inputs = evolution.proposal_inputs('p')
+        signature = evolution.input_signature('p', config, baseline_inputs)
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+
+        # 第二次实例换了临时目录、请求 id 与 UUID；其余输入完全未动。
+        failed_run('run-b', 'Controlled ablation did not complete: FileNotFoundError: '
+                            '/tmp/bundle-check-Zz9yX8/workspace/case-0123456789abcdef missing',
+                   code='environment', action='check_environment')
+        due, again, attempt = evolution.attempt_due('p', config)
+        self.assertFalse(due)
+        self.assertEqual(again, evolution.input_signature('p', config))
+        self.assertEqual(attempt['status'], 'insufficient_evidence')
+        failures = evolution.proposal_inputs('p')['failures']
+        self.assertEqual([item['reason'] for item in failures],
+                         ['Controlled ablation did not complete: FileNotFoundError: '
+                          '<path> missing'])
+        self.assertEqual(failures[0]['code'], 'environment')
+        self.assertNotIn('bundle-check', failures[0]['reason'])
+        self.assertNotIn('9f8e7d6c5b4a3f21', failures[0]['reason'])
+
+        # failure.code/action 真实变化仍要产生新签名：抑制不误伤不同类别故障。
+        failed_run('run-c', 'Controlled ablation did not complete: provider timeout',
+                   code='provider', action='retry_later')
+        self.assertNotEqual(again, evolution.input_signature('p', config))
+        due_changed, _, _ = evolution.attempt_due('p', config)
+        self.assertTrue(due_changed)
+
     def test_stale_running_attempt_does_not_suppress_evolution_forever(self):
         # record_attempt(...,\"running\") 之后进程崩溃：1 小时后 in_flight 变假，但
         # attempt.signature==signature 恒成立（running 记录从不更新 signature 也不被清除），
