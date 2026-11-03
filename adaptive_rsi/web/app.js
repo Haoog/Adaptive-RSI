@@ -126,6 +126,7 @@ const apiErrors={
  "Multiple workflow runs match this operation ID. Compare repository, workflow, ref, exact target SHA and operation ID before selecting one.": "有多个工作流执行记录都匹配本次操作编号。请先核对仓库、工作流、引用、目标提交和操作编号，再选择其中一条。",
  "One matching workflow run is visible. Reading its status never starts another run.": "已看到一条匹配的工作流执行记录。读取状态不会再次启动工作流。",
  "GitHub has not published a matching workflow run yet. Wait and query again; manual run IDs are not accepted.": "GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。",
+ "The authorized workflow file is not visible on the default branch; it may have been renamed or deleted. Restore the file or re-authorize its replacement, then reconcile the returned candidates; selecting never starts or repeats a run.": "授权的工作流文件在默认分支上不可见，可能已被改名或删除。请恢复该文件或重新授权替代文件，再对返回的候选记录进行核对；选择操作不会启动或重复执行工作流。",
  "GitHub has not confirmed a new run attempt. Inspect the original run; reconciliation never repeats an uncertain rerun request.": "GitHub 尚未确认新的执行尝试。请核对原始执行记录；重新确认不会重复提交不确定的重试请求。",
  "GitHub now reports a new run attempt. Selecting it only reads its status and never repeats the rerun request.": "GitHub 已报告新的执行尝试。选择它只会读取状态，不会再次提交重试请求。",
  "Workflow run status was read from GitHub; this never starts another run.": "工作流状态来自 GitHub 只读查询，不会启动新的执行。",

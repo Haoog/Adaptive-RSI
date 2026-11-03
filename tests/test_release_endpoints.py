@@ -699,6 +699,33 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
                 self.assertEqual(saved['workflow_run_id'], 17)
                 self.assertNotIn('manual_reconciliation', saved)
 
+    def test_missing_workflow_listing_reports_visibility_without_server_error(self):
+        self.operation()
+        def unavailable(repo, endpoint, method='GET', fields=None):
+            raise release.ApiRejected('fixture missing', 404)
+        with patch.object(release, 'api', side_effect=unavailable):
+            view = release.candidates(self.runtime, self.project, self.record['id'], 'release')
+            self.assertEqual(view['reconciliation_state'], 'workflow_not_visible')
+            self.assertEqual(view['candidates'], [])
+            self.assertIn('not visible', view['reason'])
+            saved = self.saved()
+            self.assertEqual(saved['state'], 'dispatch_unknown')
+            self.assertEqual(saved['remote_visibility']['state'], 'workflow_not_visible')
+            self.assertEqual(saved['remote_visibility']['http_status'], 404)
+            self.assertEqual(saved['reconciliation']['state'], 'workflow_not_visible')
+            with self.assertRaisesRegex(release.ReconciliationRejected, 'not visible'):
+                release.resolve(self.runtime, self.project, self.record['id'], 'release', 17)
+            self.assertEqual(self.saved()['state'], 'dispatch_unknown')
+            self.assertNotIn('manual_reconciliation', self.saved())
+        # 工作流文件恢复可见后，同一记录可正常完成人工对账。
+        with patch.object(release, 'api', side_effect=self.api(runs=[self.remote(17, status='in_progress')])):
+            view = release.candidates(self.runtime, self.project, self.record['id'], 'release')
+            self.assertEqual(view['reconciliation_state'], 'matched')
+            self.assertNotIn('remote_visibility', self.saved())
+            result = release.resolve(self.runtime, self.project, self.record['id'], 'release', 17)
+            self.assertEqual(result['state'], 'running')
+        self.assertEqual(self.posts, [])
+
     def test_candidates_refuse_stale_choices_after_receipt_changes(self):
         self.operation()
         lookup = self.api(runs=[self.remote(17)])
@@ -1135,6 +1162,39 @@ class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
             server.server_close()
             thread.join(3)
         self.assertEqual(self.saved()["state"], "dispatch_unknown")
+
+    def test_missing_workflow_listing_endpoint_returns_readable_view(self):
+        import http.client
+        from adaptive_rsi import server as server_module
+        self.operation()
+        server = server_module.Server(self.runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            def unavailable(repo, endpoint, method='GET', fields=None):
+                raise release.ApiRejected('fixture missing', 404)
+            with patch.object(release, 'api', side_effect=unavailable):
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("GET", "/api/release-candidates?project=" + self.project +
+                                       "&run=" + self.record["id"] + "&kind=release",
+                                       headers={"Cookie": server.cookie + "=" + server.token})
+                    response = connection.getresponse()
+                    payload = json.loads(response.read())
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["reconciliation_state"], "workflow_not_visible")
+                self.assertEqual(payload["candidates"], [])
+                self.assertIn("not visible", payload["reason"])
+                self.assertEqual(self.posts, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+        saved = self.saved()
+        self.assertEqual(saved["state"], "dispatch_unknown")
+        self.assertEqual(saved["remote_visibility"]["state"], "workflow_not_visible")
 
     def test_delayed_appearance_endpoint_sequence_preserves_audit_and_never_redispatches(self):
         import http.client
