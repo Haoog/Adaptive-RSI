@@ -52,6 +52,7 @@ const english = {
  "请选择一条工作流记录": "Select a workflow run",
  "关联所选记录": "Associate selected run",
  "GitHub 尚未发布与本次操作匹配的工作流记录。请等待后重新查询；这里不接受手动填写运行编号。": "GitHub has not published a workflow run matching this operation yet. Wait and query again; manually entered run IDs are not accepted here.",
+ "授权的工作流文件在默认分支上不可见，可能已被改名或删除。请恢复该文件或重新授权替代文件，再对返回的候选记录进行核对；选择操作不会启动或重复执行工作流。": "The authorized workflow file is not visible on the default branch; it may have been renamed or deleted. Restore the file or re-authorize its replacement, then reconcile the returned candidates; selecting never starts or repeats a run.",
  "只读重新查询": "Read-only check again",
  "有多个工作流执行记录都匹配本次操作编号。请先核对仓库、工作流、引用、目标提交和操作编号，再选择其中一条。": "Multiple workflow runs match this operation ID. Compare the repository, workflow, ref, target commit and operation ID, then select one.",
  "已看到一条匹配的工作流执行记录。读取状态不会再次启动工作流。": "One matching workflow run is visible. Reading its status does not start another run.",
