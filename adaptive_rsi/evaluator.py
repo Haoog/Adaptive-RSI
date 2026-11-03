@@ -682,7 +682,10 @@ class Evaluator:
                     raise ValueError("Control fixture too large")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(item["content"], encoding="utf-8")
-                protected.append(path)
+                # The fixture may overwrite a file the frozen harness already
+                # protects; the sandbox mounts each destination at most once.
+                if path not in protected:
+                    protected.append(path)
             rows, prepared = execute(target, protected)
             detected = prepared and any(row["exit_code"] not in (None, 0) and not row["error"]
                                         and not environment_failure(row) for row in rows)

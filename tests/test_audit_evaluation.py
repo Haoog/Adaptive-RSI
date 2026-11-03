@@ -576,6 +576,42 @@ class AuditEvaluationTest(unittest.TestCase):
                 self.assertTrue(protected, 'protected must cover harness/fixture paths')
                 self.assertTrue(hidden, 'hidden must cover other project paths')
 
+    def test_controls_fixture_over_protected_path_mounts_once(self):
+        """A fixture replacing a frozen harness file must not mount the path twice."""
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            # test_value.py is a harness file the freeze protects; the fixture
+            # overwrites it, so a naive append would mount the destination twice
+            # and Docker would refuse the control container outright.
+            (source / 'test_value.py').write_text('assert True\n')
+            check = {'name': 'criterion', 'argv': ['python3', 'test_value.py']}
+            control = {'id': 'c', 'criterion': 'x', 'source': 'host:fixture',
+                       'files': [{'path': 'test_value.py', 'content': 'assert False\n'}]}
+            seen = []
+            def execute(_sandbox, check, workspace, cancel=None, protected=(), hidden=(), **kwargs):
+                resolved = [str(Path(item).resolve()) for item in protected]
+                seen.append(resolved)
+                return {'name': check['name'], 'argv': check['argv'],
+                        'exit_code': 0, 'stdout': 'Ran 1 test\n', 'stderr': '',
+                        'error': None}
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            config = merge(DEFAULTS, {'validation': {'controls': [control]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                evaluator.Evaluator(store).evaluate(
+                    source, source, [check], root / 'evaluation', config, changed_files=[])
+            self.assertTrue(seen)
+            for resolved in seen:
+                self.assertEqual(len(resolved), len(set(resolved)),
+                                 'protected must not mount the same destination twice')
+
     def test_required_test_identity_cannot_be_satisfied_by_unrelated_tests(self):
         required = ['target.test_regression']
         unrelated = [{'test_identities': {'state': 'reported', 'executed': ['other.test_pass'], 'skipped': []}}]
