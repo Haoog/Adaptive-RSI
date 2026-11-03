@@ -523,6 +523,45 @@ print('BOUNDARIES_OK')
         self.assertTrue(second)
         self.assertNotEqual(first, second)
 
+    def test_edited_review_keeps_identity_and_does_not_replan_again(self):
+        from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
+        run = self.tracked_pr()
+        review = {"id": "r1", "body": "Fix edge case", "state": "CHANGES_REQUESTED",
+                  "author": {"login": "reviewer"}, "submittedAt": "2026-11-03T00:00:00Z"}
+        first = record_pr_feedback(self.store, run, "pr", {"reviews": [review]})
+        self.assertTrue(first)
+        self.assertTrue(_supersede_pr(self.store, run, {"pr": "pr"}, "queued", 1000, first))
+        retry = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(retry)
+        self.store.execute("UPDATE runs SET state='pr_open' WHERE id=?", (retry["id"],))
+        self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (retry["task"],))
+        # 同一条评审被编辑（id 不变，body/updatedAt 变化）不产生新身份；
+        # handled 已核销，eligible 满足时 unseen 仍为空，不再重排。
+        edited = dict(review, body="Fix edge case.", updatedAt="2026-11-03T01:00:00Z")
+        second = record_pr_feedback(self.store, dict(retry), "pr", {"reviews": [edited]})
+        self.assertEqual(first, second)
+        self.assertFalse(_supersede_pr(self.store, dict(retry), {"pr": "pr"}, "queued", 1060, second))
+
+    def test_new_review_id_still_triggers_one_replan(self):
+        from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
+        run = self.tracked_pr()
+        review = {"id": "r1", "body": "Fix edge case", "state": "CHANGES_REQUESTED",
+                  "author": {"login": "reviewer"}, "submittedAt": "2026-11-03T00:00:00Z"}
+        first = record_pr_feedback(self.store, run, "pr", {"reviews": [review]})
+        self.assertTrue(_supersede_pr(self.store, run, {"pr": "pr"}, "queued", 1000, first))
+        retry = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertIsNotNone(retry)
+        self.store.execute("UPDATE runs SET state='pr_open' WHERE id=?", (retry["id"],))
+        self.store.execute("UPDATE tasks SET state='pr_open' WHERE id=?", (retry["task"],))
+        # 旧评审的编辑版本（r1）已被核销，但新评审 id 仍是未见过的新信号，照常重排一次。
+        edited = dict(review, body="Fix edge case.", updatedAt="2026-11-03T01:00:00Z")
+        fresh = {"id": "r2", "body": "Also handle empty input", "state": "CHANGES_REQUESTED",
+                 "author": {"login": "reviewer"}, "submittedAt": "2026-11-03T02:00:00Z"}
+        keys = record_pr_feedback(self.store, dict(retry), "pr", {"reviews": [edited, fresh]})
+        self.assertEqual(len(keys), 2)
+        self.assertIn(first[0], keys)
+        self.assertTrue(_supersede_pr(self.store, dict(retry), {"pr": "pr"}, "queued", 1060, keys))
+
     def test_feedback_replan_transaction_rolls_back_on_task_failure(self):
         from adaptive_rsi.delivery import record_pr_feedback, _supersede_pr
         run = self.tracked_pr()
