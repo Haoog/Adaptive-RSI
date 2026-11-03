@@ -3,6 +3,7 @@ import datetime
 import difflib
 import heapq
 import json
+import logging
 import re
 import time
 
@@ -354,6 +355,37 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
     changed, complete = 0, False
     seen = set()
     pending = progress.get("pending", {})
+    prior_failures = progress.get("failures", 0)
+    failures = []
+
+    def note_failure(issue, exc):
+        """Record one skipped Issue without masking the original error."""
+        number = issue.get("number") if isinstance(issue, dict) else None
+        try:
+            store.event("issue_sync_error",
+                        "Issue sync skipped a row; its writes were rolled back: " + str(exc)[:400],
+                        project["id"], run_id, data={"issue": number})
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to record issue sync failure for %s", number)
+        failures.append(exc)
+
+    def hold_failed(issue):
+        """Stash a failed remote row in pending so the next cycle retries it."""
+        if not isinstance(issue, dict):
+            return
+        # 与 apply_existing 暂存活跃修订相同的裁剪形状。apply() 需要这些键：
+        # 结构不完整的行无法暂存重试，记录错误后等下一次远端刷新再读原文。
+        required = ("number", "updated_at", "html_url", "state", "labels", "title", "body")
+        if any(key not in issue for key in required):
+            return
+        try:
+            number = str(int(issue["number"]))
+        except (TypeError, ValueError):
+            return
+        entry = {key: issue[key] for key in ["number", "updated_at", "html_url", "state", "labels"]}
+        entry.update(title=str(issue.get("title") or "")[:300],
+                     body=str(issue.get("body") or "")[:30000])
+        pending[number] = entry
 
     def apply(issue):
         nonlocal changed
@@ -506,6 +538,21 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # Keep the sealed task and pending snapshot, but still fetch remote
             # updates: a newer, shorter revision can replace this held snapshot.
             pending[str(int(issue["number"]))] = issue
+        except Exception as exc:
+            # 其他失败同样保留 pending 快照并记录证据，不阻断本周期远端读取；
+            # 首个异常在本周期汇总后抛回调用方。
+            note_failure(issue, exc)
+            pending[str(int(issue["number"]))] = issue
+        else:
+            # 新建任务成功后清除暂存；apply_existing 路径在函数内自行 pop，且
+            # 活跃期间会重新写入新快照——只有仍是原对象的条目才移除。
+            if isinstance(issue, dict):
+                try:
+                    issue_number = str(int(issue["number"]))
+                except (TypeError, ValueError):
+                    continue
+                if pending.get(issue_number) is issue:
+                    pending.pop(issue_number, None)
     # API 按页读取并持久化游标，不限制可同步的 Issue 总数。
     size = 100
     started = time.monotonic()
@@ -528,20 +575,45 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
         if not isinstance(rows, list):
             raise RuntimeError("Unexpected GitHub Issue response")
         for issue in rows:
-            apply(issue)
+            try:
+                apply(issue)
+            except IssueRequirementsTooLong as exc:
+                # 组合需求超限时保留任务原有快照，跳过该行继续整页；记录证据并
+                # 计入失败汇总，靠保留的 since 水印在下个周期重试，不进 pending。
+                note_failure(issue, exc)
+                continue
+            except Exception as exc:
+                # 单个坏 Issue 不杀掉整页：其任务/审计写入已随事务回滚，记录
+                # 证据并暂存 pending 供下周期重试；首个异常在本周期汇总后抛出。
+                note_failure(issue, exc)
+                hold_failed(issue)
+                continue
         progress["page"] += 1
         pages_read += 1
         if len(rows) < size:
             complete = True
-            # Overlap catches updates made while this cycle was draining.
-            progress = {"repository": repo, "policy": policy, "since": progress["started"], "page": 1}
+            # Overlap catches updates made while this cycle was draining. A page
+            # with skipped rows keeps the previous since watermark instead of
+            # this cycle's start, so the next incremental scan re-reads them.
+            # prior_failures carries the same guard across continuation pages.
+            has_failures = failures or prior_failures
+            progress = {"repository": repo, "policy": policy,
+                        "since": progress["started"] if not has_failures else progress.get("since"),
+                        "page": 1}
         progress["pending"] = pending
+        progress["failures"] = len(failures)
         store.put_setting(key, progress)
         if complete:
             break
+    if failures:
+        # 页内其余行已照常处理、游标与 pending 均已落库；此刻把首个失败还给
+        # 调用方，保留「任务/审计写入不回滚、异常可见」的原有契约。summary event
+        # 在 raise 前不写：有跳过时扫描不完整，不应记录 kind='issues'。
+        raise failures[0]
     store.event("issues", "Scanned %d Issues; %d updates synchronized%s" % (
                     len(seen), changed, "" if complete else "; sync continues next cycle"), project["id"],
                 data={"complete": complete, "scanned": len(seen), "changed": changed,
+                      "skipped": len(failures),
                       "next_page": progress["page"], "pages_read": pages_read})
 
 
