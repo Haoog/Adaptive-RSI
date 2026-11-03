@@ -269,12 +269,27 @@ def junit_test_summary(text):
 
 
 def clarity_test_summary(text):
-    """Recognize bounded pytest CLI summaries without parsing arbitrary output."""
-    match = re.search(r"(?m)^=+ ([1-9]\d*) passed(?:, (\d+) failed)?(?:, (\d+) skipped)? in ",
-                      text)
-    if not match:
+    """Recognize bounded pytest CLI summaries without parsing arbitrary output.
+
+    pytest 7+ prints failures first (``== 2 failed, 3 passed in 1.00s ==``), so
+    fields are captured by name instead of position."""
+    line = re.search(r"(?m)^=+ (.+) in [\d.]+s *=+$", text)
+    if not line:
         return None
-    passed, failed, skipped = (int(value or 0) for value in match.groups())
+    fields = {}
+    for name, pattern in (("passed", "passed"), ("failed", "failed"),
+                          ("skipped", "skipped"), ("errors", "errors?"),
+                          ("deselected", "deselected"), ("warnings", "warnings?")):
+        match = re.search(r"\b(\d+) " + pattern + r"\b", line.group(1))
+        if match:
+            fields[name] = int(match.group(1))
+    if not fields.get("passed"):
+        # pytest still reports ``0 passed`` for collection-only failures; treat
+        # that as no executed summary instead of fabricating an empty run.
+        return None
+    passed = fields["passed"]
+    failed = fields.get("failed", 0) + fields.get("errors", 0)
+    skipped = fields.get("skipped", 0) + fields.get("deselected", 0)
     return {"format": "pytest_cli", "executed": passed + failed + skipped,
             "passed": passed, "failed": failed, "skipped": skipped}
 

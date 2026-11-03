@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from adaptive_rsi.credentials import Credentials
 from adaptive_rsi.delivery import _public_text, pr_body
-from adaptive_rsi.evaluator import empty_test_run
+from adaptive_rsi.evaluator import clarity_test_summary, empty_test_run
 from adaptive_rsi.native import post_json
 from adaptive_rsi.process import run_process, scrub_tree, Sandbox
 from adaptive_rsi.review import enforce_review
@@ -165,6 +165,29 @@ class AuditRound4Test(unittest.TestCase):
 
         cargo_fail = "test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s"
         self.assertFalse(empty_test_run(cargo_fail))
+
+    def test_clarity_test_summary_field_order_agnostic(self):
+        # pytest 7+ prints failures first; field order must not matter.
+        failure_first = clarity_test_summary("===== 2 failed, 3 passed, 1 skipped in 4.21s =====")
+        passed_first = clarity_test_summary("===== 3 passed, 2 failed, 1 skipped in 4.21s =====")
+        self.assertIsNotNone(failure_first)
+        self.assertIsNotNone(passed_first)
+        for key in ("executed", "passed", "failed", "skipped"):
+            self.assertEqual(failure_first[key], passed_first[key])
+        self.assertEqual(failure_first["executed"], 6)
+        self.assertEqual(failure_first["failed"], 2)
+        self.assertEqual(failure_first["skipped"], 1)
+
+    def test_clarity_test_summary_counts_errors_and_deselected(self):
+        summary = clarity_test_summary("==== 1 error, 4 passed, 2 deselected in 0.50s ====")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["skipped"], 2)
+        self.assertEqual(summary["executed"], 7)
+
+    def test_clarity_test_summary_rejects_zero_passed(self):
+        self.assertIsNone(clarity_test_summary("===== 0 passed, 1 failed in 0.10s ====="))
+        self.assertIsNone(clarity_test_summary("===== no tests ran in 0.01s ====="))
 
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {
