@@ -577,8 +577,8 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled):
     store.remote_wait(run["id"], None, time.time())
 
 
-_RECOVERY_CANDIDATE = ("(r.state='superseded' AND json_valid(r.result) "
-    "AND coalesce(json_extract(r.result,'$.pr'),'')='' "
+_RECOVERY_CANDIDATE = ("(r.state='superseded' AND CASE WHEN json_valid(r.result) "
+    "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
     "AND EXISTS (SELECT 1 FROM settings s WHERE s.key='delivery-push:'||r.id))")
 
 
