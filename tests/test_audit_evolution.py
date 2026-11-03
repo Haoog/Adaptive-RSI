@@ -407,16 +407,18 @@ class AuditEvolutionTest(unittest.TestCase):
         # 120 次成功只抽中固定的 8 个（fingerprint 前 8 位 %10==0），与 1 条 seed 合计 9。
         self.assertEqual(monitor['passed'], 9)
         self.assertEqual(monitor['failed'], 0)
+        self.assertEqual(monitor['sampled_passed'], 8)
 
     def test_sentinel_drift_threshold_uses_unbiased_ratio(self):
-        # 记录口径 passed:failed = 3:3 看似 50%，但成功按 1/10 抽样；
-        # 校正后 30:3 ≈ 0.91，不应触发 drift。
+        # 记录口径 passed:failed = 3:3 看似 50%，但只有 1 条是抽样成功；
+        # 校正后 (2 + 10):3 = 0.8 恰好不触发 drift。
         self.candidate({'monitor': {'passed': 2, 'failed': 3, 'runs': []}})
         self.feed_passing_runs(['post-18'])  # fingerprint %10==0，必然入账
         evidence = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
         self.assertNotIn('drift', evidence)
         self.assertEqual((evidence['monitor']['passed'], evidence['monitor']['failed']), (3, 3))
-        # 真实回归仍触发：校正后 30:50 = 0.375 < 0.8，且证据显式声明采样口径。
+        self.assertEqual(evidence['monitor']['sampled_passed'], 1)
+        # 真实回归仍触发：校正后 (3 + 10):50 = 13/63 ≈ 0.21 < 0.8，且证据显式声明采样口径。
         self.store.execute("UPDATE candidates SET evidence=? WHERE id='c'",
                            (encode({'monitor': {'passed': 3, 'failed': 50, 'runs': []}}),))
         self.feed_passing_runs(['post-46'])
@@ -424,8 +426,20 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(drift['phase'], 'sentinel')
         self.assertTrue(drift['sampled'])
         self.assertEqual(drift['success_sample_rate'], 0.1)
-        self.assertAlmostEqual(drift['unbiased_pass_ratio'], 40 / 90, places=3)
+        self.assertEqual(drift['sampled_passed'], 1)
+        self.assertAlmostEqual(drift['unbiased_pass_ratio'], 13 / 63, places=3)
         self.assertEqual((drift['passed'], drift['failed']), (4, 50))
+
+    def test_sentinel_initial_successes_keep_unit_weight(self):
+        # 初始窗口的 20 条成功未经抽样，若被一并按 1/10 放大，
+        # 校正比率会虚高（210/220 ≈ 0.95）而漏报真实回归；正确估计 30:40 = 0.75 必须报 drift。
+        self.candidate({'monitor': {'passed': 20, 'failed': 10, 'runs': []}})
+        self.feed_passing_runs(['post-18'])
+        evidence = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
+        drift = evidence['drift']
+        self.assertEqual(drift['phase'], 'sentinel')
+        self.assertEqual(drift['sampled_passed'], 1)
+        self.assertAlmostEqual(drift['unbiased_pass_ratio'], 30 / 40, places=3)
 
     def test_retirement_and_reclassification_keep_exposure(self):
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)', ('x', 'p', 'family', 'validation', encode({'signature': 's'}), 2, 1))

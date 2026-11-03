@@ -1713,14 +1713,19 @@ class Evolution:
                 if sentinel:
                     monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
+                if sentinel and passed:
+                    monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
                 monitor["last_checked"] = time.time()
                 # Sentinel keeps ~1/10 of successes but every failure, so the recorded
-                # ratio is biased low; scale the success count back up before applying
-                # the 0.8 threshold instead of comparing raw counts.
+                # ratio is biased low; scale the sampled successes back up before
+                # applying the 0.8 threshold. Initial-window successes were recorded
+                # without sampling and keep weight 1.
                 if sentinel:
-                    denominator = monitor["passed"] / success_rate + monitor["failed"]
-                    pass_ratio = monitor["passed"] / success_rate / denominator if denominator else 1.0
+                    sampled_passed = monitor.get("sampled_passed", 0)
+                    estimated_passed = monitor["passed"] - sampled_passed + sampled_passed / success_rate
+                    denominator = estimated_passed + monitor["failed"]
+                    pass_ratio = estimated_passed / denominator if denominator else 1.0
                 else:
                     total = monitor["passed"] + monitor["failed"]
                     pass_ratio = monitor["passed"] / total if total else 1.0
@@ -1730,6 +1735,7 @@ class Evolution:
                              "passed": monitor["passed"], "failed": monitor["failed"]}
                     if sentinel:
                         drift.update({"sampled": True, "success_sample_rate": success_rate,
+                                      "sampled_passed": monitor.get("sampled_passed", 0),
                                       "unbiased_pass_ratio": round(pass_ratio, 4)})
                     evidence["drift"] = drift
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
