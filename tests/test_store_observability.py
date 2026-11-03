@@ -117,6 +117,36 @@ class StoreObservabilityTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT data FROM stages')['data'], 'data')
         self.assertFalse(self.store.query('SELECT * FROM relationship_quarantine'))
 
+    def test_dependency_quarantine_restores_readiness_and_preserves_evidence(self):
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
+        task = self.store.add_task('p', 'goal', 'dep-key', 'title', 'body')
+        with self.store.connect() as db:
+            db.execute('PRAGMA foreign_keys=OFF')
+            db.execute("INSERT INTO task_dependencies VALUES (?,'deleted-dep')", (task,))
+            db.execute("INSERT INTO task_dependencies VALUES ('ghost-task','ghost-dep')")
+        ready = 'SELECT id FROM tasks WHERE id=? AND ' + self.store.ready_clause()
+        # p.id IS NULL 分支把任务永久挡在 ready 之外。
+        self.assertIsNone(self.store.one(ready, (task, 0)))
+        result = self.store.quarantine_orphans()
+        self.assertEqual(result['invalid_dependencies'], 2)
+        self.assertFalse(result['has_more'])
+        self.assertFalse(self.store.query('SELECT * FROM task_dependencies'))
+        rows = self.store.query("SELECT table_name,data FROM relationship_quarantine ORDER BY id")
+        self.assertEqual([row['table_name'] for row in rows], ['task_dependencies'] * 2)
+        evidence = sorted((json.loads(row['data'])['task'], json.loads(row['data'])['dependency'])
+                          for row in rows)
+        self.assertEqual(evidence, sorted([(task, 'deleted-dep'), ('ghost-task', 'ghost-dep')]))
+        events = self.store.query("SELECT project,data FROM events "
+                                  "WHERE kind='dependency_orphan_quarantined' ORDER BY seq")
+        self.assertEqual(len(events), 2)
+        by_task = {json.loads(row['data'])['task']: row for row in events}
+        self.assertEqual(by_task[task]['project'], 'p')
+        self.assertIsNone(by_task['ghost-task']['project'])
+        self.assertEqual(self.store.one(ready, (task, 0))['id'], task)
+        again = self.store.quarantine_orphans()
+        self.assertEqual(again['invalid_dependencies'], 0)
+        self.assertFalse(again['has_more'])
+
     def test_relationship_audit_covers_evidence_links_and_narrow_probe_exceptions(self):
         with self.store.connect() as db:
             db.execute('PRAGMA foreign_keys=OFF')
