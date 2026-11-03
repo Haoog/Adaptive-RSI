@@ -247,10 +247,13 @@ class TaskLifecycleTest(unittest.TestCase):
         reopened = Store(self.store.root)
         try:
             self.assertEqual([row['version'] for row in reopened.schema_migrations()],
-                             [1, 2, 3, 4, 5, 6, 7, 8])
+                             [1, 2, 3, 4, 5, 6, 7, 8, 9])
             index = reopened.one("SELECT sql FROM sqlite_master WHERE type='index' "
                                  "AND name='events_intervention_task'")
             self.assertIn("json_extract(data,'$.task')", index['sql'])
+            # version>=8 的删除连同 9 一起清掉，重放也应把 open_runs 一并补回。
+            self.assertIsNotNone(reopened.one("SELECT name FROM sqlite_master WHERE type='index' "
+                                              "AND name='open_runs'"))
             # 迁移只新增索引：历史事件仍可被索引查到。
             self.assertEqual(reopened.one("SELECT count(*) AS n FROM events WHERE json_extract(data,'$.task')=?",
                                           ('legacy',))['n'], 1)

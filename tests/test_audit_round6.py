@@ -1263,7 +1263,7 @@ class AuditMigrationHistoryTest(unittest.TestCase):
     def test_historical_version_fixture_matrix_upgrade_no_rebackfill_and_rejects_future(self):
         """为每个历史版本 fixture 补「升级 → 二次启动不重复回填 → 更新未来版本被拒」三断言。"""
         from adaptive_rsi.schema_migrations import heal
-        versions = ['legacy_v1', 1, 2, 3, 4, 5, 6, 7, 8]
+        versions = ['legacy_v1', 1, 2, 3, 4, 5, 6, 7, 8, 9]
         for target_version in versions:
             with self.subTest(version=target_version):
                 with tempfile.TemporaryDirectory() as directory:
@@ -1274,7 +1274,7 @@ class AuditMigrationHistoryTest(unittest.TestCase):
                     store = Store(path)
                     try:
                         applied = [row['version'] for row in store.schema_migrations()]
-                        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8])
+                        self.assertEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9])
                         uv = store.one("PRAGMA user_version")
                         self.assertIsNotNone(uv)
                         assert uv is not None

@@ -245,12 +245,16 @@ class UsageReportTest(unittest.TestCase):
                        "usage_known INTEGER DEFAULT 0)")
             db.execute("CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,project TEXT,run TEXT,"
                        "kind TEXT,message TEXT,data TEXT,created REAL)")
+            # 009 起新增 open_runs 部分索引需要 runs 表存在：真实库在 sealed(3) 前已由
+            # bootstrap 建表，这里补齐最小列让迁移正常应用。
+            db.execute("CREATE TABLE runs(id TEXT PRIMARY KEY,task TEXT,project TEXT,state TEXT,"
+                       "config TEXT,strategy TEXT,result TEXT,started REAL,ended REAL)")
             db.execute("INSERT INTO calls(id,project,state,tokens,created,unit_price) VALUES ('old','p','completed',123,1,2)")
             db.execute("PRAGMA user_version=2")
         db.close()
         store = Store(root)
         self.addCleanup(store.close)
-        self.assertEqual([row["version"] for row in store.schema_migrations()], [1, 2, 3, 4, 5, 6, 7, 8])
+        self.assertEqual([row["version"] for row in store.schema_migrations()], [1, 2, 3, 4, 5, 6, 7, 8, 9])
         row = store.one("SELECT * FROM calls WHERE id='old'")
         self.assertEqual((row["tokens"], row["unit_price"], row["input_price"]), (123, 2, None))
         self.assertIsNone(row["price_basis"])
