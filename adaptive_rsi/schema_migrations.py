@@ -10,7 +10,8 @@ LOGGER = logging.getLogger(__name__)
 
 SCRIPTS = ((3, "003_seal_bootstrap.sql"), (4, "004_revision_snapshots.sql"),
            (5, "005_task_group_lineage.sql"), (6, "006_dependency_dag.sql"),
-           (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"))
+           (7, "007_call_prices.sql"), (8, "008_intervention_history_index.sql"),
+           (9, "009_open_runs_index.sql"))
 
 # _bootstrap() 的建表 DDL：executescript 会隐式提交，与后续补列/数据迁移事务分离，
 # 进程可能在两者之间中断。提取为常量供 Store 复用，也让回归测试能直接构造
@@ -61,6 +62,9 @@ BOOTSTRAP_SCHEMA = """
     CREATE INDEX IF NOT EXISTS project_runs ON runs(project,started DESC);
     CREATE INDEX IF NOT EXISTS task_runs ON runs(task,started DESC,id DESC);
     CREATE INDEX IF NOT EXISTS delivery_runs ON runs(state,project);
+    -- 调度循环每 tick 用 `runs WHERE ended IS NULL` 查活跃 run；部分索引只覆盖
+    -- 未结束行，run 数增长时不再全表扫描。
+    CREATE INDEX IF NOT EXISTS open_runs ON runs(project) WHERE ended IS NULL;
     CREATE INDEX IF NOT EXISTS project_calls ON calls(project,created DESC);
     CREATE INDEX IF NOT EXISTS project_events ON events(project,seq DESC);
     CREATE INDEX IF NOT EXISTS task_queue ON tasks(state,priority,available);
@@ -130,6 +134,8 @@ EVIDENCE = {
                                      "price_basis"} <= set(_columns(db, "calls"))),
     8: ("index events_intervention_task on events(project, task, seq)",
         lambda db, tables, indexes: "events_intervention_task" in indexes),
+    9: ("partial index open_runs on runs(project) where ended is null",
+        lambda db, tables, indexes: "open_runs" in indexes),
 }
 
 

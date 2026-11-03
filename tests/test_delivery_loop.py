@@ -661,6 +661,34 @@ print('BOUNDARIES_OK')
         self.assertIsNone(self.store.setting("merge-intent:" + run["id"]))
         feedback.assert_called_once()
 
+    def test_merged_pr_without_merge_oid_keeps_task_open_for_oid_retry(self):
+        # MERGED 但 mergeCommit.oid 缺失（merge-queue/GC）是有意保留 pr_open 的重试路径：
+        # run 记 merge_sha_pending 等下一轮补齐 oid。回归前 bug：无论 target_state 一律把
+        # task 置 merged，下一轮 tick 检测到 task!=pr_open 就把 run 置 superseded、关闭证据
+        # 记 close_status=merged，已合并 PR 的反馈/监控永久丢失。
+        run = self.tracked_pr()
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": None}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr):
+            tick(self.runtime, 120)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        outcome = json.loads(row["result"])
+        self.assertEqual(row["state"], "pr_open")
+        self.assertEqual(outcome["delivery_status"], "merge_sha_pending")
+        # task 必须保持 pr_open，这样下一轮能重进 MERGED 分支重试 oid，而不是被判 superseded。
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
+
+        # 下一轮 oid 补齐：task 与 run 一起进 merged，run 绝不能被 superseded。
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base",
+              "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, 240)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertEqual(json.loads(row["result"])["merged_sha"], "merged-sha")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "merged")
+        feedback.assert_called_once()
+
     def test_stale_supersession_and_requeue_roll_back_together(self):
         run = self.tracked_pr()
         self.store.execute("CREATE TRIGGER reject_replan BEFORE UPDATE OF state ON tasks "

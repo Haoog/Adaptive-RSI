@@ -17,6 +17,10 @@ ISSUE_COMMENT_BODY_LIMIT = 4000
 ISSUE_COMMENT_FALLBACK_PAGES = 25
 ISSUE_SYNC_MAX_PAGES = 10
 ISSUE_SYNC_SECONDS = 20
+# pending 暂存行的确定性失败重试上限：语义损坏但形状合法的行每周期 replay
+# 必然再失败，超上限后移出 pending 并记 issue_sync_quarantined，不再让
+# failures 汇总把整个 sync（含 prs:/ci: 刷新与 summary 事件）永久 wedge。
+ISSUE_SYNC_PENDING_MAX_ATTEMPTS = 3
 
 
 def _github_response(text):
@@ -355,6 +359,13 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
     changed, complete = 0, False
     seen = set()
     pending = progress.get("pending", {})
+    if not isinstance(pending, dict):
+        # 历史/损坏进度里 pending 可能是 list 等形状；.values() 会直接 AttributeError
+        # 穿透出 sync()。重置为空并留证据，本周期远端读取照常进行。
+        store.event("issue_sync_progress_repaired",
+                    "Issue sync progress held a malformed pending map; it was reset",
+                    project["id"], run_id, data={"pending_type": type(pending).__name__})
+        pending = {}
     prior_failures = progress.get("failures", 0)
     failures = []
 
@@ -384,7 +395,7 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             return
         entry = {key: issue[key] for key in ["number", "updated_at", "html_url", "state", "labels"]}
         entry.update(title=str(issue.get("title") or "")[:300],
-                     body=str(issue.get("body") or "")[:30000])
+                     body=str(issue.get("body") or "")[:30000], attempts=0)
         pending[number] = entry
 
     def apply(issue):
@@ -533,26 +544,42 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
 
     for issue in list(pending.values()):
         try:
+            issue_number = str(int(issue["number"])) if isinstance(issue, dict) else None
+        except (TypeError, ValueError, KeyError):
+            issue_number = None
+        if issue_number is None:
+            # 暂存条目缺 number 或不可转 int：handler 内 int() 会穿透出 sync()。
+            # 记事件后丢弃，不再暂存。
+            store.event("issue_sync_quarantined",
+                        "Issue sync dropped a malformed pending snapshot",
+                        project["id"], run_id, data={"issue": issue if isinstance(issue, dict) else None})
+            continue
+        try:
             apply(issue)
         except IssueRequirementsTooLong:
             # Keep the sealed task and pending snapshot, but still fetch remote
             # updates: a newer, shorter revision can replace this held snapshot.
-            pending[str(int(issue["number"]))] = issue
+            pending[issue_number] = issue
         except Exception as exc:
             # 其他失败同样保留 pending 快照并记录证据，不阻断本周期远端读取；
-            # 首个异常在本周期汇总后抛回调用方。
+            # 首个异常在本周期汇总后抛回调用方。确定性坏行每次 replay 都失败，
+            # 计入 attempts，超上限后隔离丢弃而不是让 failures 永久 wedge sync。
+            attempts = issue.get("attempts", 0) + 1 if isinstance(issue.get("attempts", 0), int) else 1
             note_failure(issue, exc)
-            pending[str(int(issue["number"]))] = issue
+            if attempts >= ISSUE_SYNC_PENDING_MAX_ATTEMPTS:
+                store.event("issue_sync_quarantined",
+                            "Issue sync dropped a pending snapshot after %d failed replays: %s" % (
+                                attempts, str(exc)[:300]),
+                            project["id"], run_id, data={"issue": issue_number, "attempts": attempts})
+                pending.pop(issue_number, None)
+                continue
+            issue["attempts"] = attempts
+            pending[issue_number] = issue
         else:
             # 新建任务成功后清除暂存；apply_existing 路径在函数内自行 pop，且
             # 活跃期间会重新写入新快照——只有仍是原对象的条目才移除。
-            if isinstance(issue, dict):
-                try:
-                    issue_number = str(int(issue["number"]))
-                except (TypeError, ValueError):
-                    continue
-                if pending.get(issue_number) is issue:
-                    pending.pop(issue_number, None)
+            if pending.get(issue_number) is issue:
+                pending.pop(issue_number, None)
     # API 按页读取并持久化游标，不限制可同步的 Issue 总数。
     size = 100
     started = time.monotonic()
@@ -599,9 +626,14 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             has_failures = failures or prior_failures
             progress = {"repository": repo, "policy": policy,
                         "since": progress["started"] if not has_failures else progress.get("since"),
-                        "page": 1}
+                        "page": 1, "failures": len(failures)}
+        else:
+            # 中间页因页/时间预算中断时，上一周期的失败计数必须带进下一周期；
+            # 否则续扫到末页重建时 has_failures 为假、since 被推进，本周期之前
+            # 被跳过的行（updated_at 早于新水印）将永久漏读。complete 重建分支
+            # 只保留本周期计数：旧失败已靠 since 水印获得重读机会。
+            progress["failures"] = len(failures) or prior_failures
         progress["pending"] = pending
-        progress["failures"] = len(failures)
         store.put_setting(key, progress)
         if complete:
             break

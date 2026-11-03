@@ -458,6 +458,23 @@ class MigrationLedgerHealTest(unittest.TestCase):
         from adaptive_rsi.schema_migrations import EVIDENCE, scripts
         self.assertEqual(set(EVIDENCE), {1, 2} | {version for version, _ in scripts()})
 
+    def test_open_runs_partial_index_backs_ended_is_null_scans(self):
+        # 调度每 tick 的 scheduler_projects/recover/_add_project 与 work_busy 都跑
+        # runs WHERE ended IS NULL；无索引时对 run 全表做线性 SCAN。回归修复：
+        # BOOTSTRAP_SCHEMA 覆盖新库，编号迁移 009 给旧库补同一部分索引，EVIDENCE
+        # 让 heal() 能重复确认已应用效果（见 test_every_migration_registers_ledger_evidence）。
+        store = Store(self.root)
+        self.addCleanup(store.close)
+        with store.connect() as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='open_runs'").fetchone())
+            # 调度谓词必须走索引而不是 SCAN：project=? 与 open-run 过滤共同命中部分索引。
+            # EXPLAIN QUERY PLAN 的 detail 在第 4 列（id, parent, notused, detail）。
+            bound = [row[3] for row in db.execute(
+                "EXPLAIN QUERY PLAN SELECT project FROM runs WHERE project=? AND ended IS NULL", ("p",))]
+            self.assertTrue(any("open_runs" in detail for detail in bound), bound)
+            self.assertFalse(any("SCAN runs" in detail for detail in bound), bound)
+
     def test_interrupted_bootstrap_is_completed_on_reopen(self):
         """executescript 已提交、补列事务未提交即中断：重开必须补完 bootstrap，不得误判已封版。"""
         from adaptive_rsi.schema_migrations import BOOTSTRAP_SCHEMA

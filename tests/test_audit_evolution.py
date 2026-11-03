@@ -533,6 +533,43 @@ class AuditEvolutionTest(unittest.TestCase):
                             encode({**base_spec, 'overlay': None}), 0, 2.0))
         self.assertNotEqual(signature, evolution.input_signature('p', config))
 
+    def test_stale_running_attempt_does_not_suppress_evolution_forever(self):
+        # record_attempt(...,\"running\") 之后进程崩溃：1 小时后 in_flight 变假，但
+        # attempt.signature==signature 恒成立（running 记录从不更新 signature 也不被清除），
+        # 回归修复前 attempt_due/propose_and_evaluate 永远返回「已评估过相同输入」，自动
+        # 演化永久停摆，且每次任务完成都写 evolution_not_repeated 噪音。
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        base_spec = {'task': 't', 'repository': str(self.root), 'base': 'HEAD', 'checks': []}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('x', 'p', 'f', 'validation', encode({**base_spec, 'overlay': None}), 0, 1))
+        signature = evolution.input_signature('p', config)
+        # 正常窗口内的 running：仍按「进行中」抑制，不得重复提案。
+        evolution.record_attempt('p', signature, 'running', reason='Proposal started')
+        due, _, attempt = evolution.attempt_due('p', config)
+        self.assertFalse(due)
+        self.assertEqual(attempt['status'], 'running')
+        # 把同一条 running 记录直接老化到 3600s 之外（模拟写记录后进程崩溃、
+        # 终态从未落盘）——此时必须视为 stale，允许重新评估。
+        stale = dict(self.store.setting('evolution-attempt:p', {}))
+        stale['at'] = stale['at'] - 3601
+        self.store.put_setting('evolution-attempt:p', stale)
+        due_after, again, _ = evolution.attempt_due('p', config)
+        self.assertTrue(due_after)
+        self.assertEqual(again, signature)
+        # propose_and_evaluate 走同一 dedup gate：过期 running 不计为「已评估」，不再写
+        # evolution_not_repeated，而是进入正常的证据不足/提案流程（本例因用例不足按
+        # insufficient_evidence 收尾并覆盖掉 stale 记录）。
+        run = {'id': 'run', 'config': encode(config)}
+        result = evolution.propose_and_evaluate({'id': 'p'}, self.root / 'w', self.root / 'd', run)
+        self.assertFalse(result.get('repeated'))
+        self.assertIsNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='evolution_not_repeated'"))
+        self.assertNotEqual(self.store.setting('evolution-attempt:p', {}).get('status'), 'running')
+
     def test_vanished_overlay_is_reported_as_changed_input_not_a_valid_manifest(self):
         from tests.test_runtime import fixture, CHECKS
         from adaptive_rsi.gitops import git
