@@ -57,7 +57,7 @@ def merge(*layers):
     result = {}
     for layer in layers:
         if not isinstance(layer, dict):
-            continue
+            raise ValueError("Configuration layer must be an object")
         for key, value in layer.items():
             if isinstance(value, dict) and isinstance(result.get(key), dict):
                 result[key] = merge(result[key], value)
@@ -197,10 +197,7 @@ def validate(config):
             not 0 <= hours[0] < 24 or not 0 <= hours[1] <= 24 or hours[0] == hours[1]):
         raise ValueError("working_hours requires different start/end hours in 0..24; start must be below 24")
     from zoneinfo import ZoneInfo
-    try:
-        ZoneInfo(config["schedule"]["timezone"])
-    except KeyError:
-        raise ValueError("Invalid timezone") from None
+    ZoneInfo(config["schedule"]["timezone"])
     for key, value in config["limits"].items():
         zero_allowed = key in ["retries", "daily_calls", "run_calls", "run_seconds", "max_changed_files",
                                "min_free_disk_mb", "min_available_memory_mb"]
