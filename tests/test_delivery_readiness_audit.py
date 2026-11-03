@@ -458,7 +458,12 @@ class AuthorizationReceiptTest(unittest.TestCase):
             with patch.object(release, 'api', side_effect=case.api), \
                     patch.object(case.runtime.evaluator, 'evaluate', return_value={'decision': 'fail'}):
                 data = release.advance(case.runtime, case.runtime.project(case.project), case.run, outcome)
-            self.assertEqual(data['release']['state'], 'blocked_verification')
+            # 确定性 pin 失败按 retry_at 退避，state 落在可恢复的 blocked 而非
+            # 每 tick 重估的 blocked_verification；仍不得写远端、不得打 head。
+            self.assertEqual(data['release']['state'], 'blocked')
+            self.assertIn('did not pass', data['release']['error'])
+            self.assertGreater(case.runtime.store.setting(
+                'legacy-release-pin:' + case.run['id'] + ':' + target)['retry_at'], time.time())
             self.assertNotIn('head', outcome['feedback'])
             self.assertFalse(any(method != 'GET' for _, method, _ in case.commands))
         finally:
