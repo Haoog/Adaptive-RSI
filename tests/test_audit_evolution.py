@@ -396,6 +396,133 @@ class AuditEvolutionTest(unittest.TestCase):
             self.evolution.update_case('p', 'x', active=True, split='holdout', source='human:review')
         self.assertEqual(len(self.store.query("SELECT * FROM events WHERE kind='case_lifecycle'")), 1)
 
+    def importable_manifest(self, repo, task='replacement task', family='family', split='validation'):
+        from adaptive_rsi.gitops import git
+        return {'family': family, 'split': split, 'repository': str(repo),
+                'base': git(repo, 'rev-parse', 'HEAD'), 'task': task,
+                'checks': [{'name': 'unit', 'cwd': '.', 'argv': ['python3', '-c', 'print(1)']}],
+                'source': 'real'}
+
+    def test_retired_case_releases_its_family_for_reimport(self):
+        """family 唯一性只约束仍参与调度的用例：退休行释放 family，退休行自身原样保留。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': 'sig-old', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('old', 'p', 'family', 'validation', encode(spec), 3, 1))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        self.evolution.runtime.project = lambda project: {'id': project}
+        manifest = self.importable_manifest(repo)
+        new_id = self.evolution.import_case('p', manifest)
+        self.assertNotEqual(new_id, 'old')
+        new_row = self.store.one('SELECT * FROM cases WHERE id=?', (new_id,))
+        self.assertEqual(new_row['family'], 'family')
+        # 退休行保持不变：active 仍为假、uses 与 lifecycle 历史完整。
+        old_row = self.store.one('SELECT * FROM cases WHERE id=?', ('old',))
+        old_spec = json.loads(old_row['spec'])
+        self.assertFalse(old_spec['active'])
+        self.assertEqual(old_row['uses'], 3)
+        self.assertEqual(old_spec['lifecycle'][-1]['source'], 'maintenance:aged')
+        # 同 family 的第三条：现在有一个活跃同 family，再次导入必须拒绝。
+        with self.assertRaisesRegex(ValueError, 'family'):
+            self.evolution.import_case('p', {**manifest, 'task': 'third task'})
+
+    def test_active_same_family_case_still_blocks_import(self):
+        """存在活跃同 family 用例时导入仍被拒绝；退休不改变 signature 互斥。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        # spec.signature 必须与 import_case 重新计算的签名一致，否则命中不了 signature 互斥。
+        signature = fingerprint({'task': 'original task',
+                                 'tree': git(repo, 'rev-parse', base + '^{tree}')})
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': signature, 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('active', 'p', 'family', 'validation', encode(spec), 0, 1))
+        self.evolution.runtime.project = lambda project: {'id': project}
+        manifest = self.importable_manifest(repo)
+        with self.assertRaisesRegex(ValueError, 'family'):
+            self.evolution.import_case('p', manifest)
+        # 退休后 signature 相同的同一任务快照仍不得借退休重入。
+        same_task = self.importable_manifest(repo, task='original task', family='other')
+        self.evolution.update_case('p', 'active', active=False, source='maintenance:aged')
+        with self.assertRaisesRegex(ValueError, 'family'):
+            self.evolution.import_case('p', same_task)
+
+    def test_legacy_inactive_row_holding_family_is_released_during_import(self):
+        """上线前退休或被外部直写 available:false 的遗留行没改过名：import_case 的事务内复检
+        必须在同一事务里把它们释放，否则 INSERT 仍撞 UNIQUE(project,family)。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS, 'available': False,
+                'source': 'real', 'signature': 'sig-legacy', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('legacy', 'p', 'family', 'validation', encode(spec), 2, 1))
+        self.evolution.runtime.project = lambda project: {'id': project}
+        new_id = self.evolution.import_case('p', self.importable_manifest(repo))
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', (new_id,))['family'],
+                         'family')
+        legacy = self.store.one('SELECT family,spec,uses FROM cases WHERE id=?', ('legacy',))
+        self.assertEqual(legacy['family'], 'family-retired-legacy')
+        self.assertEqual(legacy['uses'], 2)
+        self.assertFalse(json.loads(legacy['spec'])['available'])
+
+    def test_reactivation_restores_family_or_rejects_live_replacement(self):
+        """退休改名只释放 family 名，不释放家族身份：原 family 空闲时激活恢复原名；
+        原名已被仍活跃的替代用例占住时拒绝激活，避免同一家族两条活跃行被当成
+        相互独立的评估证据。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': 'sig-old', 'repository': str(repo), 'overlay': None}
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('old', 'p', 'family', 'validation', encode(spec), 3, 1))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # 空闲原名：激活直接恢复 family，而不是带着 -retired-<id> 名继续参与调度。
+        self.evolution.update_case('p', 'old', active=True, source='human:review')
+        row = self.store.one('SELECT family,spec FROM cases WHERE id=?', ('old',))
+        self.assertEqual(row['family'], 'family')
+        self.assertNotIn('origin_family', json.loads(row['spec']))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # 原名被替代用例占住：激活必须被拒绝，退休行保持退休。
+        self.evolution.runtime.project = lambda project: {'id': project}
+        self.evolution.import_case('p', self.importable_manifest(repo))
+        with self.assertRaisesRegex(ValueError, 'occupied|family'):
+            self.evolution.update_case('p', 'old', active=True, source='human:review')
+        row = self.store.one('SELECT family,spec FROM cases WHERE id=?', ('old',))
+        self.assertEqual(row['family'], 'family-retired-old')
+        self.assertFalse(json.loads(row['spec'])['active'])
+
+    def test_reactivation_releases_family_from_inactive_holder(self):
+        """激活时原 family 被另一条非活跃行占住：占住行当场改名释放，激活行恢复原名。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        spec = {'task': 'original task', 'base': base, 'checks': CHECKS,
+                'source': 'real', 'signature': 'sig-old', 'repository': str(repo), 'overlay': None}
+        stale = dict(spec, available=False, signature='sig-stale')
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('old', 'p', 'family', 'validation', encode(spec), 3, 1))
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('stale', 'p', 'other', 'validation', encode(stale), 0, 1))
+        self.evolution.update_case('p', 'old', active=False, source='maintenance:aged')
+        # stale 行不可用却占着 old 的原名：激活时应被改名释放。
+        self.store.execute('UPDATE cases SET family=? WHERE id=?', ('family', 'stale'))
+        self.evolution.update_case('p', 'old', active=True, source='human:review')
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', ('old',))['family'],
+                         'family')
+        self.assertEqual(self.store.one('SELECT family FROM cases WHERE id=?', ('stale',))['family'],
+                         'family-retired-stale')
+
     def test_feedback_is_separate_from_sealed_results(self):
         self.candidate({'trials': [{'case': 'x', 'candidate': {'pass': False}}]})
         self.evolution.record_feedback('c', 'false_positive', 'human:alice', 'late', 'deployment unrelated')
@@ -533,6 +660,55 @@ class AuditEvolutionTest(unittest.TestCase):
                             encode({**base_spec, 'overlay': None}), 0, 2.0))
         self.assertNotEqual(signature, evolution.input_signature('p', config))
 
+    def test_failure_reasons_with_volatile_details_share_one_suppression_signature(self):
+        # 同一根因的两次故障只在临时路径 / run id / provider_request_id 上不同：
+        # 归一化后 input_signature 一致，attempt_due 不再为每次新实例反复付费提案。
+        from adaptive_rsi.config import DEFAULTS, merge
+        config = merge(DEFAULTS, {})
+        runtime = SimpleNamespace(store=self.store, config=lambda project: config,
+                                  active_strategies=lambda project: [])
+        evolution = Evolution(runtime)
+        self.store.execute("INSERT INTO projects(id,name,path,config,paused,created) "
+                           "VALUES ('p','p','/tmp/p','{}',0,0)")
+        task = self.store.add_task('p', 'goal', 'same-fault', 'Same fault', 'same fault')
+
+        def failed_run(run_id, reason, code='execution', action='inspect_details'):
+            self.store.execute('INSERT INTO runs(id,task,project,state,config,started,result) '
+                               'VALUES (?,?,?,?,?,?,?)',
+                               (run_id, task, 'p', 'failed', encode(config), time.time(),
+                                encode({'reason': reason,
+                                        'failure': {'code': code, 'action': action, 'detail': reason}})))
+
+        failed_run('run-a', 'Controlled ablation did not complete: FileNotFoundError: '
+                            '/tmp/bundle-check-Ab3xK9/workspace/case-9f8e7d6c5b4a3f21 missing',
+                   code='environment', action='check_environment')
+        baseline_inputs = evolution.proposal_inputs('p')
+        signature = evolution.input_signature('p', config, baseline_inputs)
+        evolution.record_attempt('p', signature, 'insufficient_evidence')
+
+        # 第二次实例换了临时目录、请求 id 与 UUID；其余输入完全未动。
+        failed_run('run-b', 'Controlled ablation did not complete: FileNotFoundError: '
+                            '/tmp/bundle-check-Zz9yX8/workspace/case-0123456789abcdef missing',
+                   code='environment', action='check_environment')
+        due, again, attempt = evolution.attempt_due('p', config)
+        self.assertFalse(due)
+        self.assertEqual(again, evolution.input_signature('p', config))
+        self.assertEqual(attempt['status'], 'insufficient_evidence')
+        failures = evolution.proposal_inputs('p')['failures']
+        self.assertEqual([item['reason'] for item in failures],
+                         ['Controlled ablation did not complete: FileNotFoundError: '
+                          '<path> missing'])
+        self.assertEqual(failures[0]['code'], 'environment')
+        self.assertNotIn('bundle-check', failures[0]['reason'])
+        self.assertNotIn('9f8e7d6c5b4a3f21', failures[0]['reason'])
+
+        # failure.code/action 真实变化仍要产生新签名：抑制不误伤不同类别故障。
+        failed_run('run-c', 'Controlled ablation did not complete: provider timeout',
+                   code='provider', action='retry_later')
+        self.assertNotEqual(again, evolution.input_signature('p', config))
+        due_changed, _, _ = evolution.attempt_due('p', config)
+        self.assertTrue(due_changed)
+
     def test_stale_running_attempt_does_not_suppress_evolution_forever(self):
         # record_attempt(...,\"running\") 之后进程崩溃：1 小时后 in_flight 变假，但
         # attempt.signature==signature 恒成立（running 记录从不更新 signature 也不被清除），
@@ -655,6 +831,69 @@ class AuditEvolutionTest(unittest.TestCase):
         plain = {**spec, 'overlay': None}
         self.store.execute('UPDATE cases SET spec=? WHERE id=?', (encode(plain), 'case'))
         self.assertTrue(self.evolution.verify_inputs('p', [{**item, 'spec': fingerprint(plain)}])['valid'])
+
+    def two_case_experiment(self):
+        """≥2 用例/集合且 min_cases_per_split=1：返回 (args, 抽中 id 列表, 未抽中 id 列表)。"""
+        from adaptive_rsi.evolution import select_cases
+        from adaptive_rsi.gitops import git
+        from tests.test_runtime import CHECKS
+        args = self.setup_proposal()
+        repo = args[1]
+        base = git(repo, 'rev-parse', 'HEAD')
+        for case, split in (('validation-extra', 'validation'), ('holdout-extra', 'holdout')):
+            spec = {'task': split + ' extra sealed task', 'base': base, 'checks': CHECKS,
+                    'source': 'real', 'signature': case, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               (case, 'p', case, split, encode(spec), 0, 2))
+        limit = self.config['evolution']['max_holdout_uses']
+        eligible = self.evolution.eligible_cases('p', limit)
+        rows = {'validation': [c for c in eligible if c['split'] == 'validation'],
+                'holdout': [c for c in eligible if c['split'] == 'holdout' and c['uses'] == 0]}
+        sampled = sorted({c['id'] for split, cases in rows.items()
+                          for c in select_cases(cases, 1, 'run')})
+        unsampled = sorted(c['id'] for cases in rows.values() for c in cases
+                           if c['id'] not in sampled)
+        self.assertEqual(len(unsampled), 2)
+        return args, sampled, unsampled
+
+    def mutate_cases_during_trials(self, case_ids):
+        """首个付费试验调用返回后对给定用例例行退休，模拟试验窗口期内的维护。"""
+        execute = self.evolution.runtime.execute_candidate
+        def wrapped(*call, **kwargs):
+            result = execute(*call, **kwargs)
+            if self.calls['trial'] == 1:
+                for case_id in case_ids:
+                    self.evolution.update_case('p', case_id, active=False, source='maintenance:test')
+            return result
+        self.evolution.runtime.execute_candidate = wrapped
+
+    def test_unsampled_case_retirement_does_not_void_the_paid_experiment(self):
+        args, _, unsampled = self.two_case_experiment()
+        self.mutate_cases_during_trials(unsampled)
+        result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        verification = evidence['input_verification']
+        self.assertTrue(verification['valid'])
+        self.assertEqual(verification['mismatches'], [])
+        self.assertEqual(sorted(row['case'] for row in verification['unsampled_mismatches']),
+                         unsampled)
+        self.assertNotIn('Sealed experiment inputs', evidence['reason'])
+        self.assertTrue(any('not selected for execution' in item
+                            for item in evidence['promotion_review']['limitations']))
+        self.assertEqual(self.calls['trial'], 8)
+
+    def test_sampled_case_change_still_voids_the_experiment(self):
+        args, sampled, _ = self.two_case_experiment()
+        self.mutate_cases_during_trials([sampled[0]])
+        result = self.evolution.propose_and_evaluate(*args)
+        evidence = self.evidence_of(result['candidate'])
+        verification = evidence['input_verification']
+        self.assertFalse(verification['valid'])
+        self.assertEqual([row['case'] for row in verification['mismatches']], [sampled[0]])
+        self.assertEqual(verification['unsampled_mismatches'], [])
+        self.assertEqual(evidence['decision'], 'insufficient_evidence')
+        self.assertIn('Sealed experiment inputs changed', evidence['reason'])
+        self.assertEqual(result['status'], 'insufficient_evidence')
 
     def test_trial_with_vanished_overlay_cannot_be_recorded_as_pass(self):
         """封存后 overlay 才消失时，试验必须判为不可完成，不能沿用候选自身的 pass。"""
