@@ -476,7 +476,16 @@ def _remove_owned_tree(parent, name):
     directory owning each entry must be made writable before it can be emptied.
     Directory descriptors pin the verified tree: a link swapped in later fails
     O_NOFOLLOW, and unlink/rmdir always act on the recorded parent entry.
+
+    The walk is iterative rather than recursive: dependency trees routinely nest
+    deeper than sys.getrecursionlimit() (node_modules-style paths), where a
+    recursive walk dies on RecursionError and the run can never be cleaned.
+    Only the deepest directory stays open, so depth is also unbounded by the
+    process descriptor limit.  Ascending re-opens ".." and verifies the recorded
+    (device, inode); a parent moved out from under the walk aborts the removal
+    instead of deleting outside the verified tree.
     """
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
     try:
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -484,20 +493,60 @@ def _remove_owned_tree(parent, name):
     if not stat.S_ISDIR(info.st_mode):
         os.unlink(name, dir_fd=parent)
         return
-    descriptor = os.open(name, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) |
-                         getattr(os, 'O_NOFOLLOW', 0), dir_fd=parent)
+    # Frames: [entry name in its parent, device, inode, pending child names].
+    # device/inode and the child list are filled when the directory is scanned.
+    stack = [[name, 0, 0, None]]
+    descriptor = os.open(name, flags, dir_fd=parent)
     try:
-        mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
-        if mode & stat.S_IRWXU != stat.S_IRWXU:
-            # Only directories inside the artifact being removed regain write access.
-            os.fchmod(descriptor, mode | stat.S_IRWXU)
-        with os.scandir(descriptor) as entries:
-            children = [entry.name for entry in entries]
-        for child in children:
-            _remove_owned_tree(descriptor, child)
+        while stack:
+            frame = stack[-1]
+            if frame[3] is None:
+                dirstat = os.fstat(descriptor)
+                frame[1], frame[2] = dirstat.st_dev, dirstat.st_ino
+                mode = stat.S_IMODE(dirstat.st_mode)
+                if mode & stat.S_IRWXU != stat.S_IRWXU:
+                    # Only directories inside the artifact being removed regain
+                    # write access.
+                    os.fchmod(descriptor, mode | stat.S_IRWXU)
+                with os.scandir(descriptor) as entries:
+                    frame[3] = [entry.name for entry in entries]
+            pending = frame[3]
+            descended = False
+            while pending:
+                child = pending.pop()
+                try:
+                    cinfo = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(cinfo.st_mode):
+                    # Files and links alike: the entry itself is unlinked and a
+                    # link target outside the artifact is never followed.
+                    os.unlink(child, dir_fd=descriptor)
+                    continue
+                deeper = os.open(child, flags, dir_fd=descriptor)
+                stack.append([child, 0, 0, None])
+                os.close(descriptor)
+                descriptor = deeper
+                descended = True
+                break
+            if descended:
+                continue
+            stack.pop()
+            if not stack:
+                os.close(descriptor)
+                descriptor = None
+                os.rmdir(frame[0], dir_fd=parent)
+            else:
+                upper = os.open('..', flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = upper
+                pstat = os.fstat(descriptor)
+                if (pstat.st_dev, pstat.st_ino) != (stack[-1][1], stack[-1][2]):
+                    raise NotADirectoryError('artifact tree changed during removal')
+                os.rmdir(frame[0], dir_fd=descriptor)
     finally:
-        os.close(descriptor)
-    os.rmdir(name, dir_fd=parent)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _remove_artifact(directory, name):
