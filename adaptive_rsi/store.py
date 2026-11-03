@@ -596,6 +596,9 @@ class Store:
         """Move provable orphan rows into an audit table without deleting evidence."""
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("Relationship audit limit must be 1..1000")
+        now = time.time()
+        moved = {}
+        has_more = False
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             rows = db.execute("SELECT s.rowid AS original_rowid,s.* FROM stages s LEFT JOIN runs r ON r.id=s.run WHERE r.id IS NULL "
@@ -604,9 +607,34 @@ class Store:
                 evidence = dict(row)
                 original_rowid = evidence.pop("original_rowid")
                 db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) VALUES ('stages',?,?,?)",
-                           (str(original_rowid), encode(evidence), time.time()))
+                           (str(original_rowid), encode(evidence), now))
                 db.execute("DELETE FROM stages WHERE rowid=?", (original_rowid,))
-            return {"stages_without_run": min(len(rows), limit), "has_more": len(rows) > limit}
+            moved["stages_without_run"] = min(len(rows), limit)
+            has_more = has_more or len(rows) > limit
+            # 与 relationship_audit 的 invalid_dependencies 同一判定：依赖指向已删任务、
+            # 任务本身已删、跨项目或自环的行是结构性孤儿。它们让 ready_clause 的
+            # p.id IS NULL 分支把任务永久判为 not-ready；隔离后任务恢复可调度，
+            # 原行留在 relationship_quarantine，受挡任务各得一条事件证据。
+            rows = db.execute("SELECT d.rowid AS original_rowid,d.*,t.project AS task_project "
+                              "FROM task_dependencies d LEFT JOIN tasks t ON t.id=d.task "
+                              "LEFT JOIN tasks p ON p.id=d.dependency "
+                              "WHERE t.id IS NULL OR p.id IS NULL OR t.project IS NOT p.project OR t.id=p.id "
+                              "ORDER BY d.rowid LIMIT ?", (limit + 1,)).fetchall()
+            for row in rows[:limit]:
+                evidence = dict(row)
+                original_rowid = evidence.pop("original_rowid")
+                db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) "
+                           "VALUES ('task_dependencies',?,?,?)",
+                           (str(original_rowid), encode(evidence), now))
+                db.execute("DELETE FROM task_dependencies WHERE rowid=?", (original_rowid,))
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,NULL,?,?,?,?)",
+                           (row["task_project"], "dependency_orphan_quarantined",
+                            "Orphaned dependency reference quarantined; task readiness re-evaluated",
+                            encode({"task": evidence["task"], "dependency": evidence["dependency"]}), now))
+            moved["invalid_dependencies"] = min(len(rows), limit)
+            has_more = has_more or len(rows) > limit
+            moved["has_more"] = has_more
+            return moved
 
     def config_revision(self, project=None):
         row = self.one("SELECT value FROM settings WHERE key=?", ("config-revision:" + (project or "global"),))
@@ -912,12 +940,16 @@ class Store:
             raise ValueError("Invalid span table")
         for row in db.execute("SELECT id,started FROM " + table + " WHERE run=? AND ended IS NULL", (run,)).fetchall():
             began = self._clock_samples.pop((table, row["id"]), None)
-            # _clock_samples 命中时用单调时钟；未命中（如重启后）回落到数据库
-            # started 列。两者都为 NULL 时按 0 计，不产生虚假负数时长。
+            # _clock_samples 命中时用单调时钟。未命中（重启后由新进程收尾、或跨进程
+            # 代收尾）时 span 的真实执行时长无法还原：started 到 death 之间夹了进程
+            # 停机窗口，墙钟差必然高估。phase_times 记 -1 作为「未测量」标记——
+            # 读模型用 max(0,duration) 折算为 0 贡献，phase_seconds 不被停机时长
+            # 抬高；duration<0 可机器判别。remote_waits 语义不同：远端在停机期间
+            # 确实仍在等待，保留墙钟差。started 为 NULL 时按 0 计，不虚构时长。
             if began is not None:
                 elapsed = max(0, time.monotonic() - began)
             elif row["started"] is not None:
-                elapsed = max(0, now - row["started"])
+                elapsed = -1 if table == "phase_times" else max(0, now - row["started"])
             else:
                 elapsed = 0
             db.execute("UPDATE " + table + " SET ended=?,duration=? WHERE id=?", (now, elapsed, row["id"]))

@@ -259,6 +259,25 @@ class OperabilityTest(unittest.TestCase):
         store.put_setting("provider-health:proj01:p2:sig", {"paused": True, "at": stale})
         store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                       ("skillold", "proj01", None, "verified", "[]", "content", "{}", stale, stale))
+        # case-exposure 预留键：候选仍在评估或行仍新鲜时保留；
+        # 候选已落定/不存在且行超过保留期时删除。损坏值按不可判定保留。
+        store.execute("INSERT INTO candidates(id,project,kind,status,content,created) "
+                      "VALUES ('exp-evaluating','proj01','strategy','evaluating','{}',?)", (stale,))
+        store.execute("INSERT INTO candidates(id,project,kind,status,content,created) "
+                      "VALUES ('exp-settled','proj01','strategy','stable','{}',?)", (stale,))
+        store.put_setting("case-exposure:exp-settled:case-a",
+                          {"state": "possible_exposure", "case": "case-a",
+                           "experiment": "exp-settled", "created": stale})
+        store.put_setting("case-exposure:exp-missing:case-a",
+                          {"state": "possible_exposure", "case": "case-a",
+                           "experiment": "exp-missing", "created": stale})
+        store.put_setting("case-exposure:exp-evaluating:case-a",
+                          {"state": "response_observed", "case": "case-a",
+                           "experiment": "exp-evaluating", "created": stale})
+        store.put_setting("case-exposure:exp-fresh:case-a",
+                          {"state": "possible_exposure", "case": "case-a",
+                           "experiment": "exp-fresh", "created": time.time()})
+        store.execute("INSERT INTO settings VALUES ('case-exposure:exp-corrupt:case-a','{broken')")
         self.runtime.maintenance()
         keys = {row["key"] for row in store.query("SELECT key FROM settings")}
         self.assertNotIn("run-baseline:runold01", keys)
@@ -272,6 +291,12 @@ class OperabilityTest(unittest.TestCase):
         self.assertIn("run-baseline:runnew01", keys)
         self.assertIn("task-proof:proj01:def", keys)
         self.assertIn("provider-health:proj01:p2:sig", keys)
+        # 已落定或已删除候选的旧曝光键被回收；在评估候选、新鲜行与损坏行保留。
+        self.assertNotIn("case-exposure:exp-settled:case-a", keys)
+        self.assertNotIn("case-exposure:exp-missing:case-a", keys)
+        self.assertIn("case-exposure:exp-evaluating:case-a", keys)
+        self.assertIn("case-exposure:exp-fresh:case-a", keys)
+        self.assertIn("case-exposure:exp-corrupt:case-a", keys)
         store.put_setting("issue-comments:proj01:7", {"checked_at": stale, "comments": []})
         store.put_setting("issue-comments:proj01:8", {"checked_at": time.time(), "comments": []})
         # maintenance 每小时节流一次；清理新插入的键需要重置门控再跑一轮。
