@@ -21,6 +21,13 @@ ISSUE_SYNC_SECONDS = 20
 # 必然再失败，超上限后移出 pending 并记 issue_sync_quarantined，不再让
 # failures 汇总把整个 sync（含 prs:/ci: 刷新与 summary 事件）永久 wedge。
 ISSUE_SYNC_PENDING_MAX_ATTEMPTS = 3
+# 只有这些状态的任务还会消费暂存的 Issue 快照；其余状态（已交付、评审中、
+# 已终止）写入 pending 只会让重放扫描永不收敛。
+HOLDABLE_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
+                   "deferred", "blocked", "waiting_budget", "failed", "interrupted",
+                   "insufficient_evidence", "rejected", "obsolete", "cancelled", "expired")
+# 取消或中断的任务要等用户明确重试才会再次消费快照，不能自动重放扫描。
+REPLAYABLE_STATES = tuple(state for state in HOLDABLE_STATES if state not in ("cancelled", "interrupted"))
 
 
 def _github_response(text):
@@ -622,8 +629,10 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
                 return body != existing["body"] or encoded_evidence != existing["evidence"]
             if revised:
                 # Keep active runs' evidence immutable. The new revision remains visible for next sync.
-                pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
-                pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
+                # 已交付或已在评审的任务不会消费暂存快照；写进去只会让重放扫描永不收敛。
+                if existing["state"] in HOLDABLE_STATES:
+                    pending[str(number)] = {k: issue[k] for k in ["number", "updated_at", "html_url", "state", "labels"]}
+                    pending[str(number)].update(title=issue["title"][:300], body=(issue["body"] or "")[:30000])
                 if not held or held["updated_at"] != issue["updated_at"]:
                     db.execute("INSERT INTO events(project,kind,message,data,created) VALUES (?,?,?,?,?)",
                                (project["id"], "issue_revision", "Issue changed during execution; recheck before delivery",

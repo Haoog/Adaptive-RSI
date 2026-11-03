@@ -1062,6 +1062,18 @@ class IssueRequirementsTest(unittest.TestCase):
         self.synchronize()
         self.assertEqual(self.task()["state"], "queued")
 
+    def test_issue_edit_under_pr_open_does_not_leave_a_replaying_snapshot(self):
+        self.runtime.pause(self.project_id, False)
+        run = self.store.claim(self.project_id, self.config)
+        self.store.transition(run["id"], "pr_open", {"pr": "https://example/pull/1"}, False)
+        self.issue.update(body="edited while pr open", updated_at=self.issue["updated_at"] + "1")
+        self.synchronize()
+        progress = self.store.setting("issue-sync:" + str(self.project_id))
+        self.assertEqual(progress["pending"], {})
+        self.runtime.schedule(self.project_id, self.config)
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE project=? AND source='system_issues'",
+                                         (self.project_id,)))
+
     def test_failed_update_blocks_candidate_before_failure_is_reported(self):
         self.runtime.pause(self.project_id, False)
         run = self.store.claim(self.project_id, self.config)

@@ -111,6 +111,10 @@ def _pr_feedback_prefix(project, task):
     return "pr-feedback:" + hashlib.sha256(identity).hexdigest() + ":"
 
 
+BOT_LOGINS = {"github-actions", "dependabot", "renovate", "copilot-pull-request-reviewer",
+              "copilot", "codex", "chatgpt-codex-connector"}
+
+
 def record_pr_feedback(store, run, url, pr):
     """Append distinct observations without changing task state or run evidence."""
     observations = []
@@ -119,8 +123,10 @@ def record_pr_feedback(store, run, url, pr):
             if isinstance(row, dict) and isinstance(row.get("body"), str):
                 author = row.get("author") or {}
                 login = author.get("login", "").lower() if isinstance(author, dict) else ""
-                if kind == "comment" and (login.endswith("[bot]") or login in ("github-actions", "dependabot", "renovate") or
-                                          "<!-- gh-aw-agentic-workflow:" in row["body"]):
+                # 自动账号的评论与评审都不能驱动重排，否则一个自动评审机器人
+                # 就能反复关掉交付 PR；人类反馈照常处理。
+                if (login.endswith("[bot]") or login in BOT_LOGINS or
+                        "<!-- gh-aw-agentic-workflow:" in row["body"]):
                     continue
                 fallback = row.get("url") or encode([author, row.get("createdAt"), row.get("submittedAt"), row.get("commit")])
                 observations.append({"kind": kind, "id": row.get("id") or fallback, "body": row["body"],
@@ -138,15 +144,16 @@ def record_pr_feedback(store, run, url, pr):
     prefix = _pr_feedback_prefix(run["project"], run["task"])
     actionable = []
     for item in observations:
-        identity_data = ["ci", item["name"], item["state"]] if item["kind"] == "ci" else [url, item]
+        # CI 身份按运行区分：同一个 PR 反复观测不会重排，新一轮尝试仍能重排一次。
+        identity_data = ["ci", run["id"], item["name"], item["state"]] if item["kind"] == "ci" else [url, item]
         identity = prefix + hashlib.sha256(encode(identity_data).encode("utf-8")).hexdigest()
         item.update(run=run["id"], pr=url)
         payload = encode(item)
         key = prefix + hashlib.sha256(payload.encode("utf-8")).hexdigest()
         store.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, payload))
-        if item["kind"] == "ci" or (item["kind"] == "comment" and item["body"].strip()) or (
-                item["kind"] == "review" and (item.get("state") == "CHANGES_REQUESTED" or
-                                               (item.get("state") not in ("APPROVED", "DISMISSED") and item["body"].strip()))):
+        # 只有客观信号才重排：失败检查，或人类明确请求修改。普通评论（包括
+        # 「LGTM」这类赞许）只作为后续规划的上下文，不能关掉本可合并的 PR。
+        if item["kind"] == "ci" or (item["kind"] == "review" and item.get("state") == "CHANGES_REQUESTED"):
             actionable.append(identity)
     return actionable
 

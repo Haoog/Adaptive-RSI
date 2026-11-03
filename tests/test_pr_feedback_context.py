@@ -14,9 +14,11 @@ class PRFeedbackContextTest(unittest.TestCase):
             pr = {"comments": [
                 {"author": {"login": "alice"}, "body": "Please fix", "createdAt": "2026-11-02T04:49:25Z", "url": "https://github.com/o/r/pull/1#issuecomment-1"},
                 {"author": {"login": "github-actions"}, "body": "Automated notice", "id": "IC_bot"}],
-                "reviews": [{"author": {"login": "copilot-pull-request-reviewer"}, "body": "Fix this", "state": "COMMENTED", "submittedAt": "2026-11-02T04:49:17Z", "commit": {"oid": "abc"}}]}
+                "reviews": [{"author": {"login": "bob"}, "body": "Fix this", "state": "COMMENTED", "submittedAt": "2026-11-02T04:49:17Z", "commit": {"oid": "abc"}},
+                            {"author": {"login": "copilot-pull-request-reviewer"}, "body": "Automated review", "state": "CHANGES_REQUESTED"}]}
             keys = record_pr_feedback(store, run, "pr", pr)
-            self.assertEqual(len(keys), 2)
+            # 评论只是上下文；只有人类明确请求修改才会驱动重排。
+            self.assertEqual(keys, [])
             self.assertEqual({row["body"] for row in pr_feedback_context(store, "p", "t")}, {"Please fix", "Fix this"})
             store.close()
 

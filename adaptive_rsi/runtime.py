@@ -951,7 +951,11 @@ class Runtime(Maintenance):
                                       "WHERE r.project=? AND r.ended IS NULL", (project,))
             held_tasks = self.store.query("SELECT fingerprint,state FROM tasks WHERE project=? AND source='issue'", (project,))
             held_states = {row["fingerprint"]: row["state"] for row in held_tasks if row["fingerprint"] in held_keys}
-            replayable = any(held_states.get(key) not in ("cancelled", "interrupted") for key in held_keys)
+            from .discovery import REPLAYABLE_STATES
+            # 只有仍会消费暂存快照的任务才值得重放；否则每个 tick 都会重启扫描。
+            # 找不到对应任务（例如新建失败）时仍要重放；只有明确不会消费快照的
+            # 状态（已交付、评审中、取消、中断）才不算。
+            replayable = any(held_states.get(key, "queued") in REPLAYABLE_STATES for key in held_keys)
             if (not any(row["source"] == "system_issues" for row in active) and
                     not any(row["fingerprint"] in held_keys for row in active) and
                     replayable):
