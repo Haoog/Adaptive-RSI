@@ -355,6 +355,7 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
     changed, complete = 0, False
     seen = set()
     pending = progress.get("pending", {})
+    prior_failures = progress.get("failures", 0)
     failures = []
 
     def note_failure(issue, exc):
@@ -594,10 +595,13 @@ def sync(runtime, project, config, checked, cancel=None, run_id=None):
             # Overlap catches updates made while this cycle was draining. A page
             # with skipped rows keeps the previous since watermark instead of
             # this cycle's start, so the next incremental scan re-reads them.
+            # prior_failures carries the same guard across continuation pages.
+            has_failures = failures or prior_failures
             progress = {"repository": repo, "policy": policy,
-                        "since": progress["started"] if not failures else progress.get("since"),
+                        "since": progress["started"] if not has_failures else progress.get("since"),
                         "page": 1}
         progress["pending"] = pending
+        progress["failures"] = len(failures)
         store.put_setting(key, progress)
         if complete:
             break

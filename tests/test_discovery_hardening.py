@@ -301,6 +301,48 @@ class DiscoveryHardeningTest(unittest.TestCase):
             self.assertIn("sync continues next cycle", third["message"])
         self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='issue'")), 101)
 
+    def test_skipped_issue_keeps_since_watermark_across_continuation_cycles(self):
+        # 上一周期末页前跳过一行后按页预算退出；下一周期从中间页续扫到末页时，
+        # progress["failures"] 必须把「有跳过」带进 since 判定，否则末页重建会用本轮
+        # started 覆盖旧水印，被跳过行的 updated_at 早于新 since 而永久漏读。
+        seed = [self.issue(number=1)]
+        self.synchronize(seed)
+        progress = self.store.setting("issue-sync:p")
+        progress["since"] = "watermark-before-partial-scan"
+        self.store.put_setting("issue-sync:p", progress)
+
+        def make(number):
+            return {"number": number, "title": "Issue " + str(number), "body": "body",
+                    "labels": [], "state": "open", "updated_at": "2026-11-01T00:00:00Z",
+                    "html_url": "https://github.com/owner/project/issues/" + str(number)}
+
+        def bad(number):
+            row = make(number)
+            del row["labels"]          # apply() 内抛 KeyError → note_failure，行不完整不进 pending
+            return row
+
+        page1 = [make(n) for n in range(2, 52)] + [bad(52)] + [make(n) for n in range(53, 102)]
+        page2 = [make(n) for n in range(102, 104)]
+
+        def checked(args, **kwargs):
+            page = int(next(v.split("=", 1)[1] for v in args if v.startswith("page=")))
+            return encode(page1 if page == 1 else page2)
+
+        key = "issue-sync:p"
+        with patch("adaptive_rsi.discovery.ISSUE_SYNC_MAX_PAGES", 1):
+            # 第一周期只读 page1(满页，非 complete):52 号跳过、failures=1 落库后 break 抛出。
+            with self.assertRaises(KeyError):
+                sync(self.runtime, self.project, self.config, checked)
+            self.assertEqual(self.store.setting(key)["since"], "watermark-before-partial-scan")
+            self.assertEqual(self.store.setting(key)["failures"], 1)
+            self.assertEqual(self.store.setting(key)["page"], 2)
+            # 第二周期从 page2 续扫，末页全好且本轮无新失败。prior_failures 必须保留旧水印。
+            sync(self.runtime, self.project, self.config, checked)
+            self.assertEqual(self.store.setting(key)["since"], "watermark-before-partial-scan")
+            self.assertEqual(self.store.setting(key)["page"], 1)
+            self.assertEqual(self.store.setting(key)["failures"], 0)
+        self.assertIsNone(self.store.one("SELECT id FROM tasks WHERE fingerprint='issue:owner/project:52'"))
+
     def add_related(self, task_id, title, paths, result=None, updated=1, state="merged"):
         self.store.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,state,updated) "
                            "VALUES (?,'p','inspection',?,?,'',?,?,?)",
@@ -708,7 +750,14 @@ class IssueRequirementsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "30000"):
             self.update("x" * 30000)
         self.assertEqual(self.task(), before)
-        self.assertEqual(self.store.setting("issue-sync:" + self.project_id), progress)
+        # 任务与游标业务字段（since/page/pending/policy）随写入回滚不变；唯一新增的是
+        # failures 审计计数——本次跳过被持久化，下一轮 sync() 读到 prior_failures 后
+        # 继续回退 since 水印重读该行，这正是跨周期漏读防护要的效果。
+        after = dict(self.store.setting("issue-sync:" + self.project_id))
+        self.assertEqual(after.pop("failures"), progress.get("failures", 0) + 1)
+        expected = dict(progress)
+        expected.pop("failures", None)
+        self.assertEqual(after, expected)
         self.update("shortened")
         self.assertEqual(self.task()["body"], "shortened\n\nlocal")
 
