@@ -1410,7 +1410,11 @@ class AuthSessions:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
                 if backend == "codex":
-                    _write_json(_codex_path(), data)
+                    # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
+                    # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
+                    merged = _read_json_for_write(_codex_path())
+                    merged.update(data)
+                    _write_json(_codex_path(), merged)
                 elif modern:
                     worker.install_credential(provider, value)
                 else:
