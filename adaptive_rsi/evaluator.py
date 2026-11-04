@@ -1010,7 +1010,14 @@ class Evaluator:
         """
         if not key:
             return None
-        if any(row.get("error") or UNAVAILABLE_OUTPUT.search(row.get("stderr") or "") for row in rows):
+        # Execution-layer failures leave no trustworthy baseline to reuse, and a
+        # failed check whose stderr reports a missing executable means the
+        # environment was unavailable. A check that passed can still mention
+        # that text (Go's os/exec reports absent tools this way), so only
+        # non-passing rows may veto the whole write.
+        if any(row.get("error") or
+               (not row.get("passed") and UNAVAILABLE_OUTPUT.search(row.get("stderr") or ""))
+               for row in rows):
             return None
         compact = []
         for row in rows:
