@@ -1,6 +1,7 @@
 """Stable health observations apply to all endpoints and both delivery directions."""
 import json
 import threading
+import time
 from pathlib import Path
 import tempfile
 import unittest
@@ -59,6 +60,62 @@ class DeploymentObservationTest(unittest.TestCase):
         with patch('urllib.request.build_opener', side_effect=OSError('connection failed')):
             report = direct_health_check(self.policy['health_url'], self.data['sha'])
         self.assertIsNone(report['healthy'])
+
+    def test_body_that_outlasts_the_total_deadline_is_unknown_not_unhealthy(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from adaptive_rsi.release import direct_health_check
+        payload = json.dumps({'sha': self.data['sha'], 'healthy': True}).encode()
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                try:
+                    for byte in payload:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(.02)
+                except OSError:
+                    pass
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01})
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        report = direct_health_check('http://127.0.0.1:%d/' % server.server_port, self.data['sha'], timeout=.8)
+        self.assertIsNone(report['healthy'])
+        self.assertIn('total deadline', report['error'])
+
+    def test_answered_content_errors_remain_conclusive_failures(self):
+        from adaptive_rsi.release import direct_health_check
+        class Response:
+            status = 200
+            def __init__(self, body):
+                self.body = body
+            def read1(self, size):
+                body, self.body = self.body, b''
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+        class Opener:
+            def __init__(self, body):
+                self.body = body
+            def open(self, request, timeout=None):
+                return Response(self.body)
+        for body in (json.dumps({'sha': 'c' * 40, 'healthy': True}),
+                     json.dumps({'sha': self.data['sha'], 'healthy': False}),
+                     json.dumps({'sha': self.data['sha']})):
+            with self.subTest(body=body), patch('urllib.request.build_opener', return_value=Opener(body.encode())):
+                report = direct_health_check(self.policy['health_url'], self.data['sha'], timeout=5)
+            self.assertIs(report['healthy'], False)
+            self.assertTrue(report['error'])
 
     def test_rollback_unknown_preserves_ownership(self):
         from adaptive_rsi.release import deployment_terminal

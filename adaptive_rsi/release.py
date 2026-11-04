@@ -932,6 +932,10 @@ def health_check(url, sha, timeout=15):
                 "error": "Health transport failed or exceeded its total deadline"}
 
 
+class _HealthDeadlineExceeded(ValueError):
+    """The endpoint did not finish answering within the total deadline; its health stays unknown."""
+
+
 def direct_health_check(url, sha, timeout=15):
     class SameOrigin(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
@@ -948,7 +952,7 @@ def direct_health_check(url, sha, timeout=15):
             body = bytearray()
             while len(body) <= 65536:
                 if time.monotonic() >= deadline:
-                    raise ValueError("Deployment health check exceeded the total deadline")
+                    raise _HealthDeadlineExceeded("Deployment health check exceeded the total deadline")
                 chunk = response.read1(min(8192, 65537 - len(body))) if hasattr(response, "read1") else response.read(8192)
                 if not chunk:
                     break
@@ -960,6 +964,9 @@ def direct_health_check(url, sha, timeout=15):
                 raise ValueError("Health response must confirm the exact deployment SHA and healthy status")
             result["healthy"] = response.status == 200
             result["status_code"] = response.status
+    except _HealthDeadlineExceeded as exc:
+        result["healthy"] = None
+        result["error"] = str(exc)[:500]
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         if not isinstance(exc, urllib.error.HTTPError):
             result["healthy"] = None
