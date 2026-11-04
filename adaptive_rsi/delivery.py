@@ -559,7 +559,7 @@ def publish(runtime, project, task, run, workspace, config):
     return url
 
 
-def monitoring_due(outcome, config, now):
+def monitoring_due(outcome, config, now, polled=None):
     from .storage_tools import pending_investigation
     feedback_record = outcome.get("feedback")
     if not isinstance(feedback_record, dict):
@@ -568,9 +568,30 @@ def monitoring_due(outcome, config, now):
         return True
     if outcome.get("monitoring_completed"):
         return False
+    if polled is None:
+        polled = outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0))
     return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
-            now - outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0)) >=
-            config["delivery"]["feedback_minutes"] * 60)
+            now - polled >= config["delivery"]["feedback_minutes"] * 60)
+
+
+def _last_poll(store, run, outcome):
+    """上次反馈轮询时间。心跳写入 settings，避免仅为一个时间戳重写整行 runs.result。"""
+    record = outcome.get("feedback")
+    if not isinstance(record, dict):
+        record = {}
+    return max(store.setting("feedback-polled:" + run["id"], 0) or 0,
+               outcome.get("feedback_polled_at", 0) or 0,
+               record.get("checked_at", 0) or 0)
+
+
+def _persist_result(store, run, outcome):
+    """仅在编码结果真正变化时写 runs.result；无新证据的 tick 不得整行重写。"""
+    encoded = encode(outcome)
+    if encoded == (run["result"] or "{}"):
+        return False
+    store.execute("UPDATE runs SET result=? WHERE id=?", (encoded, run["id"]))
+    run["result"] = encoded  # 同一 tick 后续调用不再重复写入相同内容。
+    return True
 
 
 def _update_pr_task(store, run, state, now):
@@ -846,7 +867,8 @@ def schedule(runtime, now=None):
                 # error once and clears it when the row becomes readable again.
                 raise ValueError("Delivery run result is not valid JSON")
             if (run["state"] in ["pr_open", "superseded"] or pending(runtime, run) or
-                    monitoring_due(outcome, runtime.config(run["project"]), now)):
+                    monitoring_due(outcome, runtime.config(run["project"]), now,
+                                   _last_poll(store, run, outcome))):
                 projects.add(run["project"])
     for project_id in projects:
         with runtime.scheduler_scope("delivery_project", project_id):
@@ -911,7 +933,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     _recover_superseded_receipt(runtime, project, run, config, now)
                 continue
             if (run["state"] == "merged" and outcome.get("monitoring_completed") and
-                    not monitoring_due(outcome, config, now) and not pending(runtime, run)):
+                    not monitoring_due(outcome, config, now, _last_poll(store, run, outcome)) and
+                    not pending(runtime, run)):
                 # 监控已结束且没有发布/部署待办的合并运行不再逐轮重付策略读取、
                 # origin 探测与 feedback/advance 调用；新出现的调查或自动化待办
                 # 会让本行回到完整跟踪路径。
@@ -1158,7 +1181,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
-                store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+                _persist_result(store, run, outcome)
             if outcome.get("merged_sha"):
                 active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
                 feedback(runtime, project, run, outcome, config, now,
@@ -1166,7 +1189,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                          shared=tick_baselines)
                 from .release import advance
                 outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
-            store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            _persist_result(store, run, outcome)
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
 
@@ -1191,22 +1214,87 @@ def parsed_result(run):
     return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
 
 
+def bounded_failures(evaluation):
+    """至多 5 条失败检查，name 截 200 字符、输出截尾部 1200 字符（沿用调查任务的既有裁法）。"""
+    checks = evaluation.get("checks") if isinstance(evaluation, dict) else None
+    if isinstance(checks, list):
+        # 复用的既有摘要保持结构，但仍逐条裁剪，避免历史行把无界数据带回来。
+        return [{"group": str(row.get("group", ""))[:200], "name": str(row.get("name", ""))[:200],
+                 "output": str(row.get("output", ""))[:1200]} for row in checks[:5] if isinstance(row, dict)]
+    if not isinstance(checks, dict):
+        return []
+    failures = []
+    for label, rows in checks.items():
+        if not isinstance(rows, list):
+            continue
+        for check in rows:
+            if isinstance(check, dict) and not check.get("passed"):
+                failures.append({"group": str(label)[:200], "name": str(check.get("name", ""))[:200],
+                                 "output": (str(check.get("stderr", "")) + str(check.get("stdout", "")))[-1200:]})
+                if len(failures) == 5:
+                    return failures
+    return failures
+
+
+def bounded_evaluation(result, report=""):
+    """runs.result 只保留有界摘要；完整报告留在 evaluator 已写好的 report.json。"""
+    bounded = {"decision": result.get("decision") if isinstance(result, dict) else None,
+               "checks": bounded_failures(result)}
+    previous = result.get("report") if isinstance(result, dict) else None
+    path = previous if isinstance(previous, str) and previous else report
+    if path:
+        bounded["report"] = path
+    return bounded
+
+
+def bounded_record(record):
+    """历史行内联的完整评估裁成有界摘要，避免工件缺失时在 previous 链里再复制一份。"""
+    if not isinstance(record, dict):
+        return {}
+    bounded = dict(record)
+    evaluation = bounded.get("evaluation")
+    if isinstance(evaluation, dict) and isinstance(evaluation.get("checks"), dict):
+        bounded["evaluation"] = bounded_evaluation(evaluation)
+    investigation = bounded.get("investigation_report")
+    if isinstance(investigation, dict):
+        bounded["investigation_report"] = bounded_record(investigation)
+    return bounded
+
+
+def artifact_evaluation(runtime, run, record):
+    """读取摘要指向的完整评估报告；工件缺失时返回 None，由调用方退回有界摘要。"""
+    from .storage_tools import run_artifact_path
+    evaluation = record.get("evaluation") if isinstance(record, dict) else None
+    relative = None
+    if isinstance(evaluation, dict) and isinstance(evaluation.get("report"), str):
+        relative = evaluation["report"]
+    elif isinstance(record, dict) and isinstance(record.get("report"), str):
+        relative = record["report"]
+    if not relative:
+        return None
+    try:
+        value = json.loads(run_artifact_path(runtime.store, run, relative).read_text(encoding="utf-8"))
+    except (ValueError, OSError, RuntimeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=None):
-    if not monitoring_due(outcome, config, now):
+    if not monitoring_due(outcome, config, now, _last_poll(runtime.store, run, outcome)):
         return
     from .storage_tools import pending_investigation
     if pending_investigation(outcome.get("feedback", {})) is not None:
         investigate(runtime, project, run, outcome)
-        if not monitoring_due(outcome, config, now):
+        if not monitoring_due(outcome, config, now, _last_poll(runtime.store, run, outcome)):
             return
     # Expiration ends monitoring even when its local artifacts were not restored.
     # Pending investigations above must finish (or remain retryable) before completion.
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
-        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        _persist_result(runtime.store, run, outcome)
         return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
-    if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
+    if now - _last_poll(runtime.store, run, outcome) < config["delivery"]["feedback_minutes"] * 60:
         return
     try:
         saved = json.loads(run["config"] or "{}")
@@ -1216,16 +1304,15 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         saved = {}
 
     def missing_artifacts():
-        previous = outcome.get("feedback")
-        if not isinstance(previous, dict):
-            previous = {}
+        previous = bounded_record(outcome.get("feedback"))
         outcome["feedback_polled_at"] = now
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
-            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            _persist_result(runtime.store, run, outcome)
             runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
         else:
-            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            # 同一结论仍要推进轮询时间戳，避免每个 tick 重新扫描工件。
+            _persist_result(runtime.store, run, outcome)
 
     try:
         output_name = "feedback/" + str(time.time_ns()) + "-" + uid()
@@ -1287,7 +1374,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     # re-evaluates the merge commit instead of freezing the run out of release.
     merge_current = (isinstance(merge_record, dict) and merge_record.get("sha") == merged_sha and
                      merge_record.get("state") in {"verified", "regressed"})
-    if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
+    if now - _last_poll(runtime.store, run, outcome) < config["delivery"]["feedback_minutes"] * 60:
         return
     identity = runtime.store.setting("run-baseline:" + run["id"])
     if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
@@ -1306,8 +1393,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     if branch != identity["branch"]:
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
     if previous.get("head") == head and merge_current:
-        outcome["feedback_polled_at"] = now
-        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        # 只有心跳变化：写独立 settings 键，不重写整行 runs.result。
+        runtime.store.put_setting("feedback-polled:" + run["id"], now)
         return
     try:
         # Fetching can take time; recheck destinations before exclusively creating output.
@@ -1393,13 +1480,18 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                                             changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
-    outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
-                           "attribution": failure_attribution(merged_sha, head, result)}
+    # 完整报告已由 evaluator 写进 run 工件；行内只保留 decision 与有界失败摘要。
+    report_path = "" if result is reused else output_name + "/evaluation/report.json"
+    attribution = (previous["attribution"] if result is reused and isinstance(previous.get("attribution"), dict)
+                   else failure_attribution(merged_sha, head, result))
+    outcome["feedback"] = {"state": state, "head": head, "checked_at": now,
+                           "evaluation": bounded_evaluation(result, report_path),
+                           "attribution": attribution}
     if merge_record is not None:
         outcome["feedback"]["merge"] = merge_record
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
         outcome["feedback"]["investigation_pending"] = True
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
     runtime.store.event("postmerge", "Post-merge verification: " + outcome["feedback"]["state"], project["id"], run["id"])
     if outcome["feedback"].get("investigation_pending"):
         investigate(runtime, project, run, outcome)
@@ -1414,20 +1506,19 @@ def investigate(runtime, project, run, outcome):
     report = pending_investigation(feedback_status)
     if report is None:
         return
-    failures = []
     evaluation = report.get("evaluation")
     if not isinstance(evaluation, dict):
         evaluation = {}
-    report_checks = evaluation.get("checks")
-    if not isinstance(report_checks, dict):
-        report_checks = {}
-    for label, rows in report_checks.items():
-        if not isinstance(rows, list):
-            continue
-        for check in rows:
-            if isinstance(check, dict) and not check.get("passed") and len(failures) < 5:
-                failures.append({"group": label, "name": str(check.get("name", ""))[:200],
-                                 "output": (str(check.get("stderr", "")) + str(check.get("stdout", "")))[-1200:]})
+    if not isinstance(evaluation.get("checks"), dict):
+        # 新行只带决策与有界摘要，完整报告在 evaluator 已写好的 report.json 里；
+        # 工件缺失或历史行内联完整报告时退回行内摘要，调查任务仍可创建。
+        evaluation = artifact_evaluation(runtime, run, report) or evaluation
+    failures = bounded_failures(evaluation)
+    summary = evaluation.get("checks")
+    if not failures and isinstance(summary, list):
+        failures = [{"group": str(row.get("group", ""))[:200], "name": str(row.get("name", ""))[:200],
+                     "output": str(row.get("output", ""))[:1200]}
+                    for row in summary[:5] if isinstance(row, dict)]
     report_head = report.get("head")
     if not isinstance(report_head, str):
         report_head = "unknown"
@@ -1441,5 +1532,5 @@ def investigate(runtime, project, run, outcome):
     report["investigation_pending"] = False
     report["investigation_task"] = task
     feedback_status.update(investigation_pending=False, investigation_task=task)
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
     runtime.wake.set()
