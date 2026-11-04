@@ -91,22 +91,22 @@ def _reclaim_database(store, dispatch_lock):
 PLANNER_STAT_TABLES = ("events",)
 PLANNER_OPTIMIZE_PRAGMA = "PRAGMA optimize=0x10002"
 PLANNER_OPTIMIZE_ALL_TABLES = sqlite3.sqlite_version_info >= (3, 46, 0)
-PLANNER_ANALYSIS_LIMIT = 1000
 
 
 def _analyze_tables(db, tables):
-    """ANALYZE ``tables`` with a per-index sample cap where SQLite supports it.
+    """ANALYZE ``tables`` in full so real index cardinalities reach the planner.
 
-    ``analysis_limit`` exists from 3.32.0; older builds ignore the unknown pragma
-    and analyze fully, which is still correct, only slower.
+    ``PRAGMA analysis_limit`` would sample instead of scanning, and sampled
+    ``sqlite_stat1`` rows collapse the two candidate indexes of the events
+    lookup into the same per-prefix count (120k rows report ~1000 per ``kind``
+    and per ``project``), so the planner keeps ``project_events`` plus a
+    ``TEMP B-TREE`` for ``GROUP BY kind`` instead of scanning the covered
+    ``event_kind_created``.  Only the bounded maintenance tables are analyzed
+    here and a full pass is cheap (120k rows in well under a second).
     """
-    db.execute("PRAGMA analysis_limit=%d" % PLANNER_ANALYSIS_LIMIT)
-    try:
-        # 表名来自上面的常量元组，不拼接外部输入。
-        for table in tables:
-            db.execute("ANALYZE %s" % table)
-    finally:
-        db.execute("PRAGMA analysis_limit=0")
+    # 表名来自上面的常量元组，不拼接外部输入。
+    for table in tables:
+        db.execute("ANALYZE %s" % table)
 
 
 def refresh_query_planner(store):
