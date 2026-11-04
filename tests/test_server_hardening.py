@@ -477,6 +477,20 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(sum(status == 401 for status, _, _ in responses), 30)
         self.assertEqual(sum(status == 429 for status, _, _ in responses), 12)
         self.assertTrue(all("Retry-After" in headers for status, headers, _ in responses if status == 429))
+        denied = [json.loads(payload) for status, _, payload in responses if status == 401]
+        limited = [json.loads(payload) for status, _, payload in responses if status == 429]
+        self.assertTrue(all(payload["error_code"] == "session_required" for payload in denied))
+        self.assertTrue(all(payload["error_code"] == "session_required_rate_limited" for payload in limited))
+        # 限流只抑制 API；首次打开控制台的人仍须看到唯一的恢复指引，而不是一行英文 JSON。
+        for path in ["/", "/index.html"]:
+            status, headers, payload = self.request(path, authenticated=False)
+            self.assertEqual(status, 429)
+            self.assertTrue(headers["Content-Type"].startswith("text/html"))
+            self.assertIn("Retry-After", headers)
+            self.assertIn("python3 scripts/rsi open", payload.decode())
+        status, headers, _ = self.request("/api/health", authenticated=False)
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers)
         self.assertEqual(self.request()[0], 200)
         self.assertEqual(self.request("/?token=" + self.server.token, authenticated=False)[0], 303)
         self.assertEqual(self.request("/login.css", authenticated=False)[0], 200)

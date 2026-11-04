@@ -352,10 +352,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def authentication_failure(self):
         retry = self.server.security_failure("session_required", authentication=True)
+        login_page = self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]
         if retry:
-            self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
-                         429, headers={"Retry-After": str(retry)})
-        elif self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+            # 限流只抑制 API 请求；登录页是恢复入口，必须继续可见，否则第三方坏请求
+            # 会把「去终端复制带 token 的地址」这条唯一指引藏起来。
+            if login_page:
+                self.respond(self.server.assets["login.html"], 429, "text/html; charset=utf-8",
+                             headers={"Retry-After": str(retry)})
+            else:
+                self.respond({"error": "Too many authentication failures",
+                              "error_code": "session_required_rate_limited"},
+                             429, headers={"Retry-After": str(retry)})
+        elif login_page:
             self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
         else:
             self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)
