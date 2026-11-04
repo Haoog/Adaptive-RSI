@@ -662,6 +662,11 @@ def _reconciliation_view(kind, target, data, repo, selectable=None):
         "candidate_count": total,
         "candidates": reconciliation.get("candidates") or [],
         "manual_reconciliation": data.get("manual_reconciliation"),
+        # Abandoning is the only exit once GitHub stopped exposing the workflow
+        # (404 on the listing or on the recorded run).
+        "can_abandon": bool(target == "operation" and data.get("state") in RECONCILIATION_UNKNOWN and
+                            (data.get("remote_visibility") or {}).get("state") in
+                            {"workflow_not_visible", "run_not_visible"}),
     }
     if selectable is not None:
         view["selectable_candidates"] = [item for item in selectable if isinstance(item, dict)][:RECONCILIATION_SELECTABLE_LIMIT]
@@ -830,6 +835,67 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
         return {"kind": kind, "target": target, "state": target_data.get("state"), "operation": data,
                 "candidates": target_data.get("reconciliation", {}).get("candidates", []),
                 "manual_reconciliation": audit}
+
+
+def abandon(runtime, project_id, run_id, kind, reason, target="operation", source="console"):
+    """Close an unconfirmed workflow start that GitHub no longer exposes.
+
+    ``dispatch_unknown``/``rerun_unknown`` only ends through reconciliation, but
+    once the workflow file or the recorded run answers 404 there is no run left
+    to bind. This is the single operator exit: it requires a written reason,
+    re-reads GitHub first and refuses whenever a run is still visible, then
+    records ``failed`` plus an audit entry. It never dispatches or reruns.
+    """
+    note = reason.strip()[:500] if isinstance(reason, str) else ""
+    if not note:
+        raise ReconciliationRejected("An operator reason is required to abandon an unconfirmed operation")
+    if target != "operation":
+        raise ReconciliationRejected("Only an unconfirmed workflow start can be abandoned")
+    origin = source if isinstance(source, str) and re.fullmatch(r"[a-z_]{1,32}", source) else "console"
+    with runtime.automation_lock_for(project_id, kind):
+        project, run, saved, policy, data, target_data, original = _reconciliation_operation(
+            runtime, project_id, run_id, kind, target)
+        repo = _reconciliation_repository(runtime, project, saved, target_data)
+        _require_unknown(target_data)
+        existing = _run_number(target_data.get("workflow_run_id"))
+        remote = _existing_remote(repo, target_data) if existing else None
+        remotes = [] if existing else (_remote_runs(repo, target_data, force=True) or [])
+        if isinstance(remote, dict) or remotes:
+            raise ReconciliationRejected("GitHub still exposes this workflow; reconcile the visible run instead of abandoning it")
+        visibility = (target_data.get("remote_visibility") or {}).get("state")
+        if visibility not in {"workflow_not_visible", "run_not_visible"}:
+            raise ReconciliationRejected("GitHub still exposes this workflow; wait for its run instead of abandoning it")
+        now = time.time()
+        reconciliation = target_data.get("reconciliation") if isinstance(target_data.get("reconciliation"), dict) else {}
+        audit = _audit_entry({
+            "at": now, "source": origin, "repository": repo, "candidate_count": 0, "candidates": [],
+            "workflow": target_data.get("workflow"), "ref": target_data.get("ref"),
+            "operation_id": target_data.get("operation_id"), "sha": target_data.get("sha"),
+            "workflow_sha": target_data.get("workflow_sha"),
+            "previous": {"state": target_data.get("state"), "error": target_data.get("error", ""),
+                         "reconciliation_state": reconciliation.get("state"),
+                         "checked_at": target_data.get("checked_at"),
+                         "candidate_run_ids": reconciliation.get("candidate_run_ids", [])},
+        })
+        audit.update(outcome="failed", reason=note, visibility=visibility)
+        target_data["operator_abandon"] = audit
+        target_data["state"] = "failed"
+        target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
+        _record_reconciliation(target_data, repo, [], "abandoned",
+                               "An operator closed this unconfirmed operation because GitHub no longer exposes its workflow. No run was started or rerun.",
+                               checked_at=now)
+        try:
+            save(runtime, run, kind, data, expected=original)
+        except _AutomationChanged:
+            raise ReconciliationRejected("Automation changed during reconciliation; reload before abandoning") from None
+        runtime.store.event("automation_abandoned", "Operator abandoned an unconfirmed workflow operation",
+                            project_id, run_id,
+                            {"kind": kind, "reason": note, "at": now, "visibility": visibility,
+                             "previous_state": audit["previous"]["state"], "workflow": target_data.get("workflow"),
+                             "operation_id": target_data.get("operation_id")})
+        runtime.wake.set()
+        return {"kind": kind, "target": target, "state": target_data["state"], "operation": data,
+                "operator_abandon": audit}
 
 
 def health_check(url, sha, timeout=15):
