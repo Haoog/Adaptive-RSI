@@ -34,7 +34,7 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 ### Stage 3: Host tools and execution dependencies
 
 - [ ] **3.1 Check VCS tooling**: Verify `git` is available on the isolated host to operate on case repository snapshots.
-- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Unsampled cases are identity-only without a sealed working tree, so they contribute no dependency requirements.
+- [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification. Each check's `argv` must be a non-empty array of strings and `cwd` must be a relative path inside the case; malformed specs are recorded in `limitations`, make the bundle non-reproducible, and are excluded from the dependency list. Unsampled cases are identity-only without a sealed working tree, so they contribute no dependency requirements.
 - [ ] **3.3 Enumerate missing tools**: The reproduction script enumerates every missing dependency without aborting at the first failure, allowing comprehensive batch provisioning.
 
 ### Stage 4: Credentials and model access
@@ -44,7 +44,7 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 
 ### Stage 5: Offline execution and replay
 
-- [ ] **5.1 Verify baseline checks**: With host tools available, run `--run-checks` to execute frozen checks against the cases. Commands run inside a disposable temporary copy: the `repository` is copied first, then the sealed `overlay` is layered onto the copy with the same symlink-rejection semantics as the evaluator; bundle files stay untouched, and only manifest-registered cases run.
+- [ ] **5.1 Verify baseline checks**: With host tools available, run `--run-checks` to execute frozen checks against the cases. Commands run inside a disposable temporary copy: the `repository` is copied first, then the sealed `overlay` is layered onto the copy with the same symlink-rejection semantics as the evaluator; bundle files stay untouched, and only manifest-registered cases run. If any check exits non-zero or fails to start, `checks_passed` and `reproducible` are both `false`, the summary reports it separately, and `--strict` exits with code 2.
 - [ ] **5.2 End-to-end evaluation note**: Re-running candidate generation requires provisioning appropriate model access and trusted network gateways.
 
 ## Reproduction script usage
@@ -63,14 +63,14 @@ python3 -B scripts/reproduce_bundle.py /path/to/bundle --json
 # Execute frozen checks when host tools are present
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --run-checks
 
-# Strict mode: exit with code 2 if any tool or credential is missing
+# Strict mode: exit with code 2 if tools/credentials are missing or executed checks do not all pass
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --strict
 ```
 
 - `bundle`: Path to sealed bundle directory (required).
 - `--json`: Format result as JSON.
-- `--run-checks`: Run case check commands if tools are present.
-- `--strict`: Return exit code 2 when any dependency or credential is missing (default returns 0 upon completing inspection).
+- `--run-checks`: Run case check commands if tools are present; if any check fails, `checks_passed` and `reproducible` are both `false` and the summary reports it.
+- `--strict`: Return exit code 2 when any dependency or credential is missing, or executed checks do not all pass; default mode returns 0 after inspection, with check failures recorded only in the result and summary.
 
 ### Python API
 
