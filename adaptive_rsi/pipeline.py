@@ -77,7 +77,6 @@ def _planned_scope(scope):
     from pathlib import PurePosixPath
     planned = list(dict.fromkeys(str(PurePosixPath(relative_path(path))) for path in scope))
     for path in planned:
-        relative_path(path)
         if path == "." or any(char in path for char in [":", "：", "\n", "\r", "\0", "*", "?", "[", "\\"]):
             raise RuntimeError("Plan must name narrower scope than the entire repository")
     return planned
@@ -535,10 +534,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         from .discovery import value_priority
         rank = value_priority(plan["value"], plan["risk"])
         runtime.store.execute("UPDATE tasks SET priority=? WHERE id=?", (rank, task["id"]))
-    (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
     transition("planning", {"value": plan.get("value"), "scope": plan.get("scope", []),
                           "plan_reason": plan.get("reason", ""), "plan_decision": plan["decision"]})
     if plan["decision"] != "ready":
+        (directory / "plan.json").write_text(encode(plan), encoding="utf-8")
         transition(plan["decision"], {"reason": plan["reason"], "value": plan.get("value"), "base": base,
             "scope": plan.get("scope", []), "decision_source": "planning", "wake_condition": "inputs_policy_or_relevant_baseline_change",
             "triage_input": fingerprint({"body": task["body"], "evidence": task["evidence"], "policy": config["triage"]["policy"]})}, True)
