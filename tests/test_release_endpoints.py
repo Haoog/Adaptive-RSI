@@ -328,6 +328,11 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 release.workflow_choices(runtime, project)
             self.assertEqual(str(caught.exception),
                              "Workflow repository must match the selected project's origin")
+            with patch("adaptive_rsi.release.api", side_effect=AssertionError("no API call expected")):
+                with self.assertRaises(ValueError) as caught:
+                    release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+            self.assertEqual(str(caught.exception),
+                             "Workflow repository must match the selected project's origin")
             server = server_module.Server(runtime)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -469,6 +474,93 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertEqual(target["sha"], commit_sha)
                 self.assertEqual(target["ref"], "rsi-workflow/" + commit_sha)
                 self.assertTrue(target["enabled"])
+
+    def _authorization_project(self, temp):
+        root = Path(temp).resolve()
+        repo = fixture(root / "project")
+        git(repo, "remote", "add", "origin", "https://github.com/example-owner/example-repo.git")
+        runtime = Runtime(Store(root / "state"), FakeAgent())
+        self.addCleanup(runtime.close)
+        project = runtime.add_project(repo, "工作流授权项目")
+        runtime.configure({"github": {"repository": "example-owner/example-repo"}}, project)
+        release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+        return runtime, project
+
+    def test_authorize_workflow_reads_only_the_selected_file(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "f" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            calls = []
+
+            def stub(repo, endpoint, method="GET", fields=None):
+                calls.append(endpoint)
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint == "contents/.github/workflows/deploy.yml?ref=" + sha:
+                    return {"encoding": "base64", "type": "file", "content": content}
+                if endpoint.startswith("git/matching-refs/"):
+                    return [{"ref": "refs/tags/rsi-workflow/" + sha, "object": {"type": "commit", "sha": sha}}]
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": ".github/workflows/w%d.yml" % index, "name": "w%d" % index,
+                                           "state": "active"} for index in range(8)]}
+                raise AssertionError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=stub):
+                target = release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+            self.assertEqual(target["workflow"], ".github/workflows/deploy.yml")
+            self.assertEqual(target["sha"], sha)
+            self.assertEqual(target["ref"], "rsi-workflow/" + sha)
+            self.assertLessEqual(len(calls), 4)
+            self.assertFalse(any("actions/workflows" in endpoint for endpoint in calls))
+            self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("contents/")],
+                             ["contents/.github/workflows/deploy.yml?ref=" + sha])
+
+    def test_authorize_workflow_rejects_missing_or_incompatible_files(self):
+        import base64
+        sha = "f" * 40
+        incompatible = {"encoding": "base64", "type": "file",
+                        "content": base64.b64encode(b"name: Deploy\non: push\n").decode("ascii")}
+        for label, content in [("incompatible", incompatible), ("missing", None)]:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+
+                def stub(repo, endpoint, method="GET", fields=None):
+                    if endpoint == "":
+                        return {"default_branch": "main"}
+                    if endpoint == "commits/main":
+                        return {"sha": sha}
+                    if endpoint.startswith("contents/"):
+                        if content is None:
+                            raise release.ApiRejected("not found", 404)
+                        return content
+                    raise AssertionError(endpoint)
+
+                with patch("adaptive_rsi.release.api", side_effect=stub):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+                with patch("adaptive_rsi.release.api", side_effect=AssertionError("no API call expected")):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", "../outside.yml")
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
 
 
 class _ManualReconciliationFixture(unittest.TestCase):
