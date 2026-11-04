@@ -96,6 +96,7 @@ class UpdateAdmissionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'active operations'):
             readiness(self.runtime, 'commit', lease=prepared['barrier']['lease'])
         self.runtime.model_center.catalog_inflight.clear()
+        self.runtime.updates.desktop_owner_pid = os.getpid()
         committed = readiness(self.runtime, 'commit', lease=prepared['barrier']['lease'])
         self.assertEqual(committed['barrier']['phase'], 'installing')
 
