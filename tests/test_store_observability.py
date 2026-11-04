@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from adaptive_rsi.store import Store
+from adaptive_rsi.store import Store, WAL_SIZE_LIMIT_BYTES
 
 
 class StoreObservabilityTest(unittest.TestCase):
@@ -407,3 +407,77 @@ class StoreObservabilityTest(unittest.TestCase):
         audit = self.store.relationship_audit(limit=200)
         self.assertEqual(len(audit['stages_without_run']), 120)
         self.assertFalse(audit['_truncated']['stages_without_run'])
+
+    def test_bulk_vacuum_wal_is_capped_and_reclaimed(self):
+        # 复现 be-455：批量写 → 保留删除 → VACUUM 后主库缩小，WAL 却永久停在
+        # 历史峰值；journal_size_limit 限制增长，无残留页时 TRUNCATE 归还磁盘。
+        wal = Path(str(self.store.path) + '-wal')
+        page_size = self.store.metrics()['page_size']
+
+        def wal_bytes():
+            return wal.stat().st_size if wal.exists() else 0
+
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.executemany("INSERT INTO events(project,run,kind,message,data,created) "
+                           "VALUES ('p',NULL,'bulk',?,'{}',?)",
+                           [('x' * 900, float(index)) for index in range(20000)])
+        self.store.execute("DELETE FROM events WHERE kind='bulk'")
+        with self.store.connect() as db:
+            db.execute('VACUUM')
+        self.store.put_setting('wal-probe', 1)
+        self.assertLessEqual(wal_bytes(), WAL_SIZE_LIMIT_BYTES + page_size)
+        report = self.store.wal_diagnostics(checkpoint=True)
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertEqual(report['truncate'], 'ok')
+        self.assertTrue(report['truncated'])
+        self.assertEqual(report['journal_size_limit_bytes'], WAL_SIZE_LIMIT_BYTES)
+        metrics = self.store.metrics()
+        self.assertEqual(metrics['wal_size_limit_bytes'], WAL_SIZE_LIMIT_BYTES)
+        self.assertEqual(metrics['wal_bytes'], wal_bytes())
+        self.assertLessEqual(metrics['wal_bytes'], page_size)
+        self.assertEqual(self.store.one('PRAGMA integrity_check')['integrity_check'], 'ok')
+
+    def test_checkpoint_yields_to_snapshot_then_truncates_next_cycle(self):
+        self.store.event('before', 'first')
+        self.store.wal_diagnostics(checkpoint=True)
+        wal = Path(str(self.store.path) + '-wal')
+        began = time.monotonic()
+        with self.store.snapshot():
+            self.store.query('SELECT * FROM events')
+            worker = threading.Thread(target=lambda: self.store.event('after', 'second'))
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            report = self.store.wal_diagnostics(checkpoint=True)
+            elapsed = time.monotonic() - began
+            self.assertEqual(report['active_snapshots'], 1)
+            self.assertGreater(report['pending_pages'], 0)
+            self.assertFalse(report['truncated'])
+            self.assertEqual(report['truncate'], 'skipped_pending')
+        self.assertLess(elapsed, 3)
+        pinned = wal.stat().st_size if wal.exists() else 0
+        self.assertGreater(pinned, 0)
+        report = self.store.wal_diagnostics(checkpoint=True)
+        self.assertEqual(report['active_snapshots'], 0)
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertTrue(report['truncated'])
+        self.assertLessEqual(self.store.metrics()['wal_bytes'], 4096)
+        self.assertLess((wal.stat().st_size if wal.exists() else 0), pinned)
+
+    def test_truncate_busy_budget_does_not_wait_for_outside_readers(self):
+        self.store.event('seed', 'first')
+        reader = sqlite3.connect(str(self.store.path), timeout=1)
+        self.addCleanup(reader.close)
+        reader.execute('BEGIN')
+        reader.execute('SELECT count(*) FROM events').fetchone()
+        began = time.monotonic()
+        report = self.store.wal_diagnostics(checkpoint=True)
+        elapsed = time.monotonic() - began
+        reader.execute('COMMIT')
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertEqual(report['truncate'], 'busy')
+        self.assertFalse(report['truncated'])
+        self.assertGreaterEqual(elapsed, .5)
+        self.assertLess(elapsed, 5)
+        self.assertEqual(self.store.metrics()['busy_timeout_ms'], 15000)
