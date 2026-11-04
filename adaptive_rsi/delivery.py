@@ -599,7 +599,7 @@ def publish(runtime, project, task, run, workspace, config):
     return url
 
 
-def monitoring_due(outcome, config, now):
+def monitoring_due(outcome, config, now, polled=None):
     from .storage_tools import pending_investigation
     feedback_record = outcome.get("feedback")
     if not isinstance(feedback_record, dict):
@@ -615,9 +615,30 @@ def monitoring_due(outcome, config, now):
     # 每个调度周期立刻重做快照与全量检查会把故障放大成资源占用与事件刷写。
     if not _feedback_retry_due(outcome, now):
         return False
+    if polled is None:
+        polled = outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0))
     return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
-            now - outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0)) >=
-            config["delivery"]["feedback_minutes"] * 60)
+            now - polled >= config["delivery"]["feedback_minutes"] * 60)
+
+
+def _last_poll(store, run, outcome):
+    """上次反馈轮询时间。心跳写入 settings，避免仅为一个时间戳重写整行 runs.result。"""
+    record = outcome.get("feedback")
+    if not isinstance(record, dict):
+        record = {}
+    return max(store.setting("feedback-polled:" + run["id"], 0) or 0,
+               outcome.get("feedback_polled_at", 0) or 0,
+               record.get("checked_at", 0) or 0)
+
+
+def _persist_result(store, run, outcome):
+    """仅在编码结果真正变化时写 runs.result；无新证据的 tick 不得整行重写。"""
+    encoded = encode(outcome)
+    if encoded == (run.get("result") or "{}"):
+        return False
+    store.execute("UPDATE runs SET result=? WHERE id=?", (encoded, run["id"]))
+    run["result"] = encoded  # 同一 tick 后续调用不再重复写入相同内容。
+    return True
 
 
 def _update_pr_task(store, run, state, now):
@@ -893,7 +914,8 @@ def schedule(runtime, now=None):
                 # error once and clears it when the row becomes readable again.
                 raise ValueError("Delivery run result is not valid JSON")
             if (run["state"] in ["pr_open", "superseded"] or pending(runtime, run) or
-                    monitoring_due(outcome, runtime.config(run["project"]), now)):
+                    monitoring_due(outcome, runtime.config(run["project"]), now,
+                                   _last_poll(store, run, outcome))):
                 projects.add(run["project"])
     for project_id in projects:
         with runtime.scheduler_scope("delivery_project", project_id):
@@ -982,7 +1004,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     _recover_superseded_receipt(runtime, project, run, config, now)
                 continue
             if (run["state"] == "merged" and outcome.get("monitoring_completed") and
-                    not monitoring_due(outcome, config, now) and not pending(runtime, run)):
+                    not monitoring_due(outcome, config, now, _last_poll(store, run, outcome)) and
+                    not pending(runtime, run)):
                 # 监控已结束且没有发布/部署待办的合并运行不再逐轮重付策略读取、
                 # origin 探测与 feedback/advance 调用；新出现的调查或自动化待办
                 # 会让本行回到完整跟踪路径。
@@ -1235,7 +1258,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
-                store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+                _persist_result(store, run, outcome)
             if outcome.get("merged_sha"):
                 active = store.one("SELECT * FROM runs WHERE id=?", (active_run,)) if active_run else None
                 feedback(runtime, project, run, outcome, config, now,
@@ -1243,7 +1266,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                          shared=tick_baselines)
                 from .release import advance
                 outcome["automation"] = advance(runtime, project, run, outcome, tracking_cancelled)
-            store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            _persist_result(store, run, outcome)
         except Exception as exc:
             store.event("delivery_error", str(exc), project["id"], run["id"])
 
@@ -1419,6 +1442,71 @@ def parsed_result(run):
     return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
 
 
+def bounded_failures(evaluation):
+    """至多 5 条失败检查，name 截 200 字符、输出截尾部 1200 字符（沿用调查任务的既有裁法）。"""
+    checks = evaluation.get("checks") if isinstance(evaluation, dict) else None
+    if isinstance(checks, list):
+        # 复用的既有摘要保持结构，但仍逐条裁剪，避免历史行把无界数据带回来。
+        return [{"group": str(row.get("group", ""))[:200], "name": str(row.get("name", ""))[:200],
+                 "output": str(row.get("output", ""))[:1200]} for row in checks[:5] if isinstance(row, dict)]
+    if not isinstance(checks, dict):
+        return []
+    failures = []
+    for label, rows in checks.items():
+        if not isinstance(rows, list):
+            continue
+        for check in rows:
+            if isinstance(check, dict) and not check.get("passed"):
+                failures.append({"group": str(label)[:200], "name": str(check.get("name", ""))[:200],
+                                 "output": (str(check.get("stderr", "")) + str(check.get("stdout", "")))[-1200:]})
+                if len(failures) == 5:
+                    return failures
+    return failures
+
+
+def inline_evaluation(result, report=""):
+    """runs.result 只保留有界摘要；完整报告留在 evaluator 已写好的 report.json。"""
+    bounded = {"decision": result.get("decision") if isinstance(result, dict) else None,
+               "checks": bounded_failures(result)}
+    previous = result.get("report") if isinstance(result, dict) else None
+    path = previous if isinstance(previous, str) and previous else report
+    if path:
+        bounded["report"] = path
+    return bounded
+
+
+def bounded_record(record):
+    """历史行内联的完整评估裁成有界摘要，避免在 previous 链里再复制一份。"""
+    if not isinstance(record, dict):
+        return {}
+    bounded = dict(record)
+    evaluation = bounded.get("evaluation")
+    if isinstance(evaluation, dict) and isinstance(evaluation.get("checks"), dict):
+        bounded["evaluation"] = inline_evaluation(evaluation)
+    investigation = bounded.get("investigation_report")
+    if isinstance(investigation, dict):
+        bounded["investigation_report"] = bounded_record(investigation)
+    return bounded
+
+
+def artifact_evaluation(runtime, run, record):
+    """读取摘要指向的完整评估报告；工件缺失时返回 None，由调用方退回有界摘要。"""
+    from .storage_tools import run_artifact_path
+    evaluation = record.get("evaluation") if isinstance(record, dict) else None
+    relative = None
+    if isinstance(evaluation, dict) and isinstance(evaluation.get("report"), str):
+        relative = evaluation["report"]
+    elif isinstance(record, dict) and isinstance(record.get("report"), str):
+        relative = record["report"]
+    if not relative:
+        return None
+    try:
+        value = json.loads(run_artifact_path(runtime.store, run, relative).read_text(encoding="utf-8"))
+    except (ValueError, OSError, RuntimeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 # 合并后验证抛异常时的退避与上限：sandbox、磁盘、git 或评估器故障会持续存在，
 # 每个调度周期重做一次快照（git init + depth-1 fetch + checkout）与整份固定检查
 # 只会挤占新任务的资源并刷满 events。首次失败 5 分钟后重试，逐次翻倍到 1 小时
@@ -1460,7 +1548,7 @@ def _record_feedback_attempt(runtime, run, outcome, now):
     """进入快照与固定检查之前落盘尝试，进程在验证中途消失也计入退避。"""
     outcome["feedback_attempts"] = _feedback_attempts(outcome) + 1
     outcome["feedback_attempt_at"] = now
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
 
 
 def _abandon_feedback(runtime, project, run, outcome, now):
@@ -1475,30 +1563,30 @@ def _abandon_feedback(runtime, project, run, outcome, now):
                            "previous": previous}
     # 终态：保留期与调度不再认为该运行仍在监控，证据保留在 previous 层。
     outcome["monitoring_completed"] = True
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
     runtime.store.event("postmerge_verification_abandoned", reason, project["id"], run["id"])
 
 
 def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=None):
-    if not monitoring_due(outcome, config, now):
+    if not monitoring_due(outcome, config, now, _last_poll(runtime.store, run, outcome)):
         return
     from .storage_tools import pending_investigation
     if pending_investigation(outcome.get("feedback", {})) is not None:
         investigate(runtime, project, run, outcome)
-        if not monitoring_due(outcome, config, now):
+        if not monitoring_due(outcome, config, now, _last_poll(runtime.store, run, outcome)):
             return
     # Expiration ends monitoring even when its local artifacts were not restored.
     # Pending investigations above must finish (or remain retryable) before completion.
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
-        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        _persist_result(runtime.store, run, outcome)
         return
     # 尝试次数用尽：只收敛终态，不再进入快照与固定检查。
     if _feedback_exhausted(outcome):
         _abandon_feedback(runtime, project, run, outcome, now)
         return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
-    if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
+    if now - _last_poll(runtime.store, run, outcome) < config["delivery"]["feedback_minutes"] * 60:
         return
     try:
         saved = json.loads(run["config"] or "{}")
@@ -1508,18 +1596,17 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         saved = {}
 
     def missing_artifacts():
-        previous = outcome.get("feedback")
-        if not isinstance(previous, dict):
-            previous = {}
+        previous = bounded_record(outcome.get("feedback"))
         outcome["feedback_polled_at"] = now
         # 工件缺失是已分类的结果，按既有轮询周期处理，不占用异常退避的重试预算。
         _clear_feedback_attempt(outcome)
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
-            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            _persist_result(runtime.store, run, outcome)
             runtime.store.event("postmerge", MISSING_ARTIFACTS, project["id"], run["id"])
         else:
-            runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+            # 同一结论仍要推进轮询时间戳，避免每个 tick 重新扫描工件。
+            _persist_result(runtime.store, run, outcome)
 
     try:
         output_name = "feedback/" + str(time.time_ns()) + "-" + uid()
@@ -1581,32 +1668,42 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     # re-evaluates the merge commit instead of freezing the run out of release.
     merge_current = (isinstance(merge_record, dict) and merge_record.get("sha") == merged_sha and
                      merge_record.get("state") in {"verified", "regressed"})
-    if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
+    if now - _last_poll(runtime.store, run, outcome) < config["delivery"]["feedback_minutes"] * 60:
         return
-    # 先落盘再取远端与执行检查：sandbox、磁盘或 git 在验证中途失败时，
-    # 下一个调度周期必须看到这次尝试，按退避等待而不是立刻重做整份验证。
-    _record_feedback_attempt(runtime, run, outcome, now)
-    identity = runtime.store.setting("run-baseline:" + run["id"])
-    if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
-        raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
-    pinned = merge(saved, {"github": {"repository": identity["repository"]},
-                            "delivery": {"base_branch": identity["branch"]}})
-    cached = shared.get((project["id"], identity["branch"])) if isinstance(shared, dict) else None
-    if cached:
-        source, head, branch = cached
-    else:
-        # 本轮首个监控观测触发一次真实 fetch，结果按目标分支供同 tick 其余监控
-        # 复用；该读数只用于观测，密封目标仍以 run-baseline 身份键为准。
-        source, head, branch = baseline(runtime, project, pinned)
-        if isinstance(shared, dict):
-            shared[(project["id"], branch)] = (source, head, branch)
-    if branch != identity["branch"]:
-        raise RuntimeError("Post-merge verification target differs from sealed delivery")
+    try:
+        identity = runtime.store.setting("run-baseline:" + run["id"])
+        if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
+            raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
+        pinned = merge(saved, {"github": {"repository": identity["repository"]},
+                                "delivery": {"base_branch": identity["branch"]}})
+        cached = shared.get((project["id"], identity["branch"])) if isinstance(shared, dict) else None
+        if cached:
+            source, head, branch = cached
+        else:
+            # 本轮首个监控观测触发一次真实 fetch，结果按目标分支供同 tick 其余监控
+            # 复用；该读数只用于观测，密封目标仍以 run-baseline 身份键为准。
+            source, head, branch = baseline(runtime, project, pinned)
+            if isinstance(shared, dict):
+                shared[(project["id"], branch)] = (source, head, branch)
+        if branch != identity["branch"]:
+            raise RuntimeError("Post-merge verification target differs from sealed delivery")
+    except Exception:
+        # 取远端或基线身份失败同样计入退避，避免每个调度周期重试一次网络 fetch。
+        _record_feedback_attempt(runtime, run, outcome, now)
+        raise
     if previous.get("head") == head and merge_current:
-        outcome["feedback_polled_at"] = now
-        _clear_feedback_attempt(outcome)
-        runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        # 只有心跳变化：写独立 settings 键，不重写整行 runs.result；
+        # 若异常退避计数仍在，清除计数属于状态变化，需要落盘并推进轮询时间。
+        if _feedback_attempts(outcome):
+            outcome["feedback_polled_at"] = now
+            _clear_feedback_attempt(outcome)
+            _persist_result(runtime.store, run, outcome)
+        else:
+            runtime.store.put_setting("feedback-polled:" + run["id"], now)
         return
+    # 先落盘再进入快照与固定检查：进程在验证中途消失也计入退避，
+    # 避免每个调度周期重做整份验证。
+    _record_feedback_attempt(runtime, run, outcome, now)
     try:
         # Fetching can take time; recheck destinations before exclusively creating output.
         for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",
@@ -1734,8 +1831,14 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     # 下一次到期轮询重新走常规反馈周期。
     _clear_feedback_attempt(outcome)
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
-    outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
-                           "attribution": failure_attribution(merged_sha, head, result)}
+    # 完整报告已由 evaluator 写进 run 工件；本 run 复用既有结论时没有新报告，
+    # 不能伪造指向本 run 的链接。行内只保留 decision 与有界失败摘要。
+    report_path = "" if origin is not None or result is reused else output_name + "/evaluation/report.json"
+    attribution = (previous["attribution"] if result is reused and isinstance(previous.get("attribution"), dict)
+                   else failure_attribution(merged_sha, head, result))
+    outcome["feedback"] = {"state": state, "head": head, "checked_at": now,
+                           "evaluation": inline_evaluation(result, report_path),
+                           "attribution": attribution}
     if origin:
         outcome["feedback"]["reused_from"] = origin
         reuse_count = 1 + (shared.get(("postmerge-reused", project["id"]), 0) if isinstance(shared, dict) else 0)
@@ -1747,7 +1850,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         outcome["feedback"]["merge"] = merge_record
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
         outcome["feedback"]["investigation_pending"] = True
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
     runtime.store.event("postmerge", "Post-merge verification: " + outcome["feedback"]["state"], project["id"], run["id"])
     if outcome["feedback"].get("investigation_pending"):
         investigate(runtime, project, run, outcome)
@@ -1762,20 +1865,14 @@ def investigate(runtime, project, run, outcome):
     report = pending_investigation(feedback_status)
     if report is None:
         return
-    failures = []
     evaluation = report.get("evaluation")
     if not isinstance(evaluation, dict):
         evaluation = {}
-    report_checks = evaluation.get("checks")
-    if not isinstance(report_checks, dict):
-        report_checks = {}
-    for label, rows in report_checks.items():
-        if not isinstance(rows, list):
-            continue
-        for check in rows:
-            if isinstance(check, dict) and not check.get("passed") and len(failures) < 5:
-                failures.append({"group": label, "name": str(check.get("name", ""))[:200],
-                                 "output": (str(check.get("stderr", "")) + str(check.get("stdout", "")))[-1200:]})
+    if not isinstance(evaluation.get("checks"), dict):
+        # 新行只带决策与有界摘要，完整报告在 evaluator 已写好的 report.json 里；
+        # 工件缺失或历史行内联完整报告时退回行内摘要，调查任务仍可创建。
+        evaluation = artifact_evaluation(runtime, run, report) or evaluation
+    failures = bounded_failures(evaluation)
     report_head = report.get("head")
     if not isinstance(report_head, str):
         report_head = "unknown"
@@ -1792,5 +1889,5 @@ def investigate(runtime, project, run, outcome):
     report["investigation_pending"] = False
     report["investigation_task"] = task
     feedback_status.update(investigation_pending=False, investigation_task=task)
-    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    _persist_result(runtime.store, run, outcome)
     runtime.wake.set()
