@@ -328,7 +328,8 @@ class StorePoolTest(unittest.TestCase):
                 db.execute("SELECT missing_column FROM settings")
         self.assertEqual(self.store._pool.qsize(), 0)
         # 坏连接未被归还：下一次查询必须新建连接且结果正确。
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 打开状态目录时已写入 instance-id，用它验证新连接读到的是已提交状态。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(len(created), 1)
         self.assertEqual(self.store._pool.qsize(), 1)
 
@@ -353,7 +354,8 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store._pool.qsize(), 1)
         self.store.close()
         self.assertEqual(self.store._pool.qsize(), 0)
-        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings"), [{"n": 1}])
+        # 池清空后重新借出连接：启动期写入的 instance-id 仍可读。
+        self.assertEqual(self.store.query("SELECT count(*) AS n FROM settings WHERE key='instance-id'"), [{"n": 1}])
         self.assertEqual(self.store._pool.qsize(), 1)
 
     def test_namespaced_setting_lazy_migration_and_corrupt_isolation(self):

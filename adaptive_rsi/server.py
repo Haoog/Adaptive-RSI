@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .build import BUILD_ID
 from .dashboard import records
-from .store import decode_object, decode_evidence
+from .store import StoreBusy, decode_object, decode_evidence
 from .adapters import detect
 from .catalog import CatalogError, list_models
 from .credentials import CredentialError
@@ -242,6 +242,13 @@ class Handler(BaseHTTPRequestHandler):
                 payload["error_code"] = code
             self.respond(payload, 400)
             return
+        if isinstance(exc, StoreBusy):
+            # 连接容量或写锁的瞬时争用不是服务端缺陷：给出可重试的 503。
+            # 此时数据库仍然满载，写 request_log 会再等一轮容量预算，直接跳过。
+            self._request_log_skipped = True
+            self.respond({"error": "Database is busy; retry shortly", "error_code": "store_busy"},
+                         503, headers={"Retry-After": "1"})
+            return
         code = getattr(exc, "code", None)
         code = code if isinstance(code, str) and (code in SAFE_ERROR_CODES or
                     re.fullmatch(r"opencode_incompatible_[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", code)) else None
@@ -386,6 +393,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._request_id = secrets.token_hex(8)
+        self._request_log_skipped = False
         # The shutdown probe must stay readable while the runtime closes its
         # store; it only reads in-memory phase and counters.
         if urlparse(self.path).path == "/api/shutdown-status":
@@ -482,8 +490,6 @@ class Handler(BaseHTTPRequestHandler):
                 data["projects"] = store.query("SELECT id,name,path FROM projects ORDER BY created")
                 for project in data["projects"]:
                     project["name"] = project_display_name(project["name"], project["path"])
-                from .store import encode, uid
-                store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
                 data["instance"] = store.setting("instance-id")
                 from .dashboard import TASKS
                 data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
@@ -928,7 +934,7 @@ class Handler(BaseHTTPRequestHandler):
             self.api_error(exc)
         finally:
             # Record only the route shape, never query values, bodies, headers or errors.
-            if urlparse(self.path).path.startswith("/api/"):
+            if urlparse(self.path).path.startswith("/api/") and not getattr(self, "_request_log_skipped", False):
                 try:
                     self.server.runtime.store.record_request(
                         request_id, "GET", urlparse(self.path).path[:300],
@@ -939,6 +945,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._request_id = secrets.token_hex(8)
+        self._request_log_skipped = False
         with self.server.runtime.store.query_scope(request=self._request_id):
             return self._do_POST()
 
@@ -1220,7 +1227,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.api_error(exc)
         finally:
-            if urlparse(self.path).path.startswith("/api/"):
+            if urlparse(self.path).path.startswith("/api/") and not getattr(self, "_request_log_skipped", False):
                 try:
                     status = getattr(self, "_response_status", 500)
                     self.server.runtime.store.record_request(
