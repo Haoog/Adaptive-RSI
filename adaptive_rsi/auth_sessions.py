@@ -33,6 +33,8 @@ TERMINAL = {"completed", "cancelled", "expired", "failed", "interrupted"}
 MAX_BYTES = 1024 * 1024
 # providers 发现结果要完整启动一个 worker（Docker 模式下是一个容器），缓存短 TTL 内的重复查询。
 PROVIDERS_CACHE_TTL = 25
+# 容器就绪探测（docker image inspect）同为子进程级成本；授权面板 1.5s 轮询期间不能每次重跑。
+CONTAINER_CACHE_TTL = 25
 # 父服务退出或崩溃时控制管道关闭；整个认证进程组随即停止。
 _SUPERVISOR = """import os,subprocess,sys,threading
 fd=int(sys.argv[1])
@@ -739,21 +741,27 @@ class OpenCodeAuth(_Process):
                     raise AuthAttemptFailed(detail) from exc
                 if status == "expired":
                     raise AuthError("auth_expired", detail=detail) from exc
-                try:
-                    value = self.http("GET", base, timeout=min(25, max(1, timeout)))
-                except AuthError:
-                    raise exc
-                data = value.get("data") if isinstance(value, dict) else None
-                status = data.get("status") if isinstance(data, dict) else None
-                if status == "complete":
-                    return True
-                if status == "failed":
-                    raise AuthAttemptFailed() from exc
-                if status == "expired":
-                    raise AuthError("auth_expired") from exc
-                raise
-            if result is not None:
-                raise AuthError("authorization_failed")
+                # pending 是尝试仍在处理的正常中间态：验证码可能已被消费，此时
+                # 既不能再发 POST，也不能当成失败，直接进入下面的退避轮询。
+                if status != "pending":
+                    try:
+                        value = self.http("GET", base, timeout=min(25, max(1, timeout)))
+                    except AuthError:
+                        raise exc
+                    data = value.get("data") if isinstance(value, dict) else None
+                    status = data.get("status") if isinstance(data, dict) else None
+                    if status == "complete":
+                        return True
+                    if status == "failed":
+                        raise AuthAttemptFailed() from exc
+                    if status == "expired":
+                        raise AuthError("auth_expired") from exc
+                    # 反查也看到 pending：与 POST 返回空响应一致，继续轮询同一 attempt。
+                    if status != "pending":
+                        raise
+            else:
+                if result is not None:
+                    raise AuthError("authorization_failed")
             # CLI 对失败的 attempt 也可能返回空响应；必须核对 attempt 状态，
             # 否则会把未完成授权当成成功，随后在导出凭据时才暴露成 invalid_credentials。
             # 状态推进和查询抖动都按有界退避重试，避免验证码已被消费却因一次瞬时错误失败。
@@ -925,6 +933,9 @@ class AuthSessions:
         self.provider_flights: dict = {}
         # 状态快照的子进程发现结果同样短 TTL 缓存，登录/登出/密钥变更时失效。
         self.status_cache = {}
+        # 容器就绪（docker image inspect）按 (docker 路径, 镜像) 做进程级短 TTL 缓存；
+        # 镜像存在性不随 backend 凭据变化，但仍随 close()/凭据变更一起失效。
+        self.container_cache = {}
         # 过期条目由后台线程刷新；同一后端最多一个刷新任务，避免面板并发打开时重复探测。
         self.status_refreshes = set()
         self.cache_generations = {backend: 0 for backend in ("codex", "opencode")}
@@ -976,6 +987,7 @@ class AuthSessions:
             self.cache_generations[backend] += 1
             self.providers_cache.pop(backend, None)
             self.status_cache.pop(backend, None)
+            self.container_cache.clear()
 
     def _backend(self, backend):
         if not isinstance(backend, str) or backend not in {"codex", "opencode"}:
@@ -1014,11 +1026,20 @@ class AuthSessions:
                     readiness = "auth_container_unavailable"
                 else:
                     image = config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
-                    try:
-                        inspected = run_process([docker, "image", "inspect", image], timeout=10)
-                        readiness = "auth_worker_image_missing" if inspected["exit_code"] or inspected["error"] else ""
-                    except OSError:
-                        readiness = "auth_container_unavailable"
+                    key = (docker, image)
+                    with self.cache_lock:
+                        cached = self.container_cache.get(key)
+                    if cached and cached[0] > time.monotonic():
+                        readiness = cached[1]
+                    else:
+                        try:
+                            inspected = run_process([docker, "image", "inspect", image], timeout=10)
+                            readiness = "auth_worker_image_missing" if inspected["exit_code"] or inspected["error"] else ""
+                        except OSError:
+                            readiness = "auth_container_unavailable"
+                        with self.cache_lock:
+                            if not self.closed:
+                                self.container_cache[key] = (time.monotonic() + CONTAINER_CACHE_TTL, readiness)
             return readiness
         for backend in ("codex", "opencode"):
             available = bool(shutil.which("docker") if container or not shutil.which(backend) else shutil.which(backend))
@@ -1730,6 +1751,7 @@ class AuthSessions:
             with self.cache_lock:
                 self.providers_cache.clear()
                 self.status_cache.clear()
+                self.container_cache.clear()
             workers = list(self.workers.values())
             discoveries = list(self.discoveries)
             first_error = None
