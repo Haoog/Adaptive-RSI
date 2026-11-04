@@ -911,6 +911,23 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             second.close()
 
+    def test_codex_login_merges_with_existing_auth_fields(self):
+        # 用户在目标文件里手放的 OPENAI_API_KEY 或新版本未知字段不能被登录写回抹掉。
+        path = self.root / "codex/auth.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"OPENAI_API_KEY": "FIXTURE-KEY",
+                                    "tokens": {"refresh_token": "OLD-REFRESH"},
+                                    "extra_field": 1}))
+        session = self.manager.start("codex")
+        self.wait_state(session, "awaiting_authorization")
+        self.gate.set()
+        self.wait_state(session, "completed")
+        data = json.loads(path.read_text())
+        self.assertEqual(data["OPENAI_API_KEY"], "FIXTURE-KEY")
+        self.assertEqual(data["extra_field"], 1)
+        self.assertEqual(data["tokens"]["refresh_token"], "SECRET-REFRESH")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_opencode_merges_only_selected_provider(self):
         path = self.root / "data/opencode/auth.json"
         path.parent.mkdir(parents=True)
@@ -1908,6 +1925,21 @@ class AuthProtocolTests(unittest.TestCase):
             self.assertEqual(data["tokens"]["refresh_token"], "FIXTURE-REFRESH")
         finally:
             manager.close()
+
+    def test_codex_rejects_unsupported_method_and_inputs_before_device_code(self):
+        worker = CodexAuth()
+        try:
+            for kwargs in ({"method": 1}, {"method": 7}, {"inputs": {"k": "v"}},
+                           {"method": 1, "inputs": {"k": "v"}}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(AuthError) as caught:
+                    worker.start(**kwargs)
+                self.assertEqual(caught.exception.code, "unsupported_auth_method")
+            fields = worker.start()
+            self.assertEqual(fields["verification_url"], "https://example.test/device")
+            self.assertEqual(fields["user_code"], "PRIVATE-USER-CODE")
+            self.assertEqual(fields["method"], "auto")
+        finally:
+            worker.close()
 
     def test_opencode_http_protocol_is_authenticated_and_persists_callback(self):
         worker = OpenCodeAuth()
