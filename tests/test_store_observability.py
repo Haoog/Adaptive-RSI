@@ -407,3 +407,33 @@ class StoreObservabilityTest(unittest.TestCase):
         audit = self.store.relationship_audit(limit=200)
         self.assertEqual(len(audit['stages_without_run']), 120)
         self.assertFalse(audit['_truncated']['stages_without_run'])
+
+    def test_maintenance_analyzes_after_retention_so_kind_queries_skip_temp_btree(self):
+        # 没有 sqlite_stat1 时规划器对 events 只有默认基数：按项目过滤后还要建
+        # 临时 B 树才能 GROUP BY kind。维护轮在 retention 之后运行 PRAGMA
+        # optimize，统计出现后同一条查询应改走 event_kind_created(kind, created)。
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO events(kind,created,project) VALUES (?,?,?)",
+                           (("kind-%d" % (index % 20), index, "p") for index in range(120000)))
+        plan = lambda: [row["detail"] for row in self.store.query(
+            "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? GROUP BY kind",
+            (0, "p"))]
+        self.assertIsNone(self.store.one("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"))
+        before = plan()
+        self.assertTrue(any("project_events" in step for step in before), before)
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(self.store, agent=object()).maintenance()
+
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        after = plan()
+        self.assertTrue(any("event_kind_created" in step for step in after), after)
+        self.assertFalse(any("TEMP B-TREE" in step for step in after), after)
+
+    def test_planner_refresh_failure_is_logged_not_raised(self):
+        from adaptive_rsi import maintenance
+        with patch.object(self.store, "connect", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertLogs("adaptive_rsi.maintenance", level="WARNING"):
+                self.assertFalse(maintenance.refresh_query_planner(self.store))

@@ -231,6 +231,26 @@ def _remove_run_artifacts(store, run_id, project, directory, stored=None):
     return True
 
 
+def refresh_query_planner(store):
+    """Refresh sqlite_stat1 after retention so plans follow real cardinalities.
+
+    ``PRAGMA optimize=0x10002`` is SQLite's documented periodic form for
+    long-lived connections: the 0x10000 bit also examines tables this pooled
+    connection never queried, and tables without ``sqlite_stat1`` rows are
+    analyzed on the first pass.  It runs on a borrowed connection with no
+    explicit transaction, so the write lock ANALYZE briefly takes belongs to
+    the pragma alone.  Failures are logged and never abort the retention round.
+    """
+    try:
+        with store.connect() as db:
+            db.execute("PRAGMA optimize=0x10002").fetchall()
+    except sqlite3.Error:
+        logging.getLogger(__name__).warning("Query planner statistics refresh failed",
+                                            exc_info=True)
+        return False
+    return True
+
+
 class Maintenance:
     # 上一次维护失败后的进程内退避截止时间；数据库不可写时仍能拦住每秒重试。
     maintenance_retry_at = 0
@@ -621,6 +641,10 @@ class Maintenance:
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))
+        # Retention has just shrunk events; refresh optimizer statistics before the
+        # passive checkpoint so the planner stops guessing cardinalities from the
+        # default table sizes.  This runs outside any explicit write transaction.
+        refresh_query_planner(self.store)
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
