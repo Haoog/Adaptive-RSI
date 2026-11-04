@@ -56,12 +56,17 @@ def format_report(result):
             lines.append(f"     [{status}] {chk.get('case')} - {chk.get('check')}: exit {chk.get('exit_code')}")
 
     lines.append("\n=== 结论 / Summary ===")
-    if result.get("reproducible"):
-        lines.append("完整性通过且所有依赖与凭据齐备，具备离线复现条件。")
-    elif not integ.get("valid"):
+    if not integ.get("valid"):
         lines.append("输入完整性校验失败，实验包文件损坏或被篡改，无法安全复现。")
-    else:
+    elif result.get("checks_failed"):
+        lines.append(f"完整性通过、依赖与凭据齐备，但离线检查有 {result['checks_failed']}/"
+                     f"{result.get('checks_executed', 0)} 项未通过，不具备离线复现条件。")
+    elif result.get("reproducible"):
+        lines.append("完整性通过且所有依赖与凭据齐备，具备离线复现条件。")
+    elif missing_creds or missing_deps:
         lines.append(f"输入完整性校验通过。缺凭据 ({len(missing_creds)} 项) 或外部依赖 ({len(missing_deps)} 项)，已逐项列出上述限制。")
+    else:
+        lines.append("输入完整性校验通过，但存在上述限制，尚不具备离线复现条件。")
 
     return "\n".join(lines)
 
@@ -70,8 +75,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", help="Path to sealed reproduction bundle directory")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON result")
-    parser.add_argument("--run-checks", action="store_true", help="Execute evaluation checks if dependencies are satisfied")
-    parser.add_argument("--strict", action="store_true", help="Exit with non-zero code if any dependency/credential is missing")
+    parser.add_argument("--run-checks", action="store_true", help="Execute evaluation checks if dependencies are satisfied; failed checks make the bundle non-reproducible")
+    parser.add_argument("--strict", action="store_true", help="Exit non-zero if dependencies/credentials are missing or executed checks fail")
     args = parser.parse_args(argv)
 
     bundle_path = Path(args.bundle).expanduser().resolve()
