@@ -2254,7 +2254,16 @@ class Runtime(Maintenance):
                              "Analysis output missing a findings array; treating as no findings",
                              project["id"], run["id"])
             items = []
+        skipped = 0
         for item in items:
+            # 单条 finding 同样来自模型：非 dict、缺字段或字段类型不符时跳过该条，
+            # 不能因为一条畸形条目让整个巡检 run 失败。
+            if not isinstance(item, dict) or not all(
+                    isinstance(item.get(key), str) for key in ("title", "body", "path", "quote")) \
+                    or not isinstance(item.get("acceptance"), list) \
+                    or not isinstance(item.get("priority"), (int, float)):
+                skipped += 1
+                continue
             try:
                 relative_path(item["path"])
                 path = (workspace / item["path"]).resolve()
@@ -2300,6 +2309,10 @@ class Runtime(Maintenance):
                                    "evidence": evidence})
             except (ValueError, OSError):
                 continue
+        if skipped:
+            self.store.event("inspection_malformed",
+                             str(skipped) + " malformed findings skipped",
+                             project["id"], run["id"], {"items": skipped})
         decisions = {}
         if len(candidates) > 1:
             try:
