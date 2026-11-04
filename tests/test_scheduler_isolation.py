@@ -345,6 +345,67 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertTrue(self.store.setting("retention_path_rejected:" + bad["id"]))
         self.assertTrue(marker.exists())
 
+    def test_retention_revalidates_rejected_symlink_after_filesystem_repair(self):
+        runs = self.store.root / "runs"
+        runs.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        linked = self.historical_run("broken", "awaiting_approval")
+        directory = Path(linked["path"])
+        directory.symlink_to(outside, target_is_directory=True)
+
+        self.runtime.maintenance()
+        mark = self.store.setting("retention_path_rejected:" + linked["id"])
+        self.assertEqual(mark["reason"], "unsafe run path")
+
+        # 运维把链接换成同名真实目录：runs.path 未变，重验窗口未到期仍跳过。
+        directory.unlink()
+        (directory / "candidate").mkdir(parents=True)
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "awaiting_approval")
+        self.assertTrue((directory / "candidate").exists())
+
+        # 窗口到期后重新检查：路径已合法，运行回到清理流水线，过期标记被清除。
+        self.store.put_setting("retention_path_rejected:" + linked["id"], dict(
+            mark, rejected=time.time() - maintenance_module.RETENTION_REJECT_REVALIDATE_SECONDS - 1))
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+
+        self.assertFalse((directory / "candidate").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "expired")
+        self.assertIsNone(self.store.setting("retention_path_rejected:" + linked["id"]))
+
+    def test_retention_rejected_path_still_unsafe_is_marked_again(self):
+        runs = self.store.root / "runs"
+        runs.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        linked = self.historical_run("broken", "awaiting_approval")
+        directory = Path(linked["path"])
+        directory.symlink_to(outside, target_is_directory=True)
+
+        self.runtime.maintenance()
+        mark = self.store.setting("retention_path_rejected:" + linked["id"])
+        first = mark["rejected"]
+
+        # 窗口到期而链接仍在：重写标记顺延窗口，事件每窗口至多一条。
+        self.store.put_setting("retention_path_rejected:" + linked["id"], dict(
+            mark, rejected=time.time() - maintenance_module.RETENTION_REJECT_REVALIDATE_SECONDS - 1))
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+
+        renewed = self.store.setting("retention_path_rejected:" + linked["id"])
+        self.assertGreater(renewed["rejected"], first)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "awaiting_approval")
+        self.assertTrue(directory.is_symlink())
+        events = self.store.query(
+            "SELECT run FROM events WHERE kind='retention_path_rejected' AND run=?", (linked["id"],))
+        self.assertEqual(len(events), 2)
+
     def test_automatic_retention_honors_run_and_project_holds(self):
         self.store.execute("INSERT INTO projects VALUES ('held','held project',?, '{}', 0, 9)",
                            (str(self.root / "held"),))
