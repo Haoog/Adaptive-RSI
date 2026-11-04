@@ -604,11 +604,144 @@ class AuthSessionTests(unittest.TestCase):
                 manager.snapshot()
                 self.assertEqual(discover.call_count, 2)
                 clock.return_value = 126
-                manager.snapshot()
+                stale = manager.snapshot()['opencode']
+                # 过期条目先返回旧结果，探测转入后台线程。
+                self.assertEqual(stale['error'], 'opencode_error')
+                self.assertTrue(stale['refreshing'])
+                for _ in range(200):
+                    if not manager.status_refreshes:
+                        break
+                    time.sleep(0.01)
                 self.assertEqual(discover.call_count, 3)
+                self.assertFalse(manager.status_refreshes)
+                self.assertGreater(manager.status_cache['opencode'][0], 126)
+                self.assertNotIn('refreshing', manager.snapshot()['opencode'])
         finally:
             manager.close()
         self.assertFalse(manager.status_cache)
+
+    def test_stale_snapshot_returns_immediately_and_refreshes_in_background(self):
+        manager = AuthSessions(self.root / 'stale-while-revalidate')
+        calls = []
+
+        def detect(binary, **kwargs):
+            calls.append(binary)
+            if len(calls) > 1:
+                time.sleep(2)
+            return OpenCodeCapabilities('1.19.3', (1, 19, 3))
+
+        def providers(binary, capabilities):
+            return ['openai'] if len(calls) < 2 else []
+
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', side_effect=detect), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', side_effect=providers):
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], ['openai'])
+                with manager.cache_lock:
+                    expires, value = manager.status_cache['opencode']
+                    manager.status_cache['opencode'] = (time.monotonic() - 1, value)
+                started = time.perf_counter()
+                stale = manager.snapshot()['opencode']
+                elapsed = time.perf_counter() - started
+                # 探测在后台 sleep 2s，请求线程只读缓存。
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(stale['refreshing'])
+                self.assertEqual(stale['authenticated_providers'], ['openai'])
+                for _ in range(300):
+                    if not manager.status_refreshes:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(manager.status_refreshes)
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], [])
+        finally:
+            manager.close()
+
+    def test_stale_snapshot_does_not_wait_for_the_session_lock(self):
+        """安装凭据/登出持有会话锁时，过期快照仍须立即返回。"""
+        manager = AuthSessions(self.root / 'stale-while-locked')
+        locked, release = threading.Event(), threading.Event()
+
+        def hold_lock():
+            with manager.lock:
+                locked.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', return_value=['openai']):
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], ['openai'])
+                with manager.cache_lock:
+                    expires, value = manager.status_cache['opencode']
+                    manager.status_cache['opencode'] = (time.monotonic() - 1, value)
+                # 另一个线程持锁，模拟 _save/logout 在 CLI 子进程期间的会话锁占用。
+                holder.start()
+                self.assertTrue(locked.wait(2))
+                started = time.perf_counter()
+                stale = manager.snapshot()['opencode']
+                elapsed = time.perf_counter() - started
+                release.set()
+                holder.join(2)
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(stale['refreshing'])
+                self.assertEqual(stale['authenticated_providers'], ['openai'])
+                for _ in range(300):
+                    if not manager.status_refreshes:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(manager.status_refreshes)
+        finally:
+            release.set()
+            holder.join(2)
+            manager.close()
+
+    def test_invalidation_during_background_refresh_keeps_new_credentials(self):
+        manager = AuthSessions(self.root / 'invalidate-during-refresh')
+        path = auth_sessions.auth_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'openai': {'type': 'api', 'key': 'OLD'}}))
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def providers(binary, capabilities):
+            data = json.loads(path.read_text())
+            calls.append(sorted(data))
+            if len(calls) == 2:
+                entered.set()
+                release.wait(3)
+            return sorted(key for key, value in data.items() if isinstance(value, dict))
+
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', side_effect=providers):
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], ['openai'])
+                with manager.cache_lock:
+                    expires, value = manager.status_cache['opencode']
+                    manager.status_cache['opencode'] = (time.monotonic() - 1, value)
+                self.assertTrue(manager.snapshot()['opencode']['refreshing'])
+                self.assertTrue(entered.wait(2))
+                # 模拟登录/登出：写新凭据并使缓存失效，下一次快照必须同步读到新值。
+                path.write_text(json.dumps({'anthropic': {'type': 'api', 'key': 'NEW'}}))
+                with manager.lock:
+                    manager._invalidate_caches('opencode')
+                fresh = manager.snapshot()['opencode']
+                self.assertFalse(fresh.get('refreshing'))
+                self.assertEqual(fresh['authenticated_providers'], ['anthropic'])
+                # 旧代际的后台结果返回后不能覆盖失效后的新缓存。
+                release.set()
+                for _ in range(300):
+                    if not manager.status_refreshes:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(manager.status_refreshes)
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], ['anthropic'])
+                self.assertEqual(calls, [['openai'], ['openai'], ['anthropic']])
+        finally:
+            release.set()
+            manager.close()
 
     def test_snapshot_reports_container_readiness_for_both_backends(self):
         for docker, exit_code, error in ((None, 0, 'auth_container_unavailable'),
