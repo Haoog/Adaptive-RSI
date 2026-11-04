@@ -61,7 +61,7 @@ def verification_cost(store, project, rows):
     samples = []
     for row in rows:
         run = store.one("SELECT id,result FROM runs WHERE project=? AND task=? AND ended IS NOT NULL "
-                        "ORDER BY started DESC,id DESC LIMIT 1", (project, row["id"]))
+                        "ORDER BY started DESC,rowid DESC LIMIT 1", (project, row["id"]))
         try:
             evaluation = json.loads(run["result"]).get("evaluation", {}) if run else {}
             checks = evaluation.get("checks", {}).get("candidate_full", [])
@@ -168,7 +168,7 @@ def execute(runtime, project, tasks, action, request=None, preview=True, expecte
         if action == "approve":
             candidates = []
             for row in rows:
-                run = runtime.store.one("SELECT id,result FROM runs WHERE task=? AND project=? AND state='awaiting_approval' ORDER BY started DESC LIMIT 1", (row["id"], project))
+                run = runtime.store.one("SELECT id,result FROM runs WHERE task=? AND project=? AND state='awaiting_approval' ORDER BY started DESC,rowid DESC LIMIT 1", (row["id"], project))
                 try:
                     result = json.loads(run["result"]) if run else {}
                     if not isinstance(result, dict):

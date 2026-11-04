@@ -293,6 +293,22 @@ class RuntimeSafetyTest(unittest.TestCase):
         self.assertTrue(status['maintenance_timed_out'])
         self.assertTrue(status['maintenance_running'])
 
+    def test_close_bounds_scheduler_join_and_records_timeout(self):
+        # 调度线程卡在 store.root 的挂起文件系统调用上时，close() 不能停在第一个
+        # join：调度 join 有限上界后才可能走到维护线程的上界并真正结束关闭。
+        self.runtime.thread = threading.Thread(
+            target=threading.Event().wait, name="rsi-scheduler-stuck", daemon=True)
+        self.runtime.thread.start()
+        with patch('adaptive_rsi.runtime.SCHEDULER_JOIN_TIMEOUT', 0.1):
+            start = time.monotonic()
+            self.runtime.close()
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 15)
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'completed')
+        self.assertTrue(status['scheduler_timed_out'])
+        self.assertFalse(status['maintenance_timed_out'])
+
     def test_pause_marks_only_unfinished_runs_in_its_project(self):
         task = self.runtime.goal(self.project, "Completed history")
         ended = self.store.claim(self.project, self.runtime.config(self.project))
