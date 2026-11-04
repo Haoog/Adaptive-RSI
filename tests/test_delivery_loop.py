@@ -13,7 +13,7 @@ from unittest.mock import patch
 from adaptive_rsi.acceptance import seal
 from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
-from adaptive_rsi.delivery import baseline, merge_gate, tick
+from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks, merge_gate, tick
 from adaptive_rsi.evaluator import Evaluator, freeze_harness
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
@@ -473,6 +473,38 @@ print('BOUNDARIES_OK')
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
         self.assertEqual(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["delivery_status"],
                          "waiting_review")
+
+    def test_delivery_status_keeps_bounded_failing_check_details(self):
+        run = self.tracked_pr()
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "mergeable": "MERGEABLE",
+              "mergeStateStatus": "CLEAN", "reviewDecision": "",
+              "statusCheckRollup": [
+                  {"name": "verify", "conclusion": "FAILURE", "detailsUrl": "https://example.test/verify"},
+                  {"name": "linux", "conclusion": "SUCCESS", "detailsUrl": "https://example.test/linux"},
+                  {"name": "browser", "conclusion": "SUCCESS", "detailsUrl": "https://example.test/browser"}]}
+        # 失败检查的反馈已在先前尝试记录：本轮不重排，交付状态停在 ci_failed 并携带明细。
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.record_pr_feedback", return_value=[]):
+            tick(self.runtime, 1000)
+        saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(saved["delivery_status"], "ci_failed")
+        self.assertEqual(saved["delivery_checks"],
+                         [{"name": "verify", "state": "FAILURE", "url": "https://example.test/verify"}])
+
+        green = {**pr, "reviewDecision": "REVIEW_REQUIRED", "statusCheckRollup": pr["statusCheckRollup"][1:]}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=green):
+            tick(self.runtime, 1061)
+        saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(saved["delivery_status"], "waiting_review")
+        self.assertNotIn("delivery_checks", saved)
+
+    def test_delivery_check_details_are_bounded_and_failures_come_first(self):
+        rows = [{"name": "pending-%d" % index, "status": "IN_PROGRESS"} for index in range(20)]
+        rows += [{"name": "failed-%d" % index, "conclusion": "FAILURE", "detailsUrl": "u"} for index in range(3)]
+        details = delivery_checks({"statusCheckRollup": rows})
+        self.assertEqual(len(details), CHECK_DETAIL_LIMIT)
+        self.assertEqual([item["name"] for item in details[:3]], ["failed-0", "failed-1", "failed-2"])
+        self.assertEqual(details[3], {"name": "pending-0", "state": "IN_PROGRESS", "url": None})
 
     def test_merged_tasks_still_trigger_strategy_evolution_and_reverts_reach_planning(self):
         self.runtime.pause(self.project, False)
