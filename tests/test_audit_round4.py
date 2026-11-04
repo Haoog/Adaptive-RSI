@@ -197,6 +197,11 @@ class AuditRound4Test(unittest.TestCase):
         self.assertFalse(empty_test_run(mixed))
         self.assertFalse(empty_test_run("ok  \tpkg1\t0.5s\nok  \tpkg2\t0.004s [no tests to run]\n"))
         self.assertFalse(empty_test_run("?   \tpkg1\t[no test files]\nok  \tpkg2\t0.5s\n"))
+        # PASS 行不能吃掉紧随其后 ok 行的前导换行：否则 finditer 非重叠扫描漏掉
+        # 真正执行过测试的包，混包输出被误判为空跑。
+        self.assertFalse(empty_test_run("?   \tpkg1\t[no test files]\nPASS\nok  \tpkg2\t0.5s\n"))
+        # 两个包的 ok 行都带零执行标记时，PASS 行仍是唯一命中，必须判为空跑。
+        self.assertTrue(empty_test_run("?   \tpkg1\t[no test files]\nPASS\nok  \tpkg2\t[no tests to run]\n"))
 
     def test_evaluator_empty_test_run_large_output_is_fast(self):
         # 12 MB 输出上限下不应逐字符跑四个正则：旧实现 8 MB 约需 7 s。

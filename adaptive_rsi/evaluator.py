@@ -416,10 +416,12 @@ _EMPTY_TEST_CUES = ("no test", "no example", "tests: 0", "tests run: 0",
 _ZERO_WORD_CUES = ("0 test", "0 example", "0 passing", "0 runs", "0 of 0")
 # `\s+` 允许任意空白（含换行），固定子串覆盖不到；仅在出现关键词时补一次扫描。
 _FLEXIBLE_EMPTY_CUE = re.compile(r"tests\s+0\b|executed\s+0\s+of\s+0")
+# 行首分支用 (?=\s) 前瞻而非消费尾部空白：否则 PASS 行会吞掉下一行 ok 的前导换行，
+# finditer 非重叠扫描漏掉真正执行过测试的包。
 _POSITIVE_TEST_PATTERN = (r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
                           r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
                           r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
-                          r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
+                          r"(?:^|\n)\s*(?:ok|PASS|FAIL)(?=\s)|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
                           r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+")
 _GO_NO_TEST_MARKER = re.compile(r"\[no tests? (?:to run|files)\]", re.I)
 
