@@ -608,13 +608,61 @@ def _supersede_pr(store, run, outcome, task_state, now, feedback_keys=None):
     return bool(changed)
 
 
-def _close_superseded_pr(store, run, outcome, repo, pr, cancelled):
+# 关闭失败的退避与上限：交付凭据失效、仓库写权限变更或策略拒绝关闭都会长期
+# 存在，每个调度周期重发一次失败远端写只会刷写事件、遮蔽同项目其它真实错误。
+# 首次失败 5 分钟后重试，逐次翻倍到 1 小时封顶；24 次后（约 1 天）落终态交人工。
+CLOSE_ATTEMPT_LIMIT = 24
+CLOSE_RETRY_INITIAL = 300
+CLOSE_RETRY_MAX = 3600
+
+# 关闭意图只在未放弃时参与轮询；终态行退出查询，不再触碰远端。
+_CLOSE_PENDING = ("(r.state='superseded' AND json_valid(r.result) "
+                  "AND json_extract(r.result,'$.close_pending')=1 "
+                  "AND coalesce(json_extract(r.result,'$.close_abandoned'),'')='')")
+
+
+def _close_retry_delay(attempts):
+    return min(CLOSE_RETRY_MAX, CLOSE_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+
+
+def _close_retry_due(outcome, now):
+    last = outcome.get("close_retry_at")
+    attempts = outcome.get("close_attempts")
+    if not isinstance(last, (int, float)) or not isinstance(attempts, int):
+        return True
+    return now - last >= _close_retry_delay(attempts)
+
+
+def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
     # A failed/lost response leaves the intent durable. Always observe remote state
     # before retrying, including manual closes and merges while the worker was down.
     if pr["state"] == "OPEN":
         if cancelled():
             return
-        checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
+        attempts = outcome.get("close_attempts")
+        attempts = (attempts if isinstance(attempts, int) else 0) + 1
+        # 尝试先落盘再发起远端写：响应丢失或进程中断同样要退避，否则下一轮
+        # tick 会立刻重发同一次失败写入。
+        outcome["close_attempts"] = attempts
+        outcome["close_retry_at"] = now
+        store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
+        try:
+            checked(["gh", "pr", "close", outcome["pr"], "--repo", repo])
+        except Cancelled:
+            raise
+        except Exception as exc:
+            if attempts < CLOSE_ATTEMPT_LIMIT:
+                raise
+            # 尝试次数用尽：退出关闭候选并只记一条终止事件交人工；失败原因随
+            # 事件保留，不再向上抛出重复的 delivery_error。
+            outcome["close_abandoned"] = "close failed after %s attempts: %s" % (attempts, exc)
+            outcome["close_pending"] = False
+            store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
+            store.event("delivery_close_abandoned",
+                        "Superseded PR close abandoned after %s attempts: %s" % (attempts, exc),
+                        run["project"], run["id"])
+            store.remote_wait(run["id"], None, time.time())
+            return
         outcome["close_status"] = "close_submitted"
     else:
         outcome["close_status"] = pr["state"].lower()
@@ -787,8 +835,8 @@ def schedule(runtime, now=None):
     projects = set()
     from .release import pending
     for run in store.query("SELECT r.* FROM runs r JOIN projects p ON p.id=r.project "
-                           "WHERE p.paused=0 AND (r.state IN ('pr_open','merged') OR "
-                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")"):
+                           "WHERE p.paused=0 AND (r.state IN ('pr_open','merged') OR " +
+                           _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")"):
         with runtime.scheduler_scope("delivery_run", run["project"], run["id"]):
             outcome = parsed_result(run)
             if run['state'] == 'superseded' and not outcome.get('pr') and not _recovery_due(outcome, now):
@@ -846,8 +894,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     tick_baselines = {}
     from .release import pending
 
-    for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR "
-                           "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")" +
+    for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR " +
+                           _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")" +
                            (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
                            (project_id,) if project_id else ()):
         if tracking_cancelled():
@@ -890,6 +938,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     # 身份校验失配是可人工修复的状态：退避后再看，不要每个调度
                     # 周期都查询同一个无法关闭的 PR。
                     continue
+                if not _close_retry_due(outcome, now):
+                    # close 写失败同样退避：权限/凭据失效往往持续数小时，不能
+                    # 每轮都重发失败远端写并刷写 delivery_error。
+                    continue
             pr = pr_view(repo, pr_url) if run["state"] in ["pr_open", "superseded"] else None
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
@@ -923,7 +975,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 project['id'], run['id'])
                     continue
                 _close_superseded_pr(store, run, outcome, repo, pr,
-                                     lambda: tracking_cancelled() or runtime.project(project['id'])['paused'])
+                                     lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now)
                 continue
             if run["state"] == "pr_open":
                 gate = merge_gate(pr, policy["head"], policy["base"])
@@ -1015,7 +1067,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         outcome["delivery_status"] = "feedback_replan"
                         if _supersede_pr(store, run, outcome, state, now, feedback_keys):
                             _close_superseded_pr(store, run, outcome, repo, pr,
-                                                 lambda: tracking_cancelled() or runtime.project(project["id"])["paused"])
+                                                 lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now)
                             continue
                         outcome = previous
                     outcome["delivery_status"] = gate
@@ -1057,7 +1109,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     # Issue sync will refresh evidence and requeue this task if it is still eligible.
                                     if _supersede_pr(store, run, outcome, "blocked", now):
                                         _close_superseded_pr(store, run, outcome, repo,
-                                                             pr_view(repo, outcome["pr"]), tracking_cancelled)
+                                                             pr_view(repo, outcome["pr"]), tracking_cancelled, now)
                                     continue
                         # Fetch and Issue checks can outlive a settings change. Re-read the complete
                         # local authorization under the same lock used by configuration writes.
@@ -1102,7 +1154,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
                             _close_superseded_pr(store, run, outcome, repo,
-                                                 pr_view(repo, outcome["pr"]), tracking_cancelled)
+                                                 pr_view(repo, outcome["pr"]), tracking_cancelled, now)
                         continue
                 status = outcome.get("delivery_status")
                 store.remote_wait(run["id"], status if status in ["waiting_ci", "waiting_review", "waiting", "merge_submitted"] else None, now)
