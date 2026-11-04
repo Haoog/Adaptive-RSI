@@ -260,6 +260,10 @@ def check_with_fresh_artifacts(sandbox, check, target, cancel=None, protected=()
     """Run one check and collect only the reports that this run created or rewrote."""
     previous = artifact_snapshot(target)
     result = sandbox.check(check, target, cancel, protected, hidden)
+    # Result rows come from producers that only echo name/argv (Sandbox._check),
+    # while candidate_full merging pairs them with the spec by (name, argv, cwd).
+    # Bind the spec cwd here so a check in a subdirectory is not dropped.
+    result.setdefault("cwd", check.get("cwd") or ".")
     result["artifacts"] = collect_test_artifacts(target, previous=previous)
     return result
 
@@ -1118,6 +1122,7 @@ class Evaluator:
             outcome["test_first_rows"] = []
             for check in test_first_check if isinstance(test_first_check, list) else [test_first_check]:
                 focused = sandbox.check(check, target, cancel, protected, hidden)
+                focused.setdefault("cwd", check.get("cwd") or ".")
                 focused_text = focused["stdout"] + focused["stderr"]
                 focused["empty_tests"] = empty_test_run(focused_text)
                 focused["passed"] = focused["exit_code"] == 0 and not focused["error"] and not focused["empty_tests"]
