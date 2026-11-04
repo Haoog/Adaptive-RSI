@@ -589,7 +589,7 @@ class Runtime(Maintenance):
                     return prior["id"]
                 if prior["state"] in ["failed", "blocked"]:
                     # 周期任务持续故障时按连败次数退避，避免每周期产生新的失败 run。
-                    rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 4", (prior["id"],)).fetchall()
+                    rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 4", (prior["id"],)).fetchall()
                     streak, last_failure = 0, 0.0
                     for row in rows:
                         if row["state"] in ["failed", "blocked"]:
@@ -766,7 +766,7 @@ class Runtime(Maintenance):
         for task in self.store.query("SELECT * FROM tasks WHERE state='blocked'" + (" AND project=?" if project else ""), (project,) if project else ()):
             if self.project(task["project"])["paused"]:
                 continue
-            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 1", (task["id"],))
+            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],))
             try:
                 problem = json.loads(run["result"] or "{}").get("failure", {}) if run else {}
             except (TypeError, ValueError, AttributeError):
@@ -1079,7 +1079,7 @@ class Runtime(Maintenance):
     def reassess_deferred(self, project, config, head):
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
-            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],)) if not decision else None
+            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)) if not decision else None
             try:
                 prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
             except (TypeError, ValueError):
