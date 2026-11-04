@@ -553,11 +553,15 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'planning')
         self.assertEqual(observed, {'phase': 'evaluation', 'cancelled': False, 'timed_out_stage': None})
 
-    def test_experiment_acceptance_baseline_runs_on_the_evaluation_clock(self):
-        """后台验收基线线程在提交前就必须处于评估相位，不能继承 preparation 预算。"""
+    def test_experiment_acceptance_baseline_is_charged_to_preparation(self):
+        """验收基线与实现并发执行，按 preparation 计时；评估相位实现结束后才起算。"""
         from adaptive_rsi import pipeline
+        baseline_observed = threading.Event()
         class HighRisk(FakeAgent):
             def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == 'implementation':
+                    # 先让基线线程读到相位，排除线程调度造成的另一个观察窗口。
+                    assert baseline_observed.wait(5), 'acceptance baseline never observed its phase'
                 result = super().invoke(role, prompt, workspace, *args, **kwargs)
                 if role == 'planning' and isinstance(result, dict):
                     return {**result, 'risk': 'high'}
@@ -567,6 +571,7 @@ class RuntimeHandoffTest(unittest.TestCase):
         observed = {}
         def baseline(*args, **kwargs):
             observed['phase'] = trial.get('_explicit_phase')
+            baseline_observed.set()
             return {'decision': 'pass', 'checks': {}}
         with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
              patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
@@ -576,7 +581,52 @@ class RuntimeHandoffTest(unittest.TestCase):
                 self.runtime, trial, project, task, project['path'], base, directory, workspace,
                 self.runtime.active_strategies(self.project, config), experiment=True)
         self.assertEqual(outcome['decision'], 'pass')
-        self.assertEqual(observed, {'phase': 'evaluation'})
+        # 实现期间不能提前切到评估相位：生产路径同样把实现与基线计入 preparation。
+        self.assertEqual(observed, {'phase': 'preparation'})
+        # 候选封存后才显式起算评估相位，评估仍拿到完整预算。
+        self.assertEqual(trial['_explicit_phase'], 'evaluation')
+
+    def test_experiment_implementation_time_is_charged_to_preparation(self):
+        """实现耗时计入 preparation，不挤占评估预算；否则长实现会被误报评估超时。"""
+        from adaptive_rsi import pipeline
+        clock = [0.0]
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(time, name)
+            def monotonic(self):
+                return clock[0]
+        class SlowImplementation(FakeAgent):
+            def invoke(self, role, *args, **kwargs):
+                result = super().invoke(role, *args, **kwargs)
+                if role == 'planning' and isinstance(result, dict):
+                    # 独立验收会产生与实现并发的基线线程，旧代码正是在这里提前切段。
+                    return {**result, 'risk': 'high'}
+                if role == 'implementation':
+                    # 600 秒实现耗时：超过本用例 300 秒评估预算，仍在 1200 秒准备预算内。
+                    clock[0] += 600
+                return result
+        self.runtime.agent = SlowImplementation()
+        self.runtime.configure({'deadlines': {'preparation_seconds': 1200, 'evaluation_seconds': 300}},
+                               self.project)
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        clock[0] = trial['_deadline_started']
+        observed = {}
+        def evaluation(*args, **kwargs):
+            observed['phase'] = trial.get('_explicit_phase')
+            observed['cancelled'] = self.runtime.is_cancelled(trial)
+            observed['timed_out_stage'] = trial.get('_timed_out_stage')
+            return {'decision': 'pass', 'checks': {}, 'improvement': {'decision': 'pass'}}
+        with patch('adaptive_rsi.runtime.time', Clock()), \
+             patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline',
+                          return_value={'decision': 'pass', 'checks': {}}), \
+             patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluation):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=True)
+        self.assertEqual(outcome['decision'], 'pass')
+        # 评估从实现结束后的封存点重新起算；实现耗时不得让试验按评估超时取消。
+        self.assertEqual(observed, {'phase': 'evaluation', 'cancelled': False, 'timed_out_stage': None})
 
     def test_trial_evaluation_timeout_reaches_parent_when_pipeline_raises(self):
         from adaptive_rsi.evolution import Evolution
