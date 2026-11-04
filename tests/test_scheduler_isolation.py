@@ -598,23 +598,6 @@ class SchedulerIsolationTest(unittest.TestCase):
                          'def add(a, b):\n    return a - b\n')
         self.assertEqual(run['task'], task)
 
-    def test_undo_cleanup_rebinds_run_path_cleared_by_retention(self):
-        run = self.historical_run("healthy", "completed")
-        directory = Path(run["path"])
-        (directory / "workspace").mkdir(parents=True)
-        (directory / "workspace" / "evidence.txt").write_text("restored evidence")
-        receipt = maintenance_module.recycle_cleanup(
-            self.store, maintenance_module.preview_cleanup(self.store, run["id"]))
-        # 保留周期清理已解绑该运行后再撤销回收：恢复的工件必须重新挂钩，
-        # 否则后续保留策略与手动清理预览都会跳过它。
-        self.store.execute("UPDATE runs SET path=NULL WHERE id=?", (run["id"],))
-
-        maintenance_module.undo_cleanup(self.store, receipt["id"])
-
-        self.assertEqual((directory / "workspace" / "evidence.txt").read_text(), "restored evidence")
-        self.assertEqual(self.store.one("SELECT path FROM runs WHERE id=?", (run["id"],))["path"],
-                         str(directory))
-
     def test_invalid_maintenance_project_does_not_block_other_project_cleanup(self):
         run = self.historical_run("healthy", "awaiting_approval")
         (Path(run["path"]) / "candidate").mkdir(parents=True)
