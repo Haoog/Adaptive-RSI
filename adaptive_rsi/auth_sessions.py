@@ -1506,11 +1506,11 @@ class AuthSessions:
                         pass
                 else:
                     binary = shutil.which("opencode")
-                    remove_auth_export(provider)
                     try:
+                        remove_auth_export(provider)
                         if not self.custom_factory and binary:
                             logout_provider(provider, binary)
-                    except (OpenCodeCompatibilityError, RuntimeError):
+                    except (OpenCodeCompatibilityError, RuntimeError, OSError):
                         raise AuthError("auth_protocol_error") from None
                     path = auth_path()
                     data = _read_json_for_write(path)
