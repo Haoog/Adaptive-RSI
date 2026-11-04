@@ -524,11 +524,94 @@ class AuditEvaluationTest(unittest.TestCase):
                              {('print(1)', True), ('print(2)', False)})
 
     def test_exact_host_tool_versions_are_recorded_without_cache_authorization(self):
+        from unittest.mock import patch
         tools = evaluator.host_tool_versions([{'argv': ['python3', '-m', 'unittest']}])
         self.assertIn('python3', tools)
         self.assertEqual(tools['python3']['state'], 'available')
         self.assertTrue(tools['python3']['version'])
         self.assertTrue(tools['python3']['binary_sha256'])
+        # 未提供执行身份时不写 scope：依赖准备缓存键保持稳定。
+        self.assertNotIn('_scope', tools)
+        scoped = evaluator.host_tool_versions([{'argv': ['python3', '-m', 'unittest']}],
+                                              {'backend': 'docker', 'image_id': 'sha256:' + 'a' * 64})
+        self.assertEqual(scoped['_scope'], {'probe': 'host', 'checks_run_in': 'docker'})
+        self.assertNotIn('image_id', scoped)
+        unsupported = evaluator.host_tool_versions([{'argv': ['custom-runner', '--check']}])
+        self.assertEqual(unsupported['custom-runner'],
+                         {'state': 'unavailable', 'reason': 'not_an_allowlisted_host_probe'})
+        with patch('adaptive_rsi.evaluator.shutil.which', return_value=None):
+            missing = evaluator.host_tool_versions([{'argv': ['node', '--version']}])
+        self.assertEqual(missing['node'], {'state': 'missing'})
+
+    def test_large_host_binary_is_hashed_in_bounded_chunks_and_digest_is_cached(self):
+        import builtins
+        import hashlib
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'node'
+            payload = b'n' * (evaluator.HOST_TOOL_DIGEST_CHUNK * 2 + 17)
+            binary.write_bytes(payload)
+            expected = hashlib.sha256(payload).hexdigest()
+            reads = []
+            real_open = builtins.open
+
+            class Tracked:
+                def __init__(self, handle): self.handle = handle
+                def __enter__(self): return self
+                def __exit__(self, *args): self.handle.close()
+                def fileno(self): return self.handle.fileno()
+                def read(self, size=-1):
+                    reads.append(size)
+                    return self.handle.read(size)
+
+            def tracked_open(file, *args, **kwargs):
+                handle = real_open(file, *args, **kwargs)
+                return Tracked(handle) if str(file) == str(binary) else handle
+
+            probe = {'exit_code': 0, 'stdout': 'v20.0.0\n', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator.shutil.which', return_value=str(binary)), \
+                    patch('adaptive_rsi.process.run_process', return_value=probe), \
+                    patch('pathlib.Path.read_bytes', side_effect=AssertionError('whole-file read')), \
+                    patch('builtins.open', side_effect=tracked_open):
+                first = evaluator.host_tool_versions([{'argv': ['node', '--version']}])
+                self.assertEqual(first['node']['binary_sha256'], expected)
+                self.assertLessEqual(max(reads), evaluator.HOST_TOOL_DIGEST_CHUNK)
+                self.assertGreaterEqual(len(reads), 4)
+                cached_reads = list(reads)
+                second = evaluator.host_tool_versions([{'argv': ['node', '--version']}])
+                self.assertEqual(reads, cached_reads)
+                self.assertEqual(second['node']['binary_sha256'], expected)
+                binary.write_bytes(payload + b'!')
+                reads.clear()
+                replaced = evaluator.host_tool_versions([{'argv': ['node', '--version']}])
+                self.assertNotEqual(replaced['node']['binary_sha256'], expected)
+                self.assertTrue(reads)
+
+    def test_docker_report_marks_host_probes_next_to_execution_image_identity(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        identity = {'build': 'build', 'backend': 'docker', 'image_id': 'sha256:' + 'a' * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'module', 'argv': ['python3', '-c', 'print(1)'], 'timeout_seconds': 1}]
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'cwd': check.get('cwd', '.'),
+                        'exit_code': 0, 'stdout': '', 'stderr': '', 'error': None}
+
+            runner = evaluator.Evaluator(Store(root / 'state'))
+            with patch.object(runner, '_execution_environment', return_value=(merge(DEFAULTS, {}), identity)), \
+                    patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), \
+                    patch('adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = runner.evaluate(source, source, checks, root / 'evaluation', merge(DEFAULTS, {}),
+                                         cache_scope='project', cache_base='base', changed_files=[])
+        self.assertEqual(result['execution_environment'], identity)
+        self.assertEqual(result['host_tools']['_scope'], {'probe': 'host', 'checks_run_in': 'docker'})
+        self.assertNotIn('image_id', result['host_tools'])
 
     @unittest.skipUnless(sys.platform == 'darwin', 'Requires macOS Seatbelt; ordinary Linux jobs have no cached sandbox image')
     def test_fixed_controls_must_be_detected_by_the_real_gate(self):
