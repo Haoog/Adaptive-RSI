@@ -568,6 +568,13 @@ def monitoring_due(outcome, config, now):
         return True
     if outcome.get("monitoring_completed"):
         return False
+    # 已用尽尝试次数：只再进一次以收敛终态，绝不重做快照与固定检查。
+    if _feedback_exhausted(outcome):
+        return True
+    # 合并后验证抛异常后同样要退避：异常可能持续数小时（sandbox、磁盘、评估器），
+    # 每个调度周期立刻重做快照与全量检查会把故障放大成资源占用与事件刷写。
+    if not _feedback_retry_due(outcome, now):
+        return False
     return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
             now - outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0)) >=
             config["delivery"]["feedback_minutes"] * 60)
@@ -1179,6 +1186,127 @@ def committed_changes(source, start, end):
         source, "diff", "--name-only", "-z", start, end, "--").split("\0") if name]
 
 
+POSTMERGE_EVAL_PREFIX = "postmerge-eval:"
+POSTMERGE_EVAL_KEEP = 8
+POSTMERGE_EVAL_ROWS = 40
+POSTMERGE_EVAL_TEXT = 800
+
+
+def postmerge_evaluation_key(project, stage, head, checks, changed, acceptance, config, baseline=None,
+                             execution=None):
+    """Inputs that make two post-merge evaluations of one tree interchangeable.
+
+    `baseline` is the merged tree whose harness the evaluator freezes into the
+    candidate: two merges that reach the same head can still disagree when
+    that frozen harness differs, so the baseline identity must be part of the
+    key. `changed` decides how far the harness is frozen, so empty, known and
+    unavailable diffs never share a result. The merge commit's own check and
+    the later mainline candidate are separate stages because they evaluate
+    different trees; a different sealed acceptance contract, execution
+    environment or resolved backend identity can also decide differently.
+    """
+    return hashlib.sha256(json.dumps(
+        {"project": project, "stage": stage, "head": head, "baseline": baseline, "checks": checks,
+         "changed": changed,
+         "acceptance": [acceptance.get("hash"), acceptance.get("change_kind")] if acceptance else None,
+         "environment": config.get("environment"), "sandbox": config.get("sandbox"),
+         "execution": execution},
+        sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def postmerge_execution_identity(runtime, config):
+    """Resolve the evaluator's immutable execution identity, or None if unpinnable.
+
+    Persisted reuse crosses ticks, so a mutable Docker tag or an unidentified
+    host toolchain cannot prove the checks would run against the same harness;
+    callers must stay within one tick when this returns None.
+    """
+    try:
+        identity = runtime.evaluator.execution_identity(config)
+    except Exception:
+        # Any resolution failure means there is no trustworthy identity.
+        return None
+    return identity if isinstance(identity, dict) and identity else None
+
+
+def bounded_evaluation(result, now):
+    """Reusable evidence: the decision plus bounded check rows, never whole logs."""
+    checks = result.get("checks")
+    rows, total = {}, 0
+    groups = list(checks.items()) if isinstance(checks, dict) else []
+    # Attribution needs the baseline rows; keep them even when candidate output is huge.
+    groups.sort(key=lambda group: group[0] not in ("baseline", "acceptance_baseline"))
+    for label, values in groups:
+        kept = []
+        for row in (values if isinstance(values, list) else []):
+            if not isinstance(row, dict):
+                continue
+            if total >= POSTMERGE_EVAL_ROWS:
+                break
+            total += 1
+            kept.append({key: (str(row.get(key) or "")[-POSTMERGE_EVAL_TEXT:] if key in ("stdout", "stderr")
+                               else row.get(key)) for key in
+                         ("name", "argv", "cwd", "passed", "exit_code", "error", "stdout", "stderr")
+                         if key in row})
+        rows[str(label)[:40]] = kept
+    summary = {"decision": result.get("decision"), "reason": result.get("reason"), "checks": rows, "at": now}
+    summary.update({key: result[key] for key in (
+        "acceptance_hash", "criteria", "coverage", "improvement", "contract", "test_identity_verification",
+        "harness_hash", "candidate_full_reused", "execution_environment", "changed_files_available")
+        if key in result})
+    return summary
+
+
+def postmerge_reusable(runtime, project, key, head, shared, persisted=True):
+    """This tick's shared cache first, then the project's persisted bounded result.
+
+    `persisted=False` keeps reuse inside one tick, where the host and its
+    images cannot have been re-resolved between two runs.
+    """
+    if not key:
+        return None, None
+    slot = ("postmerge-eval", project["id"], key)
+    cached = shared.get(slot) if isinstance(shared, dict) else None
+    if cached:
+        return cached.get("run"), cached.get("result")
+    if not persisted:
+        return None, None
+    stored = runtime.store.setting(POSTMERGE_EVAL_PREFIX + project["id"] + ":" + key)
+    if (isinstance(stored, dict) and stored.get("key") == key and stored.get("head") == head and
+            isinstance(stored.get("evaluation"), dict) and
+            stored["evaluation"].get("decision") in {"pass", "fail"}):
+        return stored.get("run"), stored["evaluation"]
+    return None, None
+
+
+def cache_postmerge_evaluation(runtime, project, key, head, run, result, origin, shared, now, persisted=True):
+    """Share a conclusive evaluation within this tick and persist its bounded form."""
+    if not key or not isinstance(result, dict) or result.get("decision") not in {"pass", "fail"}:
+        return
+    if isinstance(shared, dict):
+        # Keep the run that actually executed the checks so a later hit still traces to it.
+        shared[("postmerge-eval", project["id"], key)] = {"run": origin or run["id"], "result": result}
+    if persisted:
+        remember_postmerge_evaluation(runtime, project, key, head, run, result, origin, now)
+
+
+def remember_postmerge_evaluation(runtime, project, key, head, run, result, origin, now):
+    """Persist one bounded result; only conclusive decisions, newest KEEP per project."""
+    prefix = POSTMERGE_EVAL_PREFIX + project["id"] + ":"
+    runtime.store.put_setting(prefix + key, {"key": key, "head": head, "run": origin or run["id"], "at": now,
+                                             "evaluation": bounded_evaluation(result, now)})
+    entries = []
+    for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE ?", (prefix + "%",)):
+        if row["key"].startswith(prefix):
+            try:
+                stamp = json.loads(row["value"]).get("at")
+            except (TypeError, ValueError, AttributeError):
+                stamp = None
+            entries.append((stamp if isinstance(stamp, (int, float)) else 0, row["key"]))
+    for _, stale in sorted(entries)[:-POSTMERGE_EVAL_KEEP]:
+        runtime.store.execute("DELETE FROM settings WHERE key=?", (stale,))
+
+
 def parsed_result(run):
     """Decode a run result without letting one malformed historical row abort a scan."""
     raw = run["result"]
@@ -1189,6 +1317,66 @@ def parsed_result(run):
     if isinstance(value, dict):
         return value
     return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
+
+
+# 合并后验证抛异常时的退避与上限：sandbox、磁盘、git 或评估器故障会持续存在，
+# 每个调度周期重做一次快照（git init + depth-1 fetch + checkout）与整份固定检查
+# 只会挤占新任务的资源并刷满 events。首次失败 5 分钟后重试，逐次翻倍到 1 小时
+# 封顶；24 次后收敛为 insufficient_evidence 并交人工，不再占用验证资源。
+FEEDBACK_ATTEMPT_LIMIT = 24
+FEEDBACK_RETRY_INITIAL = 300
+FEEDBACK_RETRY_MAX = 3600
+
+
+def _feedback_retry_delay(attempts):
+    return min(FEEDBACK_RETRY_MAX, FEEDBACK_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+
+
+def _feedback_attempts(outcome):
+    attempts = outcome.get("feedback_attempts")
+    return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0 else 0
+
+
+def _feedback_retry_due(outcome, now):
+    """异常后的重试按尝试次数退避；成功与工件缺失路径会清零计数。"""
+    attempts = _feedback_attempts(outcome)
+    last = outcome.get("feedback_attempt_at")
+    if not attempts or not isinstance(last, (int, float)):
+        return True
+    return now - last >= _feedback_retry_delay(attempts)
+
+
+def _feedback_exhausted(outcome):
+    return _feedback_attempts(outcome) >= FEEDBACK_ATTEMPT_LIMIT
+
+
+def _clear_feedback_attempt(outcome):
+    """已得出结果的轮询不再退避；下一次到期按常规反馈周期执行。"""
+    outcome.pop("feedback_attempts", None)
+    outcome.pop("feedback_attempt_at", None)
+
+
+def _record_feedback_attempt(runtime, run, outcome, now):
+    """进入快照与固定检查之前落盘尝试，进程在验证中途消失也计入退避。"""
+    outcome["feedback_attempts"] = _feedback_attempts(outcome) + 1
+    outcome["feedback_attempt_at"] = now
+    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+
+
+def _abandon_feedback(runtime, project, run, outcome, now):
+    """收敛持续失败的合并后验证，只写一条终态事件并停止重试。"""
+    reason = ("Post-merge verification failed %s consecutive attempts without completing; snapshot or "
+              "fixed-check execution keeps raising. Restore the sandbox, git and artifact state, then "
+              "run fresh verification before release/deploy." % _feedback_attempts(outcome))
+    previous = outcome.get("feedback")
+    if not isinstance(previous, dict):
+        previous = {}
+    outcome["feedback"] = {"state": "insufficient_evidence", "reason": reason, "checked_at": now,
+                           "previous": previous}
+    # 终态：保留期与调度不再认为该运行仍在监控，证据保留在 previous 层。
+    outcome["monitoring_completed"] = True
+    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    runtime.store.event("postmerge_verification_abandoned", reason, project["id"], run["id"])
 
 
 def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=None):
@@ -1205,6 +1393,10 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         outcome["monitoring_completed"] = True
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
+    # 尝试次数用尽：只收敛终态，不再进入快照与固定检查。
+    if _feedback_exhausted(outcome):
+        _abandon_feedback(runtime, project, run, outcome, now)
+        return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
     if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
         return
@@ -1220,6 +1412,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         if not isinstance(previous, dict):
             previous = {}
         outcome["feedback_polled_at"] = now
+        # 工件缺失是已分类的结果，按既有轮询周期处理，不占用异常退避的重试预算。
+        _clear_feedback_attempt(outcome)
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
             runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
@@ -1289,6 +1483,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                      merge_record.get("state") in {"verified", "regressed"})
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
+    # 先落盘再取远端与执行检查：sandbox、磁盘或 git 在验证中途失败时，
+    # 下一个调度周期必须看到这次尝试，按退避等待而不是立刻重做整份验证。
+    _record_feedback_attempt(runtime, run, outcome, now)
     identity = runtime.store.setting("run-baseline:" + run["id"])
     if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
         raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
@@ -1307,6 +1504,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
     if previous.get("head") == head and merge_current:
         outcome["feedback_polled_at"] = now
+        _clear_feedback_attempt(outcome)
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     try:
@@ -1339,6 +1537,13 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     reused = previous.get("evaluation") if previous.get("head") == head and isinstance(
         previous.get("evaluation"), dict) else None
     merge_result = None
+    merge_origin = None
+    key = None
+    origin = None
+    # Persisted reuse needs a resolved execution identity (Docker image ID plus
+    # evaluator build); otherwise only same-tick sharing is trustworthy.
+    execution_identity = postmerge_execution_identity(runtime, effective)
+    persisted = execution_identity is not None
     if not merge_current:
         if (head == merged_sha and reused is not None and
                 reused.get("decision") in {"pass", "fail"}):
@@ -1347,16 +1552,30 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         else:
             # Re-run the merge commit's own fixed checks. An earlier
             # 'insufficient_evidence' decision is deliberately not reused, so a
-            # transient failure can be cleared by the next due poll.
-            merge_root = "merge/" if head != merged_sha else ""
-            merge_baseline = snapshot(source, output_path(merge_root + "baseline"), merged_sha)
-            merge_candidate = snapshot(source, output_path(merge_root + "current"), merged_sha)
-            if not checks:
-                checks = detect(merge_baseline)["checks"]
-            merge_result = runtime.evaluator.evaluate(
-                merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
-                effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[],
-                cache_scope=cache_scope, cache_base=cache_base)
+            # transient failure can be cleared by the next due poll. The same
+            # commit has no diff and identical checks, so another run observing
+            # it can share the conclusion instead of repeating the whole run.
+            merge_key = (postmerge_evaluation_key(project["id"], "merge", merged_sha, checks, [], acceptance,
+                                                  effective, baseline=merged_sha, execution=execution_identity)
+                         if checks else None)
+            merge_origin, merge_result = postmerge_reusable(runtime, project, merge_key, merged_sha, shared,
+                                                            persisted=persisted)
+            if merge_result is None:
+                merge_root = "merge/" if head != merged_sha else ""
+                merge_baseline = snapshot(source, output_path(merge_root + "baseline"), merged_sha)
+                merge_candidate = snapshot(source, output_path(merge_root + "current"), merged_sha)
+                if not checks:
+                    checks = detect(merge_baseline)["checks"]
+                if not merge_key and checks:
+                    merge_key = postmerge_evaluation_key(project["id"], "merge", merged_sha, checks, [],
+                                                         acceptance, effective, baseline=merged_sha,
+                                                         execution=execution_identity)
+                merge_result = runtime.evaluator.evaluate(
+                    merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
+                    effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[],
+                    cache_scope=cache_scope, cache_base=cache_base)
+                cache_postmerge_evaluation(runtime, project, merge_key, merged_sha, run, merge_result,
+                                           None, shared, now, persisted=persisted)
         merge_record = {"sha": merged_sha,
                         "state": {"pass": "verified", "fail": "regressed"}.get(
                             merge_result["decision"], "insufficient_evidence"),
@@ -1364,6 +1583,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     if head == merged_sha:
         if merge_result is not None:
             result = merge_result
+            origin = merge_origin
         else:
             baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
             current_tree = snapshot(source, output_path("current"), head)
@@ -1375,10 +1595,6 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     elif reused is not None:
         result = reused
     else:
-        baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
-        current_tree = snapshot(source, output_path("current"), head)
-        if not checks:
-            checks = detect(baseline_tree)["checks"]
         # A clean snapshot has no working-tree diff, so compare the two committed SHAs
         # explicitly; otherwise changed tests/harness in the later mainline are hidden.
         try:
@@ -1388,13 +1604,41 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
             # Fall back to the evaluator's own diff instead of claiming an empty set,
             # which would let frozen regression evidence be reused.
             committed = None
-        result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
-                                            effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
-                                            changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
+        # 多个 merged run 观测同一主线 head：固定检查跑在同一棵 current 树上，但
+        # harness 是各自的 baseline（merged_sha）冻结进候选的，所以只有 baseline、
+        # 检查、变更路径集（决定 harness 冻结范围）、验收契约与可解析的执行环境完全
+        # 一致时结论才可以复用；diff 不可用（None）的证据绝不共享。
+        key = (postmerge_evaluation_key(project["id"], "main", head, checks, committed, acceptance, effective,
+                                        baseline=merged_sha, execution=execution_identity)
+               if checks and committed is not None else None)
+        origin, result = postmerge_reusable(runtime, project, key, head, shared, persisted=persisted)
+        if result is None:
+            baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
+            current_tree = snapshot(source, output_path("current"), head)
+            if not checks:
+                checks = detect(baseline_tree)["checks"]
+            if not key and checks and committed is not None:
+                key = postmerge_evaluation_key(project["id"], "main", head, checks, committed, acceptance,
+                                               effective, baseline=merged_sha, execution=execution_identity)
+            result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
+                                                effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
+                                                changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
+            cache_postmerge_evaluation(runtime, project, key, head, run, result, None, shared, now,
+                                       persisted=persisted)
     outcome["feedback_polled_at"] = now
+    # 本轮验证已给出结论（含 insufficient_evidence）：退出异常退避，
+    # 下一次到期轮询重新走常规反馈周期。
+    _clear_feedback_attempt(outcome)
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
                            "attribution": failure_attribution(merged_sha, head, result)}
+    if origin:
+        outcome["feedback"]["reused_from"] = origin
+        reuse_count = 1 + (shared.get(("postmerge-reused", project["id"]), 0) if isinstance(shared, dict) else 0)
+        if isinstance(shared, dict):
+            shared[("postmerge-reused", project["id"])] = reuse_count
+        runtime.store.event("postmerge", "Post-merge verification reused run " + str(origin) +
+                            " evaluation (reused this tick: " + str(reuse_count) + ")", project["id"], run["id"])
     if merge_record is not None:
         outcome["feedback"]["merge"] = merge_record
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
@@ -1431,11 +1675,14 @@ def investigate(runtime, project, run, outcome):
     report_head = report.get("head")
     if not isinstance(report_head, str):
         report_head = "unknown"
+    # 调查对象是主线 head 本身：同 head 的第二个 run（含复用结论者）只挂到既有任务，
+    # 不再为每个 run 各建一份重复调查；无法确认 head 的报告仍按 run 隔离。
+    subject = report_head if report_head != "unknown" else run["id"]
     body = "Investigate observed post-merge mainline failure while monitoring run " + run["id"] + ". "
     body += "This does not prove a regression caused by the candidate. Attribution: " + encode(report.get("attribution", {"scope": "unknown"})) + ". "
     body += "Reproduce and assess value before changing code. Mainline: " + report_head + ". "
     body += "Full evidence is retained in the run's feedback report. Bounded excerpts: " + encode(failures)
-    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + run["id"] + ":" + report_head,
+    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + project["id"] + ":" + subject,
                                   "Investigate verified post-merge regression", body,
                                   evidence=[{"run": run["id"], "head": report_head, "checks": failures}], priority=100)
     report["investigation_pending"] = False
