@@ -244,6 +244,34 @@ def merge_protection(config):
     return result
 
 
+CHECK_FAILURE_STATES = frozenset({"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
+                                  "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"})
+CHECK_DETAIL_LIMIT = 20
+
+
+def delivery_checks(pr):
+    """Bounded, failure-first check details that explain the persisted status.
+
+    Green checks say nothing once `delivery_status` already reports waiting or
+    failure, so they are omitted and a fully green PR leaves no detail. Both
+    check-run (`name`/`conclusion`/`detailsUrl`) and status-context
+    (`context`/`state`/`targetUrl`) shapes are normalized; the cap keeps a large
+    matrix from growing run results without bound.
+    """
+    failed, pending = [], []
+    for row in pr.get("statusCheckRollup") or []:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name") or row.get("context")
+        state = row.get("conclusion") or row.get("state") or row.get("status")
+        if not name or state in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            continue
+        item = {"name": str(name)[:200], "state": str(state or "UNKNOWN")[:40],
+                "url": row.get("detailsUrl") or row.get("targetUrl")}
+        (failed if state in CHECK_FAILURE_STATES else pending).append(item)
+    return (failed + pending)[:CHECK_DETAIL_LIMIT]
+
+
 def merge_gate(pr, head, base):
     if pr["headRefOid"] != head or pr["baseRefOid"] != base:
         return "stale"
@@ -251,7 +279,7 @@ def merge_gate(pr, head, base):
     if not checks:
         return "waiting_ci"
     statuses = {check.get("conclusion") or check.get("state") or check.get("status") for check in checks}
-    if statuses & {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"}:
+    if statuses & CHECK_FAILURE_STATES:
         return "ci_failed"
     if statuses - {"SUCCESS", "NEUTRAL", "SKIPPED"}:
         return "waiting_ci"
@@ -902,6 +930,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
+                # 与状态同点落库：读方不必跳 GitHub 就能分辨哪条检查在排队、哪条失败。
+                # 全绿或无可展示项时清掉上一 tick 的明细，避免状态前进后面板仍显示旧失败。
+                details = delivery_checks(pr) if gate != "stale" else []
+                if details:
+                    outcome["delivery_checks"] = details
+                else:
+                    outcome.pop("delivery_checks", None)
                 if pr["state"] == "MERGED":
                     # 崩溃对账：意图在 gh pr merge 之前落盘，与终态落库原子消费，
                     # 区分「本进程发起的合并」与「人工合并」；缺失或损坏时回落 pr_view。
