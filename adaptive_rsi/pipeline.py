@@ -53,6 +53,25 @@ def _within_scope(path, scope):
     return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
 
 
+def _acceptance_baseline_failed(future):
+    """并发验收基线是否已确定失败（不阻塞）。
+
+    只在 future.done() 后读取结果：基线评估抛出异常、或其结果是
+    insufficient_evidence（环境/setup 失败是确定性的），都说明候选实现
+    再跑完也无法通过验收。被评估线程的取消谓词轮询调用，必须无副作用。
+    """
+    if future is None or not future.done():
+        return False
+    try:
+        if future.exception() is not None:
+            return True
+        outcome = future.result()
+    except Exception:
+        # 评估异常或被取消的 future 同样说明基线不可用；取消谓词自身不许抛出。
+        return True
+    return isinstance(outcome, dict) and outcome.get("decision") == "insufficient_evidence"
+
+
 def _planned_scope(scope):
     """Plan scope may only name paths narrower than the whole repository."""
     from pathlib import PurePosixPath
@@ -656,9 +675,17 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             else:
                 test_instruction = "Add appropriate regression coverage within the declared scope without weakening existing checks. "
                 implementation_context = context
-            result = runtime.invoke("implementation", "Implement this verified plan. " + test_instruction +
-                                 "Do not modify files outside scope. No publishing.\n" +
-                                 encode({"plan": plan, **implementation_context}), workspace, run)
+            try:
+                result = runtime.invoke("implementation", "Implement this verified plan. " + test_instruction +
+                                     "Do not modify files outside scope. No publishing.\n" +
+                                     encode({"plan": plan, **implementation_context}), workspace, run,
+                                     cancel=lambda: _acceptance_baseline_failed(acceptance_future))
+            except Cancelled:
+                if _acceptance_baseline_failed(acceptance_future):
+                    # 验收基线在实现期间已确定失败：中止的是一次注定白付的实现调用，
+                    # 按准确原因收尾而不是泛化的 cancel 文案。
+                    raise Cancelled("Acceptance baseline evaluation failed; implementation aborted")
+                raise
         scrub_tree(workspace)
         files, patch = changes(workspace)
         if not files:

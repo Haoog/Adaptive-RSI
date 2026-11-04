@@ -1629,7 +1629,7 @@ class Runtime(Maintenance):
                                  "triggers": [t for t in triggers if isinstance(t, str) and t.strip()]})
         return related(eligible, text)
 
-    def invoke(self, role, text, workspace, run):
+    def invoke(self, role, text, workspace, run, cancel=None):
         """Run one model call on the model clock inside the enclosing stage.
 
         Deadline semantics are uniform across stages: a stage budget is a
@@ -1639,6 +1639,10 @@ class Runtime(Maintenance):
         _outer_deadline_stage/_outer_deadline_started), and the call itself is
         bounded by model_seconds; after the call returns, the enclosing stage
         resumes its original clock rather than restarting it.
+
+        ``cancel`` is an optional additional stop predicate composed with
+        ``is_cancelled(run)``; it must be cheap and non-blocking because it is
+        polled from the process-watch loop and native tool loop.
         """
         protected = [p["path"] for p in self.store.query("SELECT path FROM projects")]
         for c in self.store.query("SELECT spec FROM cases"):
@@ -1686,9 +1690,10 @@ class Runtime(Maintenance):
             exposure = run.get("_case_exposure")
             key = self.store.reserve_case_exposure(run["project"], exposure["case"], exposure["experiment"],
                                                   exposure["limit"]) if exposure else None
+            cancelled = lambda: self.is_cancelled(run) or bool(cancel and cancel())
             result = self.agent.invoke(role, DATA_RULE + "\n" + text, workspace, run["project"], run["id"],
-                                       config, lambda: self.is_cancelled(run), protected)
-            if self.is_cancelled(run):
+                                       config, cancelled, protected)
+            if cancelled():
                 raise Cancelled('Model invocation cancelled or stage deadline exceeded')
             if key:
                 value = self.store.setting(key)
