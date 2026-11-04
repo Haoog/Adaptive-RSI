@@ -170,12 +170,16 @@ def test_identities(text):
                 executed.append(identity)
             elif event.get("Action") == "skip":
                 skipped.append({"id": identity, "reason": "unspecified by go event"})
-        match = re.match(r"^(test\S+ \([^)]+\)) \.\.\. (.*)$", line)
+        match = re.match(r"^(test\S+ \(([^)]+)\)) \.\.\. (.*)$", line)
         if match:
-            if match[2].startswith("skipped"):
-                skipped.append({"id": match[1], "reason": match[2][7:].strip()})
+            if match[3].startswith("skipped"):
+                skipped.append({"id": match[1], "reason": match[3][7:].strip()})
             else:
-                executed.append(match[1])
+                # unittest -v prints "method (module.Class.method) ... ok".  The
+                # parenthesized part is the selector-compatible identity callers
+                # write in required_test_ids; the whole prefix is display only.
+                # Keep both so existing display-form contracts still verify.
+                executed.extend((match[2], match[1]))
         match = re.match(r"^(\S+::\S+) (PASSED|FAILED|SKIPPED)(.*)$", line)
         if match:
             if match[2] == "SKIPPED":
