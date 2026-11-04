@@ -763,6 +763,46 @@ class AuthSessionTests(unittest.TestCase):
                 finally:
                     manager.close()
 
+    def test_stale_container_readiness_returns_immediately_and_refreshes_in_background(self):
+        manager = AuthSessions(self.root / 'container-stale', config={'sandbox': {'backend': 'docker'}})
+        calls = []
+
+        def inspect(argv, timeout=None):
+            calls.append(argv)
+            if len(calls) > 1:
+                time.sleep(1)
+                return {'exit_code': 1, 'error': ''}
+            return {'exit_code': 0, 'error': ''}
+
+        def which(name):
+            return '/usr/bin/docker' if name == 'docker' else None
+
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', side_effect=which), \
+                 patch('adaptive_rsi.auth_sessions.run_process', side_effect=inspect), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))):
+                self.assertTrue(manager.snapshot()['codex']['available'])
+                with manager.cache_lock:
+                    key = next(iter(manager.container_cache))
+                    expires, value = manager.container_cache[key]
+                    manager.container_cache[key] = (time.monotonic() - 1, value)
+                started = time.perf_counter()
+                stale = manager.snapshot()
+                elapsed = time.perf_counter() - started
+                # inspect 在后台 sleep 1s，请求线程只读旧的就绪状态。
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(stale['codex']['available'])
+                for _ in range(200):
+                    if not manager.container_refreshes:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(manager.container_refreshes)
+                refreshed = manager.snapshot()
+                self.assertFalse(refreshed['codex']['available'])
+                self.assertEqual(refreshed['codex']['error'], 'auth_worker_image_missing')
+        finally:
+            manager.close()
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
