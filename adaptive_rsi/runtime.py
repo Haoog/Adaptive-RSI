@@ -53,6 +53,12 @@ POSTPROCESS_MAX_ATTEMPTS = 5
 # 后放行（线程为 daemon，不阻止进程退出）。
 MAINTENANCE_JOIN_TIMEOUT = 30
 
+# close() 等待调度线程收尾的上限：调度每一步都落在 store.root（SQLite 读写、
+# 状态目录扫描），该路径可落在 NFS/SSHFS/坏盘而上卡在内核里。调度线程的 join
+# 排在维护线程之前，不设界会让 close 在到达维护的上界前就永久阻塞；超时记
+# scheduler_timed_out 后继续关闭（线程为 daemon）。
+SCHEDULER_JOIN_TIMEOUT = 30
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -119,7 +125,7 @@ class Runtime(Maintenance):
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
-                          "maintenance_timed_out": False}
+                          "scheduler_timed_out": False, "maintenance_timed_out": False}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -938,8 +944,17 @@ class Runtime(Maintenance):
         self._shutdown['phase'] = 'operations'
         self.operations.close()
         self._shutdown['phase'] = 'scheduler'
+        self._shutdown['scheduler_timed_out'] = False
         if self.thread:
-            self.thread.join()
+            # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
+            # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
+            # 的上界永远走不到。
+            self.thread.join(SCHEDULER_JOIN_TIMEOUT)
+            if self.thread.is_alive():
+                logging.getLogger(__name__).warning(
+                    "Scheduler thread did not stop within %ss; proceeding with shutdown",
+                    SCHEDULER_JOIN_TIMEOUT)
+                self._shutdown['scheduler_timed_out'] = True
         self._shutdown['phase'] = 'workers'
         try:
             try:
