@@ -1844,20 +1844,42 @@ class Evolution:
                 sentinel = monitor["passed"] >= config["evolution"]["monitor_tasks"]
                 # Continue observing attributable failures indefinitely. Successful
                 # post-window runs are sampled deterministically to bound history.
+                success_rate = 0.1
                 if sentinel and passed and int(fingerprint(run["id"])[:8], 16) % 10:
                     continue
                 seen.append(run["id"])
                 del seen[:-512]
                 monitor["phase"] = "sentinel" if sentinel else "initial"
-                monitor["sampling"] = "all_attributable_failures_and_one_in_ten_successes" if sentinel else "all"
+                monitor["sampling"] = ("all_attributable_failures_and_one_in_ten_successes;"
+                                       " recorded_pass_ratio_is_biased_low" if sentinel else "all")
+                if sentinel:
+                    monitor["success_sample_rate"] = success_rate
                 monitor["passed" if passed else "failed"] += 1
+                if sentinel and passed:
+                    monitor["sampled_passed"] = monitor.get("sampled_passed", 0) + 1
                 monitor["last_run"] = run["id"]
                 monitor["last_checked"] = time.time()
-                total = monitor["passed"] + monitor["failed"]
-                if not passed or (total and monitor["passed"] / total < 0.8):
-                    evidence["drift"] = {"state": "watch", "phase": monitor["phase"],
-                                         "reason": "Attributable operational regression" if not passed else "Observed pass ratio below 0.8",
-                                         "passed": monitor["passed"], "failed": monitor["failed"]}
+                # Sentinel keeps ~1/10 of successes but every failure, so the recorded
+                # ratio is biased low; scale the sampled successes back up before
+                # applying the 0.8 threshold. Initial-window successes were recorded
+                # without sampling and keep weight 1.
+                if sentinel:
+                    sampled_passed = monitor.get("sampled_passed", 0)
+                    estimated_passed = monitor["passed"] - sampled_passed + sampled_passed / success_rate
+                    denominator = estimated_passed + monitor["failed"]
+                    pass_ratio = estimated_passed / denominator if denominator else 1.0
+                else:
+                    total = monitor["passed"] + monitor["failed"]
+                    pass_ratio = monitor["passed"] / total if total else 1.0
+                if not passed or pass_ratio < 0.8:
+                    drift = {"state": "watch", "phase": monitor["phase"],
+                             "reason": "Attributable operational regression" if not passed else "Observed pass ratio below 0.8",
+                             "passed": monitor["passed"], "failed": monitor["failed"]}
+                    if sentinel:
+                        drift.update({"sampled": True, "success_sample_rate": success_rate,
+                                      "sampled_passed": monitor.get("sampled_passed", 0),
+                                      "unbiased_pass_ratio": round(pass_ratio, 4)})
+                    evidence["drift"] = drift
                 db.execute("UPDATE candidates SET evidence=? WHERE id=? AND status='stable'", (encode(evidence), row["id"]))
             if not passed:
                 self.rollback(row["id"])
