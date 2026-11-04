@@ -815,6 +815,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     # 键按 (项目, 目标分支) 隔离：同项目不同目标分支的 fetch 结果绝不互用，
     # 否则 main 的监控读数会让面向 release 的就绪 run 被静默跳过。
     tick_baselines = {}
+    from .release import pending
 
     for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR "
                            "(r.state='superseded' AND json_valid(r.result) AND json_extract(r.result,'$.close_pending')=1) OR " + _RECOVERY_CANDIDATE + ")" +
@@ -831,6 +832,12 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             if run['state'] == 'superseded' and not outcome.get('pr'):
                 if _recovery_due(outcome, now):
                     _recover_superseded_receipt(runtime, project, run, config, now)
+                continue
+            if (run["state"] == "merged" and outcome.get("monitoring_completed") and
+                    not monitoring_due(outcome, config, now) and not pending(runtime, run)):
+                # 监控已结束且没有发布/部署待办的合并运行不再逐轮重付策略读取、
+                # origin 探测与 feedback/advance 调用；新出现的调查或自动化待办
+                # 会让本行回到完整跟踪路径。
                 continue
             repo = config["github"]["repository"]
             policy = store.setting("delivery:" + run["id"])
