@@ -523,16 +523,83 @@ print('BOUNDARIES_OK')
         self.store.execute("UPDATE runs SET state='reverted',result=? WHERE id=?", (encode({"feedback": {"state": "reverted"}}), runs[0]["id"]))
         self.assertIn("reverted", [item["feedback"]["state"] for item in self.runtime.outcomes(self.project)])
 
-    def tracked_pr(self):
-        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+    def tracked_pr(self, url="https://github.com/example/project/pull/1", head="head"):
+        if "origin" not in git(self.repo, "remote").split():
+            git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
         self.runtime.configure({"github": {"repository": "example/project"}, "delivery": {"mode": "pr", "auto_merge": True}}, self.project)
         self.runtime.pause(self.project, False)
         self.runtime.goal(self.project, "Fix addition")
         run = self.store.claim(self.project, self.runtime.config(self.project))
-        self.store.transition(run["id"], "pr_open", {"pr": "https://github.com/example/project/pull/1"}, True)
-        self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.transition(run["id"], "pr_open", {"pr": url}, True)
+        self.store.put_setting("delivery:" + run["id"], {"head": head, "base": "base", "branch": "main"})
         self.store.put_setting("run-baseline:" + run["id"], {"repository": "example/project", "branch": "main", "sha": "base"})
         return run
+
+    @staticmethod
+    def pr_row(url, head):
+        return {"url": url, "state": "OPEN", "headRefOid": head, "baseRefOid": "base",
+                "baseRefName": "main", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                "reviewDecision": "REVIEW_REQUIRED", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+
+    def tracked_prs(self, count=3):
+        urls = ["https://github.com/example/project/pull/%d" % number for number in range(1, count + 1)]
+        runs = [self.tracked_pr(url, "head%d" % number) for number, url in enumerate(urls, 1)]
+        return urls, runs, [self.pr_row(url, "head%d" % number) for number, url in enumerate(urls, 1)]
+
+    def tick_with_remote(self, page, view):
+        """Run one tick with a stubbed gh: one listing page plus an exact-read callback."""
+        commands = []
+
+        def remote(argv, **kwargs):
+            commands.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                return json.dumps(page)
+            if argv[:3] == ["gh", "pr", "view"]:
+                return json.dumps(view(argv[3]))
+            raise AssertionError("unexpected remote read: " + " ".join(argv))
+        with patch("adaptive_rsi.delivery.checked", side_effect=remote):
+            tick(self.runtime, 1000)
+        return commands
+
+    def assert_tracked_status(self, runs, status="waiting_review"):
+        for run in runs:
+            saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            self.assertEqual(saved["delivery_status"], status)
+
+    def test_tick_reads_three_tracked_prs_with_one_listing(self):
+        urls, runs, rows = self.tracked_prs()
+        with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project") as probe:
+            commands = self.tick_with_remote(rows, lambda url: self.fail("exact read: " + url))
+        self.assertEqual([call[:3] for call in commands], [["gh", "pr", "list"]])
+        self.assertEqual(commands[0][commands[0].index("--limit") + 1], "100")
+        # 同一 tick 内 origin 探测也只做一次，逐 run 重复探测不再随 PR 数增长。
+        probe.assert_called_once_with(str(self.repo))
+        self.assert_tracked_status(runs)
+
+    def test_pr_missing_from_listing_falls_back_to_exact_read_without_affecting_others(self):
+        urls, runs, rows = self.tracked_prs()
+
+        def view(url):
+            if url == urls[2]:
+                raise RuntimeError("remote unavailable")
+            return rows[urls.index(url)]
+        commands = self.tick_with_remote(rows[:2], view)
+        self.assertEqual([call[3] for call in commands if call[:3] == ["gh", "pr", "view"]], [urls[2]])
+        self.assert_tracked_status(runs[:2])
+        # 单条读失败只把该 run 记成 delivery_error，其它 run 的状态照常推进。
+        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='delivery_error'")["n"], 1)
+        failed = self.store.one("SELECT result FROM runs WHERE id=?", (runs[2]["id"],))["result"]
+        self.assertNotIn("delivery_status", json.loads(failed))
+
+    def test_full_pr_page_records_event_and_reads_each_tracked_pr_exactly(self):
+        urls, runs, rows = self.tracked_prs()
+        page = [self.pr_row("https://github.com/example/project/pull/%d" % number, "other%d" % number)
+                for number in range(1000, 1100)]
+        commands = self.tick_with_remote(page, lambda url: rows[urls.index(url)])
+        # 满页不能证明第 101 个 PR 不存在：记事件并逐个精确读，不丢任何跟踪项。
+        self.assertEqual(self.store.one("SELECT COUNT(*) AS n FROM events WHERE kind='delivery_pr_page_full'")["n"], 1)
+        self.assertEqual(sorted(call[3] for call in commands if call[:3] == ["gh", "pr", "view"]), sorted(urls))
+        self.assert_tracked_status(runs)
 
     def test_tracking_feedback_requeues_once_and_preserves_evidence(self):
         from adaptive_rsi.delivery import pr_feedback_context
@@ -904,9 +971,15 @@ print('BOUNDARIES_OK')
         fresh = self.store.claim(self.project, self.runtime.config(self.project))
         self.store.transition(fresh["id"], "pr_open", {"pr": "https://github.com/example/project/pull/2"}, True)
         old_pr = {"state": "CLOSED", "headRefOid": "head", "baseRefOid": "base"}
-        with patch("adaptive_rsi.delivery.pr_view", return_value=old_pr), patch("adaptive_rsi.delivery.checked") as remote:
+
+        def remote(argv, **kwargs):
+            # 本轮共享的列表读是唯一允许的远端调用；关闭/轮转等写入必须为零。
+            self.assertEqual(argv[:3], ["gh", "pr", "list"])
+            return json.dumps([{**old_pr, "url": "https://github.com/example/project/pull/1"}])
+        with patch("adaptive_rsi.delivery.pr_view", return_value=old_pr), \
+                patch("adaptive_rsi.delivery.checked", side_effect=remote) as command:
             tick(self.runtime)
-        remote.assert_not_called()
+        self.assertEqual(command.call_count, 1)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (old["task"],))["state"], "pr_open")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (old["id"],))["state"], "superseded")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (fresh["id"],))["state"], "pr_open")
