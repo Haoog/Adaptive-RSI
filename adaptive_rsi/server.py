@@ -423,7 +423,8 @@ class Handler(BaseHTTPRequestHandler):
         if retry:
             self.respond({"error": "Too many authentication failures", "error_code": "session_required"},
                          429, headers={"Retry-After": str(retry)})
-        elif self.command == "GET" and urlparse(self.path).path in ["/", "/index.html"]:
+        elif self.command in ("GET", "HEAD") and urlparse(self.path).path in ["/", "/index.html"]:
+            # HEAD 与 GET 共享登录页的 401 表示与头；respond() 负责不发送 body。
             self.respond(self.server.assets["login.html"], 401, "text/html; charset=utf-8")
         else:
             self.respond({"error": "Open the authenticated URL printed by adaptive-rsi serve/open", "error_code": "session_required"}, 401)

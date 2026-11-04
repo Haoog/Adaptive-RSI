@@ -540,6 +540,19 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertTrue(self.server._backup_gate.acquire(blocking=False))
         self.server._backup_gate.release()
 
+    def test_unauthenticated_head_keeps_the_login_page_representation(self):
+        # 未登录访问控制台根路径时，HEAD 必须与 GET 一样返回登录页的 401 表示，
+        # 只是不传输 body；不能退化成 JSON 错误，否则 GET/HEAD 头契约被打破。
+        status, headers, body = self.request("/", authenticated=False)
+        self.assertEqual(status, 401)
+        self.assertTrue(headers["Content-Type"].startswith("text/html"))
+        self.assertEqual(headers["Content-Length"], str(len(body)))
+        status, head_headers, head_body = self.request("/", "HEAD", authenticated=False)
+        self.assertEqual((status, head_body), (401, b""))
+        for name in ("Content-Type", "Content-Length", "Cache-Control",
+                     "Content-Security-Policy", "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(head_headers[name], headers[name])
+
     def test_audit_is_bounded_and_never_records_request_secrets(self):
         for _ in range(6):
             self.request("/?token=private-query-token", authenticated=False,
