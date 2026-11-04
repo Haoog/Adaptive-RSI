@@ -484,6 +484,62 @@ class ServerHardeningTest(unittest.TestCase):
         self.server._failure_window = 0
         self.assertEqual(self.request(authenticated=False)[0], 401)
 
+    def test_login_redirect_is_recorded_with_request_identity(self):
+        status, headers, body = self.request("/?token=" + self.server.token, authenticated=False)
+        self.assertEqual(status, 303)
+        self.assertEqual(headers["Location"], "/")
+        self.assertIn(self.server.cookie + "=" + self.server.token, headers["Set-Cookie"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertEqual(body, b"")
+        request_id = headers["X-RSI-Request-ID"]
+        # 记录在发送响应之前提交，因此客户端拿到 303 时日志行必然已存在。
+        rows = self.store.query("SELECT id,method,status,error_code FROM request_log WHERE path='/'")
+        self.assertEqual([(row["method"], row["status"], row["error_code"]) for row in rows], [("GET", 303, "")])
+        self.assertEqual(rows[0]["id"], request_id)
+        # 查询串里的 token 绝不进入日志。
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM request_log WHERE path LIKE '%token%'")["n"], 0)
+
+    def test_unsupported_api_method_returns_json_405_with_security_headers(self):
+        status, headers, body = self.request("/api/state", "PUT")
+        self.assertEqual(status, 405)
+        self.assertEqual([part.strip() for part in headers["Allow"].split(",")],
+                         ["GET", "HEAD", "POST", "OPTIONS"])
+        self.assertTrue(headers["Content-Type"].startswith("application/json"))
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertIn("Content-Security-Policy", headers)
+        self.assertTrue(headers["X-RSI-Request-ID"])
+        self.assertEqual(json.loads(body), {"error": "Method not allowed", "error_code": "http_405"})
+        # 未实现的方法在未知路径上仍是 4xx，不会退化成 500 或默认 HTML 页。
+        status, headers, body = self.request("/api/unknown", "PROPFIND")
+        self.assertEqual((status, headers["Content-Type"].split(";")[0]), (405, "application/json"))
+        self.assertEqual(json.loads(body)["error_code"], "http_405")
+        self.assertEqual(self.request("/unknown", "PROPFIND")[0], 405)
+        self.assertEqual(self.request("/unknown")[0], 404)
+
+    def test_head_and_options_share_the_get_header_contract(self):
+        status, headers, body = self.request("/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Length"], str(len(body)))
+        status, head_headers, head_body = self.request("/api/health", "HEAD")
+        self.assertEqual(status, 200)
+        self.assertEqual(head_body, b"")
+        self.assertEqual(head_headers["Content-Length"], headers["Content-Length"])
+        for name in ("Content-Type", "Cache-Control", "Content-Security-Policy",
+                     "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(head_headers[name], headers[name])
+        status, headers, body = self.request("/api/health", "OPTIONS")
+        self.assertEqual((status, body), (204, b""))
+        self.assertEqual(headers["Allow"], "GET, HEAD, POST, OPTIONS")
+        # 备份流同样只发头：文件内容不会被 HEAD 传输，并发闸门也会释放。
+        self.backup.write_bytes(b"payload")
+        status, headers, body = self.request("/api/backup?id=" + self.identifier, "HEAD")
+        self.assertEqual((status, headers["Content-Length"], body), (200, "7", b""))
+        self.assertTrue(self.server._backup_gate.acquire(blocking=False))
+        self.server._backup_gate.release()
+
     def test_audit_is_bounded_and_never_records_request_secrets(self):
         for _ in range(6):
             self.request("/?token=private-query-token", authenticated=False,
