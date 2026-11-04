@@ -1909,6 +1909,21 @@ class AuthProtocolTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_codex_rejects_unsupported_method_and_inputs_before_device_code(self):
+        worker = CodexAuth()
+        try:
+            for kwargs in ({"method": 1}, {"method": 7}, {"inputs": {"k": "v"}},
+                           {"method": 1, "inputs": {"k": "v"}}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(AuthError) as caught:
+                    worker.start(**kwargs)
+                self.assertEqual(caught.exception.code, "unsupported_auth_method")
+            fields = worker.start()
+            self.assertEqual(fields["verification_url"], "https://example.test/device")
+            self.assertEqual(fields["user_code"], "PRIVATE-USER-CODE")
+            self.assertEqual(fields["method"], "auto")
+        finally:
+            worker.close()
+
     def test_opencode_http_protocol_is_authenticated_and_persists_callback(self):
         worker = OpenCodeAuth()
         try:
