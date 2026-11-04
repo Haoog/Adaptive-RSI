@@ -885,6 +885,20 @@ class AuditEvaluationTest(unittest.TestCase):
         matching = [{'test_identities': {'state': 'reported', 'executed': required, 'skipped': []}}]
         self.assertTrue(evaluator.verify_test_identities(matching, required)['valid'])
 
+    def test_unittest_verbose_identities_match_selector_form(self):
+        text = 'test_ok (test_ok.T.test_ok) ... ok\n'
+        rows = [{'test_identities': evaluator.test_identities(text)}]
+        self.assertIn('test_ok.T.test_ok', rows[0]['test_identities']['executed'])
+        self.assertTrue(evaluator.verify_test_identities(rows, ['test_ok.T.test_ok'])['valid'])
+        # The old display form stays accepted for contracts written before the fix.
+        self.assertTrue(evaluator.verify_test_identities(rows, ['test_ok (test_ok.T.test_ok)'])['valid'])
+        # Abbreviations are not fuzzy-matched, and unrelated IDs stay missing.
+        mixed = evaluator.verify_test_identities(rows, ['test_ok.T.test_ok', 'other.T.test_missing'])
+        self.assertFalse(evaluator.verify_test_identities(rows, ['T.test_ok'])['valid'])
+        self.assertEqual(['other.T.test_missing'], mixed['missing'])
+        pytest_rows = [{'test_identities': evaluator.test_identities('tests/test_x.py::test_a PASSED\n')}]
+        self.assertTrue(evaluator.verify_test_identities(pytest_rows, ['tests/test_x.py::test_a'])['valid'])
+
     def test_executed_identities_and_skip_reasons(self):
         xml = '<testsuite tests="2" skipped="1"><testcase classname="X" name="yes"/><testcase classname="X" name="no"><skipped message="unsupported platform"/></testcase></testsuite>'
         result = evaluator.test_identities(xml)
@@ -1175,6 +1189,65 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(failed_result['decision'], 'fail')
             self.assertEqual(failed_result['cache_write']['state'], 'failed')
             self.assertEqual(failed_report['decision'], 'fail')
+
+    def test_passing_check_stderr_mentioning_missing_executable_keeps_baseline_cache(self):
+        # Go 的 os/exec 在断言缺少某工具时会把 "executable file not found"
+        # 打进 stderr，但检查本身 exit 0 通过。通过行不能一票否决整段
+        # baseline 缓存，否则每次评估都要重跑一遍基线。
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        identity = {'build': 'build', 'backend': 'docker', 'image_id': 'sha256:' + 'b' * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'criterion', 'argv': ['go', 'test', './...']}]
+            calls = []
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                calls.append(Path(workspace).name)
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n',
+                        'stderr': 'exec: "missing-tool": executable file not found in $PATH\n',
+                        'error': None}
+
+            def failing(_sandbox, check, workspace, *args, **kwargs):
+                calls.append(Path(workspace).name)
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 1, 'stdout': '',
+                        'stderr': 'exec: "missing-tool": executable file not found in $PATH\n',
+                        'error': None}
+
+            def evaluate(store, name, side_effect):
+                runner = evaluator.Evaluator(store)
+                config = merge(DEFAULTS, {})
+                with patch.object(runner, '_execution_environment', return_value=(config, identity)), \
+                        patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), \
+                        patch('adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=side_effect):
+                    return runner.evaluate(source, source, checks, root / name, config,
+                                           cache_scope='project', cache_base='base', changed_files=[])
+
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            first = evaluate(store, 'first', execute)
+            self.assertEqual(first['decision'], 'pass')
+            self.assertEqual(calls, ['baseline', 'candidate'])
+            second = evaluate(store, 'second', execute)
+            self.assertEqual(second['decision'], 'pass')
+            # 基线已复用：第二轮只跑候选阶段。
+            self.assertEqual(calls, ['baseline', 'candidate', 'candidate'])
+
+            # 反例：未通过的行命中不可用模式时仍不写缓存，避免把坏环境当基线复用。
+            failed_store = Store(root / 'state-failed')
+            self.addCleanup(failed_store.close)
+            calls.clear()
+            failed = evaluate(failed_store, 'failed', failing)
+            # 候选检查不可用仍按证据不足处理，不放宽判定。
+            self.assertEqual(failed['decision'], 'insufficient_evidence')
+            self.assertEqual(calls, ['baseline', 'candidate'])
+            self.assertEqual(failed_store.query(
+                "SELECT key FROM settings WHERE key LIKE 'evaluation-baseline-entry:%'"), [])
 
     def test_go_checks_require_test_as_immediate_subcommand(self):
         # 形如 go build test / go vet ./test 的 argv 把 test 当包参数，不得生成
