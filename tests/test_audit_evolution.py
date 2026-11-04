@@ -2102,6 +2102,26 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(passive['reproducible'])
         self.assertIsNone(passive['checks_passed'])
 
+    def test_bundle_check_allows_empty_arguments_but_not_an_empty_executable(self):
+        checks = [
+            {'name': 'empty-arg', 'cwd': '.',
+             'argv': ['python3', '-c', 'import sys; assert sys.argv[1] == ""; print("ok")', '']},
+            {'name': 'empty-exec', 'cwd': '.', 'argv': ['', '--version']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-empty-arg')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        limitations = ' '.join(result['limitations'])
+        # 空字符串是合法的 subprocess 参数，只有空可执行名才算畸形规格。
+        self.assertNotIn('checks[0]', limitations)
+        self.assertIn('checks[1] argv[0] is an empty executable name', limitations)
+        self.assertEqual([(row['check'], row['passed']) for row in result['executed_checks']],
+                         [('empty-arg', True)])
+        self.assertIs(result['checks_passed'], True)
+        self.assertFalse(result['reproducible'])
+
     def test_save_hotpath_skips_reverification_in_evaluating_state(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         plan = {'data': data, 'sha256': fingerprint(data)}

@@ -897,8 +897,12 @@ class Evolution:
         def check_spec_error(check):
             argv = check.get("argv")
             if (not isinstance(argv, list) or not argv
-                    or not all(isinstance(arg, str) and arg for arg in argv)):
+                    or not all(isinstance(arg, str) for arg in argv)):
                 return "argv is not a non-empty list of strings"
+            # argv[0] 是可执行名，空串必然启动失败；其后的参数允许空字符串，
+            # 与 config.py 的规格校验和 subprocess 直接执行的行为保持一致。
+            if not argv[0]:
+                return "argv[0] is an empty executable name"
             cwd = check.get("cwd", ".")
             if (not isinstance(cwd, str) or not cwd
                     or Path(cwd).is_absolute() or ".." in Path(cwd).parts):
