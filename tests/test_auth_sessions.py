@@ -1138,7 +1138,10 @@ class AuthSessionTests(unittest.TestCase):
         session = self.manager.start("codex")
         time.sleep(1.05)
         self.assertEqual(self.manager.busy, 0)
-        self.assertEqual(self.manager.status(session["id"])["state"], "expired")
+        # status() 的过期回收是非阻塞的：worker 正在持锁落盘时会按契约返回陈旧
+        # ACTIVE 快照（见 status() 注释），因此这里断言最终收敛，而不是单次调用
+        # 必定完成回收；busy 已在上面证明过期会话不占容量。
+        self.wait_state(session, "expired")
         self.gate.set()
         self.assertFalse((self.root / "codex/auth.json").exists())
 
