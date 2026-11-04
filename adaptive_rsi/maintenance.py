@@ -74,7 +74,16 @@ def _remove_owned_tree(parent, name):
     directory owning each entry must be made writable before it can be emptied.
     Directory descriptors pin the verified tree: a link swapped in later fails
     O_NOFOLLOW, and unlink/rmdir always act on the recorded parent entry.
+
+    The walk is iterative rather than recursive: dependency trees routinely nest
+    deeper than sys.getrecursionlimit() (node_modules-style paths), where a
+    recursive walk dies on RecursionError and the run can never be cleaned.
+    Only the deepest directory stays open, so depth is also unbounded by the
+    process descriptor limit.  Ascending re-opens ".." and verifies the recorded
+    (device, inode); a parent moved out from under the walk aborts the removal
+    instead of deleting outside the verified tree.
     """
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
     try:
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -82,20 +91,60 @@ def _remove_owned_tree(parent, name):
     if not stat.S_ISDIR(info.st_mode):
         os.unlink(name, dir_fd=parent)
         return
-    descriptor = os.open(name, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) |
-                         getattr(os, 'O_NOFOLLOW', 0), dir_fd=parent)
+    # Frames: [entry name in its parent, device, inode, pending child names].
+    # device/inode and the child list are filled when the directory is scanned.
+    stack = [[name, 0, 0, None]]
+    descriptor = os.open(name, flags, dir_fd=parent)
     try:
-        mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
-        if mode & stat.S_IRWXU != stat.S_IRWXU:
-            # Only directories inside the artifact being removed regain write access.
-            os.fchmod(descriptor, mode | stat.S_IRWXU)
-        with os.scandir(descriptor) as entries:
-            children = [entry.name for entry in entries]
-        for child in children:
-            _remove_owned_tree(descriptor, child)
+        while stack:
+            frame = stack[-1]
+            if frame[3] is None:
+                dirstat = os.fstat(descriptor)
+                frame[1], frame[2] = dirstat.st_dev, dirstat.st_ino
+                mode = stat.S_IMODE(dirstat.st_mode)
+                if mode & stat.S_IRWXU != stat.S_IRWXU:
+                    # Only directories inside the artifact being removed regain
+                    # write access.
+                    os.fchmod(descriptor, mode | stat.S_IRWXU)
+                with os.scandir(descriptor) as entries:
+                    frame[3] = [entry.name for entry in entries]
+            pending = frame[3]
+            descended = False
+            while pending:
+                child = pending.pop()
+                try:
+                    cinfo = os.stat(child, dir_fd=descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISDIR(cinfo.st_mode):
+                    # Files and links alike: the entry itself is unlinked and a
+                    # link target outside the artifact is never followed.
+                    os.unlink(child, dir_fd=descriptor)
+                    continue
+                deeper = os.open(child, flags, dir_fd=descriptor)
+                stack.append([child, 0, 0, None])
+                os.close(descriptor)
+                descriptor = deeper
+                descended = True
+                break
+            if descended:
+                continue
+            stack.pop()
+            if not stack:
+                os.close(descriptor)
+                descriptor = None
+                os.rmdir(frame[0], dir_fd=parent)
+            else:
+                upper = os.open('..', flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = upper
+                pstat = os.fstat(descriptor)
+                if (pstat.st_dev, pstat.st_ino) != (stack[-1][1], stack[-1][2]):
+                    raise NotADirectoryError('artifact tree changed during removal')
+                os.rmdir(frame[0], dir_fd=descriptor)
     finally:
-        os.close(descriptor)
-    os.rmdir(name, dir_fd=parent)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _remove_artifact(directory, name):
@@ -244,6 +293,24 @@ class Maintenance:
         except Exception:
             logging.getLogger(__name__).exception("Maintenance failure persistence failed")
 
+    def _reject_retention_path(self, run, project, directory, reason):
+        """Mark a deterministically rejected runs.path so later passes skip it.
+
+        标记按 (run.id, run.path) 匹配：运维把 runs.path 修回 runs/ 内后该
+        运行自动回到候选。写 settings 失败时异常冒泡到 scheduler_scope，
+        下个周期仍会按原路径重试，不会留下只有一半的证据。
+        """
+        self.store.put_setting("retention_path_rejected:" + run["id"],
+                               {"path": run["path"], "reason": reason,
+                                "project": project, "rejected": time.time()})
+        try:
+            self.store.event("retention_path_rejected",
+                             "Rejected unsafe retention path for %s: %s" % (run["id"], reason),
+                             project, run["id"], {"path": str(directory)})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Retention rejection event persistence failed: %s", run["id"])
+
     def _clear_maintenance_failure(self):
         """Reset the backoff after a healthy pass; a stale record is harmless once past."""
         self.maintenance_retry_at = 0
@@ -264,7 +331,13 @@ class Maintenance:
             with self.scheduler_scope("maintenance_project", project["id"]):
                 config = self.config(project["id"])
                 cutoff = now - config["limits"]["retention_days"] * 86400
-                for run in self.store.query("SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL", (project["id"], cutoff)):
+                # 已确定性拒绝的 runs.path（见 _reject_retention_path）按 (id,path)
+                # 匹配跳过；运维修正 path 后标记失配，该运行自动回到清理候选。
+                for run in self.store.query(
+                        "SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL "
+                        "AND NOT EXISTS (SELECT 1 FROM settings WHERE key='retention_path_rejected:' || runs.id "
+                        "AND json_valid(value) AND json_extract(value,'$.path')=runs.path)",
+                        (project["id"], cutoff)):
                     if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
                         return
                     with self.scheduler_scope("maintenance_run", project["id"], run["id"]):
@@ -286,16 +359,21 @@ class Maintenance:
                             # runs 目录或运行目录为链接时按越界拒绝，存疑路径保留不修。
                             directory = Path(run["path"])
                             runs_root = self.store.root / "runs"
-                            if (runs_root.is_symlink() or directory.is_symlink() or
+                            # runs_root 自身是环境故障（或为链接、或 stat 失败），影响全部运行，
+                            # 仍走 scheduler_error 周期性重试；目录不可读时的 OSError 同样冒泡。
+                            if runs_root.is_symlink():
+                                raise ValueError("Unsafe retention run path")
+                            # 以下拒绝只由该行数据决定，属确定性拒绝：写运维证据后跳过本运行，
+                            # 下个周期由 SQL 预检过滤，不再每小时重复 scheduler_error。
+                            if (directory.is_symlink() or
                                     Path(run["id"]).parts != (run["id"],) or run["id"] in (".", "..") or
                                     directory.name != run["id"]):
-                                raise ValueError("Unsafe retention run path")
-                            try:
-                                inside = directory.parent.resolve() == runs_root
-                            except OSError:
-                                inside = False
+                                self._reject_retention_path(run, project["id"], directory, "unsafe run path")
+                                continue
+                            inside = directory.parent.resolve() == runs_root
                             if not inside:
-                                raise ValueError("Unsafe retention run path")
+                                self._reject_retention_path(run, project["id"], directory, "outside runs root")
+                                continue
                             directory = runs_root / run["id"]
                             if run["state"] == "awaiting_approval":
                                 with self.store.connect() as db:
