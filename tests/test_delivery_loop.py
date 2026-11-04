@@ -1151,6 +1151,76 @@ print('BOUNDARIES_OK')
         self.assertEqual(kwargs["cache_base"], head)
         self.assertEqual(outcome["feedback"]["state"], "verified")
 
+    def test_postmerge_verification_exception_backs_off_and_converges(self):
+        # 合并后验证抛异常时不能每 60 秒重做一次快照与全量检查：首次失败 5 分钟后
+        # 才重试，逐次翻倍到 1 小时封顶，到达上限只写一条终态事件并停止占用验证资源。
+        from adaptive_rsi.delivery import FEEDBACK_ATTEMPT_LIMIT, _feedback_retry_delay, monitoring_due, tick
+        self.runtime.configure({"github": {"repository": "example/project"}, "delivery": {"feedback_minutes": 5}}, self.project)
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        head = git(self.repo, "rev-parse", "HEAD")
+        now = time.time()
+        self.runtime.pause(self.project, False)
+        self.runtime.goal(self.project, "Monitor failing post-merge verification")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(directory), run["id"]))
+        self.store.transition(run["id"], "merged", {"merged_sha": head, "merged_at": now}, True)
+        self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "main", "sha": "base"})
+        stored = lambda: json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch("adaptive_rsi.release.advance", return_value={}), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             side_effect=RuntimeError("sandbox unavailable: docker daemon not running")) as evaluate:
+            tick(self.runtime, now)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertEqual(stored()["feedback_attempt_at"], now)
+            self.assertEqual(stored()["feedback_attempts"], 1)
+            # 退避未到期：下一个调度周期只记一次 delivery_error，不再重做验证。
+            tick(self.runtime, now + 61)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertFalse(monitoring_due(stored(), self.runtime.config(self.project), now + 61))
+            # 5 分钟退避到期后重试一次；此后每次失败按翻倍间隔等待。
+            tick(self.runtime, now + 301)
+            self.assertEqual(evaluate.call_count, 2)
+            moment = now + 301
+            for attempt in range(2, FEEDBACK_ATTEMPT_LIMIT):
+                moment += _feedback_retry_delay(attempt)
+                tick(self.runtime, moment)
+            self.assertEqual(evaluate.call_count, FEEDBACK_ATTEMPT_LIMIT)
+            # 达到上限：不再进入快照与固定检查，只收敛终态。
+            tick(self.runtime, moment + 3600)
+            self.assertEqual(evaluate.call_count, FEEDBACK_ATTEMPT_LIMIT)
+        saved = stored()
+        self.assertEqual(saved["feedback"]["state"], "insufficient_evidence")
+        self.assertTrue(saved["feedback"]["reason"].startswith("Post-merge verification failed 24"))
+        self.assertTrue(saved["monitoring_completed"])
+        self.assertEqual(len(self.store.query(
+            "SELECT 1 FROM events WHERE kind='postmerge_verification_abandoned'")), 1)
+        self.assertFalse(monitoring_due(saved, self.runtime.config(self.project), moment + 7200))
+
+    def test_postmerge_verification_success_clears_failure_backoff(self):
+        # 一次失败后成功必须清空退避计数，否则偶发故障会累积到上限把正常监控
+        # 收敛成 insufficient_evidence。
+        from adaptive_rsi.delivery import feedback
+        run = self.tracked_pr()
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        run["path"] = str(directory)
+        head = git(self.repo, "rev-parse", "HEAD")
+        now = time.time()
+        outcome = {"merged_sha": head, "merged_at": now, "feedback_attempts": 3, "feedback_attempt_at": now - 3600}
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             return_value={"decision": "pass", "checks": {}}):
+            feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                     self.runtime.config(self.project), now)
+        self.assertEqual(outcome["feedback"]["state"], "verified")
+        self.assertNotIn("feedback_attempts", outcome)
+        self.assertNotIn("feedback_attempt_at", outcome)
+
     def test_mainline_test_edit_survives_delivery_git_failure_and_reports_real_regression(self):
         from adaptive_rsi.delivery import feedback
         run = self.tracked_pr()
