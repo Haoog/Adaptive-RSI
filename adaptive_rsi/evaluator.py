@@ -406,10 +406,71 @@ def clarity_test_summary(text):
     return summary
 
 
+# empty_test_run 处理的是命令原始输出，verbose 运行可达数十 MB；零计数/空跑/计数/
+# 通过四个正则各扫一遍约 1 s/MB。没有空跑线索时结论必然是「非空」，所以先用子串
+# 短路：这些 cue 是 empty 正则的可靠超集（"no test" 覆盖 no tests ran/found/to
+# run/files 等全部变体）。以数字开头的 cue 还要求前一个字符不是单词字符，避免把
+# `Ran 150 tests` 里的 "0 tests" 当成零计数。
+_EMPTY_TEST_CUES = ("no test", "no example", "tests: 0", "tests run: 0",
+                    "# tests 0", "1..0", "tests 0")
+_ZERO_WORD_CUES = ("0 test", "0 example", "0 passing", "0 runs", "0 of 0")
+# `\s+` 允许任意空白（含换行），固定子串覆盖不到；仅在出现关键词时补一次扫描。
+_FLEXIBLE_EMPTY_CUE = re.compile(r"tests\s+0\b|executed\s+0\s+of\s+0")
+# 行首分支用 (?=\s) 前瞻而非消费尾部空白：否则 PASS 行会吞掉下一行 ok 的前导换行，
+# finditer 非重叠扫描漏掉真正执行过测试的包。
+_POSITIVE_TEST_PATTERN = (r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
+                          r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
+                          r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
+                          r"(?:^|\n)\s*(?:ok|PASS|FAIL)(?=\s)|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
+                          r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+")
+_GO_NO_TEST_MARKER = re.compile(r"\[no tests? (?:to run|files)\]", re.I)
+
+
+def _has_empty_test_cue(lowered):
+    if any(cue in lowered for cue in _EMPTY_TEST_CUES):
+        return True
+    for cue in _ZERO_WORD_CUES:
+        position = lowered.find(cue)
+        while position >= 0:
+            if position == 0:
+                return True
+            before = lowered[position - 1]
+            if not (before.isalnum() or before == "_"):
+                return True
+            position = lowered.find(cue, position + 1)
+    return bool(("tests" in lowered or "executed" in lowered)
+                and _FLEXIBLE_EMPTY_CUE.search(lowered))
+
+
+def _go_positive_evidence(text):
+    """Require positive evidence outside Go's zero-execution artifacts.
+
+    ``go test -run`` still prints ``PASS`` and ``ok pkg [no tests to run]`` when
+    the filter matched nothing; neither line proves execution. Only an ``ok``
+    line without that marker (a package that really ran tests) does.
+    """
+    for match in re.finditer(_POSITIVE_TEST_PATTERN, text, re.I):
+        position = match.start()
+        while position < match.end() and text[position].isspace():
+            position += 1
+        end = text.find("\n", position)
+        line = text[position:end if end >= 0 else len(text)]
+        if _GO_NO_TEST_MARKER.search(line) or line.strip().upper() == "PASS":
+            continue
+        return True
+    return False
+
+
 def empty_test_run(text):
-    structured = structured_test_summary(text)
-    if structured is not None:
-        return structured["executed"] == 0
+    # test2json 事件行是唯一的结构化输入；先做一次廉价子串判断，避免对大段
+    # verbose 输出执行 splitlines 与逐行 json 解析。
+    if '"Action"' in text:
+        structured = structured_test_summary(text)
+        if structured is not None:
+            return structured["executed"] == 0
+    lowered = text.lower()
+    if not _has_empty_test_cue(lowered):
+        return False
     # zero 是确定性的零计数信号（含 TAP 计划行 1..0）。unittest 的 `Ran 0 tests` 输出
     # 结尾恒有独立的 OK 行，不能让它否决零计数，否则零用例检查被计为通过。
     zero = re.search(r"Ran 0 tests|running 0 tests|Total tests: 0|Tests run: 0|# tests 0|"
@@ -430,11 +491,10 @@ def empty_test_run(text):
                         r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
     if zero:
         return not counted
-    positive = re.search(r"(?:Ran|running) [1-9]\d* tests?|[1-9]\d* passed|[1-9]\d* examples?|"
-                         r"[1-9]\d* passing|Tests run: [1-9]\d*|Total tests: [1-9]\d*|# tests [1-9]\d*|"
-                         r"(?:^|\n)\s*(?:ℹ\s*)?tests\s+[1-9]\d*\b|test result: (?:ok|FAILED)\b|"
-                         r"(?:^|\n)\s*(?:ok|PASS|FAIL)\s|\bAll tests? passed\b|\b[1-9]\d* (?:failures?|errors?)\b|"
-                         r"[✓✔]\s+[1-9]\d*|[1-9]\d*\s+passed\s+in\s+[\d.]+", text, re.I)
+    if "no tests to run" in lowered or "[no test files]" in lowered:
+        positive = _go_positive_evidence(text)
+    else:
+        positive = re.search(_POSITIVE_TEST_PATTERN, text, re.I)
     return bool(empty and not positive)
 
 
