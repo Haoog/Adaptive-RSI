@@ -1492,7 +1492,12 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  window.RSIExperience?.translate?.();
  window.RSIDesktop?.translate?.();
  window.RSINativeUpdate?.render?.();
- if($('detail-dialog').open&&detailTask)await showTask(detailTask);
+ if($('detail-dialog').open&&detailTask){
+  // 语言切换会重建详情体：沿用 liveDetail 的做法，先记录展开状态与滚动位置再恢复。
+  const detailTicket=detailSequence,scroll=$('detail-dialog').scrollTop,restore=window.RSIExperience?.detailsSnapshot?.($('detail-body'));
+  await showTask(detailTask,restore);
+  if(detailSequence===detailTicket+1&&$('detail-dialog').open){restore?.($('detail-body'));$('detail-dialog').scrollTop=scroll;}
+ }
 }));
 // 回到页面只由重新可见补一次刷新：可见窗口重复获得焦点不再额外全量拉取 state，常规轮询已覆盖。
 typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{
