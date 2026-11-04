@@ -1816,7 +1816,7 @@ class OpenCodeServeTests(unittest.TestCase):
             self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
         self.assertEqual([call.args[0] for call in http.call_args_list], ["POST", "GET"])
         for status, expected in (("failed", "authorization_failed"), ("expired", "auth_expired"),
-                                 ("pending", "auth_protocol_error")):
+                                 ("unknown", "auth_protocol_error")):
             with self.subTest(status=status), patch.object(worker, "http", side_effect=[
                     AuthError("auth_protocol_error"), {"data": {"status": status}}]):
                 with self.assertRaises(AuthError) as caught:
@@ -1827,6 +1827,61 @@ class OpenCodeServeTests(unittest.TestCase):
             with self.assertRaises(AuthError) as caught:
                 worker._v2_complete("fixture-code", timeout=30)
             self.assertEqual(caught.exception.code, "auth_protocol_error")
+
+    def test_v2_complete_polls_pending_attempt_after_post_protocol_error(self):
+        """POST 失败后 GET 到 pending 不能直接失败：验证码可能已被消费，attempt 仍在处理。"""
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        clock = {"now": 0.0}
+        calls = []
+
+        def fake_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], method))
+            if method == "POST":
+                raise AuthError("auth_protocol_error")
+            return {"data": {"status": "complete" if len(calls) >= 4 else "pending"}}
+
+        def fake_sleep(seconds):
+            clock["now"] += seconds
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=fake_sleep)
+        worker.http = fake_http
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        # 验证码只提交一次：POST 失败后只轮询既有 attempt，退避一次后拿到 complete。
+        self.assertEqual([method for _, method in calls], ["POST", "GET", "GET", "GET"])
+        self.assertEqual(calls[-1][0], 0.2)
+
+        # pending 一直持续时在 deadline 结束为 auth_timeout，且绝不重发验证码。
+        calls.clear()
+        clock["now"] = 0.0
+
+        def pending_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], method))
+            if method == "POST":
+                raise AuthError("auth_protocol_error")
+            return {"data": {"status": "pending"}}
+        worker.http = pending_http
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            with self.assertRaises(AuthError) as caught:
+                worker._v2_complete("fixture-code", timeout=30)
+        self.assertEqual(caught.exception.code, "auth_timeout")
+        self.assertEqual([method for _, method in calls].count("POST"), 1)
+        self.assertAlmostEqual(clock["now"], 10.0, places=6)
+
+        # POST 错误体已经给出 pending 时不再反查一次，直接按空响应口径轮询。
+        calls.clear()
+        clock["now"] = 0.0
+
+        def detail_pending_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], method))
+            if method == "POST":
+                raise AuthError("auth_protocol_error", detail={"attempt_status": "pending"})
+            return {"data": {"status": "complete"}}
+        worker.http = detail_pending_http
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        self.assertEqual([method for _, method in calls], ["POST", "GET"])
 
     def test_http_error_keeps_bounded_response_detail(self):
         worker = self.make_worker()
