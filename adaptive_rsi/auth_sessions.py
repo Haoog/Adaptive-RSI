@@ -1674,11 +1674,6 @@ class AuthSessions:
             with self.lock:
                 if self.closed:
                     raise AuthError("service_closed")
-                for session_id, item in self.sessions.items():
-                    if item["backend"] == backend and item["state"] in ACTIVE:
-                        self._update(session_id, state="cancelled")
-                        if session_id in self.workers:
-                            workers.append(self.workers[session_id])
                 if backend == "codex":
                     path = _codex_path()
                     try:
@@ -1698,6 +1693,13 @@ class AuthSessions:
                     if provider in data:
                         data.pop(provider, None)
                         _write_json(path, data)
+                # 凭据移除全部成功后再取消会话：移除失败时若已把会话标成 cancelled，
+                # 用户虽收到 auth_protocol_error，进行中的登录却已被终止，重试也无从恢复。
+                for session_id, item in self.sessions.items():
+                    if item["backend"] == backend and item["state"] in ACTIVE:
+                        self._update(session_id, state="cancelled")
+                        if session_id in self.workers:
+                            workers.append(self.workers[session_id])
         finally:
             credential_lock.release()
             for worker, stop in workers:

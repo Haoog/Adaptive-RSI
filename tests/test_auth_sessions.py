@@ -246,6 +246,24 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_logout_failure_keeps_active_session_running(self):
+        manager = AuthSessions(self.root / "export-failure-session", factory=self.factory, ttl=600)
+        try:
+            session = manager.start("opencode", "openai")
+            self.wait_state(session, "awaiting_authorization", manager)
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', side_effect=RuntimeError('corrupt export')), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider') as cli_logout:
+                with self.assertRaises(AuthError) as caught:
+                    manager.logout('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            cli_logout.assert_not_called()
+            # 凭据移除失败不得产生「会话已取消」的副作用，登录仍可继续。
+            self.assertEqual(manager.status(session['id'])['state'], 'awaiting_authorization')
+            self.assertFalse(self.created[-1].closed)
+        finally:
+            manager.close()
+
     def test_logout_normalizes_real_export_write_failure(self):
         merge_auth_export([{'integrationID': 'openai', 'id': 'credential',
                             'value': {'type': 'key', 'key': 'PRIVATE-KEY'}},
