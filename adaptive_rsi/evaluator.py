@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import time
 import threading
 import contextlib
@@ -996,10 +997,17 @@ class Evaluator:
         return copy.deepcopy(entry["rows"]) if entry and isinstance(entry.get("rows"), list) else None
 
     def _cache_put(self, scope, key, rows):
+        """Best-effort baseline cache write for cross-run reuse.
+
+        The cache only accelerates later evaluations, so a full disk, exhausted
+        connection capacity or a read-only state directory must not discard an
+        evaluation whose checks already finished. Failures are returned to the
+        caller to record in the report instead of escaping.
+        """
         if not key:
-            return
+            return None
         if any(row.get("error") or UNAVAILABLE_OUTPUT.search(row.get("stderr") or "") for row in rows):
-            return
+            return None
         compact = []
         for row in rows:
             item = {field: value for field, value in row.items() if field != "stdout"}
@@ -1013,34 +1021,39 @@ class Evaluator:
                 item["stderr"] = item["stderr"][-CACHE_STDERR_LIMIT:]
             item["cached"] = True
             compact.append(item)
-        # A CAS upsert per key prevents concurrent project checks from
-        # dropping each other's independently computed cache entries.
-        with self.store.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT value FROM settings WHERE key=?",
-                             ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
-            try:
-                previous = json.loads(row["value"]) if row and row["value"] else None
-            except (TypeError, ValueError):
-                previous = None
-            if previous and previous.get("at", 0) > time.time() - 60:
-                return
-            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
-                       ("evaluation-baseline-entry:" + scope + ":" + key,
-                        encode({"rows": compact, "at": time.time()})))
-        entries = self.store.query(
-            "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
-            ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
-        if len(entries) > BASELINE_CACHE_LIMIT:
-            def _entry_at(item):
+        try:
+            # A CAS upsert per key prevents concurrent project checks from
+            # dropping each other's independently computed cache entries.
+            with self.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT value FROM settings WHERE key=?",
+                                 ("evaluation-baseline-entry:" + scope + ":" + key,)).fetchone()
                 try:
-                    value = json.loads(item["value"] or "{}")
+                    previous = json.loads(row["value"]) if row and row["value"] else None
                 except (TypeError, ValueError):
-                    value = {}
-                return value.get("at", 0) if isinstance(value, dict) else 0
-            stale = sorted(entries, key=_entry_at)
-            for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
-                self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
+                    previous = None
+                if previous and previous.get("at", 0) > time.time() - 60:
+                    return None
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("evaluation-baseline-entry:" + scope + ":" + key,
+                            encode({"rows": compact, "at": time.time()})))
+            entries = self.store.query(
+                "SELECT key,value FROM settings WHERE key>=? AND key<? ORDER BY key",
+                ("evaluation-baseline-entry:" + scope + ":", "evaluation-baseline-entry:" + scope + ";"))
+            if len(entries) > BASELINE_CACHE_LIMIT:
+                def _entry_at(item):
+                    try:
+                        value = json.loads(item["value"] or "{}")
+                    except (TypeError, ValueError):
+                        value = {}
+                    return value.get("at", 0) if isinstance(value, dict) else 0
+                stale = sorted(entries, key=_entry_at)
+                for item in stale[:len(entries) - BASELINE_CACHE_LIMIT]:
+                    self.store.execute("DELETE FROM settings WHERE key=?", (item["key"],))
+        except (sqlite3.Error, OSError) as exc:
+            # Cache writes are an optimization; cancellation still propagates.
+            return {"state": "failed", "reason": type(exc).__name__ + ": " + str(exc)}
+        return None
 
     @staticmethod
     def _seed_target(target, seeds, config, clear=False):
@@ -1398,10 +1411,15 @@ class Evaluator:
             previous = {check_identity(row): row for row in results.get("candidate", [])}
             merged = [own.get(check_identity(check)) or previous.get(check_identity(check)) for check in full_checks]
             results["candidate_full"] = [row for row in merged if row]
+        cache_failures = []
         if cached_baseline is None and "baseline" in results:
-            self._cache_put(cache_scope, baseline_key, results["baseline"])
+            failure = self._cache_put(cache_scope, baseline_key, results["baseline"])
+            if failure:
+                cache_failures.append({**failure, "stage": "baseline"})
         if acceptance and "acceptance_baseline" in outcomes:
-            self._cache_put(cache_scope, acceptance_key, results["acceptance_baseline"])
+            failure = self._cache_put(cache_scope, acceptance_key, results["acceptance_baseline"])
+            if failure:
+                cache_failures.append({**failure, "stage": "acceptance_baseline"})
         passing = all(row["passed"] for label in ["candidate", "candidate_full", "acceptance_candidate"]
                       for row in results.get(label, []))
         unavailable = any(not row["passed"] and UNAVAILABLE_OUTPUT.search(row["stderr"])
@@ -1411,6 +1429,13 @@ class Evaluator:
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
                 "execution_environment": execution_identity,
                 "host_tools": host_tool_versions(checks, execution_identity)}
+        if cache_failures:
+            # The baseline cache only accelerates later runs; record the failed
+            # write so it stays observable without changing the decision.
+            data["cache_write"] = {
+                "state": "failed",
+                "reason": "; ".join(item["reason"] for item in cache_failures),
+                "stages": [item["stage"] for item in cache_failures]}
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
