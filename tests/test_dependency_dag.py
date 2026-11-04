@@ -1,4 +1,5 @@
 """Dependency DAG admission, migrations and interruption boundaries."""
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -113,7 +114,7 @@ class DependencyDAGTest(unittest.TestCase):
         finally:
             reopened.close()
 
-    def test_invalid_legacy_edge_blocks_migration_without_erasing_evidence(self):
+    def test_invalid_legacy_edge_is_quarantined_before_migration(self):
         with self.store.connect() as db:
             db.execute('DROP TABLE task_dependencies')
             db.execute('CREATE TABLE task_dependencies(task TEXT PRIMARY KEY,dependency TEXT)')
@@ -123,8 +124,19 @@ class DependencyDAGTest(unittest.TestCase):
             for column in ('input_price', 'output_price', 'cache_read_price', 'cache_write_price', 'price_basis'):
                 db.execute('ALTER TABLE calls DROP COLUMN ' + column)
         self.store.close()
-        with self.assertRaises(sqlite3.IntegrityError):
-            Store(self.store.root)
+        reopened = Store(self.store.root)
+        try:
+            # 自环行无法满足 006 的新约束：启动前归档到 quarantine，不再让迁移失败。
+            self.assertEqual(reopened.query("SELECT dependency FROM task_dependencies "
+                                            "WHERE task=?", (self.tasks[0],)), [])
+            quarantined = reopened.query("SELECT table_name,data FROM relationship_quarantine")
+            self.assertEqual([row['table_name'] for row in quarantined], ['task_dependencies'])
+            self.assertEqual(json.loads(quarantined[0]['data']),
+                             {'task': self.tasks[0], 'dependency': self.tasks[0]})
+            self.assertEqual(reopened.one("SELECT count(*) AS n FROM events "
+                                          "WHERE kind='dependency_orphan_quarantined'")['n'], 1)
+        finally:
+            reopened.close()
         with sqlite3.connect(self.store.path) as db:
-            self.assertEqual(db.execute('SELECT task,dependency FROM task_dependencies').fetchone(), (self.tasks[0], self.tasks[0]))
-            self.assertIsNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone())
+            self.assertIsNotNone(db.execute('SELECT 1 FROM schema_migrations WHERE version=6').fetchone())
+            self.assertIsNone(db.execute('SELECT 1 FROM task_dependencies').fetchone())

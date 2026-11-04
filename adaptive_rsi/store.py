@@ -53,6 +53,31 @@ def issue_sync_progress(db, project):
     return progress if isinstance(progress, dict) else None
 
 
+# provider/网关按微单位或多一个倍率上报时，计数可能超过 SQLite INTEGER 的上界
+# （2**63-1）。绑定溢出会在 BEGIN IMMEDIATE 内抛 OverflowError 并回滚整笔记账，
+# 已完成的付费调用反而停在 reserved、runs.tokens 不增；10**12 是远高于真实用量、
+# 又足够低于 2**63-1 的可用上限，超出的计数一律按未知处理。
+MAX_TOKEN_COUNT = 10 ** 12
+
+
+def _token_count(value):
+    """归一化单个 token 计数，返回 (count, rejected)。
+
+    非数/负数/非有限值按 0 计（网关的 null 与脏字段不触发事件）；有限但超过
+    MAX_TOKEN_COUNT 的计数按 0 计并标记 rejected，调用方须把 usage_known 清零
+    并留一条 usage_rejected 事件。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0, False
+    if isinstance(value, int):
+        if value < 0:
+            return 0, False
+        return (0, True) if value > MAX_TOKEN_COUNT else (value, False)
+    if not math.isfinite(value) or value < 0:
+        return 0, False
+    return (0, True) if value > MAX_TOKEN_COUNT else (int(value), False)
+
+
 def issue_snapshot_pending(db, project, task, progress=_LOAD_PROGRESS):
     row = db.execute("SELECT fingerprint,source FROM tasks WHERE id=? AND project=?", (task, project)).fetchone()
     if not row or row["source"] != "issue":
@@ -1403,30 +1428,28 @@ class Store:
     def record_usage(self, call, run, details, seconds):
         raw = details if isinstance(details, dict) else {}
         counts = {}
+        rejected = []
         for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
-            val = raw.get(field, 0)
-            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
-                counts[field] = int(val)
-            else:
-                counts[field] = 0
+            counts[field], invalid = _token_count(raw.get(field, 0))
+            if invalid:
+                rejected.append(field)
         if "tokens" in raw and raw["tokens"] is not None:
-            val = raw["tokens"]
-            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
-                tokens = int(val)
-            else:
-                tokens = 0
+            tokens, invalid = _token_count(raw["tokens"])
+            if invalid:
+                rejected.append("tokens")
         else:
             tokens = sum(counts.values())
         values = {
             "tokens": tokens,
             **counts,
-            "usage_known": 1 if bool(raw.get("usage_known", False)) else 0,
+            # 任一计数超出可记账范围时，这笔记账的用量不再可信，费用估算同样按未知处理。
+            "usage_known": 0 if rejected or not raw.get("usage_known", False) else 1,
         }
         fields = ["tokens", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "usage_known"]
         from .usage import PRICE_FIELDS, estimate, unit_prices
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            previous = db.execute("SELECT tokens,run,unit_price,input_price,output_price,"
+            previous = db.execute("SELECT tokens,run,project,unit_price,input_price,output_price,"
                                   "cache_read_price,cache_write_price FROM calls WHERE id=?", (call,)).fetchone()
             if previous is None or previous["run"] != run:
                 raise ValueError("Usage call does not belong to run")
@@ -1438,3 +1461,10 @@ class Store:
             prev_tokens = previous["tokens"] or 0
             db.execute("UPDATE runs SET tokens=max(0,tokens+?) WHERE id=?",
                        (values["tokens"] - prev_tokens, run))
+            for field in rejected:
+                # 与记账同一事务落库：事件与 completed 状态要么都生效，要么都不生效。
+                db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
+                           (previous["project"], run, "usage_rejected",
+                            "Provider usage count exceeds the recording limit; recorded as unknown",
+                            encode({"call": call, "run": run, "field": field,
+                                    "reported": repr(raw.get(field))[:64]}), time.time()))

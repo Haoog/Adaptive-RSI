@@ -562,6 +562,50 @@ class RecordUsageTest(unittest.TestCase):
             "usage_known": 1,
         })
 
+    def test_record_usage_rejects_counts_beyond_storage_limit(self):
+        """provider 上报 2**63 级计数时按未知记账，不再让 INTEGER 绑定溢出回滚整笔事务。"""
+        self.store.record_usage("call", "run", {"input_tokens": 2 ** 63}, 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, usage_known, price_basis "
+                                  "FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 0, "input_tokens": 0,
+                                    "usage_known": 0, "price_basis": "unknown"})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        event = self.store.one("SELECT project, run, kind, data FROM events WHERE kind='usage_rejected'")
+        assert event is not None
+        self.assertEqual(event["project"], "p")
+        self.assertEqual(event["run"], "run")
+        self.assertEqual(json.loads(event["data"]),
+                         {"call": "call", "run": "run", "field": "input_tokens",
+                          "reported": str(2 ** 63)})
+
+    def test_record_usage_rejects_out_of_range_tokens_and_other_fields(self):
+        """tokens 本身超范围时按未知记 0；有限大整数（10**400）也必须走同一条拒绝路径。"""
+        self.store.record_usage("call", "run", {"tokens": 1e308, "input_tokens": 100,
+                                                "cache_write_tokens": 10 ** 400,
+                                                "usage_known": True}, 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, cache_write_tokens, usage_known "
+                                  "FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 0, "input_tokens": 100,
+                                    "cache_write_tokens": 0, "usage_known": 0})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        rejected = {json.loads(row["data"])["field"] for row in
+                    self.store.query("SELECT data FROM events WHERE kind='usage_rejected'")}
+        self.assertEqual(rejected, {"tokens", "cache_write_tokens"})
+
+        # 重复上报同一条坏用量仍然幂等：run 汇总不因重试累加，调用保持 completed。
+        self.store.record_usage("call", "run", {"tokens": 1e308, "usage_known": True}, 1.5)
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        self.assertEqual(self.store.one("SELECT state FROM calls WHERE id='call'")["state"], "completed")
+
+    def test_record_usage_accepts_counts_at_the_limit(self):
+        """10**12 是允许的上限（仍低于 2**63-1），不能把边界值误判成脏数据。"""
+        self.store.record_usage("call", "run", self.usage(10 ** 12), 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, usage_known FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 10 ** 12,
+                                    "input_tokens": 10 ** 12, "usage_known": 1})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 10 ** 12)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='usage_rejected'")["n"], 0)
+
     def test_recover_only_interrupts_uncompleted_calls(self):
         self.store.record_usage("call", "run", self.usage(100), 1.0)
         self.store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,created) "
@@ -780,6 +824,72 @@ class MigrationLedgerHealTest(unittest.TestCase):
         self.addCleanup(reopened.close)
         self.assertEqual(self.versions(), list(range(1, future + 1)))
         self.assertEqual(reopened.one("SELECT count(*) AS n FROM sqlite_master WHERE name='future_probe'")["n"], 1)
+
+    def v5_tasks(self, count=4):
+        """Create a genuine v5 database (ledger 1–5, legacy single-key dependency table)."""
+        from adaptive_rsi.schema_migrations import SCRIPTS
+        with patch("adaptive_rsi.schema_migrations.SCRIPTS", SCRIPTS[:3]):
+            store = Store(self.root)
+        store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        tasks = [store.add_task("p", "goal", "dep-%d" % index, "Task %d" % index)
+                 for index in range(count)]
+        store.close()
+        return tasks
+
+    def legacy_dependencies(self, rows):
+        # v5 的连接没有外键约束，历史库因此能留下自环和指向已删任务的行。
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.executemany("INSERT INTO task_dependencies VALUES (?,?)", rows)
+
+    def test_v5_orphan_dependencies_are_quarantined_before_migration_006(self):
+        first, second, third, fourth = self.v5_tasks()
+        # 旧表以 task 为单列主键，每个任务最多一行：正常行、自环、指向已删任务各一。
+        self.legacy_dependencies([(first, second), (third, third), (fourth, "deleted-task")])
+        reopened = Store(self.root)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.versions(), self.applied_versions())
+        # 正常行照旧进入复合主键表；坏行不阻断启动。
+        self.assertEqual(reopened.query("SELECT task,dependency FROM task_dependencies"),
+                         [{"task": first, "dependency": second}])
+        expected = [{"task": third, "dependency": third},
+                    {"task": fourth, "dependency": "deleted-task"}]
+        quarantined = reopened.query("SELECT data FROM relationship_quarantine "
+                                     "WHERE table_name='task_dependencies'")
+        self.assertCountEqual([json.loads(row["data"]) for row in quarantined], expected)
+        events = reopened.query("SELECT project,data FROM events WHERE kind='dependency_orphan_quarantined'")
+        self.assertCountEqual([json.loads(row["data"]) for row in events], expected)
+        self.assertEqual({row["project"] for row in events}, {"p"})
+        self.assertEqual(reopened.relationship_audit()["invalid_dependencies"], [])
+
+    def test_normal_v5_dependencies_are_copied_verbatim(self):
+        first, second = self.v5_tasks(count=2)
+        # 二元环不是自环，006 允许；预清理不得把它当作需要隔离的坏行。
+        self.legacy_dependencies([(first, second), (second, first)])
+        reopened = Store(self.root)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.versions(), self.applied_versions())
+        self.assertEqual(sorted((row["task"], row["dependency"]) for row in
+                                reopened.query("SELECT task,dependency FROM task_dependencies")),
+                         sorted([(first, second), (second, first)]))
+        self.assertEqual(reopened.one("SELECT count(*) AS n FROM relationship_quarantine")["n"], 0)
+        self.assertEqual(reopened.one("SELECT count(*) AS n FROM events "
+                                      "WHERE kind='dependency_orphan_quarantined'")["n"], 0)
+
+    def test_v5_without_quarantine_table_fails_with_version_and_repair_hint(self):
+        first = self.v5_tasks()[0]
+        self.legacy_dependencies([(first, first)])
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
+            db.execute("DROP TABLE relationship_quarantine")
+        with self.assertRaisesRegex(RuntimeError,
+                                    "migration 6.*relationship_quarantine.*restore a backup"):
+            Store(self.root)
+        # 失败启动不留半个迁移：账本仍停在 5，坏行原样保留。
+        with sqlite3.connect(str(self.root / "state.sqlite3")) as db:
+            self.assertEqual([row[0] for row in db.execute(
+                "SELECT version FROM schema_migrations ORDER BY version")], [1, 2, 3, 4, 5])
+            self.assertEqual(db.execute("SELECT count(*) FROM task_dependencies "
+                                        "WHERE task=dependency").fetchone()[0], 1)
 
     def test_foreign_and_rewritten_history_still_fail(self):
         self.seed()

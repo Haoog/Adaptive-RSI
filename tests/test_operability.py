@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from adaptive_rsi.agent import CodexAgent
@@ -314,6 +315,65 @@ class OperabilityTest(unittest.TestCase):
         keys = {row["key"] for row in store.query("SELECT key FROM settings")}
         self.assertNotIn("task-proof:proj01:stale-old", keys)
         self.assertEqual(store.one("SELECT count(*) AS n FROM skills WHERE id='skillold'")["n"], 0)
+
+    def fragment(self, keep=2000):
+        """写入 20k 条 2KB 事件并删掉大部分，留下远超门槛的 freelist。"""
+        payload = "x" * 2048
+        now = time.time()
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO events(kind,message,data,created) VALUES ('fixture',?,'{}',?)",
+                           ((payload, now) for _ in range(20000)))
+        self.store.execute("DELETE FROM events WHERE kind='fixture' AND seq NOT IN "
+                           "(SELECT seq FROM events WHERE kind='fixture' ORDER BY seq DESC LIMIT ?)", (keep,))
+        with self.store.connect() as db:
+            return (db.execute("PRAGMA page_count").fetchone()[0],
+                    db.execute("PRAGMA freelist_count").fetchone()[0])
+
+    def test_maintenance_vacuums_database_after_retention_frees_pages(self):
+        pages, free_pages = self.fragment()
+        self.assertGreaterEqual(free_pages / pages, 0.25)
+        self.runtime.maintenance()
+        with self.store.connect() as db:
+            after = db.execute("PRAGMA page_count").fetchone()[0]
+            freelist = db.execute("PRAGMA freelist_count").fetchone()[0]
+        # 文件确实缩小，保留下来的事件一行不少。
+        self.assertLessEqual(after, pages // 2)
+        self.assertEqual(freelist, 0)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='fixture'")["n"], 2000)
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE kind='database_reclaimed'")["n"], 1)
+
+    def test_maintenance_skips_vacuum_with_active_run_or_insufficient_disk(self):
+        pages, _ = self.fragment()
+        self.store.execute("INSERT INTO runs(id,state,config,started) VALUES ('runactive','executing','{}',?)",
+                           (time.time(),))
+        self.runtime.maintenance()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA page_count").fetchone()[0], pages)
+        # 运行结束后磁盘余量不足同样不回收，只保留空闲页。
+        self.store.execute("UPDATE runs SET ended=? WHERE id='runactive'", (time.time(),))
+        self.store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+        with patch("adaptive_rsi.maintenance.shutil.disk_usage", return_value=SimpleNamespace(free=0)):
+            self.runtime.maintenance()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA page_count").fetchone()[0], pages)
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE kind='database_reclaimed'")["n"], 0)
+
+    def test_reclaim_failure_is_recorded_without_blocking_retention(self):
+        pages, _ = self.fragment()
+        stale = time.time() - 120 * 86400
+        self.store.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
+                           ("skillfailed", None, None, "verified", "[]", "content", "{}", stale, stale))
+        with patch("adaptive_rsi.maintenance._vacuum",
+                   side_effect=sqlite3.OperationalError("database is locked")):
+            self.runtime.maintenance()
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("PRAGMA page_count").fetchone()[0], pages)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM skills WHERE id='skillfailed'")["n"], 0)
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE kind='database_reclaim_failed'")["n"], 1)
+        self.assertIsNotNone(self.store.setting("maintenance-last"))
 
     def test_retention_cleanup_skips_unreadable_merged_result_without_aborting(self):
         store = self.store
