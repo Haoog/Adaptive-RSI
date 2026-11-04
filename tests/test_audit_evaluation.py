@@ -1142,6 +1142,66 @@ class AuditEvaluationTest(unittest.TestCase):
         result = workflow.improvement({'acceptance_baseline': [row([10])], 'acceptance_candidate': [row([5])]}, {'change_kind': 'performance', 'contract': contract})
         self.assertEqual(result['decision'], 'insufficient_evidence')
 
+    def test_baseline_cache_write_failure_keeps_evaluation_result(self):
+        # 缓存写失败（满盘、连接容量耗尽、只读状态目录）不能让已跑完检查的
+        # 评估整体作废；失败必须写进报告，不能静默丢掉加速记录。
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        identity = {'build': 'build', 'backend': 'docker', 'image_id': 'sha256:' + 'b' * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'criterion', 'argv': ['python3', 'app.py']}]
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+
+            def failing(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 1,
+                        'stdout': '', 'stderr': 'AssertionError', 'error': None}
+
+            def evaluate(store, name, side_effect):
+                runner = evaluator.Evaluator(store)
+                config = merge(DEFAULTS, {})
+                with patch.object(runner, '_execution_environment', return_value=(config, identity)), \
+                        patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), \
+                        patch('adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=side_effect):
+                    result = runner.evaluate(source, source, checks, root / name, config,
+                                             cache_scope='project', cache_base='base', changed_files=[])
+                return result, json.loads((root / name / 'report.json').read_text())
+
+            healthy = Store(root / 'state-healthy')
+            self.addCleanup(healthy.close)
+            baseline_result, _report = evaluate(healthy, 'evaluation-healthy', execute)
+            self.assertEqual(baseline_result['decision'], 'pass')
+            self.assertNotIn('cache_write', baseline_result)
+
+            broken = Store(root / 'state-broken')
+            self.addCleanup(broken.close)
+            broken.execute(
+                "CREATE TRIGGER block_baseline_cache_write BEFORE INSERT ON settings "
+                "WHEN NEW.key LIKE 'evaluation-baseline-entry:%' "
+                "BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END")
+            result, report = evaluate(broken, 'evaluation-broken', execute)
+            # 写失败不改变结论：检查结果与无故障时一致，报告照常落盘。
+            self.assertEqual(result['decision'], 'pass')
+            self.assertEqual([row['name'] for row in result['checks']['candidate_full']],
+                             [row['name'] for row in baseline_result['checks']['candidate_full']])
+            self.assertEqual(result['cache_write']['state'], 'failed')
+            self.assertIn('database or disk is full', result['cache_write']['reason'])
+            self.assertEqual(report['cache_write'], result['cache_write'])
+            self.assertEqual(report['decision'], 'pass')
+
+            # 门禁不放宽：缓存写失败时，失败的检查仍然得到 fail 并留下报告。
+            failed_result, failed_report = evaluate(broken, 'evaluation-broken-fail', failing)
+            self.assertEqual(failed_result['decision'], 'fail')
+            self.assertEqual(failed_result['cache_write']['state'], 'failed')
+            self.assertEqual(failed_report['decision'], 'fail')
+
     def test_go_checks_require_test_as_immediate_subcommand(self):
         # 形如 go build test / go vet ./test 的 argv 把 test 当包参数，不得生成
         # go build test -run ... 这类畸形隔离命令（_run 只适用于 go test 子命令）。
