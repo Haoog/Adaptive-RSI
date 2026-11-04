@@ -719,9 +719,23 @@ class Evolution:
             (root / "candidate.json").write_text(row["content"], encoding="utf-8")
             limitations = ["Credentials are excluded; external services, model availability and host tools must be supplied independently",
                            "Integrity verification is not proof of isolated-machine reproduction"]
+            # 每个 manifest 条目都登记身份；只有实际抽中执行的用例才封存工作树。
+            # 封存清单覆盖 eligible 全集，但未抽中项从未运行；逐项复制同一
+            # repo/base 的完整工作树只会让包体按候选集线性膨胀（N 份相同副本），
+            # 审计所需的 tree/spec 指纹仍由 evidence.json 的 manifest 与这里的
+            # 身份条目保留。无 sampled 标记的旧证据按抽中处理，与 verify_inputs 同口径。
+            entries = []
+            unsampled = 0
             for item in evidence.get("dataset", {}).get("manifest", []):
                 if item["case"] != Path(item["case"]).name or item["case"] in (".", ".."):
                     raise ValueError("Invalid sealed case identity")
+                sampled = bool(item.get("sampled", True))
+                entry = {"case": item["case"], "split": item.get("split"), "tree": item.get("tree"),
+                         "sampled": sampled, "exported": False}
+                entries.append(entry)
+                if not sampled:
+                    unsampled += 1
+                    continue
                 case = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], row["project"]))
                 if not case:
                     limitations.append("Missing case " + item["case"])
@@ -749,6 +763,10 @@ class Evolution:
                     sealed_tree(target / "overlay")
                 spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
+                entry["exported"] = True
+            if unsampled:
+                limitations.append(f"{unsampled} unsampled case(s) are recorded by identity only; "
+                                   "their working trees are not sealed in this bundle")
             files = {}
             for path in sorted(root.rglob("*")):
                 if ".git" in path.relative_to(root).parts:
@@ -760,7 +778,9 @@ class Evolution:
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():
                     files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
-            manifest = {"version": 1, "files": files, "limitations": limitations}
+            # `cases` 是解包方的索引：条目身份与 evidence.json 的 dataset.manifest 同源，
+            # 后者随 files 逐文件校验；未导出条目没有本地副本可校验，只登记身份。
+            manifest = {"version": 2, "files": files, "cases": entries, "limitations": limitations}
             (root / "bundle.json").write_text(encode(manifest), encoding="utf-8")
             return manifest
         except Exception:

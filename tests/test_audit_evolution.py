@@ -1626,6 +1626,60 @@ class AuditEvolutionTest(unittest.TestCase):
                 self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
 
+    def test_export_bundle_seals_only_sampled_case_trees(self):
+        """未抽中用例只登记身份：eligible 全集不再各复制一份完整工作树。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-sampled')
+        (repo / 'payload.bin').write_bytes(b'payload' * 8192)
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'payload')
+        base = git(repo, 'rev-parse', 'HEAD')
+        tree = git(repo, 'rev-parse', base + '^{tree}')
+        manifest = []
+        for name, sampled in (('a', True), ('b', True), ('c', False), ('d', False)):
+            checks = [{'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}]
+            if not sampled:
+                checks.append({'name': 'unexecuted_check', 'cwd': '.', 'argv': ['fake-unsampled-tool']})
+            spec = {'task': 'task ' + name, 'base': base, 'checks': checks, 'source': 'real',
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-' + name, 'p', 'family-' + name, 'validation', encode(spec), 0, time.time()))
+            manifest.append({'case': 'case-' + name, 'split': 'validation', 'tree': tree, 'sampled': sampled})
+        self.candidate({'dataset': {'manifest': manifest}, 'providers': []})
+        destination = self.root / 'bundle-sampled'
+        self.evolution.export_bundle('c', destination)
+
+        # 1. 只有抽中用例封存工作树；未抽中条目连 case.json 都不落盘。
+        self.assertEqual(sorted(path.parent.name for path in (destination / 'cases').glob('*/repository')),
+                         ['case-a', 'case-b'])
+        self.assertEqual(sorted(path.name for path in (destination / 'cases').iterdir()), ['case-a', 'case-b'])
+
+        # 2. bundle.json 保留全部条目的身份与导出标记，审计信息不丢。
+        exported = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))
+        entries = {item['case']: item for item in exported['cases']}
+        self.assertEqual(sorted(entries), ['case-a', 'case-b', 'case-c', 'case-d'])
+        self.assertEqual([entries['case-' + name]['exported'] for name in 'abcd'], [True, True, False, False])
+        self.assertEqual(entries['case-c']['tree'], tree)
+        self.assertEqual(entries['case-c']['split'], 'validation')
+        self.assertTrue(any('unsampled' in item for item in exported['limitations']))
+
+        # 3. 包体不随未抽中条目放大：两份工作树而不是四份。
+        source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
+                           if path.is_file() and '.git' not in path.relative_to(repo).parts)
+        bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+        self.assertLess(bundle_bytes, source_bytes * 2 + 16384)
+
+        # 4. 抽中用例仍可校验与离线复现；未执行用例的检查命令不进入依赖清单。
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertNotIn('fake-unsampled-tool', [item['name'] for item in result['dependencies']['missing']])
+        self.assertTrue(result['reproducible'])
+
     def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo', overlay=None):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
         from tests.test_runtime import fixture
