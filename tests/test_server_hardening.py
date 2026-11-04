@@ -6,6 +6,7 @@ import http.client
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
+from adaptive_rsi import contracts
 from adaptive_rsi.catalog import CatalogError
 from adaptive_rsi.operations import Operations
 from adaptive_rsi.server import Handler, Server
@@ -62,6 +64,52 @@ class ServerHardeningTest(unittest.TestCase):
             return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
+
+    @staticmethod
+    def dispatch_paths():
+        """server.py 中 /api 端点的字面量；尾部带斜杠的是前缀分派，不是独立端点。"""
+        source = (Path(__file__).resolve().parents[1] / "adaptive_rsi" / "server.py").read_text(encoding="utf-8")
+        return {value for value in re.findall(r'"(/api/[^"#]*)"', source) if not value.endswith("/")}
+
+    def test_openapi_document_states_its_subset_and_write_gate(self):
+        status, headers, payload = self.request("/api/contract?format=openapi")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json; charset=utf-8")
+        document = json.loads(payload)
+        self.assertEqual(sorted(document["paths"]), list(contracts.OPENAPI_PATHS))
+        self.assertLessEqual(set(document["paths"]), self.dispatch_paths())
+        self.assertEqual(document["servers"], [{"url": self.server.origin}])
+        description = document["info"]["description"]
+        for required in ("Partial contract", "/api/contract", "Host", "Origin", contracts.CSRF_HEADER):
+            self.assertIn(required, description)
+        self.assertEqual(document["components"]["parameters"]["Origin"]["name"], "Origin")
+        self.assertTrue(document["components"]["parameters"]["Origin"]["required"])
+        self.assertEqual(document["components"]["parameters"]["Csrf"]["name"], contracts.CSRF_HEADER)
+        self.assertTrue(document["components"]["parameters"]["Csrf"]["required"])
+        self.assertEqual(document["components"]["securitySchemes"]["sessionCookie"]["name"], self.server.cookie)
+        self.assertIn("allowlist", document["components"]["securitySchemes"]["sessionCookie"]["description"])
+        for path in ("/api/config", "/api/operations"):
+            self.assertEqual([parameter["$ref"] for parameter in document["paths"][path]["post"]["parameters"]],
+                             ["#/components/parameters/Origin", "#/components/parameters/Csrf"])
+        for path, methods in document["paths"].items():
+            responses = methods["post" if "post" in methods else "get"]["responses"]
+            self.assertLessEqual({"200", "401", "403"}, set(responses))
+            if path != "/api/health":
+                self.assertIn("400", responses)
+        state = document["paths"]["/api/state"]["get"]
+        self.assertEqual([parameter["$ref"] for parameter in state["parameters"]],
+                         ["#/components/parameters/" + name for name in
+                          ("Project", "Sections", "Limit", "Offset", "Filter", "System")])
+
+    def test_openapi_subset_fails_when_dispatch_grows(self):
+        dispatch = self.dispatch_paths()
+        uncovered = dispatch - set(contracts.OPENAPI_PATHS)
+        self.assertEqual((len(dispatch), len(uncovered),
+                          hashlib.sha1("\n".join(sorted(dispatch)).encode()).hexdigest()),
+                         (89, 85, "c88482afdb20dcba77267c50eed8c279c29d449f"),
+                         "server.py 的分派表新增或删除了 /api 路由；确认行为后同步 OPENAPI_PATHS、"
+                         "openapi() 的子集说明与本断言里的期望值。当前路由："
+                         + ", ".join(sorted(dispatch)))
 
     def test_update_check_acknowledges_current_pending_state(self):
         pending = {"state": "checking", "busy": False, "current": "fixture"}

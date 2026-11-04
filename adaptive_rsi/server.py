@@ -24,7 +24,7 @@ from .credentials import CredentialError
 from .model_center import CenterError
 from .telemetry import quality_summary
 from .config import BUILTIN_PROVIDERS, compatibility
-from .contracts import API_VERSION, descriptor
+from .contracts import CSRF_HEADER, descriptor, openapi
 from .gitops import git
 from .evolution import Evolution
 from .release import ReconciliationRejected
@@ -436,21 +436,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(runtime.operations.get(params.get("id", [""])[0]))
             elif parsed.path == "/api/contract":
                 if params.get("format", [""])[0] == "openapi":
-                    self.respond({
-                        "openapi": "3.1.0",
-                        "info": {"title": "Adaptive RSI local API", "version": str(API_VERSION)},
-                        "servers": [{"url": self.server.origin}],
-                        "paths": {
-                            "/api/health": {"get": {"responses": {"200": {"description": "Health and capabilities"}}}},
-                            "/api/state": {"get": {"responses": {"200": {"description": "Project-scoped state"}}}},
-                            "/api/config": {"post": {"responses": {"200": {"description": "Save settings"},
-                                                                    "400": {"description": "Revision conflict or validation error"}}}},
-                            "/api/operations": {"post": {"responses": {"200": {"description": "Background job receipt"}}}},
-                        },
-                        "security": [{"sessionCookie": []}],
-                        "components": {"securitySchemes": {"sessionCookie": {
-                            "type": "apiKey", "in": "cookie", "name": self.server.cookie}}},
-                    })
+                    self.respond(openapi(self.server.origin, self.server.cookie))
                     return
                 self.respond({
                     "descriptor": descriptor(),
@@ -946,7 +932,7 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         if not self.authenticated():
             return
-        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get("X-RSI-CSRF", ""), self.server.csrf):
+        if self.headers.get("Origin") not in {self.server.origin, self.server.local_origin} or not self._token_matches(self.headers.get(CSRF_HEADER, ""), self.server.csrf):
             self.server.security_failure("origin_or_csrf")
             self.respond({"error": "Invalid origin or CSRF token"}, 403)
             return
