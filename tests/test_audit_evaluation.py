@@ -169,6 +169,51 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(report['decision'], result['decision'])
             self.assertEqual(result['decision'], 'pass')
 
+    def test_report_bounds_large_outputs_and_keeps_full_files(self):
+        # 6.4MB 输出以前会把 report.json 放大到 20MB：报告只留有界尾部，
+        # 完整字节落在 outputs/，内存 rows 保留全文供判定与 performance 解析。
+        import hashlib
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            (candidate / 'value.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'unit', 'argv': ['python3', 'value.py']}]
+            big = 'PROGRESS LINE 0\n' * 400000
+            self.assertEqual(len(big), 6_400_000)
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': big, 'stderr': '', 'error': None}
+
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(store).evaluate(
+                    source, candidate, checks, root / 'evaluation', merge(DEFAULTS, {}),
+                    changed_files=[])
+            report_path = root / 'evaluation' / 'report.json'
+            self.assertLessEqual(report_path.stat().st_size, 1024 * 1024)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report['decision'], 'pass')
+            self.assertEqual(len(report['checks']['candidate_full']),
+                             len(result['checks']['candidate_full']))
+            row = report['checks']['candidate_full'][0]
+            self.assertEqual(row['stdout_bytes'], len(big))
+            self.assertTrue(row['stdout_truncated'])
+            self.assertEqual(row['stdout_sha256'], hashlib.sha256(big.encode()).hexdigest())
+            self.assertLessEqual(len(row['stdout'].encode()), 64 * 1024)
+            saved = (root / 'evaluation' / row['stdout_path']).read_bytes()
+            self.assertEqual(saved, big.encode())
+            self.assertEqual(result['checks']['candidate'][0]['stdout'], big)
+
     def test_stage_reuse_requires_explicit_opt_in(self):
         from adaptive_rsi.evaluator import checkpoint_reuse_enabled
         self.assertFalse(checkpoint_reuse_enabled(_config()))
