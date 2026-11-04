@@ -1515,25 +1515,31 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                      merge_record.get("state") in {"verified", "regressed"})
     if now - _last_poll(runtime.store, run, outcome) < config["delivery"]["feedback_minutes"] * 60:
         return
-    # 先落盘再取远端与执行检查：sandbox、磁盘或 git 在验证中途失败时，
-    # 下一个调度周期必须看到这次尝试，按退避等待而不是立刻重做整份验证。
-    _record_feedback_attempt(runtime, run, outcome, now)
-    identity = runtime.store.setting("run-baseline:" + run["id"])
-    if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
-        raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
-    pinned = merge(saved, {"github": {"repository": identity["repository"]},
-                            "delivery": {"base_branch": identity["branch"]}})
-    cached = shared.get((project["id"], identity["branch"])) if isinstance(shared, dict) else None
-    if cached:
-        source, head, branch = cached
-    else:
-        # 本轮首个监控观测触发一次真实 fetch，结果按目标分支供同 tick 其余监控
-        # 复用；该读数只用于观测，密封目标仍以 run-baseline 身份键为准。
-        source, head, branch = baseline(runtime, project, pinned)
-        if isinstance(shared, dict):
-            shared[(project["id"], branch)] = (source, head, branch)
-    if branch != identity["branch"]:
-        raise RuntimeError("Post-merge verification target differs from sealed delivery")
+    # 先取远端读数再决定是否落盘尝试：无新证据的 tick 必须零写 runs.result，
+    # 先记尝试会让下面的心跳分支把这次自造的计数当成状态变化，又把整行写回。
+    # 取身份或基线失败仍计入退避，保持「验证中途失败不立刻重做」的既有保证。
+    try:
+        identity = runtime.store.setting("run-baseline:" + run["id"])
+        if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
+            raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
+        pinned = merge(saved, {"github": {"repository": identity["repository"]},
+                                "delivery": {"base_branch": identity["branch"]}})
+        cached = shared.get((project["id"], identity["branch"])) if isinstance(shared, dict) else None
+        if cached:
+            source, head, branch = cached
+        else:
+            # 本轮首个监控观测触发一次真实 fetch，结果按目标分支供同 tick 其余监控
+            # 复用；该读数只用于观测，密封目标仍以 run-baseline 身份键为准。
+            source, head, branch = baseline(runtime, project, pinned)
+            if isinstance(shared, dict):
+                shared[(project["id"], branch)] = (source, head, branch)
+        if branch != identity["branch"]:
+            raise RuntimeError("Post-merge verification target differs from sealed delivery")
+    except Cancelled:
+        raise
+    except Exception:
+        _record_feedback_attempt(runtime, run, outcome, now)
+        raise
     if previous.get("head") == head and merge_current:
         # 只有心跳变化：写独立 settings 键，不重写整行 runs.result；
         # 若异常退避计数仍在，清除计数属于状态变化，需要落盘并推进轮询时间。
@@ -1544,6 +1550,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         else:
             runtime.store.put_setting("feedback-polled:" + run["id"], now)
         return
+    # 进入快照与固定检查之前落盘尝试：sandbox、磁盘或 git 在验证中途失败时，
+    # 下一个调度周期必须看到这次尝试，按退避等待而不是立刻重做整份验证。
+    _record_feedback_attempt(runtime, run, outcome, now)
     try:
         # Fetching can take time; recheck destinations before exclusively creating output.
         for name in ("baseline", "baseline/.git/config", "current", "current/.git/config",

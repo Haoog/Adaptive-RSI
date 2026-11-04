@@ -1274,6 +1274,26 @@ print('BOUNDARIES_OK')
             "SELECT 1 FROM events WHERE kind='postmerge_verification_abandoned'")), 1)
         self.assertFalse(monitoring_due(saved, self.runtime.config(self.project), moment + 7200))
 
+    def test_postmerge_fetch_failure_still_counts_as_attempt(self):
+        # 取远端读数失败也要落盘一次尝试：身份或 fetch 持续失败时，下一个调度
+        # 周期必须按退避等待，而不是每个周期重新进入合并后验证。
+        from adaptive_rsi.delivery import feedback, monitoring_due
+        run = self.tracked_pr()
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        run["path"] = str(directory)
+        now = time.time()
+        outcome = {"merged_sha": "head", "merged_at": now}
+        with patch("adaptive_rsi.delivery.baseline", side_effect=RuntimeError("fetch failed")):
+            with self.assertRaises(RuntimeError):
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                         self.runtime.config(self.project), now)
+        self.assertEqual(outcome["feedback_attempts"], 1)
+        self.assertEqual(outcome["feedback_attempt_at"], now)
+        stored = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertEqual(stored["feedback_attempts"], 1)
+        self.assertFalse(monitoring_due(stored, self.runtime.config(self.project), now + 61))
+
     def test_postmerge_verification_success_clears_failure_backoff(self):
         # 一次失败后成功必须清空退避计数，否则偶发故障会累积到上限把正常监控
         # 收敛成 insufficient_evidence。
