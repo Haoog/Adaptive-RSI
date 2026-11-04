@@ -46,6 +46,81 @@ class StorePoolTest(unittest.TestCase):
         # publication 被 skip 后不进入下一轮候选（仍 queued），也未被无限重领。
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (publication,))["state"], "queued")
 
+    def pending_publish_fixture(self, count):
+        """N 条 pending issue 的 publish 任务，全部排在唯一的普通任务之前。"""
+        self.store.execute("INSERT INTO projects VALUES ('p','fixture','/fixture','{}',0,0)")
+        now = time.time()
+        stamps = (now - 40 * 86400, now - 40 * 86400)
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,"
+                           "state,priority,overrides,created,updated) "
+                           "VALUES (?,?,'issue',?,'Issue','','[]','[]','merged',0,'{}',?,?)",
+                           [(f"issue{number}", "p", f"issue:owner/project:{number}", *stamps)
+                            for number in range(1, count + 1)])
+            db.executemany("INSERT INTO runs(id,task,project,state,config,started,ended) "
+                           "VALUES (?,?,'p','merged','{}',0,1)",
+                           [(f"run{number}", f"issue{number}") for number in range(1, count + 1)])
+            db.executemany("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,"
+                           "state,priority,overrides,created,updated) "
+                           "VALUES (?,?,'system_publish',?,'Publish',?,'[]','[]','queued',99,'{}',?,?)",
+                           [(f"publish{number}", "p", f"publish:run{number}", f"run{number}",
+                             now - 1000, now - 1000) for number in range(1, count + 1)])
+            db.execute("INSERT INTO tasks(id,project,source,fingerprint,title,body,evidence,acceptance,"
+                       "state,priority,overrides,created,updated) "
+                       "VALUES ('goal','p','goal','goal','Goal','','[]','[]','queued',1,'{}',?,?)",
+                       (now, now))
+        self.store.put_setting("issue-sync:p", {"repository": "owner/project",
+                                                "pending": {str(number): {} for number in range(1, count + 1)}})
+
+    def claim_candidate_queries(self, count):
+        """claim 一次并返回候选分页查询条数，用于断言成本只随页数增长。"""
+        from adaptive_rsi.config import validate
+        self.pending_publish_fixture(count)
+        statements = []
+        original = self.store.connect
+
+        @contextlib.contextmanager
+        def traced():
+            with original() as db:
+                db.set_trace_callback(statements.append)
+                try:
+                    yield db
+                finally:
+                    db.set_trace_callback(None)
+
+        started = time.perf_counter()
+        with patch.object(self.store, "connect", traced):
+            run = self.store.claim("p", validate({}))
+        elapsed = time.perf_counter() - started
+        self.assertIsNotNone(run)
+        self.assertEqual(run["task"], "goal")
+        # publish 全部保持 queued：pending 只在扫描时跳过，既不落库也不放行。
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM tasks WHERE source='system_publish' AND state='queued'")["n"], count)
+        # trace 回调拿到的是展开参数后的语句，因此按语句前缀匹配而不是占位符。
+        candidates = [sql for sql in statements
+                      if sql.startswith("SELECT * FROM tasks WHERE project=") and " ORDER BY " in sql]
+        self.assertTrue(candidates, "未捕获到候选分页查询，计数断言会失去意义")
+        # pending 进度整段扫描只解析一次，不再逐条 publish 重读整份 pending JSON。
+        progress_reads = [sql for sql in statements if sql.startswith("SELECT value FROM settings WHERE key=")]
+        self.assertLessEqual(len(progress_reads), 2)
+        return len(candidates), elapsed
+
+    def test_claim_pages_pending_publish_candidates_instead_of_requerying(self):
+        # 旧实现为每条 skipped publish 重跑一次带变长 NOT IN 的整条候选扫描：
+        # 800 条 pending 要 801 次查询、约 1 秒，成本随 pending 数平方增长。
+        # 现在按 CLAIM_PAGE 分页 + (queue_order, id) keyset 续页，查询次数只随页数增长。
+        from adaptive_rsi.store import CLAIM_PAGE
+        queries, _ = self.claim_candidate_queries(100)
+        self.assertLessEqual(queries, 100 // CLAIM_PAGE + 2)
+
+    def test_claim_cost_with_800_pending_publish_stays_linear(self):
+        from adaptive_rsi.store import CLAIM_PAGE
+        queries, elapsed = self.claim_candidate_queries(800)
+        # 13 页而不是 801 次重查；页数只随 pending 数线性增长。
+        self.assertLessEqual(queries, 800 // CLAIM_PAGE + 2)
+        self.assertLess(elapsed, 0.2)
+
     def test_corrupt_issue_sync_progress_blocks_publish_and_records_event(self):
         # issue-sync:<project> 行的默认值语义是「什么都还没发布」：损坏时静默回退
         # 默认等于摘除防重复闸门。失败方向必须相反——无法确认 pending 即按

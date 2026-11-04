@@ -20,6 +20,9 @@ from zoneinfo import ZoneInfoNotFoundError
 # 池满时新借出的连接用完直接关闭，不阻塞调用方。
 POOL_SIZE = 8
 MAX_CONNECTIONS = 32
+# claim 候选分页大小：pending publish 积压时按页推进，避免每条被跳过的候选
+# 都重跑一次整条候选扫描。
+CLAIM_PAGE = 64
 
 
 def uid():
@@ -28,6 +31,26 @@ def uid():
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+_LOAD_PROGRESS = object()
+
+
+def issue_sync_progress(db, project):
+    """读一次 issue-sync 进度，供整段候选扫描复用。
+
+    返回解析后的 dict（没有该行时为 {}）；行存在但不可解析或不是对象时返回 None，
+    调用方按 fail closed 处理。claim 每个 tick 只解析一次，避免逐条 publish 重复
+    解析整份 pending JSON。
+    """
+    setting = db.execute("SELECT value FROM settings WHERE key=?", ("issue-sync:" + project,)).fetchone()
+    if setting is None:
+        return {}
+    try:
+        progress = json.loads(setting["value"])
+    except (TypeError, ValueError):
+        return None
+    return progress if isinstance(progress, dict) else None
 
 
 # provider/网关按微单位或多一个倍率上报时，计数可能超过 SQLite INTEGER 的上界
@@ -55,18 +78,13 @@ def _token_count(value):
     return (0, True) if value > MAX_TOKEN_COUNT else (int(value), False)
 
 
-def issue_snapshot_pending(db, project, task):
+def issue_snapshot_pending(db, project, task, progress=_LOAD_PROGRESS):
     row = db.execute("SELECT fingerprint,source FROM tasks WHERE id=? AND project=?", (task, project)).fetchone()
     if not row or row["source"] != "issue":
         return False
-    setting = db.execute("SELECT value FROM settings WHERE key=?", ("issue-sync:" + project,)).fetchone()
-    try:
-        progress = json.loads(setting["value"]) if setting else {}
-        if not isinstance(progress, dict):
-            progress = None
-    except (TypeError, ValueError):
-        progress = None
-    if setting is not None and progress is None:
+    if progress is _LOAD_PROGRESS:
+        progress = issue_sync_progress(db, project)
+    if progress is None:
         # 进度行存在但不可解析：pending 集合无法确认，防重复发布必须 fail closed。
         # 这里只读判定并返回 "corrupt" 哨兵——借入的 db 可能随调用方回滚
         # （_deliver 的拒绝事务），损坏事件由调用方在各自事务外经
@@ -1044,6 +1062,32 @@ class Store:
                 "WHERE d.task=tasks.id AND (p.id IS NULL OR p.state<>'merged'))")
 
     @staticmethod
+    def claim_keys(fair=False):
+        """claim 候选分页的排序键：DESC 列取负归一为升序，ORDER BY 与续页谓词共用同一组表达式。
+
+        COALESCE 只为 NULL 行给出确定值（priority 的列默认值是 50）：键里出现 NULL
+        会让 keyset 比较结果为 NULL，续页会静默跳过其后的候选。非 NULL 行的顺序与
+        queue_order() 一致。
+        """
+        rank = "(COALESCE(priority,50) + min(20, (? - COALESCE(created,0))/86400.0))"
+        keys = ["-COALESCE(urgency,0)", "-" + rank, "COALESCE(created,0)", "id"]
+        if fair:
+            keys.insert(0, "CASE WHEN source='system_delivery' THEN 1 ELSE 0 END")
+        return keys
+
+    @staticmethod
+    def claim_key(row, now, fair=False):
+        """按 claim_keys 的表达式在 Python 侧重算同一行键，供 keyset 续页使用。"""
+        created = row["created"] or 0
+        priority = row["priority"] if row["priority"] is not None else 50
+        key = [-(row["urgency"] or 0),
+               -(priority + min(20, (now - created) / 86400.0)),
+               created, row["id"]]
+        if fair:
+            key.insert(0, 1 if row["source"] == "system_delivery" else 0)
+        return tuple(key)
+
+    @staticmethod
     def compatible_source_clause(active_sources):
         if len(active_sources) >= 2:
             return None
@@ -1076,6 +1120,7 @@ class Store:
         with self.connect() as db:
             corrupt_sync = False
             run = None
+            rescanned = False
             while True:
                 now = time.time()
                 p = db.execute("SELECT paused FROM projects WHERE id=?", (project,)).fetchone()
@@ -1091,67 +1136,97 @@ class Store:
                 effective = None
                 recent = db.execute("SELECT t.source FROM runs r JOIN tasks t ON t.id=r.task "
                                     "WHERE r.project=? ORDER BY r.started DESC,r.id DESC LIMIT 3", (project,)).fetchall()
-                fair_order = ("CASE WHEN source='system_delivery' THEN 1 ELSE 0 END," if
-                              len(recent) == 3 and all(row["source"] == "system_delivery" for row in recent) else "")
-                skipped = []
-                while True:
-                    candidate = db.execute("SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() +
-                                           source_filter + (" AND id NOT IN (" + ",".join("?" for _ in skipped) + ")" if skipped else "") +
-                                           " ORDER BY " + fair_order + self.queue_order() + " LIMIT 1",
-                                           (project, now, *skipped, now)).fetchone()
-                    if not candidate:
+                fair = (len(recent) == 3 and
+                        all(row["source"] == "system_delivery" for row in recent))
+                # 候选分页扫描：一次取一页（CLAIM_PAGE 条），pending publish 在内存里
+                # 跳过，整页无果时按 (queue_order, id) 的 keyset 续页。旧实现为每条被
+                # 跳过的候选重拼一次变长 NOT IN 并重跑整条扫描，成本随 pending 数平方
+                # 增长（800 条 pending 约 1 秒）。
+                keys = self.claim_keys(fair)
+                order = ", ".join(keys)
+                base = "SELECT * FROM tasks WHERE project=? AND " + self.ready_clause() + source_filter
+                after = None
+                rescan = False
+                # pending 集合在首次遇到 publish 候选时解析一次，整段扫描复用；
+                # 写锁内的最终复核仍重新读取，过期快照不会放行发布。
+                sync = _LOAD_PROGRESS
+                while task is None:
+                    sql = base
+                    args = [project, now]
+                    if after is not None:
+                        sql += " AND (" + order + ") > (" + ",".join("?" for _ in keys) + ")"
+                        args += [now, *after]
+                    sql += " ORDER BY " + order + " LIMIT ?"
+                    args += [now, CLAIM_PAGE]
+                    rows = db.execute(sql, args).fetchall()
+                    if not rows:
                         break
-                    if candidate["source"] == "system_publish":
-                        source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
-                        if source:
-                            pending = issue_snapshot_pending(db, project, source["task"])
-                            if pending == "corrupt":
-                                corrupt_sync = True
-                            if pending:
-                                skipped.append(candidate["id"])
-                                continue
-                    # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
-                    # 否则裸解析异常会让项目所有任务永远领不到。
-                    try:
-                        evidence = json.loads(candidate["evidence"] or "[]")
-                        if not isinstance(evidence, list):
-                            raise ValueError("Task evidence must be an array")
-                    except (ValueError, TypeError) as exc:
-                        reason = str(exc)[:300] or "Invalid task evidence"
-                        self._block_candidate(db, project, candidate["id"],
-                                              "Task was blocked because its evidence is invalid: ", reason,
-                                              candidate["evidence"], candidate["overrides"])
-                        continue
-                    source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
-                    if (source_key and not config.get("sources", {}).get(source_key, True) and
-                            any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
-                                for item in evidence)):
-                        # 快照与写锁之间 evidence 可能已被改写（request 会把排队任务的
-                        # 自动触发升级为 manual，见 runtime.request）：条件写要求作废
-                        # 依据在写锁下仍是扫描时那一份，未命中就交还重扫凭新快照重判。
-                        db.execute("BEGIN IMMEDIATE")
-                        db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=? AND state='queued' "
-                                   "AND evidence IS ?",
-                                   (time.time(), candidate["id"], candidate["evidence"]))
-                        db.commit()
-                        continue
-                    try:
-                        overrides = json.loads(candidate["overrides"])
-                        if not isinstance(overrides, dict):
-                            raise ValueError("Task configuration overrides must be an object")
-                        effective = validate(merge(config, overrides))
-                    except ZoneInfoNotFoundError:
-                        reason = "Unknown schedule timezone"
-                    except (ValueError, TypeError, AttributeError) as exc:
-                        reason = str(exc)[:300] or "Invalid task configuration overrides"
-                    else:
-                        task = candidate
+                    for candidate in rows:
+                        if candidate["source"] == "system_publish":
+                            source = db.execute("SELECT task FROM runs WHERE id=?", (candidate["body"],)).fetchone()
+                            if source:
+                                if sync is _LOAD_PROGRESS:
+                                    sync = issue_sync_progress(db, project)
+                                pending = issue_snapshot_pending(db, project, source["task"], sync)
+                                if pending == "corrupt":
+                                    corrupt_sync = True
+                                if pending:
+                                    continue
+                        # evidence 预解析不依赖 sources 开关：两条路径对损坏行同款隔离，
+                        # 否则裸解析异常会让项目所有任务永远领不到。
+                        try:
+                            evidence = json.loads(candidate["evidence"] or "[]")
+                            if not isinstance(evidence, list):
+                                raise ValueError("Task evidence must be an array")
+                        except (ValueError, TypeError) as exc:
+                            reason = str(exc)[:300] or "Invalid task evidence"
+                            if not self._block_candidate(
+                                    db, project, candidate["id"],
+                                    "Task was blocked because its evidence is invalid: ", reason,
+                                    candidate["evidence"], candidate["overrides"]):
+                                rescan = True
+                            continue
+                        source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
+                        if (source_key and not config.get("sources", {}).get(source_key, True) and
+                                any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
+                                    for item in evidence)):
+                            # 快照与写锁之间 evidence 可能已被改写（request 会把排队任务的
+                            # 自动触发升级为 manual，见 runtime.request）：条件写要求作废
+                            # 依据在写锁下仍是扫描时那一份，未命中就交还重扫凭新快照重判。
+                            db.execute("BEGIN IMMEDIATE")
+                            changed = db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=? "
+                                                 "AND state='queued' AND evidence IS ?",
+                                                 (time.time(), candidate["id"], candidate["evidence"]))
+                            db.commit()
+                            if not changed.rowcount:
+                                rescan = True
+                            continue
+                        try:
+                            overrides = json.loads(candidate["overrides"])
+                            if not isinstance(overrides, dict):
+                                raise ValueError("Task configuration overrides must be an object")
+                            effective = validate(merge(config, overrides))
+                        except ZoneInfoNotFoundError:
+                            reason = "Unknown schedule timezone"
+                        except (ValueError, TypeError, AttributeError) as exc:
+                            reason = str(exc)[:300] or "Invalid task configuration overrides"
+                        else:
+                            task = candidate
+                            break
+                        if not self._block_candidate(
+                                db, project, candidate["id"],
+                                "Task was blocked because its configuration overrides are invalid: ",
+                                reason, candidate["evidence"], candidate["overrides"]):
+                            rescan = True
+                    if task is not None or len(rows) < CLAIM_PAGE:
                         break
-                    self._block_candidate(db, project, candidate["id"],
-                                          "Task was blocked because its configuration overrides are invalid: ",
-                                          reason, candidate["evidence"], candidate["overrides"])
-                    continue
+                    after = self.claim_key(rows[-1], now, fair)
                 if task is None:
+                    # 条件写未命中说明候选在扫描后被改写：凭新快照重扫一次，
+                    # 与旧实现在同处 continue 重查的行为一致。
+                    if rescan and not rescanned:
+                        rescanned = True
+                        continue
                     break
                 # 扫描与认领之间写锁已让出：paused/archived/active sources/依赖
                 # 可能已变化，必须在短事务内复核再条件 UPDATE；更新未命中说明
@@ -1205,17 +1280,20 @@ class Store:
 
         evidence/overrides 回传扫描快照的原始值：拉黑依据来自快照，条件写要求
         决策字段在写锁下仍与扫描时一致；并发改写（如 request 升级 evidence）会
-        让 UPDATE 未命中，外层重扫后按新值重新判定，不会误拉黑改写后的任务。"""
+        让 UPDATE 未命中，外层重扫后按新值重新判定，不会误拉黑改写后的任务。
+        返回条件写是否命中，供调用方决定是否重扫。"""
         now = time.time()
         db.execute("BEGIN IMMEDIATE")
         changed = db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued' "
                              "AND evidence IS ? AND overrides IS ?",
                              (now, task, evidence, overrides))
-        if changed.rowcount:
+        applied = bool(changed.rowcount)
+        if applied:
             db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
                        (project, None, "task_configuration_error", message + reason,
                         encode({"task": task, "reason": reason}), now))
         db.commit()
+        return applied
 
     def transition(self, run, state, result=None, terminal=False, task_fields=None):
         """Persist a transition, resolving stop requests atomically; return whether a write occurred."""
