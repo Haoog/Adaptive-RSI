@@ -1,6 +1,7 @@
 """Background artifact retention and bounded state maintenance."""
 import json
 import logging
+import shutil
 import sqlite3
 import threading
 import time
@@ -22,6 +23,66 @@ MAINTENANCE_RETRY_MAX_SECONDS = 3600
 # 运维把链接换成同名真实目录后 runs.path 并不变化，永久跳过会饿死该运行；
 # 超过窗口的标记重新进入候选，仍不安全则重写标记顺延，恢复正常则清除。
 RETENTION_REJECT_REVALIDATE_SECONDS = 6 * 3600
+
+# 保留删除只把页移入 freelist；库以 auto_vacuum=0 创建，不 VACUUM 文件永不缩小。
+# 空闲页达到四分之一且磁盘留足重写整库的余量（VACUUM 峰值约需一份库文件）时
+# 才回收，避免为少量空闲页反复重写整个数据库。
+RECLAIM_FREELIST_RATIO = 0.25
+RECLAIM_DISK_HEADROOM = 2.5
+
+
+def _vacuum(store):
+    with store.connect() as db:
+        db.execute("VACUUM")
+
+
+def _reclaim_database(store, dispatch_lock):
+    """VACUUM 回收保留删除留下的空闲页；失败只留证据，不影响本轮清理。
+
+    备份与归档按库文件大小判定磁盘预算，文件虚胖会让它们在磁盘仍有余量时
+    被拒。空闲页占比、磁盘余量和活动运行都满足才回收：与调度共用锁复核
+    「无活动运行」，避免放行新运行后 VACUUM 持写锁把其写入拖到超时。
+    """
+    try:
+        with store.connect() as db:
+            pages = db.execute("PRAGMA page_count").fetchone()[0]
+            free_pages = db.execute("PRAGMA freelist_count").fetchone()[0]
+        before = store.path.stat().st_size
+        headroom = shutil.disk_usage(store.path.parent).free
+    except (OSError, sqlite3.Error):
+        logging.getLogger(__name__).exception("Database reclaim precheck failed")
+        return
+    if not pages or free_pages / pages < RECLAIM_FREELIST_RATIO:
+        return
+    if headroom < RECLAIM_DISK_HEADROOM * before:
+        return
+    with dispatch_lock:
+        if store.one("SELECT 1 FROM runs WHERE ended IS NULL LIMIT 1"):
+            return
+        try:
+            _vacuum(store)
+        except sqlite3.Error as exc:
+            message = "%s: %s" % (type(exc).__name__, exc)
+            logging.getLogger(__name__).warning("Database reclaim skipped (%s)", message)
+            try:
+                store.event("database_reclaim_failed", message,
+                            data={"error_type": type(exc).__name__, "page_count": pages,
+                                  "freelist_count": free_pages})
+            except Exception:
+                logging.getLogger(__name__).exception("Reclaim failure persistence failed")
+            return
+    try:
+        after = store.path.stat().st_size
+    except OSError:
+        after = 0
+    try:
+        store.event("database_reclaimed",
+                    "Reclaimed %d bytes from the state database" % max(0, before - after),
+                    data={"before_bytes": before, "after_bytes": after,
+                          "page_count": pages, "freelist_count": free_pages})
+    except Exception:
+        logging.getLogger(__name__).exception("Reclaim event persistence failed")
+
 
 def _retry_deadline(value):
     """Read the earliest allowed retry from the persisted backoff record."""
@@ -621,6 +682,9 @@ class Maintenance:
         cutoff_event = self.store.one("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET 1000")
         if cutoff_event:
             self.store.execute("DELETE FROM events WHERE created<? AND seq<?", (now - 90 * 86400, cutoff_event["seq"]))
+        # 保留删除留下的空闲页在 auto_vacuum=0 的库里不会归还给文件系统；
+        # 门禁满足时压缩，备份/归档的容量预算才与真实数据量一致。
+        _reclaim_database(self.store, self.dispatch_lock)
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
