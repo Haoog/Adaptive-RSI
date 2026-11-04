@@ -757,7 +757,7 @@ print('BOUNDARIES_OK')
         schedule(self.runtime, now + 122)
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (row["id"],))["state"], "queued")
 
-    def test_pending_close_does_not_repeat_write_when_remote_state_is_unknown_or_merged(self):
+    def test_pending_close_keeps_missing_merge_oid_retryable_instead_of_dropping_it(self):
         run = self.tracked_pr()
         outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
         self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
@@ -773,10 +773,80 @@ print('BOUNDARIES_OK')
             tick(self.runtime, now + 61)
         remote.assert_not_called()
         feedback.assert_not_called()
-        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        # 合并事实已确认但拿不到 mergeCommit.oid：保留关闭意图等下一 tick 复查补齐，
+        # 不能落成「已合并却没有 merged_sha」后从扫描中消失。
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertEqual(result["close_status"], "merged")
+        self.assertEqual(result["delivery_status"], "merge_sha_pending")
+        self.assertTrue(result["close_pending"])
+        self.assertIsNone(result.get("merged_sha"))
+        # 已合入的改动不再被重新实现：任务保留重排意图但进入 blocked。
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "blocked")
+        events = "SELECT count(*) AS n FROM events WHERE run=? AND kind='delivery_merged_after_supersede'"
+        self.assertEqual(self.store.one(events, (run["id"],))["n"], 1)
+
+        # oid 补齐后 run 推进到 merged，反馈接管；重复观察不应再刷一条事件。
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base",
+              "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, now + 122)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertEqual(json.loads(row["result"])["merged_sha"], "merged-sha")
+        feedback.assert_called_once()
+        self.assertEqual(self.store.one(events, (run["id"],))["n"], 1)
+
+    def test_superseded_merge_records_evidence_and_blocks_the_replanned_task(self):
+        run = self.tracked_pr()
+        outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked") as remote, \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, time.time())
+        # 已合入的 PR 不需要任何远端写；合并证据要能被合并后验证与发布推进接手。
+        remote.assert_not_called()
+        feedback.assert_called_once()
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        result = json.loads(row["result"])
+        self.assertEqual(result["merged_sha"], "merged-sha")
+        self.assertEqual(result["delivery_status"], "merged")
+        self.assertEqual(result["close_status"], "merged")
         self.assertFalse(result["close_pending"])
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "blocked")
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE run=? AND kind='delivery_merged_after_supersede'",
+            (run["id"],))["n"], 1)
+
+    def test_superseded_merge_keeps_newer_attempt_and_its_task_state(self):
+        run = self.tracked_pr()
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+        newer = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertEqual(newer["task"], run["task"])
+        self.store.execute("UPDATE runs SET started=? WHERE id=?", (run["started"] + 1, newer["id"]))
+        task_state = self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"]
+        outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, time.time(), project_id=self.project, active_run=newer["id"])
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "merged")
+        self.assertEqual(json.loads(row["result"])["merged_sha"], "merged-sha")
+        # 旧 run 仍需合并后验证，但不得代替新 run 收尾。
+        feedback.assert_called_once()
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE run=? AND kind='delivery_merged_after_supersede'",
+            (run["id"],))["n"], 1)
+        # 新 run 仍持有该任务：绝不改写它的任务状态，也不替它收尾。
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], task_state)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (newer["id"],))["state"], newer["state"])
 
     def test_merge_intent_reconciliation_distinguishes_local_from_manual_merge(self):
         run = self.tracked_pr()

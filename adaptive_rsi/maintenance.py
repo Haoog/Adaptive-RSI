@@ -84,6 +84,55 @@ def _reclaim_database(store, dispatch_lock):
         logging.getLogger(__name__).exception("Reclaim event persistence failed")
 
 
+# 保留删除只改行数不改结构；规划器只有 ANALYZE 之后才看得到真实基数。
+# SQLite 3.46.0 才让 PRAGMA optimize 自动分析没有 sqlite_stat1 记录的表，并支持
+# 0x10000 位按全表体积判断是否需要重分析；更早的版本会静默跳过本连接没查询过的
+# 表，而 Python 3.9+ 可以链接任意 SQLite 版本，所以旧版本补一次有界显式 ANALYZE。
+PLANNER_STAT_TABLES = ("events",)
+PLANNER_OPTIMIZE_PRAGMA = "PRAGMA optimize=0x10002"
+PLANNER_OPTIMIZE_ALL_TABLES = sqlite3.sqlite_version_info >= (3, 46, 0)
+PLANNER_ANALYSIS_LIMIT = 1000
+
+
+def _analyze_tables(db, tables):
+    """ANALYZE ``tables`` with a per-index sample cap where SQLite supports it.
+
+    ``analysis_limit`` exists from 3.32.0; older builds ignore the unknown pragma
+    and analyze fully, which is still correct, only slower.
+    """
+    db.execute("PRAGMA analysis_limit=%d" % PLANNER_ANALYSIS_LIMIT)
+    try:
+        # 表名来自上面的常量元组，不拼接外部输入。
+        for table in tables:
+            db.execute("ANALYZE %s" % table)
+    finally:
+        db.execute("PRAGMA analysis_limit=0")
+
+
+def refresh_query_planner(store):
+    """Refresh sqlite_stat1 after retention so plans follow real cardinalities.
+
+    ``PRAGMA optimize=0x10002`` is SQLite's documented periodic form for
+    long-lived connections, but only from 3.46.0 does it check every table's
+    size (bit 0x10000) and auto-analyze tables without ``sqlite_stat1`` rows.
+    Older builds silently skip tables the connection never queried, and Python
+    3.9+ can link any SQLite release, so those builds fall back to an explicit
+    bounded ``ANALYZE``.  It runs on a borrowed connection with no explicit
+    transaction, so the write lock ANALYZE briefly takes belongs to it alone.
+    Failures are logged and never abort the retention round.
+    """
+    try:
+        with store.connect() as db:
+            db.execute(PLANNER_OPTIMIZE_PRAGMA).fetchall()
+            if not PLANNER_OPTIMIZE_ALL_TABLES:
+                _analyze_tables(db, PLANNER_STAT_TABLES)
+    except sqlite3.Error:
+        logging.getLogger(__name__).warning("Query planner statistics refresh failed",
+                                            exc_info=True)
+        return False
+    return True
+
+
 def _retry_deadline(value):
     """Read the earliest allowed retry from the persisted backoff record."""
     if not isinstance(value, dict):
@@ -685,6 +734,10 @@ class Maintenance:
         # 保留删除留下的空闲页在 auto_vacuum=0 的库里不会归还给文件系统；
         # 门禁满足时压缩，备份/归档的容量预算才与真实数据量一致。
         _reclaim_database(self.store, self.dispatch_lock)
+        # Retention has just shrunk the event log; refresh optimizer statistics after
+        # the reclaim so the next query plans against real cardinalities instead of the
+        # default table sizes.  This runs outside any explicit write transaction.
+        refresh_query_planner(self.store)
         # Passive checkpoint yields to readers; archive checks are capped per cycle.
         self.store.wal_diagnostics(checkpoint=True)
         from .storage_tools import verify_archive
