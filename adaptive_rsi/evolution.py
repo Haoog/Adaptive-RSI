@@ -770,22 +770,37 @@ class Evolution:
     @staticmethod
     def verify_bundle(directory):
         import hashlib
+        import os
         root = Path(directory).resolve()
         manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
+        files = manifest["files"]
         mismatches = []
-        for relative, digest in manifest["files"].items():
+        for relative, digest in files.items():
             path = root / relative
             if Path(relative).is_absolute() or ".." in Path(relative).parts or any(p.is_symlink() for p in [path] + list(path.parents)):
                 mismatches.append(relative)
             elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 mismatches.append(relative)
-        # .git 不再随 bundle 导出，也不是可校验内容：cases/ 下出现的任何 .git
-        # 都属于登记清单之外的注入（旧版导出残留或篡改），按 manifest 缺登记
-        # 的同一语义判失效，不给它 valid=True 的静默豁免。
-        cases_dir = root / "cases"
-        if cases_dir.is_dir() and not cases_dir.is_symlink():
-            for entry in sorted(cases_dir.rglob(".git")):
-                mismatches.append(entry.relative_to(root).as_posix())
+        # 反向检查：磁盘上存在但未登记的文件同样是包被改动的证据。逐项比对登记摘要
+        # 只能证明"登记过的文件没变"，无法证明"包里只有登记过的文件"：
+        # sitecustomize.py / conftest.py / .pth 这类未登记文件不改动任何摘要，却会在
+        # 复现执行检查时改变结果。bundle.json 写于摘要计算之后，是唯一允许的未登记
+        # 文件；.git 不随包导出，出现即属注入，记为未登记条目且不展开其内部对象。
+        for parent, dirs, names in os.walk(root, followlinks=False):
+            base = Path(parent)
+            for name in list(dirs):
+                path = base / name
+                if path.is_symlink() or name == ".git":
+                    mismatches.append(path.relative_to(root).as_posix())
+                    dirs.remove(name)
+            dirs.sort()
+            for name in sorted(names):
+                path = base / name
+                relative = path.relative_to(root).as_posix()
+                if relative == "bundle.json" and not path.is_symlink():
+                    continue
+                if relative not in files:
+                    mismatches.append(relative)
         return {"valid": not mismatches, "mismatches": mismatches, "limitations": manifest.get("limitations", [])}
 
     @staticmethod
