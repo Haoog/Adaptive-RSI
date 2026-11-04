@@ -1138,6 +1138,29 @@ class AuditEvolutionTest(unittest.TestCase):
         trials[0]['candidate'] = {'pass': False, 'decision': 'fail'}
         self.assertEqual(Evolution.decide(trials, config)['decision'], 'fail')
 
+    def test_confirmed_regression_survives_an_inconclusive_repetition(self):
+        """同族另一轮没跑完时，已确认的回归不能被抹掉成 inconclusive。"""
+        config = {'evolution': {'repeats': 2, 'min_cases_per_split': 1, 'max_cost_ratio': 1.25}}
+        trials = [
+            {'case': 'regressed', 'split': 'validation', 'repetition': 0,
+             'stable': {'pass': True, 'decision': 'pass'},
+             'candidate': {'pass': False, 'decision': 'fail'}},
+            {'case': 'regressed', 'split': 'validation', 'repetition': 1,
+             'stable': {'pass': True, 'decision': 'insufficient_evidence', 'reason': 'evaluator unavailable'},
+             'candidate': {'pass': False, 'decision': 'fail'}},
+        ]
+        trials += [{'case': 'improved', 'split': 'holdout', 'repetition': repetition,
+                    'stable': {'pass': False, 'decision': 'fail'},
+                    'candidate': {'pass': True, 'decision': 'pass'}}
+                   for repetition in range(2)]
+        summary = paired_summary(trials)
+        # 一轮无结论不能把同族的真实回归从分母里剔除：否则 losses=0、estimate=1.0。
+        self.assertEqual((summary['wins'], summary['losses'], summary['ties'], summary['inconclusive']),
+                         (1, 1, 0, 0))
+        self.assertEqual(summary['estimate'], 0.5)
+        self.assertEqual(summary['cohorts']['regressed']['outcome'], 'loss')
+        self.assertEqual(Evolution.decide(trials, config)['decision'], 'fail')
+
     def test_erroring_stable_arm_blocks_promotion_and_skill_write(self):
         """端到端：stable 臂报错、candidate 臂通过时不得晋升，也不写 verified 技能。"""
         args = self.setup_proposal()

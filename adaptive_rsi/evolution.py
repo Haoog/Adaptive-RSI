@@ -143,15 +143,19 @@ def paired_summary(trials):
             cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                                "outcome": "no_change", "repetitions": len(complete)}
             continue
-        if any(arm_decision(row[v]) not in CONCLUSIVE_DECISIONS for row in complete for v in ("stable", "candidate")):
-            # 没跑成的臂没有结论，记成 win/loss/tie 也会伪造证据；单独计数便于报告说明原因。
+        lost = any(arm_decision(row["stable"]) == "pass" and arm_decision(row["candidate"]) == "fail" for row in complete)
+        if not lost and any(arm_decision(row[v]) not in CONCLUSIVE_DECISIONS
+                            for row in complete for v in ("stable", "candidate")):
+            # 没跑成的臂没有结论，记成 win/tie 也会伪造证据；单独计数便于报告说明原因。
+            # 已确认的回归（另一轮 stable=pass、candidate=fail）先计入 loss：同族有一轮
+            # 没跑完不能抹掉已有的负证据，否则 losses 归零会把 estimate 抬成 1.0，
+            # 与 split_decision() 先判真实回归的结论自相矛盾。
             inconclusive += 1
             cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                                "outcome": "inconclusive", "repetitions": len(complete),
                                "arms": sorted({str(variant) + ":" + str(arm_decision(row[variant]) or "unknown")
                                                for row in complete for variant in ("stable", "candidate")})}
             continue
-        lost = any(arm_decision(row["stable"]) == "pass" and arm_decision(row["candidate"]) == "fail" for row in complete)
         won = not lost and any(arm_decision(row["stable"]) == "fail" and arm_decision(row["candidate"]) == "pass" for row in complete)
         wins += won
         losses += lost
