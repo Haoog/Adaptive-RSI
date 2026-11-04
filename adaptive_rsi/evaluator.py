@@ -170,12 +170,16 @@ def test_identities(text):
                 executed.append(identity)
             elif event.get("Action") == "skip":
                 skipped.append({"id": identity, "reason": "unspecified by go event"})
-        match = re.match(r"^(test\S+ \([^)]+\)) \.\.\. (.*)$", line)
+        match = re.match(r"^(test\S+ \(([^)]+)\)) \.\.\. (.*)$", line)
         if match:
-            if match[2].startswith("skipped"):
-                skipped.append({"id": match[1], "reason": match[2][7:].strip()})
+            if match[3].startswith("skipped"):
+                skipped.append({"id": match[1], "reason": match[3][7:].strip()})
             else:
-                executed.append(match[1])
+                # unittest -v prints "method (module.Class.method) ... ok".  The
+                # parenthesized part is the selector-compatible identity callers
+                # write in required_test_ids; the whole prefix is display only.
+                # Keep both so existing display-form contracts still verify.
+                executed.extend((match[2], match[1]))
         match = re.match(r"^(\S+::\S+) (PASSED|FAILED|SKIPPED)(.*)$", line)
         if match:
             if match[2] == "SKIPPED":
@@ -1006,7 +1010,14 @@ class Evaluator:
         """
         if not key:
             return None
-        if any(row.get("error") or UNAVAILABLE_OUTPUT.search(row.get("stderr") or "") for row in rows):
+        # Execution-layer failures leave no trustworthy baseline to reuse, and a
+        # failed check whose stderr reports a missing executable means the
+        # environment was unavailable. A check that passed can still mention
+        # that text (Go's os/exec reports absent tools this way), so only
+        # non-passing rows may veto the whole write.
+        if any(row.get("error") or
+               (not row.get("passed") and UNAVAILABLE_OUTPUT.search(row.get("stderr") or ""))
+               for row in rows):
             return None
         compact = []
         for row in rows:
