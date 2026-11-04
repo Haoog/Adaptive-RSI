@@ -807,6 +807,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             {"review_key": review_key, "patch_hash": fingerprint(patch)},
             _invoke_review,
             accept=_approved_review)
+    # 首轮评审调用期间仍可能写入修订或取消；此处重读一次边界，与评估通过后的
+    # 那次迁移不重复——它覆盖的是评审调用自身的时间窗，缺了它，已付费的高风险
+    # 评审会继续为已作废的候选执行。
     transition("evaluating", {"stage": "review"})
     risk_review = None
     if risk_review_required(plan, review, files, patch) and not skip_paid_review:
