@@ -253,7 +253,7 @@ class DeploymentObservationTest(unittest.TestCase):
     def test_rollback_owner_change_during_probe_discards_evidence(self):
         self.data.update(state='rolling_back', rollback={'state': 'workflow_succeeded', 'sha': 'c' * 40})
         def probe(url, sha):
-            self.store.put_setting(owner_key('p', 'example/project', self.policy), {'run': 'newer'})
+            self.store.put_setting(owner_key('p', 'example/project', self.policy), {'run': 'newer', 'sha': 'd' * 40})
             return {'healthy': True, 'sha': sha}
         with patch('adaptive_rsi.release.reconcile', side_effect=lambda runtime, run, kind, data, **kwargs: data), patch(
                 'adaptive_rsi.release.health_check', side_effect=probe):

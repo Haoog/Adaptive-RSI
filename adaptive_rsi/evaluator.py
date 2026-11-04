@@ -271,9 +271,11 @@ def junit_test_summary(text):
 def clarity_test_summary(text):
     """Recognize bounded pytest CLI summaries without parsing arbitrary output.
 
-    pytest 7+ prints failures first (``== 2 failed, 3 passed in 1.00s ==``), so
-    fields are captured by name instead of position. Runs of 60+ seconds append
-    a humanized duration (``in 65.00s (0:01:05)``), which stays optional."""
+    pytest 7+ prints failures first (``== 2 failed, 3 passed in 1.00s ==``) and
+    omits zero-count fields entirely, so a run where every test failed ends
+    with ``== 1 failed in 0.03s ==``. Fields are captured by name instead of
+    position and missing ones count as zero. Runs of 60+ seconds append a
+    humanized duration (``in 65.00s (0:01:05)``), which stays optional."""
     line = re.search(r"(?m)^=+ (.+) in [\d.]+s(?: \([^)]*\))? *=+$", text)
     if not line:
         return None
@@ -284,18 +286,22 @@ def clarity_test_summary(text):
         match = re.search(r"\b(\d+) " + pattern + r"\b", line.group(1))
         if match:
             fields[name] = int(match.group(1))
-    if not fields.get("passed"):
-        # pytest still reports ``0 passed`` for collection-only failures; treat
-        # that as no executed summary instead of fabricating an empty run.
+    if "passed" in fields and not fields["passed"]:
+        # An explicit ``0 passed`` line stays a non-summary instead of being
+        # reported as executed evidence for an empty run.
         return None
-    passed = fields["passed"]
+    passed = fields.get("passed", 0)
+    failed = fields.get("failed", 0)
+    skipped = fields.get("skipped", 0)
+    if passed + failed + skipped == 0:
+        # ``no tests ran`` and collection-only errors report no test-body
+        # outcomes; leave ``test_summary`` unset instead of reporting 0/0.
+        return None
     # Errors overlap passed/failed when fixture setup or teardown fails for a
     # test whose body already reported an outcome (``1 passed, 1 error``).
     # Merging them into ``failed`` double-counts that test in ``executed``, so
     # errors stay a separate field and ``executed`` only sums mutually
     # exclusive test-body outcomes.
-    failed = fields.get("failed", 0)
-    skipped = fields.get("skipped", 0)
     # Deselected tests were filtered out before execution; keep them out of the
     # executed/skipped totals so the summary does not overstate coverage.
     summary = {"format": "pytest_cli", "executed": passed + failed + skipped,
