@@ -563,6 +563,30 @@ class ReliabilityTest(unittest.TestCase):
             self.assertLess(full_runs, sum(label == "candidate" for label, _, _ in calls))
             self.assertTrue(all(image == image_id for _, _, image in calls))
 
+    def test_evaluation_baseline_cache_keeps_artifact_identity_only(self):
+        evaluator = Evaluator(self.store)
+        content = "J" * (2 * 1024 * 1024)
+        rows = [{"name": "unit", "argv": ["python3", "-m", "unittest"], "cwd": ".", "passed": True,
+                 "exit_code": 0, "stdout": "Ran 1 test\n", "stderr": "", "test_summary": {"tests": 1},
+                 "artifacts": {
+                     "junit.xml": {"state": "collected", "bytes": len(content),
+                                   "sha256": "a" * 64, "content": content},
+                     "coverage.xml": {"state": "rejected", "reason": "symlink"}}}]
+        self.assertGreater(len(encode(rows)), 2 * 1024 * 1024)
+        evaluator._cache_put("project-a", "key", rows)
+        raw = self.store.one("SELECT length(value) AS size FROM settings WHERE key=?",
+                             ("evaluation-baseline-entry:project-a:key",))["size"]
+        self.assertLess(raw, 64 * 1024)
+        cached = evaluator._cache_get("project-a", "key")[0]
+        self.assertEqual({key: cached[key] for key in ("name", "argv", "cwd", "passed", "exit_code",
+                                                       "test_summary", "cached")},
+                         {"name": "unit", "argv": ["python3", "-m", "unittest"], "cwd": ".", "passed": True,
+                          "exit_code": 0, "test_summary": {"tests": 1}, "cached": True})
+        self.assertNotIn("stdout", cached)
+        self.assertEqual(cached["artifacts"]["junit.xml"],
+                         {"state": "collected", "bytes": len(content), "sha256": "a" * 64})
+        self.assertEqual(cached["artifacts"]["coverage.xml"], {"state": "rejected", "reason": "symlink"})
+
     def test_test_first_evaluation_blocks_changed_harness_before_running_checks(self):
         evaluator = Evaluator(self.store)
         with patch.object(evaluator, "_execution_environment", return_value=(self.runtime.config(self.project), None)), \
