@@ -656,6 +656,46 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_stale_snapshot_does_not_wait_for_the_session_lock(self):
+        """安装凭据/登出持有会话锁时，过期快照仍须立即返回。"""
+        manager = AuthSessions(self.root / 'stale-while-locked')
+        locked, release = threading.Event(), threading.Event()
+
+        def hold_lock():
+            with manager.lock:
+                locked.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode', return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', return_value=['openai']):
+                self.assertEqual(manager.snapshot()['opencode']['authenticated_providers'], ['openai'])
+                with manager.cache_lock:
+                    expires, value = manager.status_cache['opencode']
+                    manager.status_cache['opencode'] = (time.monotonic() - 1, value)
+                # 另一个线程持锁，模拟 _save/logout 在 CLI 子进程期间的会话锁占用。
+                holder.start()
+                self.assertTrue(locked.wait(2))
+                started = time.perf_counter()
+                stale = manager.snapshot()['opencode']
+                elapsed = time.perf_counter() - started
+                release.set()
+                holder.join(2)
+                self.assertLess(elapsed, 0.2)
+                self.assertTrue(stale['refreshing'])
+                self.assertEqual(stale['authenticated_providers'], ['openai'])
+                for _ in range(300):
+                    if not manager.status_refreshes:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(manager.status_refreshes)
+        finally:
+            release.set()
+            holder.join(2)
+            manager.close()
+
     def test_invalidation_during_background_refresh_keeps_new_credentials(self):
         manager = AuthSessions(self.root / 'invalidate-during-refresh')
         path = auth_sessions.auth_path()

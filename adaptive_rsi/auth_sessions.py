@@ -855,6 +855,9 @@ class AuthSessions:
         self.workers = {}
         self.discoveries = set()
         self.threads = set()
+        # 线程登记不占用 self.lock：后者在 install_credential/logout 期间被长时间持有，
+        # 过期快照的后台刷新若等待它，请求线程仍会被阻塞。
+        self.threads_lock = threading.Lock()
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
         self._close_error = None
@@ -1187,17 +1190,20 @@ class AuthSessions:
             try:
                 target()
             finally:
-                with self.lock:
+                with self.threads_lock:
                     self.threads.discard(threading.current_thread())
         thread = threading.Thread(target=run, daemon=True)
-        with self.lock:
-            # 先于 start() 登记，让 close() 能看到即将启动的线程；start 失败则摘除，
-            # 否则 close() 会对一个从未启动的线程 join() 而抛 RuntimeError。
+        with self.threads_lock:
+            # 与 close() 的 closed 置位+快照同锁：先于 start() 登记，让 close() 能看到
+            # 即将启动的线程；已关闭时不再启动新线程。start 失败则摘除，否则 close()
+            # 会对一个从未启动的线程 join() 而抛 RuntimeError。
+            if self.closed:
+                return
             self.threads.add(thread)
         try:
             thread.start()
         except BaseException:
-            with self.lock:
+            with self.threads_lock:
                 self.threads.discard(thread)
             raise
 
@@ -1684,7 +1690,10 @@ class AuthSessions:
                         self._terminate(item, state="interrupted", error="process_interrupted")
                         self._publish_sessions()
             self._close_error = first_error
-            threads = list(self.threads)
+            # closed 已在上面置位；此后 _thread() 不再启动新线程，这里只需在
+            # threads_lock 下取快照，避免漏掉刚登记、尚未 start 的线程。
+            with self.threads_lock:
+                threads = list(self.threads)
         for worker, stop in workers:
             stop.set()
             if worker:
