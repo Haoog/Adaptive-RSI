@@ -1527,6 +1527,64 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_verification_rejects_unregistered_files(self):
+        """封存后新增的未登记文件必须判失效，并阻止复现执行任何检查。
+
+        逐项比对登记摘要只能证明"登记过的文件没变"；sitecustomize.py 这类文件
+        不改动任何摘要，却会在复现时被 Python 自动导入并改变检查结果。
+        """
+        import subprocess
+        import sys
+        marker = self.root / 'unlisted-check-ran'
+        checks = [{'name': 'marker', 'cwd': '.',
+                   'argv': [sys.executable, '-c',
+                            'open(%r, "w").write("1")' % str(marker)]}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-unlisted')
+        case = destination / 'cases' / 'case-unlisted'
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+        injected = [case / 'repository' / 'sitecustomize.py',
+                    case / 'UNLISTED.txt',
+                    destination / 'UNLISTED.txt']
+        for path in injected:
+            path.write_text('print("unlisted")\n')
+
+        result = Evolution.verify_bundle(destination)
+        self.assertFalse(result['valid'])
+        for path in injected:
+            self.assertIn(path.relative_to(destination).as_posix(), result['mismatches'])
+
+        # 完整性失效后不得执行任何用例检查：marker 只在检查真正运行时写出。
+        repro = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertFalse(repro['integrity']['valid'])
+        self.assertFalse(repro['valid'])
+        self.assertFalse(repro['reproducible'])
+        self.assertEqual(repro['executed_checks'], [])
+        self.assertFalse(marker.exists())
+
+        # CLI 以完整性失败退出 1，不再打印「All bundle files verified」。
+        cli = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination),
+             '--run-checks', '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
+        self.assertEqual(cli.returncode, 1, cli.stdout + cli.stderr)
+        self.assertNotIn('All bundle files verified', cli.stdout)
+        self.assertIn('cases/case-unlisted/repository/sitecustomize.py', cli.stdout)
+        self.assertFalse(marker.exists())
+
+        # 未注入的正常导出包不回归：verify 通过，--strict 退出 0 且检查真实执行。
+        pristine = self.sealed_bundle(checks=checks, repo_name='repo-unlisted-pristine')
+        self.assertTrue(Evolution.verify_bundle(pristine)['valid'])
+        passed = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(pristine),
+             '--run-checks', '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertIn('All bundle files verified', passed.stdout)
+        self.assertTrue(marker.exists())
+
     def test_exported_bundle_excludes_git_metadata(self):
         """导出 bundle 只封存工作树：.git 不随包走（origin 指向的宿主机 suite
         路径不外泄），cases/ 下出现 .git 由 verify_bundle 判失效而不是静默豁免。"""
@@ -1734,12 +1792,13 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(result['valid'])
         self.assertEqual(result['executed_checks'], [])
 
-        # 复现扫描自身的符号链接检测：verify_bundle 只查登记文件，会放过 cases/ 内
-        # 未登记的符号链接条目；reproduce 必须主动判失效且不执行其中任何内容。
+        # verify_bundle 也会把 cases/ 下未登记的符号链接条目判失效：它既是清单外的
+        # 内容，也可能指向包外；reproduce 必须同时不执行其中任何内容。
         scanned = self.root / 'scanned'
         shutil.copytree(pristine, scanned)
         (scanned / 'cases' / 'link').symlink_to(outside / 'x')
-        self.assertTrue(Evolution.verify_bundle(scanned)['valid'])
+        self.assertFalse(Evolution.verify_bundle(scanned)['valid'])
+        self.assertIn('cases/link', Evolution.verify_bundle(scanned)['mismatches'])
         result = Evolution.reproduce_bundle(scanned, env={'PATH': '/usr/bin:/bin'}, run_checks=True)
         self.assertFalse(result['integrity']['valid'])
         self.assertIn('cases/link', result['integrity']['mismatches'])
@@ -1872,11 +1931,17 @@ class AuditEvolutionTest(unittest.TestCase):
         spec['overlay'] = 'overlay'
         (case_dir / 'case.json').write_text(encode(spec), encoding='utf-8')
         self.reseal_bundle(destination)
-        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        # 未登记的符号链接条目在 verify_bundle 阶段就被拒绝，不再等到 staging。
+        rejected = Evolution.verify_bundle(destination)
+        self.assertFalse(rejected['valid'])
+        self.assertIn('cases/case-escape/repository/vendor', rejected['mismatches'])
 
-        result = Evolution.reproduce_bundle(
-            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
-            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        # 即使完整性校验被绕过，复现侧仍要拒绝 overlay 经仓库内符号链接写到副本外。
+        with patch.object(Evolution, 'verify_bundle',
+                          return_value={'valid': True, 'mismatches': [], 'limitations': []}):
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
         self.assertTrue(result['integrity']['valid'])
         self.assertEqual(len(result['executed_checks']), 1)
         row = result['executed_checks'][0]
