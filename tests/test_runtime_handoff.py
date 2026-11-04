@@ -573,8 +573,12 @@ class RuntimeHandoffTest(unittest.TestCase):
     def test_experiment_acceptance_baseline_runs_on_the_preparation_clock(self):
         """并发验收基线与生产路径一致，计入 preparation，不在实现前提前切评估相位。"""
         from adaptive_rsi import pipeline
+        baseline_seen = threading.Event()
         class HighRisk(FakeAgent):
             def invoke(self, role, prompt, workspace, *args, **kwargs):
+                if role == 'implementation':
+                    # 基线线程必须在实现结束前读到相位，否则断言会依赖线程调度时机。
+                    assert baseline_seen.wait(5), 'acceptance baseline never observed its phase'
                 result = super().invoke(role, prompt, workspace, *args, **kwargs)
                 if role == 'planning' and isinstance(result, dict):
                     return {**result, 'risk': 'high'}
@@ -584,6 +588,7 @@ class RuntimeHandoffTest(unittest.TestCase):
         observed = {}
         def baseline(*args, **kwargs):
             observed['phase'] = trial.get('_explicit_phase')
+            baseline_seen.set()
             return {'decision': 'pass', 'checks': {}}
         with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
              patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline', side_effect=baseline), \
