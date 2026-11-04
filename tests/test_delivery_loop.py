@@ -1486,6 +1486,88 @@ print('BOUNDARIES_OK')
         self.assertEqual([entry["feedback"].get("reused_from") for entry in saved], [None, None])
         self.assertEqual(self.store.query("SELECT * FROM settings WHERE key LIKE 'postmerge-eval:%'"), [])
 
+    def postmerge_run_config(self, run, **updates):
+        """Stored run config with the extra fields this run was claimed with."""
+        saved = json.loads(run["config"] or "{}")
+        saved.update(updates)
+        run["config"] = json.dumps(saved)
+        return saved
+
+    def postmerge_replay(self, runs, head, configs, identity=EXECUTION_IDENTITY):
+        """Run feedback for each run with its own stored config; returns the evaluate mock."""
+        from adaptive_rsi.delivery import feedback
+        now = time.time()
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch.object(self.runtime.evaluator, "execution_identity", return_value=identity), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             return_value={"decision": "pass", "checks": {"candidate": []}}) as evaluate:
+            for run, config in zip(runs, configs):
+                outcome = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome, config, now, shared={})
+        return evaluate
+
+    def test_postmerge_evaluation_is_not_shared_across_different_validation_controls(self):
+        # 评审 P1：宿主反例控制不同会改变结论（未检出即 insufficient_evidence），
+        # 同一 head/baseline/变更集也不能互换缓存结论。
+        runs, head = self.postmerge_scenario(distinct_baselines=False)
+        configs = []
+        for index, run in enumerate(runs):
+            control = {"name": "control", "argv": ["python3", "-c", "print(1)"], "detect": "value-" + str(index)}
+            configs.append(self.postmerge_run_config(run, validation={"controls": [control],
+                                                                      "affected_check_scheduling": False}))
+        evaluate = self.postmerge_replay(runs, head, configs)
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual([entry["feedback"].get("reused_from") for entry in saved], [None, None])
+
+    def postmerge_seeded_runs(self, digests):
+        """两个带冻结依赖的监控 run：按给定摘要记录环境事件，返回 (runs, head, configs)。"""
+        runs, head = self.postmerge_scenario(distinct_baselines=False)
+        configs = []
+        for run, digest in zip(runs, digests):
+            (self.store.root / "runs" / run["id"] / "dependencies" / "node_modules").mkdir(parents=True)
+            self.store.event("environment", "Dependency snapshot frozen", self.project, run["id"],
+                             {"bytes": 1, "sha256": digest * 64})
+            configs.append(self.postmerge_run_config(run, environment={"seed_paths": ["node_modules"],
+                                                                       "max_seed_mb": 256}))
+        return runs, head, configs
+
+    def test_postmerge_evaluation_is_not_shared_across_different_frozen_seeds(self):
+        # 评审 P2：seed_paths 只说明路径，两个 run 冻结的依赖内容不同时固定检查
+        # 可能给出相反结论，因此键里必须有冻结内容的摘要。
+        runs, head, configs = self.postmerge_seeded_runs(["0", "1"])
+        evaluate = self.postmerge_replay(runs, head, configs)
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual([entry["feedback"].get("reused_from") for entry in saved], [None, None])
+
+    def test_postmerge_evaluation_is_shared_across_identical_frozen_seeds(self):
+        # 摘要相同仍可复用：纳入依赖身份不能把正常共享一并关掉。
+        runs, head, configs = self.postmerge_seeded_runs(["d", "d"])
+        evaluate = self.postmerge_replay(runs, head, configs)
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(saved[1]["feedback"]["reused_from"], runs[0]["id"])
+
+    def test_bounded_postmerge_evaluation_keeps_baseline_verdict_and_failures(self):
+        # 评审 P2：截断不能把 baseline 失败改写成通过，也不能丢掉候选失败摘录。
+        from adaptive_rsi.delivery import bounded_evaluation, failure_attribution
+        baseline_rows = [{"name": "baseline " + str(index), "passed": True} for index in range(45)]
+        baseline_rows.append({"name": "late baseline failure", "passed": False, "stderr": "boom"})
+        result = {"decision": "fail", "checks": {
+            "baseline": baseline_rows,
+            "candidate": [{"name": "candidate failure " + str(index), "passed": False, "stdout": "boom"}
+                          for index in range(3)]}}
+        bounded = bounded_evaluation(result, time.time())
+        attribution = failure_attribution("merged-sha", "head-sha", bounded)
+        self.assertFalse(attribution["merge_baseline_passed"])
+        self.assertEqual(attribution["scope"], "unknown")
+        rows = [row for values in bounded["checks"].values() for row in values]
+        self.assertEqual(len(rows), 40)
+        names = [row["name"] for row in rows]
+        self.assertIn("late baseline failure", names)
+        self.assertIn("candidate failure 0", names)
+
     def test_tick_shares_baseline_only_within_the_same_target_branch(self):
         # 评审回归：同项目内 main 的到期监控先执行时，其读数按 (项目, 目标分支)
         # 缓存；随后面向 release 的就绪 run 必须再取一次 release 的真实读数，
