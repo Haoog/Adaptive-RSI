@@ -61,6 +61,7 @@ _POST_FIELD_TYPES = {
     "/api/config/repair-global": {"confirmation": str},
     "/api/release-retry": {"project": str, "run": str, "kind": str},
     "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
+    "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
     "/api/goal": {"project": str, "text": str, "request_id": str},
     "/api/task/revise": {"task": str, "supplement": str, "reason": str},
@@ -1151,6 +1152,13 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         result = runtime.resolve_release(body.get("project"), body.get("run"), body.get("kind"),
                                                          body.get("workflow_run_id"), body.get("target", "operation"))
+                    except ReconciliationRejected as exc:
+                        raise RequestError(str(exc)) from None
+                elif path == "/api/release-abandon":
+                    from .release import abandon
+                    try:
+                        result = abandon(runtime, body.get("project"), body.get("run"), body.get("kind"),
+                                         body.get("reason"), body.get("target", "operation"), source="console")
                     except ReconciliationRejected as exc:
                         raise RequestError(str(exc)) from None
                 elif path == "/api/release-authorize":
