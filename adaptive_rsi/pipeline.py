@@ -53,6 +53,39 @@ def _within_scope(path, scope):
     return scope == "." or path == scope.rstrip("/") or path.startswith(scope.rstrip("/") + "/")
 
 
+class AcceptanceBaselineUnavailable(RuntimeError):
+    """独立验收基线因确定性环境问题不可用，而不是用户暂停或取消。
+
+    验收检查的 setup 命令失败（缺依赖、缺命令、权限）时，候选实现再跑完也无法
+    通过验收；调用方必须按环境故障收尾，而不是记成可重试的 ``interrupted``。
+    """
+
+    failure_code = "environment"
+
+    def __init__(self, outcome=None):
+        outcome = outcome if isinstance(outcome, dict) else {}
+        self.reason = str(outcome.get("reason") or "Independent acceptance environment preparation failed")
+        setup = outcome.get("setup") if isinstance(outcome.get("setup"), dict) else {}
+        self.detail = next((str(setup[key]).strip() for key in ("error", "stderr", "stdout")
+                            if isinstance(setup.get(key), str) and setup[key].strip()), self.reason)
+        super().__init__(self.reason)
+
+    def failure(self):
+        """Bounded failure payload; setup stderr is the actionable part."""
+        return {"code": "environment", "action": "check_readiness",
+                "stage": "acceptance_baseline", "detail": self.detail[:2000]}
+
+
+def _acceptance_baseline_outcome(future):
+    """确定性失败基线的原因与 setup 摘要；评估线程抛错时降级为异常文本。"""
+    try:
+        outcome = future.result() if future is not None else None
+    except BaseException as exc:
+        reason = str(exc).strip() or type(exc).__name__
+        return {"reason": "Acceptance baseline evaluation failed: " + reason}
+    return outcome if isinstance(outcome, dict) else {"reason": "Acceptance baseline evaluation failed"}
+
+
 def _acceptance_baseline_failed(future):
     """并发验收基线是否已确定失败（不阻塞）。
 
@@ -682,8 +715,8 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             except Cancelled:
                 if _acceptance_baseline_failed(acceptance_future):
                     # 验收基线在实现期间已确定失败：中止的是一次注定白付的实现调用，
-                    # 按准确原因收尾而不是泛化的 cancel 文案。
-                    raise Cancelled("Acceptance baseline evaluation failed; implementation aborted")
+                    # 按准确原因（验收环境/setup 故障）收尾而不是泛化的 cancel 文案。
+                    raise AcceptanceBaselineUnavailable(_acceptance_baseline_outcome(acceptance_future)) from None
                 raise
         scrub_tree(workspace)
         files, patch = changes(workspace)

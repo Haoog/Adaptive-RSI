@@ -609,6 +609,25 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertEqual(json.loads(row["evidence"])[0]["source"], "rediscovered")
 
+    def test_environment_failure_blocks_inspection_requeue(self):
+        """环境故障未修复前，巡检不得把同一发现自动重新入队重复付费。"""
+        from adaptive_rsi.discovery import finding_identity
+        finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
+                   "path": "calculator.py", "quote": "return a - b", "acceptance": ["2+3=5"], "priority": 60}
+        task, run = self.claim("Addition subtracts")
+        self.store.execute("UPDATE tasks SET fingerprint=?,source='inspection' WHERE id=?",
+                           (finding_identity(finding), task))
+        self.store.transition(run["id"], "insufficient_evidence",
+                              {"reason": "Acceptance baseline environment unavailable",
+                               "failure": {"code": "environment", "action": "check_readiness",
+                                           "stage": "acceptance_baseline", "detail": "pytest missing"}}, True)
+        with patch.object(self.runtime, "invoke", return_value={"findings": [finding]}):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        row = self.store.one("SELECT state,attempts FROM tasks WHERE id=?", (task,))
+        self.assertEqual(row["state"], "insufficient_evidence")
+        self.assertEqual(self.store.query("SELECT seq FROM events WHERE kind='finding_requeued'"), [])
+
     def test_rejected_and_cancelled_findings_stay_suppressed(self):
         from adaptive_rsi.discovery import finding_identity
         finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",
@@ -795,7 +814,7 @@ class RuntimeTest(unittest.TestCase):
             label = Path(workspace).name
             failed = label == "acceptance_baseline" and check["name"] == "prepare acceptance"
             return {"argv": check["argv"], "name": check["name"], "exit_code": 1 if failed else 0,
-                    "stdout": "", "stderr": "acceptance setup failed" if failed else "",
+                    "stdout": "", "stderr": "ModuleNotFoundError: No module named 'pytest'" if failed else "",
                     "seconds": 0.01, "error": None}
         real_baseline = self.runtime.evaluator.evaluate_acceptance_baseline
         def baseline(*args, **kwargs):
@@ -804,14 +823,20 @@ class RuntimeTest(unittest.TestCase):
             finally:
                 baseline_done.set()
         with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "_execution_environment",
+                          return_value=(self.runtime.config(self.project), None)), \
              patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
              patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
             task, run = self.claim()
             self.runtime.process(run)
-        # 基线 setup 失败不再经 evaluate() 聚合：实现返回处被立即取消，候选检查不执行。
+        # 基线 setup 失败是确定性的环境故障：按证据不足收尾并保留 setup 诊断，
+        # 不能记成用户可重试的 interrupted。
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
-        self.assertEqual(row["state"], "interrupted", row["result"])
-        self.assertIn("Acceptance baseline evaluation failed", row["result"])
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "insufficient_evidence", row["result"])
+        self.assertEqual(result["failure"], {"code": "environment", "action": "check_readiness",
+                                             "stage": "acceptance_baseline",
+                                             "detail": "ModuleNotFoundError: No module named 'pytest'"})
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
         self.assertFalse((self.store.root / "runs" / run["id"] / "candidate.patch").exists())
         self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
@@ -852,9 +877,10 @@ class RuntimeTest(unittest.TestCase):
         self.assertLess(elapsed, 2, "implementation must be cancelled within 2s of baseline failure")
         self.assertTrue(implementation_finished.is_set())
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
-        self.assertEqual(row["state"], "interrupted", row["result"])
-        self.assertIn("implementation aborted", row["result"])
-        self.assertIn("Acceptance baseline evaluation failed", row["result"])
+        result = json.loads(row["result"])
+        self.assertEqual(row["state"], "insufficient_evidence", row["result"])
+        self.assertEqual(result["failure"], {"code": "environment", "action": "check_readiness",
+                                             "stage": "acceptance_baseline", "detail": "setup failed"})
         # 中止的实现不得进入评估/评审：没有候选补丁留存，也没有评审调用。
         self.assertFalse((self.store.root / "runs" / run["id"] / "candidate.patch").exists())
         self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
@@ -882,6 +908,28 @@ class RuntimeTest(unittest.TestCase):
         row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
         self.assertEqual(row["state"], "awaiting_approval", row["result"])
         self.assertEqual([role for role, _ in self.runtime.agent.roles].count("implementation"), 1)
+
+    def test_project_pause_still_ends_the_run_as_interrupted(self):
+        """用户暂停/取消导致的 Cancelled 仍以 interrupted 收尾，与验收环境故障区分。"""
+        class Pausing(FakeAgent):
+            def invoke(self, role, prompt, workspace, *args, **kwargs):
+                result = super().invoke(role, prompt, workspace, *args, **kwargs)
+                if role == "planning":
+                    result["risk"] = "high"
+                if role == "implementation":
+                    self_test.runtime.pause(self_test.project, True)
+                return result
+        self_test = self
+        self.runtime.agent = Pausing()
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline",
+                          return_value={"rows": [], "execution_environment": None}):
+            task, run = self.claim()
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "interrupted", row["result"])
+        # 用户停止不应伪装成环境故障诊断。
+        self.assertNotIn("failure", json.loads(row["result"]))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_sandbox_hides_controller_prevents_network_and_harness_writes(self):
