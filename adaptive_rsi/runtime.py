@@ -67,6 +67,22 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
                           "pr_closed", "unverified_merge", "reverted", "superseded")
 
 
+def _clock_lock(run):
+    """Return the lock that guards one run's deadline clock fields.
+
+    The stage clock is a multi-field read-modify-write: the worker thread
+    writes it in ``begin_phase``/``invoke`` while cancel pollers (including
+    the acceptance-baseline thread) call ``is_cancelled`` on the same dict.
+    The lock lives in the run dict so every poller of that run object
+    serializes its check-then-act without a global registry; ``setdefault``
+    is atomic, so concurrent first callers agree on a single lock.
+    """
+    lock = run.get('_deadline_lock')
+    if lock is None:
+        lock = run.setdefault('_deadline_lock', threading.Lock())
+    return lock
+
+
 class IssueSyncCorruptPending(ValueError):
     """_deliver 因 issue-sync 进度行损坏而拒绝交付；携带项目供调用方在回滚后补写事件。"""
 
@@ -1522,10 +1538,12 @@ class Runtime(Maintenance):
     def begin_phase(self, run, stage):
         if stage not in ('preparation', 'model', 'evaluation'):
             raise ValueError('Unknown execution phase')
-        now = time.monotonic()
-        self._close_stage(run, now)
-        run['_explicit_phase'] = stage
-        run['_deadline_stage'], run['_deadline_started'] = stage, now
+        # 结算旧阶段与起新锚点必须原子：取消轮询线程会并发重算同一时钟。
+        with _clock_lock(run):
+            now = time.monotonic()
+            self._close_stage(run, now)
+            run['_explicit_phase'] = stage
+            run['_deadline_stage'], run['_deadline_started'] = stage, now
 
     @staticmethod
     def _stage_seconds(value):
@@ -1584,7 +1602,7 @@ class Runtime(Maintenance):
         trial = {key: value for key, value in parent.items()
                  if key not in ('_model_started', '_deadline_started', '_deadline_stage',
                                 '_timed_out_stage', '_explicit_phase', '_stage_used',
-                                '_deadline_checkpoint',
+                                '_deadline_checkpoint', '_deadline_lock',
                                 '_outer_deadline_stage', '_outer_deadline_started')}
         self.begin_phase(trial, 'preparation')
         return trial
@@ -1592,54 +1610,73 @@ class Runtime(Maintenance):
     @staticmethod
     def propagate_deadline(parent, trial):
         if trial.get('_timed_out_stage'):
-            parent['_timed_out_stage'] = trial['_timed_out_stage']
+            # 父 run 的时钟字段由自己的锁保护；trial 的结论只是单键快照读取。
+            with _clock_lock(parent):
+                parent['_timed_out_stage'] = trial['_timed_out_stage']
 
     def is_cancelled(self, run):
         if self.stop.is_set():
             return True
-        now = time.monotonic()
-        if '_deadline_started' in run:
-            if run.get('_model_started') is not None:
-                stage = 'model'
-            elif run.get('_explicit_phase'):
-                stage = run['_explicit_phase']
-            else:
-                state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-                stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
-            if run.get('_deadline_stage') != stage:
-                # 模型调用的进出由 invoke 恢复外层锚点，在此累计会重复计时。
-                if run.get('_deadline_stage') in ('preparation', 'evaluation') and stage in ('preparation', 'evaluation'):
-                    self._close_stage(run, now)
-                run['_deadline_stage'], run['_deadline_started'] = stage, now
-            try:
-                run_config = json.loads(run['config'] or "{}")
-            except (TypeError, ValueError):
-                run_config = {}
-            limits = merge(DEFAULTS['deadlines'], (run_config if isinstance(run_config, dict) else {}).get('deadlines', {}))
-            # 模型调用不暂停外层阶段的时钟：外层阶段的剩余预算在调用期间
-            # 仍然生效，调用结束后时钟也按原起点继续计时。
-            outer_stage = run.get('_outer_deadline_stage')
-            outer_started = run.get('_outer_deadline_started')
-            if (run.get('_model_started') is not None and
-                    outer_stage in ('preparation', 'evaluation') and outer_started is not None and
-                    self._stage_spent(run, outer_stage, outer_started, now) >= limits[outer_stage + '_seconds']):
-                # 首个超时判定者胜：trial 经 propagate_deadline 上报的阶段（如 evaluation）
-                # 不得被父 run 自身的阶段时钟（如 preparation）覆盖。
-                run.setdefault('_timed_out_stage', outer_stage)
-                return True
-            if self._stage_spent(run, stage, run['_deadline_started'], now) >= limits[stage + '_seconds']:
-                run.setdefault('_timed_out_stage', stage)
-                return True
-            checkpoint = run.get('_deadline_checkpoint')
-            if '_stage_used' in run and (checkpoint is None or now - checkpoint >= STAGE_BUDGET_CHECKPOINT_SECONDS):
-                # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
-                self._save_stage_budget(run, now, keep=True)
-                run['_deadline_checkpoint'] = now
+        if self._deadline_expired(run):
+            return True
         row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
                              "WHERE s.key='run-stop:' || r.id) AS stop_requested "
                              "FROM runs r JOIN tasks t ON r.task=t.id "
                              "JOIN projects p ON p.id=r.project WHERE r.id=?", (run["id"],))
         return self.stop.is_set() or not row or row["paused"] or row["stop_requested"] or row["state"] == "cancelled"
+
+    def _deadline_expired(self, run):
+        """Judge the stage clock and record the timeout stage under the per-run lock.
+
+        相位推导、时钟重置、预算检查点与超时判定是同一组跨字段的读-改-写：
+        worker 的 begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消
+        轮询线程也会在这里判定。整段持锁串行化；锁内只做阶段推断所需的存储读取，
+        以及一份很小的预算检查点写入（与时钟字段同锁才能保持一致快照）。
+        """
+        with _clock_lock(run):
+            if '_deadline_started' in run:
+                if run.get('_model_started') is not None:
+                    stage = 'model'
+                elif run.get('_explicit_phase'):
+                    stage = run['_explicit_phase']
+                else:
+                    # 仅当 _model_started 与 _explicit_phase 都缺席时才需要 runs.state 推断阶段；
+                    # 该谓词是高频取消轮询路径，惰性求值避免每次白查一次 runs 表。
+                    state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+                    stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
+                now = time.monotonic()
+                if run.get('_deadline_stage') != stage:
+                    # 模型调用的进出由 invoke 恢复外层锚点，在此累计会重复计时；
+                    # 准备/评估之间真正换阶段时才结算旧阶段，跨尝试累计不丢已用时间。
+                    if (run.get('_deadline_stage') in ('preparation', 'evaluation')
+                            and stage in ('preparation', 'evaluation')):
+                        self._close_stage(run, now)
+                    run['_deadline_stage'], run['_deadline_started'] = stage, now
+                try:
+                    run_config = json.loads(run['config'] or "{}")
+                except (TypeError, ValueError):
+                    run_config = {}
+                limits = merge(DEFAULTS['deadlines'], (run_config if isinstance(run_config, dict) else {}).get('deadlines', {}))
+                # 模型调用不暂停外层阶段的时钟：外层阶段的剩余预算在调用期间
+                # 仍然生效，调用结束后时钟也按原起点继续计时。
+                outer_stage = run.get('_outer_deadline_stage')
+                outer_started = run.get('_outer_deadline_started')
+                if (run.get('_model_started') is not None and
+                        outer_stage in ('preparation', 'evaluation') and outer_started is not None and
+                        self._stage_spent(run, outer_stage, outer_started, now) >= limits[outer_stage + '_seconds']):
+                    # 首个超时判定者胜：trial 经 propagate_deadline 上报的阶段（如 evaluation）
+                    # 不得被父 run 自身的阶段时钟（如 preparation）覆盖。
+                    run.setdefault('_timed_out_stage', outer_stage)
+                    return True
+                if self._stage_spent(run, stage, run['_deadline_started'], now) >= limits[stage + '_seconds']:
+                    run.setdefault('_timed_out_stage', stage)
+                    return True
+                checkpoint = run.get('_deadline_checkpoint')
+                if '_stage_used' in run and (checkpoint is None or now - checkpoint >= STAGE_BUDGET_CHECKPOINT_SECONDS):
+                    # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
+                    self._save_stage_budget(run, now, keep=True)
+                    run['_deadline_checkpoint'] = now
+        return False
 
     def active_strategies(self, project, config=None):
         # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
@@ -1739,21 +1776,23 @@ class Runtime(Maintenance):
         # 与 is_cancelled 相同的相位推导：模型耗时计入进入时所处的阶段。
         # 推导出的阶段与记录值不一致时（例如刚 transition('evaluating')），
         # 该阶段时钟从此刻起算，不继承旧阶段的已耗时间。
-        state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
-        outer_stage = (run.get('_explicit_phase') or
-                       ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
-        if run.get('_deadline_stage') != outer_stage or run.get('_deadline_started') is None:
-            # 相位被外部推进时，先结算旧阶段再起新锚点，跨尝试累计不丢已用时间。
-            now = time.monotonic()
-            self._close_stage(run, now)
-            outer_started = now
-        else:
-            outer_started = run['_deadline_started']
+        # 推导与四个字段的写入必须原子：取消轮询线程会并发重算同一时钟。
         self.store.phase(run["id"], role)
-        run['_outer_deadline_stage'] = outer_stage
-        run['_outer_deadline_started'] = outer_started
-        run['_model_started'] = time.monotonic()
-        run['_deadline_stage'], run['_deadline_started'] = 'model', run['_model_started']
+        with _clock_lock(run):
+            state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
+            outer_stage = (run.get('_explicit_phase') or
+                           ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
+            if run.get('_deadline_stage') != outer_stage or run.get('_deadline_started') is None:
+                # 相位被外部推进时，先结算旧阶段再起新锚点，跨尝试累计不丢已用时间。
+                now = time.monotonic()
+                self._close_stage(run, now)
+                outer_started = now
+            else:
+                outer_started = run['_deadline_started']
+            run['_outer_deadline_stage'] = outer_stage
+            run['_outer_deadline_started'] = outer_started
+            run['_model_started'] = time.monotonic()
+            run['_deadline_stage'], run['_deadline_started'] = 'model', run['_model_started']
         try:
             exposure = run.get("_case_exposure")
             key = self.store.reserve_case_exposure(run["project"], exposure["case"], exposure["experiment"],
@@ -1769,14 +1808,16 @@ class Runtime(Maintenance):
                 self.store.put_setting(key, value)
             return result
         finally:
-            run.pop('_model_started', None)
-            run.pop('_outer_deadline_stage', None)
-            run.pop('_outer_deadline_started', None)
-            # 所有阶段统一恢复调用前的时钟：阶段预算是覆盖其全部工作的
-            # 墙钟上限，模型调用时长计入所处阶段而非退回。
-            stage = outer_stage if outer_stage in ('preparation', 'evaluation') else 'preparation'
-            run['_deadline_stage'] = stage
-            run['_deadline_started'] = outer_started if stage == outer_stage else time.monotonic()
+            with _clock_lock(run):
+                run.pop('_model_started', None)
+                run.pop('_outer_deadline_stage', None)
+                run.pop('_outer_deadline_started', None)
+                # 所有阶段统一恢复调用前的时钟：阶段预算是覆盖其全部工作的
+                # 墙钟上限，模型调用时长计入所处阶段而非退回。摘除模型标记与
+                # 重写阶段时钟同锁完成，轮询线程不会看到「无模型、旧阶段」的中间态。
+                stage = outer_stage if outer_stage in ('preparation', 'evaluation') else 'preparation'
+                run['_deadline_stage'] = stage
+                run['_deadline_started'] = outer_started if stage == outer_stage else time.monotonic()
             self.store.phase(run["id"], stage)
 
     def process(self, run):
@@ -1787,9 +1828,10 @@ class Runtime(Maintenance):
                                for name in ('preparation', 'evaluation')}
                               if isinstance(stored, dict) else {})
         now = time.monotonic()
-        run['_deadline_started'] = now
-        run['_deadline_stage'] = 'preparation'
-        run['_deadline_checkpoint'] = now
+        with _clock_lock(run):
+            run['_deadline_started'] = now
+            run['_deadline_stage'] = 'preparation'
+            run['_deadline_checkpoint'] = now
         try:
             with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
                 return self._process(run)
@@ -1797,7 +1839,8 @@ class Runtime(Maintenance):
             row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
             # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
             keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
-            self._save_stage_budget(run, time.monotonic(), keep)
+            with _clock_lock(run):
+                self._save_stage_budget(run, time.monotonic(), keep)
 
     def _process(self, run):
         try:
