@@ -676,11 +676,14 @@ def _close_retry_due(outcome, now):
     return now - last >= _close_retry_delay(attempts)
 
 
-def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
+def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now, policy=None, sealed_target=False):
     """Observe a superseded PR and record a merge instead of discarding it.
 
     Returns True when the run was advanced to merged, so the caller still runs
     post-merge feedback and release advancement for code that already landed.
+    A merge is only accepted for the sealed target: a retargeted branch or a
+    replaced head means the landed code is not this run's delivery, and the
+    caller-side recovery check only covers ``delivery_recovery_checked`` runs.
     """
     # A failed/lost response leaves the intent durable. Always observe remote state
     # before retrying, including manual closes and merges while the worker was down.
@@ -722,8 +725,27 @@ def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
         # close_status=merged，丢掉 merged_sha：run 永远退出监控，既没有合并后
         # 验证与发布资格，任务还会以 queued 重新实现同一改动。
         previous = outcome.get("delivery_status")
+        # 与 pr_open 路径同一套身份校验：人工合并可能发生在重排之后，PR 若被
+        # 改指向别的分支或 head 被替换，合入主线的就不是封存目标的代码。此时
+        # 记合并证据会误触发合并后反馈与发布推进，任务也会被错误 block。
+        verified = (sealed_target and isinstance(policy, dict) and
+                    pr.get("headRefOid") == policy.get("head") and
+                    pr.get("baseRefName", policy.get("branch")) == policy.get("branch"))
         merge_commit = pr.get("mergeCommit")
         oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        if not verified:
+            # 身份失配可人工修复：保留关闭意图，按既有 close_blocked 退避一小时后
+            # 复查，既不落终态也不每 tick 重查同一个无法认领的 PR。
+            outcome["delivery_status"] = "unverified_merge"
+            outcome["close_pending"] = True
+            outcome["close_blocked_at"] = now
+            outcome["close_blocked_reason"] = "superseded PR merge does not match the sealed target"
+            store.execute("UPDATE runs SET result=? WHERE id=? AND state='superseded'", (encode(outcome), run["id"]))
+            if previous != "unverified_merge":
+                store.event("delivery_merge_unverified", outcome["close_blocked_reason"],
+                            run["project"], run["id"])
+            store.remote_wait(run["id"], None, time.time())
+            return False
         if isinstance(oid, str) and oid:
             outcome["merged_sha"] = oid
             outcome["merged_at"] = now
@@ -1106,7 +1128,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                 project['id'], run['id'])
                     continue
                 if _close_superseded_pr(store, run, outcome, repo, pr,
-                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now):
+                                        lambda: tracking_cancelled() or runtime.project(project['id'])['paused'], now,
+                                        policy=policy, sealed_target=sealed_target):
                     _finish_merge(runtime, project, run, outcome, config, now,
                                   active_run, tracking_cancelled, tick_baselines)
                 continue
@@ -1200,7 +1223,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         outcome["delivery_status"] = "feedback_replan"
                         if _supersede_pr(store, run, outcome, state, now, feedback_keys):
                             if _close_superseded_pr(store, run, outcome, repo, pr,
-                                                    lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now):
+                                                    lambda: tracking_cancelled() or runtime.project(project["id"])["paused"], now,
+                                                    policy=policy, sealed_target=sealed_target):
                                 _finish_merge(runtime, project, run, outcome, config, now,
                                               active_run, tracking_cancelled, tick_baselines)
                             continue
@@ -1244,7 +1268,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     # Issue sync will refresh evidence and requeue this task if it is still eligible.
                                     if _supersede_pr(store, run, outcome, "blocked", now):
                                         if _close_superseded_pr(store, run, outcome, repo,
-                                                                pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                                                pr_view(repo, outcome["pr"]), tracking_cancelled, now,
+                                                                policy=policy, sealed_target=sealed_target):
                                             _finish_merge(runtime, project, run, outcome, config, now,
                                                           active_run, tracking_cancelled, tick_baselines)
                                     continue
@@ -1293,7 +1318,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         state = "queued" if (task["attempts"] or 0) <= config["limits"]["retries"] else "blocked"
                         if _supersede_pr(store, run, outcome, state, now):
                             if _close_superseded_pr(store, run, outcome, repo,
-                                                    pr_view(repo, outcome["pr"]), tracking_cancelled, now):
+                                                    pr_view(repo, outcome["pr"]), tracking_cancelled, now,
+                                                    policy=policy, sealed_target=sealed_target):
                                 _finish_merge(runtime, project, run, outcome, config, now,
                                               active_run, tracking_cancelled, tick_baselines)
                         continue

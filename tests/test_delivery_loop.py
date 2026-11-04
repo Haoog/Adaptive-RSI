@@ -835,7 +835,9 @@ print('BOUNDARIES_OK')
             tick(self.runtime, now)
         remote.assert_not_called()
         self.assertTrue(json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])["close_pending"])
-        with patch("adaptive_rsi.delivery.pr_view", return_value={"state": "MERGED"}), \
+        with patch("adaptive_rsi.delivery.pr_view",
+                   return_value={"state": "MERGED", "headRefOid": "head", "baseRefOid": "base",
+                                 "baseRefName": "main"}), \
                 patch("adaptive_rsi.delivery.checked") as remote, patch("adaptive_rsi.delivery.feedback") as feedback:
             tick(self.runtime, now + 61)
         remote.assert_not_called()
@@ -914,6 +916,56 @@ print('BOUNDARIES_OK')
         # 新 run 仍持有该任务：绝不改写它的任务状态，也不替它收尾。
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], task_state)
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (newer["id"],))["state"], newer["state"])
+
+    def test_superseded_merge_with_changed_identity_stays_unverified(self):
+        # 重排之后 PR 被改指向别的分支或 head 被替换：合入主线的不是封存目标的
+        # 代码。与 pr_open 路径一致落 unverified_merge：不记合并证据、不 block
+        # 任务、不触发合并后反馈与发布推进，保留关闭意图供下一轮复查。
+        run = self.tracked_pr()
+        outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+        pr = {"state": "MERGED", "headRefOid": "other-head", "baseRefOid": "base",
+              "baseRefName": "release", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.checked") as remote, \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, time.time())
+        remote.assert_not_called()
+        feedback.assert_not_called()
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "superseded")
+        result = json.loads(row["result"])
+        self.assertEqual(result["delivery_status"], "unverified_merge")
+        self.assertIsNone(result.get("merged_sha"))
+        self.assertTrue(result["close_pending"])
+        # 身份失配可人工修复：退避一小时再复查，不每个 tick 重查同一个 PR。
+        self.assertIsInstance(result["close_blocked_at"], (int, float))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        self.assertEqual(self.store.one(
+            "SELECT count(*) AS n FROM events WHERE run=? AND kind='delivery_merge_unverified'",
+            (run["id"],))["n"], 1)
+
+    def test_superseded_merge_without_sealed_baseline_stays_unverified(self):
+        # 封存基线不再指向该仓库/分支/基线提交时，同一 PR 的合并回执也不属于
+        # 本次交付：只落 unverified_merge，不把无关改动记成合并证据。
+        run = self.tracked_pr()
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "release", "sha": "base"})
+        outcome = {"pr": "https://github.com/example/project/pull/1", "replanned": True, "close_pending": True}
+        self.store.execute("UPDATE runs SET state='superseded',result=? WHERE id=?", (encode(outcome), run["id"]))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (run["task"],))
+        pr = {"state": "MERGED", "headRefOid": "head", "baseRefOid": "base",
+              "baseRefName": "main", "mergeCommit": {"oid": "merged-sha"}}
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.feedback") as feedback:
+            tick(self.runtime, time.time())
+        feedback.assert_not_called()
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        self.assertEqual(row["state"], "superseded")
+        self.assertEqual(json.loads(row["result"])["delivery_status"], "unverified_merge")
+        self.assertIsNone(json.loads(row["result"]).get("merged_sha"))
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
 
     def test_merge_intent_reconciliation_distinguishes_local_from_manual_merge(self):
         run = self.tracked_pr()

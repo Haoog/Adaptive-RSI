@@ -453,6 +453,13 @@ class StoreObservabilityTest(unittest.TestCase):
             self.assertTrue(maintenance.refresh_query_planner(store))
         self.assertIsNotNone(store.one(
             "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        # 抽样统计（analysis_limit）会把每前缀基数写成样本行数（120000 1001 1），
+        # 规划器据此退回 project_events + TEMP B-TREE；全表 ANALYZE 才记录真实
+        # 基数（120000 行、20 个 kind，每前缀 6000）。先钉住统计完整性再看计划。
+        stat = store.one("SELECT stat FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'")["stat"]
+        rows, per_kind = (int(part) for part in stat.split()[:2])
+        self.assertEqual(rows, 120000, stat)
+        self.assertEqual(per_kind, 6000, stat)
         plan = [row["detail"] for row in store.query(
             "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? "
             "GROUP BY kind", (0, "p"))]
