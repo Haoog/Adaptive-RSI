@@ -565,6 +565,39 @@ class AuditEvolutionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'family'):
             self.evolution.import_case('p', same_task)
 
+    def test_transaction_recheck_rejects_interleaved_same_family_import(self):
+        """读侧预检与事务内复检之间落库的同 family 活跃行必须由复检拦截：
+        两个导入都通过预检时，只有先提交的活跃行占住 family，后到者报错而不是插入第二行。"""
+        from tests.test_runtime import fixture, CHECKS
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo')
+        base = git(repo, 'rev-parse', 'HEAD')
+        signature = fingerprint({'task': 'winner task',
+                                 'tree': git(repo, 'rev-parse', base + '^{tree}')})
+        winner = {'task': 'winner task', 'base': base, 'checks': CHECKS, 'source': 'real',
+                  'signature': signature, 'repository': str(repo), 'overlay': None}
+        self.evolution.runtime.project = lambda project: {'id': project}
+        manifest = self.importable_manifest(repo, task='challenger task')
+        original = self.store.query
+        injected = []
+
+        def racing(sql, args=()):
+            rows = original(sql, args)
+            if not injected and 'SELECT family,spec FROM cases WHERE project=?' in sql:
+                injected.append(True)
+                self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                                   ('winner', 'p', 'family', 'validation', encode(winner), 0, 1))
+            return rows
+
+        with patch.object(self.store, 'query', side_effect=racing):
+            with self.assertRaisesRegex(ValueError, 'family'):
+                self.evolution.import_case('p', manifest)
+        # 失败的导入没有留下第二行；先提交的活跃行仍是 family 的唯一占用者。
+        rows = self.store.query("SELECT id,spec FROM cases WHERE project='p' AND family='family'")
+        self.assertEqual([row['id'] for row in rows if json.loads(row['spec']).get('active', True)],
+                         ['winner'])
+        self.assertEqual(len(self.store.query("SELECT id FROM cases WHERE project='p'")), 1)
+
     def test_legacy_inactive_row_holding_family_is_released_during_import(self):
         """上线前退休或被外部直写 available:false 的遗留行没改过名：import_case 的事务内复检
         必须在同一事务里把它们释放，否则 INSERT 仍撞 UNIQUE(project,family)。"""
