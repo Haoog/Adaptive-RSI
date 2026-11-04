@@ -197,6 +197,60 @@ class ReleaseAutomationTest(unittest.TestCase):
             self.runtime.store.put_setting(owner_key(self.project, 'example/project', self.policy), receipt)
             self.assertEqual(deployment_owner(self.runtime, self.project, 'example/project', self.policy), receipt)
 
+    def test_invalid_deployment_owner_shape_is_treated_as_no_owner(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        name = owner_key(self.project, "example/project", deploy)
+        for raw in ('[1, 2]', '"x"', '{"sha": 1}', '{"run": 123, "sha": "%s"}' % MERGED,
+                    '{"run": "run", "sha": 1}'):
+            with self.subTest(raw=raw):
+                self.runtime.store.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (name, raw))
+                self.assertIsNone(deployment_owner(self.runtime, self.project, "example/project", deploy))
+        errors = [json.loads(row["data"])["error_code"] for row in
+                  self.runtime.store.query("SELECT data FROM events WHERE kind='automation_error'")]
+        self.assertEqual(errors, ["invalid_deployment_owner"])
+        # 合法的 run/sha 记录仍原样返回，并清除一次性告警状态。
+        self.runtime.store.put_setting(name, {"run": self.run["id"], "sha": MERGED})
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
+    def test_advance_and_health_treat_invalid_deployment_owner_as_absent(self):
+        from adaptive_rsi.release import deployment_health, deployment_owner
+        deploy = self.setup_deployment()
+        name = owner_key(self.project, "example/project", deploy)
+        self.runtime.store.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (name, '[1, 2]'))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            first = self.tick()["deploy"]
+        self.assertEqual(first["state"], "submitted")
+        # 派发写入修复坏记录，CAS 以“无 owner”为基线而不是静默通过。
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+        self.runtime.store.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (name, '"x"'))
+        data = {"state": "workflow_succeeded", "sha": MERGED, "repository": "example/project",
+                "operation_id": first["operation_id"], "workflow": deploy["workflow"],
+                "ref": deploy["ref"], "workflow_sha": deploy["sha"]}
+        with patch("adaptive_rsi.release.health_check", return_value={"sha": MERGED, "healthy": True}):
+            tracked = deployment_health(self.runtime, self.runtime.project(self.project), self.run,
+                                        data, deploy, None)
+        self.assertEqual(tracked["state"], "healthy")
+
+    def test_retry_with_invalid_deployment_owner_behaves_like_no_owner(self):
+        from adaptive_rsi.release import deployment_owner
+        deploy = self.setup_deployment()
+        def rejected(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("git/ref/tags/"):
+                raise ApiRejected("gh: Not Found (HTTP 404)", 404)
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=rejected):
+            self.tick()
+        name = owner_key(self.project, "example/project", deploy)
+        self.runtime.store.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)", (name, '{"sha": 1}'))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            retried = retry(self.runtime, self.project, self.run["id"], "deploy")
+        self.assertEqual(retried["state"], "submitted")
+        self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
+                         {"run": self.run["id"], "sha": MERGED})
+
     def test_legacy_deploy_snapshot_keeps_pending_health_tracking(self):
         deploy = {**self.policy, "health_url": "https://service.example/health", "automatic_rollback": False}
         self.runtime.configure({"delivery": {"deploy": deploy}}, self.project)

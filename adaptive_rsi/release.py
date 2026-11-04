@@ -123,11 +123,17 @@ WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
 
 
-def workflow_choices(runtime, project_id, refresh=False):
+def _validated_repository(runtime, project_id):
+    """Return the configured repository only when it still matches the project origin."""
     project = runtime.project(project_id)
     repo = runtime.config(project_id)["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise ValueError("Workflow repository must match the selected project's origin")
+    return repo
+
+
+def workflow_choices(runtime, project_id, refresh=False):
+    repo = _validated_repository(runtime, project_id)
     info = api(repo, "")
     branch = info["default_branch"]
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
@@ -175,10 +181,21 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
     initial = runtime.config(project_id)
-    choices = workflow_choices(runtime, project_id, refresh=True)
-    if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
+    repo = _validated_repository(runtime, project_id)
+    # Authorization pins exactly one file, so validate only that file at the
+    # default-branch SHA the tag binds. Enumerating the whole workflow directory
+    # added one contents request per other workflow and no input to this
+    # decision; the dialog path keeps using workflow_choices for the full list.
+    if not isinstance(workflow, str) or not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", workflow):
         raise ValueError("Select a compatible existing workflow from this project")
-    repo, sha = choices["repository"], choices["sha"]
+    branch = api(repo, "")["default_branch"]
+    sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
+    try:
+        compatible = compatible_workflow(workflow_content(repo, workflow, sha))
+    except (RuntimeError, ValueError, OSError):
+        compatible = False
+    if not compatible:
+        raise ValueError("Select a compatible existing workflow from this project")
     tag = "rsi-workflow/" + sha
     # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.
     refs = api(repo, "git/matching-refs/tags/" + tag)
@@ -305,6 +322,16 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
+def _owner_record(value):
+    """Only a dict naming the claiming run and its exact commit may own a target."""
+    if not isinstance(value, dict):
+        return None
+    run, sha = value.get("run"), value.get("sha")
+    if not isinstance(run, str) or not isinstance(sha, str) or not run or not sha:
+        return None
+    return value
+
+
 def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stable=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -316,7 +343,9 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stab
             owner_name, previous, owner = ownership
             current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
             try:
-                current_value = json.loads(current["value"]) if current and current["value"] else None
+                # A structurally invalid record is no ownership at all, matching
+                # deployment_owner; the write below then repairs it.
+                current_value = _owner_record(json.loads(current["value"])) if current and current["value"] else None
             except (TypeError, ValueError):
                 current_value = None
             if current_value != previous:
@@ -650,6 +679,11 @@ def _reconciliation_view(kind, target, data, repo, selectable=None):
         "candidate_count": total,
         "candidates": reconciliation.get("candidates") or [],
         "manual_reconciliation": data.get("manual_reconciliation"),
+        # Abandoning is the only exit once GitHub stopped exposing the workflow
+        # (404 on the listing or on the recorded run).
+        "can_abandon": bool(target == "operation" and data.get("state") in RECONCILIATION_UNKNOWN and
+                            (data.get("remote_visibility") or {}).get("state") in
+                            {"workflow_not_visible", "run_not_visible"}),
     }
     if selectable is not None:
         view["selectable_candidates"] = [item for item in selectable if isinstance(item, dict)][:RECONCILIATION_SELECTABLE_LIMIT]
@@ -820,6 +854,67 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
                 "manual_reconciliation": audit}
 
 
+def abandon(runtime, project_id, run_id, kind, reason, target="operation", source="console"):
+    """Close an unconfirmed workflow start that GitHub no longer exposes.
+
+    ``dispatch_unknown``/``rerun_unknown`` only ends through reconciliation, but
+    once the workflow file or the recorded run answers 404 there is no run left
+    to bind. This is the single operator exit: it requires a written reason,
+    re-reads GitHub first and refuses whenever a run is still visible, then
+    records ``failed`` plus an audit entry. It never dispatches or reruns.
+    """
+    note = reason.strip()[:500] if isinstance(reason, str) else ""
+    if not note:
+        raise ReconciliationRejected("An operator reason is required to abandon an unconfirmed operation")
+    if target != "operation":
+        raise ReconciliationRejected("Only an unconfirmed workflow start can be abandoned")
+    origin = source if isinstance(source, str) and re.fullmatch(r"[a-z_]{1,32}", source) else "console"
+    with runtime.automation_lock_for(project_id, kind):
+        project, run, saved, policy, data, target_data, original = _reconciliation_operation(
+            runtime, project_id, run_id, kind, target)
+        repo = _reconciliation_repository(runtime, project, saved, target_data)
+        _require_unknown(target_data)
+        existing = _run_number(target_data.get("workflow_run_id"))
+        remote = _existing_remote(repo, target_data) if existing else None
+        remotes = [] if existing else (_remote_runs(repo, target_data, force=True) or [])
+        if isinstance(remote, dict) or remotes:
+            raise ReconciliationRejected("GitHub still exposes this workflow; reconcile the visible run instead of abandoning it")
+        visibility = (target_data.get("remote_visibility") or {}).get("state")
+        if visibility not in {"workflow_not_visible", "run_not_visible"}:
+            raise ReconciliationRejected("GitHub still exposes this workflow; wait for its run instead of abandoning it")
+        now = time.time()
+        reconciliation = target_data.get("reconciliation") if isinstance(target_data.get("reconciliation"), dict) else {}
+        audit = _audit_entry({
+            "at": now, "source": origin, "repository": repo, "candidate_count": 0, "candidates": [],
+            "workflow": target_data.get("workflow"), "ref": target_data.get("ref"),
+            "operation_id": target_data.get("operation_id"), "sha": target_data.get("sha"),
+            "workflow_sha": target_data.get("workflow_sha"),
+            "previous": {"state": target_data.get("state"), "error": target_data.get("error", ""),
+                         "reconciliation_state": reconciliation.get("state"),
+                         "checked_at": target_data.get("checked_at"),
+                         "candidate_run_ids": reconciliation.get("candidate_run_ids", [])},
+        })
+        audit.update(outcome="failed", reason=note, visibility=visibility)
+        target_data["operator_abandon"] = audit
+        target_data["state"] = "failed"
+        target_data["error"] = WORKFLOW_NOT_VISIBLE_REASON
+        _record_reconciliation(target_data, repo, [], "abandoned",
+                               "An operator closed this unconfirmed operation because GitHub no longer exposes its workflow. No run was started or rerun.",
+                               checked_at=now)
+        try:
+            save(runtime, run, kind, data, expected=original)
+        except _AutomationChanged:
+            raise ReconciliationRejected("Automation changed during reconciliation; reload before abandoning") from None
+        runtime.store.event("automation_abandoned", "Operator abandoned an unconfirmed workflow operation",
+                            project_id, run_id,
+                            {"kind": kind, "reason": note, "at": now, "visibility": visibility,
+                             "previous_state": audit["previous"]["state"], "workflow": target_data.get("workflow"),
+                             "operation_id": target_data.get("operation_id")})
+        runtime.wake.set()
+        return {"kind": kind, "target": target, "state": target_data["state"], "operation": data,
+                "operator_abandon": audit}
+
+
 def health_check(url, sha, timeout=15):
     from .process import checked
     argv = ([sys.executable, "internal-health-check"] if getattr(sys, "frozen", False)
@@ -889,19 +984,40 @@ def owner_key(project, repo, policy):
     return "deployment-owner:" + fingerprint(target)
 
 
+def _owner_alert(runtime, name, project):
+    """Report an unreadable ownership record once; it is still treated as no owner."""
+    diagnostic = (name, "deployment-owner")
+    with runtime.automation_receipt_failures_lock:
+        if diagnostic in runtime.automation_receipt_failures:
+            return
+        runtime.store.event("automation_error",
+                            "Deployment owner record is unreadable; repair the stored record before relying on it",
+                            project, None, {"kind": "deploy", "error_code": "invalid_deployment_owner"})
+        if len(runtime.automation_receipt_failures) >= 128:
+            runtime.automation_receipt_failures.pop(next(iter(runtime.automation_receipt_failures)))
+        runtime.automation_receipt_failures[diagnostic] = True
+
+
 def deployment_owner(runtime, project, repo, policy):
     name = owner_key(project, repo, policy)
     with runtime.dispatch_lock:
-        current = runtime.store.setting(name)
+        stored = runtime.store.setting(name)
+        current = _owner_record(stored)
         if current:
+            with runtime.automation_receipt_failures_lock:
+                runtime.automation_receipt_failures.pop((name, "deployment-owner"), None)
             return current
+        if stored:
+            _owner_alert(runtime, name, project)
         migration = "deployment-owner-migrated:" + name.split(":", 1)[1]
         if runtime.store.setting(migration, False):
             return None
         legacy = []
         for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
             try:
-                receipt = json.loads(row["value"])
+                receipt = _owner_record(json.loads(row["value"]))
+                if not receipt:
+                    continue
                 run = runtime.store.one("SELECT project,config,started FROM runs WHERE id=?", (receipt["run"],))
                 if not run:
                     continue

@@ -561,6 +561,63 @@ class AuditEvaluationTest(unittest.TestCase):
                                  'candidate-added test must not run inside a control')
                 self.assertTrue((target / 'test_value.py').is_file())
 
+    def test_controls_reject_benign_fixture_when_candidate_rewrites_harness(self):
+        """A hostile candidate harness must not make every control look detected."""
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            (source / 'test_value.py').write_text('from value import VALUE\nassert VALUE == 1\n')
+            check = {'name': 'criterion', 'argv': ['python3', 'test_value.py']}
+            # The fixture restates the baseline value, so it is not a
+            # counterexample: a frozen baseline harness must not flag it.
+            control = {'id': 'benign', 'criterion': 'value remains one', 'source': 'host:fixture',
+                       'files': [{'path': 'value.py', 'content': 'VALUE = 1\n'}]}
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            (candidate / 'value.py').write_text('VALUE = 1\n')
+            # Both forgery routes: rewrite the existing harness and add a test
+            # that fails whenever the fixture touches the asserted file.
+            (candidate / 'test_value.py').write_text('assert False\n')
+            (candidate / 'test_forged.py').write_text(
+                'from pathlib import Path\nassert "VALUE = 1" in Path("value.py").read_text()\n')
+            workspaces = []
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                workspaces.append(Path(workspace))
+                texts = [path.read_text() for path in Path(workspace).glob('test_*.py')]
+                hostile = any('assert False' in text for text in texts)
+                value_one = 'VALUE = 1' in Path(workspace, 'value.py').read_text()
+                failed = hostile or not value_one
+                return {'name': check['name'], 'argv': check['argv'],
+                        'exit_code': 1 if failed else 0,
+                        'stdout': '' if failed else 'Ran 1 test\n',
+                        'stderr': 'AssertionError' if failed else '', 'error': None}
+
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            config = merge(DEFAULTS, {'validation': {'controls': [control]}})
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(store).evaluate(
+                    source, candidate, [check], root / 'evaluation', config, changed_files=[])
+            # Under the candidate's own harness this benign fixture is always
+            # "detected"; the frozen baseline harness must report it as missed
+            # and therefore refuse to claim control sensitivity.
+            self.assertFalse(result['controls']['controls'][0]['detected'])
+            self.assertEqual(result['controls']['decision'], 'insufficient_evidence')
+            self.assertEqual(result['decision'], 'insufficient_evidence')
+            control_targets = [path for path in workspaces if path.parent.name.startswith('controls')]
+            self.assertTrue(control_targets)
+            for target in control_targets:
+                self.assertFalse((target / 'test_forged.py').exists())
+                self.assertEqual((target / 'test_value.py').read_text(),
+                                 'from value import VALUE\nassert VALUE == 1\n')
+
     def test_controls_pass_protected_and_hidden_to_sandbox(self):
         """sandbox.check must receive non-empty protected/hidden in control runs."""
         from adaptive_rsi.config import DEFAULTS, merge

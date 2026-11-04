@@ -936,6 +936,8 @@ class AuthSessions:
         # 容器就绪（docker image inspect）按 (docker 路径, 镜像) 做进程级短 TTL 缓存；
         # 镜像存在性不随 backend 凭据变化，但仍随 close()/凭据变更一起失效。
         self.container_cache = {}
+        # 过期条目由后台线程刷新；同一镜像最多一个刷新任务，避免面板并发打开时重复探测。
+        self.container_refreshes = set()
         # 过期条目由后台线程刷新；同一后端最多一个刷新任务，避免面板并发打开时重复探测。
         self.status_refreshes = set()
         self.cache_generations = {backend: 0 for backend in ("codex", "opencode")}
@@ -1026,20 +1028,7 @@ class AuthSessions:
                     readiness = "auth_container_unavailable"
                 else:
                     image = config.get("sandbox", {}).get("worker_image", "adaptive-rsi-worker:local")
-                    key = (docker, image)
-                    with self.cache_lock:
-                        cached = self.container_cache.get(key)
-                    if cached and cached[0] > time.monotonic():
-                        readiness = cached[1]
-                    else:
-                        try:
-                            inspected = run_process([docker, "image", "inspect", image], timeout=10)
-                            readiness = "auth_worker_image_missing" if inspected["exit_code"] or inspected["error"] else ""
-                        except OSError:
-                            readiness = "auth_container_unavailable"
-                        with self.cache_lock:
-                            if not self.closed:
-                                self.container_cache[key] = (time.monotonic() + CONTAINER_CACHE_TTL, readiness)
+                    readiness = self._container_readiness(docker, image, _refresh)
             return readiness
         for backend in ("codex", "opencode"):
             available = bool(shutil.which("docker") if container or not shutil.which(backend) else shutil.which(backend))
@@ -1196,6 +1185,52 @@ class AuthSessions:
         finally:
             with self.cache_lock:
                 self.status_refreshes.discard(backend)
+
+    def _container_readiness(self, docker, image, refreshing=False):
+        """返回 worker 镜像就绪状态；过期缓存先返回旧值并转入后台 inspect。
+
+        冷启动没有旧值时仍同步探测一次，与 status_cache 的取舍一致。
+        refreshing=True 供后台刷新使用，跳过陈旧值直接重跑。
+        只要有过期旧值就不在请求线程探测：已有刷新在跑时同样直接返回旧值，
+        否则并发请求会各自同步 inspect、叠加最长 10s 的阻塞并重复探测。
+        """
+        key = (docker, image)
+        with self.cache_lock:
+            cached = self.container_cache.get(key)
+            if cached and cached[0] > time.monotonic():
+                return cached[1]
+            spawn = (bool(cached) and not refreshing and not self.closed
+                     and key not in self.container_refreshes)
+            if spawn:
+                self.container_refreshes.add(key)
+        if cached and not refreshing:
+            if spawn:
+                try:
+                    self._thread(lambda: self._refresh_container(key))
+                except Exception:
+                    with self.cache_lock:
+                        self.container_refreshes.discard(key)
+            return cached[1]
+        return self._inspect_container(key)
+
+    def _refresh_container(self, key):
+        try:
+            self._inspect_container(key)
+        finally:
+            with self.cache_lock:
+                self.container_refreshes.discard(key)
+
+    def _inspect_container(self, key):
+        docker, image = key
+        try:
+            inspected = run_process([docker, "image", "inspect", image], timeout=10)
+            readiness = "auth_worker_image_missing" if inspected["exit_code"] or inspected["error"] else ""
+        except OSError:
+            readiness = "auth_container_unavailable"
+        with self.cache_lock:
+            if not self.closed:
+                self.container_cache[key] = (time.monotonic() + CONTAINER_CACHE_TTL, readiness)
+        return readiness
 
     def providers(self, backend="opencode"):
         self._backend(backend)

@@ -328,6 +328,11 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 release.workflow_choices(runtime, project)
             self.assertEqual(str(caught.exception),
                              "Workflow repository must match the selected project's origin")
+            with patch("adaptive_rsi.release.api", side_effect=AssertionError("no API call expected")):
+                with self.assertRaises(ValueError) as caught:
+                    release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+            self.assertEqual(str(caught.exception),
+                             "Workflow repository must match the selected project's origin")
             server = server_module.Server(runtime)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -469,6 +474,93 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                 self.assertEqual(target["sha"], commit_sha)
                 self.assertEqual(target["ref"], "rsi-workflow/" + commit_sha)
                 self.assertTrue(target["enabled"])
+
+    def _authorization_project(self, temp):
+        root = Path(temp).resolve()
+        repo = fixture(root / "project")
+        git(repo, "remote", "add", "origin", "https://github.com/example-owner/example-repo.git")
+        runtime = Runtime(Store(root / "state"), FakeAgent())
+        self.addCleanup(runtime.close)
+        project = runtime.add_project(repo, "工作流授权项目")
+        runtime.configure({"github": {"repository": "example-owner/example-repo"}}, project)
+        release._workflow_choices_cache.clear()
+        self.addCleanup(release._workflow_choices_cache.clear)
+        return runtime, project
+
+    def test_authorize_workflow_reads_only_the_selected_file(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "f" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            calls = []
+
+            def stub(repo, endpoint, method="GET", fields=None):
+                calls.append(endpoint)
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint == "contents/.github/workflows/deploy.yml?ref=" + sha:
+                    return {"encoding": "base64", "type": "file", "content": content}
+                if endpoint.startswith("git/matching-refs/"):
+                    return [{"ref": "refs/tags/rsi-workflow/" + sha, "object": {"type": "commit", "sha": sha}}]
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": ".github/workflows/w%d.yml" % index, "name": "w%d" % index,
+                                           "state": "active"} for index in range(8)]}
+                raise AssertionError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=stub):
+                target = release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+            self.assertEqual(target["workflow"], ".github/workflows/deploy.yml")
+            self.assertEqual(target["sha"], sha)
+            self.assertEqual(target["ref"], "rsi-workflow/" + sha)
+            self.assertLessEqual(len(calls), 4)
+            self.assertFalse(any("actions/workflows" in endpoint for endpoint in calls))
+            self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("contents/")],
+                             ["contents/.github/workflows/deploy.yml?ref=" + sha])
+
+    def test_authorize_workflow_rejects_missing_or_incompatible_files(self):
+        import base64
+        sha = "f" * 40
+        incompatible = {"encoding": "base64", "type": "file",
+                        "content": base64.b64encode(b"name: Deploy\non: push\n").decode("ascii")}
+        for label, content in [("incompatible", incompatible), ("missing", None)]:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+
+                def stub(repo, endpoint, method="GET", fields=None):
+                    if endpoint == "":
+                        return {"default_branch": "main"}
+                    if endpoint == "commits/main":
+                        return {"sha": sha}
+                    if endpoint.startswith("contents/"):
+                        if content is None:
+                            raise release.ApiRejected("not found", 404)
+                        return content
+                    raise AssertionError(endpoint)
+
+                with patch("adaptive_rsi.release.api", side_effect=stub):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+                with patch("adaptive_rsi.release.api", side_effect=AssertionError("no API call expected")):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", "../outside.yml")
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
 
 
 class _ManualReconciliationFixture(unittest.TestCase):
@@ -1372,6 +1464,82 @@ class ReleaseReconciliationEndpointTest(_ManualReconciliationFixture):
             server.shutdown()
             server.server_close()
             thread.join(3)
+
+
+class ReleaseAbandonTest(_ManualReconciliationFixture):
+    """Only a workflow GitHub stopped exposing may be abandoned, with an audit trail."""
+
+    def setUp(self):
+        super().setUp()
+        from adaptive_rsi import server as server_module
+        self.server = server_module.Server(self.runtime)
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.thread.join, 3)
+
+    def request(self, method, path, fields=None):
+        import http.client
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        try:
+            connection.request(method, path, json.dumps(fields).encode() if fields is not None else None, {
+                "Cookie": self.server.cookie + "=" + self.server.token, "Origin": self.server.origin,
+                "X-RSI-CSRF": self.server.csrf, "Content-Type": "application/json"})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def abandon_body(self, reason):
+        return {"project": self.project, "run": self.record["id"], "kind": "release", "reason": reason}
+
+    def events(self, kind):
+        return self.runtime.store.query("SELECT * FROM events WHERE kind=? AND run=?", (kind, self.record["id"]))
+
+    def missing(self, repo, endpoint, method="GET", fields=None):
+        raise release.ApiRejected("fixture missing", 404)
+
+    def test_abandon_is_the_terminal_exit_when_the_workflow_is_gone(self):
+        self.operation()
+        reason = "workflow file was renamed; no run can be bound"
+        with patch.object(release, "api", side_effect=self.missing):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            self.assertTrue(view["can_abandon"])
+            self.assertEqual(view["reconciliation_state"], "workflow_not_visible")
+            status, payload = self.request("POST", "/api/release-abandon", self.abandon_body(reason))
+        self.assertEqual((status, payload["state"]), (200, "failed"))
+        saved = self.saved()
+        self.assertEqual(saved["operator_abandon"]["reason"], reason)
+        self.assertEqual(saved["operator_abandon"]["visibility"], "workflow_not_visible")
+        self.assertEqual(saved["reconciliation"]["state"], "abandoned")
+        self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+        self.assertEqual(self.posts, [])
+        self.assertEqual(json.loads(self.events("automation_abandoned")[0]["data"])["reason"], reason)
+        # 终态后调度不再轮询；部署被已终止的发布阻断，不再无限等待。
+        with patch.object(release, "api", side_effect=self.missing):
+            release.advance(self.runtime, self.runtime.project(self.project), self.record,
+                            {"merged_sha": self.MERGED, "feedback": {"state": "verified", "head": self.MERGED}})
+        self.assertFalse(release.pending(self.runtime, self.record))
+
+    def test_abandon_refuses_visible_runs_and_a_missing_reason(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.missing):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "reason is required"):
+                release.abandon(self.runtime, self.project, self.record["id"], "release", "   ")
+        # 工作流可见、只是匹配 run 尚未发布：继续等待，不能放弃。
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "still exposes"):
+                release.abandon(self.runtime, self.project, self.record["id"], "release", "no run yet")
+        self.assertEqual(self.saved()["state"], "dispatch_unknown")
+        self.assertEqual(self.events("automation_abandoned"), [])
+        # 已记录 run 的 404 同样可放弃，并保留原 run id 与可见性审计。
+        self.operation(state="rerun_unknown", workflow_run_id=17, attempt=1, previous_attempt=1)
+        with patch.object(release, "api", side_effect=self.missing):
+            result = release.abandon(self.runtime, self.project, self.record["id"], "release", "run was deleted")
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(self.saved()["workflow_run_id"], 17)
+        self.assertEqual(self.saved()["operator_abandon"]["visibility"], "run_not_visible")
 
 
 if __name__ == "__main__":
