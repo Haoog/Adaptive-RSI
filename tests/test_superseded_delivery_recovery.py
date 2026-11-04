@@ -2,7 +2,7 @@ import json
 import time
 from unittest.mock import patch
 
-from adaptive_rsi import delivery
+from adaptive_rsi import delivery, release
 from tests import test_release_endpoints
 
 
@@ -66,6 +66,29 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         # 已合入的改动不再重新实现：任务随恢复对账进入终态。
         self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (self.task['id'],))['state'], 'merged')
         self.assertEqual(result['delivery_status'], 'merged')
+
+    def test_recovered_merge_resumes_postmerge_verification_and_release(self):
+        self.prepare()
+        merged_sha = 'c' * 40
+        pr = {'url': self.url, 'state': 'MERGED', 'headRefOid': self.head,
+              'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepositoryOwner': {'login': 'example'}, 'mergeCommit': {'oid': merged_sha}}
+        with patch.object(delivery, 'checked', return_value=json.dumps([pr])):
+            delivery.tick(self.runtime, now=10000000000, project_id=self.project)
+        saved = self.store.one('SELECT state,result FROM runs WHERE id=?', (self.run['id'],))
+        result = json.loads(saved['result'])
+        self.assertEqual(result['merged_sha'], merged_sha)
+        self.assertFalse(result['close_pending'])
+        # 只记合并事实而停在 superseded 时，该运行退出后续扫描：同一段代码进了
+        # 主线却没有合并后验证回执，release/deploy 也永远不推进。
+        self.assertEqual(saved['state'], 'merged')
+        with patch.object(delivery, 'checked') as command, \
+                patch.object(delivery, 'feedback') as feedback, \
+                patch.object(release, 'advance', return_value={}) as advance:
+            delivery.tick(self.runtime, now=10000000600, project_id=self.project)
+        command.assert_not_called()
+        feedback.assert_called_once()
+        advance.assert_called_once()
 
     def test_no_pr_or_mismatched_pr_waits_without_remote_writes(self):
         for records in ([], [{'url': 'https://evil.test/pull/1', 'state': 'OPEN',
