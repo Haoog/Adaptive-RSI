@@ -1,5 +1,6 @@
 """Admission recovery must observe installer death, never just elapsed wall time."""
 import errno
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -113,3 +114,49 @@ class UpdateAdmissionTest(unittest.TestCase):
                 self.assertIsNone(installer_owner())
         with patch.dict(os.environ, {'ADAPTIVE_RSI_DESKTOP_OWNER_PID': str(os.getpid())}):
             self.assertEqual(installer_owner(), os.getpid())
+
+    def recovered_events(self):
+        return [json.loads(row['data']) for row in self.store.query(
+            "SELECT data FROM events WHERE kind='desktop_update_recovered' ORDER BY rowid")]
+
+    def test_corrupt_barrier_records_are_recovered_instead_of_key_errors(self):
+        """缺 version/lease/phase、非映射或 expires 不可比较的记录必须自愈。
+
+        旧实现在 state["version"]/state["lease"] 处 KeyError、在 .get 或
+        expires 比较处 AttributeError/TypeError，经 server 通用 except 变成
+        无诊断 500 并锁死准入。
+        """
+        shapes = (
+            ('missing_version', {'lease': 'a' * 48, 'phase': 'draining', 'expires': time.time() + 3600},
+             'invalid_record'),
+            ('missing_lease', {'version': '9.0.0', 'phase': 'draining', 'expires': time.time() + 3600},
+             'invalid_record'),
+            ('missing_phase', {'version': '9.0.0', 'lease': 'a' * 48, 'expires': time.time() + 3600},
+             'invalid_record'),
+            ('not_a_mapping', ['draining'], 'invalid_record'),
+            ('scalar', 'draining', 'invalid_record'),
+            ('bad_expires', {'version': '9.0.0', 'lease': 'a' * 48, 'phase': 'draining',
+                             'expires': 'not-a-timestamp'}, 'drain_expired'),
+        )
+        for name, state, reason in shapes:
+            with self.subTest(name):
+                before = len(self.recovered_events())
+                self.store.put_setting(KEY, state)
+                self.assertIsNone(barrier(self.runtime))
+                events = self.recovered_events()
+                self.assertEqual(len(events), before + 1)
+                self.assertEqual(events[-1]['reason'], reason)
+                self.assertEqual(events[-1]['version'],
+                                 state.get('version') if isinstance(state, dict) else None)
+                self.assertIsNone(self.store.setting(KEY))
+                self.assertIsNone(readiness(self.runtime, 'status')['barrier'])
+                prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+                self.assertEqual(prepared['version'], '9.0.0')
+                self.assertNotEqual(prepared['lease'], 'a' * 48)
+                readiness(self.runtime, 'cancel', lease=prepared['lease'])
+                self.assertIsNone(self.store.setting(KEY))
+
+    def test_corrupt_barrier_commit_reports_lease_change_instead_of_key_error(self):
+        self.store.put_setting(KEY, {'version': '9.0.0', 'phase': 'installing'})
+        with self.assertRaisesRegex(ValueError, 'lease changed'):
+            readiness(self.runtime, 'commit', lease='not-the-saved-lease')

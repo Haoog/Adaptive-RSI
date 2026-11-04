@@ -12,11 +12,22 @@ from .store import encode
 
 KEY = "desktop-update-barrier"
 
+# 屏障记录是 settings 表里的一条 JSON，可能来自旧版本结构、人工改库或部分失败的
+# 写入。lease 协议读取 version/lease/phase；缺任意一个都会 KeyError，非映射记录
+# 则在 .get 处 AttributeError，最终变成 server 通用 except 的无诊断 500，且准入被
+# 永久锁死。固定语义：无法使用的记录等同于无屏障，与 expired/owner_exited 走同一
+# 条 desktop_update_recovered 清理路径（先写审计事件再删除），修复手段不再依赖改库。
+_REQUIRED_FIELDS = ("version", "lease", "phase")
 
-def _observable(state):
-    """Only a record with a lease and version can be owned, cancelled or completed."""
-    return (isinstance(state, dict) and isinstance(state.get("lease"), str) and bool(state["lease"]) and
-            isinstance(state.get("version"), str) and bool(state["version"]))
+
+def _usable_state(state):
+    """Whether a saved barrier record supports the full lease protocol."""
+    return (isinstance(state, dict) and
+            all(isinstance(state.get(key), str) and state.get(key) for key in _REQUIRED_FIELDS))
+
+
+def _field(state, key):
+    return state.get(key) if isinstance(state, dict) else None
 
 
 def _matches(stored, lease):
@@ -24,45 +35,46 @@ def _matches(stored, lease):
             hmac.compare_digest(stored, lease))
 
 
-def _recover(runtime, state, reason):
-    with runtime.store.connect() as db:
-        db.execute("BEGIN IMMEDIATE")
-        db.execute("DELETE FROM settings WHERE key=?", (KEY,))
-        db.execute("INSERT INTO events(kind,message,data,created) VALUES "
-                   "('desktop_update_recovered','Desktop update admission recovered',?,?)",
-                   (encode({"phase": state.get("phase"), "version": state.get("version"),
-                            "reason": reason}), time.time()))
-    runtime.wake.set()
-
-
 def barrier(runtime):
     with runtime.dispatch_lock:
         state = runtime.store.setting(KEY)
         if not state:
             return state
-        if not _observable(state):
-            # 损坏记录没有可用租约，也判定不了属主；保留只会永久关闭准入。
-            _recover(runtime, state if isinstance(state, dict) else {}, "corrupt")
-            return None
-        expires = state.get("expires")
-        expired = (state.get("phase") != "installing" and
-                   (not isinstance(expires, (int, float)) or not expires > time.time()))
-        owner_exited = False
-        owner = state.get("owner_pid")
-        if state.get("phase") == "installing" and type(owner) is int and owner > 1:
-            try:
-                os.kill(owner, 0)
-            except OSError as exc:
-                # Permission errors and unknown process state must keep admission closed.
-                owner_exited = exc.errno == errno.ESRCH
-        if expired or owner_exited:
-            _recover(runtime, state, "owner_exited" if owner_exited else "drain_expired")
+        reason = None
+        if not _usable_state(state):
+            reason = "invalid_record"
+        else:
+            expires = state.get("expires", 0)
+            # 无法比较的 expires 同样会让状态接口抛 TypeError；非 installing 阶段视为已过期。
+            expired = (state.get("phase") != "installing" and
+                       (not isinstance(expires, (int, float)) or expires <= time.time()))
+            owner_exited = False
+            owner = state.get("owner_pid")
+            if state.get("phase") == "installing" and type(owner) is int and owner > 1:
+                try:
+                    os.kill(owner, 0)
+                except OSError as exc:
+                    # Permission errors and unknown process state must keep admission closed.
+                    owner_exited = exc.errno == errno.ESRCH
+            if expired or owner_exited:
+                reason = "owner_exited" if owner_exited else "drain_expired"
+        if reason:
+            with runtime.store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("DELETE FROM settings WHERE key=?", (KEY,))
+                db.execute("INSERT INTO events(kind,message,data,created) VALUES "
+                           "('desktop_update_recovered','Desktop update admission recovered',?,?)",
+                           (encode({"phase": _field(state, "phase"), "version": _field(state, "version"),
+                                    "reason": reason}), time.time()))
+            runtime.wake.set()
             return None
         return state
 
 
 def readiness(runtime, action="status", version=None, lease=None):
     with runtime.dispatch_lock:
+        # barrier() 负责把无法使用的记录清理为 None，因此这里的 state 要么为空，
+        # 要么已通过 _usable_state 校验；租约比较仍用 _matches 处理缺失/非 ASCII 输入。
         state = barrier(runtime)
         if action not in ("status", "prepare", "commit", "cancel", "complete"):
             raise ValueError("Invalid desktop update action")
