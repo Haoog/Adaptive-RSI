@@ -182,6 +182,31 @@ class AuditRound4Test(unittest.TestCase):
         # 纯 1..0 外层计划且无任何编号结果时仍是空跑。
         self.assertTrue(empty_test_run("TAP version 13\n1..0 # SKIP nothing\n"))
 
+    def test_evaluator_empty_test_run_go_single_package_zero(self):
+        # go test -run 过滤后零执行时仍打印 PASS 与 `ok pkg [no tests to run]`；
+        # 这两类行只表示过滤生效，不是执行证据。
+        zero = "testing: warning: no tests to run\nPASS\nok  \tpkg\t0.004s [no tests to run]\n"
+        self.assertTrue(empty_test_run(zero))
+        # 只有 no test files 的包同样不算执行证据。
+        self.assertTrue(empty_test_run("?   \tpkg\t[no test files]\n"))
+
+    def test_evaluator_empty_test_run_go_mixed_packages(self):
+        # 多包混合：另一个包的裸 ok 行仍是真实执行证据，不能因零执行包被判为空跑。
+        mixed = ("testing: warning: no tests to run\nPASS\n"
+                 "ok  \tpkg1\t0.004s [no tests to run]\nok  \tpkg2\t0.5s\n")
+        self.assertFalse(empty_test_run(mixed))
+        self.assertFalse(empty_test_run("ok  \tpkg1\t0.5s\nok  \tpkg2\t0.004s [no tests to run]\n"))
+        self.assertFalse(empty_test_run("?   \tpkg1\t[no test files]\nok  \tpkg2\t0.5s\n"))
+
+    def test_evaluator_empty_test_run_large_output_is_fast(self):
+        # 12 MB 输出上限下不应逐字符跑四个正则：旧实现 8 MB 约需 7 s。
+        text = "".join("=== RUN TestCase%d\n--- PASS: TestCase%d (0.00s)\n" % (i, i)
+                       for i in range(150000))
+        began = time.monotonic()
+        self.assertFalse(empty_test_run(text))
+        elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 2.5, "empty_test_run took %.2fs on %.1f MB" % (elapsed, len(text) / 1048576))
+
     def test_clarity_test_summary_field_order_agnostic(self):
         # pytest 7+ prints failures first; field order must not matter.
         failure_first = clarity_test_summary("===== 2 failed, 3 passed, 1 skipped in 4.21s =====")
