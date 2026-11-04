@@ -485,7 +485,7 @@ class Handler(BaseHTTPRequestHandler):
                 store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
                 data["instance"] = store.setting("instance-id")
                 from .dashboard import TASKS
-                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
+                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
                 self.respond(data)
             elif parsed.path == "/api/storage":
                 from .storage_tools import overview
@@ -811,8 +811,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not 1 <= limit <= 100:
                     raise RequestError("Invalid run pagination")
                 query = ("SELECT id,project,task,state,started,ended FROM runs WHERE task=?" +
-                         (" AND (started<? OR (started=? AND id<?))" if before else "") +
-                         " ORDER BY started DESC,id DESC LIMIT ?")
+                         (" AND (started<? OR (started=? AND rowid<(SELECT rowid FROM runs WHERE id=?)))" if before else "") +
+                         " ORDER BY started DESC,rowid DESC LIMIT ?")
                 if before:
                     timestamp, separator, identifier = before.partition(":")
                     try:
