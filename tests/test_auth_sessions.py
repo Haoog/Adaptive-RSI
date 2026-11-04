@@ -763,6 +763,35 @@ class AuthSessionTests(unittest.TestCase):
                 finally:
                     manager.close()
 
+    def test_container_readiness_probe_is_cached_and_invalidated(self):
+        manager = AuthSessions(self.root / 'readiness-cache', config={'sandbox': {'backend': 'docker'}})
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which',
+                       side_effect=lambda name: '/fixture/docker' if name == 'docker' else None), \
+                 patch('adaptive_rsi.auth_sessions.run_process',
+                       return_value={'exit_code': 1, 'error': ''}) as inspect, \
+                 patch('adaptive_rsi.auth_sessions.detect_opencode',
+                       return_value=OpenCodeCapabilities('1.19.3', (1, 19, 3))), \
+                 patch('adaptive_rsi.auth_sessions.auth_providers', return_value=[]):
+                first = manager.snapshot()
+                second = manager.snapshot()
+                self.assertEqual([first['codex']['error'], second['codex']['error']],
+                                 ['auth_worker_image_missing', 'auth_worker_image_missing'])
+                # 两次快照只探测一次镜像；codex/opencode 共用同一次子进程结果。
+                self.assertEqual(inspect.call_count, 1)
+                with manager.cache_lock:
+                    key = next(iter(manager.container_cache))
+                    manager.container_cache[key] = (time.monotonic() - 1, 'auth_worker_image_missing')
+                self.assertEqual(manager.snapshot()['opencode']['error'], 'auth_worker_image_missing')
+                self.assertEqual(inspect.call_count, 2)
+                with manager.lock:
+                    manager._invalidate_caches('codex')
+                self.assertEqual(manager.snapshot()['codex']['error'], 'auth_worker_image_missing')
+                self.assertEqual(inspect.call_count, 3)
+        finally:
+            manager.close()
+        self.assertFalse(manager.container_cache)
+
     def test_initialization_never_starts_cli(self):
         self.assertEqual(self.created, [])
         self.assertEqual(self.manager.busy, 0)
