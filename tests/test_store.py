@@ -487,6 +487,50 @@ class RecordUsageTest(unittest.TestCase):
             "usage_known": 1,
         })
 
+    def test_record_usage_rejects_counts_beyond_storage_limit(self):
+        """provider 上报 2**63 级计数时按未知记账，不再让 INTEGER 绑定溢出回滚整笔事务。"""
+        self.store.record_usage("call", "run", {"input_tokens": 2 ** 63}, 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, usage_known, price_basis "
+                                  "FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 0, "input_tokens": 0,
+                                    "usage_known": 0, "price_basis": "unknown"})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        event = self.store.one("SELECT project, run, kind, data FROM events WHERE kind='usage_rejected'")
+        assert event is not None
+        self.assertEqual(event["project"], "p")
+        self.assertEqual(event["run"], "run")
+        self.assertEqual(json.loads(event["data"]),
+                         {"call": "call", "run": "run", "field": "input_tokens",
+                          "reported": str(2 ** 63)})
+
+    def test_record_usage_rejects_out_of_range_tokens_and_other_fields(self):
+        """tokens 本身超范围时按未知记 0；有限大整数（10**400）也必须走同一条拒绝路径。"""
+        self.store.record_usage("call", "run", {"tokens": 1e308, "input_tokens": 100,
+                                                "cache_write_tokens": 10 ** 400,
+                                                "usage_known": True}, 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, cache_write_tokens, usage_known "
+                                  "FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 0, "input_tokens": 100,
+                                    "cache_write_tokens": 0, "usage_known": 0})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        rejected = {json.loads(row["data"])["field"] for row in
+                    self.store.query("SELECT data FROM events WHERE kind='usage_rejected'")}
+        self.assertEqual(rejected, {"tokens", "cache_write_tokens"})
+
+        # 重复上报同一条坏用量仍然幂等：run 汇总不因重试累加，调用保持 completed。
+        self.store.record_usage("call", "run", {"tokens": 1e308, "usage_known": True}, 1.5)
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 0)
+        self.assertEqual(self.store.one("SELECT state FROM calls WHERE id='call'")["state"], "completed")
+
+    def test_record_usage_accepts_counts_at_the_limit(self):
+        """10**12 是允许的上限（仍低于 2**63-1），不能把边界值误判成脏数据。"""
+        self.store.record_usage("call", "run", self.usage(10 ** 12), 1.0)
+        call_row = self.store.one("SELECT state, tokens, input_tokens, usage_known FROM calls WHERE id='call'")
+        self.assertEqual(call_row, {"state": "completed", "tokens": 10 ** 12,
+                                    "input_tokens": 10 ** 12, "usage_known": 1})
+        self.assertEqual(self.store.one("SELECT tokens FROM runs WHERE id='run'")["tokens"], 10 ** 12)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE kind='usage_rejected'")["n"], 0)
+
     def test_recover_only_interrupts_uncompleted_calls(self):
         self.store.record_usage("call", "run", self.usage(100), 1.0)
         self.store.execute("INSERT INTO calls(id,project,run,role,model,effort,state,tokens,created) "
