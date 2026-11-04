@@ -810,6 +810,52 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual(rows['coverage.xml']['state'], 'rejected')
             self.assertEqual(rows['lcov.info']['state'], 'missing')
 
+    def test_stage_artifacts_belong_only_to_the_check_that_wrote_them(self):
+        """Checks share a workspace; a stale report must not be credited to a later check."""
+        import hashlib
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        junit = '<testsuite tests="1"><testcase classname="m" name="t"/></testsuite>'
+        lcov = 'TN:\nSF:app.py\n'
+        checks = [{'name': 'unit', 'argv': ['python3', '-m', 'unittest']},
+                  {'name': 'lint', 'argv': ['python3', '-m', 'compileall']}]
+
+        def execute(_sandbox, check, workspace, *args, **kwargs):
+            if check['name'] == 'unit':
+                (Path(workspace) / 'junit.xml').write_text(junit)
+                (Path(workspace) / 'coverage').mkdir()
+                (Path(workspace) / 'coverage' / 'lcov.info').write_text(lcov)
+            return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                    'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            runner = evaluator.Evaluator(store)
+            config = merge(DEFAULTS, {})
+            with patch('adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                standard = runner._standard_stage(
+                    'candidate', source, source, source, checks, root / 'evaluation', config,
+                    None, None, None, [])['rows']
+                accepted = runner._acceptance_stage(
+                    'acceptance_candidate', source, source, {'checks': checks, 'spec': {'files': []}},
+                    root / 'acceptance', config, None, None, [])['rows']
+            for rows in (standard, accepted):
+                self.assertEqual([row['name'] for row in rows], ['unit', 'lint'])
+                first = rows[0]['artifacts']
+                self.assertEqual(first['junit.xml']['state'], 'collected')
+                self.assertEqual(first['junit.xml']['sha256'], hashlib.sha256(junit.encode()).hexdigest())
+                self.assertEqual(first['junit.xml']['bytes'], len(junit))
+                self.assertEqual(first['coverage/lcov.info']['state'], 'collected')
+                self.assertEqual(first['coverage/lcov.info']['content'], lcov)
+                self.assertEqual(rows[1]['artifacts']['junit.xml']['state'], 'missing')
+                self.assertEqual(rows[1]['artifacts']['coverage/lcov.info']['state'], 'missing')
+
     def test_dependency_graph_closes_over_dependents_and_unknown_falls_back(self):
         checks = [{'name': 'a'}, {'name': 'b'}, {'name': 'all'}]
         graph = {'a': {'paths': ['packages/a/'], 'depends_on': [], 'checks': ['a']},
