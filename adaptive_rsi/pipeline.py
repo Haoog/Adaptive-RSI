@@ -103,8 +103,14 @@ def _issue_comment_cache_evidence(issue_comments):
 def _stage_config(config, stage):
     """Keep unrelated settings out of a cached stage's invalidation key."""
     role = "planning" if stage == "acceptance" else stage
-    value = {"providers": config["providers"], "models": {role: config["models"][role]},
-             "sandbox": config["sandbox"], "limits": config["limits"]}
+    route = config["models"][role]
+    # Only providers this stage can actually route to are inputs. Adding or
+    # editing a provider used by another role must not throw away paid
+    # planning, implementation or review results.
+    wanted = {route.get("provider"), (route.get("fallback") or {}).get("provider")} - {None}
+    value = {"providers": [provider for provider in config["providers"]
+                           if isinstance(provider, dict) and provider.get("id") in wanted],
+             "models": {role: route}, "sandbox": config["sandbox"], "limits": config["limits"]}
     if stage in ["planning", "acceptance"]:
         value["triage"] = config["triage"]
     if stage in ["planning", "acceptance", "implementation"]:
