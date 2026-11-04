@@ -1,6 +1,7 @@
 """Regression coverage for the second whole-project audit."""
 import contextlib
 import json
+import os
 import sqlite3
 import tempfile
 import threading
@@ -207,6 +208,7 @@ class AuditRound5Test(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active"):
             readiness(runtime, "commit", lease=lease)
         self.store.execute("UPDATE runs SET ended=2 WHERE id='run'")
+        runtime.updates.desktop_owner_pid = os.getpid()
         self.assertEqual(readiness(runtime, "commit", lease=lease)["barrier"]["phase"], "installing")
         with self.assertRaisesRegex(ValueError, "lease"):
             readiness(runtime, "cancel", lease="incorrect")
