@@ -298,6 +298,30 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.runtime.task_budget({'id': 'later-run', 'task': task}), {})
         self.assertIsNone(self.store.setting(Runtime.BUDGET_KEY + task))
 
+    def test_manual_retry_starts_a_fresh_stage_budget(self):
+        """人工重试是新的尝试集合：必须清掉中断尝试的额度检查点，否则重试后立刻超时。"""
+        task, run = self.claim()
+        self.store.put_setting(Runtime.BUDGET_KEY + task, {'preparation': 40.0})
+        self.store.execute("UPDATE runs SET state='interrupted',ended=? WHERE id=?", (time.time(), run['id']))
+        self.store.execute("UPDATE tasks SET state='interrupted' WHERE id=?", (task,))
+        # 重试后旧 run 仍是 interrupted，task_budget 会认这一状态续用额度：
+        # 只有重试事务自己删掉检查点，新一次尝试才能重新计时。
+        self.runtime.retry(task)
+        self.assertIsNone(self.store.setting(Runtime.BUDGET_KEY + task))
+        self.assertEqual(self.runtime.task_budget({'id': 'retried-run', 'task': task}), {})
+
+    def test_evolution_trial_does_not_overwrite_the_task_stage_budget(self):
+        """试验上下文只有局部时钟：不得把父 run 的任务级累计值改写成单次试验用时。"""
+        task, run = self.claim()
+        run.update(_budget_prior={'preparation': 80.0}, _budget_closed={}, _budget_flushed={})
+        self.runtime.checkpoint_budget(run)
+        self.assertEqual(self.store.setting(Runtime.BUDGET_KEY + task), {'preparation': 80.0})
+        trial = self.runtime.new_trial_context(run)
+        trial['_deadline_started'] = time.monotonic() - 31.0
+        self.runtime.checkpoint_budget(trial, [('preparation', trial['_deadline_started'])])
+        # 父 run 的 80s 累计值不能被一次 31s 的试验覆盖（否则重启后少算真实已用时间）。
+        self.assertEqual(self.store.setting(Runtime.BUDGET_KEY + task), {'preparation': 80.0})
+
     def experiment_inputs(self):
         """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
         from adaptive_rsi.gitops import git, snapshot

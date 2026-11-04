@@ -619,6 +619,9 @@ class Runtime(Maintenance):
             db.execute("UPDATE runs SET state='superseded' WHERE task=? AND state='awaiting_approval'", (task,))
             # 手动重试代表用户明确要求重新验证：清零基础设施退避计数，瞬时故障仍可自动重试。
             db.execute("UPDATE tasks SET state='queued',available=0,infra_retries=0,attempts=0,budget_waits=0,updated=? WHERE id=?", (now, task))
+            # 重试开启新的尝试集合：旧 run 仍是 interrupted，task_budget 会据此续用额度，
+            # 所以必须在本事务里删掉阶段额度检查点，否则重试后的新运行接着旧时钟几乎立刻超时。
+            db.execute("DELETE FROM settings WHERE key=?", (self.BUDGET_KEY + task,))
             if force:
                 # 明确的人工重试凭据：只被下一次实验读取一次，不能成为永久绕过去重的开关。
                 db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
@@ -1571,7 +1574,10 @@ class Runtime(Maintenance):
         或有阶段刚结束时才落库，避免在取消轮询热路径上持续写库。
         """
         task = run.get('task')
-        if not task:
+        if not task or run.get('_budget_trial'):
+            # 进化试验用的是 new_trial_context() 派生的局部时钟：它继承父 run 的
+            # task id，但故意不继承任务级累计值。若允许它写回，单次试验的用时就会
+            # 覆盖父 run 的累计额度（80s 变 31s），重启后少算真实已用时间。
             return
         active = dict(live)
         stages = set(run.get('_budget_prior') or {}) | set(run.get('_budget_closed') or {}) | set(active)
@@ -1610,6 +1616,9 @@ class Runtime(Maintenance):
                                 '_timed_out_stage', '_explicit_phase',
                                 '_outer_deadline_stage', '_outer_deadline_started',
                                 '_budget_prior', '_budget_closed', '_budget_flushed')}
+        # 试验时钟是局部的：保留父 run 的 task id 只用于查询/取消，但它不拥有该任务
+        # 的累计额度，因此不能把自己的用时写回任务检查点（见 checkpoint_budget）。
+        trial['_budget_trial'] = True
         self.begin_phase(trial, 'preparation')
         return trial
 
