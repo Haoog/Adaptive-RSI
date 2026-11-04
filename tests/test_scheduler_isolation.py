@@ -788,6 +788,23 @@ class SchedulerIsolationTest(unittest.TestCase):
         thread.join(timeout + 1)
         return bool(acquired)
 
+    def test_bounded_retention_deletes_request_log_and_skips_skills_in_batches(self):
+        stale = time.time() - 31 * 86400
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO request_log(id,method,path,status,started,ended,error_code) VALUES (?,?,?,?,?,?,?)",
+                           [("req-%04d" % index, "POST", "/api/x", 200, stale, stale, "") for index in range(600)])
+            db.executemany("INSERT INTO skills(id,project,task,status,triggers,content,evidence,expires,created) VALUES (?,?,?,?,?,?,?,?,?)",
+                           [("skill-%04d" % index, "healthy", None, "expired", "[]", "{}", "{}", stale, stale) for index in range(600)])
+        self.runtime.maintenance()
+        remaining_log = self.store.one("SELECT count(*) AS n FROM request_log")["n"]
+        remaining_skills = self.store.one("SELECT count(*) AS n FROM skills")["n"]
+        self.assertGreaterEqual(remaining_log, 100)
+        self.assertGreaterEqual(remaining_skills, 100)
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM request_log")["n"], 0)
+        self.assertEqual(self.store.one("SELECT count(*) AS n FROM skills")["n"], 0)
+
     def test_invalid_delivery_run_does_not_block_other_tracking_jobs(self):
         bad = self.historical_run("broken", "merged")
         healthy = self.historical_run("healthy", "pr_open")
