@@ -1,5 +1,6 @@
 """Measure real contention and preserve orphan evidence under bounded maintenance."""
 import concurrent.futures
+import contextlib
 import json
 from pathlib import Path
 import sqlite3
@@ -262,6 +263,128 @@ class StoreObservabilityTest(unittest.TestCase):
         # 停机 7200s 没有计入；只剩 r2 正常收尾的毫秒级样本。
         self.assertLess(metrics['phase_seconds'].get('executing', 0), 1)
         self.assertGreaterEqual(metrics['remote_wait_seconds'].get('waiting_ci', 0), 3600)
+
+    def test_claim_blocks_bad_tasks_in_segments_without_holding_the_write_lock(self):
+        """被污染的队列：N 条坏 overrides 任务必须在各自短事务里拉黑并各写事件，
+        claim 期间另一连接的写入要能插进分段间隙，而不是被整段写锁挡住。"""
+        from adaptive_rsi.config import validate
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',0,0)")
+        bad_tasks = [self.store.add_task('p', 'goal', 'bad-' + str(index), 'fixture')
+                     for index in range(60)]
+        for task in bad_tasks:
+            self.store.execute("UPDATE tasks SET overrides='{bad json' WHERE id=?", (task,))
+        # 坏任务先入队故按 created 排在最前；给正常任务最低优先级，保证 60 条全部先被拉黑。
+        good = self.store.add_task('p', 'goal', 'good', 'fixture', priority=1)
+
+        # 观测点：claim 线程每次 COMMIT 成功后、下一段 BEGIN 之前挂起；此刻写锁
+        # 已让出，另一连接的写入必须能立即穿透。旧实现全程只有一个提交点，
+        # gate 第二次 wait 就会超时——回归能被确定性地检出。
+        claimed = []
+        claim = threading.Thread(target=lambda: claimed.append(
+            self.store.claim('p', validate({}))))
+        gate, release = threading.Event(), threading.Event()
+        stalls, writes = [0], []
+        original = Store.connect
+
+        @contextlib.contextmanager
+        def instrumented(store):
+            with original(store) as db:
+                class Probe:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    def commit(self):
+                        result = db.commit()
+                        if threading.current_thread() is claim and stalls[0] < 60:
+                            stalls[0] += 1
+                            gate.set()
+                            release.wait(5)
+                            release.clear()
+                        return result
+
+                yield Probe()
+
+        with patch.object(Store, 'connect', instrumented):
+            claim.start()
+            for _ in range(60):
+                self.assertTrue(gate.wait(5), 'claim must yield the write lock between segments')
+                began = time.monotonic()
+                self.store.execute("INSERT INTO events(project,kind,message,data,created) "
+                                   "VALUES ('p','probe','write','{}',?)", (time.time(),))
+                writes.append(time.monotonic() - began)
+                release.set()
+            deadline = time.monotonic() + 10
+            while claim.is_alive() and time.monotonic() < deadline:
+                release.set()
+                claim.join(0.05)
+        self.assertFalse(claim.is_alive())
+        self.assertEqual(len(claimed), 1)
+        run = claimed[0]
+        self.assertIsNotNone(run)
+        self.assertEqual(run['task'], good)
+        blocked = self.store.one(
+            "SELECT count(*) AS n FROM tasks WHERE state='blocked' AND project='p'")
+        assert blocked is not None
+        self.assertEqual(blocked['n'], 60)
+        errors = self.store.one(
+            "SELECT count(*) AS n FROM events WHERE kind='task_configuration_error' AND project='p'")
+        assert errors is not None
+        self.assertEqual(errors['n'], 60)
+        # 间隙写入应微秒级穿透；阈值只排除「仍被整段写锁挡住」的回归，留足调度余量。
+        self.assertLess(max(writes), 5.0)
+
+    def test_claim_rechecks_evidence_before_marking_automatic_task_obsolete(self):
+        """扫描读出自动触发 evidence 后、作废短事务开始前，request 把同一任务升级
+        为 manual（runtime.request 对排队任务重写 evidence）：作废必须按写锁下的
+        新 evidence 重判，不能把已升级的用户请求连同旧快照一起丢掉。"""
+        from adaptive_rsi.config import validate
+        from adaptive_rsi.store import encode
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',0,0)")
+        task = self.store.add_task('p', 'system_issues', 'system:issues', 'fixture',
+                                   evidence=[{"scan_trigger": "automatic"}])
+        row0 = self.store.one("SELECT evidence FROM tasks WHERE id=?", (task,))
+        assert row0 is not None
+        self.assertEqual(row0["evidence"], encode([{"scan_trigger": "automatic"}]))
+        claimed = []
+        claim = threading.Thread(target=lambda: claimed.append(
+            self.store.claim('p', validate({"sources": {"issues": False}}))))
+        upgraded = [False]
+        original = Store.connect
+        real_store = self.store
+
+        @contextlib.contextmanager
+        def instrumented(store):
+            with original(store) as db:
+                class Probe:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    def execute(self, sql, parameters=()):
+                        if (threading.current_thread() is claim and not upgraded[0]
+                                and sql.startswith("BEGIN IMMEDIATE")):
+                            # 等价于 runtime.request(automatic=False) 在快照与
+                            # 写锁之间落库的那笔 evidence 升级。
+                            real_store.execute(
+                                "UPDATE tasks SET evidence=? WHERE id=?",
+                                (encode([{"scan_trigger": "manual"}]), task))
+                            upgraded[0] = True
+                        return db.execute(sql, parameters)
+
+                yield Probe()
+
+        with patch.object(Store, 'connect', instrumented):
+            claim.start()
+            claim.join(10)
+        self.assertFalse(claim.is_alive())
+        self.assertTrue(upgraded[0])
+        row = self.store.one("SELECT state,evidence FROM tasks WHERE id=?", (task,))
+        assert row is not None
+        self.assertNotEqual(row["state"], "obsolete")
+        self.assertEqual(row["evidence"], encode([{"scan_trigger": "manual"}]))
+        self.assertEqual(len(claimed), 1)
+        run = claimed[0]
+        self.assertIsNotNone(run)
+        self.assertEqual(run["task"], task)
 
     def test_light_metrics_do_not_scan_large_history_but_explicit_integrity_finds_orphans(self):
         self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
