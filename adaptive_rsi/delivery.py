@@ -1179,6 +1179,99 @@ def committed_changes(source, start, end):
         source, "diff", "--name-only", "-z", start, end, "--").split("\0") if name]
 
 
+POSTMERGE_EVAL_PREFIX = "postmerge-eval:"
+POSTMERGE_EVAL_KEEP = 8
+POSTMERGE_EVAL_ROWS = 40
+POSTMERGE_EVAL_TEXT = 800
+
+
+def postmerge_evaluation_key(project, stage, head, checks, changed, acceptance, config):
+    """Inputs that make two post-merge evaluations of one tree interchangeable.
+
+    `changed` decides how far the harness is frozen, so empty, known and
+    unavailable diffs never share a result. The merge commit's own check and
+    the later mainline candidate are separate stages because they evaluate
+    different trees; a different sealed acceptance contract or execution
+    environment can also decide differently.
+    """
+    return hashlib.sha256(json.dumps(
+        {"project": project, "stage": stage, "head": head, "checks": checks, "changed": changed,
+         "acceptance": [acceptance.get("hash"), acceptance.get("change_kind")] if acceptance else None,
+         "environment": config.get("environment"), "sandbox": config.get("sandbox")},
+        sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def bounded_evaluation(result, now):
+    """Reusable evidence: the decision plus bounded check rows, never whole logs."""
+    checks = result.get("checks")
+    rows, total = {}, 0
+    groups = list(checks.items()) if isinstance(checks, dict) else []
+    # Attribution needs the baseline rows; keep them even when candidate output is huge.
+    groups.sort(key=lambda group: group[0] not in ("baseline", "acceptance_baseline"))
+    for label, values in groups:
+        kept = []
+        for row in (values if isinstance(values, list) else []):
+            if not isinstance(row, dict):
+                continue
+            if total >= POSTMERGE_EVAL_ROWS:
+                break
+            total += 1
+            kept.append({key: (str(row.get(key) or "")[-POSTMERGE_EVAL_TEXT:] if key in ("stdout", "stderr")
+                               else row.get(key)) for key in
+                         ("name", "argv", "cwd", "passed", "exit_code", "error", "stdout", "stderr")
+                         if key in row})
+        rows[str(label)[:40]] = kept
+    summary = {"decision": result.get("decision"), "reason": result.get("reason"), "checks": rows, "at": now}
+    summary.update({key: result[key] for key in (
+        "acceptance_hash", "criteria", "coverage", "improvement", "contract", "test_identity_verification",
+        "harness_hash", "candidate_full_reused", "execution_environment", "changed_files_available")
+        if key in result})
+    return summary
+
+
+def postmerge_reusable(runtime, project, key, head, shared):
+    """This tick's shared cache first, then the project's persisted bounded result."""
+    if not key:
+        return None, None
+    slot = ("postmerge-eval", project["id"], key)
+    cached = shared.get(slot) if isinstance(shared, dict) else None
+    if cached:
+        return cached.get("run"), cached.get("result")
+    stored = runtime.store.setting(POSTMERGE_EVAL_PREFIX + project["id"] + ":" + key)
+    if (isinstance(stored, dict) and stored.get("key") == key and stored.get("head") == head and
+            isinstance(stored.get("evaluation"), dict) and
+            stored["evaluation"].get("decision") in {"pass", "fail"}):
+        return stored.get("run"), stored["evaluation"]
+    return None, None
+
+
+def cache_postmerge_evaluation(runtime, project, key, head, run, result, origin, shared, now):
+    """Share a conclusive evaluation within this tick and persist its bounded form."""
+    if not key or not isinstance(result, dict) or result.get("decision") not in {"pass", "fail"}:
+        return
+    if isinstance(shared, dict):
+        # Keep the run that actually executed the checks so a later hit still traces to it.
+        shared[("postmerge-eval", project["id"], key)] = {"run": origin or run["id"], "result": result}
+    remember_postmerge_evaluation(runtime, project, key, head, run, result, origin, now)
+
+
+def remember_postmerge_evaluation(runtime, project, key, head, run, result, origin, now):
+    """Persist one bounded result; only conclusive decisions, newest KEEP per project."""
+    prefix = POSTMERGE_EVAL_PREFIX + project["id"] + ":"
+    runtime.store.put_setting(prefix + key, {"key": key, "head": head, "run": origin or run["id"], "at": now,
+                                             "evaluation": bounded_evaluation(result, now)})
+    entries = []
+    for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE ?", (prefix + "%",)):
+        if row["key"].startswith(prefix):
+            try:
+                stamp = json.loads(row["value"]).get("at")
+            except (TypeError, ValueError, AttributeError):
+                stamp = None
+            entries.append((stamp if isinstance(stamp, (int, float)) else 0, row["key"]))
+    for _, stale in sorted(entries)[:-POSTMERGE_EVAL_KEEP]:
+        runtime.store.execute("DELETE FROM settings WHERE key=?", (stale,))
+
+
 def parsed_result(run):
     """Decode a run result without letting one malformed historical row abort a scan."""
     raw = run["result"]
@@ -1339,6 +1432,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     reused = previous.get("evaluation") if previous.get("head") == head and isinstance(
         previous.get("evaluation"), dict) else None
     merge_result = None
+    merge_origin = None
+    key = None
+    origin = None
     if not merge_current:
         if (head == merged_sha and reused is not None and
                 reused.get("decision") in {"pass", "fail"}):
@@ -1347,16 +1443,27 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         else:
             # Re-run the merge commit's own fixed checks. An earlier
             # 'insufficient_evidence' decision is deliberately not reused, so a
-            # transient failure can be cleared by the next due poll.
-            merge_root = "merge/" if head != merged_sha else ""
-            merge_baseline = snapshot(source, output_path(merge_root + "baseline"), merged_sha)
-            merge_candidate = snapshot(source, output_path(merge_root + "current"), merged_sha)
-            if not checks:
-                checks = detect(merge_baseline)["checks"]
-            merge_result = runtime.evaluator.evaluate(
-                merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
-                effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[],
-                cache_scope=cache_scope, cache_base=cache_base)
+            # transient failure can be cleared by the next due poll. The same
+            # commit has no diff and identical checks, so another run observing
+            # it can share the conclusion instead of repeating the whole run.
+            merge_key = (postmerge_evaluation_key(project["id"], "merge", merged_sha, checks, [],
+                                                  acceptance, effective) if checks else None)
+            merge_origin, merge_result = postmerge_reusable(runtime, project, merge_key, merged_sha, shared)
+            if merge_result is None:
+                merge_root = "merge/" if head != merged_sha else ""
+                merge_baseline = snapshot(source, output_path(merge_root + "baseline"), merged_sha)
+                merge_candidate = snapshot(source, output_path(merge_root + "current"), merged_sha)
+                if not checks:
+                    checks = detect(merge_baseline)["checks"]
+                if not merge_key and checks:
+                    merge_key = postmerge_evaluation_key(project["id"], "merge", merged_sha, checks, [],
+                                                         acceptance, effective)
+                merge_result = runtime.evaluator.evaluate(
+                    merge_baseline, merge_candidate, checks, output_path(merge_root + "evaluation"),
+                    effective, cancel=cancel, acceptance=acceptance, seeds=seeds, changed_files=[],
+                    cache_scope=cache_scope, cache_base=cache_base)
+                cache_postmerge_evaluation(runtime, project, merge_key, merged_sha, run, merge_result,
+                                           None, shared, now)
         merge_record = {"sha": merged_sha,
                         "state": {"pass": "verified", "fail": "regressed"}.get(
                             merge_result["decision"], "insufficient_evidence"),
@@ -1364,6 +1471,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     if head == merged_sha:
         if merge_result is not None:
             result = merge_result
+            origin = merge_origin
         else:
             baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
             current_tree = snapshot(source, output_path("current"), head)
@@ -1375,10 +1483,6 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     elif reused is not None:
         result = reused
     else:
-        baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
-        current_tree = snapshot(source, output_path("current"), head)
-        if not checks:
-            checks = detect(baseline_tree)["checks"]
         # A clean snapshot has no working-tree diff, so compare the two committed SHAs
         # explicitly; otherwise changed tests/harness in the later mainline are hidden.
         try:
@@ -1388,13 +1492,35 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
             # Fall back to the evaluator's own diff instead of claiming an empty set,
             # which would let frozen regression evidence be reused.
             committed = None
-        result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
-                                            effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
-                                            changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
+        # 多个 merged run 观测同一主线 head：固定检查跑在同一棵 current 树上，只要
+        # 检查、变更路径集（决定 harness 冻结范围）、验收契约与执行环境一致，结论就
+        # 可以复用；diff 不可用（None）的证据绝不共享。
+        key = (postmerge_evaluation_key(project["id"], "main", head, checks, committed, acceptance, effective)
+               if checks and committed is not None else None)
+        origin, result = postmerge_reusable(runtime, project, key, head, shared)
+        if result is None:
+            baseline_tree = snapshot(source, output_path("baseline"), merged_sha)
+            current_tree = snapshot(source, output_path("current"), head)
+            if not checks:
+                checks = detect(baseline_tree)["checks"]
+            if not key and checks and committed is not None:
+                key = postmerge_evaluation_key(project["id"], "main", head, checks, committed,
+                                               acceptance, effective)
+            result = runtime.evaluator.evaluate(baseline_tree, current_tree, checks, output_path("evaluation"),
+                                                effective, cancel=cancel, acceptance=acceptance, seeds=seeds,
+                                                changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
+            cache_postmerge_evaluation(runtime, project, key, head, run, result, None, shared, now)
     outcome["feedback_polled_at"] = now
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
                            "attribution": failure_attribution(merged_sha, head, result)}
+    if origin:
+        outcome["feedback"]["reused_from"] = origin
+        reuse_count = 1 + (shared.get(("postmerge-reused", project["id"]), 0) if isinstance(shared, dict) else 0)
+        if isinstance(shared, dict):
+            shared[("postmerge-reused", project["id"])] = reuse_count
+        runtime.store.event("postmerge", "Post-merge verification reused run " + str(origin) +
+                            " evaluation (reused this tick: " + str(reuse_count) + ")", project["id"], run["id"])
     if merge_record is not None:
         outcome["feedback"]["merge"] = merge_record
     if result["decision"] == "fail" and (previous.get("state") != "regressed" or previous.get("head") != head):
@@ -1431,11 +1557,14 @@ def investigate(runtime, project, run, outcome):
     report_head = report.get("head")
     if not isinstance(report_head, str):
         report_head = "unknown"
+    # 调查对象是主线 head 本身：同 head 的第二个 run（含复用结论者）只挂到既有任务，
+    # 不再为每个 run 各建一份重复调查；无法确认 head 的报告仍按 run 隔离。
+    subject = report_head if report_head != "unknown" else run["id"]
     body = "Investigate observed post-merge mainline failure while monitoring run " + run["id"] + ". "
     body += "This does not prove a regression caused by the candidate. Attribution: " + encode(report.get("attribution", {"scope": "unknown"})) + ". "
     body += "Reproduce and assess value before changing code. Mainline: " + report_head + ". "
     body += "Full evidence is retained in the run's feedback report. Bounded excerpts: " + encode(failures)
-    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + run["id"] + ":" + report_head,
+    task = runtime.store.add_task(project["id"], "goal", "postmerge:" + project["id"] + ":" + subject,
                                   "Investigate verified post-merge regression", body,
                                   evidence=[{"run": run["id"], "head": report_head, "checks": failures}], priority=100)
     report["investigation_pending"] = False

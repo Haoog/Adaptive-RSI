@@ -1269,6 +1269,120 @@ print('BOUNDARIES_OK')
             saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
             self.assertEqual(saved["feedback"]["state"], "verified")
 
+    def postmerge_scenario(self, second_change=None):
+        """两个到期监控 run：各记不同的 merged_sha，但观测同一主线 head。"""
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"feedback_minutes": 5}}, self.project)
+        self.runtime.pause(self.project, False)
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        first = self.commit_mainline("calculator.py", "def add(a, b):\n    return a + b\n", "merge one")
+        path, content = second_change or ("calculator.py", "def add(a, b):\n    return a + b  # second\n")
+        second = self.commit_mainline(path, content, "merge two")
+        head = self.commit_mainline("calculator.py", "def add(a, b):\n    return a + b  # head\n", "mainline")
+        return self.postmerge_monitors([first, second]), head
+
+    def postmerge_monitors(self, merges, verified=True):
+        """到期监控 run；verified=False 时本 tick 需评估各 run 自己的合并提交。"""
+        runs = []
+        for index, merged in enumerate(merges):
+            self.runtime.goal(self.project, "monitor " + str(index))
+            run = self.store.claim(self.project, self.runtime.config(self.project))
+            (self.store.root / "runs" / run["id"]).mkdir(parents=True)
+            result = {"merged_sha": merged, "merged_at": time.time() - 400}
+            if verified:
+                result["feedback"] = {"state": "verified", "head": "older", "checked_at": time.time() - 400,
+                                      "merge": {"sha": merged, "state": "verified", "decision": "pass",
+                                                "checked_at": time.time() - 400}}
+            self.store.transition(run["id"], "merged", result, True)
+            self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+            self.store.put_setting("run-baseline:" + run["id"],
+                                   {"repository": "example/project", "branch": "main", "sha": "base"})
+            self.store.execute("UPDATE runs SET started=? WHERE id=?", (index + 1, run["id"]))
+            runs.append(run)
+        return runs
+
+    def commit_mainline(self, relative, content, message):
+        (self.repo / relative).write_text(content)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", message)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def postmerge_tick(self, head, report):
+        """一次 tick：evaluate 用固定结论替代真实检查，返回其 mock。"""
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value=report) as evaluate, \
+                patch("adaptive_rsi.release.advance", return_value={}):
+            tick(self.runtime, time.time())
+        return evaluate
+
+    def postmerge_results(self, runs):
+        return [json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                for run in runs]
+
+    def test_tick_reuses_postmerge_evaluation_for_the_same_mainline_inputs(self):
+        # 同 tick、同 head、同变更路径集：整套快照+固定检查只做一次，第二个 run 标注来源。
+        runs, head = self.postmerge_scenario()
+        evaluate = self.postmerge_tick(head, {"decision": "pass", "checks": {"candidate": []}})
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual([entry["feedback"]["state"] for entry in saved], ["verified", "verified"])
+        self.assertNotIn("reused_from", saved[0]["feedback"])
+        self.assertEqual(saved[1]["feedback"]["reused_from"], runs[0]["id"])
+
+    def test_tick_reuses_merge_self_check_for_the_same_merged_sha(self):
+        # 证据脚本场景：两个 run 的 merged_sha 就是同一主线 head，合并提交自检只跑一次。
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"feedback_minutes": 5}}, self.project)
+        self.runtime.pause(self.project, False)
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        head = self.commit_mainline("calculator.py", "def add(a, b):\n    return a + b\n", "only merge")
+        runs = self.postmerge_monitors([head, head], verified=False)
+        evaluate = self.postmerge_tick(head, {"decision": "pass", "checks": {"candidate": []}})
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual([entry["feedback"]["state"] for entry in saved], ["verified", "verified"])
+        self.assertEqual(saved[1]["feedback"]["reused_from"], runs[0]["id"])
+        self.assertEqual(saved[0]["feedback"]["merge"]["decision"], "pass")
+
+    def test_postmerge_evaluation_is_not_shared_when_changed_files_differ(self):
+        # merged_sha→head 之间动过的文件集不同会改变 harness 冻结范围，结论不可互换。
+        runs, head = self.postmerge_scenario(("tests/test_calculator.py", "# later mainline test edit\n"))
+        evaluate = self.postmerge_tick(head, {"decision": "pass", "checks": {"candidate": []}})
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual([entry["feedback"].get("reused_from") for entry in saved], [None, None])
+
+    def test_reused_postmerge_failure_creates_one_investigation_per_head(self):
+        # 复用同一 head 的失败结论不得为每个 run 各建一份调查任务。
+        runs, head = self.postmerge_scenario()
+        report = {"decision": "fail", "checks": {"candidate": [
+            {"name": "real unittest regression", "passed": False, "stdout": "", "stderr": "boom"}]}}
+        evaluate = self.postmerge_tick(head, report)
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual([entry["feedback"]["state"] for entry in saved], ["regressed", "regressed"])
+        self.assertEqual(saved[1]["feedback"]["reused_from"], runs[0]["id"])
+        tasks = self.store.query("SELECT * FROM tasks WHERE fingerprint LIKE 'postmerge:%'")
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(saved[1]["feedback"]["investigation_task"], tasks[0]["id"])
+
+    def test_later_tick_reuses_the_persisted_postmerge_evaluation(self):
+        # 不同 tick 的另一个同输入 run 命中持久键，不再重跑快照与固定检查。
+        from adaptive_rsi.delivery import feedback
+        runs, head = self.postmerge_scenario()
+        now = time.time()
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             return_value={"decision": "pass", "checks": {"candidate": []}}) as evaluate:
+            for run in runs:
+                outcome = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+                feedback(self.runtime, self.runtime.project(self.project), run, outcome,
+                         self.runtime.config(self.project), now, shared={})
+        saved = self.postmerge_results(runs)
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(saved[1]["feedback"]["reused_from"], runs[0]["id"])
+        self.assertEqual(saved[1]["feedback"]["evaluation"]["decision"], "pass")
+
     def test_tick_shares_baseline_only_within_the_same_target_branch(self):
         # 评审回归：同项目内 main 的到期监控先执行时，其读数按 (项目, 目标分支)
         # 缓存；随后面向 release 的就绪 run 必须再取一次 release 的真实读数，
