@@ -340,6 +340,10 @@ class CodexAuth(_Process):
                 self.notifications.append(message)
 
     def start(self, provider=None, method=0, inputs=None):
+        # codex app-server 只有 chatgptDeviceCode 一种登录方式；非零 method 或 inputs
+        # 不能静默丢弃，必须与 opencode 路径同样显式拒绝。
+        if method != 0 or inputs:
+            raise AuthError("unsupported_auth_method")
         result = self.request("account/login/start", {"type": "chatgptDeviceCode"})
         self.login_id = result.get("loginId")
         if not isinstance(self.login_id, str) or not isinstance(result.get("userCode"), str):
