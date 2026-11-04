@@ -106,9 +106,45 @@ def baseline(runtime, project, config):
         return str(cache), sha, branch
 
 
+PR_FIELDS = ("url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,"
+             "mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews")
+# 列表页最多返回 100 条；正好满页时无法证明第 101 个受跟踪 PR 不存在，只能回退逐条精确读。
+PR_LIST_LIMIT = 100
+
+
 def pr_view(repo, url):
-    return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json",
-        "url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews"]))
+    return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json", PR_FIELDS]))
+
+
+def pr_index(store, repo, project=None):
+    """Read every tracked PR in one paged request; None means read each PR exactly.
+
+    tick() shares one index per (project, repository) so N tracked PRs cost one gh
+    process instead of N. Unknown URLs still fall back to pr_view, and a full page
+    cannot prove the next page absent, so it falls back instead of dropping PRs.
+    """
+    try:
+        rows = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all",
+            "--limit", str(PR_LIST_LIMIT), "--json", PR_FIELDS]))
+    except Cancelled:
+        raise
+    except ProcessError as exc:
+        store.event("delivery_pr_list_error", str(exc), project)
+        return None
+    except Exception as exc:
+        # 批量读只是优化：任何异常都回退到逐条精确读，让每个 run 自己暴露真实错误，
+        # 不能因为一页列表坏了就中断整轮跟踪。
+        store.event("delivery_pr_list_error", "Invalid PR list response: %s" % exc, project)
+        return None
+    if not isinstance(rows, list):
+        store.event("delivery_pr_list_error", "PR list response is not a list", project)
+        return None
+    if len(rows) >= PR_LIST_LIMIT:
+        store.event("delivery_pr_page_full",
+                    "PR list page is full; tracked PRs are read individually", project)
+        return None
+    return {row["url"]: row for row in rows
+            if isinstance(row, dict) and isinstance(row.get("url"), str) and row["url"]}
 
 
 def _pr_feedback_prefix(project, task):
@@ -899,12 +935,36 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     # 键按 (项目, 目标分支) 隔离：同项目不同目标分支的 fetch 结果绝不互用，
     # 否则 main 的监控读数会让面向 release 的就绪 run 被静默跳过。
     tick_baselines = {}
+    origins = {}
+    indexes = {}
     from .release import pending
 
-    for run in store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR " +
-                           _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")" +
-                           (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
-                           (project_id,) if project_id else ()):
+    runs = store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR " +
+                       _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")" +
+                       (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
+                       (project_id,) if project_id else ())
+    # 单个受跟踪 PR 用 pr_view 更省一次列表读取；同一项目本轮有多个 PR 时才合并成
+    # 一次 gh pr list。索引按 (项目, 仓库) 缓存，配置换了仓库也不会读到别处的 PR。
+    tracked = {}
+    for row in runs:
+        if row["state"] in ("pr_open", "superseded"):
+            tracked[row["project"]] = tracked.get(row["project"], 0) + 1
+
+    def indexed_pr(project_id, repo, url):
+        key = (project_id, repo)
+        if key not in indexes:
+            indexes[key] = (pr_index(store, repo, project_id)
+                            if tracked.get(project_id, 0) > 1 else None)
+        index = indexes[key]
+        return index.get(url) if index else None
+
+    def origin(path):
+        # tick 内 origin 远端不会变化：同项目多个 run 共用首次探测结果。
+        if path not in origins:
+            origins[path] = origin_repository(path)
+        return origins[path]
+
+    for run in runs:
         if tracking_cancelled():
             return
         project = runtime.project(run["project"])
@@ -926,7 +986,7 @@ def tick(runtime, now=None, project_id=None, active_run=None):
             repo = config["github"]["repository"]
             policy = store.setting("delivery:" + run["id"])
             if (not policy or not isinstance(policy, dict) or not repo or
-                    repo.lower() != origin_repository(project["path"]).lower()):
+                    repo.lower() != origin(project["path"]).lower()):
                 continue
             if not all(isinstance(policy.get(key), str) for key in ("branch", "base", "head")):
                 # 交付策略损坏时无法安全判断远端状态；跳过本轮而非终止整个追踪循环。
@@ -949,7 +1009,11 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     # close 写失败同样退避：权限/凭据失效往往持续数小时，不能
                     # 每轮都重发失败远端写并刷写 delivery_error。
                     continue
-            pr = pr_view(repo, pr_url) if run["state"] in ["pr_open", "superseded"] else None
+            pr = None
+            if run["state"] in ["pr_open", "superseded"]:
+                # 列表里缺该 URL（页面截断、仓库 PR 过多或刚创建）时回退单条精确读；
+                # 失败仍由外层记 delivery_error，只影响本 run，不波及其它跟踪项。
+                pr = indexed_pr(run["project"], repo, pr_url) or pr_view(repo, pr_url)
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
             feedback_keys = []
@@ -1138,6 +1202,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                     live_config["delivery"]["base_branch"] == config["delivery"]["base_branch"] and
                                     (not live_config["delivery"]["base_branch"] or
                                      live_config["delivery"]["base_branch"] == policy["branch"]) and
+                                    # 合并准入复核必须实时探测 origin：fetch 期间远端可能被改指向
+                                    # 别的仓库，复用 tick 开头的读数会放行一次本该拒绝的合并。
                                     repo.lower() == origin_repository(live_project["path"]).lower() and
                                     live_policy == policy and live_identity == identity and
                                     live_identity == {"repository": repo, "branch": policy["branch"], "sha": policy["base"]} and
