@@ -1,5 +1,6 @@
 """Ordered additive migrations with explicitly identified legacy checksums."""
 import hashlib
+import json
 import logging
 from pathlib import Path
 import sqlite3
@@ -233,12 +234,70 @@ def validate_history(db):
     return 3 in applied
 
 
+def _quarantine_unsafe_dependencies(db):
+    """Archive legacy dependency rows that migration 006 cannot copy.
+
+    006 重建 task_dependencies（NOT NULL、复合主键、CHECK(task<>dependency)），随后裸
+    INSERT ... SELECT 复制旧表。历史库里只要有一行自环或指向已删任务，迁移就抛原始
+    SQLite 错误且每次启动重复失败；清理这些行的 quarantine_orphans 只在启动后的
+    maintenance 里跑，永远到不了。这里在 006 执行前把恰好无法满足新约束的行搬进
+    relationship_quarantine 并各记一条事件；006 文件本身不动，正常库逐行原样复制。
+
+    行存在但无法安全归档时抛带版本号与修复指引的 RuntimeError；不静默丢弃证据。
+    """
+    tables = _tables(db)
+    if "task_dependencies" not in tables or not {"task", "dependency"} <= set(
+            _columns(db, "task_dependencies")):
+        raise RuntimeError(
+            "Database migration 6 cannot inspect task_dependencies: the legacy table or its "
+            "task/dependency columns are missing; restore a backup or repair the table, then reopen")
+    rows = db.execute(
+        "SELECT d.rowid AS original_rowid,d.task,d.dependency,t.project AS task_project "
+        "FROM task_dependencies d LEFT JOIN tasks t ON t.id=d.task "
+        "LEFT JOIN tasks p ON p.id=d.dependency "
+        "WHERE d.task IS NULL OR d.dependency IS NULL OR d.task=d.dependency "
+        "OR t.id IS NULL OR p.id IS NULL ORDER BY d.rowid").fetchall()
+    if not rows:
+        return 0
+    missing = [name for name in ("relationship_quarantine", "events") if name not in tables]
+    if missing:
+        raise RuntimeError(
+            "Database migration 6 found %d task_dependencies row(s) that violate the new "
+            "dependency constraints but cannot quarantine them: table(s) %s are missing; "
+            "restore a backup or create the missing table(s), then reopen"
+            % (len(rows), ", ".join(missing)))
+    now = time.time()
+    try:
+        for row in rows:
+            data = json.dumps({"task": row["task"], "dependency": row["dependency"]},
+                              ensure_ascii=False, sort_keys=True)
+            db.execute("INSERT INTO relationship_quarantine(table_name,row_id,data,created) "
+                       "VALUES ('task_dependencies',?,?,?)",
+                       (str(row["original_rowid"]), data, now))
+            db.execute("DELETE FROM task_dependencies WHERE rowid=?", (row["original_rowid"],))
+            db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,NULL,?,?,?,?)",
+                       (row["task_project"], "dependency_orphan_quarantined",
+                        "Orphaned dependency reference quarantined; task readiness re-evaluated",
+                        data, now))
+    except sqlite3.Error as exc:
+        raise RuntimeError(
+            "Database migration 6 found %d task_dependencies row(s) that violate the new "
+            "dependency constraints but could not be quarantined (%s); restore a backup or "
+            "repair the quarantine tables, then reopen" % (len(rows), exc)) from exc
+    LOGGER.warning("Quarantined %d task_dependencies row(s) before migration 6", len(rows))
+    return len(rows)
+
+
 def apply(db):
     for version, content in scripts():
         if db.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
             continue
         if not db.in_transaction:
             db.execute("BEGIN IMMEDIATE")
+        if version == 6:
+            # 006 以文件 sha256 记账，不能在 SQL 里加过滤；预清理与迁移共用同一事务，
+            # 006 失败时隔离记录一并回滚，坏库不会留下半个状态。
+            _quarantine_unsafe_dependencies(db)
         # executescript commits implicitly; execute complete statements within the
         # same transaction as the ledger row so interrupted migrations roll back.
         statement = ""

@@ -137,13 +137,38 @@ def verify_test_identities(rows, required):
             "basis": "runner_reported_exact_test_ids"}
 
 
-def collect_test_artifacts(root, maximum=2 * 1024 * 1024):
-    """Collect only fixed workspace-relative reports with a total byte cap."""
+TEST_ARTIFACTS = ("junit.xml", "test-results.xml", "coverage.xml", "lcov.info", "coverage/lcov.info")
+
+
+def artifact_snapshot(root):
+    """Fingerprint the fixed report paths before a check runs.
+
+    Checks in one stage share a workspace, so a report left behind by an earlier
+    check must not be credited to a later one that never wrote it.
+    """
+    root = Path(root).resolve()
+    snapshot = {}
+    for relative in TEST_ARTIFACTS:
+        try:
+            info = os.lstat(root / relative)
+        except OSError:
+            continue
+        snapshot[relative] = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    return snapshot
+
+
+def collect_test_artifacts(root, maximum=2 * 1024 * 1024, previous=None):
+    """Collect only fixed workspace-relative reports with a total byte cap.
+
+    When ``previous`` comes from :func:`artifact_snapshot`, a report whose
+    fingerprint did not change is reported missing rather than collected: it
+    belongs to an earlier check, not the one that just ran.
+    """
     import hashlib
     import stat
     root = Path(root).resolve()
     rows, remaining = {}, maximum
-    for relative in ("junit.xml", "test-results.xml", "coverage.xml", "lcov.info", "coverage/lcov.info"):
+    for relative in TEST_ARTIFACTS:
         path = root / relative
         if any(parent.is_symlink() for parent in [path] + list(path.parents) if parent != root):
             rows[relative] = {"state": "rejected", "reason": "symlink"}
@@ -158,6 +183,10 @@ def collect_test_artifacts(root, maximum=2 * 1024 * 1024):
             continue
         with os.fdopen(descriptor, "rb") as stream:
             info = os.fstat(stream.fileno())
+            if previous is not None and previous.get(relative) == (
+                    info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+                rows[relative] = {"state": "missing"}
+                continue
             if not stat.S_ISREG(info.st_mode) or info.st_size > remaining:
                 rows[relative] = {"state": "rejected", "reason": "type_or_size_limit"}
                 continue
@@ -169,6 +198,14 @@ def collect_test_artifacts(root, maximum=2 * 1024 * 1024):
         rows[relative] = {"state": "collected", "bytes": len(data),
                           "sha256": hashlib.sha256(data).hexdigest(), "content": data.decode("utf-8", "replace")}
     return rows
+
+
+def check_with_fresh_artifacts(sandbox, check, target, cancel=None, protected=(), hidden=()):
+    """Run one check and collect only the reports that this run created or rewrote."""
+    previous = artifact_snapshot(target)
+    result = sandbox.check(check, target, cancel, protected, hidden)
+    result["artifacts"] = collect_test_artifacts(target, previous=previous)
+    return result
 
 
 def scheduling_scope(config, acceptance, changed_files):
@@ -1002,7 +1039,7 @@ class Evaluator:
             effective_checks = [check for check in effective_checks if check in run_checks]
         rows = []
         for check in effective_checks:
-            result = sandbox.check(check, target, cancel, protected, hidden)
+            result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
             text = result["stdout"] + result["stderr"]
             empty = empty_test_run(text)
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty
@@ -1010,7 +1047,6 @@ class Evaluator:
             result["test_summary"] = (structured_test_summary(text) or junit_test_summary(text) or
                                       clarity_test_summary(text))
             result["test_identities"] = test_identities(text)
-            result["artifacts"] = collect_test_artifacts(target)
             rows.append(result)
         outcome = {"rows": rows}
         if test_first_check is not None and label in {"baseline", "candidate"}:
@@ -1042,11 +1078,10 @@ class Evaluator:
                 return {"setup": result}
         rows = []
         for check in acceptance["checks"]:
-            result = sandbox.check(check, target, cancel, protected, hidden)
+            result = check_with_fresh_artifacts(sandbox, check, target, cancel, protected, hidden)
             result["passed"] = result["exit_code"] == 0 and not result["error"] and not empty_test_run(
                 result["stdout"] + result["stderr"])
             result["test_identities"] = test_identities(result["stdout"] + result["stderr"])
-            result["artifacts"] = collect_test_artifacts(target)
             rows.append(result)
         return {"rows": rows}
 
