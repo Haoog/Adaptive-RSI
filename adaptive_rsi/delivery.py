@@ -719,6 +719,7 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
             return
         outcome['delivery_recovery_at'] = now
         outcome['delivery_recovery_retry'] = 3600
+        state = 'superseded'
         if matches:
             outcome['delivery_recovery_checked'] = True
             pr = matches[0]
@@ -734,13 +735,18 @@ def _recover_superseded_receipt(runtime, project, run, config, now):
                 outcome.update(delivery_status='merged', merged_at=now, close_pending=False)
                 if isinstance(oid, str) and oid:
                     outcome['merged_sha'] = oid
+                    # 合并提交已经落在主线上：与正常合并路径一致把运行推进到 merged，
+                    # 让 tick 的 feedback()/advance() 接手合并后重验与发布推进。
+                    # 停在 superseded 会退出后续扫描，同一段代码从此没有验证回执
+                    # 和发布资格。oid 缺失时仍保留 superseded（无 sha 无法验证）。
+                    state = 'merged'
                 if previous_status not in ('stale', 'feedback_replan'):
                     db.execute("UPDATE tasks SET state='merged',updated=? WHERE id=? AND state IN ('queued','blocked','obsolete') "
                                "AND NOT EXISTS (SELECT 1 FROM runs WHERE task=? AND state='awaiting_approval')",
                                (now, run['task'], run['task']))
             db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('delivery:' + run['id'], encode(
                 {'head': head, 'base': run['base'], 'branch': base_branch, 'repository': repo})))
-        db.execute('UPDATE runs SET result=? WHERE id=? AND state=\'superseded\'', (encode(outcome), run['id']))
+        db.execute("UPDATE runs SET state=?,result=? WHERE id=? AND state='superseded'", (state, encode(outcome), run['id']))
 
 
 def schedule(runtime, now=None):
