@@ -36,6 +36,9 @@ HOST_TOOL_DIGEST_CACHE_LIMIT = 32
 _HOST_TOOL_DIGESTS = {}
 _HOST_TOOL_DIGESTS_LOCK = threading.Lock()
 CACHE_STDERR_LIMIT = 16 * 1024
+# Cached rows keep only what gate and review comparisons read; raw artifact
+# contents stay in the run directory and are re-read on demand.
+CACHE_ARTIFACT_FIELDS = ("state", "reason", "bytes", "sha256")
 UNAVAILABLE_OUTPUT = re.compile(
     r"execvp\(\).*No such file|executable file not found|exec:.*not found", re.I)
 DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
@@ -938,6 +941,11 @@ class Evaluator:
         compact = []
         for row in rows:
             item = {field: value for field, value in row.items() if field != "stdout"}
+            if isinstance(item.get("artifacts"), dict):
+                item["artifacts"] = {
+                    name: ({field: artifact[field] for field in CACHE_ARTIFACT_FIELDS if field in artifact}
+                           if isinstance(artifact, dict) else artifact)
+                    for name, artifact in item["artifacts"].items()}
             item["environment_error"] = environment_failure(row)
             if item.get("stderr"):
                 item["stderr"] = item["stderr"][-CACHE_STDERR_LIMIT:]
