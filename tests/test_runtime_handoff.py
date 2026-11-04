@@ -1481,6 +1481,54 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertIsNone(barrier(self.runtime))
         self.assertIsNone(self.store.setting(KEY))
 
+    def test_stale_installing_barrier_recovers(self):
+        # 存活但已不是安装器的 pid、或挂起的安装器，曾让 installing 屏障永不清理：
+        # expires 不参与判定，os.kill 又始终成功。硬上界必须在窗口后放行准入。
+        from adaptive_rsi.lifecycle import INSTALL_WINDOW, KEY, barrier, readiness
+        self.assertGreaterEqual(INSTALL_WINDOW, 3600)
+        self.runtime.updates.desktop_managed = True
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+        self.runtime.updates.desktop_owner_pid = os.getpid()
+        state = readiness(self.runtime, 'commit', lease=prepared['lease'])['barrier']
+        self.store.put_setting(KEY, {**state, 'committed': time.time() - INSTALL_WINDOW - 60})
+        self.assertIsNone(barrier(self.runtime))
+        self.assertIsNone(self.store.setting(KEY))
+        event = json.loads(self.store.one(
+            "SELECT data FROM events WHERE kind='desktop_update_recovered' ORDER BY rowid DESC")['data'])
+        self.assertEqual(event['reason'], 'install_expired')
+        self.assertFalse(self.runtime.updates.is_busy())
+        fresh = readiness(self.runtime, 'prepare', '9.0.1')['barrier']
+        self.assertEqual((fresh['phase'], fresh['version']), ('draining', '9.0.1'))
+
+    def test_fresh_installing_barrier_is_kept(self):
+        from adaptive_rsi.lifecycle import KEY, barrier, readiness
+        self.runtime.updates.desktop_managed = True
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+        self.runtime.updates.desktop_owner_pid = os.getpid()
+        state = readiness(self.runtime, 'commit', lease=prepared['lease'])['barrier']
+        kept = barrier(self.runtime)
+        self.assertEqual((kept['lease'], kept['owner_pid'], kept['phase']),
+                         (state['lease'], os.getpid(), 'installing'))
+        self.assertIsNotNone(self.store.setting(KEY))
+        self.assertTrue(self.runtime.updates.is_busy())
+        self.assertIsNone(self.store.one("SELECT 1 FROM events WHERE kind='desktop_update_recovered'"))
+        if state.get('owner_start') is not None:
+            self.assertEqual(kept['owner_start'], state['owner_start'])
+
+    @unittest.skipUnless(os.path.exists('/proc/self/stat'), 'PID identity requires procfs')
+    def test_reused_installer_pid_recovers_as_owner_exited(self):
+        from adaptive_rsi.lifecycle import KEY, barrier, readiness
+        self.runtime.updates.desktop_managed = True
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+        self.runtime.updates.desktop_owner_pid = os.getpid()
+        state = readiness(self.runtime, 'commit', lease=prepared['lease'])['barrier']
+        self.assertIsInstance(state['owner_start'], str)
+        self.store.put_setting(KEY, {**state, 'owner_start': state['owner_start'] + '0'})
+        self.assertIsNone(barrier(self.runtime))
+        event = json.loads(self.store.one(
+            "SELECT data FROM events WHERE kind='desktop_update_recovered' ORDER BY rowid DESC")['data'])
+        self.assertEqual(event['reason'], 'owner_exited')
+
     def test_prepare_recovers_a_barrier_record_without_a_lease(self):
         from adaptive_rsi.lifecycle import KEY, readiness
         self.runtime.updates.desktop_managed = True
