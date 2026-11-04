@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
@@ -975,6 +976,63 @@ class ManualReconciliationTest(_ManualReconciliationFixture):
             self.assertEqual(saved["reconciliation"]["state"], "matched")
             self.assertEqual(saved["reconciliation"]["candidate_run_ids"], [17])
             self.assertEqual(self.posts, [])
+
+    def saturated_listing(self, runs_per_page=100, total_count=None):
+        """Return recorded calls plus a stub that is never exhausted by paging."""
+        calls = []
+
+        def handler(repo, endpoint, method="GET", fields=None):
+            calls.append(endpoint)
+            runs = [{"id": 5000 + index, "display_title": "another-operation", "event": "workflow_dispatch",
+                     "path": self.WORKFLOW + "@refs/tags/trusted-v1", "head_sha": self.TRUSTED,
+                     "head_branch": "trusted-v1", "status": "completed",
+                     "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                    for index in range(runs_per_page)]
+            return {"workflow_runs": runs} if total_count is None else {"workflow_runs": runs, "total_count": total_count}
+
+        return calls, handler
+
+    def test_dispatch_window_bounds_the_listing_and_backs_off_a_full_page(self):
+        data = self.operation(created_at=time.time() - 60)
+        calls, handler = self.saturated_listing(total_count=100)
+        with patch.object(release, "api", side_effect=handler):
+            first = release.reconcile(self.runtime, self.record, "release", data, persist=True)
+            self.assertEqual(first["state"], "dispatch_unknown")
+            self.assertEqual(len(calls), 1)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(calls[0]).query)
+            self.assertEqual(query["event"], ["workflow_dispatch"])
+            self.assertEqual(query["created"], [">=" + time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(data["created_at"] - release.RECONCILIATION_CREATED_MARGIN_SECONDS))])
+            saved = self.saved()
+            self.assertEqual(saved["reconciliation"]["state"], "awaiting_remote_visibility")
+            self.assertGreater(saved["reconcile_next_check_at"], time.time())
+            second = release.reconcile(self.runtime, self.record, "release", saved, persist=True)
+        self.assertEqual(second["state"], "dispatch_unknown")
+        self.assertEqual(len(calls), 1, "a tick inside the recheck window must not query GitHub again")
+        self.assertEqual(self.posts, [])
+
+    def test_operator_candidates_bypass_the_no_match_recheck_window(self):
+        data = self.operation()
+        calls, handler = self.saturated_listing(total_count=100)
+        with patch.object(release, "api", side_effect=handler):
+            release.reconcile(self.runtime, self.record, "release", data, persist=True)
+            self.assertTrue(release._reconciliation_backoff_active(self.saved()))
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+        self.assertEqual(len(calls), 2, "an operator query must always re-read GitHub")
+        self.assertEqual(view["reconciliation_state"], "awaiting_remote_visibility")
+        self.assertEqual(view["candidates"], [])
+        self.assertEqual(self.posts, [])
+
+    def test_receipt_without_created_at_keeps_the_ten_page_cap(self):
+        data = self.operation(created_at=None)
+        calls, handler = self.saturated_listing()
+        with patch.object(release, "api", side_effect=handler):
+            result = release.reconcile(self.runtime, self.record, "release", data, persist=True)
+        self.assertEqual(result["state"], "dispatch_unknown")
+        self.assertEqual(result["reconciliation"]["state"], "awaiting_remote_visibility")
+        self.assertEqual(len(calls), 10)
+        self.assertNotIn("created=", calls[0])
+        self.assertEqual(self.posts, [])
 
     def test_retry_network_timeout_sets_rerun_unknown_and_enables_immediate_reconciliation(self):
         self.operation(kind="release", state="failed", workflow_run_id=17, attempt=1,
