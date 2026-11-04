@@ -17,6 +17,30 @@ FEEDBACK_LABELS = ("false_positive", "confirmed_regression", "rejected")
 FEEDBACK_SOURCE_PREFIX = "human:"
 # 受控消融沿用 attribution() 的四配置命名，避免报告与试验标签不一致。
 ABLATION_CONFIGURATIONS = ("baseline", "strategy_only", "skill_only", "combined")
+# 配对试验只有 pass/fail 是结论性结果。insufficient_evidence / error / interrupted /
+# 缺失都表示那一臂没有跑成：既不是改进，也不是回归。
+CONCLUSIVE_DECISIONS = ("pass", "fail")
+
+
+def arm_decision(arm):
+    """Return one trial arm's decision, or None when it carries no conclusion.
+
+    ``run_configuration`` 原样记录评估器返回的 ``decision``。早期封存证据里只有布尔
+    ``pass``，对这类记录按 True/False 还原 pass/fail，既让旧证据保持原有含义，也不把
+    「字段缺失」误判成失败。
+    """
+    if not isinstance(arm, dict):
+        return None
+    decision = arm.get("decision")
+    if isinstance(decision, str) and decision:
+        return decision
+    if "decision" in arm:
+        # 显式记录了未知取值：这一臂没有可用结论。
+        return None
+    passed = arm.get("pass")
+    return "pass" if passed is True else "fail" if passed is False else None
+
+
 DEFAULT_PROVIDER_ENV_KEYS = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
@@ -107,7 +131,7 @@ def paired_summary(trials):
         if trial.get("case"):
             families.setdefault(trial["case"], []).append(trial)
     wins = losses = ties = 0
-    no_change = 0
+    no_change = inconclusive = 0
     cohorts = {}
     for family, rows in families.items():
         complete = [row for row in rows if "stable" in row and "candidate" in row]
@@ -119,15 +143,23 @@ def paired_summary(trials):
             cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                                "outcome": "no_change", "repetitions": len(complete)}
             continue
-        lost = any(row["stable"]["pass"] and not row["candidate"]["pass"] for row in complete)
-        won = not lost and any(not row["stable"]["pass"] and row["candidate"]["pass"] for row in complete)
+        if any(arm_decision(row[v]) not in CONCLUSIVE_DECISIONS for row in complete for v in ("stable", "candidate")):
+            # 没跑成的臂没有结论，记成 win/loss/tie 也会伪造证据；单独计数便于报告说明原因。
+            inconclusive += 1
+            cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
+                               "outcome": "inconclusive", "repetitions": len(complete),
+                               "arms": sorted({str(variant) + ":" + str(arm_decision(row[variant]) or "unknown")
+                                               for row in complete for variant in ("stable", "candidate")})}
+            continue
+        lost = any(arm_decision(row["stable"]) == "pass" and arm_decision(row["candidate"]) == "fail" for row in complete)
+        won = not lost and any(arm_decision(row["stable"]) == "fail" and arm_decision(row["candidate"]) == "pass" for row in complete)
         wins += won
         losses += lost
         ties += not won and not lost
         cohorts[family] = {"source": complete[0].get("source"), "split": complete[0].get("split"),
                            "outcome": "loss" if lost else "win" if won else "tie", "repetitions": len(complete)}
     n = wins + losses
-    summary = {"wins": wins, "losses": losses, "ties": ties, "no_change": no_change,
+    summary = {"wins": wins, "losses": losses, "ties": ties, "no_change": no_change, "inconclusive": inconclusive,
                "unit": "independent_case_family",
                "unknown_identity_trials": sum(not trial.get("case") for trial in trials),
                "estimate": wins / n if n else None, "cohorts": cohorts}
@@ -608,11 +640,11 @@ class Evolution:
             # 若都补跑会生成重复配置行，使四配置比较永久停在 insufficient_evidence。
             case = trial.get("case")
             if (trial.get("split") != "validation" or case in seen or
-                    trial.get("stable", {}).get("pass") is not False or
-                    trial.get("candidate", {}).get("pass") is not True or
+                    arm_decision(trial.get("stable", {})) != "fail" or
+                    arm_decision(trial.get("candidate", {})) != "pass" or
                     trial.get("stable", {}).get("no_change") or
                     trial.get("candidate", {}).get("no_change")):
-                # 空转变体（no_change）不是可比较的收益，不能为它补跑消融。
+                # 空转变体没有可比较的收益；没有结论的臂（评估器不可用/异常）也不能作为消融输入。
                 continue
             seen.add(case)
             wins.append(trial)
@@ -651,7 +683,8 @@ class Evolution:
                                                     current, directory, candidate, config, branch="ablation",
                                                     experiment_skills=[skill], baseline_ids=baseline_ids)
                 record["rows"].extend([
-                    {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"]},
+                    {"input": trial["case"], "variant": "baseline", "pass": trial["stable"]["pass"],
+                     "decision": arm_decision(trial["stable"])},
                     {"input": trial["case"], "variant": "strategy_only", "pass": strategy_only["pass"],
                      "no_change": strategy_only.get("no_change", False)},
                     {"input": trial["case"], "variant": "skill_only", "pass": skill_only["pass"],
@@ -1316,7 +1349,11 @@ class Evolution:
             if hasattr(self.runtime, "propagate_deadline"):
                 self.runtime.propagate_deadline(run, trial_run)
         after = self.store.one("SELECT coalesce(sum(tokens),0) AS n, count(*) AS calls, coalesce(sum(usage_known IS NOT 1),0) AS unknown FROM calls WHERE run=?", (run["id"],))
-        return {"pass": bool(outcome and outcome.get("decision") == "pass"),
+        decision = (outcome or {}).get("decision")
+        # 只保留布尔 pass 会把「用例确实失败」和「这一臂没跑成」压成同一结论；
+        # 原样记录 decision，配对判定才能把 insufficient_evidence/error 视为无结论。
+        return {"pass": decision == "pass",
+                "decision": decision if isinstance(decision, str) and decision else "error",
                 "no_change": bool((outcome or {}).get("no_change")),
                 "review": (outcome or {}).get("review", {}), "reason": (outcome or {}).get("reason", "No change"),
                 "seconds": time.monotonic() - started, "tokens": after["n"] - before["n"],
@@ -1716,11 +1753,25 @@ class Evolution:
             # 空转的变体与 baseline 是同一棵树：它既不能证明改进，也不能算作回归。
             return {"decision": "insufficient_evidence",
                     "reason": "An experiment variant produced no code changes; an empty patch is not evidence"}
-        if any(t["stable"]["pass"] and not t["candidate"]["pass"] for t in trials):
+        # 任一臂没有结论（评估器不可用、超时、异常）时，这一配对不能计胜负：把没跑成的
+        # stable 臂当成失败会凭空造出 10 次「改进」，把没跑成的 candidate 当成失败则会把
+        # 一次瞬时故障记成回归。先判真实回归（两臂都有结论），再单独报告无结论的臂。
+        inconclusive = [t for t in trials
+                        if arm_decision(t["stable"]) not in CONCLUSIVE_DECISIONS or
+                        arm_decision(t["candidate"]) not in CONCLUSIVE_DECISIONS]
+        if any(arm_decision(t["stable"]) == "pass" and arm_decision(t["candidate"]) == "fail" for t in trials):
             return {"decision": "fail", "reason": "Candidate regressed on previously passing cases"}
+        if inconclusive:
+            arms = sorted({variant + ":" + str(arm_decision(t[variant]) or "unknown")
+                           for t in inconclusive for variant in ("stable", "candidate")
+                           if arm_decision(t[variant]) not in CONCLUSIVE_DECISIONS})
+            return {"decision": "insufficient_evidence",
+                    "reason": "A paired arm produced no conclusive result (" + ", ".join(arms) +
+                              "); an unfinished arm is neither an improvement nor a regression",
+                    "inconclusive_families": len({t.get("case") for t in inconclusive})}
         for split in {t["split"] for t in trials}:
             group = [t for t in trials if t["split"] == split]
-            if not any(not t["stable"]["pass"] and t["candidate"]["pass"] for t in group):
+            if not any(arm_decision(t["stable"]) == "fail" and arm_decision(t["candidate"]) == "pass" for t in group):
                 return {"decision": "insufficient_evidence", "reason": "No demonstrated improvement on each evaluated split"}
         return {"decision": "pass", "reason": "Paired quality improved without observed regressions; usage recorded separately"}
 
@@ -1739,7 +1790,8 @@ class Evolution:
                        len({t["split"] for t in g}) == 1 for g in families.values())
         enough = all(sum(g[0]["split"] == split for g in families.values()) >= config["evolution"]["min_cases_per_split"]
                      for split in ["validation", "holdout"])
-        wins = sum(all(not t["stable"]["pass"] and t["candidate"]["pass"] for t in group) for group in families.values())
+        wins = sum(all(arm_decision(t["stable"]) == "fail" and arm_decision(t["candidate"]) == "pass" for t in group)
+                   for group in families.values())
         # Families, not repeated executions, are the independent units. With no losses,
         # a one-sided exact sign test still needs at least five consistent wins.
         probability = 0.5 ** wins
