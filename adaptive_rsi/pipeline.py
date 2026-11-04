@@ -753,6 +753,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     if not experiment:
         save(runtime, run, "validated_candidate", {"patch": patch, "patch_hash": fingerprint(patch), "summary": result["summary"]}, candidate_key)
     transition("evaluating", {"stage": "review"})
+    # 试验判定在评估失败时直接取评估结论（见 outcome["decision"]），评审 verdict 必然
+    # 被丢弃；此时仍为 review/risk_review 各付一次模型调用纯属浪费，两个付费调用一并
+    # 跳过，改用评估证据占位保留失败诊断。
+    skip_paid_review = experiment and evaluation["decision"] != "pass"
     review_key = _review_key(run, task, base, strategies, config, plan, evaluation, result["summary"], patch)
     # 复用历史评审记录时逐项隔离：归一化后仍无法通过评审门禁的记录只作废该项，
     # 随后重新评审；其余阶段照常复用，不再中断整个恢复。
@@ -760,6 +764,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         runtime, run, "review", review_key, accept=_approved_review,
         normalize=lambda value: enforce_cached_review(value, config))
     review = saved_review
+    if review is None and skip_paid_review:
+        review = {"decision": "skipped", "reason": evaluation["reason"],
+                  "skipped": "evaluation_not_passed",
+                  "evaluation": _review_evidence(evaluation, include_test_output=False)}
     if review is None:
         review_context = {"task": context["task"], "plan": plan, "evaluation": _review_evidence(evaluation),
                           "summary": result["summary"]}
@@ -775,7 +783,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             accept=_approved_review)
     transition("evaluating", {"stage": "review"})
     risk_review = None
-    if risk_review_required(plan, review, files, patch):
+    if risk_review_required(plan, review, files, patch) and not skip_paid_review:
         # 复用的高风险评审记录同样逐项隔离；fresh 输出仍走正常 enforce_review 门禁。
         risk_review = None if experiment else cached(
             runtime, run, "risk_review", review_key, accept=_approved_review,
