@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from adaptive_rsi.store import POOL_SIZE, Store, encode
+from adaptive_rsi.store import MAX_CONNECTIONS, POOL_SIZE, Store, encode
 
 
 class StorePoolTest(unittest.TestCase):
@@ -158,25 +158,40 @@ class StorePoolTest(unittest.TestCase):
         self.assertFalse(self.store._clock_samples)
 
     def count_new_connections(self):
-        """Patch Store._new_connection and return the list of created connections."""
+        """Patch Store._new_connection，返回新建连接列表与同时存活连接的峰值。"""
         created = []
+        live = [0]
+        peak = [0]
         original = Store._new_connection
         lock = threading.Lock()
 
         def counting(store_self):
             db = original(store_self)
+            real_close = db.close
+            closed = [False]
+
+            def tracked_close():
+                with lock:
+                    if not closed[0]:
+                        closed[0] = True
+                        live[0] -= 1
+                real_close()
+
             with lock:
                 created.append(db)
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            db.close = tracked_close
             return db
 
         patcher = patch.object(Store, "_new_connection", counting)
         patcher.start()
         self.addCleanup(patcher.stop)
-        return created
+        return created, peak
 
     def test_concurrent_queries_reuse_a_bounded_pool(self):
         self.store.execute("INSERT INTO projects(id,name,path) VALUES ('p','p','/p')")
-        created = self.count_new_connections()
+        created, peak = self.count_new_connections()
         threads, iterations = 16, 50
         errors = []
         max_pool_size = [0]
@@ -203,8 +218,11 @@ class StorePoolTest(unittest.TestCase):
         self.assertEqual(self.store.one("SELECT count(*) AS n FROM events WHERE project='p'")["n"], threads * iterations)
         # 1600 次借出只允许创建受并发上限约束的少量连接：池确实在复用且有界。
         self.assertLessEqual(max_pool_size[0], POOL_SIZE)
-        self.assertLessEqual(len(created), threads)
-        self.assertLess(len(created), threads * iterations * 2)
+        # 池满时归还的连接按设计直接关闭，之后借用会重建，因此创建总数可以超过线程数；
+        # 真正有界的是同时存活的连接数（_connection_capacity 的上限）。
+        self.assertLessEqual(peak[0], MAX_CONNECTIONS + POOL_SIZE)
+        # 复用仍要占主导：1600 次借出最多允许创建一半数量的连接。
+        self.assertLess(len(created), threads * iterations // 2)
 
     def test_wal_and_foreign_keys_survive_pool_reuse(self):
         self.assertEqual(self.store.query("PRAGMA journal_mode"), [{"journal_mode": "wal"}])
@@ -229,7 +247,7 @@ class StorePoolTest(unittest.TestCase):
 
     def test_failed_transaction_is_closed_instead_of_returned_to_the_pool(self):
         self.assertEqual(self.store._pool.qsize(), 1)
-        created = self.count_new_connections()
+        created, _ = self.count_new_connections()
         with self.assertRaises(sqlite3.OperationalError):
             with self.store.connect() as db:
                 db.execute("SELECT missing_column FROM settings")
