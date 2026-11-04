@@ -27,6 +27,11 @@ MAINTENANCE_RETRY_MAX_SECONDS = 3600
 CLEANUP_LOCK_ATTEMPTS = 3
 CLEANUP_LOCK_RETRY_SECONDS = 5
 
+# 确定性拒绝标记的重验窗口：运行目录是不是符号链接取决于文件系统状态，
+# 运维把链接换成同名真实目录后 runs.path 并不变化，永久跳过会饿死该运行；
+# 超过窗口的标记重新进入候选，仍不安全则重写标记顺延，恢复正常则清除。
+RETENTION_REJECT_REVALIDATE_SECONDS = 6 * 3600
+
 
 def _retry_deadline(value):
     """Read the earliest allowed retry from the persisted backoff record."""
@@ -718,8 +723,10 @@ class Maintenance:
         """Mark a deterministically rejected runs.path so later passes skip it.
 
         标记按 (run.id, run.path) 匹配：运维把 runs.path 修回 runs/ 内后该
-        运行自动回到候选。写 settings 失败时异常冒泡到 scheduler_scope，
-        下个周期仍会按原路径重试，不会留下只有一半的证据。
+        运行自动回到候选。符号链接这类文件系统条件可在 path 不变时变化，
+        因此标记只屏蔽 RETENTION_REJECT_REVALIDATE_SECONDS 一个窗口，到期
+        重新检查；写 settings 失败时异常冒泡到 scheduler_scope，下个周期
+        仍会按原路径重试，不会留下只有一半的证据。
         """
         self.store.put_setting("retention_path_rejected:" + run["id"],
                                {"path": run["path"], "reason": reason,
@@ -757,13 +764,17 @@ class Maintenance:
             with self.scheduler_scope("maintenance_project", project["id"]):
                 config = self.config(project["id"])
                 cutoff = now - config["limits"]["retention_days"] * 86400
+                revalidate = now - RETENTION_REJECT_REVALIDATE_SECONDS
                 # 已确定性拒绝的 runs.path（见 _reject_retention_path）按 (id,path)
                 # 匹配跳过；运维修正 path 后标记失配，该运行自动回到清理候选。
+                # 符号链接等文件系统条件可在 path 不变时变化，因此只屏蔽一个
+                # 重验窗口：超窗标记回到候选，仍不安全则重新标记，恢复则清除。
                 for run in self.store.query(
                         "SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL "
                         "AND NOT EXISTS (SELECT 1 FROM settings WHERE key='retention_path_rejected:' || runs.id "
-                        "AND json_valid(value) AND json_extract(value,'$.path')=runs.path)",
-                        (project["id"], cutoff)):
+                        "AND json_valid(value) AND json_extract(value,'$.path')=runs.path "
+                        "AND json_extract(value,'$.rejected')>?)",
+                        (project["id"], cutoff, revalidate)):
                     if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
                         return
                     with self.scheduler_scope("maintenance_run", project["id"], run["id"]):
@@ -801,6 +812,13 @@ class Maintenance:
                                 self._reject_retention_path(run, project["id"], directory, "outside runs root")
                                 continue
                             directory = runs_root / run["id"]
+                            # 到达这里说明路径本轮已通过全部文件系统检查：清理同一 path
+                            # 的过期拒绝标记，让修复后的运行不再被旧证据挡住。仅删过期
+                            # 标记；新鲜标记（刚由本轮或并发轮写入）原样保留。
+                            self.store.execute(
+                                "DELETE FROM settings WHERE key=? AND json_valid(value) "
+                                "AND json_extract(value,'$.path')=? AND json_extract(value,'$.rejected')<=?",
+                                ("retention_path_rejected:" + run["id"], run["path"], revalidate))
                             if run["state"] == "awaiting_approval":
                                 with self.store.connect() as db:
                                     db.execute("BEGIN IMMEDIATE")
