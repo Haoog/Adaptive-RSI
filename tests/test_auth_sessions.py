@@ -1033,7 +1033,9 @@ class AuthSessionTests(unittest.TestCase):
         session = self.manager.start("codex")
         time.sleep(1.05)
         self.assertEqual(self.manager.busy, 0)
-        self.assertEqual(self.manager.status(session["id"])["state"], "expired")
+        # status() 在锁被 worker 的过期落盘占用时会按设计返回上一份 ACTIVE 快照；
+        # 单次断言在低配 CI runner 上曾偶发看到 awaiting_authorization，改为有界等终态。
+        self.wait_state(session, "expired")
         self.gate.set()
         self.assertFalse((self.root / "codex/auth.json").exists())
 
