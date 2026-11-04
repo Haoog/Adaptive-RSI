@@ -1671,6 +1671,23 @@ class Evolution:
             raise ValueError("Project not found")
         config = self.runtime.config(row["project"])
         now = time.time()
+        try:
+            preflight = json.loads(row["evidence"] or "{}")
+        except (TypeError, ValueError):
+            preflight = {}
+        if not isinstance(preflight, dict):
+            preflight = {}
+        # 手动晋升与自动晋升同一口径：人工复核可能隔很久，期间用例被退休/改分级、
+        # overlay 被清理或仓库被重建。这里重算封存 manifest（含 git tree），必须在
+        # 写事务之前完成，避免持锁执行外部命令；老证据没有 manifest 时保持原有行为。
+        dataset = preflight.get("dataset")
+        manifest = dataset.get("manifest") if isinstance(dataset, dict) else None
+        input_verification = (self.verify_inputs(row["project"], manifest)
+                              if isinstance(manifest, list) and manifest else None)
+        if input_verification and input_verification["mismatches"]:
+            raise ValueError("Sealed experiment inputs changed since evaluation: " + ", ".join(
+                item["case"] + " (" + ", ".join(item["fields"]) + ")"
+                for item in input_verification["mismatches"]))
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM candidates WHERE id=?", (candidate,)).fetchone()
@@ -1700,8 +1717,20 @@ class Evolution:
             expected = sealed_evidence.get("compatibility")
             if expected and expected != compatibility(config):
                 raise ValueError("Candidate evidence is incompatible with current configuration")
-            # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
-            self.activate(db, candidate, now)
+            drifted = (input_verification or {}).get("unsampled_mismatches") or []
+            if drifted:
+                # 未抽中项漂移只留档，不作废整轮证据（与自动晋升 1579-1585 同口径）。
+                sealed_evidence["input_verification"] = input_verification
+                review = sealed_evidence.get("promotion_review")
+                if isinstance(review, dict):
+                    review.setdefault("limitations", []).append(
+                        "Sealed cases not selected for execution changed before manual promotion; "
+                        "recorded in input_verification.unsampled_mismatches: "
+                        + ", ".join(sorted(item["case"] for item in drifted)))
+                self.activate(db, candidate, now, sealed_evidence)
+            else:
+                # 与自动晋升一致：同项目同类型的旧稳定版让位，候选保留原有证据。
+                self.activate(db, candidate, now)
             db.execute("INSERT INTO skills VALUES (?,?,?,?,?,?,?,?,?)",
                        self.skill_values(row["project"], candidate, content, config, now))
         self.store.event("promotion", "Ready candidate manually promoted; limited operational monitoring started",
