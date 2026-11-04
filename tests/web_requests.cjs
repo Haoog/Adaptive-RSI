@@ -80,7 +80,7 @@ const snapshot = (version = '0.2.0', csrf = 'original-csrf') => ({
 });
 
 function browser(savedSession = new Map()) {
-  const nodes = new Map(), listeners = new Map(), timers = [], local = new Map(), session = savedSession;
+  const nodes = new Map(), listeners = new Map(), windowListeners = new Map(), timers = [], local = new Map(), session = savedSession;
   let created = 0, nextTimer = 0;
   const node = id => {
     if (!nodes.has(id)) nodes.set(id, {
@@ -128,7 +128,7 @@ function browser(savedSession = new Map()) {
     else signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once: true});
   });
   const context = vm.createContext({
-    document, window: {}, initialState: snapshot(), structuredClone, URLSearchParams,
+    document, window: {addEventListener(type, handler) { windowListeners.set(type, handler); }}, initialState: snapshot(), structuredClone, URLSearchParams,
     localStorage: storage(local), sessionStorage: storage(session), t: value => value,
     AbortController, DOMException, queueMicrotask, TextEncoder, crypto: require('node:crypto').webcrypto,
     fetch: defaultFetch,
@@ -144,7 +144,7 @@ function browser(savedSession = new Map()) {
   vm.runInContext('originalSafe=safe; originalRender=render; state=initialState; scopeInitialized=true; projectId="a"; render=()=>{}; safe=fn=>{lastAction=fn();return lastAction;}', context);
   node('project-select').options = [{value: 'a', text: 'A'}, {value: 'b', text: 'B'}];
   return {
-    context, node, document, timers, sessionData: session,
+    context, node, document, timers, sessionData: session, listeners, windowListeners,
     input(id, form) { const target = node(id); target.form = node(form); listeners.get('input')({target}); target.handlers.input?.({target}); },
     submit(form) { node(form).handlers.submit({target: node(form), preventDefault() {}}); return context.lastAction; },
     async resume() {
@@ -3554,4 +3554,25 @@ test('multiple predecessors survive language rebuild and save as one dependency 
   assert.deepEqual(select.selectedOptions.map(option=>option.value).sort(),['first','second']);
   form.onsubmit({preventDefault(){}});await page.context.lastAction;
   assert.deepEqual(posts,[{task:'child',dependencies:['first','second'],urgency:0}]);
+});
+
+test('returning to the page refreshes once via visibilitychange; focus no longer issues a state fetch', async () => {
+  const page = browser(), states = [];
+  assert.equal(page.windowListeners.has('focus'), false, 'window focus must not register a state refresh');
+  page.document.visibilityState = 'visible';
+  page.context.fetch = async url => {
+    if (url.includes('/state?')) { states.push(url); return response({tasks: [], runs: []}); }
+    throw Error('unexpected request ' + url);
+  };
+  page.listeners.get('visibilitychange')();
+  await page.context.lastAction;
+  assert.equal(states.length, 1, 'becoming visible issues exactly one state refresh');
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 15000).length, 1, 'the next idle poll is rescheduled');
+  page.listeners.get('visibilitychange')();
+  await page.context.lastAction;
+  assert.equal(states.length, 2, 'a second return refreshes once more');
+  page.document.visibilityState = 'hidden';
+  page.listeners.get('visibilitychange')();
+  assert.equal(states.length, 2, 'hiding the page does not refresh');
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 60000).length, 1, 'hidden polling keeps the slow cadence');
 });
