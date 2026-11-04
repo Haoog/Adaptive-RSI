@@ -616,6 +616,41 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertEqual(len(identifiers), len(set(identifiers)))
         self.assertEqual(set(identifiers), {"run-%02d" % index for index in range(60)})
 
+    def test_latest_run_tie_is_consistent_across_read_models(self):
+        self.store.execute("INSERT INTO projects(id,name,path,created) VALUES ('p','P',?,0)", (str(self.root),))
+        # 两个任务分别覆盖 id 字典序大于/小于插入序：started 相同时，所有读模型都必须选中最后写入的 run。
+        fixtures = {"tie-min": [("b1", {"feedback": {"state": "regressed"}}), ("a1", {"summary": "latest"})],
+                    "tie-max": [("a2", {"feedback": {"state": "regressed"}}), ("b2", {"summary": "latest"})]}
+        for task, runs in fixtures.items():
+            self.store.execute("INSERT INTO tasks(id,project,source,title,state,created,updated) "
+                               "VALUES (?,?,'user',?,'merged',0,0)", (task, "p", task))
+            for identifier, result in runs:
+                self.store.execute("INSERT INTO runs(id,task,project,state,started,ended,result) "
+                                   "VALUES (?,?,?,?,?,?,?)",
+                                   (identifier, task, "p", "merged", 1000.0, 1001.0, json.dumps(result)))
+        expected = {"tie-min": ("a1", ["a1", "b1"]), "tie-max": ("b2", ["b2", "a2"])}
+
+        status, _, payload = self.request("/api/attention")
+        self.assertEqual(status, 200)
+        notices = {row["id"]: row for row in json.loads(payload)["notifications"]}
+
+        from adaptive_rsi.dashboard import records
+        state = records(self.store)
+        tasks = {row["id"]: row for row in state["tasks"]}
+        runs = {}
+        for row in state["runs"]:
+            runs.setdefault(row["task"], []).append(row["id"])
+
+        for task, (latest, order) in expected.items():
+            with self.subTest(task=task):
+                self.assertEqual(notices[task]["run"], latest)
+                # display_state 由同一次 latest run 派生；旧排序会取到 regressed 反馈。
+                self.assertEqual(tasks[task]["display_state"], "merged")
+                self.assertEqual(runs[task], order)
+                status, _, payload = self.request("/api/task-runs?task=%s&project=p&limit=2" % task)
+                self.assertEqual(status, 200)
+                self.assertEqual([row["id"] for row in json.loads(payload)["runs"]], order)
+
     def test_backup_copy_runs_outside_dispatch_lock(self):
         from adaptive_rsi import storage_tools
 
