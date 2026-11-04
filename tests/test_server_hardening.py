@@ -339,6 +339,7 @@ class ServerHardeningTest(unittest.TestCase):
             poster.join(5)
         self.assertEqual(answers[0][0], 200)
         self.assertFalse(self.runtime.operations.busy())
+        self.runtime.updates.desktop_owner_pid = os.getpid()
         committed = readiness(self.runtime, "commit", lease=prepared["barrier"]["lease"])
         self.assertEqual(committed["barrier"]["phase"], "installing")
 

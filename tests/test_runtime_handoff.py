@@ -1,7 +1,10 @@
 """Offline regression evidence for runtime handoff boundaries."""
 import datetime
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -160,6 +163,40 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def test_known_phase_skips_runs_state_lookup_in_cancel_check(self):
+        """阶段已由 _explicit_phase/_model_started 确定时，不再为推导 stage 查 runs.state。"""
+        _, run = self.claim()
+        self.runtime.begin_phase(run, 'evaluation')
+        queries = []
+        original = self.store.one
+
+        def counting(sql, args=()):
+            queries.append(sql)
+            return original(sql, args)
+
+        def stage_lookups():
+            return [sql for sql in queries if sql.startswith('SELECT state FROM runs')]
+
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(stage_lookups(), [])
+        # 省掉的只是阶段推断那一条；真正的取消判定仍要查任务与项目状态。
+        self.assertTrue(any('FROM runs r JOIN tasks t' in sql for sql in queries))
+        # _model_started 优先级高于 _explicit_phase，同样不需要该查询。
+        run['_model_started'] = time.monotonic()
+        queries.clear()
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(stage_lookups(), [])
+        # 两者都缺席时仍回退到 runs.state：状态为 evaluating 才进入 evaluation 阶段。
+        del run['_model_started'], run['_explicit_phase']
+        self.store.execute("UPDATE runs SET state='evaluating' WHERE id=?", (run['id'],))
+        queries.clear()
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(len(stage_lookups()), 1)
+        self.assertEqual(run['_deadline_stage'], 'evaluation')
+
     def test_propagated_trial_stage_survives_parent_timeout_recheck(self):
         """propagate_deadline 写入的阶段是首个判定结论；父 run 自身时钟超时不覆盖它。"""
         from adaptive_rsi.gitops import git
@@ -194,6 +231,30 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(row['state'], 'blocked')
         failure = json.loads(row['result'])['failure']
         self.assertEqual((failure['code'], failure['stage']), ('deadline', 'evaluation'))
+
+    def test_later_trial_cannot_rewrite_the_first_propagated_timeout(self):
+        """两个 trial 先后上报超时：父 run 保留首个结论，不被后一个 trial 改写。"""
+        _, parent = self.claim()
+        first = self.runtime.new_trial_context(parent)
+        first['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, first)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        second = self.runtime.new_trial_context(parent)
+        second['_timed_out_stage'] = 'preparation'
+        self.runtime.propagate_deadline(parent, second)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+
+    def test_recorded_timeout_stops_variant_dispatch_on_a_fresh_clock(self):
+        """变体循环的取消守卫读 is_cancelled；已有超时结论时不得因时钟重置而继续派发试验。"""
+        _, parent = self.claim()
+        trial = self.runtime.new_trial_context(parent)
+        trial['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, trial)
+        # 父 run 重新切相，时钟是新的、预算充足：结论本身必须让取消判定成立，
+        # 否则 evolution 的下一个 case/repetition/variant 会照常开跑并消耗模型预算。
+        self.runtime.begin_phase(parent, 'preparation')
+        self.assertTrue(self.runtime.is_cancelled(parent))
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
 
     def test_evaluation_deadline_remains_active_during_model_call(self):
         _, run = self.claim()
@@ -1262,3 +1323,45 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.runtime.configure({'schedule': {'timezone': 'UTC'}}, self.project)
         self.assertEqual(self.store.one('SELECT available FROM tasks WHERE id=?', (task,))['available'], second['at'])
         self.assertEqual(self.store.setting('task-schedule:' + task)['timezone'], 'America/New_York')
+
+    def test_commit_rejects_a_desktop_update_without_an_observable_owner(self):
+        # desktop_owner_pid 缺失时写入 installing 会让屏障两条清除路径都不可达，
+        # 准入被永久楔死；commit 必须在落盘前拒绝并释放 draining 屏障。
+        from adaptive_rsi.lifecycle import KEY, barrier, readiness
+        self.runtime.updates.desktop_managed = True
+        for owner in (None, 0, 1, True, '123'):
+            with self.subTest(owner=owner):
+                prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+                self.runtime.updates.desktop_owner_pid = owner
+                with self.assertRaisesRegex(ValueError, 'owner'):
+                    readiness(self.runtime, 'commit', lease=prepared['lease'])
+                self.assertIsNone(self.store.setting(KEY))
+                self.assertIsNone(barrier(self.runtime))
+
+    @unittest.skipUnless(os.name == 'posix', 'Process-zero liveness follows POSIX semantics')
+    def test_installing_barrier_recovers_after_the_owner_process_exits(self):
+        from adaptive_rsi.lifecycle import KEY, barrier
+        owner = subprocess.Popen([sys.executable, '-c', 'pass'])
+        owner.wait(timeout=10)
+        self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'lease-token', 'phase': 'installing',
+                                     'expires': time.time() + 3600, 'owner_pid': owner.pid,
+                                     'committed': time.time()})
+        self.assertIsNone(barrier(self.runtime))
+        self.assertIsNone(self.store.setting(KEY))
+
+    def test_prepare_recovers_a_barrier_record_without_a_lease(self):
+        from adaptive_rsi.lifecycle import KEY, readiness
+        self.runtime.updates.desktop_managed = True
+        self.store.put_setting(KEY, {'version': '9.0.0', 'phase': 'draining',
+                                     'expires': time.time() + 3600})
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')
+        self.assertIsInstance(prepared['barrier']['lease'], str)
+        self.assertEqual(self.store.setting(KEY)['lease'], prepared['barrier']['lease'])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='desktop_update_recovered'"))
+
+    def test_non_object_barrier_record_is_recovered_instead_of_crashing_admission(self):
+        from adaptive_rsi.lifecycle import KEY, barrier
+        self.store.put_setting(KEY, ['not', 'a', 'barrier'])
+        self.assertIsNone(barrier(self.runtime))
+        self.assertIsNone(self.store.setting(KEY))
