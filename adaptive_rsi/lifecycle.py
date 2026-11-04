@@ -30,6 +30,11 @@ def _field(state, key):
     return state.get(key) if isinstance(state, dict) else None
 
 
+def _matches(stored, lease):
+    return (isinstance(stored, str) and isinstance(lease, str) and stored.isascii() and lease.isascii() and
+            hmac.compare_digest(stored, lease))
+
+
 def barrier(runtime):
     with runtime.dispatch_lock:
         state = runtime.store.setting(KEY)
@@ -69,7 +74,7 @@ def barrier(runtime):
 def readiness(runtime, action="status", version=None, lease=None):
     with runtime.dispatch_lock:
         # barrier() 负责把无法使用的记录清理为 None，因此这里的 state 要么为空，
-        # 要么已通过 _usable_state 校验：下面直接下标取 version/lease/phase 是安全的。
+        # 要么已通过 _usable_state 校验；租约比较仍用 _matches 处理缺失/非 ASCII 输入。
         state = barrier(runtime)
         if action not in ("status", "prepare", "commit", "cancel", "complete"):
             raise ValueError("Invalid desktop update action")
@@ -78,18 +83,17 @@ def readiness(runtime, action="status", version=None, lease=None):
         if action == "prepare":
             if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
                 raise ValueError("Invalid desktop update version")
-            if state and (state["version"] != version or not isinstance(lease, str) or
-                          not hmac.compare_digest(state["lease"], lease)):
+            if state and (state.get("version") != version or not _matches(state.get("lease"), lease)):
                 raise ValueError("Another desktop update owns admission")
             if not state:
                 state = {"version": version, "lease": secrets.token_hex(24), "phase": "draining", "expires": time.time() + 3600}
-            elif state["phase"] == "draining":
+            elif state.get("phase") == "draining":
                 state = {**state, "expires": time.time() + 3600}
             runtime.store.put_setting(KEY, state)
         elif action in ("cancel", "complete") and state:
-            if not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
+            if not _matches(state.get("lease"), lease):
                 raise ValueError("Desktop update lease changed")
-            if action == "complete" and state["version"] != __version__:
+            if action == "complete" and state.get("version") != __version__:
                 raise ValueError("Desktop runtime version does not match the update")
             runtime.store.execute("DELETE FROM settings WHERE key=?", (KEY,))
             runtime.wake.set()
@@ -107,12 +111,21 @@ def readiness(runtime, action="status", version=None, lease=None):
         if operations and operations.busy():
             reasons.append("background_operations")
         if action == "commit":
-            if not state or not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
+            if not state or not _matches(state.get("lease"), lease):
                 raise ValueError("Desktop update lease changed")
             if reasons:
                 raise ValueError("Runtime still has active operations")
-            state = {**state, "phase": "installing",
-                     "owner_pid": getattr(runtime.updates, "desktop_owner_pid", None), "committed": time.time()}
+            owner = getattr(runtime.updates, "desktop_owner_pid", None)
+            if type(owner) is not int or owner <= 1:
+                # 没有可观测的安装器属主时写入 installing，屏障的过期与属主退出两条
+                # 清除路径都不可达，会永久关闭全部运行准入。拒绝 commit 并释放
+                # draining 屏障，避免失败的更新把准入再挡到租约过期。
+                if state.get("phase") == "draining":
+                    runtime.store.execute("DELETE FROM settings WHERE key=?", (KEY,))
+                    runtime.wake.set()
+                    state = None
+                raise ValueError("Desktop update has no observable installer owner")
+            state = {**state, "phase": "installing", "owner_pid": owner, "committed": time.time()}
             runtime.store.put_setting(KEY, state)
         return {"ready": not reasons, "reasons": reasons, "runs": runs,
                 "barrier": state, "version": __version__}
