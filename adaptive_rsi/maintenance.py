@@ -20,6 +20,13 @@ MAINTENANCE_INTERVAL = 3600
 MAINTENANCE_RETRY_SECONDS = 300
 MAINTENANCE_RETRY_MAX_SECONDS = 3600
 
+# 回收临界区 flock 的等待上界：store.root 可落在 NFS/坏盘上，持锁方卡死时
+# 阻塞式 LOCK_EX 会让 recover_cleanup（以及调用它的维护线程）永不返回。
+# 每次直接 LOCK_EX|LOCK_NB，未拿到按固定间隔重试，超过次数抛 TimeoutError；
+# recover_cleanup 幂等，本轮跳过后下一轮仍可对账。
+CLEANUP_LOCK_ATTEMPTS = 3
+CLEANUP_LOCK_RETRY_SECONDS = 5
+
 
 def _retry_deadline(value):
     """Read the earliest allowed retry from the persisted backoff record."""
@@ -382,7 +389,19 @@ def _cleanup_lock(store):
         _sync_directory(recycle.parent)
         descriptor = os.open(recycle / '.cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            # 只用 LOCK_NB 探测，持锁方卡死（NFS/坏盘）时也不能无限等待；
+            # 超限抛 TimeoutError，调用方把本轮恢复当作失败留待下轮重试。
+            for attempt in range(CLEANUP_LOCK_ATTEMPTS):
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    if attempt + 1 >= CLEANUP_LOCK_ATTEMPTS:
+                        raise TimeoutError(
+                            'Cleanup lock held beyond %ds' %
+                            (CLEANUP_LOCK_ATTEMPTS * CLEANUP_LOCK_RETRY_SECONDS))
+                    time.sleep(CLEANUP_LOCK_RETRY_SECONDS)
+                else:
+                    break
             yield
         finally:
             os.close(descriptor)
@@ -695,6 +714,24 @@ class Maintenance:
         except Exception:
             logging.getLogger(__name__).exception("Maintenance failure persistence failed")
 
+    def _reject_retention_path(self, run, project, directory, reason):
+        """Mark a deterministically rejected runs.path so later passes skip it.
+
+        标记按 (run.id, run.path) 匹配：运维把 runs.path 修回 runs/ 内后该
+        运行自动回到候选。写 settings 失败时异常冒泡到 scheduler_scope，
+        下个周期仍会按原路径重试，不会留下只有一半的证据。
+        """
+        self.store.put_setting("retention_path_rejected:" + run["id"],
+                               {"path": run["path"], "reason": reason,
+                                "project": project, "rejected": time.time()})
+        try:
+            self.store.event("retention_path_rejected",
+                             "Rejected unsafe retention path for %s: %s" % (run["id"], reason),
+                             project, run["id"], {"path": str(directory)})
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Retention rejection event persistence failed: %s", run["id"])
+
     def _clear_maintenance_failure(self):
         """Reset the backoff after a healthy pass; a stale record is harmless once past."""
         self.maintenance_retry_at = 0
@@ -720,7 +757,13 @@ class Maintenance:
             with self.scheduler_scope("maintenance_project", project["id"]):
                 config = self.config(project["id"])
                 cutoff = now - config["limits"]["retention_days"] * 86400
-                for run in self.store.query("SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL", (project["id"], cutoff)):
+                # 已确定性拒绝的 runs.path（见 _reject_retention_path）按 (id,path)
+                # 匹配跳过；运维修正 path 后标记失配，该运行自动回到清理候选。
+                for run in self.store.query(
+                        "SELECT id,path,state,task,result FROM runs WHERE project=? AND ended<? AND path IS NOT NULL "
+                        "AND NOT EXISTS (SELECT 1 FROM settings WHERE key='retention_path_rejected:' || runs.id "
+                        "AND json_valid(value) AND json_extract(value,'$.path')=runs.path)",
+                        (project["id"], cutoff)):
                     if getattr(self, "maintenance_stop", None) and self.maintenance_stop.is_set():
                         return
                     with self.scheduler_scope("maintenance_run", project["id"], run["id"]):
@@ -742,16 +785,21 @@ class Maintenance:
                             # runs 目录或运行目录为链接时按越界拒绝，存疑路径保留不修。
                             directory = Path(run["path"])
                             runs_root = self.store.root / "runs"
-                            if (runs_root.is_symlink() or directory.is_symlink() or
+                            # runs_root 自身是环境故障（或为链接、或 stat 失败），影响全部运行，
+                            # 仍走 scheduler_error 周期性重试；目录不可读时的 OSError 同样冒泡。
+                            if runs_root.is_symlink():
+                                raise ValueError("Unsafe retention run path")
+                            # 以下拒绝只由该行数据决定，属确定性拒绝：写运维证据后跳过本运行，
+                            # 下个周期由 SQL 预检过滤，不再每小时重复 scheduler_error。
+                            if (directory.is_symlink() or
                                     Path(run["id"]).parts != (run["id"],) or run["id"] in (".", "..") or
                                     directory.name != run["id"]):
-                                raise ValueError("Unsafe retention run path")
-                            try:
-                                inside = directory.parent.resolve() == runs_root
-                            except OSError:
-                                inside = False
+                                self._reject_retention_path(run, project["id"], directory, "unsafe run path")
+                                continue
+                            inside = directory.parent.resolve() == runs_root
                             if not inside:
-                                raise ValueError("Unsafe retention run path")
+                                self._reject_retention_path(run, project["id"], directory, "outside runs root")
+                                continue
                             directory = runs_root / run["id"]
                             if run["state"] == "awaiting_approval":
                                 with self.store.connect() as db:
