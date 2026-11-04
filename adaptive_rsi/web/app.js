@@ -259,7 +259,9 @@ async function negotiateCapabilities(){
 }
 async function sendApi(path,body,signal,{text=false}={}){
  const feature=featureForPath(path);
- if(feature){const supported=await negotiateCapabilities();if(!supported?.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
+ // A failed probe returns null: let the real fetch surface the connectivity error
+ // instead of misreporting it as an old service. Only a negotiated descriptor decides support.
+ if(feature){const supported=await negotiateCapabilities();if(supported!==null&&!supported.has(feature)){const error=Error(t('当前服务不支持此功能，请升级服务后重试。'));error.code='unsupported_capability';error.feature=feature;throw error;}}
  const bootstrapRepair=body!==undefined&&!state&&path==='config/repair-global';
  if(body!==undefined&&!state&&!bootstrapRepair)throw Error(t('正在连接本地服务，请稍候再提交。'));
  const controller=new AbortController();
@@ -388,9 +390,9 @@ let displayTz=null;
 function stamp(seconds){try{return new Date(seconds*1000).toLocaleString(language,{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:displayTz||undefined});}catch{return new Date(seconds*1000).toLocaleString(language,{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});}}
 function scheduleStamp(seconds,timezone){try{return new Date(seconds*1000).toLocaleString(language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',timeZone:timezone});}catch{return stamp(seconds);}}
 async function showActivityHistory(){
- const project=projectId,box=el('dialog',undefined,'experience-dialog'),list=el('div'),more=action(t('加载更早活动'),load),close=action(t('关闭'),()=>box.close());
+ const project=projectId,box=el('dialog',undefined,'experience-dialog'),list=el('div'),more=action(t('加载更早活动'),load),close=action(t('关闭'),()=>box.close()),previousFocus=document.activeElement;
  box.append(el('h2',t('活动历史')),el('p',t('显示时区')+' · '+(displayTz||Intl.DateTimeFormat().resolvedOptions().timeZone)),list,more,close);
- box.addEventListener('close',()=>box.remove());document.body.append(box);box.showModal();let before='';
+ box.addEventListener('close',()=>{box.remove();previousFocus?.focus?.();});document.body.append(box);box.showModal();let before='';
  async function load(){more.disabled=true;try{const data=await api('events?'+new URLSearchParams({project,limit:100,...(before?{before}:{})}));if(!box.open)return;for(const event of data.events){list.append(el('p',stamp(event.created)+' · '+eventCopy(event)));if(event.kind==='native_tool'){const detail=el('details'),raw=el('pre');detail.append(el('summary',t('工具轨迹元数据')),raw);detail.addEventListener('toggle',()=>{if(detail.open&&!raw.textContent)raw.textContent=typeof event.data==='string'?event.data:JSON.stringify(event.data,null,2);});list.append(detail);}}before=data.next_before;more.hidden=!data.has_more;}finally{more.disabled=false;}}
  await load();
 }
@@ -1221,10 +1223,10 @@ $('task-filter').addEventListener('change',()=>{taskOffset=0;safe(refresh);});$(
 let configHistoryDialog=null;
 async function showConfigHistory(){
  if(configHistoryDialog?.open)return;
- const scope=settingsKey(),project=scope==='global'?null:projectId,box=el('dialog',undefined,'experience-dialog'),rows=el('div'),more=el('button',t('加载更多'),'text-button'),close=el('button',t('关闭'),'text-button');
+ const scope=settingsKey(),project=scope==='global'?null:projectId,box=el('dialog',undefined,'experience-dialog'),rows=el('div'),more=el('button',t('加载更多'),'text-button'),close=el('button',t('关闭'),'text-button'),previousFocus=document.activeElement;
  if(scope!=='global'&&!project)return;
  box.append(el('h2',t('设置变更记录')),el('p',t('仅最新且未被覆盖的设置可以撤销；活动中的任务继续使用原快照。')),rows,more,close);
- more.type=close.type='button';close.onclick=()=>box.close();box.addEventListener('close',()=>{box.remove();if(configHistoryDialog===box)configHistoryDialog=null;});document.body.append(box);box.showModal();configHistoryDialog=box;let before=null,loading=false,undoing=false;
+ more.type=close.type='button';close.onclick=()=>box.close();box.addEventListener('close',()=>{box.remove();if(configHistoryDialog===box)configHistoryDialog=null;previousFocus?.focus?.();});document.body.append(box);box.showModal();configHistoryDialog=box;let before=null,loading=false,undoing=false;
  async function load(){if(loading)return;loading=true;more.disabled=true;
   try{const params=new URLSearchParams();if(project)params.set('project',project);if(before)params.set('before',before);const data=await api('config-history?'+params);if(!box.open)return;
    for(const entry of data.entries){const card=el('details');if(entry.error){card.append(el('summary',t('配置记录损坏，无法安全撤销。')));rows.append(card);continue;}

@@ -552,6 +552,27 @@ test('an ambiguous connection failure after a write is never replayed', async ()
   assert.equal(calls, 1);
 });
 
+test('a failed capability probe reports the connection error rather than an upgrade hint', async () => {
+  const page = browser();
+  let calls = 0;
+  page.context.fetch = async () => { calls++; throw new TypeError('connection lost'); };
+  await assert.rejects(vm.runInContext("api('shutdown-status')", page.context), error =>
+    /无法连接本地服务/.test(error.message) && error.code !== 'unsupported_capability');
+  assert.equal(calls, 2, 'the probe failure must fall through to the real request');
+});
+
+test('an outdated contract descriptor still blocks an unsupported feature request', async () => {
+  const page = browser();
+  let calls = 0;
+  page.context.fetch = async url => { calls++; return url === '/api/contract'
+    ? response({descriptor: {api_version: 1, capabilities: []}})
+    : response({state: 'done'}); };
+  await assert.rejects(vm.runInContext("api('shutdown-status')", page.context), error =>
+    error.code === 'unsupported_capability' && error.feature === 'shutdown-progress' && /升级服务后重试/.test(error.message));
+  assert.equal(calls, 1, 'a negotiated empty capability set must not reach the feature endpoint');
+  assert.equal(page.node('capability-notice').hidden, false);
+});
+
 test('a periodic refresh seeing the new version retains a queued submission', async () => {
   const page = browser();
   let posts = 0;

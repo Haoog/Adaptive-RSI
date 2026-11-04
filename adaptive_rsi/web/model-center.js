@@ -138,9 +138,9 @@ window.RSIModelCenter = (() => {
   }
   function protocolName(protocol){return {codex:'Codex / Responses',responses:'Responses API',chat_completions:'Chat Completions',anthropic:'Anthropic Messages',gemini:'Gemini',ollama:'Ollama API',codex_login:t('本机账户')}[protocol]||protocol;}
   function diagnosticDialog(title){
-    const box=el('dialog',undefined,'experience-dialog'),heading=el('div',undefined,'dialog-heading');
+    const box=el('dialog',undefined,'experience-dialog'),heading=el('div',undefined,'dialog-heading'),previousFocus=document.activeElement;
     const close=el('button',t('关闭'),'text-button');close.addEventListener('click',()=>box.close());
-    box.addEventListener('close',()=>box.remove());
+    box.addEventListener('close',()=>{box.remove();previousFocus?.focus?.();});
     heading.append(el('h2',t(title)),close);
     box.append(heading);document.body.append(box);box.showModal();return box;
   }
@@ -279,7 +279,8 @@ window.RSIModelCenter = (() => {
     $('mc-capability-context').value=snapshot.context_tokens;$('mc-capability-output').value=snapshot.max_output_tokens;
     $('mc-capability-source-url').value=snapshot.source_url;$('mc-capability-note').value=snapshot.note;
     $('mc-capability-error').textContent='';$('mc-capability-clear').hidden=capability.source!=='manual';
-    $('mc-capability-clear').disabled=false;$('mc-capability-save').disabled=false;box.showModal();
+    $('mc-capability-clear').disabled=false;$('mc-capability-save').disabled=false;
+    box.showModal();
   }
   function submitCapabilities(event){
     event.preventDefault();
