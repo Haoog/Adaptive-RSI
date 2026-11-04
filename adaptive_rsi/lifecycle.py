@@ -13,12 +13,40 @@ from .store import encode
 KEY = "desktop-update-barrier"
 
 
+def _observable(state):
+    """Only a record with a lease and version can be owned, cancelled or completed."""
+    return (isinstance(state, dict) and isinstance(state.get("lease"), str) and bool(state["lease"]) and
+            isinstance(state.get("version"), str) and bool(state["version"]))
+
+
+def _matches(stored, lease):
+    return (isinstance(stored, str) and isinstance(lease, str) and stored.isascii() and lease.isascii() and
+            hmac.compare_digest(stored, lease))
+
+
+def _recover(runtime, state, reason):
+    with runtime.store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM settings WHERE key=?", (KEY,))
+        db.execute("INSERT INTO events(kind,message,data,created) VALUES "
+                   "('desktop_update_recovered','Desktop update admission recovered',?,?)",
+                   (encode({"phase": state.get("phase"), "version": state.get("version"),
+                            "reason": reason}), time.time()))
+    runtime.wake.set()
+
+
 def barrier(runtime):
     with runtime.dispatch_lock:
         state = runtime.store.setting(KEY)
         if not state:
             return state
-        expired = state.get("phase") != "installing" and state.get("expires", 0) <= time.time()
+        if not _observable(state):
+            # 损坏记录没有可用租约，也判定不了属主；保留只会永久关闭准入。
+            _recover(runtime, state if isinstance(state, dict) else {}, "corrupt")
+            return None
+        expires = state.get("expires")
+        expired = (state.get("phase") != "installing" and
+                   (not isinstance(expires, (int, float)) or not expires > time.time()))
         owner_exited = False
         owner = state.get("owner_pid")
         if state.get("phase") == "installing" and type(owner) is int and owner > 1:
@@ -28,14 +56,7 @@ def barrier(runtime):
                 # Permission errors and unknown process state must keep admission closed.
                 owner_exited = exc.errno == errno.ESRCH
         if expired or owner_exited:
-            with runtime.store.connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                db.execute("DELETE FROM settings WHERE key=?", (KEY,))
-                db.execute("INSERT INTO events(kind,message,data,created) VALUES "
-                           "('desktop_update_recovered','Desktop update admission recovered',?,?)",
-                           (encode({"phase": state.get("phase"), "version": state.get("version"),
-                                    "reason": "owner_exited" if owner_exited else "drain_expired"}), time.time()))
-            runtime.wake.set()
+            _recover(runtime, state, "owner_exited" if owner_exited else "drain_expired")
             return None
         return state
 
@@ -50,18 +71,17 @@ def readiness(runtime, action="status", version=None, lease=None):
         if action == "prepare":
             if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
                 raise ValueError("Invalid desktop update version")
-            if state and (state["version"] != version or not isinstance(lease, str) or
-                          not hmac.compare_digest(state["lease"], lease)):
+            if state and (state.get("version") != version or not _matches(state.get("lease"), lease)):
                 raise ValueError("Another desktop update owns admission")
             if not state:
                 state = {"version": version, "lease": secrets.token_hex(24), "phase": "draining", "expires": time.time() + 3600}
-            elif state["phase"] == "draining":
+            elif state.get("phase") == "draining":
                 state = {**state, "expires": time.time() + 3600}
             runtime.store.put_setting(KEY, state)
         elif action in ("cancel", "complete") and state:
-            if not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
+            if not _matches(state.get("lease"), lease):
                 raise ValueError("Desktop update lease changed")
-            if action == "complete" and state["version"] != __version__:
+            if action == "complete" and state.get("version") != __version__:
                 raise ValueError("Desktop runtime version does not match the update")
             runtime.store.execute("DELETE FROM settings WHERE key=?", (KEY,))
             runtime.wake.set()
@@ -79,12 +99,21 @@ def readiness(runtime, action="status", version=None, lease=None):
         if operations and operations.busy():
             reasons.append("background_operations")
         if action == "commit":
-            if not state or not isinstance(lease, str) or not hmac.compare_digest(state["lease"], lease):
+            if not state or not _matches(state.get("lease"), lease):
                 raise ValueError("Desktop update lease changed")
             if reasons:
                 raise ValueError("Runtime still has active operations")
-            state = {**state, "phase": "installing",
-                     "owner_pid": getattr(runtime.updates, "desktop_owner_pid", None), "committed": time.time()}
+            owner = getattr(runtime.updates, "desktop_owner_pid", None)
+            if type(owner) is not int or owner <= 1:
+                # 没有可观测的安装器属主时写入 installing，屏障的过期与属主退出两条
+                # 清除路径都不可达，会永久关闭全部运行准入。拒绝 commit 并释放
+                # draining 屏障，避免失败的更新把准入再挡到租约过期。
+                if state.get("phase") == "draining":
+                    runtime.store.execute("DELETE FROM settings WHERE key=?", (KEY,))
+                    runtime.wake.set()
+                    state = None
+                raise ValueError("Desktop update has no observable installer owner")
+            state = {**state, "phase": "installing", "owner_pid": owner, "committed": time.time()}
             runtime.store.put_setting(KEY, state)
         return {"ready": not reasons, "reasons": reasons, "runs": runs,
                 "barrier": state, "version": __version__}

@@ -1,7 +1,10 @@
 """Offline regression evidence for runtime handoff boundaries."""
 import datetime
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1262,3 +1265,45 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.runtime.configure({'schedule': {'timezone': 'UTC'}}, self.project)
         self.assertEqual(self.store.one('SELECT available FROM tasks WHERE id=?', (task,))['available'], second['at'])
         self.assertEqual(self.store.setting('task-schedule:' + task)['timezone'], 'America/New_York')
+
+    def test_commit_rejects_a_desktop_update_without_an_observable_owner(self):
+        # desktop_owner_pid 缺失时写入 installing 会让屏障两条清除路径都不可达，
+        # 准入被永久楔死；commit 必须在落盘前拒绝并释放 draining 屏障。
+        from adaptive_rsi.lifecycle import KEY, barrier, readiness
+        self.runtime.updates.desktop_managed = True
+        for owner in (None, 0, 1, True, '123'):
+            with self.subTest(owner=owner):
+                prepared = readiness(self.runtime, 'prepare', '9.0.0')['barrier']
+                self.runtime.updates.desktop_owner_pid = owner
+                with self.assertRaisesRegex(ValueError, 'owner'):
+                    readiness(self.runtime, 'commit', lease=prepared['lease'])
+                self.assertIsNone(self.store.setting(KEY))
+                self.assertIsNone(barrier(self.runtime))
+
+    @unittest.skipUnless(os.name == 'posix', 'Process-zero liveness follows POSIX semantics')
+    def test_installing_barrier_recovers_after_the_owner_process_exits(self):
+        from adaptive_rsi.lifecycle import KEY, barrier
+        owner = subprocess.Popen([sys.executable, '-c', 'pass'])
+        owner.wait(timeout=10)
+        self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'lease-token', 'phase': 'installing',
+                                     'expires': time.time() + 3600, 'owner_pid': owner.pid,
+                                     'committed': time.time()})
+        self.assertIsNone(barrier(self.runtime))
+        self.assertIsNone(self.store.setting(KEY))
+
+    def test_prepare_recovers_a_barrier_record_without_a_lease(self):
+        from adaptive_rsi.lifecycle import KEY, readiness
+        self.runtime.updates.desktop_managed = True
+        self.store.put_setting(KEY, {'version': '9.0.0', 'phase': 'draining',
+                                     'expires': time.time() + 3600})
+        prepared = readiness(self.runtime, 'prepare', '9.0.0')
+        self.assertIsInstance(prepared['barrier']['lease'], str)
+        self.assertEqual(self.store.setting(KEY)['lease'], prepared['barrier']['lease'])
+        self.assertIsNotNone(self.store.one(
+            "SELECT 1 FROM events WHERE kind='desktop_update_recovered'"))
+
+    def test_non_object_barrier_record_is_recovered_instead_of_crashing_admission(self):
+        from adaptive_rsi.lifecycle import KEY, barrier
+        self.store.put_setting(KEY, ['not', 'a', 'barrier'])
+        self.assertIsNone(barrier(self.runtime))
+        self.assertIsNone(self.store.setting(KEY))
