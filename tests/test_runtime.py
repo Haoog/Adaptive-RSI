@@ -567,6 +567,33 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection_malformed'")), 4)
         self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='inspection'"), [])
 
+    def test_malformed_finding_entries_are_skipped_without_aborting_inspection(self):
+        for malformed in [{"findings": ["truncated"]}, {"findings": [{}]},
+                          {"findings": [{"path": "calculator.py"}]},
+                          {"findings": [{"title": "Subtraction defect", "body": "add(2, 3) returns -1",
+                                         "path": "calculator.py", "quote": "return a - b",
+                                         "acceptance": "2+3=5", "priority": 60}]}]:
+            with self.subTest(malformed=malformed):
+                # 相同上下文会命中 inspection_skip 短路；清掉巡检签名让每次都真正调用 invoke。
+                self.store.execute("DELETE FROM settings WHERE key LIKE 'inspection-head:%'", ())
+                with patch.object(self.runtime, "invoke", return_value=malformed):
+                    self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                         {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        # 单条畸形 finding 只跳过自身并留下诊断事件，不产生任务，也不让巡检 run 失败。
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection_malformed'")), 4)
+        self.assertEqual(self.store.query("SELECT id FROM tasks WHERE source='inspection'"), [])
+
+    def test_malformed_finding_does_not_drop_valid_siblings(self):
+        findings = {"findings": ["truncated",
+                                 {"title": "Subtraction defect", "body": "add(2, 3) returns -1",
+                                  "path": "calculator.py", "quote": "return a - b",
+                                  "acceptance": ["2+3=5"], "priority": 60}]}
+        with patch.object(self.runtime, "invoke", return_value=findings):
+            self.runtime.inspect(self.runtime.project(self.project), self.repo, "light",
+                                 {"id": "inspection", "config": encode(self.runtime.config(self.project))}, [])
+        self.assertEqual(len(self.store.query("SELECT id FROM tasks WHERE source='inspection'")), 1)
+        self.assertEqual(len(self.store.query("SELECT seq FROM events WHERE kind='inspection_malformed'")), 1)
+
     def test_rediscovered_failure_requeues_instead_of_being_suppressed(self):
         from adaptive_rsi.discovery import finding_identity
         finding = {"title": "Addition subtracts", "body": "add(2, 3) returns -1",

@@ -123,11 +123,17 @@ WORKFLOW_CHOICES_TTL = 300
 _workflow_choices_cache = {}
 
 
-def workflow_choices(runtime, project_id, refresh=False):
+def _validated_repository(runtime, project_id):
+    """Return the configured repository only when it still matches the project origin."""
     project = runtime.project(project_id)
     repo = runtime.config(project_id)["github"]["repository"]
     if not repo or repo.lower() != origin_repository(project["path"]).lower():
         raise ValueError("Workflow repository must match the selected project's origin")
+    return repo
+
+
+def workflow_choices(runtime, project_id, refresh=False):
+    repo = _validated_repository(runtime, project_id)
     info = api(repo, "")
     branch = info["default_branch"]
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
@@ -175,10 +181,21 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
     initial = runtime.config(project_id)
-    choices = workflow_choices(runtime, project_id, refresh=True)
-    if not any(item["workflow"] == workflow and item["compatible"] for item in choices["workflows"]):
+    repo = _validated_repository(runtime, project_id)
+    # Authorization pins exactly one file, so validate only that file at the
+    # default-branch SHA the tag binds. Enumerating the whole workflow directory
+    # added one contents request per other workflow and no input to this
+    # decision; the dialog path keeps using workflow_choices for the full list.
+    if not isinstance(workflow, str) or not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", workflow):
         raise ValueError("Select a compatible existing workflow from this project")
-    repo, sha = choices["repository"], choices["sha"]
+    branch = api(repo, "")["default_branch"]
+    sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
+    try:
+        compatible = compatible_workflow(workflow_content(repo, workflow, sha))
+    except (RuntimeError, ValueError, OSError):
+        compatible = False
+    if not compatible:
+        raise ValueError("Select a compatible existing workflow from this project")
     tag = "rsi-workflow/" + sha
     # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.
     refs = api(repo, "git/matching-refs/tags/" + tag)
@@ -305,6 +322,16 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
+def _owner_record(value):
+    """Only a dict naming the claiming run and its exact commit may own a target."""
+    if not isinstance(value, dict):
+        return None
+    run, sha = value.get("run"), value.get("sha")
+    if not isinstance(run, str) or not isinstance(sha, str) or not run or not sha:
+        return None
+    return value
+
+
 def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stable=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -316,7 +343,9 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stab
             owner_name, previous, owner = ownership
             current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
             try:
-                current_value = json.loads(current["value"]) if current and current["value"] else None
+                # A structurally invalid record is no ownership at all, matching
+                # deployment_owner; the write below then repairs it.
+                current_value = _owner_record(json.loads(current["value"])) if current and current["value"] else None
             except (TypeError, ValueError):
                 current_value = None
             if current_value != previous:
@@ -955,19 +984,40 @@ def owner_key(project, repo, policy):
     return "deployment-owner:" + fingerprint(target)
 
 
+def _owner_alert(runtime, name, project):
+    """Report an unreadable ownership record once; it is still treated as no owner."""
+    diagnostic = (name, "deployment-owner")
+    with runtime.automation_receipt_failures_lock:
+        if diagnostic in runtime.automation_receipt_failures:
+            return
+        runtime.store.event("automation_error",
+                            "Deployment owner record is unreadable; repair the stored record before relying on it",
+                            project, None, {"kind": "deploy", "error_code": "invalid_deployment_owner"})
+        if len(runtime.automation_receipt_failures) >= 128:
+            runtime.automation_receipt_failures.pop(next(iter(runtime.automation_receipt_failures)))
+        runtime.automation_receipt_failures[diagnostic] = True
+
+
 def deployment_owner(runtime, project, repo, policy):
     name = owner_key(project, repo, policy)
     with runtime.dispatch_lock:
-        current = runtime.store.setting(name)
+        stored = runtime.store.setting(name)
+        current = _owner_record(stored)
         if current:
+            with runtime.automation_receipt_failures_lock:
+                runtime.automation_receipt_failures.pop((name, "deployment-owner"), None)
             return current
+        if stored:
+            _owner_alert(runtime, name, project)
         migration = "deployment-owner-migrated:" + name.split(":", 1)[1]
         if runtime.store.setting(migration, False):
             return None
         legacy = []
         for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
             try:
-                receipt = json.loads(row["value"])
+                receipt = _owner_record(json.loads(row["value"]))
+                if not receipt:
+                    continue
                 run = runtime.store.one("SELECT project,config,started FROM runs WHERE id=?", (receipt["run"],))
                 if not run:
                     continue
