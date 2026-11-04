@@ -430,6 +430,10 @@ class Maintenance:
                                (row["key"], row["key"] + ":", row["key"] + ";"))
         self.store.execute("DELETE FROM settings WHERE key LIKE 'provider-account-health:%' AND json_valid(value) "
                            "AND json_extract(value,'$.retry_at')<?", (now - 7 * 86400,))
+        # baseline:<project> 是旧版每次 fetch 覆写的死键，后端已无读取方；写入
+        # 已移除，这里按索引前缀分批清掉存量行，避免旧库永久保留。
+        self.store.execute("DELETE FROM settings WHERE key IN (SELECT key FROM settings "
+                           "WHERE key>=? AND key<? LIMIT 400)", ("baseline:", "baseline;"))
         self.store.execute("DELETE FROM skills WHERE rowid IN (SELECT rowid FROM skills WHERE expires<? LIMIT 500)", (now - 30 * 86400,))
         self.store.execute("DELETE FROM request_log WHERE rowid IN (SELECT rowid FROM request_log WHERE started<? LIMIT 500)", (now - 7 * 86400,))
         self.store.execute("DELETE FROM phase_times WHERE id IN (SELECT id FROM phase_times WHERE ended IS NOT NULL AND ended<? AND run IN "
