@@ -233,9 +233,11 @@ class RuntimeHandoffTest(unittest.TestCase):
         parent['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
         parent['_deadline_stage'], parent['_deadline_started'] = 'preparation', clock[0]
         parent['_deadline_checkpoint'] = clock[0]
-        trial = self.runtime.new_trial_context(parent)
-        self.assertNotIn('_stage_used', trial)
         with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            # trial 的时钟锚点也必须在同一时钟下建立：新开机机器的真实 monotonic
+            # 只有几十秒，否则会被当成已耗时间而直接判定超时。
+            trial = self.runtime.new_trial_context(parent)
+            self.assertNotIn('_stage_used', trial)
             clock[0] += 20.0
             self.assertFalse(self.runtime.is_cancelled(trial))
             self.assertEqual(self.store.setting('stage-budget:' + task),
