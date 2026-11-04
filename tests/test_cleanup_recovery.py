@@ -78,6 +78,23 @@ class CleanupRecoveryTest(unittest.TestCase):
         rt.maintenance()
         self.assertEqual(remaining(), 0)            # 游标推进后剩余任务全部被覆盖
 
+    def test_legacy_baseline_project_keys_are_retired(self):
+        # baseline:<project> 旧版每次 fetch 覆写且无任何读取方；维护清理存量死键，
+        # 但不能误伤相邻命名空间 run-baseline:/evaluation-baseline:。
+        for key in ('baseline:p1', 'baseline:p2'):
+            self.store.execute("INSERT INTO settings VALUES (?,?)",
+                               (key, '{"sha":"base","branch":"main"}'))
+        for key in ('run-baseline:r1', 'evaluation-baseline:scope'):
+            self.store.execute("INSERT INTO settings VALUES (?,?)", (key, '{}'))
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(self.store, agent=object()).maintenance()
+
+        for key in ('baseline:p1', 'baseline:p2'):
+            self.assertIsNone(self.store.one("SELECT 1 FROM settings WHERE key=?", (key,)), key)
+        for key in ('run-baseline:r1', 'evaluation-baseline:scope'):
+            self.assertIsNotNone(self.store.one("SELECT 1 FROM settings WHERE key=?", (key,)), key)
+
     def test_deep_nested_dependency_tree_is_removed_without_recursion(self):
         # 深层嵌套（node_modules 式依赖树）超过默认递归上限；此前递归删除
         # 触发 RecursionError 且运行永久卡在保留清理里。目录构造与后续删除
