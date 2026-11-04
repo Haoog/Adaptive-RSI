@@ -1592,10 +1592,37 @@ class Runtime(Maintenance):
             if not keep or not any(values.values()):
                 self.store.execute('DELETE FROM settings WHERE key=?', (key,))
             else:
-                self.store.put_setting(key, values)
+                # 记录归属尝试：终态提交后、finally 之前崩溃会留下键，载入时据此判定它是否还有效。
+                self.store.put_setting(key, {**values, 'run': run.get('id')})
         except Exception:
             # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run。
             logging.getLogger(__name__).warning('Could not persist stage budget for %s', run.get('id'), exc_info=True)
+
+    def _checkpoint_owner_budget(self, owner, now):
+        """trial 轮询顺带为所属 run 落盘：时钟各自独立，账本仍按 owner 的阶段计。"""
+        if owner is None:
+            return
+        with _clock_lock(owner):
+            checkpoint = owner.get('_deadline_checkpoint')
+            if checkpoint is not None and now - checkpoint < STAGE_BUDGET_CHECKPOINT_SECONDS:
+                return
+            self._save_stage_budget(owner, now, keep=True)
+            owner['_deadline_checkpoint'] = now
+
+    def _load_stage_budget(self, run):
+        """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
+        key = self._stage_budget_key(run.get('task'))
+        stored = self.store.setting(key, {})
+        if not isinstance(stored, dict):
+            stored = {}
+        owner = stored.get('run')
+        if owner and owner != run.get('id'):
+            row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))
+            # 与 process() finally 的交接条件一致：只有未结或中断的尝试才把额度交给下一次。
+            if not row or not (row['ended'] is None or row['state'] == 'interrupted'):
+                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+                stored = {}
+        return {name: self._stage_seconds(stored.get(name)) for name in ('preparation', 'evaluation')}
 
     def new_trial_context(self, parent):
         """Start an experiment clock that never inherits the parent's elapsed time."""
@@ -1605,6 +1632,8 @@ class Runtime(Maintenance):
                                 '_deadline_checkpoint', '_deadline_lock',
                                 '_outer_deadline_stage', '_outer_deadline_started')}
         self.begin_phase(trial, 'preparation')
+        # trial 自带独立时钟，但仍要能把自己的轮询换算成所属 run 的检查点。
+        trial['_budget_owner'] = parent
         return trial
 
     @staticmethod
@@ -1682,6 +1711,11 @@ class Runtime(Maintenance):
                     # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
                     self._save_stage_budget(run, now, keep=True)
                     run['_deadline_checkpoint'] = now
+                elif run.get('_budget_owner') is not None:
+                    # trial 自身不记账，但它运行期间父 run 仍在消耗阶段预算：
+                    # 模型调用/评估循环的长轮询要按 owner 的检查点继续落盘，
+                    # 否则硬崩溃会把整段试验耗时丢掉。计费阶段取 owner 的。
+                    self._checkpoint_owner_budget(run['_budget_owner'], now)
         return False
 
     def active_strategies(self, project, config=None):
@@ -1828,11 +1862,9 @@ class Runtime(Maintenance):
 
     def process(self, run):
         from .process import operation_cancellation
-        # 阶段预算按任务累计：中断/重启后的新 run 续用已耗时间，而不是从零重计。
-        stored = self.store.setting(self._stage_budget_key(run.get('task')), {})
-        run['_stage_used'] = ({name: self._stage_seconds(stored.get(name))
-                               for name in ('preparation', 'evaluation')}
-                              if isinstance(stored, dict) else {})
+        # 阶段预算按任务累计：中断/重启后的新 run 续用已耗时间，而不是从零重计；
+        # 上一尝试已结案时载入会丢弃残留键，按满额度重新开始。
+        run['_stage_used'] = self._load_stage_budget(run)
         now = time.monotonic()
         with _clock_lock(run):
             run['_deadline_started'] = now

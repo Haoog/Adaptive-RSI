@@ -162,7 +162,8 @@ class RuntimeHandoffTest(unittest.TestCase):
             clock[0] += 20.0
             self.assertFalse(self.runtime.is_cancelled(run))
             # 检查点按 15 秒间隔落盘，硬崩溃最多损失一个间隔。
-            self.assertEqual(self.store.setting('stage-budget:' + task), {'preparation': 20.0, 'evaluation': 0.0})
+            self.assertEqual(self.store.setting('stage-budget:' + task),
+                             {'preparation': 20.0, 'evaluation': 0.0, 'run': run['id']})
             clock[0] += 40.0
             raise Cancelled('Runtime restarted')
         with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
@@ -170,7 +171,8 @@ class RuntimeHandoffTest(unittest.TestCase):
              patch.object(self.runtime, 'execute_candidate', side_effect=interrupted):
             self.runtime.process(run)
         self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'interrupted')
-        self.assertEqual(self.store.setting('stage-budget:' + task), {'preparation': 60.0, 'evaluation': 0.0})
+        self.assertEqual(self.store.setting('stage-budget:' + task),
+                         {'preparation': 60.0, 'evaluation': 0.0, 'run': run['id']})
 
         # 模拟进程重启：新 Store/Runtime、recover，然后按用户重试路径领取同一任务。
         self.runtime.close()
@@ -222,7 +224,60 @@ class RuntimeHandoffTest(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 self.runtime.invoke('planning', 'prompt', self.root / 'workspace', run)
         # 模型时钟独立计时，但它所属的准备阶段墙钟仍按同一个检查点落盘。
-        self.assertEqual(observed, [{'preparation': 20.0, 'evaluation': 0.0}])
+        self.assertEqual(observed, [{'preparation': 20.0, 'evaluation': 0.0, 'run': run['id']}])
+
+    def test_trial_poll_checkpoints_the_owner_budget_on_its_own_schedule(self):
+        """trial 轮询继续给所属 run 落盘：trial 时钟独立，但不能让父账丢掉整段耗时。"""
+        task, parent = self.claim()
+        clock = [1000.0]
+        parent['_stage_used'] = {'preparation': 0.0, 'evaluation': 0.0}
+        parent['_deadline_stage'], parent['_deadline_started'] = 'preparation', clock[0]
+        parent['_deadline_checkpoint'] = clock[0]
+        trial = self.runtime.new_trial_context(parent)
+        self.assertNotIn('_stage_used', trial)
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+            clock[0] += 20.0
+            self.assertFalse(self.runtime.is_cancelled(trial))
+            self.assertEqual(self.store.setting('stage-budget:' + task),
+                             {'preparation': 20.0, 'evaluation': 0.0, 'run': parent['id']})
+            # 父 run 的内存账本不被 trial 改写：落盘只做 used + 本次区间，重复调用幂等。
+            self.assertEqual(parent['_stage_used'], {'preparation': 0.0, 'evaluation': 0.0})
+            clock[0] += 10.0
+            self.assertFalse(self.runtime.is_cancelled(trial))
+            # 按 owner 的检查点节流，不因 trial 自身没有检查点而每次轮询都写盘。
+            self.assertEqual(self.store.setting('stage-budget:' + task)['preparation'], 20.0)
+            clock[0] += 5.0
+            self.assertFalse(self.runtime.is_cancelled(trial))
+            self.assertEqual(self.store.setting('stage-budget:' + task)['preparation'], 35.0)
+
+    def test_terminal_run_budget_residue_is_discarded_before_loading(self):
+        """终态提交后、finally 之前崩溃留下的键不能把旧消耗带进下一次尝试。"""
+        from adaptive_rsi.gitops import git
+        from adaptive_rsi.process import Cancelled
+        self.runtime.configure({'deadlines': {'preparation_seconds': 100}}, self.project)
+        task, stale = self.claim()
+        project = self.runtime.project(self.project)
+        base = git(project['path'], 'rev-parse', 'HEAD')
+        # 上一次尝试已把终态写进 runs，但进程死在 process() 的 finally 之前。
+        self.store.execute("UPDATE runs SET state='failed',ended=? WHERE id=?", (time.time(), stale['id']))
+        self.store.execute("UPDATE tasks SET state='failed' WHERE id=?", (task,))
+        self.store.put_setting('stage-budget:' + task,
+                               {'preparation': 60.0, 'evaluation': 5.0, 'run': stale['id']})
+        self.runtime.retry(task)
+        retried = self.store.claim(self.project, self.runtime.config(self.project))
+        self.assertNotEqual(retried['id'], stale['id'])
+        # 中断交接仍要保留额度，所以清理只能发生在载入时按归属尝试判定，而不是 retry()。
+        self.assertIsNotNone(self.store.setting('stage-budget:' + task))
+        observed = []
+        def restarted(*args, **kwargs):
+            observed.append(dict(retried['_stage_used']))
+            observed.append(self.store.setting('stage-budget:' + task))
+            raise Cancelled('Runtime restarted')
+        with patch('adaptive_rsi.delivery.baseline', return_value=(project['path'], base, 'main')), \
+             patch.object(self.runtime, 'execute_candidate', side_effect=restarted):
+            self.runtime.process(retried)
+        # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
+        self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()
