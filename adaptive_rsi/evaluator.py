@@ -44,6 +44,18 @@ UNAVAILABLE_OUTPUT = re.compile(
 DOCKER_IMAGE_ID = re.compile(r"sha256:[a-f0-9]{64}")
 
 
+def _write_report(directory, data):
+    """Persist an evaluation report, including refusals that never execute checks.
+
+    Callers keep only a bounded inline summary plus a link to report.json; returning an
+    early refusal without writing the file would leave that link dangling and drop the
+    only copy of its reason and provenance.
+    """
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return data
+
+
 def validation_controls(config):
     """Host-provided counterexamples are opt-in; models never synthesize them."""
     validation = config.get("validation")
@@ -1154,8 +1166,9 @@ class Evaluator:
         original_cancel = cancel
         cancel = lambda: stage_stop.is_set() or bool(original_cancel and original_cancel())
         if not checks:
-            return {"decision": "insufficient_evidence",
-                    "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}}
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "No executable acceptance checks. Configure checks before delivery.", "checks": {}})
         results = {}
         hidden = [row["path"] for row in self.store.query("SELECT path FROM projects")]
         execution_config, execution_identity = (
@@ -1192,9 +1205,10 @@ class Evaluator:
             # Diff and committed history were both unavailable: the frozen
             # baseline harness may not be reused, and checks cannot prove a
             # pass, so treat the evaluation as insufficient evidence.
-            return {"decision": "insufficient_evidence",
-                    "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
-                    "changed_files_available": False, "checks": {}}
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "Changed-file evidence is unavailable; harness freeze provenance cannot be established",
+                "changed_files_available": False, "checks": {}})
         added_tests = _added_test_files(candidate) if test_first else []
         existing_test_files = ([path for path in git(baseline, "ls-files", "-z").split("\0") if path and test_path(path)]
                                if test_first else [])
@@ -1238,18 +1252,21 @@ class Evaluator:
             if not additions:
                 additions = None
         if test_first and changed_harness:
-            return {"decision": "insufficient_evidence",
-                    "reason": "Test-first proof cannot modify the existing test harness", "checks": {}}
+            return _write_report(directory, {
+                "decision": "insufficient_evidence",
+                "reason": "Test-first proof cannot modify the existing test harness", "checks": {}})
         test_first_check = None
         if test_first:
             if not 1 <= len(added_tests) <= 8:
-                return {"decision": "insufficient_evidence",
-                        "reason": "Test-first proof requires 1..8 new regression test files", "checks": {}}
+                return _write_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Test-first proof requires 1..8 new regression test files", "checks": {}})
             test_first_check = [_isolated_test_check(checks, baseline, filename, regression_test_symbols) for filename in added_tests]
             if any(check is None for check in test_first_check):
-                return {"decision": "insufficient_evidence",
-                        "reason": "Configured test runner cannot execute the new regression test in isolation",
-                        "checks": {}}
+                return _write_report(directory, {
+                    "decision": "insufficient_evidence",
+                    "reason": "Configured test runner cannot execute the new regression test in isolation",
+                    "checks": {}})
         reuse_full = (changed_files is not None and full_checks == list(checks) and not overlay and
                       not changed_harness and scheduled is None)
         baseline_key = None if test_first or overlay else self._cache_key(
