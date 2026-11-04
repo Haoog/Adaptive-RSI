@@ -568,6 +568,13 @@ def monitoring_due(outcome, config, now):
         return True
     if outcome.get("monitoring_completed"):
         return False
+    # 已用尽尝试次数：只再进一次以收敛终态，绝不重做快照与固定检查。
+    if _feedback_exhausted(outcome):
+        return True
+    # 合并后验证抛异常后同样要退避：异常可能持续数小时（sandbox、磁盘、评估器），
+    # 每个调度周期立刻重做快照与全量检查会把故障放大成资源占用与事件刷写。
+    if not _feedback_retry_due(outcome, now):
+        return False
     return (now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400 or
             now - outcome.get("feedback_polled_at", feedback_record.get("checked_at", 0)) >=
             config["delivery"]["feedback_minutes"] * 60)
@@ -1284,6 +1291,66 @@ def parsed_result(run):
     return {"restore_invalidation": {"original_result": raw, "reason": "malformed_historical_result"}}
 
 
+# 合并后验证抛异常时的退避与上限：sandbox、磁盘、git 或评估器故障会持续存在，
+# 每个调度周期重做一次快照（git init + depth-1 fetch + checkout）与整份固定检查
+# 只会挤占新任务的资源并刷满 events。首次失败 5 分钟后重试，逐次翻倍到 1 小时
+# 封顶；24 次后收敛为 insufficient_evidence 并交人工，不再占用验证资源。
+FEEDBACK_ATTEMPT_LIMIT = 24
+FEEDBACK_RETRY_INITIAL = 300
+FEEDBACK_RETRY_MAX = 3600
+
+
+def _feedback_retry_delay(attempts):
+    return min(FEEDBACK_RETRY_MAX, FEEDBACK_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
+
+
+def _feedback_attempts(outcome):
+    attempts = outcome.get("feedback_attempts")
+    return attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts > 0 else 0
+
+
+def _feedback_retry_due(outcome, now):
+    """异常后的重试按尝试次数退避；成功与工件缺失路径会清零计数。"""
+    attempts = _feedback_attempts(outcome)
+    last = outcome.get("feedback_attempt_at")
+    if not attempts or not isinstance(last, (int, float)):
+        return True
+    return now - last >= _feedback_retry_delay(attempts)
+
+
+def _feedback_exhausted(outcome):
+    return _feedback_attempts(outcome) >= FEEDBACK_ATTEMPT_LIMIT
+
+
+def _clear_feedback_attempt(outcome):
+    """已得出结果的轮询不再退避；下一次到期按常规反馈周期执行。"""
+    outcome.pop("feedback_attempts", None)
+    outcome.pop("feedback_attempt_at", None)
+
+
+def _record_feedback_attempt(runtime, run, outcome, now):
+    """进入快照与固定检查之前落盘尝试，进程在验证中途消失也计入退避。"""
+    outcome["feedback_attempts"] = _feedback_attempts(outcome) + 1
+    outcome["feedback_attempt_at"] = now
+    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+
+
+def _abandon_feedback(runtime, project, run, outcome, now):
+    """收敛持续失败的合并后验证，只写一条终态事件并停止重试。"""
+    reason = ("Post-merge verification failed %s consecutive attempts without completing; snapshot or "
+              "fixed-check execution keeps raising. Restore the sandbox, git and artifact state, then "
+              "run fresh verification before release/deploy." % _feedback_attempts(outcome))
+    previous = outcome.get("feedback")
+    if not isinstance(previous, dict):
+        previous = {}
+    outcome["feedback"] = {"state": "insufficient_evidence", "reason": reason, "checked_at": now,
+                           "previous": previous}
+    # 终态：保留期与调度不再认为该运行仍在监控，证据保留在 previous 层。
+    outcome["monitoring_completed"] = True
+    runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+    runtime.store.event("postmerge_verification_abandoned", reason, project["id"], run["id"])
+
+
 def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=None):
     if not monitoring_due(outcome, config, now):
         return
@@ -1297,6 +1364,10 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
     if now - outcome.get("merged_at", now) > config["limits"]["retention_days"] * 86400:
         outcome["monitoring_completed"] = True
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
+        return
+    # 尝试次数用尽：只收敛终态，不再进入快照与固定检查。
+    if _feedback_exhausted(outcome):
+        _abandon_feedback(runtime, project, run, outcome, now)
         return
     from .storage_tools import MISSING_ARTIFACTS, run_artifact_path, unavailable_feedback
     if now - outcome.get("feedback_polled_at", 0) < config["delivery"]["feedback_minutes"] * 60:
@@ -1313,6 +1384,8 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         if not isinstance(previous, dict):
             previous = {}
         outcome["feedback_polled_at"] = now
+        # 工件缺失是已分类的结果，按既有轮询周期处理，不占用异常退避的重试预算。
+        _clear_feedback_attempt(outcome)
         if previous.get("state") != "insufficient_evidence" or previous.get("reason") != MISSING_ARTIFACTS:
             outcome["feedback"] = unavailable_feedback(previous)
             runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
@@ -1382,6 +1455,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                      merge_record.get("state") in {"verified", "regressed"})
     if now - outcome.get("feedback_polled_at", previous.get("checked_at", 0)) < config["delivery"]["feedback_minutes"] * 60:
         return
+    # 先落盘再取远端与执行检查：sandbox、磁盘或 git 在验证中途失败时，
+    # 下一个调度周期必须看到这次尝试，按退避等待而不是立刻重做整份验证。
+    _record_feedback_attempt(runtime, run, outcome, now)
     identity = runtime.store.setting("run-baseline:" + run["id"])
     if not isinstance(identity, dict) or not identity.get("repository") or not identity.get("branch"):
         raise RuntimeError("Post-merge verification requires a sealed repository and target branch")
@@ -1400,6 +1476,7 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
         raise RuntimeError("Post-merge verification target differs from sealed delivery")
     if previous.get("head") == head and merge_current:
         outcome["feedback_polled_at"] = now
+        _clear_feedback_attempt(outcome)
         runtime.store.execute("UPDATE runs SET result=? WHERE id=?", (encode(outcome), run["id"]))
         return
     try:
@@ -1511,6 +1588,9 @@ def feedback(runtime, project, run, outcome, config, now, cancel=None, shared=No
                                                 changed_files=committed, cache_scope=cache_scope, cache_base=cache_base)
             cache_postmerge_evaluation(runtime, project, key, head, run, result, None, shared, now)
     outcome["feedback_polled_at"] = now
+    # 本轮验证已给出结论（含 insufficient_evidence）：退出异常退避，
+    # 下一次到期轮询重新走常规反馈周期。
+    _clear_feedback_attempt(outcome)
     state = {"pass": "verified", "fail": "regressed"}.get(result["decision"], "insufficient_evidence")
     outcome["feedback"] = {"state": state, "head": head, "checked_at": now, "evaluation": result,
                            "attribution": failure_attribution(merged_sha, head, result)}
