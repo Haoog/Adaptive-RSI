@@ -885,6 +885,20 @@ class AuditEvaluationTest(unittest.TestCase):
         matching = [{'test_identities': {'state': 'reported', 'executed': required, 'skipped': []}}]
         self.assertTrue(evaluator.verify_test_identities(matching, required)['valid'])
 
+    def test_unittest_verbose_identities_match_selector_form(self):
+        text = 'test_ok (test_ok.T.test_ok) ... ok\n'
+        rows = [{'test_identities': evaluator.test_identities(text)}]
+        self.assertIn('test_ok.T.test_ok', rows[0]['test_identities']['executed'])
+        self.assertTrue(evaluator.verify_test_identities(rows, ['test_ok.T.test_ok'])['valid'])
+        # The old display form stays accepted for contracts written before the fix.
+        self.assertTrue(evaluator.verify_test_identities(rows, ['test_ok (test_ok.T.test_ok)'])['valid'])
+        # Abbreviations are not fuzzy-matched, and unrelated IDs stay missing.
+        mixed = evaluator.verify_test_identities(rows, ['test_ok.T.test_ok', 'other.T.test_missing'])
+        self.assertFalse(evaluator.verify_test_identities(rows, ['T.test_ok'])['valid'])
+        self.assertEqual(['other.T.test_missing'], mixed['missing'])
+        pytest_rows = [{'test_identities': evaluator.test_identities('tests/test_x.py::test_a PASSED\n')}]
+        self.assertTrue(evaluator.verify_test_identities(pytest_rows, ['tests/test_x.py::test_a'])['valid'])
+
     def test_executed_identities_and_skip_reasons(self):
         xml = '<testsuite tests="2" skipped="1"><testcase classname="X" name="yes"/><testcase classname="X" name="no"><skipped message="unsupported platform"/></testcase></testsuite>'
         result = evaluator.test_identities(xml)
