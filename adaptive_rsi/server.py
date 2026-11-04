@@ -61,6 +61,7 @@ _POST_FIELD_TYPES = {
     "/api/config/repair-global": {"confirmation": str},
     "/api/release-retry": {"project": str, "run": str, "kind": str},
     "/api/release-resolve": {"project": str, "run": str, "kind": str, "target": str},
+    "/api/release-abandon": {"project": str, "run": str, "kind": str, "reason": str, "target": str},
     "/api/release-authorize": {"project": str, "kind": str, "workflow": str},
     "/api/goal": {"project": str, "text": str, "request_id": str},
     "/api/task/revise": {"task": str, "supplement": str, "reason": str},
@@ -485,7 +486,7 @@ class Handler(BaseHTTPRequestHandler):
                 store.execute("INSERT OR IGNORE INTO settings VALUES ('instance-id',?)", (encode(uid()),))
                 data["instance"] = store.setting("instance-id")
                 from .dashboard import TASKS
-                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
+                data["notifications"] = store.query("SELECT t.id,t.project,t.title,t.state,t.display_state,t.updated,r.id AS run,r.result FROM " + TASKS + " t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) WHERE t.source NOT LIKE 'system_%' ORDER BY t.updated DESC LIMIT 200")
                 self.respond(data)
             elif parsed.path == "/api/storage":
                 from .storage_tools import overview
@@ -811,8 +812,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not 1 <= limit <= 100:
                     raise RequestError("Invalid run pagination")
                 query = ("SELECT id,project,task,state,started,ended FROM runs WHERE task=?" +
-                         (" AND (started<? OR (started=? AND id<?))" if before else "") +
-                         " ORDER BY started DESC,id DESC LIMIT ?")
+                         (" AND (started<? OR (started=? AND rowid<(SELECT rowid FROM runs WHERE id=?)))" if before else "") +
+                         " ORDER BY started DESC,rowid DESC LIMIT ?")
                 if before:
                     timestamp, separator, identifier = before.partition(":")
                     try:
@@ -1151,6 +1152,13 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         result = runtime.resolve_release(body.get("project"), body.get("run"), body.get("kind"),
                                                          body.get("workflow_run_id"), body.get("target", "operation"))
+                    except ReconciliationRejected as exc:
+                        raise RequestError(str(exc)) from None
+                elif path == "/api/release-abandon":
+                    from .release import abandon
+                    try:
+                        result = abandon(runtime, body.get("project"), body.get("run"), body.get("kind"),
+                                         body.get("reason"), body.get("target", "operation"), source="console")
                     except ReconciliationRejected as exc:
                         raise RequestError(str(exc)) from None
                 elif path == "/api/release-authorize":
