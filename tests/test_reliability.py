@@ -884,6 +884,59 @@ class ReliabilityTest(unittest.TestCase):
         self.assertFalse(evaluate.called)
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "obsolete")
 
+    def high_risk_agent(self):
+        """高风险计划且补丁触及敏感路径：未修复时 review 与 risk_review 都会被付费调用。"""
+        class HighRisk(FakeAgent):
+            def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == "planning":
+                    result["risk"] = "high"
+                    result["scope"] = ["calculator.py", "auth.py", "tests"]
+                if role == "implementation":
+                    (workspace / "auth.py").write_text("PERMISSION_BOUNDARY = 'owner'\n")
+                return result
+        return HighRisk()
+
+    def test_experiment_eval_failure_skips_paid_review(self):
+        """评估已失败的试验 verdict 必然被丢弃，review/risk_review 都不再付费执行。"""
+        from adaptive_rsi import pipeline
+        self.runtime.agent = self.high_risk_agent()
+        task, run, project, base, directory, workspace = self.no_change_inputs("Fix addition")
+        trial = self.runtime.new_trial_context(run)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline",
+                          return_value={"decision": "pass", "checks": {}}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "fail", "reason": "Candidate regressed on protected checks",
+                 "checks": {}}) as evaluate:
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project["path"], base, directory, workspace,
+                [], experiment=True)
+        self.assertTrue(evaluate.called)
+        self.assertEqual(outcome["decision"], "fail")
+        self.assertEqual(outcome["review"]["decision"], "skipped")
+        self.assertEqual(outcome["review"]["reason"], "Candidate regressed on protected checks")
+        self.assertEqual(outcome["review"]["evaluation"]["decision"], "fail")
+        self.assertIsNone(outcome["risk_review"])
+        # 高风险计划 + 敏感文件本来会追加 risk_review；两个付费调用都必须未发生。
+        self.assertNotIn("review", [role for role, _ in self.runtime.agent.roles])
+        self.assertEqual(self.store.query("SELECT * FROM calls WHERE role='review'"), [])
+
+    def test_experiment_passing_evaluation_still_runs_review(self):
+        """回归保护：评估通过的试验照常执行评审。"""
+        from adaptive_rsi import pipeline
+        task, run, project, base, directory, workspace = self.no_change_inputs("Fix addition")
+        trial = self.runtime.new_trial_context(run)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}), \
+             patch.object(self.runtime.evaluator, "evaluate", return_value={
+                 "decision": "pass", "reason": "Fixed checks passed", "checks": {}}):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project["path"], base, directory, workspace,
+                [], experiment=True)
+        self.assertEqual(outcome["decision"], "pass")
+        self.assertEqual(outcome["review"]["decision"], "pass")
+        self.assertEqual([role for role, _ in self.runtime.agent.roles].count("review"), 1)
+
     def test_validation_failure_never_exposes_holdout_and_uses_production_path(self):
         self.import_cases()
         self.runtime.configure({"limits": {"daily_calls": 100}, "evolution": {"min_cases_per_split": 1, "max_calls": 100}}, self.project)
