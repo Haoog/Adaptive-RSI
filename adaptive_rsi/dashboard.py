@@ -8,6 +8,7 @@ ATTENTION = ["waiting_budget", "awaiting_approval", "blocked", "failed", "insuff
 
 # Derive attention from the latest attempt without changing the PR tracking state.
 # decision_reason 来自 task_decisions：批量初筛或规划暂缓/不采纳的理由，供无运行记录的任务显示。
+# started 可能逐毫秒相同；latest run 一律用 rowid 决胜（随插入单调），避免各读模型选中不同的 run。
 TASKS = """(SELECT t.*, json_extract(CASE WHEN json_valid(d.data) THEN d.data ELSE '{}' END,'$.reason') AS decision_reason, CASE
     WHEN t.state='pr_open' AND json_extract(CASE WHEN json_valid(r.result) THEN r.result ELSE '{}' END, '$.delivery_status')='ci_failed' THEN 'ci_failed'
     WHEN t.state='merged' AND json_extract(CASE WHEN json_valid(r.result) THEN r.result ELSE '{}' END, '$.feedback.state')='regressed' THEN 'regressed'
@@ -16,7 +17,7 @@ TASKS = """(SELECT t.*, json_extract(CASE WHEN json_valid(d.data) THEN d.data EL
     WHEN t.state='merged' AND json_extract(CASE WHEN json_valid(r.result) THEN r.result ELSE '{}' END, '$.automation.deploy.state') IN ('pending','dispatching','submitted','queued','running','rerunning','rolling_back','waiting_target','waiting_verification','waiting_release') THEN 'deploying'
     WHEN t.state='merged' AND json_extract(CASE WHEN json_valid(r.result) THEN r.result ELSE '{}' END, '$.automation.release.state') IN ('pending','dispatching','submitted','queued','running','rerunning','waiting_verification') THEN 'releasing'
     ELSE t.state END AS display_state FROM tasks t LEFT JOIN runs r
-    ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1)
+    ON r.id=(SELECT id FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1)
     LEFT JOIN task_decisions d ON d.task=t.id)"""
 
 
@@ -46,11 +47,11 @@ def records(store, project=None, limit=50, offset=0, group="all", include_system
     # Include the latest attempt for every visible task, even if it is older than the history window.
     task_ids = [t["id"] for t in tasks]
     runs = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs WHERE " + clause +
-                       " ORDER BY started DESC LIMIT 100", base_args)
+                       " ORDER BY started DESC,rowid DESC LIMIT 100", base_args)
     if task_ids:
         latest = store.query("SELECT r.id,r.project,r.task,r.state,r.calls,r.tokens,r.started,r.ended,r.base,r.result "
                              "FROM runs r WHERE r.task IN (" + ",".join("?" for _ in task_ids) + ") "
-                             "AND r.id=(SELECT id FROM runs WHERE task=r.task ORDER BY started DESC,id LIMIT 1)", task_ids)
+                             "AND r.id=(SELECT id FROM runs WHERE task=r.task ORDER BY started DESC,rowid DESC LIMIT 1)", task_ids)
         runs = sorted({r["id"]: r for r in runs + latest}.values(), key=lambda r: r["started"] or 0, reverse=True)
     active = store.query("SELECT id,project,task,state,calls,tokens,started,ended,base,result FROM runs WHERE " + clause + " AND ended IS NULL", base_args)
     runs = sorted({r["id"]: r for r in runs + active}.values(), key=lambda r: r["started"] or 0, reverse=True)
