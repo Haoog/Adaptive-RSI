@@ -824,6 +824,9 @@ class Evolution:
                 "credentials": {"available": [], "missing": []},
                 "limitations": ["Missing bundle.json: target is not a valid reproduction bundle directory"],
                 "reproducible": False,
+                "checks_executed": 0,
+                "checks_failed": 0,
+                "checks_passed": None,
                 "executed_checks": [],
             }
 
@@ -902,6 +905,39 @@ class Evolution:
                              "mismatches": list(integrity.get("mismatches", [])) + invalid_cases}
                 case_items = []
 
+        # 检查规格先做结构校验，供依赖扫描、限制说明和执行路径共用：argv 不是
+        # 非空字符串数组时，依赖扫描会静默跳过、subprocess 又会把整个字符串当
+        # 可执行文件名（FileNotFoundError 被吞成一条 error）；cwd 为绝对路径或
+        # 含 .. 时，执行会落到一次性副本之外。两者都属于畸形规格，必须显式记录。
+        def check_spec_error(check):
+            argv = check.get("argv")
+            if (not isinstance(argv, list) or not argv
+                    or not all(isinstance(arg, str) for arg in argv)):
+                return "argv is not a non-empty list of strings"
+            # argv[0] 是可执行名，空串必然启动失败；其后的参数允许空字符串，
+            # 与 config.py 的规格校验和 subprocess 直接执行的行为保持一致。
+            if not argv[0]:
+                return "argv[0] is an empty executable name"
+            cwd = check.get("cwd", ".")
+            if (not isinstance(cwd, str) or not cwd
+                    or Path(cwd).is_absolute() or ".." in Path(cwd).parts):
+                return "cwd is not a relative path inside the case"
+            return None
+
+        malformed_checks = []
+        for case_id, case_entry, spec in case_items:
+            checks = spec.get("checks")
+            if not isinstance(checks, list):
+                malformed_checks.append(f"Case {case_id}: checks is not a list")
+                continue
+            for i, check in enumerate(checks):
+                if not isinstance(check, dict):
+                    malformed_checks.append(f"Case {case_id}: checks[{i}] is not an object")
+                    continue
+                error = check_spec_error(check)
+                if error:
+                    malformed_checks.append(f"Case {case_id}: checks[{i}] {error}")
+
         seen_tools = {}
         for case_id, case_entry, spec in case_items:
             checks = spec.get("checks")
@@ -909,12 +945,11 @@ class Evolution:
                 continue
             for check in checks:
                 # checks 可能是字符串/数字等非对象条目：check.get 会抛
-                # AttributeError，bundle 内容不可信，逐条跳过。
-                if not isinstance(check, dict):
+                # AttributeError，bundle 内容不可信，逐条跳过。畸形规格已在上面
+                # 记录，不进入依赖清单（否则会按半截 argv 报出误导性的缺工具）。
+                if not isinstance(check, dict) or check_spec_error(check):
                     continue
-                argv = check.get("argv", [])
-                if not argv or not isinstance(argv, list):
-                    continue
+                argv = check.get("argv")
                 cmd = argv[0]
                 check_name = check.get("name", "check")
                 if cmd not in seen_tools:
@@ -988,27 +1023,10 @@ class Evolution:
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
 
-        malformed_checks = []
-        for case_id, case_entry, spec in case_items:
-            checks = spec.get("checks")
-            if not isinstance(checks, list):
-                malformed_checks.append(f"Case {case_id}: checks is not a list")
-                continue
-            for i, check in enumerate(checks):
-                if not isinstance(check, dict):
-                    malformed_checks.append(f"Case {case_id}: checks[{i}] is not an object")
         if malformed_checks:
             msg = f"Malformed check specifications: {'; '.join(malformed_checks)}"
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
-
-        is_reproducible = (
-            bool(integrity.get("valid")) and
-            len(missing_tools) == 0 and
-            len(missing_creds) == 0 and
-            credential_limitation is None and
-            len(malformed_checks) == 0
-        )
 
         # 5. Optional check execution
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
@@ -1058,13 +1076,16 @@ class Evolution:
                     if not isinstance(checks, list):
                         checks = []
                     for check in checks:
-                        if not isinstance(check, dict):
+                        # 畸形规格已在前面记入 limitations，不执行：字符串 argv
+                        # 会被当成可执行文件名，错误又被吞成一条 executed_check。
+                        if not isinstance(check, dict) or check_spec_error(check):
                             continue
-                        argv = check.get("argv", [])
-                        if not argv:
-                            continue
+                        argv = check.get("argv")
                         cwd = (staging / check.get("cwd", ".")).resolve()
-                        run_cwd = cwd if cwd.is_dir() else staging
+                        # 解析后的 cwd 必须仍在一次性副本内：仓库内被注入的符号
+                        # 链接可能把它指向副本之外，此时退回 staging 根目录。
+                        run_cwd = (cwd if cwd.is_dir() and (cwd == staging or staging in cwd.parents)
+                                   else staging)
                         try:
                             proc = subprocess.run(
                                 argv,
@@ -1103,6 +1124,26 @@ class Evolution:
                     if staging_tmp:
                         shutil.rmtree(staging_tmp, ignore_errors=True)
 
+        # 6. Verdict
+        # reproducible 表示「条件齐备，且本次实际执行的检查全部通过」。未请求
+        # --run-checks 时 checks_passed 为 None，判定只看条件；一旦执行过检查，
+        # 任一 passed=False 都必须反映到机器可读结果和结论里，不能让失败被当成成功。
+        checks_failed = sum(1 for row in executed_checks if not row.get("passed"))
+        checks_passed = (checks_failed == 0) if executed_checks else None
+        if checks_failed:
+            msg = (f"Offline checks failed: {checks_failed} of {len(executed_checks)} "
+                   f"executed check(s) did not pass")
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+        is_reproducible = (
+            bool(integrity.get("valid")) and
+            len(missing_tools) == 0 and
+            len(missing_creds) == 0 and
+            credential_limitation is None and
+            len(malformed_checks) == 0 and
+            checks_passed is not False
+        )
+
         return {
             "valid": bool(integrity.get("valid")),
             "integrity": integrity,
@@ -1116,6 +1157,9 @@ class Evolution:
             },
             "limitations": repro_limitations,
             "reproducible": is_reproducible,
+            "checks_executed": len(executed_checks),
+            "checks_failed": checks_failed,
+            "checks_passed": checks_passed,
             "executed_checks": executed_checks,
         }
 
