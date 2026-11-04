@@ -35,6 +35,8 @@ The host runs acceptance checks independently. Missing evidence must be reported
 BUDGET_WAIT_SECONDS = 900
 BUDGET_WAIT_MAX_SECONDS = 3600
 BUDGET_WAIT_RETRIES = 3
+# 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
+STAGE_BUDGET_CHECKPOINT_SECONDS = 15
 
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
@@ -1517,18 +1519,72 @@ class Runtime(Maintenance):
             result.append(item)
         return result
 
-    @staticmethod
-    def begin_phase(run, stage):
+    def begin_phase(self, run, stage):
         if stage not in ('preparation', 'model', 'evaluation'):
             raise ValueError('Unknown execution phase')
+        now = time.monotonic()
+        self._close_stage(run, now)
         run['_explicit_phase'] = stage
-        run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
+        run['_deadline_stage'], run['_deadline_started'] = stage, now
+
+    @staticmethod
+    def _stage_seconds(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        return max(0.0, float(value))
+
+    @staticmethod
+    def _stage_budget_key(task):
+        return 'stage-budget:' + str(task)
+
+    def _close_stage(self, run, now):
+        """累计当前阶段已耗时间；模型时钟按调用单独计时，未加载预算的 trial 不受影响。"""
+        used, stage, started = run.get('_stage_used'), run.get('_deadline_stage'), run.get('_deadline_started')
+        if not isinstance(used, dict) or stage not in ('preparation', 'evaluation') or started is None:
+            return
+        used[stage] = self._stage_seconds(used.get(stage)) + max(0.0, now - started)
+
+    def _stage_spent(self, run, stage, started, now):
+        used = run.get('_stage_used')
+        spent = self._stage_seconds(used.get(stage)) if isinstance(used, dict) else 0.0
+        return spent + max(0.0, now - started) if started is not None else spent
+
+    @staticmethod
+    def _billable_stage(run):
+        """模型调用在途时按外层阶段计费：检查点仍要累计准备/评估的墙钟耗时。"""
+        if run.get('_model_started') is not None:
+            stage, started = run.get('_outer_deadline_stage'), run.get('_outer_deadline_started')
+            if stage in ('preparation', 'evaluation') and started is not None:
+                return stage, started
+        return run.get('_deadline_stage'), run.get('_deadline_started')
+
+    def _save_stage_budget(self, run, now, keep):
+        """落盘或清除任务已耗的阶段时间：只有中断把额度交接给下一次尝试。"""
+        used, task = run.get('_stage_used'), run.get('task')
+        if not task or not isinstance(used, dict):
+            return
+        key = self._stage_budget_key(task)
+        try:
+            values = dict(used)
+            stage, started = self._billable_stage(run)
+            if keep and stage in ('preparation', 'evaluation') and started is not None:
+                values[stage] = self._stage_seconds(values.get(stage)) + max(0.0, now - started)
+            values = {name: self._stage_seconds(values.get(name))
+                      for name in ('preparation', 'evaluation')}
+            if not keep or not any(values.values()):
+                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+            else:
+                self.store.put_setting(key, values)
+        except Exception:
+            # 预算是尽力而为的护栏：写入失败不能反过来中断正在收尾的 run。
+            logging.getLogger(__name__).warning('Could not persist stage budget for %s', run.get('id'), exc_info=True)
 
     def new_trial_context(self, parent):
         """Start an experiment clock that never inherits the parent's elapsed time."""
         trial = {key: value for key, value in parent.items()
                  if key not in ('_model_started', '_deadline_started', '_deadline_stage',
-                                '_timed_out_stage', '_explicit_phase',
+                                '_timed_out_stage', '_explicit_phase', '_stage_used',
+                                '_deadline_checkpoint',
                                 '_outer_deadline_stage', '_outer_deadline_started')}
         self.begin_phase(trial, 'preparation')
         return trial
@@ -1541,6 +1597,7 @@ class Runtime(Maintenance):
     def is_cancelled(self, run):
         if self.stop.is_set():
             return True
+        now = time.monotonic()
         if '_deadline_started' in run:
             if run.get('_model_started') is not None:
                 stage = 'model'
@@ -1550,7 +1607,10 @@ class Runtime(Maintenance):
                 state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
                 stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
             if run.get('_deadline_stage') != stage:
-                run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
+                # 模型调用的进出由 invoke 恢复外层锚点，在此累计会重复计时。
+                if run.get('_deadline_stage') in ('preparation', 'evaluation') and stage in ('preparation', 'evaluation'):
+                    self._close_stage(run, now)
+                run['_deadline_stage'], run['_deadline_started'] = stage, now
             try:
                 run_config = json.loads(run['config'] or "{}")
             except (TypeError, ValueError):
@@ -1562,14 +1622,19 @@ class Runtime(Maintenance):
             outer_started = run.get('_outer_deadline_started')
             if (run.get('_model_started') is not None and
                     outer_stage in ('preparation', 'evaluation') and outer_started is not None and
-                    time.monotonic() - outer_started >= limits[outer_stage + '_seconds']):
+                    self._stage_spent(run, outer_stage, outer_started, now) >= limits[outer_stage + '_seconds']):
                 # 首个超时判定者胜：trial 经 propagate_deadline 上报的阶段（如 evaluation）
                 # 不得被父 run 自身的阶段时钟（如 preparation）覆盖。
                 run.setdefault('_timed_out_stage', outer_stage)
                 return True
-            if time.monotonic() - run['_deadline_started'] >= limits[stage + '_seconds']:
+            if self._stage_spent(run, stage, run['_deadline_started'], now) >= limits[stage + '_seconds']:
                 run.setdefault('_timed_out_stage', stage)
                 return True
+            checkpoint = run.get('_deadline_checkpoint')
+            if '_stage_used' in run and (checkpoint is None or now - checkpoint >= STAGE_BUDGET_CHECKPOINT_SECONDS):
+                # 硬崩溃时 finally 不会执行；按间隔落盘，重启后最多损失一个间隔。
+                self._save_stage_budget(run, now, keep=True)
+                run['_deadline_checkpoint'] = now
         row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
                              "WHERE s.key='run-stop:' || r.id) AS stop_requested "
                              "FROM runs r JOIN tasks t ON r.task=t.id "
@@ -1678,7 +1743,10 @@ class Runtime(Maintenance):
         outer_stage = (run.get('_explicit_phase') or
                        ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
         if run.get('_deadline_stage') != outer_stage or run.get('_deadline_started') is None:
-            outer_started = time.monotonic()
+            # 相位被外部推进时，先结算旧阶段再起新锚点，跨尝试累计不丢已用时间。
+            now = time.monotonic()
+            self._close_stage(run, now)
+            outer_started = now
         else:
             outer_started = run['_deadline_started']
         self.store.phase(run["id"], role)
@@ -1713,10 +1781,23 @@ class Runtime(Maintenance):
 
     def process(self, run):
         from .process import operation_cancellation
-        run['_deadline_started'] = time.monotonic()
+        # 阶段预算按任务累计：中断/重启后的新 run 续用已耗时间，而不是从零重计。
+        stored = self.store.setting(self._stage_budget_key(run.get('task')), {})
+        run['_stage_used'] = ({name: self._stage_seconds(stored.get(name))
+                               for name in ('preparation', 'evaluation')}
+                              if isinstance(stored, dict) else {})
+        now = time.monotonic()
+        run['_deadline_started'] = now
         run['_deadline_stage'] = 'preparation'
-        with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
-            return self._process(run)
+        run['_deadline_checkpoint'] = now
+        try:
+            with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
+                return self._process(run)
+        finally:
+            row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+            # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
+            keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
+            self._save_stage_budget(run, time.monotonic(), keep)
 
     def _process(self, run):
         try:
