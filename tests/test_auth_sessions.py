@@ -2364,6 +2364,23 @@ class AuthProtocolTests(unittest.TestCase):
         finally:
             worker.close()
 
+    def test_codex_manager_reports_unsupported_method_and_inputs_as_session_error(self):
+        # API 客户端拿到的是会话终态错误，不能静默回落到 device code 流程。
+        for index, kwargs in enumerate(({"method": 1}, {"inputs": {"k": "v"}})):
+            manager = AuthSessions(self.root / f"state-unsupported-{index}")
+            try:
+                session = manager.start("codex", **kwargs)
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    result = manager.status(session["id"])
+                    if result["state"] in {"failed", "completed", "expired"}:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(result["state"], "failed", result)
+                self.assertEqual(result["error"], "unsupported_auth_method")
+            finally:
+                manager.close()
+
     def test_opencode_http_protocol_is_authenticated_and_persists_callback(self):
         worker = OpenCodeAuth()
         try:
