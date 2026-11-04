@@ -791,7 +791,9 @@ class Evaluator:
             return protected
         sandbox = Sandbox(self.store.root, config)
         def execute(target, protected):
-            self._seed_target(target, seeds, config)
+            # seed 路径由种子独占：候选在该路径留下的文件先清除再还原，
+            # 与 _standard_stage 的 clear=True 语义一致，避免 restore() 抛 overlap。
+            self._seed_target(target, seeds, config, clear=True)
             rows = []
             for setup in config["environment"]["setup"]:
                 result = sandbox.check(setup, target, cancel, protected, hidden)
@@ -1073,7 +1075,9 @@ class Evaluator:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(item["content"], encoding="utf-8")
             protected.append(dst)
-        self._seed_target(target, seeds, config)
+        # 独立验收复用了 seed 路径：候选写入该路径时按 seed 独占语义清除后还原，
+        # 否则 restore() 抛 RuntimeError 会逃出评估而不是给出结构化结论。
+        self._seed_target(target, seeds, config, clear=True)
         sandbox = Sandbox(self.store.root, config)
         for setup in config["environment"]["setup"]:
             result = sandbox.check(setup, target, cancel, protected, hidden)

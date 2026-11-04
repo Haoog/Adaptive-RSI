@@ -66,6 +66,109 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertTrue((target / 'deps').is_dir())
             self.assertEqual((target / 'deps/value').read_text(), 'seeded\n')
 
+    def test_acceptance_stage_clears_candidate_seed_overlap(self):
+        # 候选把文件写在 seed 路径时，独立验收阶段必须清除后还原种子，
+        # 而不是让 restore() 的 overlap RuntimeError 逃出评估。
+        from adaptive_rsi.config import DEFAULTS, merge
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seeds = root / 'seeds'
+            (seeds / 'deps').mkdir(parents=True)
+            (seeds / 'deps/value').write_text('seeded\n')
+            source = root / 'source'
+            source.mkdir()
+            (source / 'deps').write_text('candidate-file\n')
+            config = merge(DEFAULTS, {'environment': {'seed_paths': ['deps']}})
+            acceptance = {'hash': 'h', 'checks': [], 'spec': {'files': []}, 'criteria': []}
+            outcome = evaluator.Evaluator(SimpleNamespace(root=root / 'state'))._acceptance_stage(
+                'acceptance_candidate', source, source, acceptance, root / 'evaluation',
+                config, None, seeds, [])
+            self.assertEqual(outcome, {'rows': []})
+            target = root / 'evaluation' / 'acceptance_candidate'
+            self.assertTrue((target / 'deps').is_dir())
+            self.assertEqual((target / 'deps/value').read_text(), 'seeded\n')
+
+    def test_controls_clear_candidate_seed_overlap(self):
+        # 对照例目标同样复用 seed 路径，候选写入该路径时不得让阶段异常退出。
+        from adaptive_rsi.config import DEFAULTS, merge
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seeds = root / 'seeds'
+            (seeds / 'deps').mkdir(parents=True)
+            (seeds / 'deps/value').write_text('seeded\n')
+            source = root / 'source'
+            source.mkdir()
+            (source / 'deps').write_text('candidate-file\n')
+            (source / 'value.py').write_text('VALUE = 1\n')
+            checks = [{'name': 'unit', 'argv': ['python3', 'value.py']}]
+            controls = [{'id': 'c1', 'source': 'host:fixture', 'criterion': 'x',
+                         'files': [{'path': 'value.py', 'content': 'VALUE = 2\n'}]}]
+            config = merge(DEFAULTS, {'environment': {'seed_paths': ['deps']}})
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+
+            with patch('adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                outcome = evaluator.Evaluator(SimpleNamespace(root=root / 'state')).validate_controls(
+                    source, checks, controls, root / 'controls', config, seeds=seeds)
+            # 空夹具下检查通过但未检出反例：仍返回结构化结论而非抛异常。
+            self.assertEqual(outcome['decision'], 'insufficient_evidence')
+            self.assertFalse(outcome['controls'][0]['detected'])
+            for target in [root / 'controls/positive', root / 'controls/0']:
+                self.assertTrue((target / 'deps').is_dir())
+                self.assertEqual((target / 'deps/value').read_text(), 'seeded\n')
+
+    def test_seed_overlap_writes_evaluation_report(self):
+        # 端到端：候选写入 seed 路径时评估仍落盘 report.json。
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            seeds = root / 'seeds'
+            (seeds / 'deps').mkdir(parents=True)
+            (seeds / 'deps/value').write_text('seeded\n')
+            source = root / 'source'
+            source.mkdir()
+            (source / 'value.py').write_text('VALUE = 1\n')
+            candidate = root / 'candidate'
+            candidate.mkdir()
+            (candidate / 'value.py').write_text('VALUE = 1\n')
+            (candidate / 'deps').write_text('candidate-file\n')
+            checks = [{'name': 'unit', 'argv': ['python3', 'value.py']}]
+            acceptance = {'hash': 'h', 'change_kind': 'refactor', 'criteria': ['behavior preserved'],
+                          'checks': [{'name': 'ac', 'argv': ['python3', 'value.py']}],
+                          'spec': {'files': [], 'checks': [{'name': 'ac', 'criteria': [0]}]}}
+            config = merge(DEFAULTS, {'environment': {'seed_paths': ['deps']}})
+
+            restored = []
+
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                marker = Path(workspace) / 'deps' / 'value'
+                restored.append(marker.read_text() if marker.is_file() else None)
+                return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
+                        'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
+
+            store = Store(root / 'state')
+            self.addCleanup(store.close)
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                # 必须真的把快照交给 evaluate()：不传 seeds 时 _seed_target() 直接
+                # 返回，验收阶段不会触发 overlap，用例就测不到本次修复的行为。
+                result = evaluator.Evaluator(store).evaluate(
+                    source, candidate, checks, root / 'evaluation', config,
+                    seeds=seeds, changed_files=[], acceptance=acceptance)
+            # 每个阶段（含验收阶段）执行检查时都应看到已还原的种子内容。
+            self.assertTrue(restored)
+            self.assertEqual(set(restored), {'seeded\n'})
+            report = json.loads((root / 'evaluation' / 'report.json').read_text())
+            self.assertEqual(report['decision'], result['decision'])
+            self.assertEqual(result['decision'], 'pass')
+
     def test_stage_reuse_requires_explicit_opt_in(self):
         from adaptive_rsi.evaluator import checkpoint_reuse_enabled
         self.assertFalse(checkpoint_reuse_enabled(_config()))
