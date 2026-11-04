@@ -237,6 +237,9 @@ class UsageReportTest(unittest.TestCase):
                 if version <= 6:
                     db.execute("INSERT INTO schema_migrations VALUES (?,?,?)",
                                (version, hashlib.sha256(content).hexdigest(), 0))
+            # Store 打开时会写入 instance-id：真实封存库的 settings 表由 bootstrap 建好，
+            # 夹具与下面的 runs 一样补齐这张基线表，启动期写入才不会落在空表上。
+            db.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             db.execute("CREATE TABLE calls(id TEXT PRIMARY KEY,project TEXT,run TEXT,role TEXT,model TEXT,"
                        "effort TEXT,state TEXT,tokens INTEGER DEFAULT 0,seconds REAL DEFAULT 0,created REAL,"
                        "provider TEXT DEFAULT 'openai',unit_price REAL,unit TEXT DEFAULT 'unknown',"
