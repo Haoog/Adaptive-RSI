@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+## 0.5.137
+
+<!-- adaptive-rsi-release:0.5.137;base:e2c514a300618e8871632d60c759e8d723358991 -->
+
+- 发布经过检查的主线改进；本版本对应提交 `e2c514a300618e8871632d60c759e8d723358991`。
+
 ## 0.5.136
 
 <!-- adaptive-rsi-release:0.5.136;base:1c93aed86f8a3a49f537221f0076ad1224f8cdaf -->
