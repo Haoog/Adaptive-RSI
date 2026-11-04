@@ -177,6 +177,9 @@ def workflow_choices(runtime, project_id, refresh=False):
     return result
 
 
+_WORKFLOW_INSPECT_FAILED = "Unable to inspect this workflow right now; retry after the GitHub request succeeds"
+
+
 def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
@@ -192,7 +195,21 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     sha = api(repo, "commits/" + quote(branch, safe=""))["sha"]
     try:
         compatible = compatible_workflow(workflow_content(repo, workflow, sha))
-    except (RuntimeError, ValueError, OSError):
+    except ApiRejected as exc:
+        # A 404 is GitHub's definitive answer that this path is absent at the
+        # pinned commit, so the selection is unusable. Other rejections (429
+        # cooldown, 403, 5xx) never read the file and must not be reported as
+        # an incompatible workflow.
+        if exc.status != 404:
+            raise ValueError(_WORKFLOW_INSPECT_FAILED) from None
+        compatible = False
+    except (RuntimeError, OSError):
+        # gh non-JSON output, rate limits and network failures: the file was
+        # never inspected, so "select a compatible workflow" would send the
+        # operator to edit a YAML that may be correct.
+        raise ValueError(_WORKFLOW_INSPECT_FAILED) from None
+    except ValueError:
+        # The file was read but is not a regular UTF-8 repository file.
         compatible = False
     if not compatible:
         raise ValueError("Select a compatible existing workflow from this project")
