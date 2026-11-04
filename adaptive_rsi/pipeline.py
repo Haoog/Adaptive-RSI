@@ -278,6 +278,22 @@ def _touched_paths(workspace):
     return {path for path in raw.split("\0") if path}
 
 
+def _setup_changes(workspace):
+    """Paths the environment setup step wrote into the shared candidate workspace.
+
+    ``changes()`` later stages everything with ``git add -A`` against the base
+    commit, so a setup command that rewrites a tracked file (or leaves an
+    untracked, non-ignored file) would be indistinguishable from a model edit:
+    it either trips the planned-scope gate or enters the delivered patch. This
+    snapshot taken right after setup keeps that attribution separate. Ignored
+    paths (dependency seeds, ``node_modules``) are excluded exactly like the
+    later patch capture excludes them.
+    """
+    tracked = git(workspace, "diff", "HEAD", "--name-only", "-z").split("\0")
+    untracked = git(workspace, "ls-files", "--others", "--exclude-standard", "-z").split("\0")
+    return sorted({path for path in tracked + untracked if path})
+
+
 def _prepare_environment(runtime, run, project, config, directory, workspace, checks):
     """Seal selected dependency seeds once and restore a private copy per workspace."""
     from .environment import capture, materialize, prepare_cached, restore
@@ -408,6 +424,18 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if prepared["exit_code"] or prepared["error"]:
             raise ProcessError(prepared, "Dependency preparation failed before planning: " +
                                (prepared.get("error") or prepared.get("stderr") or prepared.get("stdout") or "Command failed"))
+    setup_changes = _setup_changes(workspace)
+    if setup_changes:
+        # Setup runs before any paid planning call and shares the workspace with
+        # the model. Its writes must be named here, not reported later as the
+        # model escaping the planned scope or shipped as an unapproved change.
+        shown = ", ".join(setup_changes[:10])
+        extra = len(setup_changes) - 10
+        reason = "Environment setup modified workspace files: " + shown + \
+            (" (+%d more)" % extra if extra > 0 else "")
+        failure = {"code": "environment", "action": "check_readiness", "paths": setup_changes}
+        transition("insufficient_evidence", {"reason": reason, "failure": failure}, True)
+        return {"decision": "insufficient_evidence", "reason": reason, "failure": failure} if experiment else None
     from .context import code_map
     from .recovery import signature, cached, save, enforce_cached_review
     from .discovery import related_work
