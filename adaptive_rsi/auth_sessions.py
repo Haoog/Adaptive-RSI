@@ -1181,6 +1181,8 @@ class AuthSessions:
 
         冷启动没有旧值时仍同步探测一次，与 status_cache 的取舍一致。
         refreshing=True 供后台刷新使用，跳过陈旧值直接重跑。
+        只要有过期旧值就不在请求线程探测：已有刷新在跑时同样直接返回旧值，
+        否则并发请求会各自同步 inspect、叠加最长 10s 的阻塞并重复探测。
         """
         key = (docker, image)
         with self.cache_lock:
@@ -1191,12 +1193,13 @@ class AuthSessions:
                      and key not in self.container_refreshes)
             if spawn:
                 self.container_refreshes.add(key)
-        if spawn:
-            try:
-                self._thread(lambda: self._refresh_container(key))
-            except Exception:
-                with self.cache_lock:
-                    self.container_refreshes.discard(key)
+        if cached and not refreshing:
+            if spawn:
+                try:
+                    self._thread(lambda: self._refresh_container(key))
+                except Exception:
+                    with self.cache_lock:
+                        self.container_refreshes.discard(key)
             return cached[1]
         return self._inspect_container(key)
 
