@@ -7,7 +7,7 @@ window.RSIBatch=(()=>{
  async function history(){
   if(historyBox?.open)return;
   const project=projectId,data=await api('tasks/batches?project='+encodeURIComponent(project));
-  const box=el('dialog',undefined,'experience-dialog');historyBox=box;
+  const box=el('dialog',undefined,'experience-dialog'),previousFocus=document.activeElement;historyBox=box;
   box.append(el('h2',t('批次记录')));
   const filter=el('input');filter.type='search';filter.setAttribute('aria-label',t('搜索批次记录'));
   const rows=el('div');box.append(filter,rows);
@@ -28,7 +28,7 @@ window.RSIBatch=(()=>{
   const download=el('button',t('导出批次记录'),'button');download.type='button';
   download.onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'})),link=el('a');link.href=url;link.download='adaptive-rsi-batches-'+project+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
   const close=el('button',t('关闭'),'text-button');close.type='button';close.onclick=()=>box.close();
-  box.append(download,close);box.onclose=()=>{if(historyBox===box)historyBox=null;box.remove();};document.body.append(box);box.showModal();filter.focus();
+  box.append(download,close);box.onclose=()=>{if(historyBox===box)historyBox=null;box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();filter.focus();
  }
  function ids(){if(!selected.has(projectId))selected.set(projectId,new Set());return selected.get(projectId);}
  function costText(cost){
@@ -64,7 +64,7 @@ window.RSIBatch=(()=>{
  }
  async function evidence(task){
   const project=projectId,data=await api('task?id='+encodeURIComponent(task.id)+'&project='+encodeURIComponent(project));
-  const mapping=data.group_lineage?.acceptance_evidence,box=el('dialog',undefined,'experience-dialog');
+  const mapping=data.group_lineage?.acceptance_evidence,box=el('dialog',undefined,'experience-dialog'),previousFocus=document.activeElement;
   box.append(el('h2',t('逐条验收证据')));
   box.append(el('p',t(mapping?.all_passed?'通过':'覆盖记录未知')));
   for(const item of mapping?.requirements||[]){
@@ -76,7 +76,7 @@ window.RSIBatch=(()=>{
   if(saved.verification_cost)box.append(el('p',costText(saved.verification_cost)));
   const actual=mapping?.actual_verification_cost?.separate_seconds;
   box.append(el('p',t('实际完整检查耗时')+' · '+(Number.isFinite(actual)?actual.toFixed(1)+' s':t('未知'))));
-  const close=el('button',t('关闭'));close.onclick=()=>box.close();box.append(close);box.onclose=()=>box.remove();document.body.append(box);box.showModal();
+  const close=el('button',t('关闭'));close.onclick=()=>box.close();box.append(close);box.onclose=()=>{box.remove();previousFocus?.focus?.();};document.body.append(box);box.showModal();
  }
  function toolbar(){
   const host=document.querySelector('.task-toolbar');if(!host)return;

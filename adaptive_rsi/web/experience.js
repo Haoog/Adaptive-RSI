@@ -58,13 +58,17 @@ window.RSIExperience = (() => {
   }
   function dialog(title) {
     const box = el("dialog", undefined, "experience-dialog"),
-      heading = el("div", undefined, "dialog-heading");
+      heading = el("div", undefined, "dialog-heading"),
+      previousFocus = document.activeElement;
     heading.append(
       el("h2", t(title)),
       action(t("关闭"), () => box.close(), "text-button"),
     );
     box.append(heading);
-    box.addEventListener("close", () => box.remove());
+    box.addEventListener("close", () => {
+      box.remove();
+      previousFocus?.focus?.();
+    });
     document.body.append(box);
     box.showModal();
     return box;
