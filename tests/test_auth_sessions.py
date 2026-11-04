@@ -230,6 +230,38 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_logout_normalizes_auth_export_removal_failures(self):
+        manager = AuthSessions(self.root / 'export-removal-error')
+        try:
+            for failure in (RuntimeError('corrupt export'), OSError('disk full')):
+                with self.subTest(failure=type(failure).__name__):
+                    with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                         patch('adaptive_rsi.auth_sessions.remove_auth_export', side_effect=failure), \
+                         patch('adaptive_rsi.auth_sessions.logout_provider') as cli_logout:
+                        with self.assertRaises(AuthError) as caught:
+                            manager.logout('opencode', 'openai')
+                    self.assertEqual(caught.exception.code, 'auth_protocol_error')
+                    cli_logout.assert_not_called()
+        finally:
+            manager.close()
+
+    def test_logout_normalizes_real_export_write_failure(self):
+        merge_auth_export([{'integrationID': 'openai', 'id': 'credential',
+                            'value': {'type': 'key', 'key': 'PRIVATE-KEY'}},
+                           {'integrationID': 'other', 'id': 'keep',
+                            'value': {'type': 'key', 'key': 'PRIVATE-OTHER'}}])
+        manager = AuthSessions(self.root / 'export-write-error')
+        try:
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None), \
+                 patch('adaptive_rsi.opencode._private_json', side_effect=OSError('read-only')):
+                with self.assertRaises(AuthError) as caught:
+                    manager.logout('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            self.assertEqual([item['integrationID'] for item in load_auth_export()],
+                             ['openai', 'other'])
+        finally:
+            manager.close()
+
     def test_authorization_rejection_within_ttl_is_not_expiration(self):
         worker = FakeAuth('opencode', self.gate)
         self.created.append(worker)
@@ -2018,6 +2050,21 @@ class AuthProtocolTests(unittest.TestCase):
             self.assertEqual(data["tokens"]["refresh_token"], "FIXTURE-REFRESH")
         finally:
             manager.close()
+
+    def test_codex_rejects_unsupported_method_and_inputs_before_device_code(self):
+        worker = CodexAuth()
+        try:
+            for kwargs in ({"method": 1}, {"method": 7}, {"inputs": {"k": "v"}},
+                           {"method": 1, "inputs": {"k": "v"}}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(AuthError) as caught:
+                    worker.start(**kwargs)
+                self.assertEqual(caught.exception.code, "unsupported_auth_method")
+            fields = worker.start()
+            self.assertEqual(fields["verification_url"], "https://example.test/device")
+            self.assertEqual(fields["user_code"], "PRIVATE-USER-CODE")
+            self.assertEqual(fields["method"], "auto")
+        finally:
+            worker.close()
 
     def test_opencode_http_protocol_is_authenticated_and_persists_callback(self):
         worker = OpenCodeAuth()
