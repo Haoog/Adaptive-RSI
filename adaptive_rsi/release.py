@@ -305,6 +305,16 @@ class _AutomationChanged(RuntimeError):
     """A concurrent action replaced the operation being reconciled."""
 
 
+def _owner_record(value):
+    """Only a dict naming the claiming run and its exact commit may own a target."""
+    if not isinstance(value, dict):
+        return None
+    run, sha = value.get("run"), value.get("sha")
+    if not isinstance(run, str) or not isinstance(sha, str) or not run or not sha:
+        return None
+    return value
+
+
 def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stable=None):
     with runtime.store.connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -316,7 +326,9 @@ def save(runtime, run, kind, data, expected=_UNCONDITIONAL, ownership=None, stab
             owner_name, previous, owner = ownership
             current = db.execute("SELECT value FROM settings WHERE key=?", (owner_name,)).fetchone()
             try:
-                current_value = json.loads(current["value"]) if current and current["value"] else None
+                # A structurally invalid record is no ownership at all, matching
+                # deployment_owner; the write below then repairs it.
+                current_value = _owner_record(json.loads(current["value"])) if current and current["value"] else None
             except (TypeError, ValueError):
                 current_value = None
             if current_value != previous:
@@ -889,19 +901,40 @@ def owner_key(project, repo, policy):
     return "deployment-owner:" + fingerprint(target)
 
 
+def _owner_alert(runtime, name, project):
+    """Report an unreadable ownership record once; it is still treated as no owner."""
+    diagnostic = (name, "deployment-owner")
+    with runtime.automation_receipt_failures_lock:
+        if diagnostic in runtime.automation_receipt_failures:
+            return
+        runtime.store.event("automation_error",
+                            "Deployment owner record is unreadable; repair the stored record before relying on it",
+                            project, None, {"kind": "deploy", "error_code": "invalid_deployment_owner"})
+        if len(runtime.automation_receipt_failures) >= 128:
+            runtime.automation_receipt_failures.pop(next(iter(runtime.automation_receipt_failures)))
+        runtime.automation_receipt_failures[diagnostic] = True
+
+
 def deployment_owner(runtime, project, repo, policy):
     name = owner_key(project, repo, policy)
     with runtime.dispatch_lock:
-        current = runtime.store.setting(name)
+        stored = runtime.store.setting(name)
+        current = _owner_record(stored)
         if current:
+            with runtime.automation_receipt_failures_lock:
+                runtime.automation_receipt_failures.pop((name, "deployment-owner"), None)
             return current
+        if stored:
+            _owner_alert(runtime, name, project)
         migration = "deployment-owner-migrated:" + name.split(":", 1)[1]
         if runtime.store.setting(migration, False):
             return None
         legacy = []
         for row in runtime.store.query("SELECT key,value FROM settings WHERE key LIKE 'deployment-owner:%'"):
             try:
-                receipt = json.loads(row["value"])
+                receipt = _owner_record(json.loads(row["value"]))
+                if not receipt:
+                    continue
                 run = runtime.store.one("SELECT project,config,started FROM runs WHERE id=?", (receipt["run"],))
                 if not run:
                     continue
