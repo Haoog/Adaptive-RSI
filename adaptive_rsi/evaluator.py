@@ -36,6 +36,9 @@ HOST_TOOL_DIGEST_CACHE_LIMIT = 32
 _HOST_TOOL_DIGESTS = {}
 _HOST_TOOL_DIGESTS_LOCK = threading.Lock()
 CACHE_STDERR_LIMIT = 16 * 1024
+# report.json keeps only a bounded tail of each stream; the full bytes stay in
+# the evaluation directory so evidence remains auditable without copying logs.
+REPORT_STREAM_LIMIT = 64 * 1024
 # Cached rows keep only what gate and review comparisons read; raw artifact
 # contents stay in the run directory and are re-read on demand.
 CACHE_ARTIFACT_FIELDS = ("state", "reason", "bytes", "sha256")
@@ -809,6 +812,73 @@ def checkpoint_reuse_enabled(config):
     return isinstance(recovery, dict) and recovery.get("reuse_sealed_checkpoints") is True
 
 
+def _report_output_location(directory, trail):
+    """Directory and file stem holding one row's complete output streams."""
+    if trail and isinstance(trail[-1], int):
+        parts, name = trail[:-1], str(trail[-1])
+    else:
+        parts, name = trail, "0"
+    parts = [re.sub(r"[^A-Za-z0-9_-]", "_", str(part)) for part in parts]
+    if parts and parts[0] == "checks":
+        parts = parts[1:]
+    return Path(directory).joinpath(*(parts + ["outputs"])), name
+
+
+def _bounded_report_row(row, directory, trail):
+    """Copy one result row, moving oversized streams to files next to the report."""
+    import hashlib
+    location, name = _report_output_location(directory, trail)
+    item = dict(row)
+    for stream, suffix in (("stdout", "out"), ("stderr", "err")):
+        text = row.get(stream)
+        if not isinstance(text, str):
+            continue
+        raw = text.encode("utf-8", "replace")
+        item[stream + "_bytes"] = len(raw)
+        item[stream + "_sha256"] = hashlib.sha256(raw).hexdigest()
+        item[stream + "_truncated"] = len(raw) > REPORT_STREAM_LIMIT
+        if len(raw) <= REPORT_STREAM_LIMIT:
+            continue
+        location.mkdir(parents=True, exist_ok=True)
+        path = location / (name + "." + suffix)
+        path.write_bytes(raw)
+        item[stream] = raw[-REPORT_STREAM_LIMIT:].decode("utf-8", "replace")
+        item[stream + "_path"] = path.relative_to(directory).as_posix()
+    return item
+
+
+def _bounded_report_node(node, directory, trail=(), memo=None):
+    """Copy report data while bounding every row's stdout/stderr to its tail.
+
+    Rows shared by several stages (candidate/candidate_full reuse) keep one
+    copy of the full streams, so duplicate stage evidence cannot multiply the
+    report size. Callers keep their in-memory rows untouched for gate logic.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(node, dict):
+        if "stdout" in node or "stderr" in node:
+            key = id(node)
+            if key not in memo:
+                memo[key] = _bounded_report_row(node, directory, trail)
+            return memo[key]
+        return {key: _bounded_report_node(value, directory, trail + (key,), memo)
+                for key, value in node.items()}
+    if isinstance(node, list):
+        return [_bounded_report_node(value, directory, trail + (index,), memo)
+                for index, value in enumerate(node)]
+    return node
+
+
+def write_evaluation_report(directory, data):
+    """Persist the evaluation report without inlining multi-megabyte logs."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    document = _bounded_report_node(data, directory)
+    (directory / "report.json").write_text(json.dumps(document, ensure_ascii=False, indent=2),
+                                           encoding="utf-8")
+
+
 class Evaluator:
     def __init__(self, store):
         self.store = store
@@ -1340,8 +1410,7 @@ class Evaluator:
             data = {"decision": "insufficient_evidence", "reason": acceptance_baseline["reason"],
                     "setup": acceptance_baseline.get("setup"), "checks": results,
                     "execution_environment": execution_identity}
-            Path(directory).mkdir(parents=True, exist_ok=True)
-            (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            write_evaluation_report(directory, data)
             return data
         stages = {}
         if "baseline" not in results:
@@ -1382,8 +1451,7 @@ class Evaluator:
                         if label.startswith("acceptance") else "Isolated dependency preparation failed",
                         "setup": outcome["setup"], "checks": results,
                         "execution_environment": execution_identity}
-                Path(directory).mkdir(parents=True, exist_ok=True)
-                (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                write_evaluation_report(directory, data)
                 return data
             results[label] = outcome["rows"]
             if "test_first_rows" in outcome:
@@ -1469,6 +1537,5 @@ class Evaluator:
             else:
                 data["controls"] = {"decision": "not_run", "reason": "Candidate checks did not pass",
                                     "controls": []}
-        Path(directory).mkdir(parents=True, exist_ok=True)
-        (Path(directory) / "report.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_evaluation_report(directory, data)
         return data
