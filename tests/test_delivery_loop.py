@@ -1299,3 +1299,60 @@ print('BOUNDARIES_OK')
             self.runtime.process(run)
         publish.assert_not_called()
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "completed")
+
+    def test_completed_merged_run_skips_origin_probe_and_advance(self):
+        # 监控已结束且无自动化待办的合并运行不再逐轮付出 origin 探测与 advance 调用；
+        # 同一 tick 内仍在跟踪的 pr_open 行必须照常处理。
+        tracked = self.tracked_pr()
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.runtime.goal(self.project, "Completed delivery")
+        merged = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(merged["id"], "merged",
+                              {"merged_sha": head, "merged_at": time.time() - 400,
+                               "monitoring_completed": True}, True)
+        self.store.put_setting("delivery:" + merged["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.execute("UPDATE runs SET started=? WHERE id=?", (1, merged["id"]))
+        self.store.execute("UPDATE runs SET started=? WHERE id=?", (2, tracked["id"]))
+        pr = {"state": "OPEN", "headRefOid": "head", "baseRefOid": "base", "baseRefName": "main",
+              "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": "REVIEW_REQUIRED",
+              "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
+        probes = []
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.origin_repository",
+                      side_effect=lambda root: probes.append(str(root)) or "example/project"), \
+                patch("adaptive_rsi.release.advance", return_value={}) as advance:
+            tick(self.runtime, time.time())
+        # 只有 pr_open 行需要探测远端；merged 行在解析结果后即被跳过。
+        self.assertEqual(probes, [str(self.repo)])
+        advance.assert_not_called()
+        saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (tracked["id"],))["result"])
+        self.assertEqual(saved["delivery_status"], "waiting_review")
+
+    def test_merged_run_with_pending_release_is_still_processed(self):
+        # 仍有发布待办的合并运行不能因为监控结束被跳过：它要继续探测目标仓库并推进自动化。
+        self.runtime.configure({"github": {"repository": "example/project"},
+                                "delivery": {"mode": "pr",
+                                             "release": {"enabled": True,
+                                                         "workflow": ".github/workflows/release.yml",
+                                                         "ref": "v1.0.0", "sha": "a" * 40}}}, self.project)
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        self.runtime.pause(self.project, False)
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.runtime.goal(self.project, "Completed delivery")
+        run = self.store.claim(self.project, self.runtime.config(self.project))
+        self.store.transition(run["id"], "merged",
+                              {"merged_sha": head, "merged_at": time.time() - 400,
+                               "monitoring_completed": True}, True)
+        self.store.put_setting("delivery:" + run["id"], {"head": "head", "base": "base", "branch": "main"})
+        self.store.put_setting("automation:" + run["id"] + ":release",
+                               {"state": "queued", "repository": "example/project",
+                                "workflow": ".github/workflows/release.yml", "ref": "v1.0.0",
+                                "sha": head, "workflow_sha": "a" * 40, "operation_id": "rsi-test"})
+        with patch("adaptive_rsi.delivery.origin_repository", return_value="example/project") as probe, \
+                patch("adaptive_rsi.release.advance", return_value={}) as advance:
+            tick(self.runtime, time.time())
+        probe.assert_called_once_with(str(self.repo))
+        advance.assert_called_once()
+        self.assertEqual(advance.call_args[0][2]["id"], run["id"])
+        saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+        self.assertIn("automation", saved)
