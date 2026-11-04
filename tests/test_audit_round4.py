@@ -225,6 +225,22 @@ class AuditRound4Test(unittest.TestCase):
     def test_clarity_test_summary_rejects_zero_passed(self):
         self.assertIsNone(clarity_test_summary("===== 0 passed, 1 failed in 0.10s ====="))
         self.assertIsNone(clarity_test_summary("===== no tests ran in 0.01s ====="))
+        self.assertIsNone(clarity_test_summary("===== 2 errors in 0.05s ====="))
+
+    def test_clarity_test_summary_reads_failure_only_run(self):
+        # pytest omits zero-count fields, so an all-failing run ends with
+        # ``1 failed in 0.03s`` and must still yield structured stats.
+        summary = clarity_test_summary("===== 1 failed in 0.03s =====")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["executed"], 1)
+        self.assertEqual(summary["passed"], 0)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_clarity_test_summary_counts_skipped_only_run(self):
+        summary = clarity_test_summary("===== 2 skipped in 0.05s =====")
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["executed"], 2)
+        self.assertEqual(summary["skipped"], 2)
 
     def test_review_enforce_finding_line_and_rank_defensive(self):
         valid_review = {
