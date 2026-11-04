@@ -855,6 +855,9 @@ class AuthSessions:
         self.workers = {}
         self.discoveries = set()
         self.threads = set()
+        # 线程登记不占用 self.lock：后者在 install_credential/logout 期间被长时间持有，
+        # 过期快照的后台刷新若等待它，请求线程仍会被阻塞。
+        self.threads_lock = threading.Lock()
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
         self._close_error = None
@@ -868,6 +871,8 @@ class AuthSessions:
         self.provider_flights: dict = {}
         # 状态快照的子进程发现结果同样短 TTL 缓存，登录/登出/密钥变更时失效。
         self.status_cache = {}
+        # 过期条目由后台线程刷新；同一后端最多一个刷新任务，避免面板并发打开时重复探测。
+        self.status_refreshes = set()
         self.cache_generations = {backend: 0 for backend in ("codex", "opencode")}
         self.factory = factory or (lambda backend, cancel=None: (CodexAuth if backend == "codex" else OpenCodeAuth)(
             self.config() if callable(self.config) else self.config, cancel=cancel or self.shutdown))
@@ -941,7 +946,7 @@ class AuthSessions:
                 count += 1
         return count
 
-    def snapshot(self):
+    def snapshot(self, _refresh=False):
         self.busy
         result = {}
         config = self.config() if callable(self.config) else self.config or {}
@@ -995,6 +1000,12 @@ class AuthSessions:
                                 continue
                             capabilities, providers = cached[1]
                         else:
+                            if cached and not _refresh:
+                                # 过期缓存先返回陈旧值，把子进程探测移出请求线程。
+                                stale = self._stale_status(backend, generation, available, container)
+                                if stale is not None:
+                                    result[backend] = stale
+                                    continue
                             binary = shutil.which("opencode")
                             if binary:
                                 capabilities = detect_opencode(binary)
@@ -1019,13 +1030,7 @@ class AuthSessions:
                             with self.cache_lock:
                                 if not self.closed and generation == self.cache_generations[backend]:
                                     self.status_cache[backend] = (time.monotonic() + 25, (capabilities, providers))
-                    result[backend] = {"state": "authenticated" if providers else "signed_out",
-                                       "available": available,
-                                       "transport": "docker" if container or not shutil.which(backend) else "host",
-                                       "authenticated_providers": providers}
-                    if capabilities:
-                        result[backend]["version"] = capabilities.version
-                        result[backend]["compatibility"] = "supported"
+                    result[backend] = self._status_view(backend, available, container, capabilities, providers)
             except OpenCodeCompatibilityError as exc:
                 result[backend] = {"state": "signed_out", "available": available,
                                    "transport": "docker" if container or not shutil.which(backend) else "host",
@@ -1061,6 +1066,61 @@ class AuthSessions:
             result["sessions"] = [{key: item.get(key) for key in ("id", "backend", "provider", "state", "expires_at", "error")}
                                   for item in list(self.public_sessions.values())[-30:]]
         return result
+
+    @staticmethod
+    def _status_view(backend, available, container, capabilities, providers):
+        view = {"state": "authenticated" if providers else "signed_out",
+                "available": available,
+                "transport": "docker" if container or not shutil.which(backend) else "host",
+                "authenticated_providers": providers}
+        if capabilities:
+            view["version"] = capabilities.version
+            view["compatibility"] = "supported"
+        return view
+
+    def _stale_status(self, backend, generation, available, container):
+        """过期缓存先返回陈旧值，并确保同一后端只有一个后台刷新线程。
+
+        代际不一致（登录/登出/密钥变更已失效缓存）或缓存已被清空时返回 None，
+        调用方改为同步探测，保持 _invalidate_caches 之后必须读到新数据的语义。
+        """
+        if self.custom_factory:
+            return None
+        spawn = False
+        with self.cache_lock:
+            if self.closed or generation != self.cache_generations[backend]:
+                return None
+            cached = self.status_cache.get(backend)
+            if not cached:
+                return None
+            if isinstance(cached[1], dict):
+                result = copy.deepcopy(cached[1])
+                result["available"] = available
+            else:
+                result = self._status_view(backend, available, container, *cached[1])
+            if backend not in self.status_refreshes:
+                self.status_refreshes.add(backend)
+                spawn = True
+        if spawn:
+            try:
+                self._thread(lambda: self._refresh_status(backend))
+            except Exception:
+                with self.cache_lock:
+                    self.status_refreshes.discard(backend)
+                return result
+        result["refreshing"] = True
+        return result
+
+    def _refresh_status(self, backend):
+        """后台重跑完整快照；_refresh=True 跳过陈旧值分支，回写仍受代际校验保护。"""
+        try:
+            self.snapshot(_refresh=True)
+        except Exception:
+            # 后台探测失败不影响服务，保留旧值，下一次请求会再次尝试刷新。
+            pass
+        finally:
+            with self.cache_lock:
+                self.status_refreshes.discard(backend)
 
     def providers(self, backend="opencode"):
         self._backend(backend)
@@ -1130,17 +1190,20 @@ class AuthSessions:
             try:
                 target()
             finally:
-                with self.lock:
+                with self.threads_lock:
                     self.threads.discard(threading.current_thread())
         thread = threading.Thread(target=run, daemon=True)
-        with self.lock:
-            # 先于 start() 登记，让 close() 能看到即将启动的线程；start 失败则摘除，
-            # 否则 close() 会对一个从未启动的线程 join() 而抛 RuntimeError。
+        with self.threads_lock:
+            # 与 close() 的 closed 置位+快照同锁：先于 start() 登记，让 close() 能看到
+            # 即将启动的线程；已关闭时不再启动新线程。start 失败则摘除，否则 close()
+            # 会对一个从未启动的线程 join() 而抛 RuntimeError。
+            if self.closed:
+                return
             self.threads.add(thread)
         try:
             thread.start()
         except BaseException:
-            with self.lock:
+            with self.threads_lock:
                 self.threads.discard(thread)
             raise
 
@@ -1627,7 +1690,10 @@ class AuthSessions:
                         self._terminate(item, state="interrupted", error="process_interrupted")
                         self._publish_sessions()
             self._close_error = first_error
-            threads = list(self.threads)
+            # closed 已在上面置位；此后 _thread() 不再启动新线程，这里只需在
+            # threads_lock 下取快照，避免漏掉刚登记、尚未 start 的线程。
+            with self.threads_lock:
+                threads = list(self.threads)
         for worker, stop in workers:
             stop.set()
             if worker:
