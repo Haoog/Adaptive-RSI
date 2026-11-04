@@ -3,6 +3,7 @@ import time
 from unittest.mock import patch
 
 from adaptive_rsi import delivery, release
+from adaptive_rsi.process import ProcessError
 from tests import test_release_endpoints
 
 
@@ -13,6 +14,13 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
         self.store.put_setting('delivery-push:' + self.run['id'], {
             'repository': 'example/project', 'branch': 'feat/rsi-' + self.run['id'],
             'head': self.head, 'base': self.run['base']})
+
+    def pending_close(self):
+        self.prepare()
+        self.store.execute("UPDATE runs SET result=? WHERE id=?",
+                           (json.dumps({'pr': self.url, 'replanned': True, 'close_pending': True}), self.run['id']))
+        self.store.put_setting('delivery:' + self.run['id'], {
+            'repository': 'example/project', 'branch': 'main', 'base': self.run['base'], 'head': self.head})
 
     def test_scheduler_recovers_receipt_without_touching_requeued_task(self):
         self.prepare()
@@ -164,6 +172,53 @@ class SupersededRecoveryTest(test_release_endpoints.DeliveryRecoveryTest):
             self.assertEqual(command.call_args.args[0][1:3], ['pr', 'close'])
         self.assertFalse(json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])['close_pending'])
         self.assertEqual(self.store.one('SELECT * FROM tasks WHERE id=?', (self.task['id'],)), before)
+
+    def test_close_failure_backs_off_and_abandons_after_bounded_attempts(self):
+        self.pending_close()
+        pr = {'url': self.url, 'state': 'OPEN', 'headRefOid': self.head,
+              'headRefName': 'feat/rsi-' + self.run['id'], 'baseRefName': 'main',
+              'headRepositoryOwner': {'login': 'example'}}
+        now = 10000000000
+        with patch.object(delivery, 'CLOSE_ATTEMPT_LIMIT', 3), \
+                patch.object(delivery, 'pr_view', return_value=pr) as view, \
+                patch.object(delivery, 'checked', side_effect=ProcessError({'exit_code': 1, 'stderr': 'permission denied'})) as close:
+            delivery.tick(self.runtime, now=now, project_id=self.project)
+            result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+            # 尝试先落盘：失败后 run 仍待关闭，但带上了尝试次数与退避时间。
+            self.assertEqual(result['close_attempts'], 1)
+            self.assertEqual(result['close_retry_at'], now)
+            self.assertTrue(result['close_pending'])
+            self.assertEqual((view.call_count, close.call_count), (1, 1))
+            # 退避窗口内的连续 tick 不再发起远端读或失败写入。
+            delivery.tick(self.runtime, now=now + 100, project_id=self.project)
+            delivery.tick(self.runtime, now=now + 200, project_id=self.project)
+            self.assertEqual((view.call_count, close.call_count), (1, 1))
+            delivery.tick(self.runtime, now=now + 300, project_id=self.project)
+            self.assertEqual((view.call_count, close.call_count), (2, 2))
+            # 第二次失败后间隔翻倍到 600s。
+            delivery.tick(self.runtime, now=now + 800, project_id=self.project)
+            self.assertEqual((view.call_count, close.call_count), (2, 2))
+            delivery.tick(self.runtime, now=now + 900, project_id=self.project)
+            self.assertEqual((view.call_count, close.call_count), (3, 3))
+        result = json.loads(self.store.one('SELECT result FROM runs WHERE id=?', (self.run['id'],))['result'])
+        self.assertFalse(result['close_pending'])
+        self.assertEqual(result['close_attempts'], 3)
+        self.assertEqual(result['close_retry_at'], now + 900)
+        self.assertIn('3 attempts', result['close_abandoned'])
+        # 前两次失败各留一条 delivery_error；达到上限只记一条终止事件。
+        self.assertEqual(len(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='delivery_error'",
+                                              (self.run['id'],))), 2)
+        self.assertEqual(len(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='delivery_close_abandoned'",
+                                              (self.run['id'],))), 1)
+        # 终态后退出轮询：后续 tick 既不查询远端也不再写失败调用。
+        with patch.object(delivery, 'pr_view') as view, patch.object(delivery, 'checked') as close:
+            delivery.tick(self.runtime, now=now + 1200, project_id=self.project)
+            delivery.tick(self.runtime, now=now + 90000, project_id=self.project)
+        view.assert_not_called()
+        close.assert_not_called()
+        self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (self.run['id'],))['state'], 'superseded')
+        self.assertEqual(len(self.store.query("SELECT 1 FROM events WHERE run=? AND kind='delivery_close_abandoned'",
+                                              (self.run['id'],))), 1)
 
     def test_bounded_attempts_abandon_recovery_and_release_keys_to_cleanup(self):
         self.prepare()

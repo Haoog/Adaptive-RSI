@@ -672,8 +672,9 @@ print('BOUNDARIES_OK')
         pr["state"] = "CLOSED"
         with patch("adaptive_rsi.delivery.pr_view", return_value=pr) as view, \
                 patch("adaptive_rsi.delivery.checked") as remote:
-            tick(self.runtime, now + 61)
-            tick(self.runtime, now + 122)
+            # 关闭失败后按退避重试：首次失败 5 分钟内不再触碰远端。
+            tick(self.runtime, now + 400)
+            tick(self.runtime, now + 461)
         remote.assert_not_called()
         view.assert_called_once()
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "failed")
@@ -698,13 +699,14 @@ print('BOUNDARIES_OK')
         self.assertEqual(self.store.one("SELECT source FROM tasks WHERE id=?", (tracking["task"],))["source"], "system_delivery")
         with patch("adaptive_rsi.delivery.pr_view", return_value=pr) as view, \
                 patch("adaptive_rsi.delivery.checked", return_value="") as remote:
-            tick(self.runtime, now + 61, project_id=self.project, active_run=tracking["id"])
+            # 关闭失败后要等退避到期才重试，仍先观察远端状态再关闭。
+            tick(self.runtime, now + 400, project_id=self.project, active_run=tracking["id"])
             view.assert_called_once()
             remote.assert_called_once_with(["gh", "pr", "close", "https://github.com/example/project/pull/1",
                                             "--repo", "example/project"])
         self.store.transition(tracking["id"], "completed", {}, True)
         with patch("adaptive_rsi.delivery.pr_view") as view, patch("adaptive_rsi.delivery.checked") as remote:
-            tick(self.runtime, now + 122)
+            tick(self.runtime, now + 461)
         view.assert_not_called()
         remote.assert_not_called()
 
