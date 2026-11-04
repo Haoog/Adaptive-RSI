@@ -145,7 +145,11 @@ class AuditEvaluationTest(unittest.TestCase):
                           'spec': {'files': [], 'checks': [{'name': 'ac', 'criteria': [0]}]}}
             config = merge(DEFAULTS, {'environment': {'seed_paths': ['deps']}})
 
+            restored = []
+
             def execute(_sandbox, check, workspace, *args, **kwargs):
+                marker = Path(workspace) / 'deps' / 'value'
+                restored.append(marker.read_text() if marker.is_file() else None)
                 return {'name': check['name'], 'argv': check['argv'], 'exit_code': 0,
                         'stdout': 'Ran 1 test\n', 'stderr': '', 'error': None}
 
@@ -153,9 +157,14 @@ class AuditEvaluationTest(unittest.TestCase):
             self.addCleanup(store.close)
             with patch('adaptive_rsi.evaluator.detect', return_value={'checks': []}), patch(
                     'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                # 必须真的把快照交给 evaluate()：不传 seeds 时 _seed_target() 直接
+                # 返回，验收阶段不会触发 overlap，用例就测不到本次修复的行为。
                 result = evaluator.Evaluator(store).evaluate(
                     source, candidate, checks, root / 'evaluation', config,
-                    changed_files=[], acceptance=acceptance)
+                    seeds=seeds, changed_files=[], acceptance=acceptance)
+            # 每个阶段（含验收阶段）执行检查时都应看到已还原的种子内容。
+            self.assertTrue(restored)
+            self.assertEqual(set(restored), {'seeded\n'})
             report = json.loads((root / 'evaluation' / 'report.json').read_text())
             self.assertEqual(report['decision'], result['decision'])
             self.assertEqual(result['decision'], 'pass')
