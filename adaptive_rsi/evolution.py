@@ -26,6 +26,13 @@ DEFAULT_PROVIDER_ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
 }
+# 复现包的完整性校验只覆盖「已导出的文件未被篡改」，不证明包里存在可执行的
+# 基线用例：没有 dataset.manifest 的旧候选/手写 ready 行会导出只有 json 的空包，
+# manifest 登记但库中缺失的用例也照常导出。导出与复现两侧共用同一段文案，
+# 复现侧据此判不可复现，并避免同一条限制说明重复出现。
+BUNDLE_NO_CASES = ("Bundle is incomplete: no registered case.json was exported, "
+                   "so offline reproduction has no executable baseline")
+BUNDLE_MISSING_CASES = "Bundle is incomplete: %d of %d registered dataset cases are missing (%s)"
 
 # 重复抑制签名的失败文本归一化：临时目录、绝对路径、run/case/请求 id、UUID 与
 # 时间戳逐实例变化，但同属一类故障；剥掉这些易变成分后同一根因聚成一个签名，
@@ -719,7 +726,14 @@ class Evolution:
             (root / "candidate.json").write_text(row["content"], encoding="utf-8")
             limitations = ["Credentials are excluded; external services, model availability and host tools must be supplied independently",
                            "Integrity verification is not proof of isolated-machine reproduction"]
-            for item in evidence.get("dataset", {}).get("manifest", []):
+            # dataset 可能是非对象（旧证据/手写证据）：按「未登记任何用例」处理，
+            # 而不是让导出在 evidence.get(...).get(...) 上抛 AttributeError。
+            dataset = evidence.get("dataset")
+            dataset_cases = dataset.get("manifest") if isinstance(dataset, dict) else None
+            if not isinstance(dataset_cases, list):
+                dataset_cases = []
+            exported_cases = []
+            for item in dataset_cases:
                 if item["case"] != Path(item["case"]).name or item["case"] in (".", ".."):
                     raise ValueError("Invalid sealed case identity")
                 case = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], row["project"]))
@@ -749,6 +763,15 @@ class Evolution:
                     sealed_tree(target / "overlay")
                 spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
+                exported_cases.append(item["case"])
+            # 空包与缺包同样是「完整性有效但不可复现」：限制说明必须写明缺了什么，
+            # 复现侧再据此把 reproducible 判为否，而不是让调用方误以为条件齐备。
+            if not dataset_cases:
+                limitations.append(BUNDLE_NO_CASES)
+            elif len(exported_cases) < len(dataset_cases):
+                missing_cases = [item["case"] for item in dataset_cases if item["case"] not in exported_cases]
+                limitations.append(BUNDLE_MISSING_CASES % (len(missing_cases), len(dataset_cases),
+                                                           ", ".join(missing_cases)))
             files = {}
             for path in sorted(root.rglob("*")):
                 if ".git" in path.relative_to(root).parts:
@@ -792,8 +815,10 @@ class Evolution:
     def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
         """Inspect and verify offline reproduction readiness for a sealed bundle.
 
-        Verifies input integrity and itemizes all missing tool dependencies and
-        credentials without failing fast on the first missing requirement.
+        Verifies input integrity, requires at least one exported case with every
+        registered dataset case present, and itemizes all missing tool
+        dependencies and credentials without failing fast on the first missing
+        requirement.
         """
         import os
         import shutil
@@ -805,6 +830,7 @@ class Evolution:
             return {
                 "valid": False,
                 "integrity": {"valid": False, "mismatches": ["bundle.json"]},
+                "cases": {"exported": [], "registered": [], "missing": []},
                 "dependencies": {"available": [], "missing": []},
                 "credentials": {"available": [], "missing": []},
                 "limitations": ["Missing bundle.json: target is not a valid reproduction bundle directory"],
@@ -853,10 +879,26 @@ class Evolution:
         # 2. Inspect case check dependencies across verified manifest entries only.
         # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
         # 同一套规则判 integrity 失效（防 verify 与读取之间被调包）。
+        # 先按 bundle.json 自身登记的 cases/<id>/case.json 统计「随包导出的用例」：
+        # 空包与缺包即便 integrity 有效，也没有可执行的离线基线。
+        files = manifest.get("files")
+        exported_cases = []
+        if isinstance(files, dict):
+            for relative in sorted(files):
+                parts = Path(relative).parts
+                if len(parts) == 3 and parts[0] == "cases" and parts[2] == "case.json":
+                    exported_cases.append(parts[1])
+        registered_cases = []
+        dataset = evidence.get("dataset") if isinstance(evidence, dict) else None
+        if isinstance(dataset, dict) and isinstance(dataset.get("manifest"), list):
+            for item in dataset["manifest"]:
+                case_id = item.get("case") if isinstance(item, dict) else None
+                if isinstance(case_id, str) and case_id not in registered_cases:
+                    registered_cases.append(case_id)
+        missing_cases = [case_id for case_id in registered_cases if case_id not in exported_cases]
         case_items = []
         invalid_cases = []
         if integrity.get("valid"):
-            files = manifest.get("files")
             if isinstance(files, dict):
                 for relative in sorted(files):
                     parts = Path(relative).parts
@@ -987,8 +1029,20 @@ class Evolution:
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
 
+        # 用例齐备性：integrity 只覆盖已导出文件，空包/缺包此前仍被判「具备离线
+        # 复现条件」。没有已登记 case.json，或 evidence.dataset.manifest 的用例
+        # 没有全部随包导出，都意味着没有（完整的）可执行基线。
+        if not exported_cases and BUNDLE_NO_CASES not in repro_limitations:
+            repro_limitations.append(BUNDLE_NO_CASES)
+        if missing_cases:
+            msg = BUNDLE_MISSING_CASES % (len(missing_cases), len(registered_cases), ", ".join(missing_cases))
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+
         is_reproducible = (
             bool(integrity.get("valid")) and
+            len(exported_cases) > 0 and
+            len(missing_cases) == 0 and
             len(missing_tools) == 0 and
             len(missing_creds) == 0 and
             credential_limitation is None and
@@ -1091,6 +1145,11 @@ class Evolution:
         return {
             "valid": bool(integrity.get("valid")),
             "integrity": integrity,
+            "cases": {
+                "exported": exported_cases,
+                "registered": registered_cases,
+                "missing": missing_cases,
+            },
             "dependencies": {
                 "available": available_tools,
                 "missing": missing_tools,

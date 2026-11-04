@@ -23,13 +23,14 @@
 
 - [ ] **1.1 获取封存包**：从已完成演化的实例或归档中获取实验包目录（例如由 `Evolution.export_bundle` 导出的目录）。
 - [ ] **1.2 放置于隔离目录**：将包解压或拷贝至隔离机器的目标路径，确保所在文件系统支持常规文件读写且无越界软链接。
-- [ ] **1.3 核对基础目录结构**：确认根目录下包含 `bundle.json`、`candidate.json`、`evidence.json` 以及 `cases/` 目录。
+- [ ] **1.3 核对基础目录结构**：确认根目录下包含 `bundle.json`、`candidate.json`、`evidence.json`，且至少有一个已登记用例目录 `cases/<id>/case.json`。只有 json 文件、没有任何用例的包属于空包，不具备离线复现条件。
 
 ### 阶段二：输入完整性验证
 
 - [ ] **2.1 执行哈希校验**：使用 `scripts/reproduce_bundle.py` 或 `Evolution.verify_bundle(bundle_dir)`。
 - [ ] **2.2 比对文件清单**：确认 `bundle.json` 内 `files` 字段列出的所有文件均存在且 SHA-256 摘要完全一致。
 - [ ] **2.3 路径安全性确认**：验证清单内无绝对路径、无 `..` 目录穿越、无软链接逃逸。
+- [ ] **2.4 核对用例齐备性**：`files` 至少登记一个 `cases/<id>/case.json`，且 `evidence.json` 的 `dataset.manifest` 列出的每个用例都能在 `files` 中找到。完整性校验只证明已导出文件未被篡改：空包（旧候选或手写 `ready` 行导出，只有 json 文件）以及缺少已登记用例的包同样可能通过完整性校验，但复现脚本会判定 `reproducible=false`，在 `cases.missing` 与限制说明中列出缺失用例，`--strict` 退出码为 2。
 
 ### 阶段三：宿主工具与执行依赖检查
 
@@ -63,14 +64,14 @@ python3 -B scripts/reproduce_bundle.py /path/to/bundle --json
 # 若本地依赖齐备，离线执行用例中的固定检查项
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --run-checks
 
-# 严格模式：当缺少任何依赖或凭据时返回非零退出码 (exit code 2)
+# 严格模式：当缺少任何依赖、凭据或用例时返回非零退出码 (exit code 2)
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --strict
 ```
 
 - `bundle`：封存实验包路径（必填）。
-- `--json`：以 JSON 格式打印完整检查结果。
+- `--json`：以 JSON 格式打印完整检查结果（含 `cases.exported` / `cases.registered` / `cases.missing`）。
 - `--run-checks`：在工具齐备时对用例执行测试命令。
-- `--strict`：若存在缺失的工具依赖或凭据，退出码为 2；默认模式下成功完成检查并列出缺失项即返回 0。
+- `--strict`：若存在缺失的工具依赖、凭据或已登记用例，退出码为 2；默认模式下成功完成检查并列出缺失项即返回 0。
 
 ### Python API
 
@@ -87,6 +88,7 @@ report = Evolution.reproduce_bundle(
 )
 
 assert report["integrity"]["valid"] is True
+print("Cases:", report["cases"])  # exported / registered / missing
 print("Missing dependencies:", report["dependencies"]["missing"])
 print("Missing credentials:", report["credentials"]["missing"])
 print("Limitations:", report["limitations"])
@@ -122,4 +124,5 @@ print("Limitations:", report["limitations"])
 
 1. **凭据安全**：导出包不含敏感信息，避免凭据泄漏到离线或第三方审计环境。
 2. **因果与泛化界限**：输入完整性保证的是实验记录未被篡改，不代表离线离线重算能够全自动复现模型生成随机性。
-3. **非阻断式排查**：依赖排查全面覆盖全部用例与配置，杜绝单点报错导致的隐蔽缺失。
+3. **完整性不等于齐备性**：`bundle.json` 校验通过只说明已导出文件未变；包内没有用例、或 `dataset.manifest` 登记的用例未全部随包导出时，`reproducible` 为 `false`，不能据此放行自动验收。
+4. **非阻断式排查**：依赖排查全面覆盖全部用例与配置，杜绝单点报错导致的隐蔽缺失。
