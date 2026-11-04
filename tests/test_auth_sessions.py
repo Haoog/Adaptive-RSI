@@ -1,5 +1,6 @@
 import json
 import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -1664,6 +1665,64 @@ class OpenCodeServeTests(unittest.TestCase):
             with self.assertRaises(AuthError) as caught:
                 worker._v2_complete("fixture-code", timeout=30)
             self.assertEqual(caught.exception.code, "auth_protocol_error")
+
+    def test_http_error_keeps_bounded_response_detail(self):
+        worker = self.make_worker()
+        worker.header = "Basic fixture"
+        error = urllib.error.HTTPError(
+            worker.base + "/complete", 400, "Bad Request", {},
+            io.BytesIO(b'{"error":"invalid_grant","message":"code rejected",'
+                       b'"data":{"status":"failed"}}'))
+        opener = types.SimpleNamespace(open=lambda request, timeout=None: (_ for _ in ()).throw(error))
+        with patch("adaptive_rsi.auth_sessions.urllib.request.build_opener", return_value=opener):
+            with self.assertRaises(AuthError) as caught:
+                worker.http("POST", "/complete", {"code": "fixture-code"})
+        self.assertEqual(caught.exception.code, "auth_protocol_error")
+        self.assertEqual(caught.exception.detail, {"http_status": 400, "error": "invalid_grant",
+                                                   "message": "code rejected", "attempt_status": "failed"})
+
+    def test_v2_complete_uses_error_body_attempt_status_without_fallback_get(self):
+        worker = self.make_worker()
+        worker.capabilities = OpenCodeCapabilities("2.1.3", (2, 1, 3))
+        worker.provider, worker.attempt_id = "openai", "attempt-1"
+        worker.header = "Basic fixture"
+        for status, expected in (("failed", "authorization_failed"), ("expired", "auth_expired")):
+            calls = []
+
+            def fail(request, timeout=None):
+                calls.append((request.get_method(), request.full_url))
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {},
+                                             io.BytesIO(json.dumps({"data": {"status": status}}).encode()))
+            opener = types.SimpleNamespace(open=fail)
+            with self.subTest(status=status), \
+                 patch("adaptive_rsi.auth_sessions.urllib.request.build_opener", return_value=opener):
+                with self.assertRaises(AuthError) as caught:
+                    worker.complete("fixture-code", timeout=30)
+                self.assertEqual(caught.exception.code, expected)
+                self.assertEqual(caught.exception.detail["attempt_status"], status)
+            self.assertEqual([method for method, _ in calls], ["POST"],
+                             "错误体已给出 attempt 终态时不得再发兜底 GET")
+        calls = []
+
+        def complete(request, timeout=None):
+            calls.append(request.get_method())
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {},
+                                         io.BytesIO(b'{"data":{"status":"complete"}}'))
+        opener = types.SimpleNamespace(open=complete)
+        with patch("adaptive_rsi.auth_sessions.urllib.request.build_opener", return_value=opener):
+            self.assertTrue(worker.complete("fixture-code", timeout=30))
+        self.assertEqual(calls, ["POST"])
+
+    def test_error_detail_never_enters_api_response(self):
+        from adaptive_rsi.server import Handler
+        handler = object.__new__(Handler)
+        responses = []
+        handler.respond = lambda payload, status=200: responses.append((payload, status))
+        handler.api_error(AuthError("auth_protocol_error", detail={
+            "http_status": 400, "error": "invalid_grant", "message": "code rejected"}))
+        self.assertEqual(responses, [({"error": "Request failed: auth_protocol_error",
+                                       "error_code": "auth_protocol_error"}, 400)])
+        self.assertNotIn("code rejected", json.dumps(responses))
 
     def test_v2_complete_retries_transient_status_lookup_after_code(self):
         worker = object.__new__(OpenCodeAuth)

@@ -160,6 +160,40 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(parent['_timed_out_stage'], 'evaluation')
         self.assertNotIn('_timed_out_stage', self.runtime.new_trial_context(parent))
 
+    def test_known_phase_skips_runs_state_lookup_in_cancel_check(self):
+        """阶段已由 _explicit_phase/_model_started 确定时，不再为推导 stage 查 runs.state。"""
+        _, run = self.claim()
+        self.runtime.begin_phase(run, 'evaluation')
+        queries = []
+        original = self.store.one
+
+        def counting(sql, args=()):
+            queries.append(sql)
+            return original(sql, args)
+
+        def stage_lookups():
+            return [sql for sql in queries if sql.startswith('SELECT state FROM runs')]
+
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(stage_lookups(), [])
+        # 省掉的只是阶段推断那一条；真正的取消判定仍要查任务与项目状态。
+        self.assertTrue(any('FROM runs r JOIN tasks t' in sql for sql in queries))
+        # _model_started 优先级高于 _explicit_phase，同样不需要该查询。
+        run['_model_started'] = time.monotonic()
+        queries.clear()
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(stage_lookups(), [])
+        # 两者都缺席时仍回退到 runs.state：状态为 evaluating 才进入 evaluation 阶段。
+        del run['_model_started'], run['_explicit_phase']
+        self.store.execute("UPDATE runs SET state='evaluating' WHERE id=?", (run['id'],))
+        queries.clear()
+        with patch.object(self.store, 'one', side_effect=counting):
+            self.assertFalse(self.runtime.is_cancelled(run))
+        self.assertEqual(len(stage_lookups()), 1)
+        self.assertEqual(run['_deadline_stage'], 'evaluation')
+
     def test_propagated_trial_stage_survives_parent_timeout_recheck(self):
         """propagate_deadline 写入的阶段是首个判定结论；父 run 自身时钟超时不覆盖它。"""
         from adaptive_rsi.gitops import git

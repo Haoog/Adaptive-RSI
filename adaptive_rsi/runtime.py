@@ -1547,6 +1547,8 @@ class Runtime(Maintenance):
             elif run.get('_explicit_phase'):
                 stage = run['_explicit_phase']
             else:
+                # 仅当 _model_started 与 _explicit_phase 都缺席时才需要 runs.state 推断阶段；
+                # 该谓词是高频取消轮询路径，惰性求值避免每次白查一次 runs 表。
                 state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
                 stage = 'evaluation' if state and state['state'] == 'evaluating' else 'preparation'
             if run.get('_deadline_stage') != stage:
