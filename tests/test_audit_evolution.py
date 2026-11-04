@@ -1552,7 +1552,23 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(repro['integrity']['valid'])
         self.assertFalse(repro['valid'])
 
-    def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo'):
+    def test_bundle_drops_git_metadata_from_overlay(self):
+        """overlay 由宿主机目录整棵复制，其中的 .git 同样不能进包：留下会把宿主机
+        路径带给接收方，并让 verify_bundle 把刚导出的包判为失效。"""
+        overlay = self.root / 'overlay-with-git'
+        (overlay / '.git').mkdir(parents=True)
+        (overlay / '.git' / 'config').write_text('[remote "origin"]\n\turl = ' + str(self.root) + '/suite\n')
+        (overlay / 'protected.txt').write_text('sealed input\n')
+        destination = self.sealed_bundle(repo_name='repo-overlay-git', overlay=overlay)
+        case = destination / 'cases' / 'case-overlay-git'
+        self.assertEqual((case / 'overlay' / 'protected.txt').read_text(), 'sealed input\n')
+        self.assertFalse(list((destination / 'cases').rglob('.git')))
+        for path in destination.rglob('*'):
+            if path.is_file() and not path.is_symlink():
+                self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo', overlay=None):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
         from tests.test_runtime import fixture
         from adaptive_rsi.gitops import git
@@ -1568,7 +1584,7 @@ class AuditEvolutionTest(unittest.TestCase):
             'source': 'real',
             'signature': 'sig-' + suffix,
             'repository': str(repo),
-            'overlay': None,
+            'overlay': str(overlay) if overlay else None,
         }
         self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
                            ('case-' + suffix, 'p', 'family-' + suffix, 'validation', encode(spec), 0, time.time()))
