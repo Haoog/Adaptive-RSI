@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import re
 import shutil
 import time
@@ -171,6 +172,30 @@ def overlay_available(directory):
     except (OSError, TypeError, ValueError):
         # 非路径类型的 overlay 同样属于「配置了却不可用」；调度与封存都不能因此崩溃。
         return False
+
+
+def sealed_tree(root):
+    """清掉用例树里的 git 元数据；删不掉就失败，不导出夹带宿主机路径的包。
+
+    `snapshot()` 写出的 `.git/config` 记录了源仓库的本地绝对路径，而导出端只登记
+    工作树文件，`.git` 既不进 `manifest["files"]` 也无法被校验，属于路径泄漏加
+    校验盲区；`reproduce_bundle` 只按 `case.json` 的 checks 执行，不需要 git 元
+    数据。overlay 由宿主机目录整棵复制，同样可能自带 `.git`，两处都要清理。
+    """
+    root = Path(root)
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        for name in list(dirs) + files:
+            if name != ".git":
+                continue
+            item = Path(parent) / name
+            if item.is_symlink() or not item.is_dir():
+                # gitfile（`gitdir: …`）与符号链接都指向宿主机路径，同样不能留。
+                item.unlink()
+            else:
+                shutil.rmtree(item)
+        dirs[:] = [name for name in dirs if name != ".git"]
+    if next(root.rglob(".git"), None) is not None:
+        raise ValueError("Reproduction bundle cannot contain git metadata")
 
 
 def case_stratum(case):
@@ -714,17 +739,23 @@ class Evolution:
                 # bundle 只封存工作树文件：snapshot 写出的 .git 既含 origin 指向的宿主机
                 # suite 绝对路径（本地路径泄漏），又因不入 manifest 成为校验盲区，且
                 # 对象库白白增大包体。reproduce_bundle 只按 case.json 的 checks 执行，
-                # 不依赖 git 元数据，导出时整棵删除。
-                shutil.rmtree(target / "repository" / ".git", ignore_errors=True)
+                # 不依赖 git 元数据，导出时整棵删除；删不干净即失败而不是照常导出。
+                sealed_tree(target / "repository")
                 if spec.get("overlay"):
                     scrub_tree(spec["overlay"])
                     shutil.copytree(spec["overlay"], target / "overlay", symlinks=True)
+                    # overlay 是宿主机目录，同样可能自带 .git：留下会把宿主机路径带进
+                    # 包体，并让 verify_bundle 把刚导出的包判为失效。
+                    sealed_tree(target / "overlay")
                 spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
             files = {}
             for path in sorted(root.rglob("*")):
                 if ".git" in path.relative_to(root).parts:
-                    continue
+                    # 用例树导出前已由 sealed_tree 清空 git 元数据；这里再出现只能是
+                    # 删除失败或有人绕过导出路径。此时拒绝导出，而不是把 .git 排除在
+                    # 哈希之外、留下一个既泄漏宿主机路径又无法校验的包。
+                    raise ValueError("Reproduction bundle cannot contain git metadata")
                 if path.is_symlink():
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():

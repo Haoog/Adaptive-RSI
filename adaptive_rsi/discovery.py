@@ -870,7 +870,7 @@ def related_work(store, project, task, limit=12):
     # 流式遍历完整历史，仅保留最高分结果，并列时保持原顺序。
     with store.connect() as db:
         rows = db.execute("SELECT t.id,t.title,t.state,t.evidence,t.updated,"
-                          "(SELECT result FROM runs WHERE task=t.id ORDER BY started DESC,id LIMIT 1) AS result "
+                          "(SELECT result FROM runs WHERE task=t.id ORDER BY started DESC,rowid DESC LIMIT 1) AS result "
                           "FROM tasks t WHERE project=? AND id<>? AND source NOT LIKE 'system_%' "
                           "AND state NOT IN ('rejected','obsolete','cancelled','superseded') ORDER BY updated DESC",
                           (project, task["id"]))

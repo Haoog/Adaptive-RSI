@@ -53,6 +53,12 @@ POSTPROCESS_MAX_ATTEMPTS = 5
 # 后放行（线程为 daemon，不阻止进程退出）。
 MAINTENANCE_JOIN_TIMEOUT = 30
 
+# close() 等待调度线程收尾的上限：调度每一步都落在 store.root（SQLite 读写、
+# 状态目录扫描），该路径可落在 NFS/SSHFS/坏盘而上卡在内核里。调度线程的 join
+# 排在维护线程之前，不设界会让 close 在到达维护的上界前就永久阻塞；超时记
+# scheduler_timed_out 后继续关闭（线程为 daemon）。
+SCHEDULER_JOIN_TIMEOUT = 30
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -119,7 +125,7 @@ class Runtime(Maintenance):
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
-                          "maintenance_timed_out": False}
+                          "scheduler_timed_out": False, "maintenance_timed_out": False}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -589,7 +595,7 @@ class Runtime(Maintenance):
                     return prior["id"]
                 if prior["state"] in ["failed", "blocked"]:
                     # 周期任务持续故障时按连败次数退避，避免每周期产生新的失败 run。
-                    rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 4", (prior["id"],)).fetchall()
+                    rows = db.execute("SELECT state,ended FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 4", (prior["id"],)).fetchall()
                     streak, last_failure = 0, 0.0
                     for row in rows:
                         if row["state"] in ["failed", "blocked"]:
@@ -766,7 +772,7 @@ class Runtime(Maintenance):
         for task in self.store.query("SELECT * FROM tasks WHERE state='blocked'" + (" AND project=?" if project else ""), (project,) if project else ()):
             if self.project(task["project"])["paused"]:
                 continue
-            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,id DESC LIMIT 1", (task["id"],))
+            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],))
             try:
                 problem = json.loads(run["result"] or "{}").get("failure", {}) if run else {}
             except (TypeError, ValueError, AttributeError):
@@ -938,8 +944,17 @@ class Runtime(Maintenance):
         self._shutdown['phase'] = 'operations'
         self.operations.close()
         self._shutdown['phase'] = 'scheduler'
+        self._shutdown['scheduler_timed_out'] = False
         if self.thread:
-            self.thread.join()
+            # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
+            # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
+            # 的上界永远走不到。
+            self.thread.join(SCHEDULER_JOIN_TIMEOUT)
+            if self.thread.is_alive():
+                logging.getLogger(__name__).warning(
+                    "Scheduler thread did not stop within %ss; proceeding with shutdown",
+                    SCHEDULER_JOIN_TIMEOUT)
+                self._shutdown['scheduler_timed_out'] = True
         self._shutdown['phase'] = 'workers'
         try:
             try:
@@ -1079,7 +1094,7 @@ class Runtime(Maintenance):
     def reassess_deferred(self, project, config, head):
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
-            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC LIMIT 1", (task["id"],)) if not decision else None
+            run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)) if not decision else None
             try:
                 prior = json.loads(decision["data"]) if decision else json.loads(run["result"]) if run else self.store.setting("triage-state:" + task["id"], {})
             except (TypeError, ValueError):
