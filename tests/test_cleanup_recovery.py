@@ -144,6 +144,25 @@ class CleanupRecoveryTest(unittest.TestCase):
         maintenance.recover_cleanup(self.store)
         self.assertEqual((self.directory / 'workspace' / 'evidence').read_text(), 'original')
 
+    def test_recover_cleanup_bounded_wait_when_cleanup_lock_is_held(self):
+        # 持锁方卡死（NFS/坏盘）时 recover_cleanup 必须限时返回错误而非永久等待；
+        # 锁释放后下一轮恢复照常进行（幂等重试语义）。
+        import fcntl
+        (self.store.root / 'recycle').mkdir()
+        holder = os.open(self.store.root / 'recycle' / '.cleanup.lock',
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            with patch.object(maintenance, 'CLEANUP_LOCK_RETRY_SECONDS', 0.01):
+                start = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    maintenance.recover_cleanup(self.store)
+                self.assertLess(time.monotonic() - start, 5)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            maintenance.recover_cleanup(self.store)
+        finally:
+            os.close(holder)
+
     def test_process_exit_before_commit_recovers_on_reopen(self):
         import subprocess
         import sys

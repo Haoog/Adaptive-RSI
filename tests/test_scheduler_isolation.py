@@ -235,8 +235,15 @@ class SchedulerIsolationTest(unittest.TestCase):
             self.assertFalse((Path(run["path"]) / "candidate").exists())
             self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "expired")
         self.assertEqual(self.dispatched[-1]["task"], healthy_task)
-        event = self.errors("maintenance_run")[0]
-        self.assertEqual((event["project"], event["run"]), ("broken", bad["id"]))
+        # 确定性拒绝留 settings 证据与事件，不记 scheduler_error、不周期重试。
+        mark = self.store.setting("retention_path_rejected:" + bad["id"])
+        self.assertEqual(mark["path"], str(outside))
+        event = self.store.one("SELECT * FROM events WHERE kind='retention_path_rejected' AND run=?", (bad["id"],))
+        self.assertEqual(event["project"], "broken")
+        self.assertEqual(self.errors("maintenance_run"), [])
+        self.store.put_setting("maintenance-last", 0)
+        self.iteration()
+        self.assertEqual(self.errors("maintenance_run"), [])
 
     def test_retention_rejects_symlinked_run_and_malicious_paths(self):
         runs = self.store.root / "runs"
@@ -261,6 +268,11 @@ class SchedulerIsolationTest(unittest.TestCase):
         bad_runs = [linked]
         for path in malicious_paths:
             bad_runs.append(self.historical_run("broken", "awaiting_approval", path))
+        # 目录名与运行一致但父目录不在 runs/ 下，覆盖「越界拒绝」分支。
+        outside_named = self.historical_run("broken", "awaiting_approval")
+        self.store.execute("UPDATE runs SET path=? WHERE id=?",
+                           (str(outside / outside_named["id"]), outside_named["id"]))
+        bad_runs.append(outside_named)
         # 单独保留健康运行，确认拒绝坏路径不会阻塞正常清理。
         good = self.historical_run("broken", "awaiting_approval")
         (Path(good["path"]) / "candidate").mkdir(parents=True)
@@ -275,10 +287,19 @@ class SchedulerIsolationTest(unittest.TestCase):
             with self.subTest(path=run["path"]):
                 self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
                 self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "awaiting_approval")
-        self.assertEqual({event["run"] for event in self.errors("maintenance_run")},
-                         {run["id"] for run in bad_runs})
+                self.assertTrue(self.store.setting("retention_path_rejected:" + run["id"]))
+        self.assertEqual(self.errors("maintenance_run"), [])
+        self.assertEqual({event["run"] for event in self.store.query(
+            "SELECT run FROM events WHERE kind='retention_path_rejected'")},
+            {run["id"] for run in bad_runs})
         self.assertFalse((Path(good["path"]) / "candidate").exists())
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (good["id"],))["state"], "expired")
+        # 被拒路径不再进入候选：下个周期不重新 stat、不再产生事件。
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertEqual(self.errors("maintenance_run"), [])
+        self.assertEqual(len(self.store.query(
+            "SELECT run FROM events WHERE kind='retention_path_rejected'")), len(bad_runs))
 
     def test_retention_rejects_symlinked_runs_parent(self):
         outside = self.root / "outside"
@@ -294,6 +315,96 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertEqual(marker.read_text(), "must remain")
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "awaiting_approval")
         self.assertEqual(self.errors("maintenance_run")[0]["run"], run["id"])
+
+    def test_retention_resolve_oserror_retries_without_rejection_mark(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        bad = self.historical_run("broken", "awaiting_approval")
+        # 目录名与运行一致但父目录不在 runs/ 下：唯有越过名称预检才会触发 resolve()。
+        target = outside / bad["id"]
+        target.mkdir()
+        self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(target), bad["id"]))
+        (target / "candidate").mkdir()
+        marker = target / "candidate" / "keep.txt"
+        marker.write_text("must remain")
+        real = Path.resolve
+
+        def flaky(self):
+            if self == outside:
+                raise OSError("runs root unreadable")
+            return real(self)
+
+        with patch.object(Path, "resolve", flaky):
+            self.runtime.maintenance()
+
+        self.assertEqual(self.errors("maintenance_run")[0]["run"], bad["id"])
+        self.assertIsNone(self.store.setting("retention_path_rejected:" + bad["id"]))
+        # 环境恢复后同一运行重新评估并落入确定性拒绝路径。
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertTrue(self.store.setting("retention_path_rejected:" + bad["id"]))
+        self.assertTrue(marker.exists())
+
+    def test_retention_revalidates_rejected_symlink_after_filesystem_repair(self):
+        runs = self.store.root / "runs"
+        runs.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        linked = self.historical_run("broken", "awaiting_approval")
+        directory = Path(linked["path"])
+        directory.symlink_to(outside, target_is_directory=True)
+
+        self.runtime.maintenance()
+        mark = self.store.setting("retention_path_rejected:" + linked["id"])
+        self.assertEqual(mark["reason"], "unsafe run path")
+
+        # 运维把链接换成同名真实目录：runs.path 未变，重验窗口未到期仍跳过。
+        directory.unlink()
+        (directory / "candidate").mkdir(parents=True)
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "awaiting_approval")
+        self.assertTrue((directory / "candidate").exists())
+
+        # 窗口到期后重新检查：路径已合法，运行回到清理流水线，过期标记被清除。
+        self.store.put_setting("retention_path_rejected:" + linked["id"], dict(
+            mark, rejected=time.time() - maintenance_module.RETENTION_REJECT_REVALIDATE_SECONDS - 1))
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+
+        self.assertFalse((directory / "candidate").exists())
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "expired")
+        self.assertIsNone(self.store.setting("retention_path_rejected:" + linked["id"]))
+
+    def test_retention_rejected_path_still_unsafe_is_marked_again(self):
+        runs = self.store.root / "runs"
+        runs.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        linked = self.historical_run("broken", "awaiting_approval")
+        directory = Path(linked["path"])
+        directory.symlink_to(outside, target_is_directory=True)
+
+        self.runtime.maintenance()
+        mark = self.store.setting("retention_path_rejected:" + linked["id"])
+        first = mark["rejected"]
+
+        # 窗口到期而链接仍在：重写标记顺延窗口，事件每窗口至多一条。
+        self.store.put_setting("retention_path_rejected:" + linked["id"], dict(
+            mark, rejected=time.time() - maintenance_module.RETENTION_REJECT_REVALIDATE_SECONDS - 1))
+        self.store.put_setting("maintenance-last", 0)
+        self.runtime.maintenance()
+
+        renewed = self.store.setting("retention_path_rejected:" + linked["id"])
+        self.assertGreater(renewed["rejected"], first)
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (linked["id"],))["state"],
+                         "awaiting_approval")
+        self.assertTrue(directory.is_symlink())
+        events = self.store.query(
+            "SELECT run FROM events WHERE kind='retention_path_rejected' AND run=?", (linked["id"],))
+        self.assertEqual(len(events), 2)
 
     def test_automatic_retention_honors_run_and_project_holds(self):
         self.store.execute("INSERT INTO projects VALUES ('held','held project',?, '{}', 0, 9)",

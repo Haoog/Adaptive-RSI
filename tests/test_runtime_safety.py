@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -275,6 +276,22 @@ class RuntimeSafetyTest(unittest.TestCase):
             self.assertNotEqual(fresh["id"], run["id"])
         finally:
             reopened.close()
+
+    def test_close_bounds_maintenance_join_and_records_timeout(self):
+        # 维护线程卡在 NFS/坏盘的 flock/fsync 里永不返回时，close() 必须限时
+        # 放行：join 有上界、shutdown 记录超时证据、终态 phase 不停在 'maintenance'。
+        self.runtime.maintenance_thread = threading.Thread(
+            target=threading.Event().wait, name="rsi-maintenance-stuck", daemon=True)
+        self.runtime.maintenance_thread.start()
+        with patch('adaptive_rsi.runtime.MAINTENANCE_JOIN_TIMEOUT', 0.1):
+            start = time.monotonic()
+            self.runtime.close()
+            elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 15)
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'completed')
+        self.assertTrue(status['maintenance_timed_out'])
+        self.assertTrue(status['maintenance_running'])
 
     def test_pause_marks_only_unfinished_runs_in_its_project(self):
         task = self.runtime.goal(self.project, "Completed history")
