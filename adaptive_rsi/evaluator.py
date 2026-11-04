@@ -31,6 +31,10 @@ HARNESS_CONFIG_PREFIXES = ("jest.config.", "vitest.config.", "playwright.config.
 HARNESS_CONFIGS = {".mocharc.js", ".mocharc.cjs", ".mocharc.mjs", ".mocharc.json", ".mocharc.yaml",
                    ".mocharc.yml", ".mocharc.toml"}
 BASELINE_CACHE_LIMIT = 4
+HOST_TOOL_DIGEST_CHUNK = 1024 * 1024
+HOST_TOOL_DIGEST_CACHE_LIMIT = 32
+_HOST_TOOL_DIGESTS = {}
+_HOST_TOOL_DIGESTS_LOCK = threading.Lock()
 CACHE_STDERR_LIMIT = 16 * 1024
 # Cached rows keep only what gate and review comparisons read; raw artifact
 # contents stay in the run directory and are re-read on demand.
@@ -53,9 +57,58 @@ def validation_controls(config):
     return controls
 
 
-def host_tool_versions(checks):
-    """Probe only known host tools, never execute candidate-provided binaries."""
+def _binary_sha256(path):
+    """Hash a file in bounded chunks so large binaries are never loaded whole."""
     import hashlib
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        while True:
+            chunk = handle.read(HOST_TOOL_DIGEST_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest(), (info.st_mtime_ns, info.st_size, info.st_ino)
+
+
+def _cached_binary_sha256(path):
+    """Digest a host binary, rehashing only when its filesystem identity changes."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    key = (path, info.st_mtime_ns, info.st_size, info.st_ino)
+    with _HOST_TOOL_DIGESTS_LOCK:
+        cached = _HOST_TOOL_DIGESTS.get(key)
+    if cached is not None:
+        return cached
+    try:
+        digest, hashed = _binary_sha256(path)
+    except OSError:
+        return None
+    if hashed != (info.st_mtime_ns, info.st_size, info.st_ino):
+        # The path was replaced between stat and open: return the digest of the
+        # file that was actually hashed, but do not cache it under a stale key.
+        return digest
+    with _HOST_TOOL_DIGESTS_LOCK:
+        if len(_HOST_TOOL_DIGESTS) >= HOST_TOOL_DIGEST_CACHE_LIMIT:
+            _HOST_TOOL_DIGESTS.pop(next(iter(_HOST_TOOL_DIGESTS)))
+        _HOST_TOOL_DIGESTS[key] = digest
+    return digest
+
+
+def host_tool_versions(checks, execution_environment=None):
+    """Probe only known host tools, never execute candidate-provided binaries.
+
+    Probes always run on the host. When checks execute in a container, the
+    execution toolchain is identified by ``execution_environment["image_id"]``;
+    the reserved ``_scope`` entry marks these records as host-only so they are
+    not mistaken for the toolchain inside that image. Scope is only recorded when
+    the caller supplies the execution identity, so callers using the result as a
+    dependency-cache key keep a stable key. Digests are bounded and
+    cached per (path, mtime, size, inode), so repeated evaluations do not
+    re-read large toolchains.
+    """
     flags = {"python": "--version", "python3": "--version", "node": "--version", "npm": "--version",
              "git": "--version", "go": "version", "cargo": "--version", "rustc": "--version",
              "java": "-version", "mvn": "--version", "ruby": "--version", "php": "--version"}
@@ -70,13 +123,13 @@ def host_tool_versions(checks):
             continue
         from .process import run_process as probe_process
         probe = probe_process([path, flags[name]], timeout=5)
-        try:
-            digest = hashlib.sha256(Path(path).resolve().read_bytes()).hexdigest()
-        except OSError:
-            digest = None
+        digest = _cached_binary_sha256(path)
         result[name] = {"state": "available" if probe["exit_code"] == 0 and not probe["error"] else "unavailable",
                         "path": path, "binary_sha256": digest,
                         "version": (probe["stdout"] + probe["stderr"])[:4096].strip()}
+    if execution_environment is not None:
+        result["_scope"] = {"probe": "host",
+                            "checks_run_in": execution_environment.get("backend") or "unknown"}
     return result
 
 
@@ -1296,7 +1349,8 @@ class Evaluator:
         data = {"decision": "insufficient_evidence" if unavailable else "pass" if passing else "fail",
                 "reason": "Regression and full candidate checks passed" if passing else "Candidate failed independent checks",
                 "harness_hash": fingerprint(checks), "candidate_full_reused": reuse_full, "checks": results,
-                "execution_environment": execution_identity, "host_tools": host_tool_versions(checks)}
+                "execution_environment": execution_identity,
+                "host_tools": host_tool_versions(checks, execution_identity)}
         if seeds:
             from .process import scrub_tree
             scrub_tree(seeds)
