@@ -101,7 +101,8 @@ def baseline(runtime, project, config):
         github_git(cache, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
             "+refs/heads/" + branch + ":refs/heads/rsi-baseline", timeout=180)
         sha = git(cache, "rev-parse", "refs/heads/rsi-baseline")
-        runtime.store.put_setting("baseline:" + project["id"], {"sha": sha, "branch": branch})
+        # 基线身份只经返回值传播；旧版写入的 settings 键没有读取方，且每次 fetch
+        # 覆写同一键，已停止写入并由维护清理存量行。
         return str(cache), sha, branch
 
 
