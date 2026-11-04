@@ -54,6 +54,63 @@ class RuntimeHandoffTest(unittest.TestCase):
             gate.set()
             closer.join(5)
         self.assertEqual(self.runtime.shutdown_status()['phase'], 'completed')
+        self.assertFalse(self.runtime.shutdown_status()['workers_timed_out'])
+
+    def test_shutdown_bounds_non_cancellable_worker(self):
+        gate, began = threading.Event(), threading.Event()
+        _, run = self.claim()
+
+        def wedged():
+            began.set()
+            gate.wait(10)
+
+        future = self.runtime.pool.submit(wedged)
+        with self.runtime._futures_lock:
+            self.runtime.futures.add(future)
+            self.runtime._future_runs[future] = run['id']
+        self.assertTrue(began.wait(1))
+        try:
+            with patch('adaptive_rsi.runtime.WORKER_DRAIN_TIMEOUT', .2):
+                started = time.monotonic()
+                self.runtime.close()
+                elapsed = time.monotonic() - started
+            status = self.runtime.shutdown_status()
+            self.assertLess(elapsed, 1)
+            self.assertEqual(status['phase'], 'completed')
+            self.assertTrue(status['workers_timed_out'])
+            self.assertFalse(status['operations_timed_out'])
+            events = self.store.query("SELECT data FROM events WHERE kind='shutdown_workers_timed_out'")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(json.loads(events[0]['data'])['runs'], [run['id']])
+        finally:
+            gate.set()
+
+    def test_operations_close_bounds_a_wedged_operation(self):
+        gate, began = threading.Event(), threading.Event()
+
+        def wedged(operation, kind, parameters, stop):
+            began.set()
+            gate.wait(10)
+            return {}
+
+        with patch.object(self.runtime.operations, '_execute', wedged):
+            operation = self.runtime.operations.start('diagnostics', {})['id']
+        self.assertTrue(began.wait(1))
+        try:
+            with patch('adaptive_rsi.operations.OPERATION_DRAIN_TIMEOUT', .2):
+                started = time.monotonic()
+                self.runtime.operations.close()
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1)
+            self.assertTrue(self.runtime.operations.timed_out)
+            events = self.store.query("SELECT data FROM events WHERE kind='shutdown_operations_timed_out'")
+            self.assertEqual(len(events), 1)
+            self.assertEqual(json.loads(events[0]['data'])['operations'], [operation])
+        finally:
+            gate.set()
+            limit = time.monotonic() + 5
+            while (self.runtime.operations.active or self.runtime.operations.pending) and time.monotonic() < limit:
+                time.sleep(.01)
 
     def test_shutdown_rejects_claim_once_the_admission_boundary_closes(self):
         self.runtime.pause(self.project, False)
