@@ -1745,6 +1745,60 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('Sealed Bundle Reproduction Inspection', strict_proc.stdout)
         self.assertIn('OPENAI_API_KEY', strict_proc.stdout)
 
+    def test_bundle_without_any_case_is_not_reproducible(self):
+        # 没有 dataset.manifest 的候选（旧证据/手写 ready 行）导出的包只有三个
+        # json 文件：integrity 有效，但没有可执行基线，不得判「具备离线复现条件」。
+        import subprocess
+        import sys
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
+                        'providers': []})
+        destination = self.root / 'bundle-empty'
+        manifest = self.evolution.export_bundle('c', destination)
+        self.assertEqual(sorted(manifest['files']), ['candidate.json', 'evidence.json'])
+
+        result = Evolution.reproduce_bundle(destination)
+        self.assertTrue(result['valid'])
+        self.assertEqual(result['cases'], {'exported': [], 'registered': [], 'missing': []})
+        self.assertFalse(result['reproducible'])
+        self.assertTrue(any('no registered case.json' in item for item in result['limitations']))
+
+        strict = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(strict.returncode, 2)
+        self.assertIn('不含任何已登记用例', strict.stdout)
+
+    def test_bundle_missing_registered_case_is_not_reproducible(self):
+        # manifest 登记两个用例、库里只有一个：导出只写出一个，缺的用例必须让
+        # 复现结论为否，并可在 cases.missing 与限制说明中读出具体 id。
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-partial')
+        spec = {
+            'task': 'partial bundle task', 'base': git(repo, 'rev-parse', 'HEAD'),
+            'checks': [{'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}],
+            'source': 'real', 'signature': 'sig-partial',
+            'repository': str(repo), 'overlay': None,
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-present', 'p', 'family-present', 'validation', encode(spec), 0, time.time()))
+        self.candidate({'dataset': {'manifest': [{'case': 'case-present'}, {'case': 'case-missing'}]},
+                        'providers': []})
+        destination = self.root / 'bundle-partial'
+        manifest = self.evolution.export_bundle('c', destination)
+        self.assertIn('cases/case-present/case.json', manifest['files'])
+        self.assertNotIn('cases/case-missing/case.json', manifest['files'])
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['cases']['exported'], ['case-present'])
+        self.assertEqual(result['cases']['missing'], ['case-missing'])
+        self.assertFalse(result['reproducible'])
+        self.assertIn('case-missing', ' '.join(result['limitations']))
+
     def test_bundle_reproduction_ignores_unmanifested_case_directories(self):
         # 线程 1：向 bundle 多塞一个未登记用例目录不得被执行，也不得保持 integrity 有效。
         pristine = self.sealed_bundle(repo_name='repo-pristine')
