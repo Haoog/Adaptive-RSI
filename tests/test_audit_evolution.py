@@ -2033,6 +2033,75 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(result['credentials']['available'], [])
         self.assertTrue(result['reproducible'])
 
+    def test_bundle_run_checks_failure_marks_unreproducible_and_strict_fails(self):
+        import subprocess
+        import sys
+        checks = [
+            {'name': 'passing', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']},
+            {'name': 'failing', 'cwd': '.', 'argv': ['python3', '-c', 'raise SystemExit(3)']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-check-fail')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual([row['passed'] for row in result['executed_checks']], [True, False])
+        self.assertEqual(result['checks_executed'], 2)
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertFalse(result['checks_passed'])
+        self.assertFalse(result['reproducible'])
+        self.assertTrue(any('Offline checks failed: 1 of 2' in item for item in result['limitations']))
+
+        strict = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination),
+             '--run-checks', '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
+        self.assertEqual(strict.returncode, 2, strict.stdout + strict.stderr)
+        self.assertIn('未通过，不具备离线复现条件', strict.stdout)
+        self.assertIn('[FAIL] case-check-fail - failing', strict.stdout)
+
+        # 正常路径不回归：全部检查通过时仍可复现，--strict 退出 0。
+        passing = self.sealed_bundle(
+            checks=[{'name': 'passing', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}],
+            repo_name='repo-check-pass')
+        result = Evolution.reproduce_bundle(
+            passing, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['checks_passed'])
+        self.assertTrue(result['reproducible'])
+        clean = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(passing),
+             '--run-checks', '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'})
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+
+    def test_bundle_malformed_check_specs_block_reproducibility(self):
+        checks = [
+            {'name': 'string-argv', 'cwd': '.', 'argv': "python3 -c 'print(1)'"},
+            {'name': 'empty-argv', 'cwd': '.', 'argv': []},
+            {'name': 'escaping-cwd', 'cwd': '../outside', 'argv': ['python3', '-c', 'print(1)']},
+            {'name': 'python-in-argv', 'cwd': '.', 'argv': ['python3', 3]},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-malformed-check')
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertFalse(result['reproducible'])
+        limitations = ' '.join(result['limitations'])
+        self.assertIn('checks[0] argv is not a non-empty list of strings', limitations)
+        self.assertIn('checks[1] argv is not a non-empty list of strings', limitations)
+        self.assertIn('checks[2] cwd is not a relative path inside the case', limitations)
+        self.assertIn('checks[3] argv is not a non-empty list of strings', limitations)
+        # 畸形规格不执行，也不会按半截 argv 进入依赖清单。
+        self.assertEqual(result['executed_checks'], [])
+        self.assertIsNone(result['checks_passed'])
+        self.assertEqual(result['dependencies']['missing'], [])
+        # 未请求执行时同样只凭畸形规格判不可复现。
+        passive = Evolution.reproduce_bundle(destination, env={'PATH': '/usr/bin:/bin'})
+        self.assertFalse(passive['reproducible'])
+        self.assertIsNone(passive['checks_passed'])
+
     def test_save_hotpath_skips_reverification_in_evaluating_state(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         plan = {'data': data, 'sha256': fingerprint(data)}
