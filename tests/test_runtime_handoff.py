@@ -1481,6 +1481,32 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertIsNone(barrier(self.runtime))
         self.assertIsNone(self.store.setting(KEY))
 
+    def test_out_of_range_owner_pid_is_recovered(self):
+        # os.kill 对超出 C int 的 pid 抛 OverflowError 而非 OSError；修复前异常穿出
+        # barrier()，桌面进程在 start 前退出，调度 tick 全部被跳过。已写入但不可用的
+        # 属主值必须按 invalid_record 走统一恢复路径，合法存活属主仍保持屏障。
+        from adaptive_rsi.lifecycle import KEY, barrier, readiness
+        self.runtime.updates.desktop_managed = True
+        for owner in (10 ** 30, 2 ** 31, -1, True, 2.5, '123'):
+            with self.subTest(owner=owner):
+                self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'lease-token',
+                                             'phase': 'installing', 'owner_pid': owner,
+                                             'expires': time.time() + 3600})
+                self.assertIsNone(barrier(self.runtime))
+                self.assertIsNone(self.store.setting(KEY))
+                event = self.store.one("SELECT data FROM events WHERE kind='desktop_update_recovered' "
+                                       "ORDER BY rowid DESC LIMIT 1")
+                self.assertEqual(json.loads(event['data'])['reason'], 'invalid_record')
+        self.store.put_setting(KEY, {'version': '9.0.0', 'lease': 'lease-token', 'phase': 'installing',
+                                     'owner_pid': os.getpid(), 'expires': time.time() + 3600})
+        self.assertEqual(barrier(self.runtime)['owner_pid'], os.getpid())
+        self.runtime.updates.desktop_owner_pid = os.getpid()
+        committed = readiness(self.runtime, 'commit', lease='lease-token')['barrier']
+        self.assertEqual((committed['phase'], committed['owner_pid']), ('installing', os.getpid()))
+        self.assertIsNotNone(self.store.setting(KEY))
+        readiness(self.runtime, 'cancel', lease='lease-token')
+        self.assertIsNone(self.store.setting(KEY))
+
     def test_prepare_recovers_a_barrier_record_without_a_lease(self):
         from adaptive_rsi.lifecycle import KEY, readiness
         self.runtime.updates.desktop_managed = True

@@ -50,13 +50,23 @@ def barrier(runtime):
                        (not isinstance(expires, (int, float)) or expires <= time.time()))
             owner_exited = False
             owner = state.get("owner_pid")
-            if state.get("phase") == "installing" and type(owner) is int and owner > 1:
-                try:
-                    os.kill(owner, 0)
-                except OSError as exc:
-                    # Permission errors and unknown process state must keep admission closed.
-                    owner_exited = exc.errno == errno.ESRCH
-            if expired or owner_exited:
+            if state.get("phase") == "installing" and "owner_pid" in state:
+                # os.kill 对超出 C int 的 pid 抛 OverflowError（不是 OSError），一旦穿出本
+                # 函数，桌面进程会在 start 前退出，调度 tick 也会被整体跳过。已写入但不可
+                # 用的属主值与其它损坏记录同属 invalid_record，走统一恢复路径；缺字段的
+                # 旧记录仍保留屏障，等待带租约的 cancel/complete 显式清理。
+                if type(owner) is not int or not 1 < owner < 2 ** 31:
+                    reason = "invalid_record"
+                else:
+                    try:
+                        os.kill(owner, 0)
+                    except OSError as exc:
+                        # Permission errors and unknown process state must keep admission closed.
+                        owner_exited = exc.errno == errno.ESRCH
+                    except (OverflowError, ValueError):
+                        # 防御平台差异：无法交给 os.kill 的值同样按不可用记录恢复。
+                        reason = "invalid_record"
+            if reason is None and (expired or owner_exited):
                 reason = "owner_exited" if owner_exited else "drain_expired"
         if reason:
             with runtime.store.connect() as db:
