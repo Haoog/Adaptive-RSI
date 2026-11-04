@@ -455,7 +455,7 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
                "untrusted_issue_comment_context": issue_comments,
                "untrusted_pr_feedback": pr_feedback,
                "previous_attempts": runtime.store.query("SELECT id,base,state,result FROM runs WHERE task=? AND ended IS NOT NULL "
-                                                      "ORDER BY started DESC LIMIT 2", (task["id"],))}
+                                                      "ORDER BY started DESC,rowid DESC LIMIT 2", (task["id"],))}
     if experiment:
         injected = {item.get("evidence", {}).get("candidate") for item in experiment_skills or ()}
         context["skills"] = experiment_skill_context(context["skills"], strategies,

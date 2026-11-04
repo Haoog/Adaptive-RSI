@@ -50,7 +50,7 @@ def acceptance_evidence(store, task, project):
         originals = json.loads(grouped["evidence"])[0]["originals"]
     except (TypeError, ValueError, KeyError, IndexError):
         originals = []
-    run = store.one("SELECT id,result FROM runs WHERE task=? AND project=? ORDER BY started DESC,id DESC LIMIT 1", (task, project))
+    run = store.one("SELECT id,result FROM runs WHERE task=? AND project=? ORDER BY started DESC,rowid DESC LIMIT 1", (task, project))
     result = decode_object(run["result"]) if run else {}
     evaluation = result.get("evaluation") or {}
     evaluation = evaluation if isinstance(evaluation, dict) else {}
@@ -92,7 +92,7 @@ def lineage(store, task, project, before=2**63 - 1):
         raise ValueError("Task not found")
     groups = store.query("SELECT m.rowid AS cursor,g.id,g.title,g.state,g.created,m.restored,r.id AS run_id,r.state AS run_state,r.result AS run_result "
                          "FROM task_group_members m JOIN tasks g ON g.id=m.group_task "
-                         "LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=g.id ORDER BY started DESC,id DESC LIMIT 1) "
+                         "LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE task=g.id ORDER BY started DESC,rowid DESC LIMIT 1) "
                          "WHERE m.original_task=? AND g.project=? AND m.rowid<? "
                          "ORDER BY m.rowid DESC LIMIT 101", (task, project, before))
     for group in groups[:100]:
