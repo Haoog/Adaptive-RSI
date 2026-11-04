@@ -57,16 +57,48 @@ raise SystemExit(subprocess.call(sys.argv[4:],close_fds=True))
 
 
 class AuthError(RuntimeError):
-    def __init__(self, code):
+    def __init__(self, code, detail=None):
         self.code = code
+        # 仅用于内部判断与排障，不进入异常文本或 HTTP 响应。
+        self.detail = detail
         super().__init__("Authentication: " + code)
 
 
 class AuthAttemptFailed(AuthError):
     """现代 CLI 确认本次 attempt 已失败，但不能推断具体失败原因。"""
 
-    def __init__(self):
-        super().__init__("authorization_failed")
+    def __init__(self, detail=None):
+        super().__init__("authorization_failed", detail)
+
+
+def _http_error_detail(status, raw):
+    """提取 HTTP 错误体中的诊断字段；只保留有界字符串。"""
+    detail = {"http_status": status}
+    try:
+        value = json.loads(raw) if raw else None
+    except (ValueError, RecursionError):
+        value = None
+    if not isinstance(value, dict):
+        return detail
+    for key in ("error", "message"):
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            detail[key] = item[:512]
+        elif isinstance(item, dict) and isinstance(item.get("message"), str) and item["message"]:
+            detail.setdefault("message", item["message"][:512])
+    data = value.get("data")
+    if isinstance(data, dict):
+        for key in ("error", "message"):
+            item = data.get(key)
+            if isinstance(item, str) and item and key not in detail:
+                detail[key] = item[:512]
+        attempt = data.get("status")
+        if isinstance(attempt, str) and attempt:
+            detail["attempt_status"] = attempt[:64]
+    attempt = value.get("status")
+    if isinstance(attempt, str) and attempt and "attempt_status" not in detail:
+        detail["attempt_status"] = attempt[:64]
+    return detail
 
 
 AuthenticationError = AuthError
@@ -481,6 +513,19 @@ class OpenCodeAuth(_Process):
             if not raw:
                 return None
             return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            # 非 2xx 的错误体常带 provider 的 message/attempt 状态；保留有界诊断
+            # 信息供内部判断，但只以白名单错误码对外。错误体仅用于诊断，读取失败
+            # 不应掩盖原始 HTTP 状态。
+            try:
+                raw = exc.read(MAX_BYTES + 1)
+            except Exception:
+                raw = b""
+            finally:
+                exc.close()
+            if len(raw) > MAX_BYTES:
+                raw = b""
+            raise AuthError("auth_protocol_error", detail=_http_error_detail(exc.code, raw)) from None
         except (OSError, ValueError, urllib.error.URLError):
             raise AuthError("auth_protocol_error") from None
 
@@ -683,8 +728,17 @@ class OpenCodeAuth(_Process):
             except AuthError as exc:
                 if exc.code != "auth_protocol_error":
                     raise
-                # POST 的 HTTP 错误和网络失败共用错误码；仅在状态明确时细化，
-                # 查询失败或状态不确定时保留原始错误，绝不重复提交验证码。
+                # POST 的 HTTP 错误和网络失败共用错误码；provider 错误体已给出
+                # attempt 终态时直接使用，避免再发一次 GET 反推。detail 缺失或
+                # 状态不明确时保留原有反查；查询失败时绝不重复提交验证码。
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                status = detail.get("attempt_status")
+                if status == "complete":
+                    return True
+                if status == "failed":
+                    raise AuthAttemptFailed(detail) from exc
+                if status == "expired":
+                    raise AuthError("auth_expired", detail=detail) from exc
                 try:
                     value = self.http("GET", base, timeout=min(25, max(1, timeout)))
                 except AuthError:
