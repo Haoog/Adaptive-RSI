@@ -65,33 +65,28 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
                           "pr_closed", "unverified_merge", "reverted", "superseded")
 
 
+def _clock_lock(run):
+    """Return the lock that guards one run's deadline clock fields.
+
+    The stage clock is a multi-field read-modify-write: the worker thread
+    writes it in ``begin_phase``/``invoke`` while cancel pollers (including
+    the acceptance-baseline thread) call ``is_cancelled`` on the same dict.
+    The lock lives in the run dict so every poller of that run object
+    serializes its check-then-act without a global registry; ``setdefault``
+    is atomic, so concurrent first callers agree on a single lock.
+    """
+    lock = run.get('_deadline_lock')
+    if lock is None:
+        lock = run.setdefault('_deadline_lock', threading.Lock())
+    return lock
+
+
 class IssueSyncCorruptPending(ValueError):
     """_deliver 因 issue-sync 进度行损坏而拒绝交付；携带项目供调用方在回滚后补写事件。"""
 
     def __init__(self, project):
         super().__init__("Issue snapshot is pending synchronization")
         self.project = project
-
-
-# run 字典里的截止时钟字段由工作线程、验收基线线程和子进程轮询线程共享。
-# “读 stage → 比较 → 写 stage/started”不是原子操作：invoke 收尾若先摘除
-# _model_started 再恢复时钟，并发 is_cancelled 会把已耗时间清零并漏判超时。
-# 所有多字段读改写都在同一把锁内完成；锁内不得再做数据库写事务或获取
-# dispatch_lock，避免与子进程轮询路径形成锁序死锁。
-_DEADLINE_LOCKS_GUARD = threading.Lock()
-
-
-def _deadline_guard(run):
-    """Return the run's deadline-field lock, creating it on first use."""
-    lock = run.get('_deadline_lock')
-    if lock is not None:
-        return lock
-    with _DEADLINE_LOCKS_GUARD:
-        lock = run.get('_deadline_lock')
-        if lock is None:
-            lock = threading.Lock()
-            run['_deadline_lock'] = lock
-    return lock
 
 
 class Runtime(Maintenance):
@@ -1542,34 +1537,46 @@ class Runtime(Maintenance):
     def begin_phase(run, stage):
         if stage not in ('preparation', 'model', 'evaluation'):
             raise ValueError('Unknown execution phase')
-        with _deadline_guard(run):
+        with _clock_lock(run):
             run['_explicit_phase'] = stage
             run['_deadline_stage'], run['_deadline_started'] = stage, time.monotonic()
 
     def new_trial_context(self, parent):
         """Start an experiment clock that never inherits the parent's elapsed time."""
-        with _deadline_guard(parent):
-            trial = {key: value for key, value in parent.items()
-                     if key not in ('_model_started', '_deadline_started', '_deadline_stage',
-                                    '_timed_out_stage', '_explicit_phase',
-                                    '_outer_deadline_stage', '_outer_deadline_started',
-                                    '_deadline_lock')}
+        trial = {key: value for key, value in parent.items()
+                 if key not in ('_model_started', '_deadline_started', '_deadline_stage',
+                                '_timed_out_stage', '_explicit_phase', '_deadline_lock',
+                                '_outer_deadline_stage', '_outer_deadline_started')}
         self.begin_phase(trial, 'preparation')
         return trial
 
     @staticmethod
     def propagate_deadline(parent, trial):
         if trial.get('_timed_out_stage'):
-            with _deadline_guard(parent):
+            # 父 run 的时钟字段由自己的锁保护；trial 的结论只是单键快照读取。
+            with _clock_lock(parent):
                 parent['_timed_out_stage'] = trial['_timed_out_stage']
 
     def is_cancelled(self, run):
         if self.stop.is_set():
             return True
-        if '_deadline_started' in run:
-            # 阶段推导与时钟改写必须原子：并发调用方可能在 invoke 收尾的
-            # 中间态读到 _model_started 已摘除而 _deadline_stage 仍是 model。
-            with _deadline_guard(run):
+        if self._deadline_expired(run):
+            return True
+        row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
+                             "WHERE s.key='run-stop:' || r.id) AS stop_requested "
+                             "FROM runs r JOIN tasks t ON r.task=t.id "
+                             "JOIN projects p ON p.id=r.project WHERE r.id=?", (run["id"],))
+        return self.stop.is_set() or not row or row["paused"] or row["stop_requested"] or row["state"] == "cancelled"
+
+    def _deadline_expired(self, run):
+        """Judge the stage clock and record the timeout stage under the per-run lock.
+
+        相位推导、时钟重置与超时判定是一组跨字段的读-改-写：worker 的
+        begin_phase/invoke 会并发改同一 dict，acceptance 基线等取消轮询线程也会
+        在这里判定。整段持锁串行化；锁内只做存储读取（阶段推断），不取写事务。
+        """
+        with _clock_lock(run):
+            if '_deadline_started' in run:
                 if run.get('_model_started') is not None:
                     stage = 'model'
                 elif run.get('_explicit_phase'):
@@ -1598,11 +1605,7 @@ class Runtime(Maintenance):
                 if time.monotonic() - run['_deadline_started'] >= limits[stage + '_seconds']:
                     run.setdefault('_timed_out_stage', stage)
                     return True
-        row = self.store.one("SELECT t.state,p.paused,EXISTS(SELECT 1 FROM settings s "
-                             "WHERE s.key='run-stop:' || r.id) AS stop_requested "
-                             "FROM runs r JOIN tasks t ON r.task=t.id "
-                             "JOIN projects p ON p.id=r.project WHERE r.id=?", (run["id"],))
-        return self.stop.is_set() or not row or row["paused"] or row["stop_requested"] or row["state"] == "cancelled"
+        return False
 
     def active_strategies(self, project, config=None):
         # evidence 随首查一并取出，避免对每个 candidate 追加一条查询；输出保持原有字段。
@@ -1701,10 +1704,10 @@ class Runtime(Maintenance):
                      patch.decode("utf-8", "replace") + "\n```")
         # 与 is_cancelled 相同的相位推导：模型耗时计入进入时所处的阶段。
         # 推导出的阶段与记录值不一致时（例如刚 transition('evaluating')），
-        # 该阶段时钟从此刻起算，不继承旧阶段的已耗时间。相位推导与模型时钟
-        # 的写入同锁完成，避免并发 is_cancelled 在中间态重置外层时钟。
+        # 该阶段时钟从此刻起算，不继承旧阶段的已耗时间。
+        # 推导与四个字段的写入必须原子：取消轮询线程会并发重算同一时钟。
         self.store.phase(run["id"], role)
-        with _deadline_guard(run):
+        with _clock_lock(run):
             state = self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))
             outer_stage = (run.get('_explicit_phase') or
                            ('evaluation' if state and state['state'] == 'evaluating' else 'preparation'))
@@ -1731,26 +1734,22 @@ class Runtime(Maintenance):
                 self.store.put_setting(key, value)
             return result
         finally:
-            # 先恢复截止时钟、再摘除模型调用标记：并发 is_cancelled 无论
-            # 在 finally 的哪一步之后取到锁，看到的都是自洽状态
-            # （有 _model_started 即阶段为 model，否则阶段与起点已恢复），
-            # 不会把已耗用的阶段时间清零或漏判到期预算。
-            with _deadline_guard(run):
-                # 所有阶段统一恢复调用前的时钟：阶段预算是覆盖其全部工作的
-                # 墙钟上限，模型调用时长计入所处阶段而非退回。
-                stage = outer_stage if outer_stage in ('preparation', 'evaluation') else 'preparation'
-                run['_deadline_stage'] = stage
-                run['_deadline_started'] = outer_started if stage == outer_stage else time.monotonic()
+            with _clock_lock(run):
                 run.pop('_model_started', None)
                 run.pop('_outer_deadline_stage', None)
                 run.pop('_outer_deadline_started', None)
+                # 所有阶段统一恢复调用前的时钟：阶段预算是覆盖其全部工作的
+                # 墙钟上限，模型调用时长计入所处阶段而非退回。摘除模型标记与
+                # 重写阶段时钟同锁完成，轮询线程不会看到「无模型、旧阶段」的中间态。
+                stage = outer_stage if outer_stage in ('preparation', 'evaluation') else 'preparation'
+                run['_deadline_stage'] = stage
+                run['_deadline_started'] = outer_started if stage == outer_stage else time.monotonic()
             self.store.phase(run["id"], stage)
 
     def process(self, run):
         from .process import operation_cancellation
-        with _deadline_guard(run):
-            run['_deadline_started'] = time.monotonic()
-            run['_deadline_stage'] = 'preparation'
+        with _clock_lock(run):
+            run['_deadline_stage'], run['_deadline_started'] = 'preparation', time.monotonic()
         with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
             return self._process(run)
 

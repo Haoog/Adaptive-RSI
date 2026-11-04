@@ -266,48 +266,65 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertTrue(self.runtime.is_cancelled(run))
             self.assertEqual(run['_timed_out_stage'], 'preparation')
 
-    def test_concurrent_cancel_check_during_invoke_teardown_keeps_the_elapsed_clock(self):
-        """invoke 收尾期间并发读取不得在 pop 与重写之间把阶段时钟清零。
-
-        旧顺序先 pop('_model_started') 再重写 _deadline_*；此窗口内的
-        is_cancelled 会把 _deadline_started 重置为当前时刻并漏判已到期的
-        preparation 预算。用 Event 把一次真实并发读取卡进该窗口，断言它
-        观察到恢复后的时钟与超时结论。
-        """
-        from adaptive_rsi.process import Cancelled
+    def test_concurrent_cancel_poll_cannot_rewrite_the_stage_clock(self):
+        """invoke finally 与另一线程的 is_cancelled 交错后，时钟三元组仍等于顺序执行结果。"""
         _, claimed = self.claim()
-        paused, observed = threading.Event(), []
-        class PausingRun(dict):
+        in_finally, poller_inside, worker_done = threading.Event(), threading.Event(), threading.Event()
+        threads = {}
+
+        class InterleavingRun(dict):
+            """在摘除模型标记、轮询线程写阶段字段处插入确定性的交错点。"""
+
             def pop(self, key, *default):
                 value = super().pop(key, *default)
-                if key == '_model_started':
-                    paused.set()
-                    # 未加锁时让并发读真正进入窗口；加锁后它会在锁上等待。
-                    time.sleep(0.05)
+                if key == '_model_started' and threading.current_thread() is threads.get('worker'):
+                    # 真实竞态窗口：_model_started 已摘除、阶段时钟尚未重写的间隙。
+                    in_finally.set()
+                    poller_inside.wait(1.0)
                 return value
-        run = PausingRun(claimed)
-        clock = [10.0]
-        def probe():
-            if not paused.wait(5):
-                return
-            observed.append((self.runtime.is_cancelled(run),
-                             run.get('_deadline_stage'), run.get('_deadline_started')))
-        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]):
+
+            def __setitem__(self, key, value):
+                if key == '_deadline_stage' and threading.current_thread() is threads.get('poller'):
+                    # 让轮询线程的旧时钟写落在 worker 恢复时钟之后。
+                    poller_inside.set()
+                    worker_done.wait(5)
+                super().__setitem__(key, value)
+
+        run = InterleavingRun(claimed)
+        clock = [100.0]
+        observed = {}
+
+        def model(*args, **kwargs):
+            clock[0] += 10
+            return {}
+
+        def invoke():
+            try:
+                self.runtime.invoke('planning', 'work', self.root, run)
+            finally:
+                worker_done.set()
+
+        def poll():
+            observed['cancelled'] = self.runtime.is_cancelled(run)
+
+        with patch('adaptive_rsi.runtime.time.monotonic', side_effect=lambda: clock[0]), \
+             patch.object(self.runtime.agent, 'invoke', side_effect=model):
             self.runtime.begin_phase(run, 'preparation')
-            clock[0] = 1000.0
-            helper = threading.Thread(target=probe, daemon=True)
-            helper.start()
-            with patch.object(self.runtime.agent, 'invoke', return_value={}):
-                with self.assertRaises(Cancelled):
-                    self.runtime.invoke('planning', 'work', self.root, run)
-            helper.join(5)
-        self.assertFalse(helper.is_alive())
-        self.assertEqual(observed, [(True, 'preparation', 10.0)])
+            started = run['_deadline_started']
+            threads['worker'] = threading.Thread(target=invoke)
+            threads['poller'] = threading.Thread(target=poll)
+            threads['worker'].start()
+            self.assertTrue(in_finally.wait(5), 'worker never reached the clock rewrite')
+            threads['poller'].start()
+            threads['worker'].join(5)
+            threads['poller'].join(5)
+        self.assertFalse(threads['worker'].is_alive())
+        self.assertFalse(threads['poller'].is_alive())
+        self.assertFalse(observed['cancelled'])
+        # 与单线程 invoke 结束后的状态一致：恢复调用前阶段与起点，不产生超时标记。
         self.assertEqual(run['_deadline_stage'], 'preparation')
-        self.assertEqual(run['_deadline_started'], 10.0)
-        self.assertEqual(run['_timed_out_stage'], 'preparation')
-        self.assertNotIn('_model_started', run)
-        self.assertNotIn('_outer_deadline_stage', run)
+        self.assertEqual(run['_deadline_started'], started)
+        self.assertNotIn('_timed_out_stage', run)
 
     def experiment_inputs(self):
         """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
