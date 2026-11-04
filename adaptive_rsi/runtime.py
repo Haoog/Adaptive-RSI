@@ -1611,11 +1611,17 @@ class Runtime(Maintenance):
     def propagate_deadline(parent, trial):
         if trial.get('_timed_out_stage'):
             # 父 run 的时钟字段由自己的锁保护；trial 的结论只是单键快照读取。
+            # 首个超时判定者胜：前一个 trial 已上报的阶段不得被后一个 trial 改写，
+            # 与 _deadline_expired 的 setdefault 保持同一契约。
             with _clock_lock(parent):
-                parent['_timed_out_stage'] = trial['_timed_out_stage']
+                parent.setdefault('_timed_out_stage', trial['_timed_out_stage'])
 
     def is_cancelled(self, run):
         if self.stop.is_set():
+            return True
+        # 已记录的超时结论是终态：trial 经 propagate_deadline 上报后，父 run 即使
+        # 时钟被重置或仍在预算内也不得继续派发后续 trial。
+        if run.get('_timed_out_stage'):
             return True
         if self._deadline_expired(run):
             return True
