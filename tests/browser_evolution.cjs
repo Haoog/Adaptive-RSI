@@ -51,7 +51,8 @@ async function checkEvolution(browser, url, errors) {
     const exported=JSON.parse(Buffer.concat(chunks).toString());
     assert.equal(exported.comparison.cost_state,'unknown_usage');
     assert.equal(exported.comparison.token_ratio,null);
-    assert.equal(exported.evidence.dataset.manifest[0].tree,'fixture-tree');
+    assert.equal(exported.evidence.dataset.manifest[0].case, 'browser-holdout-0');
+    assert.match(exported.evidence.dataset.manifest[0].tree, /^[0-9a-f]{40,64}$/);
     assert.equal(exported.evidence.preregistered_plan.data.metric,'fixture_only');
 
     // ---------- 3) 曝光耗尽原因给出可操作中文说明，不再直出英文 ----------
