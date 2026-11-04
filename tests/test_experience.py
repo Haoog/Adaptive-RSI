@@ -140,7 +140,13 @@ class RelatedWorkTest(unittest.TestCase):
             store.execute("UPDATE runs SET result=? WHERE id='run'", (encode(outcome),))
             self.assertEqual(records(store, "first", group="attention")["tasks"][0]["display_state"], "release_failed")
             self.assertEqual(records(store, "first", group="history")["tasks"], [])
+            outcome["automation"]["release"]["state"] = "reconciliation_blocked"
+            store.execute("UPDATE runs SET result=? WHERE id='run'", (encode(outcome),))
+            self.assertEqual(records(store, "first", group="attention")["tasks"][0]["display_state"], "release_failed")
             outcome["automation"]["release"]["state"] = "workflow_succeeded"
+            outcome["automation"]["deploy"] = {"state": "reconciliation_blocked"}
+            store.execute("UPDATE runs SET result=? WHERE id='run'", (encode(outcome),))
+            self.assertEqual(records(store, "first", group="attention")["tasks"][0]["display_state"], "deploy_failed")
             for state in ["waiting_target", "waiting_verification", "waiting_release"]:
                 with self.subTest(state=state):
                     outcome["automation"]["deploy"] = {"state": state}
