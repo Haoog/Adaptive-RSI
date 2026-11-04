@@ -195,6 +195,30 @@ class RuntimeHandoffTest(unittest.TestCase):
         failure = json.loads(row['result'])['failure']
         self.assertEqual((failure['code'], failure['stage']), ('deadline', 'evaluation'))
 
+    def test_later_trial_cannot_rewrite_the_first_propagated_timeout(self):
+        """两个 trial 先后上报超时：父 run 保留首个结论，不被后一个 trial 改写。"""
+        _, parent = self.claim()
+        first = self.runtime.new_trial_context(parent)
+        first['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, first)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+        second = self.runtime.new_trial_context(parent)
+        second['_timed_out_stage'] = 'preparation'
+        self.runtime.propagate_deadline(parent, second)
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+
+    def test_recorded_timeout_stops_variant_dispatch_on_a_fresh_clock(self):
+        """变体循环的取消守卫读 is_cancelled；已有超时结论时不得因时钟重置而继续派发试验。"""
+        _, parent = self.claim()
+        trial = self.runtime.new_trial_context(parent)
+        trial['_timed_out_stage'] = 'evaluation'
+        self.runtime.propagate_deadline(parent, trial)
+        # 父 run 重新切相，时钟是新的、预算充足：结论本身必须让取消判定成立，
+        # 否则 evolution 的下一个 case/repetition/variant 会照常开跑并消耗模型预算。
+        self.runtime.begin_phase(parent, 'preparation')
+        self.assertTrue(self.runtime.is_cancelled(parent))
+        self.assertEqual(parent['_timed_out_stage'], 'evaluation')
+
     def test_evaluation_deadline_remains_active_during_model_call(self):
         _, run = self.claim()
         clock = [10.0]
