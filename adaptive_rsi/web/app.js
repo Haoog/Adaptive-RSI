@@ -1494,10 +1494,10 @@ $('language-select').addEventListener('change',()=>safe(async()=>{
  window.RSINativeUpdate?.render?.();
  if($('detail-dialog').open&&detailTask)await showTask(detailTask);
 }));
+// 回到页面只由重新可见补一次刷新：可见窗口重复获得焦点不再额外全量拉取 state，常规轮询已覆盖。
 typeof document.addEventListener==='function'&&document.addEventListener('visibilitychange',()=>{
  if(document.visibilityState==='visible'&&state)safe(refresh);
  else scheduleRefreshPoll();
 });
-typeof window.addEventListener==='function'&&window.addEventListener('focus',()=>{if(state)safe(refresh);});
 
 document.addEventListener('DOMContentLoaded',()=>{fetchSysMetrics();sysHudTimer=setInterval(fetchSysMetrics,30000);});
