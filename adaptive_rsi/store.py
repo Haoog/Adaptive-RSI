@@ -1094,15 +1094,20 @@ class Store:
                     except (ValueError, TypeError) as exc:
                         reason = str(exc)[:300] or "Invalid task evidence"
                         self._block_candidate(db, project, candidate["id"],
-                                              "Task was blocked because its evidence is invalid: ", reason)
+                                              "Task was blocked because its evidence is invalid: ", reason,
+                                              candidate["evidence"], candidate["overrides"])
                         continue
                     source_key = {"system_light": "inspection", "system_issues": "issues"}.get(candidate["source"])
                     if (source_key and not config.get("sources", {}).get(source_key, True) and
                             any(isinstance(item, dict) and item.get("scan_trigger") == "automatic"
                                 for item in evidence)):
+                        # 快照与写锁之间 evidence 可能已被改写（request 会把排队任务的
+                        # 自动触发升级为 manual，见 runtime.request）：条件写要求作废
+                        # 依据在写锁下仍是扫描时那一份，未命中就交还重扫凭新快照重判。
                         db.execute("BEGIN IMMEDIATE")
-                        db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=? AND state='queued'",
-                                   (time.time(), candidate["id"]))
+                        db.execute("UPDATE tasks SET state='obsolete',updated=? WHERE id=? AND state='queued' "
+                                   "AND evidence IS ?",
+                                   (time.time(), candidate["id"], candidate["evidence"]))
                         db.commit()
                         continue
                     try:
@@ -1118,7 +1123,8 @@ class Store:
                         task = candidate
                         break
                     self._block_candidate(db, project, candidate["id"],
-                                          "Task was blocked because its configuration overrides are invalid: ", reason)
+                                          "Task was blocked because its configuration overrides are invalid: ",
+                                          reason, candidate["evidence"], candidate["overrides"])
                     continue
                 if task is None:
                     break
@@ -1169,12 +1175,17 @@ class Store:
             return None
         return self.one("SELECT * FROM runs WHERE id=?", (run,))
 
-    def _block_candidate(self, db, project, task, message, reason):
-        """一条坏任务一个短写事务：条件 UPDATE 命中才补事件，保证不整段持锁。"""
+    def _block_candidate(self, db, project, task, message, reason, evidence, overrides):
+        """一条坏任务一个短写事务：条件 UPDATE 命中才补事件，保证不整段持锁。
+
+        evidence/overrides 回传扫描快照的原始值：拉黑依据来自快照，条件写要求
+        决策字段在写锁下仍与扫描时一致；并发改写（如 request 升级 evidence）会
+        让 UPDATE 未命中，外层重扫后按新值重新判定，不会误拉黑改写后的任务。"""
         now = time.time()
         db.execute("BEGIN IMMEDIATE")
-        changed = db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued'",
-                             (now, task))
+        changed = db.execute("UPDATE tasks SET state='blocked',updated=? WHERE id=? AND state='queued' "
+                             "AND evidence IS ? AND overrides IS ?",
+                             (now, task, evidence, overrides))
         if changed.rowcount:
             db.execute("INSERT INTO events(project,run,kind,message,data,created) VALUES (?,?,?,?,?,?)",
                        (project, None, "task_configuration_error", message + reason,

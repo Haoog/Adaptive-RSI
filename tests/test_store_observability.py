@@ -333,6 +333,59 @@ class StoreObservabilityTest(unittest.TestCase):
         # 间隙写入应微秒级穿透；阈值只排除「仍被整段写锁挡住」的回归，留足调度余量。
         self.assertLess(max(writes), 5.0)
 
+    def test_claim_rechecks_evidence_before_marking_automatic_task_obsolete(self):
+        """扫描读出自动触发 evidence 后、作废短事务开始前，request 把同一任务升级
+        为 manual（runtime.request 对排队任务重写 evidence）：作废必须按写锁下的
+        新 evidence 重判，不能把已升级的用户请求连同旧快照一起丢掉。"""
+        from adaptive_rsi.config import validate
+        from adaptive_rsi.store import encode
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',0,0)")
+        task = self.store.add_task('p', 'system_issues', 'system:issues', 'fixture',
+                                   evidence=[{"scan_trigger": "automatic"}])
+        row0 = self.store.one("SELECT evidence FROM tasks WHERE id=?", (task,))
+        assert row0 is not None
+        self.assertEqual(row0["evidence"], encode([{"scan_trigger": "automatic"}]))
+        claimed = []
+        claim = threading.Thread(target=lambda: claimed.append(
+            self.store.claim('p', validate({"sources": {"issues": False}}))))
+        upgraded = [False]
+        original = Store.connect
+        real_store = self.store
+
+        @contextlib.contextmanager
+        def instrumented(store):
+            with original(store) as db:
+                class Probe:
+                    def __getattr__(self, name):
+                        return getattr(db, name)
+
+                    def execute(self, sql, parameters=()):
+                        if (threading.current_thread() is claim and not upgraded[0]
+                                and sql.startswith("BEGIN IMMEDIATE")):
+                            # 等价于 runtime.request(automatic=False) 在快照与
+                            # 写锁之间落库的那笔 evidence 升级。
+                            real_store.execute(
+                                "UPDATE tasks SET evidence=? WHERE id=?",
+                                (encode([{"scan_trigger": "manual"}]), task))
+                            upgraded[0] = True
+                        return db.execute(sql, parameters)
+
+                yield Probe()
+
+        with patch.object(Store, 'connect', instrumented):
+            claim.start()
+            claim.join(10)
+        self.assertFalse(claim.is_alive())
+        self.assertTrue(upgraded[0])
+        row = self.store.one("SELECT state,evidence FROM tasks WHERE id=?", (task,))
+        assert row is not None
+        self.assertNotEqual(row["state"], "obsolete")
+        self.assertEqual(row["evidence"], encode([{"scan_trigger": "manual"}]))
+        self.assertEqual(len(claimed), 1)
+        run = claimed[0]
+        self.assertIsNotNone(run)
+        self.assertEqual(run["task"], task)
+
     def test_light_metrics_do_not_scan_large_history_but_explicit_integrity_finds_orphans(self):
         self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
         task = self.store.add_task('p','goal','valid','valid')
