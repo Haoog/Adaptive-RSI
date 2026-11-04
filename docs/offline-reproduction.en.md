@@ -33,7 +33,7 @@ Sealed bundles adhere to deterministic input and credential exclusion principles
 
 ### Stage 3: Host tools and execution dependencies
 
-- [ ] **3.1 Check VCS tooling**: Verify `git` is available on the isolated host to operate on case repository snapshots.
+- [ ] **3.1 Check VCS tooling**: VCS requirements are derived from the registered case check commands. Bundles contain no `.git`; the host only needs `git` when a check's `argv[0]` is `git`. When no check invokes git, a missing git is recorded as informational and does not block the reproducibility verdict or `--run-checks` execution.
 - [ ] **3.2 Itemize check dependencies**: Scan commands in `cases/*/case.json` checks registered in the `bundle.json` manifest and verify all required binaries (such as `python3`, `node`, `pytest`, `cargo`); unmanifested case directories are never read or executed and invalidate integrity verification.
 - [ ] **3.3 Enumerate missing tools**: The reproduction script enumerates every missing dependency without aborting at the first failure, allowing comprehensive batch provisioning.
 

@@ -843,12 +843,13 @@ class Evolution:
         available_tools = []
         missing_tools = []
 
-        # 1. VCS dependency (git)
+        # 1. VCS dependency (git) is derived from registered checks, not assumed.
+        # bundle 明确不含 .git（sealed_tree 导出时整棵删除，残留即判篡改），复现只按
+        # case.json 的 checks 执行，不需要 VCS 元数据。只有某个登记检查的 argv[0] 为
+        # git 时才把宿主 git 计入必需项；未被引用时只记录可用性，缺失既不参与
+        # reproducible 判定，也不阻止 --run-checks 执行其它可运行的检查。
         git_found = lookup("git", path=path_env) if path_env else lookup("git")
-        if git_found:
-            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found)})
-        else:
-            missing_tools.append({"name": "git", "type": "vcs", "reason": "git executable not found in PATH"})
+        git_referenced = False
 
         # 2. Inspect case check dependencies across verified manifest entries only.
         # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
@@ -901,6 +902,8 @@ class Evolution:
                 if not argv or not isinstance(argv, list):
                     continue
                 cmd = argv[0]
+                if cmd == "git":
+                    git_referenced = True
                 check_name = check.get("name", "check")
                 if cmd not in seen_tools:
                     found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
@@ -919,6 +922,14 @@ class Evolution:
                         info["cases"].append(case_id)
                     if check_name not in info["checks"]:
                         info["checks"].append(check_name)
+
+        # git 未被任何登记检查引用：可用时仍作为环境信息列出（required=False），
+        # 缺失时只记录说明，不进 missing、不参与 reproducible。
+        git_optional_missing = (bool(integrity.get("valid")) and not git_referenced
+                                and not git_found)
+        if not git_referenced and git_found:
+            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found),
+                                    "required": False})
 
         for status, info in seen_tools.values():
             if status == "available":
@@ -963,6 +974,11 @@ class Evolution:
             repro_limitations.append(credential_limitation)
         if missing_creds:
             msg = f"Missing credentials: {', '.join(c['name'] for c in missing_creds)} not configured; online model generation cannot be reproduced without external provider access"
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
+        if git_optional_missing:
+            msg = ("git executable not found in PATH; no registered check invokes git, "
+                   "so it is not required for this bundle")
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
         if missing_tools:

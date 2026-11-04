@@ -1640,6 +1640,46 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('Missing host tools', limitations_text)
         self.assertIn('Isolated offline environment', limitations_text)
 
+    def test_bundle_checks_run_without_host_git_when_checks_do_not_use_it(self):
+        """bundle 不含 .git；检查只用 python3 时，宿主缺 git 不得把结论变成不可复现。"""
+        import sys
+        destination = self.sealed_bundle(repo_name='repo-no-git')
+        bindir = self.root / 'python-only-bin'
+        bindir.mkdir()
+        (bindir / 'python3').symlink_to(sys.executable)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': str(bindir)}, run_checks=True)
+
+        self.assertTrue(result['integrity']['valid'])
+        self.assertNotIn('git', [item['name'] for item in result['dependencies']['missing']])
+        self.assertEqual([row['check'] for row in result['executed_checks']], ['unit_check'])
+        self.assertTrue(result['executed_checks'][0]['passed'])
+        self.assertTrue(result['reproducible'])
+        # 缺 git 只作为说明记录，不构成阻断项。
+        self.assertTrue(any('git executable not found' in item for item in result['limitations']))
+        self.assertFalse(any('Missing host tools' in item for item in result['limitations']))
+
+    def test_bundle_check_that_invokes_git_reports_missing_tool(self):
+        """检查命令 argv[0] 为 git 且宿主无 git：报缺失并拒绝执行，不得静默跳过。"""
+        import sys
+        checks = [{'name': 'vcs_check', 'cwd': '.', 'argv': ['git', '--version']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-needs-git')
+        bindir = self.root / 'python-only-bin-vcs'
+        bindir.mkdir()
+        (bindir / 'python3').symlink_to(sys.executable)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': str(bindir)}, run_checks=True)
+
+        self.assertTrue(result['integrity']['valid'])
+        missing = {item['name']: item for item in result['dependencies']['missing']}
+        self.assertIn('git', missing)
+        self.assertEqual(missing['git']['cases'], ['case-needs-git'])
+        self.assertIn('vcs_check', missing['git']['checks'])
+        self.assertEqual(result['executed_checks'], [])
+        self.assertFalse(result['reproducible'])
+
     def test_bundle_offline_reproduction_detects_tampered_bundle(self):
         self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
                         'providers': []})
