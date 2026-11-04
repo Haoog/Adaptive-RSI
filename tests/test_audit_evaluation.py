@@ -568,6 +568,32 @@ class AuditEvaluationTest(unittest.TestCase):
             self.assertEqual({(row['argv'][-1], row['passed']) for row in rows},
                              {('print(1)', True), ('print(2)', False)})
 
+    def test_candidate_full_keeps_detected_subdir_check(self):
+        from adaptive_rsi.config import DEFAULTS, merge
+        from adaptive_rsi.store import Store
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            (source / 'app.py').write_text('VALUE = 1\n')
+            configured = [{'name': 'root', 'argv': ['python3', '-c', 'print(1)'], 'timeout_seconds': 1}]
+            detected = [{'name': 'sub', 'argv': ['python3', '-c', 'print(2)'], 'timeout_seconds': 2,
+                         'cwd': 'sub'}]
+            def execute(_sandbox, check, workspace, *args, **kwargs):
+                # 真实 Sandbox._check 的行只回填 name/argv，cwd 仍由 spec 决定。
+                return {'name': check['name'], 'argv': check['argv'],
+                        'exit_code': 1 if check.get('cwd', '.') == 'sub' else 0,
+                        'stdout': '', 'stderr': '', 'error': None}
+            with patch('adaptive_rsi.evaluator.detect', return_value={'checks': detected}), patch(
+                    'adaptive_rsi.evaluator.Sandbox.check', autospec=True, side_effect=execute):
+                result = evaluator.Evaluator(Store(root / 'state')).evaluate(
+                    source, source, configured, root / 'evaluation', merge(DEFAULTS, {}), changed_files=[])
+            rows = result['checks']['candidate_full']
+            self.assertEqual(result['decision'], 'fail')
+            self.assertEqual([(row['name'], row['cwd'], row['passed']) for row in rows],
+                             [('root', '.', True), ('sub', 'sub', False)])
+
     def test_exact_host_tool_versions_are_recorded_without_cache_authorization(self):
         from unittest.mock import patch
         tools = evaluator.host_tool_versions([{'argv': ['python3', '-m', 'unittest']}])
