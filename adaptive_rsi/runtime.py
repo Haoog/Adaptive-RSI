@@ -59,6 +59,13 @@ MAINTENANCE_JOIN_TIMEOUT = 30
 # scheduler_timed_out 后继续关闭（线程为 daemon）。
 SCHEDULER_JOIN_TIMEOUT = 30
 
+# close() 等待 worker 线程池排空的上限：worker 可能卡在不再轮询 is_cancelled 的
+# 阻塞调用里（模型 HTTP 读、内核/NFS I/O、第三方 CLI 死锁），无上界的
+# shutdown(wait=True) 会让 close 永远停在 phase='workers'，桌面排水等待不到返回。
+# 超时记 workers_timed_out 并留下 run 证据后继续关闭数据层；未收尾的 run 由下次
+# store.recover() 恢复，与维护线程放弃卡死 join 的取舍一致。
+WORKER_DRAIN_TIMEOUT = 30
+
 # 这些状态的任务仍代表一条「在办」的发现；巡检不会为同一问题重建任务。
 LIVE_FINDING_STATES = ("queued", "planning", "executing", "evaluating", "awaiting_approval",
                        "pr_open", "merged", "deferred", "waiting_budget")
@@ -125,7 +132,8 @@ class Runtime(Maintenance):
         self.agent = agent or CodexAgent(store)
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
-                          "scheduler_timed_out": False, "maintenance_timed_out": False}
+                          "scheduler_timed_out": False, "workers_timed_out": False,
+                          "maintenance_timed_out": False}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -916,6 +924,7 @@ class Runtime(Maintenance):
     def shutdown_status(self):
         return {**self._shutdown, 'remaining_workers': sum(not f.done() for f in tuple(self.futures)),
                 'remaining_operations': len(self.operations.active),
+                'operations_timed_out': sorted(self.operations.timed_out),
                 'maintenance_running': bool(self.maintenance_thread and self.maintenance_thread.is_alive())}
 
     def close(self):
@@ -956,14 +965,31 @@ class Runtime(Maintenance):
                     SCHEDULER_JOIN_TIMEOUT)
                 self._shutdown['scheduler_timed_out'] = True
         self._shutdown['phase'] = 'workers'
+        self._shutdown['workers_timed_out'] = False
+        unfinished = []
         try:
             try:
-                self.pool.shutdown(wait=True, cancel_futures=True)
+                # 只停止接收新工作：排空由 _drain_workers 的有界等待负责。
+                self.pool.shutdown(wait=False, cancel_futures=True)
             except TypeError:
-                self.pool.shutdown(wait=True)
+                self.pool.shutdown(wait=False)
+            unfinished = self._drain_workers()
         finally:
             # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
             self._reconcile_unstarted_workers()
+        if unfinished:
+            self._shutdown['workers_timed_out'] = True
+            logging.getLogger(__name__).warning(
+                "Workers did not stop within %ss; abandoning %d run(s): %s",
+                WORKER_DRAIN_TIMEOUT, len(unfinished), ", ".join(unfinished))
+            for run in unfinished:
+                try:
+                    self.store.event("shutdown_workers_timed_out",
+                                     "Worker ignored shutdown and was abandoned after the drain bound",
+                                     run=run, data={"timeout": WORKER_DRAIN_TIMEOUT})
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Failed to record worker shutdown timeout for %s", run)
         self._shutdown['phase'] = 'maintenance'
         self._shutdown['maintenance_timed_out'] = False
         if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
@@ -980,6 +1006,25 @@ class Runtime(Maintenance):
         self.store.close()
         if self.lockfile:
             self.lockfile.close()
+
+    def _drain_workers(self):
+        """Wait up to WORKER_DRAIN_TIMEOUT for submitted workers; return unfinished run ids.
+
+        ``shutdown(wait=False)`` only stops new submissions. A worker stuck in a
+        blocking call that never polls ``is_cancelled`` would keep the pool's join
+        (and the whole shutdown) open forever, so the bounded wait here is the only
+        upper bound. Futures added straight to ``self.futures`` by other callers are
+        awaited too, so they cannot bypass the drain.
+        """
+        with self._futures_lock:
+            # run id 优先于「未登记」占位，否则同一 future 的 id 会被覆盖掉。
+            tracked = {future: None for future in self.futures}
+            tracked.update(self._future_runs)
+        pending = {future: run for future, run in tracked.items() if not future.done()}
+        if not pending:
+            return []
+        concurrent.futures.wait(tuple(pending), timeout=WORKER_DRAIN_TIMEOUT)
+        return sorted({run for future, run in pending.items() if run and not future.done()})
 
     def _reconcile_unstarted_workers(self):
         """Persist an interrupted run for each claimed worker cancelled before it started.

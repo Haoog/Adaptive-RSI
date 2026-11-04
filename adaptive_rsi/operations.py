@@ -12,12 +12,20 @@ from pathlib import Path
 from .store import uid
 
 
+# close() 等待后台操作排空的上限：备份、恢复演练和模型探针可能卡在内核/NFS I/O
+# 或外部 CLI 上，无上界的 shutdown(wait=True) 会让 close 永远停在 operations 阶段，
+# 也拖住后续 worker/维护线程/数据层的收尾。超时记下 operation id 后放行。
+OPERATION_DRAIN_TIMEOUT = 30
+
+
 class Operations:
     def __init__(self, runtime):
         self.runtime, self.store = runtime, runtime.store
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="rsi-operation")
         self.lock = threading.RLock()
         self.active = {}
+        self.futures = {}
+        self.timed_out = set()
         self.progress = {}
         self.inflight = {}
         self.store.execute("CREATE TABLE IF NOT EXISTS operations "
@@ -82,9 +90,17 @@ class Operations:
 
     @staticmethod
     def _observe(future):
+        if future.cancelled():
+            return
         error = future.exception()
         if error is not None:
             logging.getLogger(__name__).error("Background worker failed outside its result handler (%s)", type(error).__name__)
+
+    def _retire(self, future):
+        """Done callback: stop tracking the future, then report an unhandled failure."""
+        with self.lock:
+            self.futures.pop(future, None)
+        self._observe(future)
 
     def busy(self):
         with self.lock:
@@ -128,7 +144,9 @@ class Operations:
                                (operation, kind, "queued", time.time()))
             self.active[operation] = stop
             try:
-                self.pool.submit(self._run, operation, kind, parameters, stop).add_done_callback(self._observe)
+                future = self.pool.submit(self._run, operation, kind, parameters, stop)
+                self.futures[future] = operation
+                future.add_done_callback(self._retire)
             except BaseException:
                 self.active.pop(operation)
                 self.store.execute("UPDATE operations SET state='interrupted',ended=? WHERE id=?", (time.time(), operation))
@@ -241,4 +259,16 @@ class Operations:
         with self.lock:
             for stop in self.active.values():
                 stop.set()
-        self.pool.shutdown(wait=True)
+            pending = list(self.futures.items())
+        # wait=False 只停止接收新操作，排队中的操作仍会执行；排空交给下面有上界的
+        # wait，卡死的操作不能把 close 永远停在 operations 阶段。
+        self.pool.shutdown(wait=False)
+        if pending:
+            concurrent.futures.wait([future for future, _ in pending], timeout=OPERATION_DRAIN_TIMEOUT)
+        with self.lock:
+            stuck = {operation for future, operation in pending if not future.done()} - self.timed_out
+            self.timed_out |= stuck
+        for operation in sorted(stuck):
+            logging.getLogger(__name__).warning(
+                "Background operation %s did not stop within %ss and was abandoned",
+                operation, OPERATION_DRAIN_TIMEOUT)

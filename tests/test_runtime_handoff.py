@@ -73,11 +73,8 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertIsNotNone(run)
             closer = threading.Thread(target=self.runtime.close)
             closer.start()
-            limit = time.monotonic() + 2
-            while self.runtime.shutdown_status()['phase'] != 'workers' and time.monotonic() < limit:
-                time.sleep(.01)
-            self.assertEqual(self.runtime.shutdown_status()['phase'], 'workers')
-            gate.set()
+            # worker 排空有上界且只等待登记的 run：未登记的池内阻塞任务不再让 close
+            # 停在 workers 阶段，等关闭完成即可确认排队中的领取已被取消。
             closer.join(5)
             self.assertFalse(closer.is_alive())
             saved = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
@@ -100,10 +97,8 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.runtime.cancel_task(task)
             closer = threading.Thread(target=self.runtime.close)
             closer.start()
-            limit = time.monotonic() + 2
-            while self.runtime.shutdown_status()['phase'] != 'workers' and time.monotonic() < limit:
-                time.sleep(.01)
-            gate.set()
+            # worker 排空有上界且只等待登记的 run：未登记的池内阻塞任务不再让 close
+            # 停在 workers 阶段，等关闭完成即可确认排队中的领取已被取消。
             closer.join(5)
             self.assertFalse(closer.is_alive())
             self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'cancelled')
@@ -123,14 +118,97 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.runtime.pause(self.project, True)
             closer = threading.Thread(target=self.runtime.close)
             closer.start()
-            limit = time.monotonic() + 2
-            while self.runtime.shutdown_status()['phase'] != 'workers' and time.monotonic() < limit:
-                time.sleep(.01)
-            gate.set()
+            # worker 排空有上界且只等待登记的 run：未登记的池内阻塞任务不再让 close
+            # 停在 workers 阶段，等关闭完成即可确认排队中的领取已被取消。
             closer.join(5)
             self.assertFalse(closer.is_alive())
             self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'interrupted')
             self.assertEqual(self.store.one('SELECT state FROM tasks WHERE id=?', (task,))['state'], 'interrupted')
+        finally:
+            gate.set()
+
+    def test_shutdown_bounds_non_cancellable_worker(self):
+        # worker 卡在不再轮询 stop 的阻塞调用里时，close() 必须在 WORKER_DRAIN_TIMEOUT
+        # 后放行：记录 workers_timed_out 与带 run id 的事件，再继续关闭数据层。
+        gate, began = threading.Event(), threading.Event()
+
+        def stuck(run):
+            began.set()
+            gate.wait(30)
+
+        self.runtime.pause(self.project, False)
+        task = self.runtime.goal(self.project, 'Worker that ignores shutdown')
+        with patch.object(self.runtime, 'process', stuck):
+            self.runtime.dispatch([(self.runtime.project(self.project), self.runtime.config(self.project))])
+        self.assertTrue(began.wait(5))
+        run = self.store.one('SELECT * FROM runs WHERE task=?', (task,))
+        self.assertIsNotNone(run)
+        try:
+            with patch('adaptive_rsi.runtime.WORKER_DRAIN_TIMEOUT', .2):
+                started = time.monotonic()
+                self.runtime.close()
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1)
+            status = self.runtime.shutdown_status()
+            self.assertEqual(status['phase'], 'completed')
+            self.assertTrue(status['workers_timed_out'])
+            events = self.store.query("SELECT run,data FROM events WHERE kind='shutdown_workers_timed_out'")
+            self.assertEqual([event['run'] for event in events], [run['id']])
+        finally:
+            gate.set()
+
+    def test_shutdown_within_bound_keeps_order_and_records_no_timeout(self):
+        # 正常 worker 在排空上界内结束：不记超时、不写超时事件，关闭阶段顺序不变。
+        gate, began = threading.Event(), threading.Event()
+
+        def quick(run):
+            began.set()
+            gate.wait(5)
+
+        self.runtime.pause(self.project, False)
+        self.runtime.goal(self.project, 'Worker that stops before the drain bound')
+        with patch.object(self.runtime, 'process', quick):
+            self.runtime.dispatch([(self.runtime.project(self.project), self.runtime.config(self.project))])
+        self.assertTrue(began.wait(5))
+        observed = []
+
+        def record(call):
+            def wrapper(*args, **kwargs):
+                observed.append(self.runtime._shutdown['phase'])
+                return call(*args, **kwargs)
+            return wrapper
+
+        drain = self.runtime._drain_workers
+        closer = threading.Thread(target=self.runtime.close)
+        with patch.object(self.runtime.auth_sessions, 'close', record(self.runtime.auth_sessions.close)), \
+                patch.object(self.runtime.operations, 'close', record(self.runtime.operations.close)), \
+                patch.object(self.runtime, '_drain_workers', record(drain)), \
+                patch.object(self.store, 'close', record(self.store.close)):
+            closer.start()
+            gate.set()
+            closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(observed, ['authentication', 'operations', 'workers', 'storage'])
+        status = self.runtime.shutdown_status()
+        self.assertEqual(status['phase'], 'completed')
+        self.assertFalse(status['workers_timed_out'])
+        self.assertEqual(
+            self.store.one("SELECT count(*) AS n FROM events WHERE kind='shutdown_workers_timed_out'")['n'], 0)
+
+    def test_operations_close_bounds_a_stuck_operation(self):
+        # 后台操作卡在不再检查 stop 的阻塞调用里时，operations.close 同样必须有上界，
+        # 否则 runtime.close 永远走不到 worker/维护线程/数据层的收尾。
+        gate = threading.Event()
+        future = self.runtime.operations.pool.submit(gate.wait, 30)
+        self.runtime.operations.futures[future] = 'stuck-operation'
+        self.runtime.operations.active['stuck-operation'] = threading.Event()
+        try:
+            with patch('adaptive_rsi.operations.OPERATION_DRAIN_TIMEOUT', .2):
+                started = time.monotonic()
+                self.runtime.operations.close()
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1)
+            self.assertEqual(self.runtime.operations.timed_out, {'stuck-operation'})
         finally:
             gate.set()
 
