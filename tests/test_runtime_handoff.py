@@ -18,6 +18,23 @@ from adaptive_rsi.store import Store, encode
 from tests.test_runtime import FakeAgent, fixture
 
 
+class SlowHighRisk(FakeAgent):
+    """高风险计划 + 慢实现：风险触发并发验收基线，实现耗时用于验证阶段记账。
+
+    实现阶段睡 3 秒，大于用例里 2 秒的评估预算；若实现耗时被记进
+    evaluation_seconds，评估尚未开始就会超时。生产路径与试验路径共用同一份
+    实现，用来证明差异只出在阶段记账，而不是放宽评估预算。
+    """
+
+    def invoke(self, role, prompt, workspace, *args, **kwargs):
+        result = super().invoke(role, prompt, workspace, *args, **kwargs)
+        if role == 'planning' and isinstance(result, dict):
+            return {**result, 'risk': 'high'}
+        if role == 'implementation':
+            time.sleep(3)
+        return result
+
+
 class RuntimeHandoffTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -553,8 +570,8 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.one('SELECT state FROM runs WHERE id=?', (run['id'],))['state'], 'planning')
         self.assertEqual(observed, {'phase': 'evaluation', 'cancelled': False, 'timed_out_stage': None})
 
-    def test_experiment_acceptance_baseline_runs_on_the_evaluation_clock(self):
-        """后台验收基线线程在提交前就必须处于评估相位，不能继承 preparation 预算。"""
+    def test_experiment_acceptance_baseline_runs_on_the_preparation_clock(self):
+        """并发验收基线与生产路径一致，计入 preparation，不在实现前提前切评估相位。"""
         from adaptive_rsi import pipeline
         class HighRisk(FakeAgent):
             def invoke(self, role, prompt, workspace, *args, **kwargs):
@@ -576,7 +593,78 @@ class RuntimeHandoffTest(unittest.TestCase):
                 self.runtime, trial, project, task, project['path'], base, directory, workspace,
                 self.runtime.active_strategies(self.project, config), experiment=True)
         self.assertEqual(outcome['decision'], 'pass')
-        self.assertEqual(observed, {'phase': 'evaluation'})
+        self.assertEqual(observed, {'phase': 'preparation'})
+
+    def test_experiment_implementation_time_is_not_charged_to_evaluation_budget(self):
+        """实现耗时计入 preparation：同一份慢实现不会被 2 秒评估预算误判为评估超时。"""
+        from adaptive_rsi import pipeline
+        self.runtime.configure({'deadlines': {'preparation_seconds': 1000, 'evaluation_seconds': 2,
+                                              'model_seconds': 60}}, self.project)
+        self.runtime.agent = SlowHighRisk()
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        observed = {}
+        def evaluate(_baseline, _candidate, _checks, _target, _config, _cancel, **kwargs):
+            observed.update({'phase': trial.get('_explicit_phase'),
+                             'cancelled': self.runtime.is_cancelled(trial),
+                             'timed_out_stage': trial.get('_timed_out_stage')})
+            return {'decision': 'pass', 'checks': {}, 'improvement': {'decision': 'pass'}}
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline',
+                          return_value={'decision': 'pass', 'checks': {}}), \
+             patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluate):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=True)
+        self.assertEqual(outcome['decision'], 'pass')
+        self.assertIsNone(trial.get('_timed_out_stage'))
+        # 实现结束后才进入评估相位，评估时钟从实现完成起算。
+        self.assertEqual(observed, {'phase': 'evaluation', 'cancelled': False, 'timed_out_stage': None})
+
+    def test_production_slow_implementation_passes_with_the_same_deadlines(self):
+        """生产路径对照：同一份 3 秒实现、同一组预算仍通过，说明差异只在实验记账。"""
+        from adaptive_rsi import pipeline
+        self.runtime.configure({'deadlines': {'preparation_seconds': 1000, 'evaluation_seconds': 2,
+                                              'model_seconds': 60}}, self.project)
+        self.runtime.agent = SlowHighRisk()
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        # 与 process() 一致：生产 run 的准备时钟由运行器建立。
+        run['_deadline_stage'], run['_deadline_started'] = 'preparation', time.monotonic()
+        observed = {}
+        def evaluate(_baseline, _candidate, _checks, _target, _config, _cancel, **kwargs):
+            observed.update({'cancelled': self.runtime.is_cancelled(run),
+                             'timed_out_stage': run.get('_timed_out_stage')})
+            return {'decision': 'pass', 'checks': {}, 'improvement': {'decision': 'pass'},
+                    'execution_environment': {'build': 'test', 'backend': 'none', 'image_id': None}}
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate_acceptance_baseline',
+                          return_value={'decision': 'pass', 'checks': {}}), \
+             patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluate):
+            outcome = pipeline.execute_candidate(
+                self.runtime, run, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=False)
+        self.assertEqual(outcome['decision'], 'pass')
+        self.assertEqual(observed, {'cancelled': False, 'timed_out_stage': None})
+
+    def test_experiment_evaluation_overrun_still_cancels_on_the_evaluation_clock(self):
+        """评估阶段真实超时仍按 evaluation 取消，本次修复不放宽评估超时护栏。"""
+        from adaptive_rsi import pipeline
+        self.runtime.configure({'deadlines': {'preparation_seconds': 1000, 'evaluation_seconds': 1,
+                                              'model_seconds': 60}}, self.project)
+        run, task, project, config, base, directory, workspace, trial = self.experiment_inputs()
+        observed = {}
+        def evaluate(_baseline, _candidate, _checks, _target, _config, _cancel, **kwargs):
+            time.sleep(1.2)
+            observed['cancelled'] = self.runtime.is_cancelled(trial)
+            observed['timed_out_stage'] = trial.get('_timed_out_stage')
+            return {'decision': 'interrupted', 'reason': 'evaluation exceeded its budget', 'checks': {}}
+        with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch.object(self.runtime.evaluator, 'evaluate', side_effect=evaluate):
+            outcome = pipeline.execute_candidate(
+                self.runtime, trial, project, task, project['path'], base, directory, workspace,
+                self.runtime.active_strategies(self.project, config), experiment=True)
+        self.assertNotEqual(outcome['decision'], 'pass')
+        self.assertTrue(observed['cancelled'])
+        self.assertEqual(observed['timed_out_stage'], 'evaluation')
 
     def test_trial_evaluation_timeout_reaches_parent_when_pipeline_raises(self):
         from adaptive_rsi.evolution import Evolution

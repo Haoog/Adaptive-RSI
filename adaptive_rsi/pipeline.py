@@ -629,10 +629,9 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     acceptance_cancel = threading.Event()
     if (saved_candidate is None and task["source"] != "rollback" and acceptance and
             acceptance.get("change_kind") != "performance"):
-        if experiment:
-            # 实验路径的 transition() 不写 runs.state（见本函数开头），后台验收基线
-            # 评估会一直按 preparation 预算计时；评估工作开始前显式切到评估相位。
-            runtime.begin_phase(run, "evaluation")
+        # 验收基线在实现期间并发执行，与生产路径一样计入 preparation 预算：此处若
+        # 提前切到评估相位，实现本身的耗时也会被记进 evaluation_seconds，实现较慢的
+        # 试验会被误判为评估超时。
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         try:
@@ -728,10 +727,11 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not experiment:
             save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
         transition("evaluating")
-        if experiment and run.get("_explicit_phase") != "evaluation":
-            # 实验路径没有 runs.state 迁移，必须显式切相位；否则五个评估阶段仍共用
-            # preparation 的 900 秒预算，长评估会被误判超时。验收基线已切过相位时
-            # 不再重置计时，避免同一试验拿到双份评估预算。
+        if experiment:
+            # 实验路径不写 runs.state，相位只能显式推进：实现（以及并发执行的验收基线）
+            # 计入 preparation，评估时钟在这里重新起算，与生产 transition('evaluating')
+            # 后拿到全新 evaluation 预算的行为一致。不能在实现前提前切相位，否则实现
+            # 耗时会挤占 evaluation_seconds，较慢的配置被误判为评估超时。
             runtime.begin_phase(run, "evaluation")
         if acceptance_future is not None:
             acceptance_baseline = acceptance_future.result()
