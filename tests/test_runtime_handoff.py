@@ -266,6 +266,38 @@ class RuntimeHandoffTest(unittest.TestCase):
             self.assertTrue(self.runtime.is_cancelled(run))
             self.assertEqual(run['_timed_out_stage'], 'preparation')
 
+    def test_stage_budget_survives_restart_of_an_interrupted_attempt(self):
+        """阶段预算按任务持久化：重启后按已耗时间续算，不重新领一份完整额度。"""
+        self.runtime.configure({'deadlines': {'preparation_seconds': 30}}, self.project)
+        task, run = self.claim()
+        # 本次尝试在 preparation 已耗 40s 后被中断，收尾检查点把绝对累计值落库。
+        run.update(_budget_prior={}, _budget_closed={'preparation': 40.0}, _budget_flushed={})
+        self.runtime.checkpoint_budget(run)
+        self.assertEqual(self.store.setting(Runtime.BUDGET_KEY + task), {'preparation': 40.0})
+        self.store.execute("UPDATE runs SET state='interrupted',ended=? WHERE id=?", (time.time(), run['id']))
+        self.store.execute("UPDATE tasks SET state='queued' WHERE id=?", (task,))
+        # 新 Store/Runtime 只能从持久层读到该额度，等同于进程重启后的下一次运行。
+        store = Store(self.root / 'state')
+        runtime = Runtime(store, FakeAgent())
+        try:
+            claimed = store.claim(self.project, runtime.config(self.project))
+            self.assertEqual(claimed['task'], task)
+            self.assertEqual(runtime.task_budget(claimed), {'preparation': 40.0})
+            claimed.update(_budget_prior=runtime.task_budget(claimed), _budget_closed={},
+                           _deadline_stage='preparation', _deadline_started=time.monotonic())
+            self.assertTrue(runtime.is_cancelled(claimed))
+            self.assertEqual(claimed['_timed_out_stage'], 'preparation')
+        finally:
+            runtime.close()
+
+    def test_stage_budget_restarts_after_a_non_interrupted_attempt(self):
+        """只有紧邻的 interrupted 尝试续用额度；完成/失败后的重试重新计时。"""
+        task, run = self.claim()
+        self.store.put_setting(Runtime.BUDGET_KEY + task, {'preparation': 40.0})
+        self.store.execute("UPDATE runs SET state='completed',ended=? WHERE id=?", (time.time(), run['id']))
+        self.assertEqual(self.runtime.task_budget({'id': 'later-run', 'task': task}), {})
+        self.assertIsNone(self.store.setting(Runtime.BUDGET_KEY + task))
+
     def experiment_inputs(self):
         """准备一条试验运行的隔离工作区，返回 execute_candidate 需要的全部输入。"""
         from adaptive_rsi.gitops import git, snapshot

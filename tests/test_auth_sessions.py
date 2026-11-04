@@ -1621,7 +1621,7 @@ class OpenCodeServeTests(unittest.TestCase):
             self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
         self.assertEqual([call.args[0] for call in http.call_args_list], ["POST", "GET"])
         for status, expected in (("failed", "authorization_failed"), ("expired", "auth_expired"),
-                                 ("pending", "auth_protocol_error")):
+                                 ("unknown", "auth_protocol_error")):
             with self.subTest(status=status), patch.object(worker, "http", side_effect=[
                     AuthError("auth_protocol_error"), {"data": {"status": status}}]):
                 with self.assertRaises(AuthError) as caught:
@@ -1632,6 +1632,45 @@ class OpenCodeServeTests(unittest.TestCase):
             with self.assertRaises(AuthError) as caught:
                 worker._v2_complete("fixture-code", timeout=30)
             self.assertEqual(caught.exception.code, "auth_protocol_error")
+
+    def test_v2_complete_polls_pending_attempt_after_post_protocol_error(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.provider = "openai"
+        worker.attempt_id = "attempt-1"
+        clock = {"now": 0.0}
+        calls = []
+
+        def fake_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], method))
+            if method == "POST":
+                raise AuthError("auth_protocol_error")
+            return {"data": {"status": "pending" if len(calls) <= 3 else "complete"}}
+
+        def fake_sleep(seconds):
+            clock["now"] += seconds
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"], sleep=fake_sleep)
+        worker.http = fake_http
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            self.assertTrue(worker._v2_complete("fixture-code", timeout=30))
+        # 验证码只提交一次，POST 失败后仅轮询既有 attempt，并在退避后拿到 complete。
+        self.assertEqual([method for _, method in calls], ["POST", "GET", "GET", "GET"])
+        self.assertEqual(calls[-1][0], 0.2)
+
+        # pending 一直持续时仍在 deadline 结束为 auth_timeout，不发第二次 POST。
+        calls.clear()
+        clock["now"] = 0.0
+
+        def pending_http(method, path, body=None, timeout=25):
+            calls.append((clock["now"], method))
+            if method == "POST":
+                raise AuthError("auth_protocol_error")
+            return {"data": {"status": "pending"}}
+        worker.http = pending_http
+        with patch("adaptive_rsi.auth_sessions.time", fake_time):
+            with self.assertRaisesRegex(AuthError, "auth_timeout"):
+                worker._v2_complete("fixture-code", timeout=30)
+        self.assertEqual([method for _, method in calls].count("POST"), 1)
+        self.assertAlmostEqual(clock["now"], 10.0, places=6)
 
     def test_v2_complete_retries_transient_status_lookup_after_code(self):
         worker = object.__new__(OpenCodeAuth)

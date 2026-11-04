@@ -693,9 +693,13 @@ class OpenCodeAuth(_Process):
                     raise AuthAttemptFailed() from exc
                 if status == "expired":
                     raise AuthError("auth_expired") from exc
-                raise
-            if result is not None:
-                raise AuthError("authorization_failed")
+                if status != "pending":
+                    raise
+                # 与 POST 返回空响应一致：验证码可能已被消费、attempt 仍在处理，
+                # 继续轮询该 attempt，而不是把可恢复的处理中状态当成失败。
+            else:
+                if result is not None:
+                    raise AuthError("authorization_failed")
             # CLI 对失败的 attempt 也可能返回空响应；必须核对 attempt 状态，
             # 否则会把未完成授权当成成功，随后在导出凭据时才暴露成 invalid_credentials。
             # 状态推进和查询抖动都按有界退避重试，避免验证码已被消费却因一次瞬时错误失败。
