@@ -563,6 +563,49 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                         release.authorize_workflow(runtime, project, "release", "../outside.yml")
                 self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
 
+    def test_authorize_workflow_reports_unreadable_files_as_retryable(self):
+        sha = "f" * 40
+
+        def stub(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": sha}
+            raise AssertionError("unexpected API call: " + endpoint)
+
+        failures = [RuntimeError("gh: rate limited (HTTP 429)"),
+                    release.ApiRejected("gh: rate limited (HTTP 429)", 429)]
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                with patch("adaptive_rsi.release.api", side_effect=stub), \
+                        patch("adaptive_rsi.release.workflow_content", side_effect=failure):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                self.assertIn("Unable to inspect", str(caught.exception))
+                self.assertNotIn("Select a compatible", str(caught.exception))
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+                self.assertFalse(runtime.store.query("SELECT 1 FROM events WHERE kind='workflow_authorized'"))
+
+    def test_authorize_workflow_rejects_yaml_without_the_dispatch_contract(self):
+        sha = "f" * 40
+
+        def stub(repo, endpoint, method="GET", fields=None):
+            if endpoint == "":
+                return {"default_branch": "main"}
+            if endpoint == "commits/main":
+                return {"sha": sha}
+            raise AssertionError("unexpected API call: " + endpoint)
+
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            with patch("adaptive_rsi.release.api", side_effect=stub), \
+                    patch("adaptive_rsi.release.workflow_content", return_value="name: Deploy\non: push\n"):
+                with self.assertRaises(ValueError) as caught:
+                    release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+            self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+            self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
+
 
 class _ManualReconciliationFixture(unittest.TestCase):
     """Shared real-runtime fixture for manual reconciliation tests."""
