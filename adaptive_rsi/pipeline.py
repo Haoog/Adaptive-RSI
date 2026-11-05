@@ -843,9 +843,20 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         # Real evaluate() results always carry the execution environment; older
         # or stubbed records can miss the key, and reuse would then discard
         # them as incomplete. Bind the current identity at save time so every
-        # stored evaluation is reusable on the same host.
+        # stored evaluation is reusable on the same host. Resolving it probes
+        # the sandbox backend, which can be unavailable even though the checks
+        # already ran (the readiness gate saw it earlier, or Docker went away
+        # mid-run): that bookkeeping failure must keep the completed verdict
+        # instead of failing the candidate as an environment fault. A record
+        # saved without the key is refused by ``_reusable_evaluation`` and the
+        # evaluation simply runs again, so nothing unverified becomes reusable.
         if isinstance(evaluation, dict) and "execution_environment" not in evaluation:
-            evaluation = {**evaluation, "execution_environment": runtime.evaluator.execution_identity(config)}
+            try:
+                identity = runtime.evaluator.execution_identity(config)
+            except Exception:
+                pass
+            else:
+                evaluation = {**evaluation, "execution_environment": identity}
         save(runtime, run, "evaluation", evaluation, candidate_key)
     if evaluation["decision"] != "pass" and not experiment:
         runtime.store.execute("DELETE FROM stages WHERE signature=? AND stage='validated_candidate' AND run IN (SELECT id FROM runs WHERE task=?)", (candidate_key, task["id"]))
