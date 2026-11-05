@@ -243,6 +243,41 @@ class ServerHardeningTest(unittest.TestCase):
             time.sleep(.01)
         self.assertEqual([(r['status'], r['error_code']) for r in rows], [(200, ''), (400, 'http_400')])
 
+    def test_request_log_write_does_not_wait_for_the_database_write_lock(self):
+        holder = sqlite3.connect(str(self.store.path), timeout=0)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            status, _, _ = self.request("/api/health")
+            elapsed = time.monotonic() - started
+            # 响应体先于 finally 写出，等到 handler 真正尝试写日志再断言释放时机。
+            deadline = time.monotonic() + 1
+            while (self.store.metrics()["request_logging"]["observed"] < 1
+                   and time.monotonic() < deadline):
+                time.sleep(.005)
+            self.assertEqual(self.store.metrics()["request_logging"]["observed"], 1)
+            # 写锁仍被占用时 handler 线程就必须归还连接，而不是等满默认 15s。
+            deadline = time.monotonic() + .2
+            while self.store.metrics()["borrowed"] and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(self.store.metrics()["borrowed"], 0)
+            self.assertEqual(self.store.metrics()["request_logging"]["failed"], 1)
+        finally:
+            holder.rollback()
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, .2)
+        # 锁释放后日志照常写入，采样与计数语义不变。
+        self.assertEqual(self.request("/api/health")[0], 200)
+        rows = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rows = self.store.query("SELECT status FROM request_log WHERE path='/api/health'")
+            if rows:
+                break
+            time.sleep(.01)
+        self.assertEqual([row["status"] for row in rows], [200])
+
     def test_interrupted_backup_stream_is_not_logged_as_success(self):
         self.backup.write_bytes(b'payload')
         original = Handler.end_headers
