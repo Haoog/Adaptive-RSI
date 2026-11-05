@@ -459,6 +459,8 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     return {"default_branch": "main"}
                 if endpoint.startswith("commits/"):
                     return {"sha": commit_sha}
+                if endpoint == "actions/workflows/deploy.yml":
+                    return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}
                 if endpoint.startswith("actions/workflows"):
                     return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}]}
                 if endpoint.startswith("contents/"):
@@ -517,6 +519,8 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     return {"sha": sha}
                 if endpoint == "contents/.github/workflows/deploy.yml?ref=" + sha:
                     return {"encoding": "base64", "type": "file", "content": content}
+                if endpoint == "actions/workflows/deploy.yml":
+                    return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": "active"}
                 if endpoint.startswith("git/matching-refs/"):
                     return [{"ref": "refs/tags/rsi-workflow/" + sha, "object": {"type": "commit", "sha": sha}}]
                 if endpoint.startswith("actions/workflows?"):
@@ -529,8 +533,10 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
             self.assertEqual(target["workflow"], ".github/workflows/deploy.yml")
             self.assertEqual(target["sha"], sha)
             self.assertEqual(target["ref"], "rsi-workflow/" + sha)
-            self.assertLessEqual(len(calls), 4)
-            self.assertFalse(any("actions/workflows" in endpoint for endpoint in calls))
+            self.assertLessEqual(len(calls), 5)
+            # 授权只读这一个文件的状态；不枚举整个 workflow 目录。
+            self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("actions/workflows")],
+                             ["actions/workflows/deploy.yml"])
             self.assertEqual([endpoint for endpoint in calls if endpoint.startswith("contents/")],
                              ["contents/.github/workflows/deploy.yml?ref=" + sha])
 
@@ -562,6 +568,95 @@ class WorkflowChoicesFeedbackTest(unittest.TestCase):
                     with self.assertRaises(ValueError) as caught:
                         release.authorize_workflow(runtime, project, "release", "../outside.yml")
                 self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+
+    def test_workflow_choices_explains_disabled_state_instead_of_yaml(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "a" * 40
+        with tempfile.TemporaryDirectory() as temp:
+            runtime, project = self._authorization_project(temp)
+            contents = []
+
+            def stub(repo, endpoint, method="GET", fields=None):
+                if endpoint == "":
+                    return {"default_branch": "main"}
+                if endpoint == "commits/main":
+                    return {"sha": sha}
+                if endpoint.startswith("actions/workflows?"):
+                    return {"workflows": [{"path": ".github/workflows/deploy.yml", "name": "Deploy",
+                                           "state": "disabled_manually"}]}
+                if endpoint.startswith("contents/"):
+                    contents.append(endpoint)
+                    return {"encoding": "base64", "type": "file", "content": content}
+                raise AssertionError(endpoint)
+
+            with patch("adaptive_rsi.release.api", side_effect=stub):
+                result = release.workflow_choices(runtime, project)
+            # 已禁用的文件不会被调度，内容是否合规与结论无关，也不该再去读。
+            self.assertEqual(contents, [])
+            item = result["workflows"][0]
+            self.assertFalse(item["compatible"])
+            self.assertIn("disabled", item["reason"])
+            self.assertNotIn("YAML", item["reason"])
+
+    def test_authorize_workflow_requires_active_state(self):
+        import base64
+        compatible = (
+            "name: Deploy\n"
+            "run-name: ${{ inputs.rsi_operation_id }}\n"
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      rsi_operation_id:\n"
+            "        type: string\n"
+            "        required: true\n"
+            "      rsi_sha:\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        content = base64.b64encode(compatible.encode("utf-8")).decode("ascii")
+        sha = "b" * 40
+        for label, state in [("disabled", "disabled_manually"), ("unreadable", None)]:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temp:
+                runtime, project = self._authorization_project(temp)
+                writes = []
+
+                def stub(repo, endpoint, method="GET", fields=None):
+                    if endpoint == "":
+                        return {"default_branch": "main"}
+                    if endpoint == "commits/main":
+                        return {"sha": sha}
+                    if endpoint.startswith("contents/"):
+                        return {"encoding": "base64", "type": "file", "content": content}
+                    if endpoint == "actions/workflows/deploy.yml":
+                        if state is None:
+                            raise release.ApiRejected("not found", 404)
+                        return {"path": ".github/workflows/deploy.yml", "name": "Deploy", "state": state}
+                    if method != "GET":
+                        writes.append(endpoint)
+                        return {}
+                    raise AssertionError(endpoint)
+
+                with patch("adaptive_rsi.release.api", side_effect=stub):
+                    with self.assertRaises(ValueError) as caught:
+                        release.authorize_workflow(runtime, project, "release", ".github/workflows/deploy.yml")
+                # 与选择器同一规则：非 active 或读不到状态都按不可用处理，且不留下标记与配置。
+                self.assertEqual(str(caught.exception), "Select a compatible existing workflow from this project")
+                self.assertEqual(writes, [])
+                self.assertFalse(runtime.config(project)["delivery"]["release"]["enabled"])
 
 
 class _ManualReconciliationFixture(unittest.TestCase):

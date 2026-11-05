@@ -252,12 +252,19 @@ def workflow_choices(runtime, project_id, refresh=False):
         path = item.get("path", "")
         if not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", path):
             return None
+        name = item.get("name", path)
+        # 目录里的 state 已经说明这个文件不会被调度；再读内容既没有意义，也会把
+        # 「已禁用」误报成 YAML 写错了，让运维去改一份本来合规的文件。
+        state = item.get("state")
+        if state != "active":
+            return {"workflow": path, "name": name, "compatible": False,
+                    "reason": "This workflow is disabled (state=%s); enable it in the repository before authorizing" % (state or "unknown")}
         try:
-            compatible = item.get("state") == "active" and compatible_workflow(workflow_content(repo, path, sha))
+            compatible = compatible_workflow(workflow_content(repo, path, sha))
         except (RuntimeError, ValueError, OSError):
-            return {"workflow": path, "name": item.get("name", path), "compatible": False,
+            return {"workflow": path, "name": name, "compatible": False,
                     "reason": "Unable to inspect this workflow; refresh before authorizing"}
-        return {"workflow": path, "name": item.get("name", path), "compatible": compatible,
+        return {"workflow": path, "name": name, "compatible": compatible,
                 "reason": "" if compatible else "Requires explicit block-style YAML: workflow_dispatch inputs rsi_operation_id/rsi_sha (required string), and top-level run-name: ${{ inputs.rsi_operation_id }}; anchors, aliases and flow mappings require manual inspection"}
     # 逐个 workflow 拉取内容很慢；受控并发把对话框打开时间压到单次往返级别。
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -274,15 +281,26 @@ def workflow_choices(runtime, project_id, refresh=False):
     return result
 
 
+def _workflow_state(repo, workflow):
+    """Read one workflow file's repository state (active/disabled_*).
+
+    The single-file endpoint is keyed by the file name, so only the last path
+    segment is sent. Callers treat an unreadable state as "not active".
+    """
+    data = api(repo, "actions/workflows/" + quote(workflow.split("/")[-1], safe=""))
+    if not isinstance(data, dict):
+        raise ValueError("Invalid workflow response")
+    return data.get("state")
+
+
 def authorize_workflow(runtime, project_id, kind, workflow):
     if kind not in KINDS:
         raise ValueError("Unknown automation kind")
     initial = runtime.config(project_id)
     repo = _validated_repository(runtime, project_id)
     # Authorization pins exactly one file, so validate only that file at the
-    # default-branch SHA the tag binds. Enumerating the whole workflow directory
-    # added one contents request per other workflow and no input to this
-    # decision; the dialog path keeps using workflow_choices for the full list.
+    # default-branch SHA the tag binds and read only that file's state. The
+    # dialog path keeps using workflow_choices for the full list.
     if not isinstance(workflow, str) or not re.fullmatch(r"\.github/workflows/[A-Za-z0-9_.-]+\.ya?ml", workflow):
         raise ValueError("Select a compatible existing workflow from this project")
     branch = api(repo, "")["default_branch"]
@@ -292,6 +310,15 @@ def authorize_workflow(runtime, project_id, kind, workflow):
     except (RuntimeError, ValueError, OSError):
         compatible = False
     if not compatible:
+        raise ValueError("Select a compatible existing workflow from this project")
+    # 对话框只把 active 的工作流标为可用；这里必须用同一条规则，否则 API 调用方
+    # 能把一个永远不会被调度的 disabled workflow 钉进 delivery。state 读不到时
+    # 与内容读不到一样按不可用处理（fail closed）。
+    try:
+        state = _workflow_state(repo, workflow)
+    except (RuntimeError, ValueError, OSError):
+        state = None
+    if state != "active":
         raise ValueError("Select a compatible existing workflow from this project")
     tag = "rsi-workflow/" + sha
     # GitHub rejects duplicate refs. Read before creation so repeated authorization is safe.

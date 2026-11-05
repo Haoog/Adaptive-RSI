@@ -697,6 +697,9 @@ class ReleaseAutomationTest(unittest.TestCase):
                 return {"sha": TRUSTED}
             if endpoint.startswith("actions/workflows?"):
                 return {"workflows": [{"name": "Publish", "path": self.policy["workflow"], "state": "active"}]}
+            if endpoint.startswith("actions/workflows/"):
+                # 授权路径按文件名读取单个 workflow 的注册状态（active/disabled_*）。
+                return {"name": "Publish", "path": self.policy["workflow"], "state": "active"}
             if endpoint.startswith("git/matching-refs/"):
                 return []
             if endpoint == "git/refs":
