@@ -61,12 +61,16 @@ class ReconciliationRejected(ValueError):
 class ApiRejected(RuntimeError):
     """GitHub explicitly rejected a request before accepting its side effect."""
 
-    def __init__(self, message, status):
+    def __init__(self, message, status, local=False):
         super().__init__(message)
         self.status = status
+        # True 表示本机限流冷却在 `gh` 发出请求之前就拦下了它：GitHub 没有看到
+        # 这次调用，也就谈不上拒绝，调用方应把它当成可自动重试的本地等待。
+        self.local = local
 
 
 _API_BACKOFF = {}
+API_COOLDOWN_SECONDS = 60
 
 
 def api(repo, endpoint, method="GET", fields=None):
@@ -74,7 +78,7 @@ def api(repo, endpoint, method="GET", fields=None):
     # of this transport share the primary/secondary limit cooldown.
     retry_at = _API_BACKOFF.get("github.com", 0)
     if time.monotonic() < retry_at:
-        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429)
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -85,7 +89,7 @@ def api(repo, endpoint, method="GET", fields=None):
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
         if status and (int(status[1]) == 429 or int(status[1]) == 403 and
                        any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
-            _API_BACKOFF["github.com"] = time.monotonic() + 60
+            _API_BACKOFF["github.com"] = time.monotonic() + API_COOLDOWN_SECONDS
         if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
             raise ApiRejected(str(exc), int(status[1])) from exc
         raise
@@ -1599,18 +1603,28 @@ def advance(runtime, project, run, outcome, cancel=None):
             try:
                 validate_pin(repo, policy)
             except ApiRejected as exc:
-                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
-                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
-                # 状态被轮询无限重试。
                 identity = {"repository": repo, "workflow": policy["workflow"], "ref": policy["ref"],
                             "workflow_sha": policy["sha"], "sha": outcome["merged_sha"], "kind": kind}
                 if not data:
-                    data = {"state": "failed", **identity}
+                    data = {"state": "pending", **identity}
                 for field, value in identity.items():
                     data.setdefault(field, value)
                 data.setdefault("operation_id", "rsi-" + fingerprint(
                     {"project": project["id"], "run": run["id"], "kind": kind,
                      "repository": repo, "sha": outcome["merged_sha"]})[:32])
+                if exc.local:
+                    # 冷却在请求发出前拦下：GitHub 从未看到这次校验，也没有产生
+                    # 任何远端副作用。保持待发并让下一个调度轮询自动重试，不能
+                    # 记成「GitHub 拒绝」的终态失败。
+                    data.update(state="pending", error=str(exc)[:500],
+                                retry_at=time.time() + API_COOLDOWN_SECONDS)
+                    data.pop("dispatch_receipt", None)
+                    data.pop("dispatch_http_status", None)
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
+                # Dispatch 前的只读校验被 GitHub 明确拒绝：显式落到失败态并留下
+                # 人工介入入口（retry 通道按被拒回执重新派发），不能留在 waiting_*
+                # 状态被轮询无限重试。
                 data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                             dispatch_http_status=exc.status)
                 raise
@@ -1640,6 +1654,15 @@ def advance(runtime, project, run, outcome, cancel=None):
                 api(repo, "actions/workflows/" + quote(policy["workflow"].split("/")[-1], safe="") + "/dispatches", "POST",
                     {"ref": policy["ref"], "inputs[rsi_operation_id]": data["operation_id"], "inputs[rsi_sha]": data["sha"]})
             except ApiRejected as exc:
+                if exc.local:
+                    # POST 同样没有发出：把已持久化的 dispatching 退回 pending，
+                    # 保留派发意图等待冷却结束后自动重发，而不是记为未知或失败。
+                    data.update(state="pending", error=str(exc)[:500],
+                                retry_at=time.time() + API_COOLDOWN_SECONDS)
+                    data.pop("dispatch_receipt", None)
+                    data.pop("dispatch_http_status", None)
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
                 data.update(state="failed", error=str(exc)[:500], dispatch_receipt="rejected",
                             dispatch_http_status=exc.status)
                 raise
