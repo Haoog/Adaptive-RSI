@@ -1890,6 +1890,40 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual((rows["empty"]["connected"], rows["empty"]["connection_count"]), (False, 0))
         self.assertEqual((rows["two"]["connected"], rows["two"]["connection_count"]), (True, 2))
 
+    def test_v2_connection_count_counts_host_export_only_provider(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = True
+        worker.capabilities = None
+        worker._v2_integrations = lambda: [
+            {"id": "host-only", "name": "Host only", "methods": [{"type": "key"}], "connections": []}]
+        with patch("adaptive_rsi.auth_sessions.load_auth_export",
+                   return_value=[{"integrationID": "host-only", "value": {"type": "key"}}]), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            rows = {row["id"]: row for row in worker._v2_providers()}
+        self.assertIs(rows["host-only"]["connected"], True)
+        self.assertEqual(rows["host-only"]["connection_count"], 1)
+
+    def test_v2_connection_count_does_not_double_count_worker_credentials(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = True
+        worker.capabilities = None
+        worker._v2_integrations = lambda: [
+            {"id": "shared", "name": "Shared", "methods": [{"type": "key"}],
+             "connections": [{"type": "credential", "id": "one"},
+                             {"type": "credential", "id": "two"}]},
+            {"id": "host-only", "name": "Host only", "methods": [{"type": "key"}]},
+            {"id": "missing", "name": "Missing", "methods": [{"type": "key"}]}]
+        host_export = [{"integrationID": "shared", "value": {"type": "key"}},
+                       {"integrationID": "host-only", "value": {"type": "key"}}]
+        with patch("adaptive_rsi.auth_sessions.load_auth_export", return_value=host_export), patch(
+                "adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            rows = {row["id"]: row for row in worker._v2_providers()}
+        self.assertEqual(rows["shared"]["connection_count"], 2)
+        self.assertEqual(rows["host-only"]["connection_count"], 1)
+        self.assertEqual(rows["missing"]["connection_count"], 0)
+        for row in rows.values():
+            self.assertEqual(row["connected"], row["connection_count"] > 0, row["id"])
+
 
 class OpenCodeServeTests(unittest.TestCase):
     def make_worker(self):

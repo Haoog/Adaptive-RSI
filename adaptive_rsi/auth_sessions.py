@@ -695,6 +695,10 @@ class OpenCodeAuth(_Process):
                            if isinstance(connection, dict) and connection.get("type") == "credential"
                            ] if isinstance(connections, list) else []
             connected = provider in host_connected or bool(credentials)
+            # container 模式凭据可能只存在于 host 侧导出文件；merge_auth_export 按
+            # integrationID 去重，每个 provider 至多一条，因此只在 worker 侧没有连接时补 1，
+            # 保证 connection_count > 0 与 connected 始终一致。
+            host_only = provider in host_connected and not credentials
             items = []
             for index, method in enumerate(integration.get("methods", [])):
                 if not isinstance(method, dict) or method.get("type") not in {"key", "oauth"}:
@@ -721,7 +725,7 @@ class OpenCodeAuth(_Process):
             if items:
                 result.append({"id": provider, "name": str(integration.get("name", provider))[:160],
                                "methods": items, "connected": connected,
-                               "connection_count": len(credentials)})
+                               "connection_count": len(credentials) + int(host_only)})
         self._v2_methods = methods_by_index
         result.sort(key=lambda row: (not row["connected"], row["name"].casefold()))
         return result
