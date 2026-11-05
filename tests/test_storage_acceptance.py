@@ -366,6 +366,38 @@ class StorageAcceptanceTest(unittest.TestCase):
         storage_tools.overview(self.store)
         self.assertEqual(len(getattr(self.store, "_storage_digests")), 1)
 
+    def test_refresh_hashes_only_within_budget_and_reports_pending_digests(self):
+        folder = self.store.root / 'backups'
+        folder.mkdir(parents=True, exist_ok=True)
+        budget = storage_tools.DIGEST_REFRESH_BUDGET
+        backups = []
+        for index in range(4):
+            path = folder / ('%016x.sqlite3' % (index + 1))
+            with open(path, 'wb') as stream:
+                stream.truncate(budget)
+            os.utime(path, (1000 + index, 1000 + index))
+            backups.append(path)
+
+        started = time.monotonic()
+        snapshot = storage_tools.overview(self.store, refresh=True)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(snapshot['hashed_bytes'], budget)
+        self.assertTrue(snapshot['digest_pending'])
+        entries = {item['path']: item for item in snapshot['backup_manifest']}
+        newest = entries['backups/' + backups[-1].name]
+        self.assertEqual(newest['sha256'], storage_tools.file_digest(backups[-1]))
+        self.assertNotIn('digest_pending', newest)
+        for path in backups[:-1]:
+            entry = entries['backups/' + path.name]
+            self.assertIsNone(entry['sha256'])
+            self.assertTrue(entry['digest_pending'])
+        with patch('adaptive_rsi.storage_tools.file_digest', wraps=storage_tools.file_digest) as digest:
+            again = storage_tools.overview(self.store, refresh=True)
+            self.assertEqual(digest.call_count, 1)
+            self.assertEqual(again['hashed_bytes'], budget)
+
     def test_rehearsal_trigger_entry_cli_drops_report_file(self):
         import io
         from contextlib import redirect_stdout
