@@ -987,12 +987,39 @@ test('task run history loads and appends earlier pages with a visible count', as
   assert.equal(more.hidden, true, 'the entry disappears when no further page remains');
 });
 
+test('list rows omit body and evidence so the open detail fetches them once', async () => {
+  const page = browser(), requests = [];
+  page.context.fetch = async url => {
+    requests.push(url);
+    if (url.includes('task?id=')) return response({id: 'a', project: 'a', title: 'Task a', body: '补取的正文',
+      evidence: '[]', state: 'failed'});
+    if (url.includes('task-runs?')) return response({runs: [], has_more: false, next_before: null});
+    return response({});
+  };
+  await page.context.showTask({id: 'a', project: 'a', title: 'Task a', state: 'failed'});
+  await new Promise(setImmediate);
+  const body = page.node('detail-body');
+  const requirements = () => body.children.find(node => node.className === 'task-requirements');
+  const paragraph = node => node.children.find(child => child.id === 'task-requirements');
+  assert.equal(paragraph(requirements()).textContent, '补取的正文', 'the detail request fills 任务要求');
+  assert.equal(body.children.find(node => node.className === 'detail-section').hidden, false,
+    'evidence becomes available once the detail row arrives');
+  assert.equal(requests.filter(url => url.includes('task?id=')).length, 1);
+  const detail = vm.runInContext('detailTask', page.context);
+  assert.equal(detail.body, '补取的正文', 'the completed row replaces the partial detailTask');
+  await page.context.showTask(detail);
+  await new Promise(setImmediate);
+  assert.equal(requests.filter(url => url.includes('task?id=')).length, 1,
+    'language switches and post-operation redraws reuse the completed detailTask');
+  assert.equal(paragraph(requirements()).textContent, '补取的正文', 'redrawing keeps 任务要求 text');
+});
+
 test('closing task details while a response waits keeps the dialog closed', async () => {
   const page = browser();
   page.context.initialState.runs = [{id: 'ra', task: 'a', project: 'a'}];
   let finish;
   page.context.fetch = () => new Promise(resolve => { finish = () => resolve(response({config: {models: {}}, result: {}})); });
-  const pending = page.context.showTask({id: 'a', title: 'Task a', evidence: '[]', state: 'executing'});
+  const pending = page.context.showTask({id: 'a', title: 'Task a', body: '正文', evidence: '[]', state: 'executing'});
   page.context.closeTaskDetail(); finish(); await pending;
   assert.notEqual(page.node('detail-dialog').open, true);
   assert.equal(descendants(page.node('detail-body')).filter(node => node.tagName === 'BUTTON' && node.textContent === '取消任务').length, 0);
@@ -3596,4 +3623,48 @@ test('returning to the page refreshes once via visibilitychange; focus no longer
   page.listeners.get('visibilitychange')();
   assert.equal(states.length, 2, 'hiding the page does not refresh');
   assert.equal(page.timers.filter(timer => timer.active && timer.delay === 60000).length, 1, 'hidden polling keeps the slow cadence');
+});
+
+test('an expired session stops polling and keeps a reload path with the last successful data time', async () => {
+  const page = browser();
+  let calls = 0;
+  page.context.fetch = async url => {
+    if (!url.split('?')[0].endsWith('/state')) return response({});
+    calls++;
+    return calls === 1 ? response({...snapshot(), selected_project: 'a', sections: ['core']}) : response({}, 401);
+  };
+  await page.context.refresh();
+  assert.equal(calls, 1);
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 15000).length, 1, 'a successful refresh schedules the next poll');
+  page.fireTimer(15000);
+  await waitFor(() => vm.runInContext('sessionExpired', page.context));
+  assert.equal(calls, 2, 'the poll refreshes once more and receives the 401');
+  const last = vm.runInContext('lastRefreshAt', page.context);
+  assert.ok(last > 0, 'the last successful refresh time is kept');
+  const date = new Date(last);
+  const time = String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0');
+  assert.equal(page.node('connection').textContent, '登录已失效 · 当前显示 ' + time + ' 的数据');
+  assert.equal(page.node('reload-ui').hidden, false, 'the reload entry becomes visible again');
+  assert.equal(page.node('reload-ui').textContent, '登录已失效，重新打开控制台');
+  assert.deepEqual(page.timers.filter(timer => timer.active).map(timer => timer.delay), [], 'the expired session schedules no further poll');
+  // 推进 60 秒：没有可触发的轮询；之后的手动刷新也不再发请求。
+  for (const timer of page.timers.filter(timer => timer.active)) { timer.active = false; timer.callback(); }
+  await new Promise(setImmediate);
+  await page.context.refresh();
+  assert.equal(calls, 2, 'no request starts while the session is expired');
+  assert.equal(page.node('connection').textContent, '登录已失效 · 当前显示 ' + time + ' 的数据', 'the expired copy stays in place');
+});
+
+test('a non-session connection failure keeps retrying on the normal 15 second interval', async () => {
+  const page = browser();
+  let calls = 0;
+  page.context.fetch = async () => { calls++; throw new TypeError('connection lost'); };
+  await assert.rejects(page.context.refresh(), /无法连接本地服务/);
+  assert.equal(vm.runInContext('sessionExpired', page.context), false);
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 15000).length, 1, 'a failed refresh still schedules the retry');
+  page.fireTimer(15000);
+  await waitFor(() => page.node('connection').textContent === '连接中断');
+  assert.equal(calls, 2);
+  assert.equal(page.timers.filter(timer => timer.active && timer.delay === 15000).length, 1, 'the retry loop continues');
+  assert.equal(vm.runInContext('sessionExpired', page.context), false);
 });

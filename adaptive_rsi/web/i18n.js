@@ -1030,6 +1030,9 @@ const english = {
   "服务返回了无法识别的结果。输入已保留，请稍后重试。": "The service returned an unreadable response. Your input is preserved. Please retry later.",
   "JSON 格式有误，请检查逗号、引号和括号；输入已保留。": "Invalid JSON. Check commas, quotes and brackets. Your input is preserved.",
   "需要重新登录": "Sign in again",
+  "登录已失效 · 当前显示 {time} 的数据": "Session expired · Showing data from {time}",
+  "登录已失效": "Session expired",
+  "登录已失效，重新打开控制台": "Session expired. Reopen the console",
   "未成功的链接已保留，已接入的项目不会重复导入。": "Only unsuccessful links remain. Successfully connected projects will not be imported again.",
 
   "工作台": "Workspace",
