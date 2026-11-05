@@ -662,10 +662,6 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
     acceptance_cancel = threading.Event()
     if (saved_candidate is None and task["source"] != "rollback" and acceptance and
             acceptance.get("change_kind") != "performance"):
-        if experiment:
-            # 实验路径的 transition() 不写 runs.state（见本函数开头），后台验收基线
-            # 评估会一直按 preparation 预算计时；评估工作开始前显式切到评估相位。
-            runtime.begin_phase(run, "evaluation")
         acceptance_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rsi-acceptance-baseline")
         try:
@@ -761,10 +757,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
         if not experiment:
             save(runtime, run, "implementation", {"files": files, "patch_hash": fingerprint(patch)}, candidate_key)
         transition("evaluating")
-        if experiment and run.get("_explicit_phase") != "evaluation":
-            # 实验路径没有 runs.state 迁移，必须显式切相位；否则五个评估阶段仍共用
-            # preparation 的 900 秒预算，长评估会被误判超时。验收基线已切过相位时
-            # 不再重置计时，避免同一试验拿到双份评估预算。
+        if experiment:
+            # 实验路径不写 runs.state，必须在评估工作开始前显式起算评估相位。
+            # 实现与并发的验收基线都按 preparation 计时（与生产路径一致），
+            # 不能提前切到 evaluation，否则实现越慢，留给评估的预算越少。
             runtime.begin_phase(run, "evaluation")
         if acceptance_future is not None:
             acceptance_baseline = acceptance_future.result()
