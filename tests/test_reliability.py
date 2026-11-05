@@ -1441,6 +1441,48 @@ class ReliabilityTest(unittest.TestCase):
         implementation_after, _ = _stage_config(changed, "implementation")
         self.assertNotEqual(fingerprint(implementation_before), fingerprint(implementation_after))
 
+    def test_stage_cache_keys_ignore_providers_the_stage_never_routes_to(self):
+        config = json.loads(json.dumps(self.runtime.config(self.project)))
+        config["providers"] = [
+            {"id": "local_gw", "name": "Local gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
+            {"id": "spare_gw", "name": "Spare gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8081/v1", "env_key": ""},
+        ]
+        config["models"]["evolution"]["provider"] = "local_gw"
+        stages = ["planning", "acceptance", "implementation", "review"]
+        before = {stage: fingerprint(_stage_config(config, stage)[0]) for stage in stages}
+        changed = json.loads(json.dumps(config))
+        changed["providers"][0]["base_url"] = "http://127.0.0.1:9080/v1"
+        changed["providers"][1]["base_url"] = "http://127.0.0.1:9081/v1"
+        for stage in stages:
+            self.assertEqual(fingerprint(_stage_config(changed, stage)[0]), before[stage], stage)
+
+    def test_stage_cache_keys_change_for_the_provider_the_stage_routes_to(self):
+        config = json.loads(json.dumps(self.runtime.config(self.project)))
+        config["providers"] = [
+            {"id": "plan_gw", "name": "Planning gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8080/v1", "env_key": ""},
+            {"id": "fallback_gw", "name": "Fallback gateway", "protocol": "chat_completions",
+             "base_url": "http://127.0.0.1:8081/v1", "env_key": ""},
+        ]
+        config["models"]["planning"]["provider"] = "plan_gw"
+        config["models"]["planning"]["fallback"] = {"provider": "fallback_gw", "model": "local-model",
+                                                    "effort": "high", "fallback": None}
+        before_planning, _ = _stage_config(config, "planning")
+        before_acceptance, _ = _stage_config(config, "acceptance")
+        before_implementation, _ = _stage_config(config, "implementation")
+
+        primary = json.loads(json.dumps(config))
+        primary["providers"][0]["base_url"] = "http://127.0.0.1:9080/v1"
+        self.assertNotEqual(fingerprint(_stage_config(primary, "planning")[0]), fingerprint(before_planning))
+        self.assertNotEqual(fingerprint(_stage_config(primary, "acceptance")[0]), fingerprint(before_acceptance))
+        self.assertEqual(fingerprint(_stage_config(primary, "implementation")[0]), fingerprint(before_implementation))
+
+        fallback = json.loads(json.dumps(config))
+        fallback["providers"][1]["base_url"] = "http://127.0.0.1:9081/v1"
+        self.assertNotEqual(fingerprint(_stage_config(fallback, "planning")[0]), fingerprint(before_planning))
+
     def test_review_evidence_keeps_results_without_full_check_transcripts(self):
         evaluation = {"decision": "pass", "checks": {"candidate": [{
             "name": "tests", "argv": ["python3", "-m", "unittest"], "passed": True,
