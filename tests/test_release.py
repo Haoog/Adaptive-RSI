@@ -893,6 +893,66 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertEqual(deployment_owner(self.runtime, self.project, "example/project", deploy),
                          {"run": self.run["id"], "sha": MERGED})
 
+    def test_health_unconfirmed_owner_allows_compare_and_takeover_by_newer_deployment(self):
+        from adaptive_rsi.release import deployment_terminal
+        deploy = self.setup_deployment()
+        self.assertTrue(deployment_terminal({"state": "health_unconfirmed"}, deploy))
+        previous = "previous-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": previous, "sha": PREVIOUS})
+        self.runtime.store.put_setting(key(previous, "deploy"),
+                                       {"state": "health_unconfirmed", "sha": PREVIOUS, "repository": "example/project",
+                                        "created_at": time.time() - 60})
+        compares = []
+        def api_ahead(repo, endpoint, method="GET", fields=None):
+            if endpoint.startswith("compare/"):
+                compares.append(endpoint)
+                return {"status": "ahead"}
+            return self.api(repo, endpoint, method, fields)
+        with patch("adaptive_rsi.release.api", side_effect=api_ahead):
+            result = self.tick()["deploy"]
+        self.assertEqual(result["state"], "submitted")
+        self.assertEqual(compares, ["compare/" + PREVIOUS + "..." + MERGED])
+
+    def test_rollback_health_unconfirmed_target_wait_is_bounded(self):
+        from adaptive_rsi.release import TARGET_WAIT_SECONDS
+        deploy = self.setup_deployment()
+        previous = "previous-run"
+        self.runtime.store.put_setting(owner_key(self.project, "example/project", deploy),
+                                       {"run": previous, "sha": PREVIOUS})
+        stale = {"state": "rollback_health_unconfirmed", "sha": PREVIOUS, "repository": "example/project",
+                 "rollback": {"state": "workflow_succeeded", "sha": PREVIOUS, "health_started_at": time.time() - 60}}
+        self.runtime.store.put_setting(key(previous, "deploy"), stale)
+        with patch("adaptive_rsi.release.api", side_effect=AssertionError("target wait must not read GitHub")):
+            waiting = self.tick()["deploy"]
+        self.assertEqual(waiting["state"], "waiting_target")
+        self.assertEqual(waiting["blocked_by_target"], {"run": previous, "state": "rollback_health_unconfirmed"})
+        stale["rollback"]["health_started_at"] = time.time() - TARGET_WAIT_SECONDS - 60
+        self.runtime.store.put_setting(key(previous, "deploy"), stale)
+        with patch("adaptive_rsi.release.api", side_effect=AssertionError("target wait must not read GitHub")):
+            blocked = self.tick()["deploy"]
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertIn(previous, blocked["error"])
+        self.assertIn("automatic tracking of that receipt has stopped", blocked["error"])
+
+    def test_receipt_state_table_drives_pending_and_deployment_ownership(self):
+        from adaptive_rsi.release import AUTOMATION_STATES, automation_state_flag, deployment_terminal
+        deploy = self.setup_deployment()
+        identity = {"repository": "example/project", "workflow": deploy["workflow"], "ref": deploy["ref"],
+                    "workflow_sha": deploy["sha"], "sha": MERGED, "operation_id": "fixture"}
+        for state in AUTOMATION_STATES:
+            receipt = {"state": state, **identity}
+            if state == "rolling_back":
+                receipt["rollback"] = {"state": "running", **identity}
+            self.runtime.store.put_setting(key(self.run["id"], "deploy"), receipt)
+            with self.subTest(state=state):
+                self.assertEqual(pending(self.runtime, self.run),
+                                 not automation_state_flag(receipt, "terminal", deploy))
+                self.assertEqual(deployment_terminal(receipt, deploy),
+                                 automation_state_flag(receipt, "ownership_terminal", deploy))
+        self.assertTrue(deployment_terminal({"state": "health_unconfirmed"}, deploy))
+        self.assertFalse(deployment_terminal({"state": "rollback_health_unconfirmed"}, deploy))
+
     def test_retry_rejected_preflight_refuses_when_another_deployment_active(self):
         deploy = self.setup_deployment()
         def rejected(repo, endpoint, method="GET", fields=None):
