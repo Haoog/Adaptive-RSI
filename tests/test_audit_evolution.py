@@ -2078,6 +2078,67 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('Symlink overlaps reproduction overlay', row['error'])
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_bundle_reproduction_fails_check_with_missing_cwd(self):
+        # 声明的 cwd 不在用例树里时不得退回 staging 根目录执行：那样检查会在
+        # 错误目录里通过，整包被判可复现，接收方也无从核对实际工作目录。
+        overlay = self.root / 'overlay-cwd'
+        (overlay / 'sub').mkdir(parents=True)
+        (overlay / 'sub' / 'marker.txt').write_text('present\n')
+        checks = [
+            {'name': 'missing_cwd', 'cwd': 'nested', 'argv': ['python3', '-c', 'print("ran")']},
+            {'name': 'root_cwd', 'cwd': '.', 'argv': ['python3', '-c', 'print("root")']},
+            {'name': 'subdir_cwd', 'cwd': 'sub',
+             'argv': ['python3', '-c',
+                      'import pathlib, sys; sys.exit(0 if pathlib.Path("marker.txt").is_file() else 7)']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-cwd-missing', overlay=overlay)
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertTrue(result['integrity']['valid'])
+        rows = {row['check']: row for row in result['executed_checks']}
+        self.assertEqual(sorted(rows), ['missing_cwd', 'root_cwd', 'subdir_cwd'])
+        missing = rows['missing_cwd']
+        self.assertFalse(missing['passed'])
+        self.assertEqual(missing['exit_code'], -1)
+        self.assertEqual(missing['cwd'], 'nested')
+        self.assertIn('cwd', missing['error'])
+        # 合法 cwd（根目录与 overlay 提供的既有子目录）照常执行并通过。
+        self.assertTrue(rows['root_cwd']['passed'], rows['root_cwd'])
+        self.assertTrue(rows['subdir_cwd']['passed'], rows['subdir_cwd'])
+        self.assertFalse(result['reproducible'])
+        self.assertFalse(result['checks_passed'])
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertIn('Offline checks failed: 1 of 3', ' '.join(result['limitations']))
+
+    def test_bundle_reproduction_rejects_cwd_symlink_escape(self):
+        # 用例仓库内的符号链接把 cwd 指向副本之外时，同样不能静默改写工作目录
+        # 后照常执行；该检查必须失败，且命令不得在副本外的目标目录留下副作用。
+        destination = self.sealed_bundle(
+            checks=[{'name': 'escaped_cwd', 'cwd': 'escape',
+                     'argv': ['python3', '-c', 'open("ESCAPED", "w").write("1")']}],
+            repo_name='repo-cwd-escape')
+        case_dir = destination / 'cases' / 'case-cwd-escape'
+        outside = self.root / 'outside-cwd'
+        outside.mkdir()
+        (case_dir / 'repository' / 'escape').symlink_to(outside)
+
+        with patch.object(Evolution, 'verify_bundle',
+                          return_value={'valid': True, 'mismatches': [], 'limitations': []}):
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertEqual(row['cwd'], 'escape')
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertIn('escapes the case copy', row['error'])
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse(result['reproducible'])
+
     def test_bundle_credentials_follow_exported_provider_requirements(self):
         # 线程 3：凭据需求来自导出的非机密 provider 元数据，不再默认 OPENAI_API_KEY。
         destination = self.sealed_bundle(repo_name='repo-creds')
