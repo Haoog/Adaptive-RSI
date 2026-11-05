@@ -880,6 +880,7 @@ const english = {
   "发现 bug 和有价值的改进，逐步检查各模块。": "Find bugs and useful improvements while progressively inspecting modules.",
   "同步 Issues，进入同一个价值评估流程。": "Sync Issues into the same value assessment workflow.",
   "系统会尝试改进工作方法，但不能自行放宽检查标准或权限。": "The system can improve its working methods, while checks and permissions remain protected.",
+  "系统状态": "System status",
   "模型调用与 tokens 只记录用量，不设置调用次数、费用或任务数量额度。可以随时暂停或取消任务。": "Model calls and tokens are recorded without call, cost or task quotas. Pause or cancel tasks at any time.",
   "Docker（执行与检查）": "Docker (execution and checks)",
   "本机私有文件（服务器）": "Private local file (server)",
