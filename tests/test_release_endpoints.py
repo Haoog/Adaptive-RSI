@@ -273,6 +273,8 @@ class ReleaseReconciliationRaceTest(unittest.TestCase):
                     if method == "POST":
                         posts.append(endpoint)
                         return {}
+                    if endpoint.endswith("/jobs?per_page=20"):
+                        return {"total_count": 0, "jobs": []}
                     self.assertEqual(endpoint, "actions/runs/" + str(target["workflow_run_id"]))
                     if threading.get_ident() == tracker_thread[0]:
                         snapshot_taken.set()
