@@ -309,8 +309,11 @@ def delivery_checks(pr):
 
 
 def merge_gate(pr, head, base):
-    if pr["headRefOid"] != head or pr["baseRefOid"] != base:
+    if pr["headRefOid"] != head:
         return "stale"
+    if pr["baseRefOid"] != base:
+        # 目标分支前进不等于候选失败：保留同一 PR，先更新分支再重跑检查。
+        return "behind"
     checks = pr.get("statusCheckRollup") or []
     if not checks:
         return "waiting_ci"
@@ -347,6 +350,73 @@ def baseline_change(source, previous, current):
     except (RuntimeError, OSError):
         pass
     return result
+
+
+REBASE_ATTEMPT_LIMIT = 12  # 退避曲线与关闭失败共用；上限让无果更新收敛到重排。
+
+
+def update_behind(runtime, project, run, outcome, policy, repo, now):
+    """把前进的目标分支并入候选分支并重封，保留同一个 PR 而不是关闭重排。
+
+    返回新的 gate：重封为 waiting_ci；暂不宜写远端为 waiting；工作区缺失、基线
+    被改写、冲突或退避用尽为 stale，交回关闭重排路径。
+    """
+    store = runtime.store
+    attempts, last = outcome.get("rebase_attempts"), outcome.get("rebase_retry_at")
+    if isinstance(attempts, int) and (attempts >= REBASE_ATTEMPT_LIMIT or (
+            isinstance(last, (int, float)) and now - last < _write_retry_delay(attempts))):
+        return "stale" if attempts >= REBASE_ATTEMPT_LIMIT else "waiting"
+    workspace = Path(store.root) / "runs" / run["id"] / "candidate"
+    if not workspace.is_dir():
+        store.event("delivery_rebase_unavailable", "Candidate workspace is missing", project["id"], run["id"])
+        return "stale"
+    config = merge(runtime.config(project["id"]), {"delivery": {"base_branch": policy["branch"]}})
+    source, current, branch = baseline(runtime, project, config)
+    change = baseline_change(source, policy["base"], current)
+    if branch != policy["branch"] or change["relation"] == "identical":
+        return "waiting"  # PR 读数尚未追上真实基线：本轮不写，下轮重判。
+    if change["relation"] != "advanced":
+        # 基线被改写：候选基于的提交已不在主线，合并没有正确结果可分叉。
+        store.event("baseline_changed", "Remote baseline rewrite invalidates the candidate",
+                    project["id"], run["id"], change)
+        return "stale"
+    attempts = (attempts if isinstance(attempts, int) else 0) + 1
+    outcome.update(rebase_attempts=attempts, rebase_retry_at=now)
+    store.execute("UPDATE runs SET result=? WHERE id=? AND state='pr_open'", (encode(outcome), run["id"]))
+    try:
+        github_git(workspace, "fetch", "--quiet", "--no-tags", "https://github.com/" + repo + ".git",
+                   "+refs/heads/" + policy["branch"] + ":refs/remotes/origin/" + policy["branch"], timeout=180)
+        # 快照是浅克隆，只取基线分支尖端算不出合并基点，因此完整取该分支历史。
+        github_git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
+                   "merge", "--no-edit", "origin/" + policy["branch"], timeout=180)
+    except Exception as exc:
+        conflicted = (workspace / ".git" / "MERGE_HEAD").exists()
+        try:
+            git(workspace, "merge", "--abort")
+        except Exception:
+            pass
+        store.event("delivery_rebase_conflict", str(exc), project["id"], run["id"], change)
+        return "stale" if conflicted else "waiting"
+    head = git(workspace, "rev-parse", "HEAD")
+    try:
+        github_git(workspace, "push", "https://github.com/" + repo + ".git",
+                   "HEAD:refs/heads/" + policy["branch"], timeout=180)
+    except Exception:
+        return "waiting"  # 本地已合并、远端未更新：下轮重试仍是 fast-forward。
+    sealed = {"repository": repo, "branch": policy["branch"], "sha": current}
+    resealed = {"head": head, "base": current, "branch": policy["branch"], "repository": repo}
+    with store.connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        live = db.execute("SELECT state FROM runs WHERE id=?", (run["id"],)).fetchone()
+        if not live or live["state"] != "pr_open":
+            return "waiting"
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery:" + run["id"], encode(resealed)))
+        db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(sealed)))
+    outcome.pop("rebase_attempts", None)
+    outcome.pop("rebase_retry_at", None)
+    store.event("baseline_changed", "Target branch advanced; candidate branch re-sealed",
+                project["id"], run["id"], change)
+    return "waiting_ci"
 
 
 def pushed_branch_journal(repo, store):
@@ -689,7 +759,7 @@ _CLOSE_PENDING = ("(r.state='superseded' AND json_valid(r.result) "
                   "AND coalesce(json_extract(r.result,'$.close_abandoned'),'')='')")
 
 
-def _close_retry_delay(attempts):
+def _write_retry_delay(attempts):
     return min(CLOSE_RETRY_MAX, CLOSE_RETRY_INITIAL * 2 ** max(0, min(attempts, 8) - 1))
 
 
@@ -698,7 +768,7 @@ def _close_retry_due(outcome, now):
     attempts = outcome.get("close_attempts")
     if not isinstance(last, (int, float)) or not isinstance(attempts, int):
         return True
-    return now - last >= _close_retry_delay(attempts)
+    return now - last >= _write_retry_delay(attempts)
 
 
 def _close_superseded_pr(store, run, outcome, repo, pr, cancelled, now):
@@ -1142,9 +1212,13 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                 if pr.get("baseRefName", policy["branch"]) != policy["branch"] or (
                         config["delivery"]["base_branch"] and config["delivery"]["base_branch"] != policy["branch"]):
                     gate = "stale"
+                if gate == "behind" and not sealed_target:
+                    # 密封身份都对不上时不是「基线前进」，仍按原路径重排。
+                    gate = "stale"
                 # 与状态同点落库：读方不必跳 GitHub 就能分辨哪条检查在排队、哪条失败。
                 # 全绿或无可展示项时清掉上一 tick 的明细，避免状态前进后面板仍显示旧失败。
-                details = delivery_checks(pr) if gate != "stale" else []
+                # behind 的检查属于旧 head，更新分支后必然重跑，故不落库。
+                details = delivery_checks(pr) if gate not in ("stale", "behind") else []
                 if details:
                     outcome["delivery_checks"] = details
                 else:
@@ -1232,7 +1306,6 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                                               active_run, tracking_cancelled, tick_baselines)
                             continue
                         outcome = previous
-                    outcome["delivery_status"] = gate
                     # 同时要求运行时及当前项目授权，撤销授权立即阻止合并。
                     try:
                         run_config = json.loads(run["config"] or "{}")
@@ -1240,6 +1313,10 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                         run_config = {}
                     authorized = _dict_field(run_config, "delivery").get("auto_merge") and config["delivery"]["auto_merge"]
                     authorized = authorized and sealed_target
+                    if gate == "behind" and authorized and not tracking_cancelled():
+                        # 基线前进：先更新同一 PR 的分支再重跑检查，不再关闭重排整轮。
+                        gate = update_behind(runtime, project, run, outcome, policy, repo, now)
+                    outcome["delivery_status"] = "waiting" if gate == "behind" else gate
                     if gate == "ready" and authorized and not runtime.project(project["id"])["paused"]:
                         # 同一 tick 内的就绪 run 共享一次真实 fetch：首个准入复核
                         # （或更早的监控观测）留下的本轮读数按目标分支复用，密封判定

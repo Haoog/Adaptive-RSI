@@ -302,7 +302,7 @@ class DeliveryLoopTest(unittest.TestCase):
         good = {"headRefOid": "head", "baseRefOid": "base", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
                 "reviewDecision": "", "statusCheckRollup": [{"conclusion": "SUCCESS"}]}
         self.assertEqual(merge_gate(good, "head", "base"), "ready")
-        for values, state in [({"headRefOid": "other"}, "stale"), ({"baseRefOid": "other"}, "stale"),
+        for values, state in [({"headRefOid": "other"}, "stale"), ({"baseRefOid": "other"}, "behind"),
                               ({"mergeable": "CONFLICTING"}, "waiting"), ({"reviewDecision": "REVIEW_REQUIRED"}, "waiting_review"),
                               ({"statusCheckRollup": []}, "waiting_ci"),
                               ({"statusCheckRollup": [{"conclusion": "FAILURE"}]}, "ci_failed"),
@@ -1043,6 +1043,73 @@ print('BOUNDARIES_OK')
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
         self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
         self.assertNotIn("close_pending", json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"]))
+
+    def behind_fixture(self, conflict=False):
+        base = git(self.repo, "rev-parse", "HEAD")
+        run = self.tracked_pr()
+        for key, sealed in (("delivery:", {"head": "head", "base": base, "branch": "main",
+                                          "repository": "example/project"}),
+                            ("run-baseline:", {"repository": "example/project", "branch": "main", "sha": base})):
+            self.store.put_setting(key + run["id"], sealed)
+        workspace = snapshot(self.repo, self.store.root / "runs" / run["id"] / "candidate", base)
+        commit = ("-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "--quiet", "-m")
+        names = ("calculator.py", "calculator.py") if conflict else ("candidate.txt", "mainline.txt")
+        mine, theirs = (("def add(a, b):\n    return a + b\n", "def add(a, b):\n    return a * b\n")
+                        if conflict else ("candidate\n", "advanced\n"))
+        for root, name, body, message in ((workspace, names[0], mine, "candidate"),
+                                          (self.repo, names[1], theirs, "advance")):
+            (root / name).write_text(body)
+            git(root, "add", name)
+            git(root, *commit, message)
+        return run, workspace, git(self.repo, "rev-parse", "HEAD")
+
+    def behind_remote(self, calls=None):
+        def remote(root, *args, timeout=60):
+            if args[0] == "fetch":
+                return git(root, "fetch", "--no-tags", str(self.repo), "+refs/heads/master:refs/remotes/origin/main")
+            record = calls if calls is not None else []
+            if "push" in args:
+                record.append("push")
+                return ""
+            record.append("merge")
+            return git(root, *args)
+        return remote
+
+    def test_advanced_base_updates_the_same_pr_instead_of_replanning(self):
+        run, workspace, new_base = self.behind_fixture()
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", "head"), "baseRefOid": new_base}
+        calls = []
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), new_base, "main")), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=self.behind_remote(calls)), \
+                patch("adaptive_rsi.delivery.checked") as command:
+            tick(self.runtime, 1000)
+        self.assertEqual(calls, ["merge", "push"])
+        self.assertEqual(git(workspace, "rev-parse", "HEAD^2"), new_base)
+        command.assert_not_called()
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "pr_open")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "pr_open")
+        result = self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"]
+        self.assertEqual(json.loads(result)["delivery_status"], "waiting_ci")
+        self.assertEqual(self.store.setting("run-baseline:" + run["id"]),
+                         {"repository": "example/project", "branch": "main", "sha": new_base})
+        self.assertEqual(self.store.setting("delivery:" + run["id"])["head"], git(workspace, "rev-parse", "HEAD"))
+
+    def test_conflicting_base_update_falls_back_to_close_and_replan(self):
+        run, workspace, new_base = self.behind_fixture(conflict=True)
+        self.runtime.configure({"limits": {"retries": 1}}, self.project)
+        pr = {**self.pr_row("https://github.com/example/project/pull/1", "head"), "baseRefOid": new_base}
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), new_base, "main")), \
+                patch("adaptive_rsi.delivery.pr_view", return_value=pr), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=self.behind_remote()), \
+                patch("adaptive_rsi.delivery.checked") as command:
+            tick(self.runtime, 1000)
+        self.assertIn("close", command.call_args.args[0])
+        self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (run["id"],))["state"], "superseded")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (run["task"],))["state"], "queued")
+        self.assertTrue(self.store.one("SELECT 1 FROM events WHERE kind='delivery_rebase_conflict' AND run=?",
+                                       (run["id"],)))
+        self.assertFalse((workspace / ".git" / "MERGE_HEAD").exists())
 
     def test_legacy_tracking_cannot_overwrite_new_attempt_even_when_it_has_a_pr(self):
         old = self.tracked_pr()
