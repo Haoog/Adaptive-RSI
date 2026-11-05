@@ -1412,6 +1412,58 @@ class AuthSessionTests(unittest.TestCase):
         self.assertIsInstance(manager._close_error, OSError)
         self.assertEqual(manager.status(session["id"])["state"], "interrupted")
 
+    def test_worker_close_error_does_not_abort_close(self):
+        release, finished = threading.Event(), threading.Event()
+
+        class Broken(FakeAuth):
+            def close(worker):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        class Healthy(FakeAuth):
+            def close(worker):
+                try:
+                    super(Healthy, worker).close()
+                finally:
+                    release.set()
+
+        broken, healthy = Broken("codex"), Healthy("opencode")
+        self.created.extend([broken, healthy])
+        manager = AuthSessions(self.root / "close-worker-error", factory=self.factory, ttl=600)
+        self.addCleanup(manager.close)
+        manager.workers["broken"] = (broken, threading.Event())
+        manager.workers["healthy"] = (healthy, threading.Event())
+        manager._thread(lambda: (release.wait(5), finished.set()))
+        manager.close()
+        # 首个 worker 抛错只记录诊断：其余 worker 与线程回收必须照常完成。
+        self.assertTrue(manager.closed)
+        self.assertIsInstance(manager._close_error, BrokenPipeError)
+        self.assertTrue(healthy.closed)
+        self.assertTrue(finished.is_set(), "close() skipped joining the remaining threads")
+        self.assertEqual(manager.threads, set())
+
+    def test_process_close_ignores_dead_child_with_buffered_stdin(self):
+        worker = auth_sessions._Process("codex")
+        worker.container = False
+        worker.container_name = ""
+        worker.process = subprocess.Popen([sys.executable, "-c", "pass"],
+                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            # 8 字节留在用户态缓冲：子进程已退出后 close() 会再 flush 并抛 BrokenPipeError。
+            worker.process.stdin.write(b"01234567")
+            worker.process.wait(timeout=10)
+            worker.close()
+            self.assertTrue(worker.is_closed)
+            self.assertFalse(worker.home.exists())
+            self.assertTrue(any(isinstance(exc, BrokenPipeError) for exc in worker.close_errors))
+        finally:
+            for stream in (worker.process.stdin, worker.process.stdout):
+                if stream and not stream.closed:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+            worker.directory.cleanup()
+
     def test_reserve_registers_busy_session_before_any_worker_launch(self):
         session = self.manager.reserve("codex")
         self.assertEqual(session["state"], "starting")
