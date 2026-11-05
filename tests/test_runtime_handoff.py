@@ -1217,6 +1217,75 @@ class RuntimeHandoffTest(unittest.TestCase):
         self.assertEqual(self.store.setting('postprocess:' + runs[0]['id'])['state'], 'completed')
         self.assertEqual(self.store.one('SELECT count(*) AS n FROM skills')['n'], 2)
 
+    def test_postprocess_tick_budget_frees_dispatch_lock_between_records(self):
+        # 单条 delivery 会同步等待 git push / gh pr create；旧实现把整批（最多 20 条）
+        # 放进 dispatch_lock，暂停、保存配置和调度领取都要等整批跑完。这里用 20 条
+        # pending + 每条 0.5s 的交付桩验证 drain 自身的锁范围：一次 drain 在 tick 预算
+        # 附近返回、留下可续的 marker，且 drain 在途时 pause()/dispatch() 立即返回
+        # （真实 deliver 内部的重入 dispatch_lock 仍只覆盖单条交付）。
+        from adaptive_rsi import runtime as runtime_module
+        project = self.runtime.add_project(fixture(self.root / 'bounded-tick'))
+        self.runtime.configure({'delivery': {'mode': 'pr'}, 'evolution': {'enabled': False}}, project)
+        self.runtime.pause(project, False)
+        runs = []
+        for index in range(runtime_module.POSTPROCESS_BATCH):
+            self.runtime.goal(project, 'Bounded postprocess ' + str(index))
+            run = self.store.claim(project, self.runtime.config(project))
+            self.runtime.queue_postprocess(run)
+            self.store.transition(run['id'], 'awaiting_approval', {
+                'summary': 'Verified outcome',
+                'evaluation': {'decision': 'pass'},
+                'review': {'decision': 'pass'},
+            }, True)
+            runs.append(run['id'])
+
+        calls, delivering = [], threading.Event()
+        def slow_deliver(run_id, automatic=False):
+            calls.append(run_id)
+            delivering.set()
+            time.sleep(.5)
+
+        def pending_markers():
+            return self.store.one("SELECT count(*) AS n FROM settings WHERE key>=? AND key<?",
+                                  ('postprocess-pending:', 'postprocess-pending;'))['n']
+
+        watched = {}
+        def watch_latency():
+            self.assertTrue(delivering.wait(10))
+            began = time.monotonic()
+            self.runtime.pause(project, True)
+            watched['pause'] = time.monotonic() - began
+            began = time.monotonic()
+            self.runtime.dispatch([])
+            watched['dispatch'] = time.monotonic() - began
+
+        with patch.object(self.runtime, 'deliver', side_effect=slow_deliver):
+            watcher = threading.Thread(target=watch_latency)
+            watcher.start()
+            began = time.monotonic()
+            self.runtime.drain_postprocess()
+            elapsed = time.monotonic() - began
+            watcher.join(10)
+
+            # 预算内处理了若干条并留下剩余待办，而不是一次跑完 20 条（~10s）。
+            self.assertGreaterEqual(len(calls), 1)
+            self.assertLess(len(calls), len(runs))
+            self.assertGreater(pending_markers(), 0)
+            self.assertLessEqual(elapsed, runtime_module.POSTPROCESS_TICK_SECONDS + 1)
+            # 交付在途时暂停/调度领取仍立即返回，不被 gh 往返拖住。
+            self.assertLessEqual(watched['pause'], .2)
+            self.assertLessEqual(watched['dispatch'], .2)
+
+            # 后续 tick 接着做完剩余 marker；每条恰好交付一次。
+            for _ in range(runtime_module.POSTPROCESS_BATCH + 1):
+                if not pending_markers():
+                    break
+                self.runtime.drain_postprocess()
+        self.assertEqual(pending_markers(), 0)
+        self.assertEqual(sorted(calls), sorted(runs))
+        self.assertEqual({self.store.setting('postprocess:' + run_id)['state'] for run_id in runs},
+                         {'completed'})
+
     def test_postprocess_pending_index_is_bounded_and_range_scanned(self):
         from adaptive_rsi import runtime as runtime_module
         batch = getattr(runtime_module, 'POSTPROCESS_BATCH', 20)

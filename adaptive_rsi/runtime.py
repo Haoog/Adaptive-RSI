@@ -45,8 +45,13 @@ STAGE_BUDGET_CHECKPOINT_SECONDS = 15
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
 
-# 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度锁。
+# 后处理待办的领取上限：每轮最多处理这一数量，避免历史遗留或持续失败项长时间占用调度线程。
 POSTPROCESS_BATCH = 20
+
+# 后处理每轮的墙钟预算：单条 delivery 会同步执行 git push 与 gh pr create（各 60s
+# 超时），整批 20 条最多能把调度线程占住几十分钟。预算用尽即返回，剩余 marker 留在
+# 持久索引里由下一个调度节拍继续；单条 drain_postprocess(run_id) 不受此预算限制。
+POSTPROCESS_TICK_SECONDS = 5
 
 # 后处理确定性失败的重试上限：attempts 达到上限后置 failed 终态并摘除待办索引，
 # 不再每 5 秒热循环。重试节奏由调度节拍本身（~5s）承担，瞬时失败保持即时重试契约。
@@ -180,6 +185,9 @@ class Runtime(Maintenance):
         self._automation_locks = {}
         self._automation_locks_guard = threading.Lock()
         self.dispatch_lock = threading.RLock()
+        # 后处理专用锁：只串行后处理本身，不参与暂停/保存配置/调度领取。旧实现把整批
+        # 后处理放在 dispatch_lock 里，一条 gh pr create 就能冻结这些入口数十秒。
+        self._postprocess_lock = threading.RLock()
         self.maintenance_lock = threading.Lock()
         self.maintenance_thread = None
         self.maintenance_stop = threading.Event()
@@ -1493,16 +1501,20 @@ class Runtime(Maintenance):
                        (marker, encode({'created': time.time()})))
 
     def drain_postprocess(self, run_id=None):
-        with self.dispatch_lock:
-            return self._drain_postprocess(run_id)
+        # 不再整批持 dispatch_lock：逐条只取后处理专用锁，单条副作用仍由 deliver()
+        # 内部的重入 dispatch_lock 与任务写保持原子。整批远端调用若占用全局锁，
+        # 用户点暂停、保存配置、切换项目与调度领取都要排在一条 gh pr create 后面。
+        return self._drain_postprocess(run_id)
 
     def _drain_postprocess(self, run_id=None):
         if run_id is not None:
             key = 'postprocess:' + run_id
-            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
-            if row:
-                self._drain_postprocess_record(key, run_id, row['value'],
-                                               'postprocess-pending:' + run_id)
+            # 回执读取与处理同锁：另一线程刚完成时不能拿旧快照重放步骤。
+            with self._postprocess_lock:
+                row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+                if row:
+                    self._drain_postprocess_record(key, run_id, row['value'],
+                                                   'postprocess-pending:' + run_id)
             return
         # 待办索引使用主键范围（而不是 LIKE 全表扫描）并有界领取；已完成/obsolete
         # 的历史回执继续留在 postprocess: 命名空间，但不会进入本轮的查询与解析。
@@ -1517,14 +1529,21 @@ class Runtime(Maintenance):
                                         ('postprocess-pending:', cursor, POSTPROCESS_BATCH - len(markers)))
         if markers:
             self.store.put_setting('postprocess-pending-cursor', markers[-1]['key'])
+        # 每轮有墙钟预算：单条 delivery 可能卡到 60s 超时，处理到预算用尽就返回，
+        # 未处理的 marker 留在持久索引里由下一个调度节拍接着做；至少处理一条，
+        # 否则慢速输入会让待办永不前进。
+        deadline = time.monotonic() + POSTPROCESS_TICK_SECONDS
         for marker in markers:
             identifier = marker['key'].split(':', 1)[1]
             key = 'postprocess:' + identifier
-            row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
-            if not row:
-                self.store.execute('DELETE FROM settings WHERE key=?', (marker['key'],))
-                continue
-            self._drain_postprocess_record(key, identifier, row['value'], marker['key'])
+            with self._postprocess_lock:
+                row = self.store.one('SELECT value FROM settings WHERE key=?', (key,))
+                if row:
+                    self._drain_postprocess_record(key, identifier, row['value'], marker['key'])
+                else:
+                    self.store.execute('DELETE FROM settings WHERE key=?', (marker['key'],))
+            if time.monotonic() >= deadline:
+                break
 
     def _drain_postprocess_record(self, key, identifier, value, marker=None):
         with self.scheduler_scope('postprocess_run', run=identifier):
