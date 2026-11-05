@@ -1572,8 +1572,10 @@ class AuthSessions:
         except Exception as exc:
             if not isinstance(exc, AuthError):
                 # 不记录异常文本或 traceback，第三方错误中可能包含授权材料。
-                logging.getLogger(__name__).warning("Auth session %s failed unexpectedly: %s",
-                                                    session_id, type(exc).__name__)
+                # errno/code 是有界的诊断值；路径与异常原文仍然不落日志。
+                logging.getLogger(__name__).warning("Auth session %s failed unexpectedly: %s (errno=%s, code=%s)",
+                                                    session_id, type(exc).__name__,
+                                                    getattr(exc, "errno", None), getattr(exc, "code", None))
             entry = self.sessions.get(session_id)
             if entry is None:
                 return
@@ -1649,6 +1651,10 @@ class AuthSessions:
                 # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
                 self._invalidate_caches(backend)
                 self._update(session_id, state="completed")
+        except OSError as exc:
+            # 磁盘满、只读挂载或容器权限不足时凭据写不进去；与协议错误分开上报，
+            # 否则前端会误让用户升级工具。errno 只进内部 detail，不进入响应或日志文本。
+            raise AuthError("auth_storage_failed", {"errno": exc.errno}) from None
         finally:
             credential_lock.release()
 
