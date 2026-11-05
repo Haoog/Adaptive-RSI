@@ -321,6 +321,12 @@ class AuditRound4Test(unittest.TestCase):
         self.assertFalse(empty_test_run("1 failed, 1 skipped in 0.01s\n2 skipped in 0.02s\n"))
         # Only when every recognizable suite reports skips does it stay empty.
         self.assertTrue(empty_test_run("2 skipped in 0.01s\n5 skipped, 1 warning in 0.02s\n"))
+        # xfail/xpass test bodies really ran, so a skip-only suite must not
+        # hide them when a wrapper concatenates the two summaries.
+        self.assertFalse(empty_test_run("1 skipped in 0.01s\n1 xfailed in 0.02s\n"))
+        self.assertFalse(empty_test_run("1 xfailed in 0.02s\n1 skipped in 0.01s\n"))
+        self.assertFalse(empty_test_run("1 skipped in 0.01s\n1 xpassed in 0.02s\n"))
+        self.assertFalse(empty_test_run("2 skipped, 1 xfailed in 0.02s\n"))
 
     def test_evaluator_empty_test_run_cargo_all_ignored(self):
         ignored = ("test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; "

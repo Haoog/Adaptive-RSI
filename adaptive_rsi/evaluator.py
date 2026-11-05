@@ -425,12 +425,14 @@ def clarity_test_summary(text):
 # unterminated line must not make this scan backtrack across megabytes.
 _QUIET_SUMMARY_LINE = re.compile(r"(?m)^[ \t]*([^\n]{1,200}?) in [\d.]+s(?: \([^)]*\))?[ \t]*$")
 _QUIET_SUMMARY_FIELD = re.compile(
-    r"^(\d+) (passed|failed|skipped|error|errors|warning|warnings|deselected)$")
+    r"^(\d+) (passed|failed|skipped|xfailed|xpassed|error|errors|warning|warnings|deselected)$")
 _QUIET_SUMMARY_FIELDS = {"passed": "passed", "failed": "failed", "skipped": "skipped",
+                         "xfailed": "xfailed", "xpassed": "xpassed",
                          "error": "error", "errors": "error",
                          "warning": "warning", "warnings": "warning",
                          "deselected": "deselected"}
-_QUIET_SUMMARY_OUTCOMES = {"passed", "failed", "skipped", "error", "deselected"}
+_QUIET_SUMMARY_OUTCOMES = {"passed", "failed", "skipped", "xfailed", "xpassed",
+                           "error", "deselected"}
 
 
 def _pytest_quiet_summary(text):
@@ -449,8 +451,11 @@ def _pytest_quiet_summary(text):
     executed a test body must keep the whole check non-empty. Only the
     zero/nonzero split of the totals drives the gate, so summing repeated or
     ordered summaries cannot turn a skip-only run into executed evidence.
+    ``xfailed``/``xpassed`` outcomes ran their bodies too, so they are
+    execution evidence; only ``skipped`` (and collection bookkeeping such as
+    errors/deselected/warnings) stays out of ``executed``.
     """
-    totals = {"passed": 0, "failed": 0, "skipped": 0}
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}
     recognized = False
     for match in _QUIET_SUMMARY_LINE.finditer(text):
         fields = {}
@@ -468,7 +473,8 @@ def _pytest_quiet_summary(text):
     if not recognized:
         return None
     return {"format": "pytest_quiet",
-            "executed": totals["passed"] + totals["failed"], **totals}
+            "executed": (totals["passed"] + totals["failed"]
+                         + totals["xfailed"] + totals["xpassed"]), **totals}
 
 
 # empty_test_run 处理的是命令原始输出，verbose 运行可达数十 MB；零计数/空跑/计数/
