@@ -651,6 +651,9 @@ const english = {
   "远端项目请填写服务器上的路径。": "Enter the path on the server for remote projects.",
 
   "重试是否启动仍待确认": "Retry startup is still unconfirmed",
+  "对账多次失败，已停止自动确认": "Reconciliation failed repeatedly; automatic confirmation stopped",
+  "自动对账已停止，需要人工确认": "Automatic reconciliation stopped; manual confirmation required",
+  "恢复 GitHub 访问后，用下面的只读查询确认并关联已有工作流记录。": "After restoring GitHub access, use the read-only query below to confirm and link an existing workflow run.",
   "GitHub 暂未确认重试，请查看工作流。重新确认只查询状态，不会再次启动。": "GitHub has not confirmed the retry. Check the workflow. Confirming again only reads its status and does not start another run.",
   "重新确认状态": "Check status again",
   "重试恢复旧版本": "Retry restoring the previous version",

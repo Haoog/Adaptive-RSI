@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from adaptive_rsi.store import Store
+from adaptive_rsi.store import Store, WAL_SIZE_LIMIT_BYTES
 
 
 class StoreObservabilityTest(unittest.TestCase):
@@ -407,3 +407,135 @@ class StoreObservabilityTest(unittest.TestCase):
         audit = self.store.relationship_audit(limit=200)
         self.assertEqual(len(audit['stages_without_run']), 120)
         self.assertFalse(audit['_truncated']['stages_without_run'])
+
+    def test_bulk_vacuum_wal_is_capped_and_reclaimed(self):
+        # 复现 be-455：批量写 → 保留删除 → VACUUM 后主库缩小，WAL 却永久停在
+        # 历史峰值；journal_size_limit 限制增长，无残留页时 TRUNCATE 归还磁盘。
+        wal = Path(str(self.store.path) + '-wal')
+        page_size = self.store.metrics()['page_size']
+
+        def wal_bytes():
+            return wal.stat().st_size if wal.exists() else 0
+
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.executemany("INSERT INTO events(project,run,kind,message,data,created) "
+                           "VALUES ('p',NULL,'bulk',?,'{}',?)",
+                           [('x' * 900, float(index)) for index in range(20000)])
+        self.store.execute("DELETE FROM events WHERE kind='bulk'")
+        with self.store.connect() as db:
+            db.execute('VACUUM')
+        self.store.put_setting('wal-probe', 1)
+        self.assertLessEqual(wal_bytes(), WAL_SIZE_LIMIT_BYTES + page_size)
+        report = self.store.wal_diagnostics(checkpoint=True)
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertEqual(report['truncate'], 'ok')
+        self.assertTrue(report['truncated'])
+        self.assertEqual(report['journal_size_limit_bytes'], WAL_SIZE_LIMIT_BYTES)
+        metrics = self.store.metrics()
+        self.assertEqual(metrics['wal_size_limit_bytes'], WAL_SIZE_LIMIT_BYTES)
+        self.assertEqual(metrics['wal_bytes'], wal_bytes())
+        self.assertLessEqual(metrics['wal_bytes'], page_size)
+        self.assertEqual(self.store.one('PRAGMA integrity_check')['integrity_check'], 'ok')
+
+    def test_checkpoint_yields_to_snapshot_then_truncates_next_cycle(self):
+        self.store.event('before', 'first')
+        self.store.wal_diagnostics(checkpoint=True)
+        wal = Path(str(self.store.path) + '-wal')
+        began = time.monotonic()
+        with self.store.snapshot():
+            self.store.query('SELECT * FROM events')
+            worker = threading.Thread(target=lambda: self.store.event('after', 'second'))
+            worker.start()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            report = self.store.wal_diagnostics(checkpoint=True)
+            elapsed = time.monotonic() - began
+            self.assertEqual(report['active_snapshots'], 1)
+            self.assertGreater(report['pending_pages'], 0)
+            self.assertFalse(report['truncated'])
+            self.assertEqual(report['truncate'], 'skipped_pending')
+        self.assertLess(elapsed, 3)
+        pinned = wal.stat().st_size if wal.exists() else 0
+        self.assertGreater(pinned, 0)
+        report = self.store.wal_diagnostics(checkpoint=True)
+        self.assertEqual(report['active_snapshots'], 0)
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertTrue(report['truncated'])
+        self.assertLessEqual(self.store.metrics()['wal_bytes'], 4096)
+        self.assertLess((wal.stat().st_size if wal.exists() else 0), pinned)
+
+    def test_truncate_busy_budget_does_not_wait_for_outside_readers(self):
+        self.store.event('seed', 'first')
+        reader = sqlite3.connect(str(self.store.path), timeout=1)
+        self.addCleanup(reader.close)
+        reader.execute('BEGIN')
+        reader.execute('SELECT count(*) FROM events').fetchone()
+        began = time.monotonic()
+        report = self.store.wal_diagnostics(checkpoint=True)
+        elapsed = time.monotonic() - began
+        reader.execute('COMMIT')
+        self.assertEqual(report['pending_pages'], 0)
+        self.assertEqual(report['truncate'], 'busy')
+        self.assertFalse(report['truncated'])
+        self.assertGreaterEqual(elapsed, .5)
+        self.assertLess(elapsed, 5)
+        self.assertEqual(self.store.metrics()['busy_timeout_ms'], 15000)
+
+    def _reopened_store_with_events(self, rows=120000):
+        # 评审场景：events 播种后丢弃连接池，再从磁盘重新打开 Store；新连接从未
+        # 查询过 events，SQLite 3.46.0 之前的 PRAGMA optimize 因此不会分析它。
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO events(kind,created,project) VALUES (?,?,?)",
+                           (("kind-%d" % (index % 20), time.time() - index, "p")
+                            for index in range(rows)))
+        self.store.close()
+        store = Store(self.store.root)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.one("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"))
+        return store
+
+    def test_maintenance_analyzes_after_reopening_store_without_prior_query(self):
+        # 维护轮在 retention 之后补齐 events 统计；此前没有在同一条连接上执行过
+        # 目标查询，所以不能依赖 0x10000 位让 optimize 顺手分析它。
+        store = self._reopened_store_with_events()
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(store, agent=object()).maintenance()
+
+        self.assertIsNotNone(store.one(
+            "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        plan = [row["detail"] for row in store.query(
+            "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? "
+            "GROUP BY kind", (0, "p"))]
+        self.assertTrue(any("event_kind_created" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def test_planner_refresh_analyzes_tables_optimize_leaves_unanalyzed(self):
+        # 3.46.0 之前 optimize 忽略 0x10000，也不会自动分析没有 sqlite_stat1 的表；
+        # 用空 MASK（什么也不做）等价模拟旧版空转，校验显式 ANALYZE 兜底。行数取
+        # 默认的 120k：抽样统计会让两个候选索引的每前缀基数都报成样本行数，
+        # 规划器因此退回 project_events + TEMP B-TREE，必须真扫全表才不会退化。
+        from adaptive_rsi import maintenance
+        store = self._reopened_store_with_events()
+        with store.connect() as db:
+            db.execute("PRAGMA optimize=0").fetchall()
+        self.assertIsNone(store.one("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"))
+        with patch.object(maintenance, "PLANNER_OPTIMIZE_PRAGMA", "PRAGMA optimize=0"), \
+                patch.object(maintenance, "PLANNER_OPTIMIZE_ALL_TABLES", False):
+            self.assertTrue(maintenance.refresh_query_planner(store))
+        self.assertIsNotNone(store.one(
+            "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        plan = [row["detail"] for row in store.query(
+            "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? "
+            "GROUP BY kind", (0, "p"))]
+        self.assertTrue(any("event_kind_created" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def test_planner_refresh_failure_is_logged_not_raised(self):
+        from adaptive_rsi import maintenance
+        with patch.object(self.store, "connect",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertLogs("adaptive_rsi.maintenance", level="WARNING"):
+                self.assertFalse(maintenance.refresh_query_planner(self.store))
