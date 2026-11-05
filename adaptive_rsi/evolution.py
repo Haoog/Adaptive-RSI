@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -172,6 +173,20 @@ def overlay_available(directory):
     except (OSError, TypeError, ValueError):
         # 非路径类型的 overlay 同样属于「配置了却不可用」；调度与封存都不能因此崩溃。
         return False
+
+
+def file_digest(path):
+    """按 64 KiB 分块计算文件 SHA-256。
+
+    封存包里可能含数据集、二进制或缓存目录；整文件 ``read_bytes()`` 会让峰值内存
+    随单个文件大小线性增长（300 MiB 文件即多占约 300 MiB），并与后续复制包体的
+    峰值叠加。分块读取的摘要与整文件读取完全一致，但内存占用恒定。
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def sealed_tree(root):
@@ -691,7 +706,6 @@ class Evolution:
 
     def export_bundle(self, candidate, destination):
         """Export sealed local inputs, never credentials or arbitrary evidence paths."""
-        import hashlib
         row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate,))
         if not row:
             raise ValueError("Candidate not found")
@@ -759,7 +773,7 @@ class Evolution:
                 if path.is_symlink():
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():
-                    files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    files[path.relative_to(root).as_posix()] = file_digest(path)
             manifest = {"version": 1, "files": files, "limitations": limitations}
             (root / "bundle.json").write_text(encode(manifest), encoding="utf-8")
             return manifest
@@ -769,7 +783,6 @@ class Evolution:
 
     @staticmethod
     def verify_bundle(directory):
-        import hashlib
         import os
         root = Path(directory).resolve()
         manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
@@ -779,7 +792,7 @@ class Evolution:
             path = root / relative
             if Path(relative).is_absolute() or ".." in Path(relative).parts or any(p.is_symlink() for p in [path] + list(path.parents)):
                 mismatches.append(relative)
-            elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            elif not path.is_file() or file_digest(path) != digest:
                 mismatches.append(relative)
         # 反向检查：磁盘上存在但未登记的文件同样是包被改动的证据。逐项比对登记摘要
         # 只能证明"登记过的文件没变"，无法证明"包里只有登记过的文件"：
