@@ -339,6 +339,27 @@ class RuntimeTest(unittest.TestCase):
         finally:
             probe.close()
 
+    def test_start_is_idempotent_and_keeps_one_scheduler_thread(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        self.runtime.start()
+        self.runtime.start()
+        schedulers = [t for t in threading.enumerate() if t.name == "rsi-scheduler"]
+        self.assertEqual(len(schedulers), 1)
+        self.runtime.close()
+        self.assertEqual([t for t in threading.enumerate() if t.name == "rsi-scheduler"], [])
+
+    def test_second_start_does_not_change_project_paused_state(self):
+        self.runtime.configure({"updates": {"mode": "manual"}})
+        paused_project = self.runtime.add_project(fixture(self.root / "paused-project"))
+        self.runtime.pause(self.project, False)
+        self.runtime.start()
+        # 重复 start 是 no-op：不应把已在运行的项目再次批量置为暂停。
+        self.runtime.start(paused=True)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (paused_project,))["paused"], 1)
+        self.assertEqual(
+            self.store.one("SELECT paused FROM projects WHERE id=?", (self.project,))["paused"], 0)
+
     def test_active_strategies_fetches_evidence_without_extra_candidate_queries(self):
         key = compatibility(self.runtime.config(self.project))
         for candidate, evidence in [("a", {"compatibility": key}), ("b", {"compatibility": "other"}),

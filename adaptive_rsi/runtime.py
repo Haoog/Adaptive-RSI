@@ -946,6 +946,14 @@ class Runtime(Maintenance):
         return task
 
     def start(self, paused=False):
+        """Claim the state directory lock and launch the scheduler thread.
+
+        Idempotent while the scheduler is running: a second call returns without
+        starting another thread or re-applying ``paused``, so in-process callers
+        see the same single-owner contract as ``Runtime.open()``.
+        """
+        if self.thread and self.thread.is_alive():
+            return
         if self.lockfile is None or self.lockfile.closed:
             self.lockfile = (self.store.root / "runtime.lock").open("a+")
             try:
