@@ -27,6 +27,13 @@ DEFAULT_PROVIDER_ENV_KEYS = {
     "openrouter": "OPENROUTER_API_KEY",
     "opencode_go": "OPENCODE_API_KEY",
 }
+# 复现包的完整性校验只覆盖「已导出的文件未被篡改」，不证明包里存在可执行的
+# 基线用例：没有 dataset.manifest 的旧候选/手写 ready 行会导出只有 json 的空包，
+# manifest 登记但库中缺失的用例也可能没有随包导出。复现侧据此判不可复现，
+# 并在限制说明里写明缺了哪些用例。
+BUNDLE_NO_CASES = ("Bundle is incomplete: no registered case.json was exported, "
+                   "so offline reproduction has no executable baseline")
+BUNDLE_MISSING_CASES = "Bundle is incomplete: %d of %d registered dataset cases are missing (%s)"
 
 # 重复抑制签名的失败文本归一化：临时目录、绝对路径、run/case/请求 id、UUID 与
 # 时间戳逐实例变化，但同属一类故障；剥掉这些易变成分后同一根因聚成一个签名，
@@ -211,6 +218,27 @@ def sealed_tree(root):
         dirs[:] = [name for name in dirs if name != ".git"]
     if next(root.rglob(".git"), None) is not None:
         raise ValueError("Reproduction bundle cannot contain git metadata")
+
+
+def sealed_evidence(evidence):
+    """就地删掉导出证据里的宿主绝对路径（试验的评估报告路径）。
+
+    ``run_configuration`` 把 ``<state>/experiments/<case>-<rep>/<variant>/evaluation/
+    report.json`` 的绝对路径记进每个试验，导出时会带上用户名与状态目录布局；报告
+    本身不随包导出，也没有读取方，因此导出副本直接删除该字段，而不是写一个包里
+    并不存在的相对路径。只裁剪传入的副本，数据库里的原始证据保持不变。
+    """
+    if isinstance(evidence, dict):
+        for key in list(evidence):
+            item = evidence[key]
+            if key == "report" and isinstance(item, str) and Path(item).is_absolute():
+                del evidence[key]
+            else:
+                sealed_evidence(item)
+    elif isinstance(evidence, list):
+        for item in evidence:
+            sealed_evidence(item)
+    return evidence
 
 
 def case_stratum(case):
@@ -717,6 +745,9 @@ class Evolution:
             evidence = {}
         if not isinstance(evidence, dict):
             evidence = {}
+        # 试验记录带有宿主状态目录下的 report 绝对路径；封存包用于跨机器分享，
+        # 只保留判定字段，路径不进包（本地候选证据仍保留完整路径）。
+        evidence = sealed_evidence(evidence)
         try:
             # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
             # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
@@ -733,9 +764,23 @@ class Evolution:
             (root / "candidate.json").write_text(row["content"], encoding="utf-8")
             limitations = ["Credentials are excluded; external services, model availability and host tools must be supplied independently",
                            "Integrity verification is not proof of isolated-machine reproduction"]
+            # 每个 manifest 条目都登记身份；只有实际抽中执行的用例才封存工作树。
+            # 封存清单覆盖 eligible 全集，但未抽中项从未运行；逐项复制同一
+            # (repository, base) 的完整工作树只会让包体按候选集线性膨胀（N 份相同副本），
+            # 审计所需的 tree/spec 指纹仍由 evidence.json 的 manifest 与这里的身份条目
+            # 保留。无 sampled 标记的旧证据按抽中处理，与 verify_inputs 同口径。
+            entries = []
+            unsampled = 0
             for item in evidence.get("dataset", {}).get("manifest", []):
                 if item["case"] != Path(item["case"]).name or item["case"] in (".", ".."):
                     raise ValueError("Invalid sealed case identity")
+                sampled = bool(item.get("sampled", True))
+                entry = {"case": item["case"], "split": item.get("split"), "tree": item.get("tree"),
+                         "sampled": sampled, "exported": False}
+                entries.append(entry)
+                if not sampled:
+                    unsampled += 1
+                    continue
                 case = self.store.one("SELECT spec FROM cases WHERE id=? AND project=?", (item["case"], row["project"]))
                 if not case:
                     limitations.append("Missing case " + item["case"])
@@ -763,6 +808,10 @@ class Evolution:
                     sealed_tree(target / "overlay")
                 spec = {**spec, "repository": "repository", "overlay": "overlay" if spec.get("overlay") else None}
                 (target / "case.json").write_text(encode(spec), encoding="utf-8")
+                entry["exported"] = True
+            if unsampled:
+                limitations.append(f"{unsampled} unsampled case(s) are recorded by identity only; "
+                                   "their working trees are not sealed in this bundle")
             files = {}
             for path in sorted(root.rglob("*")):
                 if ".git" in path.relative_to(root).parts:
@@ -774,7 +823,9 @@ class Evolution:
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():
                     files[path.relative_to(root).as_posix()] = file_digest(path)
-            manifest = {"version": 1, "files": files, "limitations": limitations}
+            # `cases` 是解包方的索引：条目身份与 evidence.json 的 dataset.manifest 同源，
+            # 后者随 files 逐文件校验；未导出条目没有本地副本可校验，只登记身份。
+            manifest = {"version": 2, "files": files, "cases": entries, "limitations": limitations}
             (root / "bundle.json").write_text(encode(manifest), encoding="utf-8")
             return manifest
         except Exception:
@@ -820,8 +871,10 @@ class Evolution:
     def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
         """Inspect and verify offline reproduction readiness for a sealed bundle.
 
-        Verifies input integrity and itemizes all missing tool dependencies and
-        credentials without failing fast on the first missing requirement.
+        Verifies input integrity, requires at least one exported case with every
+        registered dataset case present, and itemizes all missing tool
+        dependencies and credentials without failing fast on the first missing
+        requirement.
         """
         import os
         import shutil
@@ -833,6 +886,7 @@ class Evolution:
             return {
                 "valid": False,
                 "integrity": {"valid": False, "mismatches": ["bundle.json"]},
+                "cases": {"exported": [], "registered": [], "missing": []},
                 "dependencies": {"available": [], "missing": []},
                 "credentials": {"available": [], "missing": []},
                 "limitations": ["Missing bundle.json: target is not a valid reproduction bundle directory"],
@@ -874,20 +928,43 @@ class Evolution:
         available_tools = []
         missing_tools = []
 
-        # 1. VCS dependency (git)
+        # 1. VCS dependency (git) is derived from registered checks, not assumed.
+        # bundle 明确不含 .git（sealed_tree 导出时整棵删除，残留即判篡改），复现只按
+        # case.json 的 checks 执行，不需要 VCS 元数据。只有某个登记检查的 argv[0] 为
+        # git 时才把宿主 git 计入必需项；未被引用时只记录可用性，缺失既不参与
+        # reproducible 判定，也不阻止 --run-checks 执行其它可运行的检查。
         git_found = lookup("git", path=path_env) if path_env else lookup("git")
-        if git_found:
-            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found)})
-        else:
-            missing_tools.append({"name": "git", "type": "vcs", "reason": "git executable not found in PATH"})
+        git_referenced = False
 
         # 2. Inspect case check dependencies across verified manifest entries only.
         # 未登记的用例目录一律不读、不执行；用例路径出现符号链接则按 verify_bundle
         # 同一套规则判 integrity 失效（防 verify 与读取之间被调包）。
+        # 先按 bundle.json 自身登记的 cases/<id>/case.json 统计「随包导出的用例」：
+        # 空包与缺包即便 integrity 有效，也没有可执行的离线基线。
+        files = manifest.get("files")
+        exported_cases = []
+        if isinstance(files, dict):
+            for relative in sorted(files):
+                parts = Path(relative).parts
+                if len(parts) == 3 and parts[0] == "cases" and parts[2] == "case.json":
+                    exported_cases.append(parts[1])
+        registered_cases = []
+        dataset = evidence.get("dataset") if isinstance(evidence, dict) else None
+        if isinstance(dataset, dict) and isinstance(dataset.get("manifest"), list):
+            for item in dataset["manifest"]:
+                if not isinstance(item, dict):
+                    continue
+                # 未抽中执行的条目（sampled=false）只登记身份、不封存工作树，
+                # 不属于必须随包导出的基线；无标记的旧证据按抽中处理。
+                if not item.get("sampled", True):
+                    continue
+                case_id = item.get("case")
+                if isinstance(case_id, str) and case_id not in registered_cases:
+                    registered_cases.append(case_id)
+        missing_cases = [case_id for case_id in registered_cases if case_id not in exported_cases]
         case_items = []
         invalid_cases = []
         if integrity.get("valid"):
-            files = manifest.get("files")
             if isinstance(files, dict):
                 for relative in sorted(files):
                     parts = Path(relative).parts
@@ -989,6 +1066,8 @@ class Evolution:
                     continue
                 argv = check.get("argv")
                 cmd = argv[0]
+                if cmd == "git":
+                    git_referenced = True
                 check_name = check.get("name", "check")
                 # 同一个相对命令在不同用例（或同一用例的不同 cwd）里指向不同文件，
                 # 按「用例 + cwd + 命令」分别记录；宿主工具仍按命令名合并。
@@ -1032,6 +1111,14 @@ class Evolution:
                 available_tools.append(info)
             else:
                 missing_bundle.append(info)
+        # git 未被任何登记检查引用：可用时仍作为环境信息列出（required=False），
+        # 缺失时只记录说明，不进 missing、不参与 reproducible。
+        git_optional_missing = (bool(integrity.get("valid")) and not git_referenced
+                                and not git_found)
+        if not git_referenced and git_found:
+            available_tools.append({"name": "git", "type": "vcs", "path": str(git_found),
+                                    "required": False})
+
         for status, info in seen_tools.values():
             if status == "available":
                 available_tools.append(info)
@@ -1077,6 +1164,11 @@ class Evolution:
             msg = f"Missing credentials: {', '.join(c['name'] for c in missing_creds)} not configured; online model generation cannot be reproduced without external provider access"
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
+        if git_optional_missing:
+            msg = ("git executable not found in PATH; no registered check invokes git, "
+                   "so it is not required for this bundle")
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
         if missing_tools:
             msg = f"Missing host tools: {len(missing_tools)} required executable(s) missing ({', '.join(t['name'] for t in missing_tools)})"
             if msg not in repro_limitations:
@@ -1089,6 +1181,16 @@ class Evolution:
         offline_note = "Isolated offline environment: external model APIs cannot be contacted without network egress and valid credentials"
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
+
+        # 用例齐备性：integrity 只覆盖已导出文件，空包/缺包此前仍被判「具备离线
+        # 复现条件」。没有已登记 case.json，或 evidence.dataset.manifest 的用例
+        # 没有全部随包导出，都意味着没有（完整的）可执行基线。
+        if not exported_cases and BUNDLE_NO_CASES not in repro_limitations:
+            repro_limitations.append(BUNDLE_NO_CASES)
+        if missing_cases:
+            msg = BUNDLE_MISSING_CASES % (len(missing_cases), len(registered_cases), ", ".join(missing_cases))
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
 
         if malformed_checks:
             msg = f"Malformed check specifications: {'; '.join(malformed_checks)}"
@@ -1220,6 +1322,8 @@ class Evolution:
                 repro_limitations.append(msg)
         is_reproducible = (
             bool(integrity.get("valid")) and
+            len(exported_cases) > 0 and
+            len(missing_cases) == 0 and
             len(missing_tools) == 0 and
             len(missing_bundle) == 0 and
             len(missing_creds) == 0 and
@@ -1231,6 +1335,11 @@ class Evolution:
         return {
             "valid": bool(integrity.get("valid")),
             "integrity": integrity,
+            "cases": {
+                "exported": exported_cases,
+                "registered": registered_cases,
+                "missing": missing_cases,
+            },
             "dependencies": {
                 "available": available_tools,
                 "missing": missing_tools + missing_bundle,
@@ -1919,17 +2028,22 @@ class Evolution:
             self._plan_keys = {}
         plan = evidence.get("preregistered_plan")
         plan_key = fingerprint(plan) if plan else None
+        trials = evidence.get("trials", [])
+        # 试验数同样是派生证据的输入。只按计划哈希缓存会让评估期间每次 save 都复用
+        # 0 条试验时算出的 win_rate / plan_verification；进程中断后落库的就是
+        # 「做了 N 条试验、胜场 0、计划未执行」的自相矛盾证据。
+        cache_key = (plan_key, len(trials))
         sentinel = object()
-        plan_changed = (self._plan_keys.get(candidate, sentinel) != plan_key) or (bool(plan) and "plan_verification" not in evidence)
+        plan_changed = (self._plan_keys.get(candidate, sentinel) != cache_key) or (bool(plan) and "plan_verification" not in evidence)
         is_terminal = (status != "evaluating")
 
         if is_terminal or plan_changed or "win_rate" not in evidence:
             if plan:
-                evidence["plan_verification"] = self.verify_plan(plan, evidence.get("trials", []))
+                evidence["plan_verification"] = self.verify_plan(plan, trials)
                 if status == "evaluating" and not evidence["plan_verification"]["valid"]:
                     evidence["plan_verification"]["analysis"] = "planned_in_progress"
-            evidence["win_rate"] = paired_summary(evidence.get("trials", []))
-            self._plan_keys[candidate] = plan_key
+            evidence["win_rate"] = paired_summary(trials)
+            self._plan_keys[candidate] = cache_key
         if is_terminal:
             self._plan_keys.pop(candidate, None)
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))

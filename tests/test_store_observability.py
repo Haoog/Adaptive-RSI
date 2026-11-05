@@ -481,3 +481,61 @@ class StoreObservabilityTest(unittest.TestCase):
         self.assertGreaterEqual(elapsed, .5)
         self.assertLess(elapsed, 5)
         self.assertEqual(self.store.metrics()['busy_timeout_ms'], 15000)
+
+    def _reopened_store_with_events(self, rows=120000):
+        # 评审场景：events 播种后丢弃连接池，再从磁盘重新打开 Store；新连接从未
+        # 查询过 events，SQLite 3.46.0 之前的 PRAGMA optimize 因此不会分析它。
+        self.store.execute("INSERT INTO projects VALUES ('p','p','/p','{}',1,1)")
+        with self.store.connect() as db:
+            db.executemany("INSERT INTO events(kind,created,project) VALUES (?,?,?)",
+                           (("kind-%d" % (index % 20), time.time() - index, "p")
+                            for index in range(rows)))
+        self.store.close()
+        store = Store(self.store.root)
+        self.addCleanup(store.close)
+        self.assertIsNone(store.one("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"))
+        return store
+
+    def test_maintenance_analyzes_after_reopening_store_without_prior_query(self):
+        # 维护轮在 retention 之后补齐 events 统计；此前没有在同一条连接上执行过
+        # 目标查询，所以不能依赖 0x10000 位让 optimize 顺手分析它。
+        store = self._reopened_store_with_events()
+
+        from adaptive_rsi.runtime import Runtime
+        Runtime(store, agent=object()).maintenance()
+
+        self.assertIsNotNone(store.one(
+            "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        plan = [row["detail"] for row in store.query(
+            "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? "
+            "GROUP BY kind", (0, "p"))]
+        self.assertTrue(any("event_kind_created" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def test_planner_refresh_analyzes_tables_optimize_leaves_unanalyzed(self):
+        # 3.46.0 之前 optimize 忽略 0x10000，也不会自动分析没有 sqlite_stat1 的表；
+        # 用空 MASK（什么也不做）等价模拟旧版空转，校验显式 ANALYZE 兜底。行数取
+        # 默认的 120k：抽样统计会让两个候选索引的每前缀基数都报成样本行数，
+        # 规划器因此退回 project_events + TEMP B-TREE，必须真扫全表才不会退化。
+        from adaptive_rsi import maintenance
+        store = self._reopened_store_with_events()
+        with store.connect() as db:
+            db.execute("PRAGMA optimize=0").fetchall()
+        self.assertIsNone(store.one("SELECT 1 FROM sqlite_master WHERE name='sqlite_stat1'"))
+        with patch.object(maintenance, "PLANNER_OPTIMIZE_PRAGMA", "PRAGMA optimize=0"), \
+                patch.object(maintenance, "PLANNER_OPTIMIZE_ALL_TABLES", False):
+            self.assertTrue(maintenance.refresh_query_planner(store))
+        self.assertIsNotNone(store.one(
+            "SELECT 1 FROM sqlite_stat1 WHERE tbl='events' AND idx='event_kind_created'"))
+        plan = [row["detail"] for row in store.query(
+            "EXPLAIN QUERY PLAN SELECT kind,count(*) FROM events WHERE created>? AND project=? "
+            "GROUP BY kind", (0, "p"))]
+        self.assertTrue(any("event_kind_created" in step for step in plan), plan)
+        self.assertFalse(any("TEMP B-TREE" in step for step in plan), plan)
+
+    def test_planner_refresh_failure_is_logged_not_raised(self):
+        from adaptive_rsi import maintenance
+        with patch.object(self.store, "connect",
+                          side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertLogs("adaptive_rsi.maintenance", level="WARNING"):
+                self.assertFalse(maintenance.refresh_query_planner(self.store))
