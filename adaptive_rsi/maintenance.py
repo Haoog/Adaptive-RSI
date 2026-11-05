@@ -181,6 +181,20 @@ def retention_hold(store, run_id, project):
     return None
 
 
+def _legal_hold_guard(alias):
+    """SQL condition excluding runs protected by a run- or project-level hold.
+
+    Mirrors retention_hold's fail-closed reading: only an explicit JSON false
+    releases a hold, so a corrupt or non-boolean value still keeps the run's
+    derived evidence keys.  ``alias`` is the runs table alias of the enclosing
+    eligibility query.
+    """
+    return ("AND NOT EXISTS (SELECT 1 FROM settings AS held WHERE "
+            "held.key IN ('legal-hold:'||%s.id, 'legal-hold-project:'||%s.project) "
+            "AND CASE WHEN json_valid(held.value) THEN json_type(held.value)='false' "
+            "ELSE 0 END=0) " % (alias, alias))
+
+
 def _remove_owned_tree(parent, name):
     """Remove one entry beneath an open directory without following any link.
 
@@ -555,7 +569,9 @@ class Maintenance:
         self.store.execute("DELETE FROM submissions WHERE rowid IN (SELECT rowid FROM submissions WHERE task IN "
                            "(SELECT id FROM tasks WHERE updated<? AND state IN ('merged','obsolete','cancelled','expired','reverted','superseded','pr_closed')) LIMIT 500)", (stale,))
         # 交付生命周期未结束的运行（PR 跟踪、合并后监控）仍需要这些键；
-        # 与上方目录清理的保护范围保持一致，不做无条件删除。
+        # 与上方目录清理的保护范围保持一致，不做无条件删除。运行或项目
+        # legal hold 同样保留全部派生证据键（基线、推送、合并意图、交付），
+        # 只有显式 JSON false 解除。
         # 已清理的运行不能继续占据 LIMIT，否则后续周期永远无法排空积压。
         prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
         # 在一致读快照中按索引扫描键；最长匹配的运行 ID 拥有该键。
@@ -582,8 +598,9 @@ class Maintenance:
                                 "THEN coalesce(json_extract(result,'$.pr'),'') ELSE 'x' END='' "
                                 "AND CASE WHEN json_valid(result) "
                                 "THEN coalesce(json_extract(result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
-                                "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) AS eligible "
-                                "FROM runs WHERE id=?", (stale, candidate)).fetchone()
+                                "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||runs.id)) "
+                                + _legal_hold_guard("runs") +
+                                "AS eligible FROM runs WHERE id=?", (stale, candidate)).fetchone()
                             if owner:
                                 if owner["eligible"]:
                                     runs.add(owner["id"])
@@ -609,7 +626,8 @@ class Maintenance:
                     "THEN coalesce(json_extract(r.result,'$.pr'),'') ELSE 'x' END='' "
                     "AND CASE WHEN json_valid(r.result) "
                     "THEN coalesce(json_extract(r.result,'$.delivery_recovery_abandoned'),0) ELSE 0 END=0 "
-                    "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id))",
+                    "AND EXISTS (SELECT 1 FROM settings WHERE key='delivery-push:'||r.id)) "
+                    + _legal_hold_guard("r"),
                     (run, stale)).fetchone()
                 if not eligible:
                     continue
