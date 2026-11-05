@@ -803,7 +803,11 @@ class RuntimeTest(unittest.TestCase):
                 return real_baseline(*args, **kwargs)
             finally:
                 baseline_done.set()
+        # 基线线程里的真实 Sandbox.backend() 会探测宿主机 docker（8s 超时）；CI 上冷探测
+        # 可能超过下面 5s 的等待上界，把环境耗时误报成基线未完成。后端探测与本用例
+        # 要验证的「setup 失败后取消实现」无关，固定返回值使用例只依赖被 patch 的检查。
         with patch('adaptive_rsi.readiness.inspect', return_value={'ready': True, 'items': []}), \
+             patch("adaptive_rsi.evaluator.Sandbox.backend", return_value="stub"), \
              patch.object(self.runtime.evaluator, "evaluate_acceptance_baseline", side_effect=baseline), \
              patch("adaptive_rsi.evaluator.Sandbox.check", autospec=True, side_effect=check):
             task, run = self.claim()
