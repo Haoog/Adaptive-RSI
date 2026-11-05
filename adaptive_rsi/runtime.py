@@ -35,6 +35,9 @@ The host runs acceptance checks independently. Missing evidence must be reported
 BUDGET_WAIT_SECONDS = 900
 BUDGET_WAIT_MAX_SECONDS = 3600
 BUDGET_WAIT_RETRIES = 3
+# 线程池准入失败的退避：claim 之后提交被拒（线程/内存耗尽）不构成一次任务尝试，
+# 归还额度并把任务延后重排；否则每个调度节拍（~5s）都会新建一条 interrupted run。
+ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
 
@@ -1410,8 +1413,22 @@ class Runtime(Maintenance):
                     try:
                         future = self.pool.submit(self.process, run)
                     except Exception:
-                        self.store.transition(run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
-                                              task_fields={"state": "queued"})
+                        # 准入失败不是任务尝试：claim 已经自增 attempts，这里必须归还，
+                        # 否则一次线程/内存耗尽就会吃掉任务仅有的自动重试额度（与
+                        # provider 故障路径的归还约定一致）。同时写入退避时间，避免
+                        # 故障持续时每个调度节拍都新建一条 interrupted run。
+                        backoff = time.time() + ADMISSION_BACKOFF_SECONDS
+                        self.store.execute("UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?",
+                                           (run["task"],))
+                        transitioned = self.store.transition(
+                            run["id"], "interrupted", {"reason": "Worker admission failed"}, True,
+                            task_fields={"state": "queued", "available": backoff})
+                        if transitioned and self.store.one(
+                                "SELECT state FROM tasks WHERE id=?", (run["task"],))["state"] == "queued":
+                            self.store.event("infrastructure_retry",
+                                             "Worker pool rejected submission; retry scheduled",
+                                             run["project"], run["id"],
+                                             {"code": "admission", "retry_at": backoff})
                         raise
                     with self._futures_lock:
                         self.futures.add(future)
