@@ -150,7 +150,7 @@ class Runtime(Maintenance):
         self.evaluator = Evaluator(store)
         self._shutdown = {"phase": "running", "started": None, "ended": None,
                           "scheduler_timed_out": False, "maintenance_timed_out": False,
-                          "workers_timed_out": False, "reconcile_failed": 0}
+                          "workers_timed_out": False, "reconcile_failed": 0, "errors": []}
         self._close_lock = threading.Lock()
         self._closed = False
         # 领取与关闭的共同边界：close 先关闭准入，再排空线程池；竞态下不会留下已领取
@@ -955,59 +955,92 @@ class Runtime(Maintenance):
                 self._closing = True
             self._shutdown.update(phase='stopping', started=time.time())
             try:
-                self._close()
+                failures = self._close()
             except BaseException:
                 self._shutdown.update(phase='failed', ended=time.time())
                 raise
+            # 个别子系统报错时 _close 仍已尝试完所有阶段：worker 池、store 与状态
+            # 目录锁都已释放，因此照常标记关闭完成；completed 只表示所有阶段都执行
+            # 过，reconcile_failed>0 或 errors 非空时必须按未干净关闭处理。
             self._closed = True
-            # completed 只表示关闭流程走完；reconcile_failed>0 表示仍有已领取的
-            # run 未能落终态，必须等下一次启动的 store.recover() 修复。
-            self._shutdown.update(phase='completed', ended=time.time())
+            self._shutdown.update(phase='failed' if failures else 'completed', ended=time.time())
+            if failures:
+                raise failures[0]
 
     def _close(self):
+        """Attempt every phase; return step exceptions for ``close()`` to re-raise."""
+        failures = []
+
+        def attempt(phase, target, action):
+            try:
+                action()
+            except Exception as error:
+                # 只隔离 Exception：坏盘、NFS 或权限异常不能让后续阶段被跳过，
+                # 而 KeyboardInterrupt 等 BaseException 仍立即上抛。
+                self._shutdown['errors'].append({
+                    'phase': phase, 'target': target,
+                    'error': ('%s: %s' % (type(error).__name__, error))[:200]})
+                failures.append(error)
+                logging.getLogger(__name__).exception(
+                    'Shutdown step %s (%s) failed; continuing with remaining steps', target, phase)
+
         self.stop.set()
         self.maintenance_stop.set()
         self.wake.set()
         self._shutdown['phase'] = 'authentication'
-        self.auth_sessions.close()
+        attempt('authentication', 'auth_sessions', self.auth_sessions.close)
         self._shutdown['phase'] = 'operations'
-        self.operations.close()
+        attempt('operations', 'operations', self.operations.close)
+
+        def scheduler_phase():
+            self._shutdown['scheduler_timed_out'] = False
+            if self.thread:
+                # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
+                # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
+                # 的上界永远走不到。
+                self.thread.join(SCHEDULER_JOIN_TIMEOUT)
+                if self.thread.is_alive():
+                    logging.getLogger(__name__).warning(
+                        "Scheduler thread did not stop within %ss; proceeding with shutdown",
+                        SCHEDULER_JOIN_TIMEOUT)
+                    self._shutdown['scheduler_timed_out'] = True
+
         self._shutdown['phase'] = 'scheduler'
-        self._shutdown['scheduler_timed_out'] = False
-        if self.thread:
-            # stop 已在上方置位，dispatch 不会再领取新工作；但线程可能正卡在
-            # store.root 的挂起文件系统调用里，join 必须有上界，否则维护线程
-            # 的上界永远走不到。
-            self.thread.join(SCHEDULER_JOIN_TIMEOUT)
-            if self.thread.is_alive():
-                logging.getLogger(__name__).warning(
-                    "Scheduler thread did not stop within %ss; proceeding with shutdown",
-                    SCHEDULER_JOIN_TIMEOUT)
-                self._shutdown['scheduler_timed_out'] = True
+        attempt('scheduler', 'scheduler_thread', scheduler_phase)
+
+        def workers_phase():
+            self._shutdown['workers_timed_out'] = False
+            try:
+                self._shutdown_workers()
+            finally:
+                # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
+                _, failed = self._reconcile_unstarted_workers()
+                self._shutdown['reconcile_failed'] = len(failed)
+
         self._shutdown['phase'] = 'workers'
-        self._shutdown['workers_timed_out'] = False
-        try:
-            self._shutdown_workers()
-        finally:
-            # 即使线程池排空自身报错，也必须为已取消、从未启动的领取留下终态。
-            _, failed = self._reconcile_unstarted_workers()
-            self._shutdown['reconcile_failed'] = len(failed)
+        attempt('workers', 'worker_pool', workers_phase)
+
+        def maintenance_phase():
+            self._shutdown['maintenance_timed_out'] = False
+            if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
+                # 维护线程是 daemon，但它可能卡在 NFS/坏盘上的 flock 或 fsync 里
+                # 永不返回；join 必须限时，超时后记录证据放行 close，进程退出不受阻。
+                self.maintenance_thread.join(MAINTENANCE_JOIN_TIMEOUT)
+                if self.maintenance_thread.is_alive():
+                    logging.getLogger(__name__).warning(
+                        "Maintenance thread did not stop within %ss; proceeding with shutdown",
+                        MAINTENANCE_JOIN_TIMEOUT)
+                    self._shutdown['maintenance_timed_out'] = True
+
         self._shutdown['phase'] = 'maintenance'
-        self._shutdown['maintenance_timed_out'] = False
-        if self.maintenance_thread and self.maintenance_thread is not threading.current_thread():
-            # 维护线程是 daemon，但它可能卡在 NFS/坏盘上的 flock 或 fsync 里
-            # 永不返回；join 必须限时，超时后记录证据放行 close，进程退出不受阻。
-            self.maintenance_thread.join(MAINTENANCE_JOIN_TIMEOUT)
-            if self.maintenance_thread.is_alive():
-                logging.getLogger(__name__).warning(
-                    "Maintenance thread did not stop within %ss; proceeding with shutdown",
-                    MAINTENANCE_JOIN_TIMEOUT)
-                self._shutdown['maintenance_timed_out'] = True
+        attempt('maintenance', 'maintenance_thread', maintenance_phase)
         self._shutdown['phase'] = 'storage'
         # 关闭数据层空闲连接；已借出的连接由各自的 with 块负责。
-        self.store.close()
+        attempt('storage', 'store', self.store.close)
         if self.lockfile:
-            self.lockfile.close()
+            # store 关闭失败也不能继续占用状态目录锁，否则下次启动会被拒绝。
+            attempt('storage', 'lockfile', self.lockfile.close)
+        return failures
 
     def _shutdown_workers(self):
         """Drain workers within WORKER_DRAIN_TIMEOUT, then record still-running runs.
