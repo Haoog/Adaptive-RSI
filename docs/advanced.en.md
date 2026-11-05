@@ -328,7 +328,7 @@ The desktop menu offers open-window, check-for-updates and export-diagnostics co
 
 Successful console polling writes at most one request log per route per minute; error responses and writes are still recorded individually. `database.request_logging` reports process-local observed, persisted, sampled-out and failed-write counts. Logs contain paths without query values, bodies or authentication headers. Sampled-out request IDs have no persistent lookup.
 
-WAL maintenance uses only a `PASSIVE` checkpoint that does not wait for readers. The `wal` diagnostics report process-local snapshot count, oldest snapshot age, pending pages at the last checkpoint and its time. The snapshot count cannot describe readers in other processes. Long readers may retain WAL pages; maintenance does not interrupt them.
+WAL maintenance first runs a `PASSIVE` checkpoint that does not wait for readers; when no pages are pending and this process holds no read snapshot, it then runs `TRUNCATE` with a one-second exclusive budget to shrink the file itself, giving up and reporting the result when other readers are present. The `wal` diagnostics report process-local snapshot count, oldest snapshot age, pending pages and truncation result at the last checkpoint, and its time. The snapshot count cannot describe readers in other processes. `journal_size_limit` caps the WAL at 8 MiB; long readers may still retain WAL pages, and maintenance does not interrupt them.
 
 Export and verify a private database archive with these commands. Compression levels are 0–9, with 6 as the default. Timeout or cancellation does not publish an incomplete archive.
 
