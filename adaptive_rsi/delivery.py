@@ -106,45 +106,16 @@ def baseline(runtime, project, config):
         return str(cache), sha, branch
 
 
+# 精确读同时承载合并门禁、superseded 身份校验与反馈观测，comments/reviews 只在
+# 单条读里取。曾用同一组字段做全仓库 gh pr list 批量索引，但本仓库 100 条查询
+# 稳定 502/504（GraphQL 网关约 10 秒上限），且满页无法证明没有下一页；受跟踪
+# PR 数量很小，逐条精确读（实测 PR #450 为 0.67 秒/9.7KB）比一次失败的批量读更可靠。
 PR_FIELDS = ("url,state,headRefOid,headRefName,headRepositoryOwner,baseRefOid,baseRefName,"
              "mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,mergeCommit,isDraft,comments,reviews")
-# 列表页最多返回 100 条；正好满页时无法证明第 101 个受跟踪 PR 不存在，只能回退逐条精确读。
-PR_LIST_LIMIT = 100
 
 
 def pr_view(repo, url):
     return json.loads(checked(["gh", "pr", "view", url, "--repo", repo, "--json", PR_FIELDS]))
-
-
-def pr_index(store, repo, project=None):
-    """Read every tracked PR in one paged request; None means read each PR exactly.
-
-    tick() shares one index per (project, repository) so N tracked PRs cost one gh
-    process instead of N. Unknown URLs still fall back to pr_view, and a full page
-    cannot prove the next page absent, so it falls back instead of dropping PRs.
-    """
-    try:
-        rows = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all",
-            "--limit", str(PR_LIST_LIMIT), "--json", PR_FIELDS]))
-    except Cancelled:
-        raise
-    except ProcessError as exc:
-        store.event("delivery_pr_list_error", str(exc), project)
-        return None
-    except Exception as exc:
-        # 批量读只是优化：任何异常都回退到逐条精确读，让每个 run 自己暴露真实错误，
-        # 不能因为一页列表坏了就中断整轮跟踪。
-        store.event("delivery_pr_list_error", "Invalid PR list response: %s" % exc, project)
-        return None
-    if not isinstance(rows, list):
-        store.event("delivery_pr_list_error", "PR list response is not a list", project)
-        return None
-    if len(rows) >= PR_LIST_LIMIT:
-        store.event("delivery_pr_page_full",
-                    "PR list page is full; tracked PRs are read individually", project)
-        return None
-    return {row["url"]: row for row in rows
-            if isinstance(row, dict) and isinstance(row.get("url"), str) and row["url"]}
 
 
 def _pr_feedback_prefix(project, task):
@@ -1022,27 +993,15 @@ def tick(runtime, now=None, project_id=None, active_run=None):
     # 否则 main 的监控读数会让面向 release 的就绪 run 被静默跳过。
     tick_baselines = {}
     origins = {}
-    indexes = {}
     from .release import pending
 
     runs = store.query("SELECT r.* FROM runs r WHERE (r.state IN ('pr_open','merged') OR " +
                        _CLOSE_PENDING + " OR " + _RECOVERY_CANDIDATE + ")" +
                        (" AND r.project=?" if project_id else "") + " ORDER BY r.started",
                        (project_id,) if project_id else ())
-    # 单个受跟踪 PR 用 pr_view 更省一次列表读取；同一项目本轮有多个 PR 时才合并成
-    # 一次 gh pr list。索引按 (项目, 仓库) 缓存，配置换了仓库也不会读到别处的 PR。
-    tracked = {}
-    for row in runs:
-        if row["state"] in ("pr_open", "superseded"):
-            tracked[row["project"]] = tracked.get(row["project"], 0) + 1
-
-    def indexed_pr(project_id, repo, url):
-        key = (project_id, repo)
-        if key not in indexes:
-            indexes[key] = (pr_index(store, repo, project_id)
-                            if tracked.get(project_id, 0) > 1 else None)
-        index = indexes[key]
-        return index.get(url) if index else None
+    # 每个受跟踪 PR 精确读一次，同一份读数供合并门禁、superseded 身份校验与反馈
+    # 观测共用。批量 gh pr list 在 PR 较多的仓库会超出 GraphQL 网关时限（稳定
+    # 502/504），失败后仍要逐条补读并留下误导性事件，因此不再预读整页。
 
     def origin(path):
         # tick 内 origin 远端不会变化：同项目多个 run 共用首次探测结果。
@@ -1098,9 +1057,8 @@ def tick(runtime, now=None, project_id=None, active_run=None):
                     continue
             pr = None
             if run["state"] in ["pr_open", "superseded"]:
-                # 列表里缺该 URL（页面截断、仓库 PR 过多或刚创建）时回退单条精确读；
-                # 失败仍由外层记 delivery_error，只影响本 run，不波及其它跟踪项。
-                pr = indexed_pr(run["project"], repo, pr_url) or pr_view(repo, pr_url)
+                # 失败由外层记 delivery_error，只影响本 run，不波及其它跟踪项。
+                pr = pr_view(repo, pr_url)
             if run["state"] in ["pr_open", "superseded"] and pr is None:
                 continue
             feedback_keys = []
