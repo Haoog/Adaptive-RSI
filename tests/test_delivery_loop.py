@@ -14,7 +14,7 @@ from adaptive_rsi.acceptance import seal
 from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
 from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks, merge_gate, tick
-from adaptive_rsi.evaluator import Evaluator, freeze_harness
+from adaptive_rsi.evaluator import Evaluator, freeze_harness, write_evaluation_report
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
 from adaptive_rsi.process import Sandbox, run_process
@@ -1238,9 +1238,14 @@ print('BOUNDARIES_OK')
             with patch.object(self.store, "add_task", side_effect=RuntimeError("temporary database failure")):
                 with self.assertRaisesRegex(RuntimeError, "database failure"):
                     feedback(self.runtime, self.runtime.project(self.project), run, outcome, self.runtime.config(self.project), time.time())
-            saved = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
+            raw = self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"]
+            saved = json.loads(raw)
             self.assertTrue(saved["feedback"]["investigation_pending"])
-            self.assertEqual(len(saved["feedback"]["evaluation"]["checks"]["candidate"][0]["stderr"]), 40000)
+            bounded = saved["feedback"]["evaluation"]["checks"]
+            self.assertEqual(len(bounded), 1)
+            self.assertEqual(bounded[0]["name"], "long failure")
+            self.assertEqual(len(bounded[0]["output"]), 1200)
+            self.assertLess(len(raw.encode("utf-8")), 64 * 1024)
             feedback(self.runtime, self.runtime.project(self.project), run, saved, self.runtime.config(self.project), time.time())
             self.assertEqual(evaluate.call_count, 1)
         tasks = self.store.query("SELECT body FROM tasks WHERE fingerprint LIKE 'postmerge:%'")
@@ -1390,8 +1395,87 @@ print('BOUNDARIES_OK')
                      self.runtime.config(self.project), time.time())
         result = outcome["feedback"]
         self.assertEqual(result["state"], "regressed")
-        self.assertTrue(result["evaluation"]["checks"]["candidate"][0]["passed"])
-        self.assertFalse(result["evaluation"]["checks"]["candidate_full"][0]["passed"])
+        evaluation = result["evaluation"]
+        self.assertEqual(evaluation["decision"], "fail")
+        # 行内只留有界摘要；完整报告（含全部检查输出）仍在 evaluator 写好的工件里。
+        report = json.loads((directory / evaluation["report"]).read_text(encoding="utf-8"))
+        self.assertTrue(report["checks"]["candidate"][0]["passed"])
+        self.assertFalse(report["checks"]["candidate_full"][0]["passed"])
+
+    def test_postmerge_result_row_stays_bounded_and_unchanged_tick_writes_nothing(self):
+        # 完整报告已由 evaluator 写进 feedback/<id>/evaluation/report.json；
+        # runs.result 只保留 decision 与至多 5 条有界摘录，无新证据的 tick 不重写整行。
+        run = self.tracked_pr()
+        self.runtime.configure({"delivery": {"feedback_minutes": 5}, "github": {"repository": "example/project"}},
+                               self.project)
+        directory = self.store.root / "runs" / run["id"]
+        directory.mkdir(parents=True)
+        (directory / "dependencies").mkdir()
+        merged = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "calculator.py").write_text("def add(a,b):\n    return a+b\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "later mainline")
+        head = git(self.repo, "rev-parse", "HEAD")
+        self.store.execute("UPDATE runs SET path=? WHERE id=?", (str(directory), run["id"]))
+        self.store.put_setting("delivery:" + run["id"], {"head": "candidate", "base": merged, "branch": "main"})
+        self.store.put_setting("run-baseline:" + run["id"],
+                               {"repository": "example/project", "branch": "main", "sha": merged})
+        payload = "x" * (1024 * 1024)
+        report = {"decision": "fail",
+                  "checks": {"candidate": [{"name": "large failure", "passed": False, "stderr": payload}]}}
+
+        def evaluate(_baseline, _candidate, _checks, directory, *args, **kwargs):
+            # 模拟 evaluator 的持久化契约：report.json 只内联有界尾部，完整流写进 outputs/。
+            write_evaluation_report(directory, report)
+            return report
+
+        pr = {"state": "MERGED", "headRefOid": "candidate", "baseRefOid": merged, "mergeCommit": {"oid": merged}}
+        now = time.time()
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), patch(
+                "adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), patch.object(
+                self.runtime.evaluator, "evaluate", side_effect=evaluate) as evaluator:
+            tick(self.runtime, now)
+        self.assertTrue(evaluator.called)
+        saved = self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))
+        self.assertLess(len(saved["result"].encode("utf-8")), 64 * 1024)
+        result = json.loads(saved["result"])
+        self.assertEqual(result["feedback"]["state"], "regressed")
+        evaluation = result["feedback"]["evaluation"]
+        self.assertEqual(evaluation["decision"], "fail")
+        self.assertEqual(len(evaluation["checks"]), 1)
+        self.assertEqual(len(evaluation["checks"][0]["output"]), 1200)
+        report_path = directory / evaluation["report"]
+        artifact = json.loads(report_path.read_text(encoding="utf-8"))
+        row = artifact["checks"]["candidate"][0]
+        self.assertTrue(row["stderr_truncated"])
+        self.assertEqual(row["stderr_bytes"], len(payload))
+        self.assertEqual(len((report_path.parent / row["stderr_path"]).read_text(encoding="utf-8")), len(payload))
+        task = self.store.one("SELECT body FROM tasks WHERE fingerprint LIKE 'postmerge:%'")
+        self.assertLess(len(task["body"]), 12000)
+        self.assertIn(payload[-1200:], task["body"])
+        writes = []
+        original = self.store.execute
+
+        def counted(sql, args=()):
+            if "runs" in sql.lower() and sql.lstrip().lower().startswith(("update", "insert", "delete")):
+                writes.append(sql)
+            return original(sql, args)
+
+        with patch("adaptive_rsi.delivery.pr_view", return_value=pr), patch(
+                "adaptive_rsi.delivery.baseline", return_value=(str(self.repo), head, "main")), patch.object(
+                self.store, "execute", side_effect=counted):
+            tick(self.runtime, now + 301)
+        self.assertEqual(writes, [])
+        # 到期但没有新证据时只推进 settings 心跳，不重写 runs.result。
+        self.assertGreater(self.store.setting("feedback-polled:" + run["id"], 0), now)
+
+    def test_bounded_failures_keeps_at_most_five_bounded_excerpts(self):
+        from adaptive_rsi.delivery import bounded_failures
+        checks = {"candidate": [{"name": "check-" + str(index), "passed": False, "stderr": "e" * 5000}
+                                for index in range(7)]}
+        rows = bounded_failures({"checks": checks})
+        self.assertEqual([row["name"] for row in rows], ["check-0", "check-1", "check-2", "check-3", "check-4"])
+        self.assertTrue(all(len(row["output"]) == 1200 for row in rows))
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression(self):
@@ -1427,8 +1511,10 @@ print('BOUNDARIES_OK')
             tick(self.runtime, now + 301)
         result = json.loads(self.store.one("SELECT result FROM runs WHERE id=?", (run["id"],))["result"])
         self.assertEqual(result["feedback"]["state"], "regressed")
-        self.assertTrue(result["feedback"]["evaluation"]["checks"]["baseline"][0]["passed"])
-        self.assertFalse(result["feedback"]["evaluation"]["checks"]["acceptance_candidate"][0]["passed"])
+        evaluation = result["feedback"]["evaluation"]
+        report = json.loads((self.store.root / "runs" / run["id"] / evaluation["report"]).read_text(encoding="utf-8"))
+        self.assertTrue(report["checks"]["baseline"][0]["passed"])
+        self.assertFalse(report["checks"]["acceptance_candidate"][0]["passed"])
         self.assertTrue(self.store.one("SELECT 1 FROM tasks WHERE state='queued' AND title LIKE 'Investigate verified%'"))
         self.assertNotIn("evaluation", self.runtime.outcomes(self.project)[0]["feedback"])
 
