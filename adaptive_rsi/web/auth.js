@@ -37,8 +37,11 @@ window.RSIAuth = (() => {
       }selectPreferredProvider();render();schedule();
     })().finally(()=>loading=null);return loading;
   }
-  async function getProviders(){if(providers)return;const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
+  async function fetchProviders(){const result=await api('auth/providers?backend=opencode');providers=Array.isArray(result)?result:result.providers;
     selectPreferredProvider();render();}
+  async function getProviders(){if(providers)return;await fetchProviders();}
+  // 认证变更后供应商的连接数、已连接标记与可用登录方式都可能变化；失败时保留旧列表，不把登录结果提示改成刷新失败。
+  async function refreshProviders(){if(!providers)return;try{await fetchProviders();}catch{}}
   async function mutate(path,body){pending=true;render();try{return await api('auth/'+path,body);}catch(error){error.message=authMessage(error.code,error.message);throw error;}finally{pending=false;render();}}
   function schedule(){clearTimeout(timer);if(!pollingStopped&&[...sessions.values()].some(s=>!terminal.has(s.state)||s.refreshStage)){const delay=document.visibilityState==='hidden'?30000:1500;timer=setTimeout(()=>safe(poll),delay);}}
   async function refreshCompleted(id,session){
@@ -46,6 +49,7 @@ window.RSIAuth = (() => {
     try{
       if(session.refreshStage==='status'){
         readinessCache.clear();await status(true);if(sessions.get(id)!==session)return;
+        await refreshProviders();
         session.refreshStage='catalog';
       }
       await session.refresh();if(sessions.get(id)!==session)return;
@@ -142,13 +146,13 @@ window.RSIAuth = (() => {
       if(session.error)box.append(el('p',session.error==='authorization_failed'&&session.state==='awaiting_authorization'?t('授权未完成，请打开新的授权页面后重试。'):authMessage(session.error,session.error),'mc-error'));
     }
     if(running)return;
-    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
+    if(connected){const logout=action(t('退出账号'),async()=>{const current={...context};await mutate('logout',{backend:current.backend,provider:current.backend==='codex'?null:current.provider});sessions.delete(current.backend+':'+(current.provider||''));await status(true);await refreshProviders();readinessCache.clear();},'text-button');logout.disabled=pending;box.append(logout);}
     const methods=backend==='codex'?[{index:0,type:'oauth',supported:true,label:t('前往 Codex 官方登录')}]:providers?.find(p=>p.id===context.provider)?.methods||[];
     for(const method of methods){
       if(method.type==='api'){
         if(method.supported===false){box.append(el('p',authMessage(method.unsupported_reason,'此登录方式暂不支持远程页面，请使用供应商密钥。'),'mc-secondary'));continue;}
         const form=el('form'),label=text('label','API 密钥'),input=el('input');input.type='password';input.dataset.authField='key:'+context.provider;input.autocomplete='new-password';input.required=true;input.maxLength=8192;label.append(input);const submit=text('button','保存供应商密钥','button');submit.type='submit';submit.disabled=pending;form.append(label,submit);
-        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});await status(true);readinessCache.clear();await current.refresh();});});box.append(form);continue;
+        form.addEventListener('submit',event=>{event.preventDefault();const current={...context};safe(async()=>{const secret=input.value;input.value='';await mutate('key',{backend:'opencode',provider:current.provider,key:secret});await status(true);await refreshProviders();readinessCache.clear();await current.refresh();});});box.append(form);continue;
       }
       const form=el('form'),fields=new Map();
       const updatePrompts=()=>{for(const prompt of method.prompts||[]){const field=fields.get(prompt.key),condition=prompt.when,show=!condition||(condition.op==='neq'?fields.get(condition.key)?.input.value!==condition.value:fields.get(condition.key)?.input.value===condition.value);field.label.hidden=!show;field.input.disabled=!show;field.input.required=show;}};

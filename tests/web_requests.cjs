@@ -1470,6 +1470,37 @@ test('temporary auth polling failures preserve authorization; explicit expiry st
   assert.equal(terminal.page.timers.filter(timer=>timer.active&&timer.delay===1500).length,0);
 });
 
+test('provider metadata refreshes after saving a key and after signing out', async () => {
+  const page=browser();let providerCalls=0,connected=false;
+  page.context.safe=page.context.originalSafe;
+  page.context.fetch=async url=>{
+    if(url.endsWith('/api/auth/status'))return response({sessions:[],opencode:{available:true,authenticated_providers:connected?['open-go']:[]}});
+    if(url.includes('/api/auth/providers?backend=opencode')){
+      providerCalls++;
+      return response({providers:[{id:'open-go',name:'OpenCode Go',connected,connection_count:connected?2:0,methods:[{index:0,type:'api',supported:true,label:'API Key'}]}]});
+    }
+    if(url.endsWith('/api/auth/key')){connected=true;return response({});}
+    if(url.endsWith('/api/auth/logout')){connected=false;return response({});}
+    return response({});
+  };
+  vm.runInContext(authSource,page.context);
+  page.context.window.RSIAuth.show('opencode',()=>Promise.resolve());
+  await waitFor(()=>providerCalls===1);
+  const currentSelect=()=>descendants(page.node('mc-auth')).find(node=>node.tagName==='SELECT');
+  const options=()=>currentSelect().children.map(option=>option.textContent||'');
+  await waitFor(()=>options().length>1);
+  assert.doesNotMatch(options().join(' '),/已连接/);
+  currentSelect().value='open-go';currentSelect().handlers.change();
+  const key=descendants(page.node('mc-auth')).find(node=>node.dataset?.authField==='key:open-go');
+  key.value='secret-key';
+  descendants(page.node('mc-auth')).find(node=>node.tagName==='FORM').handlers.submit({preventDefault(){}});
+  await waitFor(()=>/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,2,'saving a key must refresh the provider list without a page reload');
+  descendants(page.node('mc-auth')).find(node=>node.textContent==='退出账号').handlers.click();
+  await waitFor(()=>!/已连接/.test(options().join(' ')));
+  assert.equal(providerCalls,3,'signing out must drop the stale connection count');
+});
+
 test('non JSON errors give recovery instructions rather than a parser exception', async () => {
   const page=browser();
   page.context.fetch=async()=>({ok:false,status:502,json:async()=>{throw new SyntaxError('HTML error page');}});
