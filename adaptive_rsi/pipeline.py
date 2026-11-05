@@ -826,7 +826,10 @@ def execute_candidate(runtime, run, project, task, source, base, directory, work
             result = {"summary": replay["summary"]}
             patch = replay["patch"]
             if fingerprint(patch) != replay["patch_hash"]:
-                raise RuntimeError("Saved candidate evidence changed; retry refused")
+                # 两条重放来源的取证含义不同：候选阶段已带验收结论，实现阶段
+                # 只是封存补丁。恢复各自文案，运维才能判断该重跑哪一段。
+                raise RuntimeError("Saved %s evidence changed; retry refused" %
+                                   ("candidate" if saved_candidate is not None else "implementation"))
             (directory / "resume.patch").write_text(patch + "\n", encoding="utf-8")
             try:
                 git(workspace, "apply", "--index", str(directory / "resume.patch"))
