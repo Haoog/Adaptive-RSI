@@ -817,12 +817,18 @@ class Evolution:
         return {"valid": not mismatches, "mismatches": mismatches, "limitations": manifest.get("limitations", [])}
 
     @staticmethod
-    def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False):
+    def reproduce_bundle(directory, env=None, which=None, required_credentials=None, run_checks=False,
+                         timeout_seconds=None):
         """Inspect and verify offline reproduction readiness for a sealed bundle.
 
         Verifies input integrity and itemizes all missing tool dependencies and
         credentials without failing fast on the first missing requirement.
+
+        ``timeout_seconds`` is the default budget for checks that do not declare
+        their own ``timeout_seconds``; it defaults to the evaluator's 300 s so a
+        check the evaluation side accepts is not killed early offline.
         """
+        import math
         import os
         import shutil
         import subprocess
@@ -1044,6 +1050,28 @@ class Evolution:
         # 5. Optional check execution
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
+        # 每个检查的预算：用例声明 timeout_seconds 时按声明执行（evaluator 为派生
+        # 检查读取同一字段），未声明时沿用调用方缺省值。旧实现写死 60 s，会把评估侧
+        # 允许更久的编译/集成检查杀成 TimeExpired，得出与基线相反的假失败结论。
+        default_timeout = 300 if timeout_seconds is None else timeout_seconds
+
+        def clipped(value):
+            """失败行与成功行保持同一 stdout/stderr 形状；非文本异常输出记空串。"""
+            return value[:1000] if isinstance(value, str) else ""
+
+        def check_timeout(check):
+            """本检查的秒级预算；声明值非法时返回 None，由执行路径显式记失败。
+
+            评估侧直接 ``check.get("timeout_seconds", 300)`` 交给进程层，离线复现
+            必须读同一字段，否则声明为 1 s 的检查会跑满整个旧 60 s 上限还判通过。
+            """
+            value = check.get("timeout_seconds", default_timeout)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if not math.isfinite(value) or value <= 0:
+                return None
+            return value
+
         executed_checks = []
         if run_checks and integrity.get("valid") and not missing_tools:
             import tempfile
@@ -1094,6 +1122,19 @@ class Evolution:
                         if not isinstance(check, dict) or check_spec_error(check):
                             continue
                         argv = check.get("argv")
+                        timeout = check_timeout(check)
+                        if timeout is None:
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "exit_code": -1,
+                                "passed": False,
+                                "overlay_applied": overlay_applied,
+                                "timeout_seconds": check.get("timeout_seconds"),
+                                "error": "timeout_seconds must be a positive finite number of seconds",
+                            })
+                            continue
                         cwd = (staging / check.get("cwd", ".")).resolve()
                         # 解析后的 cwd 必须仍在一次性副本内：仓库内被注入的符号
                         # 链接可能把它指向副本之外，此时退回 staging 根目录。
@@ -1105,7 +1146,7 @@ class Evolution:
                                 cwd=run_cwd,
                                 capture_output=True,
                                 text=True,
-                                timeout=60,
+                                timeout=timeout,
                                 env=env_dict,
                             )
                             executed_checks.append({
@@ -1115,10 +1156,13 @@ class Evolution:
                                 "exit_code": proc.returncode,
                                 "passed": proc.returncode == 0,
                                 "overlay_applied": overlay_applied,
+                                "timeout_seconds": timeout,
                                 "stdout": proc.stdout[:1000],
                                 "stderr": proc.stderr[:1000],
                             })
                         except Exception as exc:
+                            # 失败行也保留 stdout/stderr 键：超时异常会带上被杀前
+                            # 的部分输出，调用方不必区分成功/失败两种形状。
                             executed_checks.append({
                                 "case": case_id,
                                 "check": check.get("name"),
@@ -1126,6 +1170,9 @@ class Evolution:
                                 "exit_code": -1,
                                 "passed": False,
                                 "overlay_applied": overlay_applied,
+                                "timeout_seconds": timeout,
+                                "stdout": clipped(getattr(exc, "stdout", "")),
+                                "stderr": clipped(getattr(exc, "stderr", "")),
                                 "error": str(exc),
                             })
                 except Exception as exc:
