@@ -354,6 +354,44 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertEqual((receipt["state"], receipt["dispatch_receipt"], receipt["dispatch_http_status"]),
                          ("failed", "rejected", 422))
 
+    def test_local_rate_limit_cooldown_keeps_release_pending_and_dispatches_later(self):
+        # 冷却在请求发出前拦下：没有 gh 调用，也不能写成 GitHub 拒绝的终态失败。
+        with patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+                patch("adaptive_rsi.release.checked") as command:
+            first = self.tick()["release"]
+        self.assertEqual(first["state"], "pending")
+        self.assertNotIn("dispatch_receipt", first)
+        self.assertNotIn("dispatch_http_status", first)
+        self.assertIn("cooldown active", first["error"])
+        self.assertGreater(first["retry_at"], time.time())
+        self.assertEqual(command.call_count, 0)
+        self.assertEqual(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'"), [])
+        self.assertTrue(pending(self.runtime, self.run))
+        saved = self.runtime.store.setting(key(self.run["id"], "release"))
+        self.assertEqual((saved["state"], saved.get("dispatch_receipt")), ("pending", None))
+        # 冷却结束后同一个 run 自动完成派发，恰好一次 POST。
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            second = self.tick()["release"]
+        self.assertEqual(second["state"], "submitted")
+        self.assertEqual(second["operation_id"], saved["operation_id"])
+        self.assertEqual(sum(item[0].endswith("/dispatches") for item in self.commands), 1)
+
+    def test_local_rate_limit_cooldown_before_dispatch_post_reverts_to_pending(self):
+        # validate_pin 之后才进入冷却：POST 没有发出，必须从 dispatching 退回 pending。
+        with patch("adaptive_rsi.release.validate_pin"), \
+                patch("adaptive_rsi.release._API_BACKOFF", {"github.com": time.monotonic() + 60}), \
+                patch("adaptive_rsi.release.checked") as command:
+            first = self.tick()["release"]
+        self.assertEqual(first["state"], "pending")
+        self.assertNotIn("dispatch_receipt", first)
+        self.assertEqual(command.call_count, 0)
+        self.assertEqual([item for item in self.commands if "/dispatches" in item[0]], [])
+        self.assertTrue(pending(self.runtime, self.run))
+        with patch("adaptive_rsi.release.api", side_effect=self.api):
+            second = self.tick()["release"]
+        self.assertEqual(second["state"], "submitted")
+        self.assertEqual(sum(item[0].endswith("/dispatches") for item in self.commands), 1)
+
     def tearDown(self):
         self.runtime.close()
         self.temp.cleanup()
