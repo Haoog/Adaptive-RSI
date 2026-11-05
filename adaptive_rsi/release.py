@@ -139,15 +139,25 @@ class ReconciliationRejected(ValueError):
     """A fixed, user-safe refusal for manual workflow reconciliation."""
 
 
+# GitHub 的临时拒绝文案：secondary limit 用 "rate limit"，滥用检测不带该词。
+RATE_LIMIT_TERMS = ("rate limit", "abuse detection")
+
+
 class ApiRejected(RuntimeError):
     """GitHub explicitly rejected a request before accepting its side effect."""
 
-    def __init__(self, message, status, local=False):
+    def __init__(self, message, status, local=False, transient=False, retry_after=None):
         super().__init__(message)
         self.status = status
         # True 表示本机限流冷却在 `gh` 发出请求之前就拦下了它：GitHub 没有看到
         # 这次调用，也就谈不上拒绝，调用方应把它当成可自动重试的本地等待。
         self.local = local
+        # True 表示拒绝只是临时的（本地冷却、429、403 限流）：等待后可以重试，
+        # 不能当成「永久失败」消耗在途回执的失败预算。
+        text = str(message).lower()
+        self.transient = bool(local or transient or status == 429 or
+                              status == 403 and any(term in text for term in RATE_LIMIT_TERMS))
+        self.retry_after = retry_after
 
 
 _API_BACKOFF = {}
@@ -156,10 +166,12 @@ API_COOLDOWN_SECONDS = 60
 
 def api(repo, endpoint, method="GET", fields=None):
     # Never sleep in the scheduler or automatically replay a write. All callers
-    # of this transport share the primary/secondary limit cooldown.
-    retry_at = _API_BACKOFF.get("github.com", 0)
+    # of this transport share the primary/secondary limit cooldown, scoped to the
+    # repository that hit it: one project's limit must not freeze every project.
+    retry_at = _API_BACKOFF.get(repo, 0)
     if time.monotonic() < retry_at:
-        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True)
+        raise ApiRejected("GitHub rate limit cooldown active; request was not sent", 429, local=True,
+                          retry_after=max(1, round(retry_at - time.monotonic())))
     path = "repos/" + repo + ("/" + endpoint if endpoint else "")
     argv = ["gh", "api", path, "--method", method]
     for key, value in (fields or {}).items():
@@ -168,11 +180,13 @@ def api(repo, endpoint, method="GET", fields=None):
         output = checked(argv)
     except RuntimeError as exc:
         status = re.search(r"\(HTTP (\d{3})\)", str(exc))
-        if status and (int(status[1]) == 429 or int(status[1]) == 403 and
-                       any(term in str(exc).lower() for term in ("rate limit", "abuse detection"))):
-            _API_BACKOFF["github.com"] = time.monotonic() + API_COOLDOWN_SECONDS
-        if status and 400 <= int(status[1]) < 500 and int(status[1]) != 408:
-            raise ApiRejected(str(exc), int(status[1])) from exc
+        code = int(status[1]) if status else 0
+        limited = code == 429 or code == 403 and any(term in str(exc).lower() for term in RATE_LIMIT_TERMS)
+        if limited:
+            _API_BACKOFF[repo] = time.monotonic() + API_COOLDOWN_SECONDS
+        if 400 <= code < 500 and code != 408:
+            raise ApiRejected(str(exc), code, transient=limited,
+                              retry_after=API_COOLDOWN_SECONDS if limited else None) from exc
         raise
     try:
         return json.loads(output) if output.strip() else {}
@@ -997,7 +1011,7 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
             raise ReconciliationRejected("GitHub did not return a confirmed status for the selected workflow run; query again before selecting")
         # 人工对账已成功读取 GitHub：恢复后的失败重新从零计数，避免一次瞬时错误
         # 立刻再次转入 reconciliation_blocked。
-        for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+        for field in ("advance_failures", "last_advance_error", "last_advance_error_at", "retry_at"):
             target_data.pop(field, None)
             # 回滚子回执的失败计数记在操作回执上，恢复跟踪时一并清零。
             if target != "operation":
@@ -1581,6 +1595,20 @@ def _advance_failure_count(data):
     return 0
 
 
+def _record_advance_retry(data, exc):
+    """Note a temporary limit without consuming the permanent-failure budget.
+
+    A rate limit or a cooldown that never sent the request says nothing about the
+    receipt's health: the run may still be live on GitHub. Only the retry hint and
+    the latest error are written, so the next tick reconciles again instead of
+    ending tracking of an operation that is still running.
+    """
+    data["last_advance_error"] = str(exc)[:500]
+    data["last_advance_error_at"] = time.time()
+    data["retry_at"] = time.time() + (getattr(exc, "retry_after", None) or API_COOLDOWN_SECONDS)
+    return data
+
+
 def _record_advance_failure(runtime, project, run, kind, data, exc, target=None):
     """Count one consecutive tracking failure and stop polling at the limit.
 
@@ -1672,6 +1700,11 @@ def advance(runtime, project, run, outcome, cancel=None):
                 except Cancelled:
                     raise
                 except Exception as exc:
+                    # 临时限流（429/403 限流）或请求从未发出的本地冷却不消耗永久
+                    # 失败预算：GitHub 上的 run 可能仍在跑，等待后继续对账。
+                    if isinstance(exc, ApiRejected) and exc.transient:
+                        result[kind] = persist(runtime, run, kind, _record_advance_retry(data, exc))
+                        continue
                     # 永久性对账错误（403、身份不一致等）若原样上抛，下一次 tick 会
                     # 再次读取同一必然失败的远端，并每次写一条 automation_error。
                     # 连续失败达到上限后转入终态：停止自动轮询，只在转入时记一条事件，
@@ -1679,7 +1712,7 @@ def advance(runtime, project, run, outcome, cancel=None):
                     data = _record_advance_failure(runtime, project, run, kind, data, exc)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
-                for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
+                for field in ("advance_failures", "last_advance_error", "last_advance_error_at", "retry_at"):
                     data.pop(field, None)
                 persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
@@ -1698,10 +1731,13 @@ def advance(runtime, project, run, outcome, cancel=None):
                         data = current
                         raise
                     # 回滚子回执同样受连续失败上限约束：永久 403/SSO 失权不再
-                    # 每个 tick 重读一次并写一条事件。
+                    # 每个 tick 重读一次并写一条事件；临时限流只记重试提示。
                     target = current.get("rollback") if entry_state == "rolling_back" else None
-                    data = _record_advance_failure(runtime, project, run, kind, current, exc,
-                                                   target if isinstance(target, dict) else None)
+                    if isinstance(exc, ApiRejected) and exc.transient:
+                        data = _record_advance_retry(current, exc)
+                    else:
+                        data = _record_advance_failure(runtime, project, run, kind, current, exc,
+                                                       target if isinstance(target, dict) else None)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
                 persist(runtime, run, kind, data)
