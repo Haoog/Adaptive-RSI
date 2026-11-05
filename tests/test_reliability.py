@@ -1184,6 +1184,65 @@ class ReliabilityTest(unittest.TestCase):
         self.assertEqual(outcome["decision"], "fail")
         self.assertIn("rename from src/a.py", (directory / "candidate.patch").read_text())
 
+    def planning_agent(self, **overrides):
+        """Schema-valid ready plan with fields overridden by the case."""
+        class Planned(FakeAgent):
+            def invoke(self, role, prompt, workspace, project, run, config, cancel=None, protected=()):
+                result = super().invoke(role, prompt, workspace, project, run, config, cancel, protected)
+                if role == "planning":
+                    result.update(overrides)
+                return result
+        return Planned()
+
+    def test_empty_acceptance_plan_stops_as_insufficient_evidence(self):
+        """schema 合法但 acceptance 为空的 ready 计划是需要重新评估的证据问题，不是内部故障。"""
+        self.runtime.agent = self.planning_agent(scope=["src"], acceptance=[])
+        self.scoped_repo({"src/app.py": "VALUE = 1\n"})
+        task, run = self.claim("Fix the scoped value")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}):
+            self.runtime.process(run)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"] or "{}")
+        self.assertEqual(row["state"], "insufficient_evidence", result)
+        self.assertEqual(result["failure"]["code"], "improvement")
+        self.assertEqual(result["failure"]["action"], "inspect_evidence")
+        self.assertEqual(self.store.one("SELECT state FROM tasks WHERE id=?", (task,))["state"], "insufficient_evidence")
+        plan = json.loads((self.store.root / "runs" / run["id"] / "plan.json").read_text())
+        self.assertEqual(plan["acceptance"], [])
+        self.assertFalse((self.store.root / "runs" / run["id"] / "tool-scope.json").exists())
+
+    def test_whole_repository_plan_scope_stops_as_insufficient_evidence(self):
+        """把整个仓库当范围的计划同样停在 insufficient_evidence，且不生成授权范围。"""
+        from adaptive_rsi import pipeline
+        self.runtime.agent = self.planning_agent(scope=["."])
+        self.scoped_repo({"src/app.py": "VALUE = 1\n"})
+        task, run, project, base, directory, workspace = self.no_change_inputs("Fix the scoped value")
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}):
+            outcome = pipeline.execute_candidate(self.runtime, run, project, task, project["path"], base,
+                                                 directory, workspace, [])
+        self.assertIsNone(outcome)
+        row = self.store.one("SELECT state,result FROM runs WHERE id=?", (run["id"],))
+        result = json.loads(row["result"] or "{}")
+        self.assertEqual(row["state"], "insufficient_evidence", result)
+        self.assertEqual(result["failure"]["code"], "improvement")
+        self.assertEqual(result["reason"], "Plan must name narrower scope than the entire repository")
+        self.assertTrue((directory / "plan.json").exists())
+        self.assertFalse((directory / "tool-scope.json").exists())
+
+    def test_experiment_plan_contract_failure_returns_insufficient_evidence(self):
+        """实验路径不写运行状态，但必须返回 insufficient_evidence 而不是抛异常。"""
+        from adaptive_rsi import pipeline
+        self.runtime.agent = self.planning_agent(scope=["src"], acceptance=[])
+        self.scoped_repo({"src/app.py": "VALUE = 1\n"})
+        task, run, project, base, directory, workspace = self.no_change_inputs("Fix the scoped value")
+        trial = self.runtime.new_trial_context(run)
+        with patch("adaptive_rsi.readiness.inspect", return_value={"ready": True, "items": []}):
+            outcome = pipeline.execute_candidate(self.runtime, trial, project, task, project["path"], base,
+                                                 directory, workspace, [], experiment=True)
+        self.assertEqual(outcome["decision"], "insufficient_evidence")
+        self.assertEqual(outcome["reason"], "Plan lacks scope or acceptance criteria")
+        self.assertTrue((directory / "plan.json").exists())
+
     def rollback_fixture(self, forward, saved_files, patch_edit=None):
         """构造一次已完成的候选 run（可含 rename）和它的 rollback 任务。"""
         (self.repo / "pkg").mkdir(parents=True, exist_ok=True)
