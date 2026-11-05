@@ -504,6 +504,16 @@ class ReleaseAutomationTest(unittest.TestCase):
         self.assertEqual(reads, ["actions/runs/17/jobs?per_page=20"])
         self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), events_before)
 
+    def test_job_timing_cancellation_propagates_instead_of_becoming_a_jobs_error(self):
+        from adaptive_rsi.process import Cancelled
+        done, reads, _ = self.completed_with_job_read({"total_count": 1, "jobs": []})
+        self.remote["run_attempt"] = 2
+        with patch("adaptive_rsi.release.api", side_effect=self.jobs_api(Cancelled("Cancelled"), reads)):
+            with self.assertRaises(Cancelled):
+                reconcile(self.runtime, self.run, "release", done, persist=False)
+        self.assertNotIn("jobs_error", done["timing"])
+        self.assertEqual(reads[-1], "actions/runs/17/attempts/2/jobs?per_page=20")
+
     def test_dispatch_pins_target_and_reconciles_after_restart_without_duplicates(self):
         with patch("adaptive_rsi.release.api", side_effect=self.api):
             first = self.tick()["release"]

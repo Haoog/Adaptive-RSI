@@ -732,6 +732,10 @@ def _job_timing(repo, remote, attempt, previous, page=20, limit=10, name_limit=1
         # Never claim more jobs than were normalized; a bogus count is repaired.
         return {"jobs": timing, "jobs_attempt": attempt,
                 "jobs_total_count": total if type(total) is int and total >= len(timing) else len(timing)}
+    except Cancelled:
+        # Cancellation is control flow, not a timing-read failure: callers unwind
+        # to the explicit handler in advance() instead of persisting this attempt.
+        raise
     except (ApiRejected, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         return {"jobs_error": _bounded_text(str(exc), 200) or "Job timing unavailable"}
 
