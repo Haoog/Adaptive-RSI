@@ -40,11 +40,12 @@ def held_by_model(lock):
 
 
 class FakeAuth:
-    def __init__(self, backend, gate=None, failure=None, method="auto"):
+    def __init__(self, backend, gate=None, failure=None, method="auto", account=None):
         self.backend = backend
         self.gate = gate or threading.Event()
         self.failure = failure
         self.method = method
+        self.account = account
         self.temp = tempfile.TemporaryDirectory()
         self.credentials = Path(self.temp.name) / "auth.json"
         self.closed = False
@@ -940,6 +941,29 @@ class AuthSessionTests(unittest.TestCase):
             manager.close()
         self.assertEqual(load_auth_export(), [])
 
+    def test_codex_wait_records_account_identity_and_requests_once(self):
+        worker = object.__new__(CodexAuth)
+        worker.notifications = [{"method": "account/login/completed",
+                                 "params": {"loginId": "fixture-login", "success": True}}]
+        worker.login_id = "fixture-login"
+        calls = []
+
+        def request(method, params, timeout=25):
+            calls.append((method, params))
+            return {"account": {"email": "a@example.test", "planType": "plus", "tokens": "SECRET"}}
+
+        worker.request = request
+        self.assertTrue(worker.wait(threading.Event(), time.time() + 1))
+        self.assertEqual(calls, [("account/read", {"refreshToken": False})])
+        accounts = auth_sessions._account_entries(worker.account)
+        self.assertEqual(accounts, [{"label": "a@example.test", "plan": "plus"}])
+        snapshot = AuthSessions._public({"state": "completed", "accounts": accounts})
+        self.assertEqual(snapshot["accounts"], accounts)
+        self.assertEqual(AuthSessions._public({"state": "failed"})["accounts"], [])
+        private = AuthSessions._public({"accounts": [{"label": "a@example.test", "plan": "plus", "token": "SECRET"}]})
+        self.assertNotIn("SECRET", json.dumps(private))
+        self.assertEqual(len(AuthSessions._public({"accounts": [{"label": "a"}, {"label": "b"}, {"label": "c"}]})["accounts"]), 2)
+
     def test_codex_device_completion_persists_compatible_private_credentials(self):
         session = self.manager.start("codex")
         self.wait_state(session, "awaiting_authorization")
@@ -953,6 +977,26 @@ class AuthSessionTests(unittest.TestCase):
         self.assertNotIn("verification_url", result)
         self.assertEqual(self.manager.busy, 0)
         self.assertEqual(self.manager.snapshot()["codex"]["state"], "authenticated")
+
+    def test_codex_completion_exposes_and_persists_account_identity(self):
+        self.options["account"] = {"email": "a@example.test", "planType": "plus", "tokens": "SECRET"}
+        session = self.manager.start("codex")
+        self.wait_state(session, "awaiting_authorization")
+        self.gate.set()
+        result = self.wait_state(session, "completed")
+        self.assertEqual(result["accounts"], [{"label": "a@example.test", "plan": "plus"}])
+        self.assertNotIn("SECRET", json.dumps(result))
+        stored = json.loads(self.manager.file.read_text())[session["id"]]
+        self.assertEqual(set(stored), {"id", "backend", "provider", "state", "expires_at", "error", "accounts"})
+        self.assertEqual(stored["accounts"], [{"label": "a@example.test", "plan": "plus"}])
+        listed = {row["id"]: row for row in self.manager.snapshot()["sessions"]}
+        self.assertEqual(listed[session["id"]]["accounts"], [{"label": "a@example.test", "plan": "plus"}])
+        restarted = AuthSessions(self.root / "state", factory=self.factory, ttl=2)
+        try:
+            self.assertEqual(restarted.status(session["id"])["accounts"],
+                             [{"label": "a@example.test", "plan": "plus"}])
+        finally:
+            restarted.close()
 
     def test_pending_authorization_material_never_enters_metadata_or_snapshot(self):
         session = self.manager.start("codex")
@@ -1843,6 +1887,22 @@ class AuthSessionTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(self.created), 2, "Custom factory should never use the providers cache")
         self.assertEqual(self.manager.providers_cache, {})
+
+    def test_v2_provider_connection_count_preserves_connected_semantics(self):
+        worker = object.__new__(OpenCodeAuth)
+        worker.container = False
+        worker.capabilities = None
+        worker._v2_integrations = lambda: [
+            {"id": "missing", "name": "Missing", "methods": [{"type": "key"}]},
+            {"id": "empty", "name": "Empty", "methods": [{"type": "key"}], "connections": []},
+            {"id": "two", "name": "Two", "methods": [{"type": "key"}],
+             "connections": [{"type": "credential", "id": "one"},
+                             {"type": "credential", "id": "two"}]}]
+        with patch("adaptive_rsi.auth_sessions.shutil.which", return_value=None):
+            rows = {row["id"]: row for row in worker._v2_providers()}
+        self.assertEqual((rows["missing"]["connected"], rows["missing"]["connection_count"]), (False, 0))
+        self.assertEqual((rows["empty"]["connected"], rows["empty"]["connection_count"]), (False, 0))
+        self.assertEqual((rows["two"]["connected"], rows["two"]["connection_count"]), (True, 2))
 
 
 class OpenCodeServeTests(unittest.TestCase):
