@@ -282,6 +282,112 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             manager.close()
 
+    def test_logout_keeps_session_lock_free_while_provider_cli_logs_out(self):
+        # custom_factory=False 才走真实 CLI 登出分支；此时 _run 以 (backend, cancel)
+        # 调用 factory，仍注入假 worker。
+        manager = AuthSessions(self.root / 'logout-lock-scope', ttl=600,
+                               factory=lambda backend, cancel=None: self.factory(backend))
+        manager.custom_factory = False
+        entered, release = threading.Event(), threading.Event()
+        reserved = {}
+
+        def blocking_logout(provider, binary):
+            entered.set()
+            release.wait(1)
+            return True
+
+        def run_logout():
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider', side_effect=blocking_logout), \
+                 patch.object(manager, 'snapshot', return_value={}):
+                manager.logout('opencode', 'openai')
+
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            logout = threading.Thread(target=run_logout)
+            logout.start()
+            try:
+                self.assertTrue(entered.wait(2), 'logout_provider was not called')
+                started = time.monotonic()
+                try:
+                    reserved['value'] = manager.reserve('opencode', 'anthropic')['state']
+                except AuthError as exc:
+                    reserved['value'] = exc.code
+                reserved['ms'] = (time.monotonic() - started) * 1000
+                started = time.monotonic()
+                reserved['status'] = manager.status(session['id'])['state']
+                status_ms = (time.monotonic() - started) * 1000
+                # 放行前先断言：登出仍阻塞在子进程里。
+                self.assertTrue(logout.is_alive())
+            finally:
+                release.set()
+            logout.join(5)
+            self.assertFalse(logout.is_alive())
+            self.assertLess(reserved['ms'], 200, 'reserve() waited for the logout subprocess')
+            self.assertLess(status_ms, 100, 'status() waited for the logout subprocess')
+            self.assertEqual(reserved['status'], 'awaiting_authorization')
+            self.assertEqual(reserved['value'], 'auth_busy')
+            self.assertEqual(manager.status(session['id'])['state'], 'cancelled')
+        finally:
+            release.set()
+            manager.close()
+
+    def test_logout_other_provider_keeps_active_session(self):
+        path = auth_sessions.auth_path()
+        auth_sessions._write_json(path, {'openai': {'type': 'api', 'key': 'keep'},
+                                        'anthropic': {'type': 'api', 'key': 'drop'}})
+        manager = AuthSessions(self.root / 'logout-provider-scope', factory=self.factory, ttl=600)
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value=None), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True):
+                manager.logout('opencode', 'anthropic')
+            # 退出 anthropic 不得取消正在为 openai 进行的设备授权。
+            self.assertEqual(manager.status(session['id'])['state'], 'awaiting_authorization')
+            self.assertEqual(auth_sessions._read_json(path), {'openai': {'type': 'api', 'key': 'keep'}})
+        finally:
+            manager.close()
+
+    def test_logout_provider_failure_keeps_active_session_running(self):
+        manager = AuthSessions(self.root / 'logout-cli-failure', ttl=600,
+                               factory=lambda backend, cancel=None: self.factory(backend))
+        manager.custom_factory = False
+        try:
+            session = manager.start('opencode', 'openai')
+            self.wait_state(session, 'awaiting_authorization', manager)
+            with patch('adaptive_rsi.auth_sessions.shutil.which', return_value='/fixture/opencode'), \
+                 patch('adaptive_rsi.auth_sessions.remove_auth_export', return_value=True), \
+                 patch('adaptive_rsi.auth_sessions.logout_provider', side_effect=RuntimeError('cli failed')), \
+                 patch.object(manager, 'snapshot', return_value={}):
+                with self.assertRaises(AuthError) as caught:
+                    manager.logout('opencode', 'openai')
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            self.assertEqual(manager.status(session['id'])['state'], 'awaiting_authorization')
+            self.assertFalse(self.created[-1].closed)
+        finally:
+            manager.close()
+
+    def test_logout_marker_stops_pending_save_from_restoring_credentials(self):
+        path = auth_sessions.auth_path()
+        manager = AuthSessions(self.root / 'logout-save-race', factory=self.factory, ttl=600)
+        try:
+            session = manager.reserve('opencode', 'openai')
+            worker = FakeAuth('opencode')
+            self.created.append(worker)
+            worker.credentials.write_text(json.dumps(
+                {'openai': {'type': 'oauth', 'refresh': 'SECRET-REFRESH', 'access': 'SECRET-ACCESS'}}))
+            with manager.lock:
+                manager.logging_out.add(('opencode', 'openai'))
+            with self.assertRaises(AuthError) as caught:
+                manager._save(worker, 'opencode', 'openai', session['id'], threading.Event())
+            self.assertEqual(caught.exception.code, 'auth_protocol_error')
+            self.assertFalse(path.exists())
+        finally:
+            manager.close()
+
     def test_authorization_rejection_within_ttl_is_not_expiration(self):
         worker = FakeAuth('opencode', self.gate)
         self.created.append(worker)
