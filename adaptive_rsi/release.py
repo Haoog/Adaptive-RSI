@@ -867,6 +867,9 @@ def resolve(runtime, project_id, run_id, kind, workflow_run_id, target="operatio
         # 立刻再次转入 reconciliation_blocked。
         for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
             target_data.pop(field, None)
+            # 回滚子回执的失败计数记在操作回执上，恢复跟踪时一并清零。
+            if target != "operation":
+                data.pop(field, None)
         if target == "rollback":
             data["rollback"] = reconciled
             if reconciled.get("state") in {"queued", "running", "workflow_succeeded"}:
@@ -1103,7 +1106,8 @@ def deployment_terminal(data, policy):
         return not policy.get("automatic_rollback") or data.get("rollback_unavailable", False)
     if data.get("state") == "health_unconfirmed":
         return False
-    return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded"}
+    return data.get("state") in {"healthy", "failed", "rolled_back", "rollback_failed", "superseded",
+                                 "reconciliation_blocked"}
 
 
 def health_sample(policy, sha):
@@ -1416,6 +1420,36 @@ def _advance_failure_count(data):
     return 0
 
 
+def _record_advance_failure(runtime, project, run, kind, data, exc, target=None):
+    """Count one consecutive tracking failure and stop polling at the limit.
+
+    A permanent reconciliation error (403, identity mismatch, SSO expiry) would
+    otherwise be retried on every tick and write one ``automation_error`` event
+    each time. The counter lives on the operation receipt; once the limit is
+    reached the receipt goes to ``reconciliation_blocked``, which stops automatic
+    polling and writes exactly one event. ``target`` is the sub-receipt that
+    could not be read (the rollback run); it is marked blocked too so that the
+    read-only ``candidates``/``resolve`` entries accept it as unknown.
+
+    Manual reconciliation never dispatches or reruns; it clears the counter when
+    GitHub becomes readable again.
+    """
+    failures = _advance_failure_count(data) + 1
+    data["advance_failures"] = failures
+    data["last_advance_error"] = str(exc)[:500]
+    data["last_advance_error_at"] = time.time()
+    if failures >= ADVANCE_FAILURE_LIMIT:
+        data["state"] = "reconciliation_blocked"
+        data["error"] = str(exc)[:500]
+        payload = {"kind": kind, "state": "reconciliation_blocked"}
+        if target is not None:
+            target["state"] = "reconciliation_blocked"
+            target["error"] = str(exc)[:500]
+            payload["target"] = "rollback"
+        runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"], payload)
+    return data
+
+
 def advance(runtime, project, run, outcome, cancel=None):
     if not re.fullmatch(r"[a-f0-9]{40}", outcome.get("merged_sha", "")):
         return {}
@@ -1482,29 +1516,34 @@ def advance(runtime, project, run, outcome, cancel=None):
                     # 再次读取同一必然失败的远端，并每次写一条 automation_error。
                     # 连续失败达到上限后转入终态：停止自动轮询，只在转入时记一条事件，
                     # 人工仍可经 candidates/resolve/abandon 收口（这些路径不派发、不重跑）。
-                    failures = _advance_failure_count(data) + 1
-                    data["advance_failures"] = failures
-                    data["last_advance_error"] = str(exc)[:500]
-                    data["last_advance_error_at"] = time.time()
-                    if failures >= ADVANCE_FAILURE_LIMIT:
-                        data["state"] = "reconciliation_blocked"
-                        data["error"] = str(exc)[:500]
-                        runtime.store.event("automation_error", str(exc)[:500], project["id"], run["id"],
-                                            {"kind": kind, "state": "reconciliation_blocked"})
+                    data = _record_advance_failure(runtime, project, run, kind, data, exc)
                     result[kind] = persist(runtime, run, kind, data)
                     continue
                 for field in ("advance_failures", "last_advance_error", "last_advance_error_at"):
                     data.pop(field, None)
                 persist(runtime, run, kind, data)
             if kind == "deploy" and data and data["state"] in {"workflow_succeeded", "health_failed", "rolling_back"}:
+                tracked, entry_state = expected, data["state"]
                 try:
                     data = deployment_health(runtime, project, run, data, policy, cancel, persist=persist)
-                except Exception:
+                except Cancelled:
+                    raise
+                except Exception as exc:
                     current, raw = _read_automation(runtime, run["id"], kind)
                     if raw != expected or current and current.get("receipt_error"):
                         raise _AutomationChanged("Automation receipt changed during health tracking")
-                    data = current
-                    raise
+                    if raw != tracked:
+                        # 健康跟踪自身已落盘了新状态（例如回滚派发被拒后的
+                        # rollback_failed）；沿用外层错误上报，不把已有进展计为失败。
+                        data = current
+                        raise
+                    # 回滚子回执同样受连续失败上限约束：永久 403/SSO 失权不再
+                    # 每个 tick 重读一次并写一条事件。
+                    target = current.get("rollback") if entry_state == "rolling_back" else None
+                    data = _record_advance_failure(runtime, project, run, kind, current, exc,
+                                                   target if isinstance(target, dict) else None)
+                    result[kind] = persist(runtime, run, kind, data)
+                    continue
                 persist(runtime, run, kind, data)
             if data and data["state"] not in {"pending", "blocked", "waiting_verification", "blocked_verification", "waiting_target", "waiting_release"}:
                 result[kind] = data
