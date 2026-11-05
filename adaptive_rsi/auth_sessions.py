@@ -955,10 +955,13 @@ class AuthSessions:
         self.public_sessions = {}
         self.sessions = {}
         self.workers = {}
+        # 凭据写入（可能起子进程或 fsync）在 self.lock 外执行；此集合标记写入中的会话，
+        # 供 cancel() 拒绝并发取消，并让状态扫描不要把写入中的会话提前过期。
+        self.credential_writes = set()
         self.discoveries = set()
         self.threads = set()
-        # 线程登记不占用 self.lock：后者在 install_credential/logout 期间被长时间持有，
-        # 过期快照的后台刷新若等待它，请求线程仍会被阻塞。
+        # 线程登记不占用 self.lock：后者在 logout 期间仍会被较长时间持有（凭据移除
+        # 会起子进程），过期快照的后台刷新若等待它，请求线程仍会被阻塞。
         self.threads_lock = threading.Lock()
         self.closed = False
         # close() 期间状态文件写失败时保留首个异常，供排查；不向调用方抛出。
@@ -1400,7 +1403,8 @@ class AuthSessions:
             # 在 TTL 内持续 auth_busy。
             for session_key, item in list(self.sessions.items()):
                 if (item["backend"] == backend and item["state"] in ACTIVE
-                        and self.now() >= item["expires_at"]):
+                        and self.now() >= item["expires_at"]
+                        and session_key not in self.credential_writes):
                     self._update(session_key, state="expired", error="auth_expired")
             if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
@@ -1625,6 +1629,9 @@ class AuthSessions:
                 self._update(session_id, state="expired", error="auth_expired")
                 return
         try:
+            # 凭据 I/O 可能起子进程（opencode auth import 最长 20s）或 fsync：锁内只
+            # 校验状态并登记「写入中」，锁外持 credential_lock 完成写入，避免在
+            # dispatch_lock 内调用 reserve() 的请求等满整段写入而阻塞全站写端点。
             with self.lock:
                 current_session = self.sessions.get(session_id)
                 if current_session is None:
@@ -1634,6 +1641,8 @@ class AuthSessions:
                 if self.now() >= current_session["expires_at"]:
                     self._update(session_id, state="expired", error="auth_expired")
                     return
+                self.credential_writes.add(session_id)
+            try:
                 if backend == "codex":
                     # 与 opencode 分支一致：合并写回，保留用户手放的 OPENAI_API_KEY
                     # 和新版 CLI 写入的未知字段，只覆盖凭据本身的同名字段。
@@ -1646,9 +1655,20 @@ class AuthSessions:
                     current = _read_json_for_write(auth_path())
                     current[provider] = value
                     _write_json(auth_path(), current)
-                # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
-                self._invalidate_caches(backend)
-                self._update(session_id, state="completed")
+                with self.lock:
+                    current_session = self.sessions.get(session_id)
+                    if current_session is None:
+                        return
+                    if self.closed or stop.is_set() or current_session["state"] not in ACTIVE:
+                        return
+                    # 授权期间的状态/供应商查询可能重新填充旧缓存，保存凭据后再次失效。
+                    self._invalidate_caches(backend)
+                    self._update(session_id, state="completed")
+            finally:
+                # 写入中取消会被 cancel() 拒绝，因此这里结束前状态仍是同一 ACTIVE 会话；
+                # 仍在持锁时摘标记，避免「标记已摘、completed 未写」的窗口被取消穿过。
+                with self.lock:
+                    self.credential_writes.discard(session_id)
         finally:
             credential_lock.release()
 
@@ -1666,7 +1686,10 @@ class AuthSessions:
             item = self.sessions.get(session_id) if isinstance(session_id, str) else None
             if item is None:
                 raise AuthError("unknown_session")
-            if item["state"] in ACTIVE and self.now() >= item["expires_at"]:
+            # 凭据写入期间不在这里过期：写入方持有 credential_lock 且尚未收尾，
+            # 提前标 expired 会得到「凭据已落盘、会话却过期」的矛盾终态。
+            if (item["state"] in ACTIVE and self.now() >= item["expires_at"]
+                    and session_id not in self.credential_writes):
                 self._update(session_id, state="expired", error="auth_expired")
                 # 锁内只做状态判定并摘除 workers 引用；close() 含 docker rm、killpg、
                 # wait 及目录清理等慢操作，放到锁外执行。close() 自身幂等，
@@ -1706,6 +1729,10 @@ class AuthSessions:
     def cancel(self, session_id):
         self.status(session_id)
         with self.lock:
+            if session_id in self.credential_writes:
+                # 凭据写入已开始；放行取消会出现「已取消却仍安装凭据」。
+                # 与 logout/set_api_key 等待凭据锁一致，返回 409 让用户稍后重试。
+                raise AuthError("auth_credentials_busy")
             self._update(session_id, state="cancelled")
             worker = self.workers.get(session_id)
         if worker:
@@ -1775,7 +1802,8 @@ class AuthSessions:
             # ACTIVE 的同后端行，否则一次过期的尝试会在 TTL 内持续 auth_busy。
             for session_key, item in list(self.sessions.items()):
                 if (item["backend"] == backend and item["state"] in ACTIVE
-                        and self.now() >= item["expires_at"]):
+                        and self.now() >= item["expires_at"]
+                        and session_key not in self.credential_writes):
                     self._update(session_key, state="expired", error="auth_expired")
             if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                 raise AuthError("auth_busy")
@@ -1811,18 +1839,19 @@ class AuthSessions:
                         raise AuthError("service_closed")
                     if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                         raise AuthError("auth_busy")
-                    worker.install_credential(provider, credentials)
-                    self._invalidate_caches(backend)
+                # 安装可能起子进程；与 _save 一致移出会话锁，只在 AUTH_LOCK 下写凭据。
+                worker.install_credential(provider, credentials)
             else:
                 with self.lock:
                     if self.closed:
                         raise AuthError("service_closed")
                     if any(item["state"] in ACTIVE and item["backend"] == backend for item in self.sessions.values()):
                         raise AuthError("auth_busy")
-                    data = _read_json_for_write(auth_path())
-                    data[provider] = {"type": "api", "key": key.strip()}
-                    _write_json(auth_path(), data)
-                    self._invalidate_caches(backend)
+                data = _read_json_for_write(auth_path())
+                data[provider] = {"type": "api", "key": key.strip()}
+                _write_json(auth_path(), data)
+            with self.lock:
+                self._invalidate_caches(backend)
         finally:
             try:
                 if worker:
