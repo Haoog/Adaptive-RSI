@@ -97,6 +97,23 @@ DEAD_DEPENDENCY_STATES = ("failed", "cancelled", "expired", "obsolete", "rejecte
                           "pr_closed", "unverified_merge", "reverted", "superseded")
 
 
+def _fair_ledger(value):
+    """公平账本只参与排序：形状或数值损坏的条目丢弃并报告，不能让一次调度失败。
+
+    与 `rotation`、`postprocess-pending-cursor` 等设置读取的防御一致；返回
+    (清洗后的账本, 被丢弃的键)。
+    """
+    if not isinstance(value, dict):
+        return {}, ["<%s>" % type(value).__name__]
+    cleaned, dropped = {}, []
+    for key, entry in value.items():
+        if isinstance(entry, bool) or not isinstance(entry, (int, float)):
+            dropped.append(str(key))
+        else:
+            cleaned[key] = entry
+    return cleaned, dropped
+
+
 def _clock_lock(run):
     """Return the lock that guards one run's deadline clock fields.
 
@@ -111,6 +128,25 @@ def _clock_lock(run):
     if lock is None:
         lock = run.setdefault('_deadline_lock', threading.Lock())
     return lock
+
+
+def _literal_pathspec(path):
+    """只有普通相对路径才能与一次全量 diff 的结果做字面比较。
+
+    glob（`*?[`）、排除（`!`/`^`）、pathspec 魔法（`:`）、`.`/`..` 段以及空路径
+    在 git 里有各自的匹配语义，交由 git 逐条判定，避免改变唤醒结论。
+    """
+    if not isinstance(path, str) or not path or path.startswith(("/", "!", "^", ":")):
+        return False
+    segments = path.rstrip("/").split("/")
+    return all(segment not in ("", ".", "..") for segment in segments) and \
+        not any(character in path for character in "*?[")
+
+
+def _diff_touches(changed, path):
+    """路径本身或其目录前缀出现在变更集里，等价于 git pathspec 命中。"""
+    path = path.rstrip("/")
+    return any(name == path or name.startswith(path + "/") for name in changed)
 
 
 class IssueSyncCorruptPending(ValueError):
@@ -1193,6 +1229,22 @@ class Runtime(Maintenance):
             candidate = boundary
 
     def reassess_deferred(self, project, config, head):
+        # 同一 base 的暂缓任务共享一次 base→head 变更集：逐条 git diff 会把完全相同的区间
+        # 重复 fork/exec N 次，而 related_paths 只是各自的过滤条件。
+        changes_by_base = {}
+
+        def changes_for(base):
+            if base not in changes_by_base:
+                try:
+                    # --no-renames 让重命名两侧的旧路径也出现在集合里，与逐条 pathspec 查询一致。
+                    output = git(self.project(project)["path"], "diff", "--name-only", "-z",
+                                 "--no-renames", base, head)
+                    changes_by_base[base] = {path for path in output.split("\0") if path}
+                except RuntimeError:
+                    # base 已不存在等情况：该 base 的任务按「无法判定」保持唤醒，与逐条 diff 一致。
+                    changes_by_base[base] = None
+            return changes_by_base[base]
+
         for task in self.store.query("SELECT * FROM tasks WHERE project=? AND state='deferred'", (project,)):
             decision = self.store.one("SELECT data FROM task_decisions WHERE task=?", (task["id"],))
             run = self.store.one("SELECT result FROM runs WHERE task=? ORDER BY started DESC,rowid DESC LIMIT 1", (task["id"],)) if not decision else None
@@ -1225,8 +1277,15 @@ class Runtime(Maintenance):
                 try:
                     for path in paths:
                         relative_path(path)
-                    changed = git(self.project(project)["path"], "diff", "--name-only", prior["base"], head, "--", *paths).strip()
-                    if not changed:
+                    if all(_literal_pathspec(path) for path in paths):
+                        changed = changes_for(prior["base"])
+                        # 无法取得变更集（base 已失效）时保持原结论：唤醒并重新评估。
+                        touched = True if changed is None else any(_diff_touches(changed, path) for path in paths)
+                    else:
+                        # glob、排除或 "." 等 pathspec 语法不能按字面比较，退回逐条查询。
+                        touched = bool(git(self.project(project)["path"], "diff", "--name-only",
+                                           prior["base"], head, "--", *paths).strip())
+                    if not touched:
                         baseline_changed = False
                         self.store.execute("INSERT OR REPLACE INTO task_decisions VALUES (?,?,?)",
                                            (task["id"], encode({**prior, "base": head}), time.time()))
@@ -1412,9 +1471,27 @@ class Runtime(Maintenance):
                         (now, now, now - 86400, project["id"], now - 86400))["seconds"]
             if not ready:
                 return
-            services = self.store.setting("fair-service", {})
+            services, dropped = _fair_ledger(self.store.setting("fair-service", {}))
+            dropped = ["fair-service:" + key for key in dropped]
             clock = self.store.setting("fair-clock", max(services.values(), default=0))
-            waiting = self.store.setting("fair-waiting", {})
+            if isinstance(clock, bool) or not isinstance(clock, (int, float)):
+                dropped.append("fair-clock")
+                clock = max(services.values(), default=0)
+            waiting, waiting_dropped = _fair_ledger(self.store.setting("fair-waiting", {}))
+            dropped += ["fair-waiting:" + key for key in waiting_dropped]
+            if dropped:
+                # 账本只影响排序：坏条目在内存里丢弃后按清洗值回写并记录一次，避免每个
+                # 调度节拍重复报告；回写或事件失败时继续用清洗后的内存值调度。
+                try:
+                    self.store.put_setting("fair-service", services)
+                    self.store.put_setting("fair-waiting", waiting)
+                    if "fair-clock" in dropped:
+                        self.store.put_setting("fair-clock", clock)
+                    self.store.event("fair_ledger_repaired",
+                                     "Discarded corrupt fair ledger entries",
+                                     data={"dropped": sorted(set(dropped))})
+                except Exception:
+                    logging.getLogger(__name__).warning("Fair ledger repair failed", exc_info=True)
             active = {p["id"] for p, _ in ready}
             waiting = {key: value for key, value in waiting.items() if key in active}
             for key in active:
@@ -1454,11 +1531,27 @@ class Runtime(Maintenance):
                     run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
                     if not run:
                         return
-                    services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
-                    self.store.put_setting("fair-service", services)
-                    self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
-                    waiting[project["id"]] = now
-                    self.store.put_setting("fair-waiting", waiting)
+                    # 账本只服务下一次调度的排序，claim 却已经改写任务与 runs 行；若这里
+                    # 让一次瞬时写失败（database is locked / 磁盘满）逃出去，run 会永久
+                    # 停在 planning、任务停在 planning，同项目的普通任务在 recover() 前
+                    # 全部领不到。记账失败只告警并继续提交，run 由 worker 正常收尾。
+                    try:
+                        services[project["id"]] = (services.get(project["id"], clock) +
+                                                   1 / max(1, config["schedule"].get("weight", 1)))
+                        self.store.put_setting("fair-service", services)
+                        self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
+                        waiting[project["id"]] = now
+                        self.store.put_setting("fair-waiting", waiting)
+                    except Exception as exc:
+                        logging.getLogger(__name__).warning(
+                            "Fair ledger update failed for %s: %s", project["id"], exc)
+                        try:
+                            self.store.event("fair_ledger_skipped",
+                                             "Fair ledger update failed; dispatching the claimed run anyway",
+                                             run["project"], run["id"], {"error": type(exc).__name__})
+                        except Exception:
+                            logging.getLogger(__name__).warning(
+                                "Fair ledger failure event could not be recorded", exc_info=True)
                     try:
                         future = self.pool.submit(self.process, run)
                     except Exception:
