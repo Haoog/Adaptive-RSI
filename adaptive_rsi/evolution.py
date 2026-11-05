@@ -1943,17 +1943,22 @@ class Evolution:
             self._plan_keys = {}
         plan = evidence.get("preregistered_plan")
         plan_key = fingerprint(plan) if plan else None
+        trials = evidence.get("trials", [])
+        # 试验数同样是派生证据的输入。只按计划哈希缓存会让评估期间每次 save 都复用
+        # 0 条试验时算出的 win_rate / plan_verification；进程中断后落库的就是
+        # 「做了 N 条试验、胜场 0、计划未执行」的自相矛盾证据。
+        cache_key = (plan_key, len(trials))
         sentinel = object()
-        plan_changed = (self._plan_keys.get(candidate, sentinel) != plan_key) or (bool(plan) and "plan_verification" not in evidence)
+        plan_changed = (self._plan_keys.get(candidate, sentinel) != cache_key) or (bool(plan) and "plan_verification" not in evidence)
         is_terminal = (status != "evaluating")
 
         if is_terminal or plan_changed or "win_rate" not in evidence:
             if plan:
-                evidence["plan_verification"] = self.verify_plan(plan, evidence.get("trials", []))
+                evidence["plan_verification"] = self.verify_plan(plan, trials)
                 if status == "evaluating" and not evidence["plan_verification"]["valid"]:
                     evidence["plan_verification"]["analysis"] = "planned_in_progress"
-            evidence["win_rate"] = paired_summary(evidence.get("trials", []))
-            self._plan_keys[candidate] = plan_key
+            evidence["win_rate"] = paired_summary(trials)
+            self._plan_keys[candidate] = cache_key
         if is_terminal:
             self._plan_keys.pop(candidate, None)
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))
