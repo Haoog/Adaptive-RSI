@@ -1527,6 +1527,42 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_evidence_drops_host_trial_report_paths(self):
+        """试验的评估报告绝对路径带出用户名与状态目录布局，导出时不得进包。"""
+        def report(variant):
+            return str(self.root / 'experiments' / 'experiments' / 'case-1-0' / variant / 'evaluation' / 'report.json')
+        trial = {'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                 'order': ['stable', 'candidate'],
+                 'stable': {'pass': False, 'report': report('stable')},
+                 'candidate': {'pass': True, 'report': report('candidate')}}
+        ablation = {'state': 'complete', 'trials': [
+            {'case': 'case-1', 'repetition': 0,
+             'strategy_only': {'pass': True, 'report': report('strategy_only')},
+             'skill_only': {'pass': False, 'report': report('skill_only')}}]}
+        self.candidate({'trials': [trial], 'ablation': ablation})
+        destination = self.root / 'bundle-trial-report'
+        self.evolution.export_bundle('c', destination)
+
+        text = (destination / 'evidence.json').read_text(encoding='utf-8')
+        self.assertNotIn(str(self.root), text)
+        exported = json.loads(text)
+        # 判定字段保留，只有宿主路径被删除。
+        self.assertEqual(exported['trials'][0]['case'], 'case-1')
+        self.assertEqual(exported['trials'][0]['split'], 'validation')
+        self.assertEqual(exported['trials'][0]['repetition'], 0)
+        self.assertEqual(exported['trials'][0]['order'], ['stable', 'candidate'])
+        self.assertEqual([exported['trials'][0]['stable']['pass'],
+                          exported['trials'][0]['candidate']['pass']], [False, True])
+        self.assertNotIn('report', exported['trials'][0]['stable'])
+        self.assertNotIn('report', exported['trials'][0]['candidate'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['strategy_only'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['skill_only'])
+        self.assertFalse(exported['ablation']['trials'][0]['skill_only']['pass'])
+        # 导出只裁剪副本，本地候选证据仍保留完整路径。
+        stored = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
+        self.assertEqual(stored['trials'][0]['stable']['report'], trial['stable']['report'])
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
     def test_bundle_hashing_streams_instead_of_reading_whole_files(self):
         """封存与校验摘要必须分块读取，峰值内存不随单个文件大小增长。
 
@@ -2041,6 +2077,67 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(row['passed'])
         self.assertIn('Symlink overlaps reproduction overlay', row['error'])
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_bundle_reproduction_fails_check_with_missing_cwd(self):
+        # 声明的 cwd 不在用例树里时不得退回 staging 根目录执行：那样检查会在
+        # 错误目录里通过，整包被判可复现，接收方也无从核对实际工作目录。
+        overlay = self.root / 'overlay-cwd'
+        (overlay / 'sub').mkdir(parents=True)
+        (overlay / 'sub' / 'marker.txt').write_text('present\n')
+        checks = [
+            {'name': 'missing_cwd', 'cwd': 'nested', 'argv': ['python3', '-c', 'print("ran")']},
+            {'name': 'root_cwd', 'cwd': '.', 'argv': ['python3', '-c', 'print("root")']},
+            {'name': 'subdir_cwd', 'cwd': 'sub',
+             'argv': ['python3', '-c',
+                      'import pathlib, sys; sys.exit(0 if pathlib.Path("marker.txt").is_file() else 7)']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-cwd-missing', overlay=overlay)
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertTrue(result['integrity']['valid'])
+        rows = {row['check']: row for row in result['executed_checks']}
+        self.assertEqual(sorted(rows), ['missing_cwd', 'root_cwd', 'subdir_cwd'])
+        missing = rows['missing_cwd']
+        self.assertFalse(missing['passed'])
+        self.assertEqual(missing['exit_code'], -1)
+        self.assertEqual(missing['cwd'], 'nested')
+        self.assertIn('cwd', missing['error'])
+        # 合法 cwd（根目录与 overlay 提供的既有子目录）照常执行并通过。
+        self.assertTrue(rows['root_cwd']['passed'], rows['root_cwd'])
+        self.assertTrue(rows['subdir_cwd']['passed'], rows['subdir_cwd'])
+        self.assertFalse(result['reproducible'])
+        self.assertFalse(result['checks_passed'])
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertIn('Offline checks failed: 1 of 3', ' '.join(result['limitations']))
+
+    def test_bundle_reproduction_rejects_cwd_symlink_escape(self):
+        # 用例仓库内的符号链接把 cwd 指向副本之外时，同样不能静默改写工作目录
+        # 后照常执行；该检查必须失败，且命令不得在副本外的目标目录留下副作用。
+        destination = self.sealed_bundle(
+            checks=[{'name': 'escaped_cwd', 'cwd': 'escape',
+                     'argv': ['python3', '-c', 'open("ESCAPED", "w").write("1")']}],
+            repo_name='repo-cwd-escape')
+        case_dir = destination / 'cases' / 'case-cwd-escape'
+        outside = self.root / 'outside-cwd'
+        outside.mkdir()
+        (case_dir / 'repository' / 'escape').symlink_to(outside)
+
+        with patch.object(Evolution, 'verify_bundle',
+                          return_value={'valid': True, 'mismatches': [], 'limitations': []}):
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertEqual(row['cwd'], 'escape')
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertIn('escapes the case copy', row['error'])
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse(result['reproducible'])
 
     def test_bundle_credentials_follow_exported_provider_requirements(self):
         # 线程 3：凭据需求来自导出的非机密 provider 元数据，不再默认 OPENAI_API_KEY。
