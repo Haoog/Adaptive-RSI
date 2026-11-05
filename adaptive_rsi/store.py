@@ -23,6 +23,14 @@ MAX_CONNECTIONS = 32
 # claim 候选分页大小：pending publish 积压时按页推进，避免每条被跳过的候选
 # 都重跑一次整条候选扫描。
 CLAIM_PAGE = 64
+# WAL checkpoint 只重置写位置、不缩小文件；默认 journal_size_limit=-1 会让
+# state.sqlite3-wal 永久停在历史最大写突发（VACUUM 会把整库镜像写进 WAL），
+# 主库回收后磁盘占用并不下降。8 MiB 高于正常 checkpoint 往返量，又能把峰值
+# 收进磁盘预算；连接级设置，每次借出重新确保生效。
+WAL_SIZE_LIMIT_BYTES = 8 * 1024 * 1024
+# TRUNCATE checkpoint 需要短暂的排他窗口；维护路径最多等 1 秒，遇到读者就
+# 放弃并在诊断中报告，不能把小时级维护卡在 15 秒的默认 busy timeout 上。
+WAL_TRUNCATE_BUSY_MS = 1000
 
 
 def uid():
@@ -359,6 +367,7 @@ class Store:
             # WAL 下 NORMAL 将每笔提交从 FULL fsync 降到 checkpoint 才落盘；
             # 崩溃只丢最后未 checkpoint 的事务，库不损坏，备份/恢复体系兜底。
             db.execute("PRAGMA synchronous=NORMAL")
+            db.execute("PRAGMA journal_size_limit=%d" % WAL_SIZE_LIMIT_BYTES)
         except BaseException:
             db.close()
             raise
@@ -370,6 +379,7 @@ class Store:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         db.execute("PRAGMA synchronous=NORMAL")
+        db.execute("PRAGMA journal_size_limit=%d" % WAL_SIZE_LIMIT_BYTES)
         return db
 
     @contextlib.contextmanager
@@ -535,7 +545,7 @@ class Store:
                 self._read_snapshot.connection = None
 
     def wal_diagnostics(self, checkpoint=False):
-        """A passive checkpoint never waits for readers or truncates their WAL."""
+        """A passive checkpoint never waits for readers; truncation only runs unpinned."""
         now = time.monotonic()
         with self._metrics_lock:
             ages = [max(0, now - started) for started in self._active_snapshots.values()]
@@ -545,7 +555,17 @@ class Store:
             with self.connect() as db:
                 busy, pages, copied = db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
                 result.update(busy=bool(busy), wal_pages=pages, checkpointed_pages=copied,
-                              pending_pages=max(0, pages - copied), mode="passive")
+                              pending_pages=max(0, pages - copied), mode="passive",
+                              journal_size_limit_bytes=db.execute("PRAGMA journal_size_limit").fetchone()[0])
+                result.update(self._truncate_wal(db, result["pending_pages"], result["active_snapshots"]))
+            result["wal_bytes"] = self._wal_file_bytes()
+            if result.get("truncate") == "error":
+                try:
+                    self.event("wal_truncate_failed", "WAL truncate failed",
+                               data={"error_type": result["truncate_error"],
+                                     "journal_size_limit_bytes": result["journal_size_limit_bytes"]})
+                except Exception:
+                    logging.getLogger(__name__).exception("WAL truncate failure persistence failed")
             self._wal_snapshot = result
         else:
             previous = getattr(self, "_wal_snapshot", {})
@@ -553,6 +573,35 @@ class Store:
                            if key not in ("active_snapshots", "oldest_snapshot_seconds", "checked_at", "snapshot_scope")})
             result["checkpoint_checked_at"] = previous.get("checked_at")
         return result
+
+    def _wal_file_bytes(self):
+        try:
+            return Path(str(self.path) + "-wal").stat().st_size
+        except OSError:
+            return 0
+
+    def _truncate_wal(self, db, pending_pages, active_snapshots):
+        """PASSIVE 只把页写回主库；没有残留页与本进程快照时再截断文件本身。
+
+        读者仍可能来自其他进程或普通连接，所以 TRUNCATE 只等
+        WAL_TRUNCATE_BUSY_MS；busy 或错误都只写进报告，不改变不等待读者的语义。
+        """
+        if pending_pages or active_snapshots:
+            return {"truncated": False,
+                    "truncate": "skipped_pending" if pending_pages else "skipped_snapshot"}
+        previous = db.execute("PRAGMA busy_timeout").fetchone()[0]
+        db.execute("PRAGMA busy_timeout=%d" % WAL_TRUNCATE_BUSY_MS)
+        try:
+            busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as exc:
+            logging.getLogger(__name__).warning("WAL truncate skipped (%s: %s)", type(exc).__name__, exc)
+            return {"truncated": False, "truncate": "error", "truncate_error": type(exc).__name__}
+        finally:
+            try:
+                db.execute("PRAGMA busy_timeout=%d" % previous)
+            except sqlite3.Error:
+                pass
+        return {"truncated": not busy, "truncate": "busy" if busy else "ok"}
 
     def record_request(self, request, method, path, status, started, ended, error_code=""):
         polls = {"/api/state", "/api/events", "/api/usage", "/api/auth/status", "/api/operation"}
@@ -593,8 +642,8 @@ class Store:
         with self.connect() as db:
             values.update({
                 "database_bytes": self.path.stat().st_size if self.path.exists() else 0,
-                "wal_bytes": Path(str(self.path) + "-wal").stat().st_size
-                if Path(str(self.path) + "-wal").exists() else 0,
+                "wal_bytes": self._wal_file_bytes(),
+                "wal_size_limit_bytes": db.execute("PRAGMA journal_size_limit").fetchone()[0],
                 "page_count": db.execute("PRAGMA page_count").fetchone()[0],
                 "page_size": db.execute("PRAGMA page_size").fetchone()[0],
                 "busy_timeout_ms": db.execute("PRAGMA busy_timeout").fetchone()[0],
