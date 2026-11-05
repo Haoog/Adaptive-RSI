@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi import delivery, readiness, release
-from adaptive_rsi.config import DEFAULTS
+from adaptive_rsi.config import DEFAULTS, fingerprint
 from adaptive_rsi.process import ProcessError
 import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
@@ -170,6 +170,137 @@ class BaselineAndCleanupTest(unittest.TestCase):
                 self.publish()
         self.assertFalse(command.called)
         self.assertEqual(self.store.setting('delivery-push:' + self.run['id'])['head'], 'a' * 40)
+
+
+class AdvancedBaselineReplayTest(unittest.TestCase):
+    """A moved mainline replays the sealed patch instead of discarding it."""
+
+    setUp = recovery_tests.DeliveryRecoveryTest.setUp
+    publish = recovery_tests.DeliveryRecoveryTest.publish
+
+    def advance(self, path="notes.txt", content="mainline\n"):
+        previous = git(self.repo, "rev-parse", "HEAD")
+        (self.repo / path).write_text(content)
+        git(self.repo, "add", path)
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "-m", "advance")
+        return previous, git(self.repo, "rev-parse", "HEAD")
+
+    def sealed_acceptance(self):
+        (self.root / "acceptance.json").write_text(json.dumps({
+            "hash": "a" * 64, "criteria": ["2 + 3 equals 5"],
+            "spec": {"files": [], "checks": []},
+            "checks": [{"name": "independent addition", "criteria": [0],
+                        "argv": ["python3", "-c", "assert add(2, 3) == 5"]}]}), encoding="utf-8")
+
+    def remote_writes(self):
+        """Answer the PR lookup, refuse any remote write, and record ordering."""
+        calls = []
+        creates = []
+        def fake_checked(argv, **kwargs):
+            if argv[1:3] == ["pr", "list"]:
+                calls.append("list")
+                return json.dumps([])
+            if argv[1:3] == ["pr", "create"]:
+                creates.append(argv)
+                return self.url
+            raise AssertionError(f"Unexpected checked argv: {argv}")
+        return fake_checked, calls, creates
+
+    def test_advanced_baseline_replays_patch_and_revalidates_before_pr(self):
+        previous, current = self.advance()
+        self.assertEqual(previous, self.run["base"])
+        self.sealed_acceptance()
+        original_patch = git(self.workspace, "diff", previous, "--binary", "--no-ext-diff", "--no-textconv")
+        fake_checked, calls, creates = self.remote_writes()
+        seen = {}
+        def fake_evaluate(baseline, candidate, checks, directory, config, cancel=None, **kwargs):
+            self.assertEqual(creates, [], "PR must not exist before the new baseline is verified")
+            seen["evaluated"] = True
+            seen["baseline"] = git(baseline, "rev-parse", "HEAD")
+            seen["candidate"] = git(candidate, "rev-parse", "HEAD^")
+            seen["acceptance"] = kwargs.get("acceptance")
+            seen["checks"] = checks
+            return {"decision": "pass", "reason": "re-verified on the advanced baseline",
+                    "checks": {"candidate": [{"passed": True}]}}
+        pushed = []
+        def fake_push(ws, *args, **kwargs):
+            pushed.append((Path(ws), args))
+        with patch.object(delivery, "baseline", return_value=(str(self.repo), current, "main")), \
+                patch.object(delivery, "checked", side_effect=fake_checked), \
+                patch.object(delivery, "github_git", side_effect=fake_push), \
+                patch.object(self.runtime.evaluator, "evaluate", side_effect=fake_evaluate):
+            self.assertEqual(self.publish(), self.url)
+        self.assertTrue(seen.get("evaluated"))
+        self.assertEqual(seen["baseline"], current)
+        self.assertEqual(seen["candidate"], current)
+        self.assertIsNotNone(seen["acceptance"], "independent acceptance must run on the new tree")
+        self.assertTrue(seen["checks"])
+        self.assertEqual(calls, ["list"])
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(pushed), 1)
+        workspace = pushed[0][0]
+        self.assertEqual(git(workspace, "rev-parse", "HEAD^"), current)
+        self.assertEqual(fingerprint(git(workspace, "diff", current, "--binary", "--no-ext-diff", "--no-textconv")),
+                         fingerprint(original_patch))
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"]),
+                         {"repository": "example/project", "branch": "main", "sha": current})
+        self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], current)
+        self.assertEqual(self.store.setting("delivery:" + self.run["id"])["base"], current)
+        change = json.loads(self.store.one("SELECT data FROM events WHERE kind='baseline_changed' AND run=?",
+                                           (self.run["id"],))["data"])
+        self.assertEqual(change["relation"], "advanced")
+        self.assertIsNotNone(self.store.one("SELECT 1 FROM events WHERE kind='baseline_revalidated' AND run=?",
+                                            (self.run["id"],)))
+
+    def test_conflicting_patch_keeps_the_stale_candidate_path(self):
+        (self.repo / "calculator.py").write_text("def add(a, b):\n    return 0\n")
+        git(self.repo, "add", "calculator.py")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "-m", "conflict")
+        current = git(self.repo, "rev-parse", "HEAD")
+        fake_checked, calls, creates = self.remote_writes()
+        with patch.object(delivery, "baseline", return_value=(str(self.repo), current, "main")), \
+                patch.object(delivery, "checked", side_effect=fake_checked), \
+                patch.object(delivery, "github_git", side_effect=AssertionError("push attempted")):
+            with self.assertRaisesRegex(delivery.StaleCandidate, "no longer applies"):
+                self.publish()
+        self.assertEqual(calls, ["list"])
+        self.assertEqual(creates, [])
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], self.run["base"])
+        change = json.loads(self.store.one("SELECT data FROM events WHERE kind='baseline_changed' AND run=?",
+                                           (self.run["id"],))["data"])
+        self.assertEqual(change["relation"], "advanced")
+
+    def test_failing_checks_on_the_new_baseline_keep_stale_semantics(self):
+        previous, current = self.advance()
+        fake_checked, calls, creates = self.remote_writes()
+        with patch.object(delivery, "baseline", return_value=(str(self.repo), current, "main")), \
+                patch.object(delivery, "checked", side_effect=fake_checked), \
+                patch.object(delivery, "github_git", side_effect=AssertionError("push attempted")), \
+                patch.object(self.runtime.evaluator, "evaluate",
+                             return_value={"decision": "fail", "reason": "regression on the new baseline"}):
+            with self.assertRaisesRegex(delivery.StaleCandidate, "did not pass"):
+                self.publish()
+        self.assertEqual(calls, ["list"])
+        self.assertEqual(creates, [])
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], previous)
+        self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], previous)
+
+    def test_rewritten_baseline_is_never_replayed(self):
+        (self.repo / "pyproject.toml").write_text('[project]\nname="fixture"\nversion="0.0.2"\n')
+        git(self.repo, "add", "pyproject.toml")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost",
+            "commit", "--quiet", "--amend", "--no-edit")
+        current = git(self.repo, "rev-parse", "HEAD")
+        fake_checked, calls, creates = self.remote_writes()
+        with patch.object(delivery, "baseline", return_value=(str(self.repo), current, "main")), \
+                patch.object(delivery, "checked", side_effect=fake_checked), \
+                patch.object(delivery, "github_git", side_effect=AssertionError("push attempted")), \
+                patch.object(self.runtime.evaluator, "evaluate", side_effect=AssertionError("replayed")):
+            with self.assertRaisesRegex(delivery.StaleCandidate, "Remote baseline changed"):
+                self.publish()
+        self.assertEqual(creates, [])
 
 
 class AttributionTest(unittest.TestCase):

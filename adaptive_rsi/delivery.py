@@ -5,7 +5,7 @@ import re
 import time
 from pathlib import Path
 
-from .config import merge
+from .config import fingerprint, merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
@@ -444,6 +444,56 @@ def failure_attribution(merged, head, result):
             "disclaimer": "later-mainline 失败不记候选回归" if scope == "subsequent_mainline" else ""}
 
 
+def replay_validated_candidate(runtime, workspace, run, config, source, previous, current, patch,
+                               branch, title):
+    """Replay one evaluated patch on an advanced mainline and re-run its gates.
+
+    The stored verdict belongs to ``previous``; only the patch bytes are reused.
+    Fixed checks and independent acceptance execute again on ``current``, so a
+    moved baseline never carries an old pass forward.  Apply conflicts, missing
+    check contracts and failing gates raise ``StaleCandidate``, leaving the
+    existing superseded/requeue path in charge of those cases.
+    """
+    if not patch.strip():
+        raise StaleCandidate("Evaluated candidate has no replayable patch")
+    directory = Path(workspace).parent
+    label = "replay-" + current[:12] + "-" + uid()[:8]
+    baseline_tree = snapshot(source, directory / (label + "-baseline"), current)
+    candidate = snapshot(source, directory / (label + "-candidate"), current)
+    patch_file = directory / (label + ".patch")
+    patch_file.write_text(patch + "\n", encoding="utf-8")
+    try:
+        git(candidate, "apply", "--index", str(patch_file))
+    except ProcessError:
+        raise StaleCandidate("Validated patch no longer applies to the advanced baseline") from None
+    git(candidate, "checkout", "--quiet", "-b", branch)
+    git(candidate, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
+        "commit", "--quiet", "-m", "完成任务：" + title)
+    sha = git(candidate, "rev-parse", "HEAD")
+    if fingerprint(git(candidate, "diff", current, "--binary", "--no-ext-diff", "--no-textconv")) != fingerprint(patch):
+        raise StaleCandidate("Replayed candidate differs from the evaluated patch")
+    from .adapters import detect
+    checks = list(config["checks"] or []) or detect(baseline_tree)["checks"]
+    if not checks:
+        raise StaleCandidate("No executable checks remain for the advanced baseline")
+    acceptance = None
+    acceptance_file = directory / "acceptance.json"
+    if acceptance_file.is_file():
+        try:
+            acceptance = json.loads(acceptance_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise StaleCandidate("Sealed acceptance evidence is unreadable; re-evaluate before publishing") from None
+        if not isinstance(acceptance, dict) or not acceptance.get("checks"):
+            raise StaleCandidate("Sealed acceptance evidence is incomplete; re-evaluate before publishing")
+    evaluation = runtime.evaluator.evaluate(
+        baseline_tree, candidate, checks, directory / (label + "-evaluation"), config,
+        lambda: runtime.is_cancelled(run), acceptance=acceptance)
+    if not isinstance(evaluation, dict) or evaluation.get("decision") != "pass":
+        reason = evaluation.get("reason") if isinstance(evaluation, dict) else ""
+        raise StaleCandidate("Checks did not pass on the advanced baseline: " + str(reason or "no verdict")[:300])
+    return candidate, sha, evaluation
+
+
 def publish(runtime, project, task, run, workspace, config):
     store = runtime.store
     approval = store.one("SELECT id,evidence FROM tasks WHERE project=? AND source='system_publish' AND body=? AND state='planning'",
@@ -574,7 +624,35 @@ def publish(runtime, project, task, run, workspace, config):
         if current != run["base"]:
             change = baseline_change(source, run["base"], current)
             store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
-            raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
+            # 已推过的分支不能再指向别的提交，改写/分叉的主线也无法在旧证据上合并。
+            if change["relation"] != "advanced" or pushed_intent:
+                raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
+            patch = git(workspace, "diff", run["base"], "--binary", "--no-ext-diff", "--no-textconv")
+            if outcome.get("patch_hash") and fingerprint(patch) != outcome["patch_hash"]:
+                raise RuntimeError("Candidate changed after evaluation; delivery refused")
+            # 补丁字节不变，但结论必须在新树上重跑：固定检查与独立验收都使用
+            # current 的基线快照，任一门禁失败仍按 StaleCandidate 重排。
+            workspace, sha, evaluation = replay_validated_candidate(
+                runtime, workspace, run, config, source, run["base"], current, patch, branch, title)
+            # run-baseline 与 runs.base 在同一事务重封，避免只更新一半时旧证据
+            # 被当作新基线上的结论继续发布。
+            with store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                live = db.execute("SELECT base,state FROM runs WHERE id=? AND project=?",
+                                  (run["id"], project["id"])).fetchone()
+                if not live or live["state"] != "awaiting_approval" or live["base"] != run["base"]:
+                    raise StaleCandidate("Run or baseline changed while revalidating; retry delivery")
+                db.execute("UPDATE runs SET base=? WHERE id=?", (current, run["id"]))
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)",
+                           ("run-baseline:" + run["id"],
+                            encode({"repository": repo, "branch": base_branch, "sha": current})))
+            run["base"] = current
+            outcome["base"] = current
+            verified = evaluation.get("checks") if isinstance(evaluation.get("checks"), dict) else {}
+            store.event("baseline_revalidated", "Patch re-verified on the advanced baseline",
+                        project["id"], run["id"], {"previous": change["previous"], "current": current,
+                                                   "patch_hash": fingerprint(patch),
+                                                   "checks": sorted(verified.keys())})
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
         authorize_write()
         pushed_intent = pushed_intent or {
