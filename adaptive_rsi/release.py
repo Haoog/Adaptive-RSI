@@ -7,6 +7,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote, urlsplit
@@ -107,6 +108,15 @@ RECONCILIATION_SELECTABLE_LIMIT = 200
 # restored; the recheck is spaced so a missing file cannot flood GitHub or the
 # event log. Operator-driven queries pass force=True and always re-check.
 WORKFLOW_VISIBILITY_RECHECK_SECONDS = 900
+# An absent matching run whose query filled a 100-run page means GitHub already
+# exposes a large run history for the operation. Re-read that listing on the
+# next scheduler cadence instead of every tick; a short page is cheap to repeat.
+# Operator-driven queries pass force=True and always re-check.
+RECONCILIATION_RECHECK_SECONDS = 60
+# GitHub ``created`` filters accept a lower bound only. Keep a small margin so
+# clock skew between this host and GitHub cannot hide a run dispatched at the
+# recorded time.
+RECONCILIATION_CREATED_MARGIN_SECONDS = 120
 WORKFLOW_NOT_VISIBLE_REASON = ("The authorized workflow file is not visible on the default branch; it may have been "
                                "renamed or deleted. Restore the file or re-authorize its replacement, then reconcile "
                                "the returned candidates; selecting never starts or repeats a run.")
@@ -597,18 +607,59 @@ def _record_reconciliation(data, repo, remotes, state, reason, checked_at=None):
     return candidates
 
 
+def _reconciliation_backoff_active(data):
+    try:
+        return float(data.get("reconcile_next_check_at")) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
+def _created_window(data):
+    """Return the ISO lower bound for one dispatch receipt, or ``None``.
+
+    Older receipts have no ``created_at`` (or a non-numeric one); those keep the
+    previous unfiltered listing behavior.
+    """
+    try:
+        created = float(data.get("created_at"))
+    except (TypeError, ValueError):
+        return None
+    if not created > 0:
+        return None
+    since = created - RECONCILIATION_CREATED_MARGIN_SECONDS
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _remote_runs(repo, data, force=False):
     visibility = data.get("remote_visibility") or {}
     if (not force and visibility.get("state") == "workflow_not_visible"
             and time.time() < visibility.get("next_check_at", 0)):
         return None
+    since = _created_window(data)
     endpoint = "actions/workflows/" + quote(data["workflow"].split("/")[-1], safe="") + "/runs?event=workflow_dispatch&per_page=100"
+    if since:
+        # Answer "did this dispatch start a run" from the dispatch window instead
+        # of rescanning the repository's whole recent history. GitHub accepts the
+        # lower bound and caps this endpoint at 1,000 filtered results.
+        endpoint += "&created=" + quote(">=" + since, safe="")
     found = []
+    full_page = False
     try:
+        scanned = 0
         for page in range(1, 11):
-            runs = api(repo, endpoint + "&page=" + str(page)).get("workflow_runs", [])
+            payload = api(repo, endpoint + "&page=" + str(page))
+            runs = payload.get("workflow_runs", [])
+            runs = runs if isinstance(runs, list) else []
+            scanned += len(runs)
             found.extend(item for item in runs if isinstance(item, dict) and item.get("display_title") == data["operation_id"])
             if len(runs) < 100:
+                break
+            full_page = True
+            total = payload.get("total_count")
+            if type(total) is int and 0 < total <= scanned:
                 break
     except ApiRejected as exc:
         if exc.status != 404:
@@ -617,8 +668,15 @@ def _remote_runs(repo, data, force=False):
         data["remote_visibility"] = {"state": "workflow_not_visible", "http_status": 404,
                                      "workflow": data.get("workflow"), "checked_at": first or time.time(),
                                      "next_check_at": time.time() + WORKFLOW_VISIBILITY_RECHECK_SECONDS}
+        data.pop("reconcile_next_check_at", None)
         return None
     data.pop("remote_visibility", None)
+    if found or not full_page:
+        data.pop("reconcile_next_check_at", None)
+    else:
+        # A full page with no match is the expensive case: page through at most
+        # once per recheck window instead of on every scheduler tick.
+        data["reconcile_next_check_at"] = time.time() + RECONCILIATION_RECHECK_SECONDS
     return found
 
 
@@ -659,6 +717,10 @@ def _existing_remote(repo, data):
 
 
 def reconcile(runtime, run, kind, data, persist=True):
+    if not data.get("workflow_run_id") and _reconciliation_backoff_active(data):
+        # A saturated no-match listing was just read; the scheduler re-checks
+        # when the window expires. Operator queries use force=True elsewhere.
+        return save(runtime, run, kind, data) if persist else data
     repo = data["repository"]
     remote = (_existing_remote(repo, data) if data.get("workflow_run_id")
               else find_remote(repo, data))
@@ -683,7 +745,6 @@ def reconcile(runtime, run, kind, data, persist=True):
         data.update(rerun_pending=False, rerun_receipt="confirmed", error="")
     _record_reconciliation(data, repo, [remote], "matched",
                            "Workflow run status was read from GitHub; this never starts another run.")
-    from datetime import datetime
     def timestamp(name):
         try:
             return datetime.fromisoformat(remote[name].replace("Z", "+00:00")).timestamp()
