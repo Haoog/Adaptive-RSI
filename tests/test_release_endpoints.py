@@ -1522,6 +1522,54 @@ class ReleaseAbandonTest(_ManualReconciliationFixture):
                             {"merged_sha": self.MERGED, "feedback": {"state": "verified", "head": self.MERGED}})
         self.assertFalse(release.pending(self.runtime, self.record))
 
+    def test_abandon_allows_a_dispatch_that_never_produced_a_run_after_grace(self):
+        self.operation(created_at=time.time() - 3600)
+        reason = "the dispatch POST never reached GitHub"
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            self.assertTrue(view["can_abandon"])
+            self.assertEqual(view["reconciliation_state"], "awaiting_remote_visibility")
+            status, payload = self.request("POST", "/api/release-abandon", self.abandon_body(reason))
+        self.assertEqual((status, payload["state"]), (200, "failed"))
+        saved = self.saved()
+        self.assertEqual(saved["state"], "failed")
+        self.assertEqual(saved["error"], release.NO_RUN_AFTER_GRACE_REASON)
+        self.assertNotIn("workflow_run_id", saved)
+        self.assertEqual(saved["operator_abandon"]["visibility"], "no_run_after_grace")
+        self.assertEqual(saved["operator_abandon"]["reason"], reason)
+        self.assertEqual(saved["reconciliation"]["state"], "abandoned")
+        self.assertFalse(saved["reconciliation"]["redispatch_allowed"])
+        self.assertEqual(self.posts, [])
+        self.assertEqual(json.loads(self.events("automation_abandoned")[0]["data"])["visibility"],
+                         "no_run_after_grace")
+
+    def test_abandon_refuses_a_fresh_dispatch_with_no_run(self):
+        self.operation()
+        with patch.object(release, "api", side_effect=self.api(runs=[])):
+            view = release.candidates(self.runtime, self.project, self.record["id"], "release")
+            self.assertFalse(view["can_abandon"])
+            with self.assertRaisesRegex(release.ReconciliationRejected, "still exposes"):
+                release.abandon(self.runtime, self.project, self.record["id"], "release", "no run yet")
+        self.assertEqual(self.saved()["state"], "dispatch_unknown")
+        self.assertEqual(self.events("automation_abandoned"), [])
+
+    def test_abandon_still_refuses_a_visible_run_after_grace(self):
+        self.operation(created_at=time.time() - 3600)
+        with patch.object(release, "api", side_effect=self.api(runs=[self.remote()])):
+            with self.assertRaisesRegex(release.ReconciliationRejected, "reconcile the visible run"):
+                release.abandon(self.runtime, self.project, self.record["id"], "release", "no run yet")
+        self.assertEqual(self.saved()["state"], "dispatch_unknown")
+
+    def test_abandon_reports_a_deleted_recorded_run_distinctly(self):
+        self.operation(state="rerun_unknown", workflow_run_id=17, attempt=1, previous_attempt=1)
+        with patch.object(release, "api", side_effect=self.missing):
+            result = release.abandon(self.runtime, self.project, self.record["id"], "release", "run was deleted")
+        saved = self.saved()
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(saved["operator_abandon"]["visibility"], "run_not_visible")
+        self.assertEqual(saved["error"], release.RUN_NOT_VISIBLE_REASON)
+        self.assertNotEqual(saved["error"], release.WORKFLOW_NOT_VISIBLE_REASON)
+
     def test_abandon_refuses_visible_runs_and_a_missing_reason(self):
         self.operation()
         with patch.object(release, "api", side_effect=self.missing):

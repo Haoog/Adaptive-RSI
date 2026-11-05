@@ -9,12 +9,12 @@
 通过策略演化（Evolution）导出的封存实验包包含了复现评估所需的本地封闭输入：
 - 候选策略/技能定义 (`candidate.json`)
 - 历史实验记录与配对证据 (`evidence.json`)
-- 评测用例配置、代码仓库基线快照与受保护覆盖层 (`cases/`)
+- 抽中执行用例的评测配置、代码仓库基线快照与受保护覆盖层 (`cases/`)；未抽中用例只在 `bundle.json` 的 `cases` 索引中登记身份（`case`、`split`、`tree`），不封存工作树
 - 全量输入 SHA-256 哈希清单与限制说明 (`bundle.json`)
 
 封存实验包设计遵循确定性输入与凭据脱敏原则：
 1. **脱敏保护**：包内绝不包含任何第三方 API Key、认证凭据或私有环境变量；`evidence.json` 仅记录非机密的 provider 需求（provider id 与所需环境变量名），不含密钥值。
-2. **输入冻结**：所有用例的源码仓库、提交哈希与测试检查命令均在封存时固定，防范外部漂移。
+2. **输入冻结**：封存清单覆盖 eligible 全集的身份、提交哈希与测试检查命令指纹，但只有实际抽中执行的用例封存完整工作树：未抽中用例从未运行，逐项复制同一 `(repository, base)` 只会让包体按候选集线性膨胀。它们在 `bundle.json` 中 `exported` 为 `false`，执行期校验仍按库里实时 `git rev-parse` 的 tree 哈希核对全部条目。
 3. **隔离边界**：输入完整性验证不等于真实环境推理，离线无凭据环境仅可核查输入完整性及离线可运行的本地用例，无法直接调用远端模型。
 
 ## 离线复现操作清单
@@ -23,18 +23,19 @@
 
 - [ ] **1.1 获取封存包**：从已完成演化的实例或归档中获取实验包目录（例如由 `Evolution.export_bundle` 导出的目录）。
 - [ ] **1.2 放置于隔离目录**：将包解压或拷贝至隔离机器的目标路径，确保所在文件系统支持常规文件读写且无越界软链接。
-- [ ] **1.3 核对基础目录结构**：确认根目录下包含 `bundle.json`、`candidate.json`、`evidence.json` 以及 `cases/` 目录。
+- [ ] **1.3 核对基础目录结构**：确认根目录下包含 `bundle.json`、`candidate.json`、`evidence.json`，且至少有一个已登记用例目录 `cases/<id>/case.json`。只有 json 文件、没有任何用例的包属于空包，不具备离线复现条件。
 
 ### 阶段二：输入完整性验证
 
 - [ ] **2.1 执行哈希校验**：使用 `scripts/reproduce_bundle.py` 或 `Evolution.verify_bundle(bundle_dir)`。
 - [ ] **2.2 比对文件清单**：确认 `bundle.json` 内 `files` 字段列出的所有文件均存在且 SHA-256 摘要完全一致。
 - [ ] **2.3 路径安全性确认**：验证清单内无绝对路径、无 `..` 目录穿越、无软链接逃逸。
+- [ ] **2.4 核对用例齐备性**：`files` 至少登记一个 `cases/<id>/case.json`，且 `evidence.json` 的 `dataset.manifest` 中每个抽中执行的用例都能在 `files` 中找到。完整性校验只证明已导出文件未被篡改：空包（旧候选或手写 `ready` 行导出，只有 json 文件）以及缺少已登记且抽中执行用例的包同样可能通过完整性校验，但复现脚本会判定 `reproducible=false`，在 `cases.missing` 与限制说明中列出缺失用例，`--strict` 退出码为 2。
 
 ### 阶段三：宿主工具与执行依赖检查
 
-- [ ] **3.1 检查版本控制工具**：确认隔离机器已安装 `git`，供用例仓库快照核对使用。
-- [ ] **3.2 逐项列出检查项依赖**：仅针对 `bundle.json` 清单登记的 `cases/*/case.json` 中的 `checks` 命令列表，逐项排查所需可执行程序（例如 `python3`, `node`, `pytest`, `cargo` 等）；未登记的用例目录一律不读取、不执行，且会使完整性校验失败。`checks` 中的 `argv` 必须是非空字符串数组、`cwd` 必须是用例内相对路径；畸形规格会写入 `limitations` 并判定为不可复现，且不会进入依赖清单。
+- [ ] **3.1 检查版本控制工具**：VCS 依赖按登记用例检查命令的实际引用计算。bundle 不含 `.git`，仅当某个 `checks` 的 `argv[0]` 为 `git` 时才要求宿主安装 `git`；未被任何检查引用时，缺少 git 只记录为说明，不阻断复现判定与 `--run-checks` 执行。
+- [ ] **3.2 逐项列出检查项依赖**：仅针对 `bundle.json` 清单登记的 `cases/*/case.json` 中的 `checks` 命令列表，逐项排查所需可执行程序（例如 `python3`, `node`, `pytest`, `cargo` 等）；未登记的用例目录一律不读取、不执行，且会使完整性校验失败。`checks` 中的 `argv` 必须是非空字符串数组、`cwd` 必须是用例内相对路径；畸形规格会写入 `limitations` 并判定为不可复现，且不会进入依赖清单。未抽中用例只登记身份、不封存工作树，因此不参与依赖枚举。
 - [ ] **3.3 记录缺失依赖**：若隔离环境缺少某项工具，复现脚本会完整记录所有缺失项而非在首个缺失处直接中断，便于批量补齐离线运行时依赖。
 
 ### 阶段四：凭据与模型接入检查
@@ -63,14 +64,14 @@ python3 -B scripts/reproduce_bundle.py /path/to/bundle --json
 # 若本地依赖齐备，离线执行用例中的固定检查项
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --run-checks
 
-# 严格模式：缺少依赖/凭据，或已执行检查未全部通过时返回非零退出码 (exit code 2)
+# 严格模式：缺少依赖/凭据/用例，或已执行检查未全部通过时返回非零退出码 (exit code 2)
 python3 -B scripts/reproduce_bundle.py /path/to/bundle --strict
 ```
 
 - `bundle`：封存实验包路径（必填）。
-- `--json`：以 JSON 格式打印完整检查结果。
+- `--json`：以 JSON 格式打印完整检查结果（含 `cases.exported` / `cases.registered` / `cases.missing`）。
 - `--run-checks`：在工具齐备时对用例执行测试命令；任一检查未通过时 `checks_passed` 与 `reproducible` 均为 `false`，并在结论段说明。
-- `--strict`：若存在缺失的工具依赖、凭据，或已执行检查未全部通过，退出码为 2；默认模式下完成检查即返回 0，检查失败只写入结果与结论。
+- `--strict`：若存在缺失的工具依赖、凭据或抽中执行的已登记用例，或已执行检查未全部通过，退出码为 2；默认模式下完成检查即返回 0，检查失败只写入结果与结论。
 
 ### Python API
 
@@ -87,6 +88,7 @@ report = Evolution.reproduce_bundle(
 )
 
 assert report["integrity"]["valid"] is True
+print("Cases:", report["cases"])  # exported / registered / missing
 print("Missing dependencies:", report["dependencies"]["missing"])
 print("Missing credentials:", report["credentials"]["missing"])
 print("Limitations:", report["limitations"])
@@ -122,4 +124,5 @@ print("Limitations:", report["limitations"])
 
 1. **凭据安全**：导出包不含敏感信息，避免凭据泄漏到离线或第三方审计环境。
 2. **因果与泛化界限**：输入完整性保证的是实验记录未被篡改，不代表离线离线重算能够全自动复现模型生成随机性。
-3. **非阻断式排查**：依赖排查全面覆盖全部用例与配置，杜绝单点报错导致的隐蔽缺失。
+3. **完整性不等于齐备性**：`bundle.json` 校验通过只说明已导出文件未变；包内没有用例、或 `dataset.manifest` 中抽中执行的用例未全部随包导出时，`reproducible` 为 `false`，不能据此放行自动验收。
+4. **非阻断式排查**：依赖排查全面覆盖全部用例与配置，杜绝单点报错导致的隐蔽缺失。

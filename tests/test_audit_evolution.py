@@ -1623,6 +1623,80 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_evidence_drops_host_trial_report_paths(self):
+        """试验的评估报告绝对路径带出用户名与状态目录布局，导出时不得进包。"""
+        def report(variant):
+            return str(self.root / 'experiments' / 'experiments' / 'case-1-0' / variant / 'evaluation' / 'report.json')
+        trial = {'case': 'case-1', 'split': 'validation', 'repetition': 0,
+                 'order': ['stable', 'candidate'],
+                 'stable': {'pass': False, 'report': report('stable')},
+                 'candidate': {'pass': True, 'report': report('candidate')}}
+        ablation = {'state': 'complete', 'trials': [
+            {'case': 'case-1', 'repetition': 0,
+             'strategy_only': {'pass': True, 'report': report('strategy_only')},
+             'skill_only': {'pass': False, 'report': report('skill_only')}}]}
+        self.candidate({'trials': [trial], 'ablation': ablation})
+        destination = self.root / 'bundle-trial-report'
+        self.evolution.export_bundle('c', destination)
+
+        text = (destination / 'evidence.json').read_text(encoding='utf-8')
+        self.assertNotIn(str(self.root), text)
+        exported = json.loads(text)
+        # 判定字段保留，只有宿主路径被删除。
+        self.assertEqual(exported['trials'][0]['case'], 'case-1')
+        self.assertEqual(exported['trials'][0]['split'], 'validation')
+        self.assertEqual(exported['trials'][0]['repetition'], 0)
+        self.assertEqual(exported['trials'][0]['order'], ['stable', 'candidate'])
+        self.assertEqual([exported['trials'][0]['stable']['pass'],
+                          exported['trials'][0]['candidate']['pass']], [False, True])
+        self.assertNotIn('report', exported['trials'][0]['stable'])
+        self.assertNotIn('report', exported['trials'][0]['candidate'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['strategy_only'])
+        self.assertNotIn('report', exported['ablation']['trials'][0]['skill_only'])
+        self.assertFalse(exported['ablation']['trials'][0]['skill_only']['pass'])
+        # 导出只裁剪副本，本地候选证据仍保留完整路径。
+        stored = json.loads(self.store.one('SELECT evidence FROM candidates WHERE id=?', ('c',))['evidence'])
+        self.assertEqual(stored['trials'][0]['stable']['report'], trial['stable']['report'])
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
+    def test_bundle_hashing_streams_instead_of_reading_whole_files(self):
+        """封存与校验摘要必须分块读取，峰值内存不随单个文件大小增长。
+
+        整文件 ``read_bytes()`` 会为每个文件临时分配等长内存；300 MiB 用例在 2 GB
+        机器上足以把校验/导出进程顶到 OOM，并连带中断同进程里的运行时。这里用
+        稀疏文件模拟大文件：磁盘占用近零，但读出的字节数与真实文件一致。
+        """
+        import tracemalloc
+        bundle = self.root / 'stream-bundle'
+        bundle.mkdir()
+        big = bundle / 'big.bin'
+        with big.open('wb') as out:
+            out.write(b'x' * 1024)
+            out.truncate(64 * 1024 * 1024)
+        expected = hashlib.sha256()
+        with big.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                expected.update(block)
+        (bundle / 'bundle.json').write_text(json.dumps(
+            {'version': 1, 'files': {'big.bin': expected.hexdigest()}, 'limitations': []}),
+            encoding='utf-8')
+
+        tracemalloc.start()
+        try:
+            result = Evolution.verify_bundle(bundle)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertTrue(result['valid'], result['mismatches'])
+        self.assertLess(peak, 8 * 1024 * 1024, 'peak %d bytes' % peak)
+
+    def test_bundle_export_and_verify_never_read_whole_files(self):
+        """导出与校验都不能调用整文件读取；禁止 read_bytes 后仍应导出并校验成功。"""
+        import adaptive_rsi.build  # noqa: F401  # 预热模块级 BUILD_ID，避免其自身的小文件读取被误伤
+        with patch.object(Path, 'read_bytes', side_effect=AssertionError('whole-file read')):
+            destination = self.sealed_bundle(repo_name='repo-stream')
+            self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
     def test_bundle_verification_rejects_unregistered_files(self):
         """封存后新增的未登记文件必须判失效，并阻止复现执行任何检查。
 
@@ -1722,6 +1796,60 @@ class AuditEvolutionTest(unittest.TestCase):
                 self.assertNotIn(str(self.root), path.read_bytes().decode('utf-8', errors='replace'))
         self.assertTrue(Evolution.verify_bundle(destination)['valid'])
 
+    def test_export_bundle_seals_only_sampled_case_trees(self):
+        """未抽中用例只登记身份：eligible 全集不再各复制一份完整工作树。"""
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-sampled')
+        (repo / 'payload.bin').write_bytes(b'payload' * 8192)
+        git(repo, 'add', '.')
+        git(repo, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            'commit', '--quiet', '-m', 'payload')
+        base = git(repo, 'rev-parse', 'HEAD')
+        tree = git(repo, 'rev-parse', base + '^{tree}')
+        manifest = []
+        for name, sampled in (('a', True), ('b', True), ('c', False), ('d', False)):
+            checks = [{'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}]
+            if not sampled:
+                checks.append({'name': 'unexecuted_check', 'cwd': '.', 'argv': ['fake-unsampled-tool']})
+            spec = {'task': 'task ' + name, 'base': base, 'checks': checks, 'source': 'real',
+                    'signature': 'sig-' + name, 'repository': str(repo), 'overlay': None}
+            self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                               ('case-' + name, 'p', 'family-' + name, 'validation', encode(spec), 0, time.time()))
+            manifest.append({'case': 'case-' + name, 'split': 'validation', 'tree': tree, 'sampled': sampled})
+        self.candidate({'dataset': {'manifest': manifest}, 'providers': []})
+        destination = self.root / 'bundle-sampled'
+        self.evolution.export_bundle('c', destination)
+
+        # 1. 只有抽中用例封存工作树；未抽中条目连 case.json 都不落盘。
+        self.assertEqual(sorted(path.parent.name for path in (destination / 'cases').glob('*/repository')),
+                         ['case-a', 'case-b'])
+        self.assertEqual(sorted(path.name for path in (destination / 'cases').iterdir()), ['case-a', 'case-b'])
+
+        # 2. bundle.json 保留全部条目的身份与导出标记，审计信息不丢。
+        exported = json.loads((destination / 'bundle.json').read_text(encoding='utf-8'))
+        entries = {item['case']: item for item in exported['cases']}
+        self.assertEqual(sorted(entries), ['case-a', 'case-b', 'case-c', 'case-d'])
+        self.assertEqual([entries['case-' + name]['exported'] for name in 'abcd'], [True, True, False, False])
+        self.assertEqual(entries['case-c']['tree'], tree)
+        self.assertEqual(entries['case-c']['split'], 'validation')
+        self.assertTrue(any('unsampled' in item for item in exported['limitations']))
+
+        # 3. 包体不随未抽中条目放大：两份工作树而不是四份。
+        source_bytes = sum(path.stat().st_size for path in repo.rglob('*')
+                           if path.is_file() and '.git' not in path.relative_to(repo).parts)
+        bundle_bytes = sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())
+        self.assertLess(bundle_bytes, source_bytes * 2 + 16384)
+
+        # 4. 抽中用例仍可校验与离线复现；未执行用例的检查命令不进入依赖清单。
+        self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertNotIn('fake-unsampled-tool', [item['name'] for item in result['dependencies']['missing']])
+        self.assertTrue(result['reproducible'])
+
     def sealed_bundle(self, checks=None, providers=None, evidence=None, repo_name='repo', overlay=None):
         """导出一个含单个用例的封存实验包，供 bundle 复现测试复用。"""
         from tests.test_runtime import fixture
@@ -1794,6 +1922,100 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIn('Missing host tools', limitations_text)
         self.assertIn('Isolated offline environment', limitations_text)
 
+    def test_bundle_checks_run_without_host_git_when_checks_do_not_use_it(self):
+        """bundle 不含 .git；检查只用 python3 时，宿主缺 git 不得把结论变成不可复现。"""
+        import sys
+        destination = self.sealed_bundle(repo_name='repo-no-git')
+        bindir = self.root / 'python-only-bin'
+        bindir.mkdir()
+        (bindir / 'python3').symlink_to(sys.executable)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': str(bindir)}, run_checks=True)
+
+        self.assertTrue(result['integrity']['valid'])
+        self.assertNotIn('git', [item['name'] for item in result['dependencies']['missing']])
+        self.assertEqual([row['check'] for row in result['executed_checks']], ['unit_check'])
+        self.assertTrue(result['executed_checks'][0]['passed'])
+        self.assertTrue(result['reproducible'])
+        # 缺 git 只作为说明记录，不构成阻断项。
+        self.assertTrue(any('git executable not found' in item for item in result['limitations']))
+        self.assertFalse(any('Missing host tools' in item for item in result['limitations']))
+
+    def test_bundle_check_that_invokes_git_reports_missing_tool(self):
+        """检查命令 argv[0] 为 git 且宿主无 git：报缺失并拒绝执行，不得静默跳过。"""
+        import sys
+        checks = [{'name': 'vcs_check', 'cwd': '.', 'argv': ['git', '--version']}]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-needs-git')
+        bindir = self.root / 'python-only-bin-vcs'
+        bindir.mkdir()
+        (bindir / 'python3').symlink_to(sys.executable)
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': str(bindir)}, run_checks=True)
+
+        self.assertTrue(result['integrity']['valid'])
+        missing = {item['name']: item for item in result['dependencies']['missing']}
+        self.assertIn('git', missing)
+        self.assertEqual(missing['git']['cases'], ['case-needs-git'])
+        self.assertIn('vcs_check', missing['git']['checks'])
+        self.assertEqual(result['executed_checks'], [])
+        self.assertFalse(result['reproducible'])
+
+    def test_bundle_relative_check_commands_resolve_inside_case_bundle(self):
+        # 用例自带的相对命令（./run.sh）是包内依赖：必须按检查 cwd 在用例仓库
+        # 中定位并真实执行，不能被当成「宿主缺少工具」而跳过全部检查。
+        destination = self.sealed_bundle(repo_name='repo-relative-argv')
+        case = destination / 'cases' / 'case-relative-argv'
+        script = case / 'repository' / 'run.sh'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        script.chmod(0o755)
+        spec = json.loads((case / 'case.json').read_text(encoding='utf-8'))
+        spec['checks'] = [{'name': 'repo-script', 'cwd': '.', 'argv': ['./run.sh']}]
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+
+        probed = []
+
+        def which(cmd, **kwargs):
+            probed.append(cmd)
+            return '/usr/bin/' + cmd if cmd in ('git', 'python3') else None
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True, which=which)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['dependencies']['missing'], [])
+        # 包内路径不进入宿主 which() 查询。
+        self.assertNotIn('./run.sh', probed)
+        available = {item['name']: item for item in result['dependencies']['available']}
+        self.assertEqual(available['./run.sh']['type'], 'bundle')
+        self.assertEqual([(row['case'], row['check'], row['passed'])
+                          for row in result['executed_checks']],
+                         [('case-relative-argv', 'repo-script', True)])
+        self.assertEqual(result['checks_executed'], 1)
+        self.assertTrue(result['reproducible'])
+
+        # 真正缺失的宿主工具仍按宿主依赖记录；包内缺失的脚本单独归类，
+        # 两者都继续阻止复现，且不会再执行任何检查。
+        spec['checks'] = [
+            {'name': 'repo-script', 'cwd': '.', 'argv': ['./run.sh']},
+            {'name': 'missing-host-tool', 'cwd': '.', 'argv': ['definitely-missing-binary']},
+            {'name': 'missing-bundle-script', 'cwd': '.', 'argv': ['tools/missing.sh']},
+        ]
+        (case / 'case.json').write_text(encode(spec), encoding='utf-8')
+        self.reseal_bundle(destination)
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True, which=which)
+        missing = {item['name']: item for item in result['dependencies']['missing']}
+        self.assertEqual(missing['definitely-missing-binary']['type'], 'executable')
+        self.assertEqual(missing['tools/missing.sh']['type'], 'bundle')
+        self.assertNotIn('./run.sh', missing)
+        self.assertEqual(result['executed_checks'], [])
+        self.assertFalse(result['reproducible'])
+        limitations = ' '.join(result['limitations'])
+        self.assertIn('Missing host tools: 1', limitations)
+        self.assertIn('Missing bundle executables: 1', limitations)
+
     def test_bundle_offline_reproduction_detects_tampered_bundle(self):
         self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
                         'providers': []})
@@ -1840,6 +2062,60 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertEqual(strict_proc.returncode, 2)
         self.assertIn('Sealed Bundle Reproduction Inspection', strict_proc.stdout)
         self.assertIn('OPENAI_API_KEY', strict_proc.stdout)
+
+    def test_bundle_without_any_case_is_not_reproducible(self):
+        # 没有 dataset.manifest 的候选（旧证据/手写 ready 行）导出的包只有三个
+        # json 文件：integrity 有效，但没有可执行基线，不得判「具备离线复现条件」。
+        import subprocess
+        import sys
+        self.candidate({'preregistered_plan': {'data': {'x': 1}, 'sha256': fingerprint({'x': 1})},
+                        'providers': []})
+        destination = self.root / 'bundle-empty'
+        manifest = self.evolution.export_bundle('c', destination)
+        self.assertEqual(sorted(manifest['files']), ['candidate.json', 'evidence.json'])
+
+        result = Evolution.reproduce_bundle(destination)
+        self.assertTrue(result['valid'])
+        self.assertEqual(result['cases'], {'exported': [], 'registered': [], 'missing': []})
+        self.assertFalse(result['reproducible'])
+        self.assertTrue(any('no registered case.json' in item for item in result['limitations']))
+
+        strict = subprocess.run(
+            [sys.executable, '-B', 'scripts/reproduce_bundle.py', str(destination), '--strict'],
+            capture_output=True, text=True, env={'PATH': '/usr/bin:/bin'},
+        )
+        self.assertEqual(strict.returncode, 2)
+        self.assertIn('不含任何已登记用例', strict.stdout)
+
+    def test_bundle_missing_registered_case_is_not_reproducible(self):
+        # manifest 登记两个用例、库里只有一个：导出只写出一个，缺的用例必须让
+        # 复现结论为否，并可在 cases.missing 与限制说明中读出具体 id。
+        from tests.test_runtime import fixture
+        from adaptive_rsi.gitops import git
+        repo = fixture(self.root / 'repo-partial')
+        spec = {
+            'task': 'partial bundle task', 'base': git(repo, 'rev-parse', 'HEAD'),
+            'checks': [{'name': 'unit_check', 'cwd': '.', 'argv': ['python3', '-c', 'print("ok")']}],
+            'source': 'real', 'signature': 'sig-partial',
+            'repository': str(repo), 'overlay': None,
+        }
+        self.store.execute('INSERT INTO cases VALUES (?,?,?,?,?,?,?)',
+                           ('case-present', 'p', 'family-present', 'validation', encode(spec), 0, time.time()))
+        self.candidate({'dataset': {'manifest': [{'case': 'case-present'}, {'case': 'case-missing'}]},
+                        'providers': []})
+        destination = self.root / 'bundle-partial'
+        manifest = self.evolution.export_bundle('c', destination)
+        self.assertIn('cases/case-present/case.json', manifest['files'])
+        self.assertNotIn('cases/case-missing/case.json', manifest['files'])
+
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'},
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+        self.assertTrue(result['integrity']['valid'])
+        self.assertEqual(result['cases']['exported'], ['case-present'])
+        self.assertEqual(result['cases']['missing'], ['case-missing'])
+        self.assertFalse(result['reproducible'])
+        self.assertIn('case-missing', ' '.join(result['limitations']))
 
     def test_bundle_reproduction_ignores_unmanifested_case_directories(self):
         # 线程 1：向 bundle 多塞一个未登记用例目录不得被执行，也不得保持 integrity 有效。
@@ -2045,6 +2321,67 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertFalse(row['passed'])
         self.assertIn('Symlink overlaps reproduction overlay', row['error'])
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_bundle_reproduction_fails_check_with_missing_cwd(self):
+        # 声明的 cwd 不在用例树里时不得退回 staging 根目录执行：那样检查会在
+        # 错误目录里通过，整包被判可复现，接收方也无从核对实际工作目录。
+        overlay = self.root / 'overlay-cwd'
+        (overlay / 'sub').mkdir(parents=True)
+        (overlay / 'sub' / 'marker.txt').write_text('present\n')
+        checks = [
+            {'name': 'missing_cwd', 'cwd': 'nested', 'argv': ['python3', '-c', 'print("ran")']},
+            {'name': 'root_cwd', 'cwd': '.', 'argv': ['python3', '-c', 'print("root")']},
+            {'name': 'subdir_cwd', 'cwd': 'sub',
+             'argv': ['python3', '-c',
+                      'import pathlib, sys; sys.exit(0 if pathlib.Path("marker.txt").is_file() else 7)']},
+        ]
+        destination = self.sealed_bundle(checks=checks, repo_name='repo-cwd-missing', overlay=overlay)
+        result = Evolution.reproduce_bundle(
+            destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+            which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertTrue(result['integrity']['valid'])
+        rows = {row['check']: row for row in result['executed_checks']}
+        self.assertEqual(sorted(rows), ['missing_cwd', 'root_cwd', 'subdir_cwd'])
+        missing = rows['missing_cwd']
+        self.assertFalse(missing['passed'])
+        self.assertEqual(missing['exit_code'], -1)
+        self.assertEqual(missing['cwd'], 'nested')
+        self.assertIn('cwd', missing['error'])
+        # 合法 cwd（根目录与 overlay 提供的既有子目录）照常执行并通过。
+        self.assertTrue(rows['root_cwd']['passed'], rows['root_cwd'])
+        self.assertTrue(rows['subdir_cwd']['passed'], rows['subdir_cwd'])
+        self.assertFalse(result['reproducible'])
+        self.assertFalse(result['checks_passed'])
+        self.assertEqual(result['checks_failed'], 1)
+        self.assertIn('Offline checks failed: 1 of 3', ' '.join(result['limitations']))
+
+    def test_bundle_reproduction_rejects_cwd_symlink_escape(self):
+        # 用例仓库内的符号链接把 cwd 指向副本之外时，同样不能静默改写工作目录
+        # 后照常执行；该检查必须失败，且命令不得在副本外的目标目录留下副作用。
+        destination = self.sealed_bundle(
+            checks=[{'name': 'escaped_cwd', 'cwd': 'escape',
+                     'argv': ['python3', '-c', 'open("ESCAPED", "w").write("1")']}],
+            repo_name='repo-cwd-escape')
+        case_dir = destination / 'cases' / 'case-cwd-escape'
+        outside = self.root / 'outside-cwd'
+        outside.mkdir()
+        (case_dir / 'repository' / 'escape').symlink_to(outside)
+
+        with patch.object(Evolution, 'verify_bundle',
+                          return_value={'valid': True, 'mismatches': [], 'limitations': []}):
+            result = Evolution.reproduce_bundle(
+                destination, env={'PATH': '/usr/bin:/bin'}, run_checks=True,
+                which=lambda cmd, **kw: '/usr/bin/' + cmd if cmd in ('git', 'python3') else None)
+
+        self.assertEqual(len(result['executed_checks']), 1)
+        row = result['executed_checks'][0]
+        self.assertEqual(row['cwd'], 'escape')
+        self.assertFalse(row['passed'])
+        self.assertEqual(row['exit_code'], -1)
+        self.assertIn('escapes the case copy', row['error'])
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse(result['reproducible'])
 
     def test_bundle_credentials_follow_exported_provider_requirements(self):
         # 线程 3：凭据需求来自导出的非机密 provider 元数据，不再默认 OPENAI_API_KEY。
@@ -2283,7 +2620,7 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIs(result['checks_passed'], True)
         self.assertFalse(result['reproducible'])
 
-    def test_save_hotpath_skips_reverification_in_evaluating_state(self):
+    def test_save_refreshes_derived_evidence_when_plan_or_trial_count_changes(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         plan = {'data': data, 'sha256': fingerprint(data)}
         evidence = {'preregistered_plan': plan, 'trials': []}
@@ -2297,32 +2634,41 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertEqual(mock_summary.call_count, 1)
             self.assertEqual(evidence['plan_verification']['analysis'], 'planned_in_progress')
 
-            # 2. 追加 trial 后再次以 evaluating 保存：跳过完整重验，但 trials 正常持久化
+            # 2. 证据未变化时再次保存：沿用缓存，不重复计算
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+
+            # 3. 追加 trial 后再次以 evaluating 保存：试验数变化必须刷新派生证据，
+            #    否则中断后落库的仍是 0 条试验时的胜场与计划执行进度。
             trial1 = {'case': 'x', 'split': 'validation', 'repetition': 0,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial1)
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 1)
-            self.assertEqual(mock_summary.call_count, 1)
+            self.assertEqual(mock_verify.call_count, 2)
+            self.assertEqual(mock_summary.call_count, 2)
             row1 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row1 is not None
             persisted = json.loads(row1['evidence'])
             self.assertEqual(len(persisted['trials']), 1)
+            self.assertEqual(persisted['win_rate']['wins'], 1)
+            self.assertEqual(persisted['plan_verification']['observed'], 1)
+            self.assertFalse(persisted['plan_verification']['valid'])
 
-            # 3. 计划变化时：触发重新验证
+            # 4. 计划变化时：触发重新验证
             modified_data = {'repeats': 1, 'samples': [{'id': 'x', 'split': 'validation'}]}
             evidence['preregistered_plan'] = {'data': modified_data, 'sha256': fingerprint(modified_data)}
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 2)
-            self.assertEqual(mock_summary.call_count, 2)
+            self.assertEqual(mock_verify.call_count, 3)
+            self.assertEqual(mock_summary.call_count, 3)
 
-            # 4. 终态保存：触发完整重验
+            # 5. 终态保存：触发完整重验
             trial2 = {'case': 'x', 'split': 'validation', 'repetition': 1,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial2)
             self.evolution.save('c', 'ready', evidence)
-            self.assertEqual(mock_verify.call_count, 3)
-            self.assertEqual(mock_summary.call_count, 3)
+            self.assertEqual(mock_verify.call_count, 4)
+            self.assertEqual(mock_summary.call_count, 4)
             row2 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row2 is not None
             persisted = json.loads(row2['evidence'])
@@ -2330,6 +2676,61 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertIn('wilson_95', persisted['win_rate'])
             # 终态清理缓存
             self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
+
+    def test_evaluating_save_refreshes_win_rate_and_plan_verification_after_each_trial(self):
+        # 崩溃恢复只改状态、不重算派生证据：评估中的每次 save 都必须让落库的
+        # win_rate / plan_verification 与当前试验数一致，不能停在 0 条试验。
+        data = {'repeats': 2, 'samples': [{'id': 'v1', 'split': 'validation'},
+                                          {'id': 'h1', 'split': 'holdout'}]}
+        plan = {'data': data, 'sha256': fingerprint(data)}
+        evidence = {'preregistered_plan': plan, 'trials': []}
+        self.candidate(evidence)
+
+        def persisted():
+            row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row is not None
+            return json.loads(row['evidence'])
+
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(stored['win_rate']['wins'], 0)
+        self.assertIsNone(stored['win_rate']['estimate'])
+        self.assertEqual(stored['plan_verification']['observed'], 0)
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        all_trials = [
+            {'case': case, 'split': split, 'repetition': repetition,
+             'stable': {'pass': False}, 'candidate': {'pass': True}}
+            for case, split in (('v1', 'validation'), ('h1', 'holdout'))
+            for repetition in range(2)]
+        evidence['trials'] = all_trials[:2]
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 2)
+        self.assertEqual(stored['win_rate']['wins'], 1)
+        self.assertEqual(stored['plan_verification']['observed'], 2)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertFalse(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        evidence['trials'] = all_trials
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 4)
+        self.assertEqual(stored['win_rate']['wins'], 2)
+        self.assertEqual(stored['win_rate']['estimate'], 1.0)
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+
+        # 终态结果不变：完整计划通过，分析口径仍为 preregistered。
+        self.evolution.save('c', 'ready', evidence)
+        stored = persisted()
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
 
     def test_case_selection_follows_population_share(self):
         from adaptive_rsi.evolution import case_stratum, select_cases
