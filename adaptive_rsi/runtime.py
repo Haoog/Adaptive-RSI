@@ -41,6 +41,9 @@ BUDGET_WAIT_RETRIES = 3
 ADMISSION_BACKOFF_SECONDS = 30
 # 阶段预算跨尝试累计时，崩溃最多丢失一个检查点间隔的已耗时间。
 STAGE_BUDGET_CHECKPOINT_SECONDS = 15
+# 阶段预算读取失败的退避：读不到额度同样不是任务尝试，run 按基础设施故障收尾后
+# 让任务稍后重排；否则状态库持续不可读时每个调度节拍都会新建一条 interrupted run。
+STAGE_BUDGET_BACKOFF_SECONDS = 30
 
 # 失败退避的时长上限：指数退避只表达「越失败越谨慎」，不无限拉长。
 FAILURE_BACKOFF_MAX_SECONDS = 21600
@@ -1830,7 +1833,11 @@ class Runtime(Maintenance):
             owner['_deadline_checkpoint'] = now
 
     def _load_stage_budget(self, run):
-        """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。"""
+        """载入同一任务上一尝试的额度；不属于未结尝试的残留直接丢弃。
+
+        读取失败（database is locked、磁盘 I/O、库损坏）交给 process() 收尾：
+        额度不明时不能假装满额度继续，否则本次尝试全程没有护栏可依。
+        """
         key = self._stage_budget_key(run.get('task'))
         stored = self.store.setting(key, {})
         if not isinstance(stored, dict):
@@ -1840,7 +1847,13 @@ class Runtime(Maintenance):
             row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (owner,))
             # 与 process() finally 的交接条件一致：只有未结或中断的尝试才把额度交给下一次。
             if not row or not (row['ended'] is None or row['state'] == 'interrupted'):
-                self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+                try:
+                    self.store.execute('DELETE FROM settings WHERE key=?', (key,))
+                except Exception:
+                    # 清理失败不能穿出：残留额度属于已结案尝试，删不掉时按满额度继续，
+                    # 不能让一次删除失败反过来阻断执行。
+                    logging.getLogger(__name__).warning(
+                        'Could not discard stale stage budget for %s', run.get('task'), exc_info=True)
                 stored = {}
         return {name: self._stage_seconds(stored.get(name)) for name in ('preparation', 'evaluation')}
 
@@ -2084,7 +2097,14 @@ class Runtime(Maintenance):
         from .process import operation_cancellation
         # 阶段预算按任务累计：中断/重启后的新 run 续用已耗时间，而不是从零重计；
         # 上一尝试已结案时载入会丢弃残留键，按满额度重新开始。
-        run['_stage_used'] = self._load_stage_budget(run)
+        try:
+            budget = self._load_stage_budget(run)
+        except Exception as error:
+            # 额度读不到时既不能无护栏继续，也不能让异常穿出：worker future 失败
+            # 不会写终态，run 会一直占用 planning，同项目普通任务全被冻到重启。
+            self._abandon_unbudgeted_run(run, error)
+            return
+        run['_stage_used'] = budget
         now = time.monotonic()
         with _clock_lock(run):
             run['_deadline_started'] = now
@@ -2094,11 +2114,44 @@ class Runtime(Maintenance):
             with operation_cancellation(lambda: self.is_cancelled(run)), self.store.query_scope(run=run["id"], task=run.get("task")):
                 return self._process(run)
         finally:
-            row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+            try:
+                row = self.store.one('SELECT state,ended FROM runs WHERE id=?', (run['id'],))
+            except Exception:
+                # 读不到 run 行就无法判定交接：按已结案结算，保证 _save_stage_budget
+                # 仍执行且 finally 不掩盖真正的失败原因。
+                logging.getLogger(__name__).warning(
+                    'Could not read run state for stage budget %s', run.get('id'), exc_info=True)
+                row = None
             # 只有中断会交接给下一次尝试；其他终态（含 deadline 阻塞）视为本轮已结案。
             keep = bool(row) and (row['ended'] is None or row['state'] == 'interrupted')
             with _clock_lock(run):
                 self._save_stage_budget(run, time.monotonic(), keep)
+
+    def _abandon_unbudgeted_run(self, run, error):
+        """阶段预算读不到时收尾本次尝试，而不是把 run 留在 planning 等重启。"""
+        logger = logging.getLogger(__name__)
+        logger.warning('Could not load stage budget for %s', run.get('id'), exc_info=True)
+        retry_at = time.time() + STAGE_BUDGET_BACKOFF_SECONDS
+        try:
+            # claim 已经自增 attempts；读预算失败属于基础设施故障而不是任务尝试，
+            # 与线程池准入失败一致地归还额度，避免一次状态库抖动吃掉自动重试次数。
+            self.store.execute('UPDATE tasks SET attempts=max(0,attempts-1) WHERE id=?', (run['task'],))
+            transitioned = self.store.transition(
+                run['id'], 'interrupted',
+                {'reason': 'Stage budget unavailable',
+                 'failure': {'code': 'environment', 'action': 'check_environment',
+                             'detail': 'Stage budget could not be read from the state database'}},
+                True, task_fields={'state': 'queued', 'available': retry_at})
+            if transitioned:
+                self.store.event('stage_budget_unavailable',
+                                 'Stage budget could not be read; fresh run scheduled',
+                                 run.get('project'), run['id'],
+                                 {'code': 'environment', 'error': type(error).__name__,
+                                  'retry_at': retry_at})
+        except Exception:
+            # 状态库连状态写都失败时保留未结 run：调度循环会记 scheduler_error，
+            # 下一次启动由 store.recover() 收成 interrupted。
+            logger.exception('Could not close unbudgeted run %s', run.get('id'))
 
     def _process(self, run):
         try:

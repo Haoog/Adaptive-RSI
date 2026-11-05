@@ -368,6 +368,34 @@ class RuntimeHandoffTest(unittest.TestCase):
         # 失败后的新尝试从满额度起算，残留键在载入时已被丢弃。
         self.assertEqual(observed, [{'preparation': 0.0, 'evaluation': 0.0}, None])
 
+    def test_unreadable_stage_budget_closes_run_and_releases_the_project(self):
+        """预算读失败不能把 run 钉在 planning：该项目的普通任务否则全被冻到重启。"""
+        task, run = self.claim()
+        original = self.store.setting
+
+        def unreadable(key, default=None):
+            if str(key).startswith('stage-budget:'):
+                raise sqlite3.OperationalError('database is locked')
+            return original(key, default)
+
+        with patch.object(self.store, 'setting', side_effect=unreadable), \
+             patch('adaptive_rsi.runtime.STAGE_BUDGET_BACKOFF_SECONDS', 0):
+            self.runtime.process(run)
+        row = self.store.one('SELECT state,ended,result FROM runs WHERE id=?', (run['id'],))
+        self.assertEqual(row['state'], 'interrupted')
+        self.assertIsNotNone(row['ended'])
+        self.assertEqual(json.loads(row['result'])['failure']['code'], 'environment')
+        claimed_task = self.store.one('SELECT state,attempts FROM tasks WHERE id=?', (task,))
+        self.assertEqual(claimed_task['state'], 'queued')
+        # 读预算失败属于基础设施故障而不是任务尝试：claim 自增的额度要归还。
+        self.assertEqual(claimed_task['attempts'], 0)
+        event = self.store.one("SELECT * FROM events WHERE run=? AND kind='stage_budget_unavailable'", (run['id'],))
+        self.assertIsNotNone(event)
+        self.assertEqual(json.loads(event['data'])['error'], 'OperationalError')
+        # 未结 run 消失后来源互斥解除：同项目下一条普通任务能重新领取。
+        self.runtime.goal(self.project, 'Second ordinary task')
+        self.assertIsNotNone(self.store.claim(self.project, self.runtime.config(self.project)))
+
     def test_trial_phase_clock_ignores_parent_planning_and_propagates_timeout(self):
         _, parent = self.claim()
         parent['_deadline_started'] = time.monotonic() - 5000
