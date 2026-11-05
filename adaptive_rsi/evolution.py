@@ -1148,15 +1148,29 @@ class Evolution:
                         if not isinstance(check, dict) or check_spec_error(check):
                             continue
                         argv = check.get("argv")
-                        cwd = (staging / check.get("cwd", ".")).resolve()
-                        # 解析后的 cwd 必须仍在一次性副本内：仓库内被注入的符号
-                        # 链接可能把它指向副本之外，此时退回 staging 根目录。
-                        run_cwd = (cwd if cwd.is_dir() and (cwd == staging or staging in cwd.parents)
-                                   else staging)
+                        declared_cwd = check.get("cwd", ".")
+                        cwd = (staging / declared_cwd).resolve()
+                        # 声明的 cwd 缺失、不是目录或经符号链接逃出一次性副本时，
+                        # 不能退回 staging 根目录继续执行：那样检查会在错误的工作
+                        # 目录里通过，复现结论不可核对。记一条失败并保留声明的
+                        # cwd，让接收方能看出它没在声明目录里跑。
+                        inside = cwd == staging or staging in cwd.parents
+                        if not inside or not cwd.is_dir():
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "cwd": declared_cwd,
+                                "exit_code": -1,
+                                "passed": False,
+                                "overlay_applied": overlay_applied,
+                                "error": "cwd is missing or escapes the case copy",
+                            })
+                            continue
                         try:
                             proc = subprocess.run(
                                 argv,
-                                cwd=run_cwd,
+                                cwd=cwd,
                                 capture_output=True,
                                 text=True,
                                 timeout=60,
@@ -1166,6 +1180,7 @@ class Evolution:
                                 "case": case_id,
                                 "check": check.get("name"),
                                 "argv": argv,
+                                "cwd": declared_cwd,
                                 "exit_code": proc.returncode,
                                 "passed": proc.returncode == 0,
                                 "overlay_applied": overlay_applied,
@@ -1177,6 +1192,7 @@ class Evolution:
                                 "case": case_id,
                                 "check": check.get("name"),
                                 "argv": argv,
+                                "cwd": declared_cwd,
                                 "exit_code": -1,
                                 "passed": False,
                                 "overlay_applied": overlay_applied,
