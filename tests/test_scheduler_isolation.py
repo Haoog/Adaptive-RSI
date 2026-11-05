@@ -438,6 +438,43 @@ class SchedulerIsolationTest(unittest.TestCase):
         self.assertFalse((Path(unheld["path"]) / "workspace").exists())
         self.assertEqual(self.store.one("SELECT state FROM runs WHERE id=?", (unheld["id"],))["state"], "expired")
 
+    def test_automatic_retention_holds_keep_derived_evidence_keys(self):
+        self.store.execute("INSERT INTO projects VALUES ('held','held project',?, '{}', 0, 9)",
+                           (str(self.root / "held"),))
+        run_held = self.historical_run("broken", "completed")
+        project_held = self.historical_run("held", "completed")
+        corrupt = self.historical_run("healthy", "completed")
+        released = self.historical_run("healthy", "completed")
+        prefixes = ("run-baseline:", "automation:", "delivery:", "merge-intent:", "delivery-push:")
+        cases = {"run": run_held, "project": project_held, "corrupt": corrupt}
+        for run in [*cases.values(), released]:
+            for prefix in prefixes:
+                self.store.put_setting(prefix + run["id"], {"head": "evidence"})
+        self.store.put_setting("legal-hold:" + run_held["id"], True)
+        self.store.put_setting("legal-hold-project:held", True)
+        self.store.execute("INSERT INTO settings VALUES (?,?)", ("legal-hold:" + corrupt["id"], "not-json"))
+
+        self.runtime.maintenance()
+
+        keys = {row["key"] for row in self.store.query("SELECT key FROM settings")}
+        for label, run in cases.items():
+            with self.subTest(hold=label):
+                self.assertEqual({prefix + run["id"] for prefix in prefixes} - keys, set())
+        for prefix in prefixes:
+            self.assertNotIn(prefix + released["id"], keys)
+
+        # 解除 hold 后下一轮维护恢复清理；损坏值仍按 hold 保留。
+        self.store.put_setting("legal-hold:" + run_held["id"], False)
+        self.store.put_setting("legal-hold-project:held", False)
+        self.store.execute("DELETE FROM settings WHERE key='maintenance-last'")
+        self.runtime.maintenance()
+        keys = {row["key"] for row in self.store.query("SELECT key FROM settings")}
+        for run in (run_held, project_held):
+            with self.subTest(released=run["id"]):
+                self.assertEqual({prefix + run["id"] for prefix in prefixes} & keys, set())
+        for prefix in prefixes:
+            self.assertIn(prefix + corrupt["id"], keys)
+
     def test_retention_hold_committed_after_the_precheck_blocks_every_deletion(self):
         run = self.historical_run("healthy", "awaiting_approval")
         directory = Path(run["path"])
