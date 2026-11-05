@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -181,6 +182,20 @@ def overlay_available(directory):
         return False
 
 
+def file_digest(path):
+    """按 64 KiB 分块计算文件 SHA-256。
+
+    封存包里可能含数据集、二进制或缓存目录；整文件 ``read_bytes()`` 会让峰值内存
+    随单个文件大小线性增长（300 MiB 文件即多占约 300 MiB），并与后续复制包体的
+    峰值叠加。分块读取的摘要与整文件读取完全一致，但内存占用恒定。
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def sealed_tree(root):
     """清掉用例树里的 git 元数据；删不掉就失败，不导出夹带宿主机路径的包。
 
@@ -203,6 +218,27 @@ def sealed_tree(root):
         dirs[:] = [name for name in dirs if name != ".git"]
     if next(root.rglob(".git"), None) is not None:
         raise ValueError("Reproduction bundle cannot contain git metadata")
+
+
+def sealed_evidence(evidence):
+    """就地删掉导出证据里的宿主绝对路径（试验的评估报告路径）。
+
+    ``run_configuration`` 把 ``<state>/experiments/<case>-<rep>/<variant>/evaluation/
+    report.json`` 的绝对路径记进每个试验，导出时会带上用户名与状态目录布局；报告
+    本身不随包导出，也没有读取方，因此导出副本直接删除该字段，而不是写一个包里
+    并不存在的相对路径。只裁剪传入的副本，数据库里的原始证据保持不变。
+    """
+    if isinstance(evidence, dict):
+        for key in list(evidence):
+            item = evidence[key]
+            if key == "report" and isinstance(item, str) and Path(item).is_absolute():
+                del evidence[key]
+            else:
+                sealed_evidence(item)
+    elif isinstance(evidence, list):
+        for item in evidence:
+            sealed_evidence(item)
+    return evidence
 
 
 def case_stratum(case):
@@ -698,7 +734,6 @@ class Evolution:
 
     def export_bundle(self, candidate, destination):
         """Export sealed local inputs, never credentials or arbitrary evidence paths."""
-        import hashlib
         row = self.store.one("SELECT * FROM candidates WHERE id=?", (candidate,))
         if not row:
             raise ValueError("Candidate not found")
@@ -710,6 +745,9 @@ class Evolution:
             evidence = {}
         if not isinstance(evidence, dict):
             evidence = {}
+        # 试验记录带有宿主状态目录下的 report 绝对路径；封存包用于跨机器分享，
+        # 只保留判定字段，路径不进包（本地候选证据仍保留完整路径）。
+        evidence = sealed_evidence(evidence)
         try:
             # 非机密 provider 需求随包导出：只记录 provider id 与所需环境变量名，不含密钥值。
             # 证据中已登记的列表逐项裁剪为 {id, env_key}，任何多余字段（可能夹带密钥值）
@@ -766,7 +804,7 @@ class Evolution:
                 if path.is_symlink():
                     raise ValueError("Reproduction bundles require regular files")
                 if path.is_file():
-                    files[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    files[path.relative_to(root).as_posix()] = file_digest(path)
             manifest = {"version": 1, "files": files, "limitations": limitations}
             (root / "bundle.json").write_text(encode(manifest), encoding="utf-8")
             return manifest
@@ -776,7 +814,6 @@ class Evolution:
 
     @staticmethod
     def verify_bundle(directory):
-        import hashlib
         import os
         root = Path(directory).resolve()
         manifest = json.loads((root / "bundle.json").read_text(encoding="utf-8"))
@@ -786,7 +823,7 @@ class Evolution:
             path = root / relative
             if Path(relative).is_absolute() or ".." in Path(relative).parts or any(p.is_symlink() for p in [path] + list(path.parents)):
                 mismatches.append(relative)
-            elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            elif not path.is_file() or file_digest(path) != digest:
                 mismatches.append(relative)
         # 反向检查：磁盘上存在但未登记的文件同样是包被改动的证据。逐项比对登记摘要
         # 只能证明"登记过的文件没变"，无法证明"包里只有登记过的文件"：
@@ -970,7 +1007,32 @@ class Evolution:
                 if error:
                     malformed_checks.append(f"Case {case_id}: checks[{i}] {error}")
 
+        # argv[0] 含路径分隔符且不是绝对路径时，subprocess 按检查 cwd（一次性副本
+        # 内）解析，不是宿主 PATH 查询：必须到用例 repository/overlay 里定位。否则
+        # 包内自带的 ./run.sh 会被 which() 按宿主进程当前目录判成缺工具，整包检查
+        # 随之全部跳过，失败原因还会指向宿主环境。绝对路径仍指宿主文件，照旧处理。
+        def bundle_executable(case_entry, check, cmd):
+            relative = Path(check.get("cwd", ".")) / cmd
+            for base in ("overlay", "repository"):
+                try:
+                    root_dir = (case_entry / base).resolve()
+                    target = (root_dir / relative).resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if root_dir not in target.parents:
+                    continue
+                # overlay 叠在 repository 之上：同名文件以 overlay 为准，存在但不是
+                # 可执行文件时不能再回退到 repository 的旧版本。
+                if target.is_file():
+                    return target if os.access(target, os.X_OK) else None
+            return None
+
+        def bundle_command(cmd):
+            return (not os.path.isabs(cmd)
+                    and (os.sep in cmd or (os.altsep is not None and os.altsep in cmd)))
+
         seen_tools = {}
+        seen_bundle = {}
         for case_id, case_entry, spec in case_items:
             checks = spec.get("checks")
             if not isinstance(checks, list):
@@ -984,24 +1046,48 @@ class Evolution:
                 argv = check.get("argv")
                 cmd = argv[0]
                 check_name = check.get("name", "check")
-                if cmd not in seen_tools:
-                    found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
-                    if found:
-                        info = {"name": cmd, "type": "executable", "path": str(found),
-                                "cases": [case_id], "checks": [check_name]}
-                        seen_tools[cmd] = ("available", info)
+                # 同一个相对命令在不同用例（或同一用例的不同 cwd）里指向不同文件，
+                # 按「用例 + cwd + 命令」分别记录；宿主工具仍按命令名合并。
+                bundled = bundle_command(cmd)
+                key = (case_id, check.get("cwd", "."), cmd) if bundled else cmd
+                table = seen_bundle if bundled else seen_tools
+                if key not in table:
+                    if bundled:
+                        found = bundle_executable(case_entry, check, cmd)
+                        if found:
+                            info = {"name": cmd, "type": "bundle",
+                                    "path": found.relative_to(root).as_posix(),
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("available", info)
+                        else:
+                            info = {"name": cmd, "type": "bundle",
+                                    "reason": f"Command '{cmd}' is not an executable file in the case bundle",
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("missing", info)
                     else:
-                        info = {"name": cmd, "type": "executable",
-                                "reason": f"Command '{cmd}' not found in PATH",
-                                "cases": [case_id], "checks": [check_name]}
-                        seen_tools[cmd] = ("missing", info)
+                        found = lookup(cmd, path=path_env) if path_env else lookup(cmd)
+                        if found:
+                            info = {"name": cmd, "type": "executable", "path": str(found),
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("available", info)
+                        else:
+                            info = {"name": cmd, "type": "executable",
+                                    "reason": f"Command '{cmd}' not found in PATH",
+                                    "cases": [case_id], "checks": [check_name]}
+                            table[key] = ("missing", info)
                 else:
-                    status, info = seen_tools[cmd]
+                    status, info = table[key]
                     if case_id not in info["cases"]:
                         info["cases"].append(case_id)
                     if check_name not in info["checks"]:
                         info["checks"].append(check_name)
 
+        missing_bundle = []
+        for status, info in seen_bundle.values():
+            if status == "available":
+                available_tools.append(info)
+            else:
+                missing_bundle.append(info)
         for status, info in seen_tools.values():
             if status == "available":
                 available_tools.append(info)
@@ -1051,6 +1137,11 @@ class Evolution:
             msg = f"Missing host tools: {len(missing_tools)} required executable(s) missing ({', '.join(t['name'] for t in missing_tools)})"
             if msg not in repro_limitations:
                 repro_limitations.append(msg)
+        if missing_bundle:
+            msg = (f"Missing bundle executables: {len(missing_bundle)} declared command(s) "
+                   f"not executable in the case bundle ({', '.join(t['name'] for t in missing_bundle)})")
+            if msg not in repro_limitations:
+                repro_limitations.append(msg)
         offline_note = "Isolated offline environment: external model APIs cannot be contacted without network egress and valid credentials"
         if offline_note not in repro_limitations:
             repro_limitations.append(offline_note)
@@ -1074,7 +1165,7 @@ class Evolution:
         # 检查命令在一次性临时副本上执行：先复制 repository，再把封存 overlay
         # 叠上去（与 evaluator 同一套 scrub + 符号链接拒绝语义），bundle 原文件保持不变。
         executed_checks = []
-        if run_checks and integrity.get("valid") and not missing_tools:
+        if run_checks and integrity.get("valid") and not missing_tools and not missing_bundle:
             import tempfile
             for case_id, case_entry, spec in case_items:
                 repo_dir = case_entry / "repository"
@@ -1123,15 +1214,29 @@ class Evolution:
                         if not isinstance(check, dict) or check_spec_error(check):
                             continue
                         argv = check.get("argv")
-                        cwd = (staging / check.get("cwd", ".")).resolve()
-                        # 解析后的 cwd 必须仍在一次性副本内：仓库内被注入的符号
-                        # 链接可能把它指向副本之外，此时退回 staging 根目录。
-                        run_cwd = (cwd if cwd.is_dir() and (cwd == staging or staging in cwd.parents)
-                                   else staging)
+                        declared_cwd = check.get("cwd", ".")
+                        cwd = (staging / declared_cwd).resolve()
+                        # 声明的 cwd 缺失、不是目录或经符号链接逃出一次性副本时，
+                        # 不能退回 staging 根目录继续执行：那样检查会在错误的工作
+                        # 目录里通过，复现结论不可核对。记一条失败并保留声明的
+                        # cwd，让接收方能看出它没在声明目录里跑。
+                        inside = cwd == staging or staging in cwd.parents
+                        if not inside or not cwd.is_dir():
+                            executed_checks.append({
+                                "case": case_id,
+                                "check": check.get("name"),
+                                "argv": argv,
+                                "cwd": declared_cwd,
+                                "exit_code": -1,
+                                "passed": False,
+                                "overlay_applied": overlay_applied,
+                                "error": "cwd is missing or escapes the case copy",
+                            })
+                            continue
                         try:
                             proc = subprocess.run(
                                 argv,
-                                cwd=run_cwd,
+                                cwd=cwd,
                                 capture_output=True,
                                 text=True,
                                 timeout=60,
@@ -1141,6 +1246,7 @@ class Evolution:
                                 "case": case_id,
                                 "check": check.get("name"),
                                 "argv": argv,
+                                "cwd": declared_cwd,
                                 "exit_code": proc.returncode,
                                 "passed": proc.returncode == 0,
                                 "overlay_applied": overlay_applied,
@@ -1152,6 +1258,7 @@ class Evolution:
                                 "case": case_id,
                                 "check": check.get("name"),
                                 "argv": argv,
+                                "cwd": declared_cwd,
                                 "exit_code": -1,
                                 "passed": False,
                                 "overlay_applied": overlay_applied,
@@ -1182,6 +1289,7 @@ class Evolution:
             len(exported_cases) > 0 and
             len(missing_cases) == 0 and
             len(missing_tools) == 0 and
+            len(missing_bundle) == 0 and
             len(missing_creds) == 0 and
             credential_limitation is None and
             len(malformed_checks) == 0 and
@@ -1198,7 +1306,7 @@ class Evolution:
             },
             "dependencies": {
                 "available": available_tools,
-                "missing": missing_tools,
+                "missing": missing_tools + missing_bundle,
             },
             "credentials": {
                 "available": available_creds,
@@ -1884,17 +1992,22 @@ class Evolution:
             self._plan_keys = {}
         plan = evidence.get("preregistered_plan")
         plan_key = fingerprint(plan) if plan else None
+        trials = evidence.get("trials", [])
+        # 试验数同样是派生证据的输入。只按计划哈希缓存会让评估期间每次 save 都复用
+        # 0 条试验时算出的 win_rate / plan_verification；进程中断后落库的就是
+        # 「做了 N 条试验、胜场 0、计划未执行」的自相矛盾证据。
+        cache_key = (plan_key, len(trials))
         sentinel = object()
-        plan_changed = (self._plan_keys.get(candidate, sentinel) != plan_key) or (bool(plan) and "plan_verification" not in evidence)
+        plan_changed = (self._plan_keys.get(candidate, sentinel) != cache_key) or (bool(plan) and "plan_verification" not in evidence)
         is_terminal = (status != "evaluating")
 
         if is_terminal or plan_changed or "win_rate" not in evidence:
             if plan:
-                evidence["plan_verification"] = self.verify_plan(plan, evidence.get("trials", []))
+                evidence["plan_verification"] = self.verify_plan(plan, trials)
                 if status == "evaluating" and not evidence["plan_verification"]["valid"]:
                     evidence["plan_verification"]["analysis"] = "planned_in_progress"
-            evidence["win_rate"] = paired_summary(evidence.get("trials", []))
-            self._plan_keys[candidate] = plan_key
+            evidence["win_rate"] = paired_summary(trials)
+            self._plan_keys[candidate] = cache_key
         if is_terminal:
             self._plan_keys.pop(candidate, None)
         self.store.execute("UPDATE candidates SET status=?,evidence=? WHERE id=?", (status, encode(evidence), candidate))
