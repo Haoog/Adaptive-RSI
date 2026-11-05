@@ -36,6 +36,46 @@ def _dict_field(mapping, key):
     return value if isinstance(value, dict) else {}
 
 
+def _check_counts(checks):
+    """每组的通过数/总数；坏行忽略，已知组按固定顺序排在前面便于评审对照。"""
+    groups = []
+    for label, rows in (checks.items() if isinstance(checks, dict) else []):
+        if not isinstance(rows, list):
+            continue
+        total = passed = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            total += 1
+            if row.get("passed") is True:
+                passed += 1
+        if total:
+            groups.append((label, passed, total))
+    known = ["baseline", "candidate", "candidate_full", "acceptance_baseline", "acceptance_candidate"]
+    return ([row for name in known for row in groups if row[0] == name] +
+            [row for row in groups if row[0] not in known])
+
+
+def _failure_count(checks):
+    if isinstance(checks, list):
+        rows = [row for row in checks if isinstance(row, dict)]
+    elif isinstance(checks, dict):
+        rows = [row for values in checks.values() if isinstance(values, list)
+                for row in values if isinstance(row, dict)]
+    else:
+        rows = []
+    return sum(1 for row in rows if row.get("passed") is not True)
+
+
+def _short_hash(value):
+    """验收契约与补丁哈希只公开前 12 位，且只保留字母数字。"""
+    digits = re.sub(r"[^0-9a-zA-Z]", "", value)[:12] if isinstance(value, str) else ""
+    return digits if len(digits) >= 6 else ""
+
+
+PR_CHECK_GROUPS = 8
+
+
 def pr_body(task, run, outcome):
     """Explain the delivered behavior and evidence without publishing private task text."""
     value = outcome.get("value")
@@ -60,10 +100,41 @@ def pr_body(task, run, outcome):
         if len(files) > 50:
             file_lines.append(f"- <code>... 还有 {len(files) - 50} 个文件 ...</code>")
         lines += ["修改文件：", "", *file_lines, ""]
+    evidence = []
+    groups = _check_counts(evaluation.get("checks"))
+    if groups:
+        shown = groups[:PR_CHECK_GROUPS]
+        line = "- 本地检查统计：" + "、".join(
+            _public_text(label, 40) + " %d/%d" % (passed, total) for label, passed, total in shown)
+        if len(groups) > len(shown):
+            line += "（仅列前 %d 组）" % len(shown)
+        evidence.append(line)
+    failures = bounded_failures(evaluation)
+    if failures:
+        line = "- 失败检查：" + "；".join(
+            " / ".join(part for part in (_public_text(row.get("group"), 80),
+                                         _public_text(row.get("name"), 200)) if part)
+            for row in failures)
+        failed = _failure_count(evaluation.get("checks"))
+        if failed > len(failures):
+            line += "（已截断：共 %d 项失败，仅列前 %d 条）" % (failed, len(failures))
+        evidence.append(line)
+    acceptance_hash = _short_hash(evaluation.get("acceptance_hash"))
+    if acceptance_hash:
+        evidence.append("- 验收契约哈希：`" + acceptance_hash + "`")
+    patch_hash = _short_hash(outcome.get("patch_hash"))
+    if patch_hash:
+        evidence.append("- 候选补丁哈希：`" + patch_hash + "`")
+    if evaluation.get("decision") != "pass" and evaluation.get("reason"):
+        evidence.append("- 未通过原因：" + _public_text(evaluation["reason"], 500))
+    # 读者只有 PR 页面：本地证据不能混同远端 CI，且运行目录会在保留期后删除。
+    evidence.append("- 本地固定检查与独立验收由本机执行，完整报告保存在本机状态目录（默认保留 30 天）；"
+                    "GitHub CI 结果以 PR 检查页为准。")
     lines += ["## 验证", "",
               "- 原始回归与候选完整检查：" + ("通过" if evaluation.get("decision") == "pass" else "未通过"),
               "- 独立验收：" + ("通过" if _dict_field(evaluation, "improvement").get("decision") == "pass" else "见运行记录"),
               "- 独立代码评审：" + ("通过" if review.get("decision") == "pass" else "未通过"),
+              *evidence,
               "", "## 运行信息", "",
               "- 运行：`" + run["id"] + "`",
               "- 基线：`" + run["base"] + "`"]

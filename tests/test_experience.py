@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from adaptive_rsi.auth_sessions import AuthError, AuthSessions
 from adaptive_rsi.dashboard import records
@@ -97,7 +97,11 @@ class RelatedWorkTest(unittest.TestCase):
                     raise RuntimeError("Provider timeout")
                 return super().invoke(role, *args, **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
+        # 本用例只验证 related work 变化后重建 planning 缓存；readiness 的沙箱探测
+        # 依赖宿主的 Docker 守护进程，出现瞬时失败会在 planning 之前以
+        # insufficient_evidence 收尾，制造与本用例无关的假失败。
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("adaptive_rsi.readiness.Sandbox.backend", return_value="docker"):
             root = Path(directory).resolve()
             store = Store(root / "state")
             runtime = Runtime(store, Outage())

@@ -13,7 +13,7 @@ from unittest.mock import patch
 from adaptive_rsi.acceptance import seal
 from adaptive_rsi.adapters import test_path
 from adaptive_rsi.config import DEFAULTS, merge
-from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks, merge_gate, tick
+from adaptive_rsi.delivery import CHECK_DETAIL_LIMIT, baseline, delivery_checks, merge_gate, pr_body, tick
 from adaptive_rsi.evaluator import Evaluator, freeze_harness, write_evaluation_report
 from adaptive_rsi.gitops import changes, git, snapshot
 from adaptive_rsi.runtime import Runtime
@@ -1485,6 +1485,55 @@ print('BOUNDARIES_OK')
         rows = bounded_failures({"checks": checks})
         self.assertEqual([row["name"] for row in rows], ["check-0", "check-1", "check-2", "check-3", "check-4"])
         self.assertTrue(all(len(row["output"]) == 1200 for row in rows))
+
+    def test_pr_body_reports_check_counts_and_short_hashes(self):
+        outcome = {
+            "summary": "限制登录重试次数",
+            "files": ["adaptive_rsi/auth.py"],
+            "evaluation": {"decision": "pass",
+                           "checks": {"baseline": [{"name": "suite", "passed": True}] * 3,
+                                      "candidate": [{"name": "suite-a", "passed": True},
+                                                    {"name": "suite-b", "passed": True}],
+                                      "candidate_full": [{"name": "full", "passed": True}] * 4},
+                           "acceptance_hash": "0123456789abcdef" * 4,
+                           "improvement": {"decision": "pass"}},
+            "patch_hash": "abcdef0123456789" * 4,
+            "review": {"decision": "pass"}}
+        body = pr_body({"title": "限制登录重试"}, {"id": "r-123", "base": "a" * 40}, outcome)
+        self.assertIn("baseline 3/3", body)
+        self.assertIn("candidate 2/2", body)
+        self.assertIn("candidate_full 4/4", body)
+        self.assertIn("`0123456789ab`", body)
+        self.assertIn("`abcdef012345`", body)
+        self.assertIn("本地", body)
+        self.assertIn("保留 30 天", body)
+
+    def test_pr_body_bounds_failure_names_and_escapes_public_text(self):
+        checks = {"candidate": [{"name": "ok", "passed": True}],
+                  "candidate_full": [{"name": "test<%d>@corp" % index, "passed": False, "stderr": "x"}
+                                     for index in range(7)]}
+        outcome = {"summary": "", "evaluation": {"decision": "fail", "reason": "候选失败 <x>@y",
+                                                "checks": checks},
+                   "review": {"decision": "pass"}}
+        body = pr_body({"title": "t"}, {"id": "r", "base": "b"}, outcome)
+        self.assertIn("test&lt;0&gt;＠corp", body)
+        self.assertNotIn("<", body)
+        self.assertNotIn("@", body)
+        self.assertIn("仅列前 5 条", body)
+        self.assertIn("共 7 项失败", body)
+        self.assertIn("未通过原因", body)
+
+    def test_pr_body_bounds_large_check_and_file_evidence(self):
+        checks = {"candidate": [{"name": "check-" + "x" * 180 + str(index), "passed": False}
+                                for index in range(200)]}
+        outcome = {"summary": "s",
+                   "files": ["adaptive_rsi/generated/module_%02d.py" % index for index in range(50)],
+                   "evaluation": {"checks": checks, "decision": "pass"},
+                   "review": {"decision": "pass"}}
+        body = pr_body({"title": "t"}, {"id": "r", "base": "b"}, outcome)
+        self.assertLessEqual(len(body), 8000)
+        self.assertIn("candidate 0/200", body)
+        self.assertIn("已截断", body)
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS sandbox execution")
     def test_merged_feedback_rechecks_changed_mainline_and_reports_real_regression(self):
