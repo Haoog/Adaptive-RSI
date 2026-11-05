@@ -1133,15 +1133,29 @@ def health_sample(policy, sha):
 
 
 def observe_health(data, report, policy, now):
-    """Persist bounded observations; successes must be consecutive across ticks."""
+    """Persist bounded observations; successes must be consecutive across ticks.
+
+    Every probe consumes one configured round, including unknown outcomes
+    (timeouts); otherwise the round limit is never reached and tracking stops
+    early. The elapsed-time cap is only a stall guard for a scheduler that
+    stopped waking us, so its floor covers the real scheduled rounds at the
+    60-second advance cadence.
+    """
+    limit = policy.get("health_attempts", 1)
+    interval = policy.get("health_interval_seconds", 10)
     if report.get("healthy") is None:
         data["health_successes"] = 0
         data["health"] = report
         data["health_observations"] = [*data.get("health_observations", []), report][-10:]
+        data["health_attempts"] = data.get("health_attempts", 0) + 1
+        data["health_gate"] = {"required_consecutive": policy.get("health_consecutive_successes", 1),
+                               "observed_consecutive": 0,
+                               "round_limit": limit,
+                               "rounds": data["health_attempts"]}
         first = data.setdefault("health_observation_started_at", now)
-        if now - first >= max(60, policy.get("health_attempts", 1) * (15 + policy.get("health_interval_seconds", 10))):
+        if data["health_attempts"] >= limit or now - first >= max(60 * (limit + 1), limit * (15 + interval)):
             return "health_unconfirmed"
-        data["health_retry_at"] = now + policy.get("health_interval_seconds", 10)
+        data["health_retry_at"] = now + interval
         return "pending"
     data["health_attempts"] = data.get("health_attempts", 0) + 1
     data["health_successes"] = data.get("health_successes", 0) + 1 if report.get("healthy") is True else 0
