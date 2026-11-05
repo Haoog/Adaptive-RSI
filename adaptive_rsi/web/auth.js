@@ -18,6 +18,18 @@ window.RSIAuth = (() => {
   }
   const key=()=>context.backend+':'+(context.provider||'');
   const text=(tag,value,cls)=>el(tag,t(value),cls);
+  // 账号快照只用于展示当前登录身份，不写入本地存储；最近一次完成的 Codex 会话可覆盖刷新后的空会话表。
+  function accountRows(session){
+    if(session&&Array.isArray(session.accounts)&&session.accounts.length)return session.accounts;
+    if(session&&!terminal.has(session.state))return [];
+    const rows=(Array.isArray(snapshot?.sessions)?snapshot.sessions:[]).filter(row=>row&&row.backend==='codex'&&Array.isArray(row.accounts)&&row.accounts.length);
+    return rows.length?rows[rows.length-1].accounts:[];
+  }
+  function connectionLabel(provider){
+    const count=Number(provider?.connection_count);
+    if(!Number.isInteger(count)||count<1)return '';
+    return count===1?t('1 个账号'):count+' '+t('个账号');
+  }
   function external(url,label){
     try{const parsed=new URL(url);if(parsed.protocol!=='https:')return null;const link=text('a',label,'button');link.href=parsed.href;link.target='_blank';link.rel='noopener noreferrer';return link;}catch{return null;}
   }
@@ -103,9 +115,16 @@ window.RSIAuth = (() => {
   function renderBody(){
     const box=$('mc-auth');if(!context){box.hidden=true;return;}box.hidden=false;box.replaceChildren();
     const sessionKey=key(),backend=context.backend,account=snapshot?.[backend],session=sessions.get(sessionKey),connected=backend==='opencode'?account?.authenticated_providers?.includes(context.provider):account?.state==='authenticated';
+    const selected=backend==='opencode'&&Array.isArray(providers)?providers.find(item=>item.id===context.provider):null,connections=connected?connectionLabel(selected):'';
+    const heading=connected?t('账号已连接')+(connections?' · '+connections:''):account?.available===false?t('运行机器尚未安装此工具'):t('尚未登录');
     if($('mc-step-account'))$('mc-step-account').dataset.state=connected?'done':'current';
     if(connected&&$('mc-step-models')?.dataset.state==='pending')$('mc-step-models').dataset.state='current';
-    box.append(text('h3','账号连接'),text('p',snapshot?(connected?'账号已连接':account?.available===false?'运行机器尚未安装此工具':'尚未登录'):'正在读取账号状态…','mc-secondary'));
+    box.append(text('h3','账号连接'),text('p',snapshot?heading:'正在读取账号状态…','mc-secondary'));
+    if(connected&&backend==='codex')for(const row of accountRows(session)){
+      const label=typeof row?.label==='string'?row.label.trim():'',plan=typeof row?.plan==='string'?row.plan.trim():'';
+      if(!label&&!plan)continue;
+      box.append(text('p',label?t('已连接账号：')+label+(plan?' · '+t('套餐 ')+plan:''):t('套餐 ')+plan,'mc-secondary'));
+    }
     if(account?.error)box.append(el('p',authMessage(account.error,account.error),'mc-error'));
     if(backend==='opencode'){
       box.append(text('p','OpenCode Go 使用 API Key。请在供应商列表选择对应的 OpenCode 服务并保存密钥；ChatGPT 登录不提供 Go 凭据。','mc-secondary'));
@@ -115,7 +134,8 @@ window.RSIAuth = (() => {
       search.placeholder=t('搜索供应商');search.setAttribute('aria-label',t('搜索供应商'));
       const fill=()=>{const query=providerQuery.trim().toLocaleLowerCase();const first=text('option','选择供应商');first.value='';select.replaceChildren(first);
         for(const provider of (providers||[]).filter(item=>!query||item.name.toLocaleLowerCase().includes(query)||item.id.toLocaleLowerCase().includes(query))){
-          const option=el('option',provider.name+(provider.connected?' · '+t('已连接'):''));option.value=provider.id;select.append(option);
+          const connections=provider.connected?connectionLabel(provider):'';
+          const option=el('option',provider.name+(provider.connected?' · '+t('已连接')+(connections?' · '+connections:''):''));option.value=provider.id;select.append(option);
         }
         select.value=context.provider||'';};
       fill();search.addEventListener('input',()=>{providerQuery=search.value;fill();});
