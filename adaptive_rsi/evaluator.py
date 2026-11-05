@@ -420,6 +420,47 @@ def clarity_test_summary(text):
     return summary
 
 
+# pytest -q drops the ``=`` rule and ends with a bare ``2 skipped in 0.01s``.
+# Line length is bounded because the summary is short; a run ending in a huge
+# unterminated line must not make this scan backtrack across megabytes.
+_QUIET_SUMMARY_LINE = re.compile(r"(?m)^[ \t]*([^\n]{1,200}?) in [\d.]+s(?: \([^)]*\))?[ \t]*$")
+_QUIET_SUMMARY_FIELD = re.compile(
+    r"^(\d+) (passed|failed|skipped|error|errors|warning|warnings|deselected)$")
+_QUIET_SUMMARY_FIELDS = {"passed": "passed", "failed": "failed", "skipped": "skipped",
+                         "error": "error", "errors": "error",
+                         "warning": "warning", "warnings": "warning",
+                         "deselected": "deselected"}
+_QUIET_SUMMARY_OUTCOMES = {"passed", "failed", "skipped", "error", "deselected"}
+
+
+def _pytest_quiet_summary(text):
+    """Read pytest's quiet-mode summary line for the empty-run gate only.
+
+    ``pytest -q`` ends with ``2 skipped in 0.01s`` or
+    ``1 passed, 1 skipped in 0.01s`` instead of the decorated
+    ``===== 2 skipped in 0.01s =====`` form. Only a line made up entirely of
+    ``<count> <field>`` tokens is accepted, and one test-outcome field is
+    required, so a build log line such as ``3 warnings in 2.1s`` stays
+    unrecognized. ``clarity_test_summary`` deliberately keeps requiring the
+    decorated form so quiet output never becomes ``test_summary`` evidence.
+    """
+    for match in _QUIET_SUMMARY_LINE.finditer(text):
+        fields = {}
+        for token in match.group(1).split(","):
+            field = _QUIET_SUMMARY_FIELD.match(token.strip())
+            if field is None:
+                fields = {}
+                break
+            fields[_QUIET_SUMMARY_FIELDS[field.group(2)]] = int(field.group(1))
+        if not fields or not (_QUIET_SUMMARY_OUTCOMES & set(fields)):
+            continue
+        return {"format": "pytest_quiet",
+                "executed": fields.get("passed", 0) + fields.get("failed", 0),
+                "passed": fields.get("passed", 0), "failed": fields.get("failed", 0),
+                "skipped": fields.get("skipped", 0)}
+    return None
+
+
 # empty_test_run 处理的是命令原始输出，verbose 运行可达数十 MB；零计数/空跑/计数/
 # 通过四个正则各扫一遍约 1 s/MB。没有空跑线索时结论必然是「非空」，所以先用子串
 # 短路：这些 cue 是 empty 正则的可靠超集（"no test" 覆盖 no tests ran/found/to
@@ -479,13 +520,15 @@ def _skip_only_test_run(text, lowered):
     """Return True when tests were collected but none executed (all skipped).
 
     Exit code 0 alone cannot distinguish this: unittest prints
-    ``Ran 2 tests ... OK (skipped=2)``, node prints ``# pass 0 / # skipped 2``
-    and pytest prints ``===== 2 skipped in 0.01s =====``; all three exit 0
-    without running a single test body. TAP stays excluded on purpose: it
-    counts skipped test points as executed (``ok 1 - x # SKIP``). Mixed runs
-    with at least one executed test must stay non-empty.
+    ``Ran 2 tests ... OK (skipped=2)``, node prints ``# pass 0 / # skipped 2``,
+    pytest prints ``===== 2 skipped in 0.01s =====`` (or, with ``-q``, a bare
+    ``2 skipped in 0.01s``) and cargo prints ``test result: ok. 0 passed; ...
+    5 ignored``; all of them exit 0 without running a single test body. TAP
+    stays excluded on purpose: it counts skipped test points as executed
+    (``ok 1 - x # SKIP``). Mixed runs with at least one executed test must
+    stay non-empty.
     """
-    if "skipped" not in lowered:
+    if "skipped" not in lowered and "ignored" not in lowered:
         return False
     empty = executed = False
     # unittest: ``Ran N tests`` counts collected tests; ``OK (skipped=N)`` is
@@ -513,13 +556,28 @@ def _skip_only_test_run(text, lowered):
                 empty = True
             else:
                 executed = True
-    if "==" in text and " in " in lowered:
-        summary = clarity_test_summary(text)
-        if summary is not None:
-            if summary["executed"] == 0 and summary["skipped"] > 0:
-                empty = True
-            else:
+    summary = clarity_test_summary(text) if "==" in text and " in " in lowered else None
+    if summary is None:
+        # pytest -q omits the ``=`` rule; recognize the bare form only for the
+        # empty-run gate, never as ``test_summary`` evidence.
+        summary = _pytest_quiet_summary(text)
+    if summary is not None:
+        if summary["executed"] == 0 and summary["skipped"] > 0:
+            empty = True
+        else:
+            executed = True
+    # cargo test: ``test result: ok. 0 passed; 0 failed; 5 ignored; ...`` exits
+    # 0 and says ok without running any test body when every case is ignored.
+    # A binary with an executed case keeps the whole run non-empty.
+    if "test result:" in lowered and "ignored" in lowered:
+        for match in re.finditer(
+                r"(?m)^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored\b",
+                text):
+            passed, failed, ignored = (int(match.group(number)) for number in (1, 2, 3))
+            if passed or failed:
                 executed = True
+            elif ignored:
+                empty = True
     report = junit_test_summary(text)
     if report is not None:
         if (report["skipped"] > 0 and report["skipped"] >= report["tests"]
