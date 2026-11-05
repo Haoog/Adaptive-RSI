@@ -1448,9 +1448,16 @@ class Runtime(Maintenance):
                 with self._admission:
                     if self._closing or self.stop.is_set():
                         return
-                    run = None if self.updates.is_busy() else self.store.claim(project["id"], config)
-                    if not run:
+                    if self.updates.is_busy():
                         return
+                    run = self.store.claim(project["id"], config)
+                    if not run:
+                        # ready_clause 认可的候选不一定都领得到：issue-sync 快照 pending 的
+                        # 发布任务会被跳过，损坏的 evidence/overrides 候选会被拉黑。这里只把
+                        # 该项目移出本轮重试，不能 return 结束整个 tick——它的公平账本不前进，
+                        # 下个 tick 仍排第一，会把同一 tick 的其他项目和空闲并发持续饿死。
+                        eligible = [(p, c) for p, c in eligible if p["id"] != project["id"]]
+                        continue
                     services[project["id"]] += 1 / max(1, config["schedule"].get("weight", 1))
                     self.store.put_setting("fair-service", services)
                     self.store.put_setting("fair-clock", max(clock, min(services[key] for key in active)))
