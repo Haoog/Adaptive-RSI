@@ -1265,6 +1265,44 @@ class AuthSessionTests(unittest.TestCase):
         finally:
             second.close()
 
+    def test_startup_tolerates_unwritable_state_directory(self):
+        state = self.root / "readonly-state"
+        state.mkdir()
+        file = state / "auth-sessions.json"
+        original = json.dumps({"old-session": {
+            "id": "old-session", "backend": "codex", "provider": None, "state": "completed",
+            "expires_at": time.time() + 600, "error": ""}})
+        file.write_text(original)
+        state.chmod(0o500)
+        try:
+            manager = AuthSessions(state, factory=self.factory, ttl=600)
+        finally:
+            state.chmod(0o700)
+        self.addCleanup(manager.close)
+        # 整理旧文件失败不能阻止启动：已加载会话仍可读，首个异常留给排查，原文件不被破坏。
+        self.assertIsInstance(manager._persist_error, OSError)
+        self.assertEqual([item["id"] for item in manager.snapshot()["sessions"]], ["old-session"])
+        self.assertEqual(file.read_text(), original)
+        # 目录恢复可写后，后续操作照常落盘，内存会话一并保留。
+        session = manager.reserve("codex")
+        self.assertEqual(session["state"], "starting")
+        stored = json.loads(file.read_text())
+        self.assertEqual(stored["old-session"]["state"], "completed")
+        self.assertEqual(stored[session["id"]]["state"], "starting")
+
+    def test_startup_without_state_file_and_unwritable_directory(self):
+        state = self.root / "missing-state"
+        state.mkdir()
+        state.chmod(0o500)
+        try:
+            manager = AuthSessions(state, factory=self.factory, ttl=600)
+        finally:
+            state.chmod(0o700)
+        self.addCleanup(manager.close)
+        # 没有旧文件时不尝试写盘，构造与快照都不受只读目录影响。
+        self.assertIsNone(manager._persist_error)
+        self.assertEqual(manager.snapshot()["sessions"], [])
+
     def test_codex_login_merges_with_existing_auth_fields(self):
         # 用户在目标文件里手放的 OPENAI_API_KEY 或新版本未知字段不能被登录写回抹掉。
         path = self.root / "codex/auth.json"
