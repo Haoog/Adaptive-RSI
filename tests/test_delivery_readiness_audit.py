@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from adaptive_rsi import delivery, readiness, release
-from adaptive_rsi.config import DEFAULTS
+from adaptive_rsi.delivery import StaleCandidate
+from adaptive_rsi.config import DEFAULTS, fingerprint
 from adaptive_rsi.process import ProcessError
 import tests.test_delivery_loop as delivery_tests
 import tests.test_release_endpoints as recovery_tests
@@ -170,6 +171,123 @@ class BaselineAndCleanupTest(unittest.TestCase):
                 self.publish()
         self.assertFalse(command.called)
         self.assertEqual(self.store.setting('delivery-push:' + self.run['id'])['head'], 'a' * 40)
+
+
+class BaselineReplayTest(unittest.TestCase):
+    setUp = recovery_tests.DeliveryRecoveryTest.setUp
+    publish = recovery_tests.DeliveryRecoveryTest.publish
+
+    def advance(self, path="MAINLINE.md", text="mainline moved\n"):
+        (self.repo / path).write_text(text)
+        git(self.repo, "add", ".")
+        git(self.repo, "-c", "user.name=Test", "-c", "user.email=t@localhost", "commit", "-qm", "mainline advance")
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def write_acceptance(self):
+        directory = self.root / "run"
+        directory.mkdir()
+        acceptance = {"hash": "acceptance-hash", "criteria": ["2 + 3 equals 5"],
+                      "checks": [{"name": "independent", "argv": ["python3", "-c", "assert True"], "cwd": "."}],
+                      "spec": {"files": [{"path": ".rsi-acceptance/check.py", "content": "assert True\n"}],
+                               "checks": [{"name": "independent", "argv": ["python3", "-c", "assert True"],
+                                           "criteria": [0]}]}}
+        (directory / "acceptance.json").write_text(json.dumps(acceptance), encoding="utf-8")
+        outcome = json.loads(self.run["result"])
+        outcome["files"] = ["calculator.py"]
+        outcome["patch_hash"] = fingerprint(git(
+            self.workspace, "diff", self.run["base"], "--binary", "--no-ext-diff", "--no-textconv"))
+        self.store.execute("UPDATE runs SET path=?,result=? WHERE id=?",
+                           (str(directory), encode(outcome), self.run["id"]))
+        self.run = self.store.one("SELECT * FROM runs WHERE id=?", (self.run["id"],))
+        return acceptance
+
+    def test_advanced_baseline_replays_patch_and_reverifies_before_creating_pr(self):
+        expected_patch = git(self.workspace, "diff", self.run["base"], "--binary", "--no-ext-diff", "--no-textconv")
+        acceptance = self.write_acceptance()
+        base1 = self.advance()
+        order, pushed = [], []
+
+        def evaluate(baseline_tree, candidate, checks, *args, **kwargs):
+            order.append("evaluate")
+            # 只允许在新基线的树上重验：固定检查与独立验收都必须在场。
+            self.assertTrue(checks)
+            self.assertEqual(git(baseline_tree, "rev-parse", "HEAD"), base1)
+            self.assertEqual(git(candidate, "rev-parse", "HEAD"), base1)
+            self.assertEqual(git(candidate, "diff", "--cached", "--name-only"), "calculator.py")
+            self.assertEqual(kwargs.get("acceptance"), acceptance)
+            self.assertTrue(kwargs.get("changed_files"))
+            return {"decision": "pass", "checks": {}}
+
+        def command(argv, **kwargs):
+            if argv[1:3] == ["pr", "list"]:
+                return "[]"
+            if argv[1:3] == ["pr", "create"]:
+                self.assertEqual(order, ["evaluate"], "PR 必须先完成新基线验证")
+                order.append("create")
+                return self.url
+            raise AssertionError("Unexpected checked argv: " + repr(argv))
+
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base1, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", side_effect=evaluate) as evaluator, \
+                patch("adaptive_rsi.delivery.checked", side_effect=command), \
+                patch("adaptive_rsi.delivery.github_git", side_effect=lambda *args, **kwargs: pushed.append(args)):
+            self.assertEqual(self.publish(), self.url)
+        self.assertEqual(evaluator.call_count, 1)
+        self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], base1)
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], base1)
+        self.assertEqual(self.store.setting("delivery:" + self.run["id"])["base"], base1)
+        # PR head 上的补丁与第一轮逐字节一致（patch hash 相同）。
+        replay = self.root / "candidate.rebase"
+        self.assertEqual(git(replay, "diff", base1, "--binary", "--no-ext-diff", "--no-textconv"), expected_patch)
+        self.assertEqual(len(pushed), 1)
+
+    def test_apply_conflict_keeps_stale_candidate_and_original_base(self):
+        self.write_acceptance()
+        base1 = self.advance("calculator.py", "def add(a, b):\n    return a * b\n")
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base1, "main")), \
+                patch("adaptive_rsi.delivery.checked", return_value="[]") as command, \
+                patch("adaptive_rsi.delivery.github_git") as push:
+            with self.assertRaises(StaleCandidate):
+                self.publish()
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0][1:3], ["pr", "list"])
+        push.assert_not_called()
+        self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], self.run["base"])
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], self.run["base"])
+        event = self.store.one("SELECT data FROM events WHERE run=? AND kind='baseline_changed' ORDER BY seq DESC LIMIT 1", (self.run["id"],))
+        self.assertEqual(json.loads(event["data"])["relation"], "advanced")
+
+    def test_rewritten_or_diverged_baseline_never_replays(self):
+        base1 = self.advance()
+        for relation in ["rewritten", "diverged"]:
+            change = {"previous": self.run["base"], "current": base1, "relation": relation,
+                      "evidence_invalidated": True, "recovery": "refresh"}
+            with self.subTest(relation=relation), \
+                    patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base1, "main")), \
+                    patch("adaptive_rsi.delivery.baseline_change", return_value=change), \
+                    patch("adaptive_rsi.delivery.checked", return_value="[]"), \
+                    patch("adaptive_rsi.delivery.github_git") as push:
+                with self.assertRaises(StaleCandidate):
+                    self.publish()
+                push.assert_not_called()
+            self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], self.run["base"])
+            event = self.store.one("SELECT data FROM events WHERE run=? AND kind='baseline_changed' ORDER BY seq DESC LIMIT 1", (self.run["id"],))
+            self.assertEqual(json.loads(event["data"])["relation"], relation)
+
+    def test_failed_checks_on_new_baseline_keep_stale_candidate(self):
+        self.write_acceptance()
+        base1 = self.advance()
+        with patch("adaptive_rsi.delivery.baseline", return_value=(str(self.repo), base1, "main")), \
+                patch.object(self.runtime.evaluator, "evaluate", return_value={"decision": "fail", "checks": {}}), \
+                patch("adaptive_rsi.delivery.checked", return_value="[]"), \
+                patch("adaptive_rsi.delivery.github_git") as push:
+            with self.assertRaises(StaleCandidate):
+                self.publish()
+        push.assert_not_called()
+        self.assertEqual(self.store.one("SELECT base FROM runs WHERE id=?", (self.run["id"],))["base"], self.run["base"])
+        self.assertEqual(self.store.setting("run-baseline:" + self.run["id"])["sha"], self.run["base"])
+        event = self.store.one("SELECT data FROM events WHERE run=? AND kind='baseline_changed' ORDER BY seq DESC LIMIT 1", (self.run["id"],))
+        self.assertEqual(json.loads(event["data"])["replay"], "fixed checks or acceptance did not pass on the new baseline")
 
 
 class AttributionTest(unittest.TestCase):

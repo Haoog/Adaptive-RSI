@@ -2,10 +2,11 @@ import json
 import html
 import hashlib
 import re
+import shutil
 import time
 from pathlib import Path
 
-from .config import merge
+from .config import fingerprint, merge
 from .gitops import git, origin_repository, snapshot
 from .process import Cancelled, ProcessError, checked
 from .store import encode, uid
@@ -349,6 +350,103 @@ def baseline_change(source, previous, current):
     return result
 
 
+def _replay_checks(outcome, baseline_tree, config):
+    """Recover the exact fixed-check harness used for the original verdict."""
+    from .adapters import detect
+    spec = outcome.get("checks_spec")
+    checks = spec if isinstance(spec, list) and spec and all(isinstance(item, dict) for item in spec) else None
+    if checks is None:
+        checks = list(config["checks"] or []) or detect(baseline_tree)["checks"]
+    harness = (outcome.get("evaluation") or {}).get("harness_hash")
+    if harness and fingerprint(checks) != harness:
+        raise ValueError("fixed checks differ from the evaluated harness")
+    return checks
+
+
+def _replay_acceptance(run, workspace, outcome):
+    """Load the sealed acceptance spec that must be re-executed with the patch."""
+    directory = Path(run.get("path") or Path(workspace).parent)
+    path = directory / "acceptance.json"
+    expected = (outcome.get("evaluation") or {}).get("acceptance_hash")
+    if not path.exists():
+        if expected:
+            raise ValueError("sealed acceptance evidence is missing")
+        return None
+    try:
+        acceptance = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ValueError("sealed acceptance evidence is unreadable") from None
+    if (not isinstance(acceptance, dict) or not isinstance(acceptance.get("checks"), list)
+            or not isinstance(acceptance.get("spec"), dict) or not isinstance(acceptance.get("hash"), str)):
+        raise ValueError("sealed acceptance evidence is invalid")
+    if expected and acceptance["hash"] != expected:
+        raise ValueError("sealed acceptance evidence changed")
+    return acceptance
+
+
+def _fresh_snapshot(source, destination, sha):
+    destination = Path(destination)
+    if destination.exists():
+        shutil.rmtree(destination, ignore_errors=True)
+    return snapshot(source, destination, sha)
+
+
+def replay_on_advanced_baseline(runtime, project, run, workspace, outcome, source, current, config):
+    """Re-execute fixed checks and acceptance for the evaluated patch on a newer baseline.
+
+    Only the patch crosses baselines; the stored verdict is never reused. The
+    caller reseals the run base after this returns, so every failure mode keeps
+    the old evidence and the existing StaleCandidate recovery path.
+    """
+    store = runtime.store
+    previous = run["base"]
+    change = baseline_change(source, previous, current)
+
+    def refuse(reason):
+        change["replay"] = reason
+        store.event("baseline_changed", "Remote baseline evidence invalidated",
+                    project["id"], run["id"], change)
+        raise StaleCandidate("Remote baseline changed (" + change["relation"] + "; " + reason + "); " +
+                             change["recovery"])
+
+    if change["relation"] != "advanced":
+        refuse("the verified patch cannot be replayed onto a rewritten or diverged baseline")
+    patch = git(workspace, "diff", previous, "--binary", "--no-ext-diff", "--no-textconv")
+    if not patch.strip():
+        refuse("no candidate patch to replay")
+    if outcome.get("patch_hash") and fingerprint(patch) != outcome["patch_hash"]:
+        raise RuntimeError("Candidate changed after evaluation; delivery refused")
+    baseline_tree = _fresh_snapshot(source, Path(str(workspace) + ".rebase-baseline"), current)
+    try:
+        checks = _replay_checks(outcome, baseline_tree, config)
+        acceptance = _replay_acceptance(run, workspace, outcome)
+    except ValueError as exc:
+        refuse(str(exc))
+    replay = _fresh_snapshot(source, Path(str(workspace) + ".rebase"), current)
+    patch_file = Path(str(workspace) + ".rebase.patch")
+    patch_file.write_text(patch + "\n", encoding="utf-8")
+    try:
+        git(replay, "apply", "--index", str(patch_file))
+    except (ProcessError, RuntimeError):
+        refuse("the verified patch no longer applies cleanly")
+    directory = Path(run.get("path") or Path(workspace).parent)
+    seeds = directory / "dependencies"
+    files = outcome.get("files") if isinstance(outcome.get("files"), list) else None
+    try:
+        evaluation = runtime.evaluator.evaluate(
+            baseline_tree, replay, checks, Path(str(workspace) + ".rebase-evaluation"), config,
+            cancel=lambda: runtime.is_cancelled(run), seeds=seeds if seeds.is_dir() else None,
+            acceptance=acceptance, changed_files=files)
+    except Cancelled:
+        raise
+    except Exception as exc:
+        change["error"] = str(exc)[:500]
+        refuse("verification on the new baseline is unavailable")
+    if not isinstance(evaluation, dict) or evaluation.get("decision") != "pass":
+        refuse("fixed checks or acceptance did not pass on the new baseline")
+    return replay, evaluation
+
+
 def pushed_branch_journal(repo, store):
     """Local delivery-push journal: branch -> recorded head SHAs for this repo."""
     if store is None:
@@ -444,7 +542,7 @@ def failure_attribution(merged, head, result):
             "disclaimer": "later-mainline 失败不记候选回归" if scope == "subsequent_mainline" else ""}
 
 
-def publish(runtime, project, task, run, workspace, config):
+def publish(runtime, project, task, run, workspace, config, outcome=None):
     store = runtime.store
     approval = store.one("SELECT id,evidence FROM tasks WHERE project=? AND source='system_publish' AND body=? AND state='planning'",
                          (project["id"], run["id"]))
@@ -489,12 +587,13 @@ def publish(runtime, project, task, run, workspace, config):
     authorize_write()
     if task["source"] == "issue" and not runtime.issue_still_open(project, task, config):
         raise StaleCandidate("Issue closed before delivery; synchronize before retrying")
-    try:
-        outcome = json.loads(run["result"] or "{}")
-    except (TypeError, ValueError):
-        outcome = {}
-    if not isinstance(outcome, dict):
-        outcome = {}
+    if outcome is None:
+        try:
+            outcome = json.loads(run["result"] or "{}")
+        except (TypeError, ValueError):
+            outcome = {}
+        if not isinstance(outcome, dict):
+            outcome = {}
     evaluation = outcome.get("evaluation")
     if not isinstance(evaluation, dict):
         evaluation = {}
@@ -523,23 +622,30 @@ def publish(runtime, project, task, run, workspace, config):
         pushed_intent = None
     if pushed_intent and pushed_intent.get("branch") and pushed_intent["branch"] != branch:
         raise RuntimeError("Delivery push journal records a different branch; reconcile it before retrying")
-    if git(workspace, "branch", "--show-current") != branch:
-        # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
-        existing_head = git(workspace, "branch", "--list", branch, "--format=%(objectname)")
-        if existing_head:
-            if existing_head != git(workspace, "rev-parse", "HEAD"):
-                raise RuntimeError("Existing delivery branch differs from evaluated candidate")
-            git(workspace, "checkout", branch)
-        else:
-            git(workspace, "checkout", "-b", branch)
     title = re.sub(r"[\r\n\0]+", " ", task["title"]).strip()
-    if git(workspace, "diff", "--cached", "--name-only"):
-        git(workspace, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
-            "commit", "-m", "完成任务：" + title)
-    sha = git(workspace, "rev-parse", "HEAD")
-    if pushed_intent and pushed_intent.get("head") and pushed_intent["head"] != sha:
-        # 该分支上一次已被推过别的提交；不覆盖远端引用，交人工按意图记录对账。
-        raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+
+    def prepare_head(target):
+        if git(target, "branch", "--show-current") != branch:
+            # 重试可复用同一候选提交上的分支，不能覆盖已有分支指向的其他提交。
+            existing_head = git(target, "branch", "--list", branch, "--format=%(objectname)")
+            if existing_head:
+                if existing_head != git(target, "rev-parse", "HEAD"):
+                    raise RuntimeError("Existing delivery branch differs from evaluated candidate")
+                git(target, "checkout", branch)
+            else:
+                git(target, "checkout", "-b", branch)
+        if git(target, "diff", "--cached", "--name-only"):
+            git(target, "-c", "user.name=Adaptive RSI", "-c", "user.email=adaptive-rsi@localhost",
+                "commit", "-m", "完成任务：" + title)
+        return git(target, "rev-parse", "HEAD")
+
+    def check_journal(head):
+        if pushed_intent and pushed_intent.get("head") and pushed_intent["head"] != head:
+            # 该分支上一次已被推过别的提交；不覆盖远端引用，交人工按意图记录对账。
+            raise RuntimeError("Delivery push journal records a different candidate head; reconcile it before retrying")
+
+    sha = prepare_head(workspace)
+    check_journal(sha)
     existing = json.loads(checked(["gh", "pr", "list", "--repo", repo, "--state", "all", "--head", branch,
                                    "--limit", "1", "--json", "url"]))
     if existing:
@@ -572,9 +678,31 @@ def publish(runtime, project, task, run, workspace, config):
                            (time.time(), task["id"]))
     else:
         if current != run["base"]:
-            change = baseline_change(source, run["base"], current)
-            store.event("baseline_changed", "Remote baseline evidence invalidated", project["id"], run["id"], change)
-            raise StaleCandidate("Remote baseline changed (" + change["relation"] + "); " + change["recovery"])
+            # 主线前进后不再直接作废证据：把已评估补丁重放到新基线，重新跑固定
+            # 检查与验收，只有验证通过才在同一事务里重封基线并发起远端写。
+            replay, revalidated = replay_on_advanced_baseline(
+                runtime, project, run, workspace, outcome, source, current, config)
+            authorize_write()
+            previous = run["base"]
+            with store.connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute("SELECT state FROM runs WHERE id=? AND project=?",
+                                 (run["id"], project["id"])).fetchone()
+                if not row or row["state"] != "awaiting_approval":
+                    raise Cancelled("Approved candidate was superseded; publishing stopped")
+                db.execute("UPDATE runs SET base=? WHERE id=?", (current, run["id"]))
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("run-baseline:" + run["id"], encode(
+                    {"repository": repo, "branch": base_branch, "sha": current})))
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("delivery-replay:" + run["id"], encode(
+                    {"workspace": str(replay), "base": current})))
+            run["base"] = current
+            outcome["base"] = current
+            outcome["evaluation"] = revalidated
+            outcome["baseline_replay"] = {"previous": previous, "current": current,
+                                          "patch_hash": outcome.get("patch_hash")}
+            workspace = replay
+            sha = prepare_head(workspace)
+            check_journal(sha)
         git(workspace, "remote", "set-url", "origin", "https://github.com/" + repo + ".git")
         authorize_write()
         pushed_intent = pushed_intent or {
