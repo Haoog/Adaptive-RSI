@@ -356,6 +356,74 @@ class ConfigRepairHTTPTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["resource_pressure"], {"admitted": False, "reasons": ["memory"]})
 
+    def test_sys_metrics_reports_maintenance_state(self):
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        # 新装状态目录：只有固定形状的空状态，running 来自线程存活判断。
+        self.assertEqual(body["maintenance"], {"running": False, "last_success": None,
+                                               "next_due": None, "failures": 0,
+                                               "retry_at": None, "degraded": None})
+
+        now = time.time()
+        last = now - 1800
+        self.runtime.store.put_setting("maintenance-last", last)
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        maintenance = body["maintenance"]
+        self.assertEqual(maintenance["last_success"], last)
+        self.assertEqual(maintenance["next_due"], last + 3600)
+        self.assertIsNone(maintenance["retry_at"])
+
+        # 未到期的退避接管下一次到期时间；失败消息原文不出现在响应里。
+        retry_at = now + 120
+        self.runtime.store.put_setting("maintenance-retry", {
+            "retry_at": retry_at, "failures": 2, "error_type": "OSError",
+            "message": "PermissionError: /srv/private/state/runs/x"})
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        maintenance = body["maintenance"]
+        self.assertEqual((maintenance["failures"], maintenance["retry_at"]), (2, retry_at))
+        self.assertEqual(maintenance["next_due"], retry_at)
+        self.assertNotIn("/srv/private", json.dumps(maintenance))
+
+        # 过期的退避不能继续显示成待重试，到期时间回落到常规周期。
+        self.runtime.store.put_setting("maintenance-retry", {"retry_at": now - 60, "failures": 2})
+        status, body = self.get("/api/sys-metrics")
+        self.assertEqual(status, 200)
+        maintenance = body["maintenance"]
+        self.assertEqual(maintenance["failures"], 2)
+        self.assertIsNone(maintenance["retry_at"])
+        self.assertEqual(maintenance["next_due"], last + 3600)
+
+        # 损坏的退避记录降级为 null，而不是 500。
+        for corrupt in ("broken", ["not", "a", "record"]):
+            self.runtime.store.put_setting("maintenance-retry", corrupt)
+            status, body = self.get("/api/sys-metrics")
+            self.assertEqual(status, 200)
+            maintenance = body["maintenance"]
+            self.assertEqual((maintenance["failures"], maintenance["retry_at"]), (None, None))
+            self.assertEqual(maintenance["last_success"], last)
+
+        # 损坏的上次成功时间同样只影响自己的字段。
+        for corrupt in ("broken", float("inf")):
+            self.runtime.store.put_setting("maintenance-last", corrupt)
+            status, body = self.get("/api/sys-metrics")
+            self.assertEqual(status, 200)
+            maintenance = body["maintenance"]
+            self.assertEqual((maintenance["last_success"], maintenance["next_due"]), (None, None))
+
+        # running 复用 shutdown_status() 的线程存活判断。
+        release = threading.Event()
+        self.runtime.maintenance_thread = threading.Thread(target=release.wait, daemon=True)
+        self.runtime.maintenance_thread.start()
+        try:
+            status, body = self.get("/api/sys-metrics")
+            self.assertEqual(status, 200)
+            self.assertIs(body["maintenance"]["running"], True)
+        finally:
+            release.set()
+            self.runtime.maintenance_thread.join(3)
+
 
 class ImportAdmissionTest(unittest.TestCase):
     def setUp(self):
