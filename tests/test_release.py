@@ -202,10 +202,14 @@ class ReleaseAutomationTest(unittest.TestCase):
             for _ in range(2):
                 result = advance(self.runtime, self.runtime.project(self.project), self.run, outcome)
                 self.assertEqual(result['release']['state'], 'blocked')
-                self.assertIn('Legacy release verification could not run locally', result['release']['error'])
-                self.assertIn('fixture disk failure', result['release']['error'])
+                # 执行异常才归入「本地跑不起来」，并保留类型与摘要。
+                self.assertEqual(result['release']['error'],
+                                 'Legacy release verification could not run locally: OSError: fixture disk failure')
             self.assertEqual(snapshot.call_count, 1)
-        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 1)
+        events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['message'],
+                         'Legacy release verification could not run locally: OSError: fixture disk failure')
 
     def test_legacy_pin_failed_decision_backs_off_until_retry_at(self):
         # 确定性 decision!="pass" 与执行异常同样走 retry_key 退避：同一 sha 的
@@ -217,14 +221,21 @@ class ReleaseAutomationTest(unittest.TestCase):
             for _ in range(2):
                 result = advance(self.runtime, self.runtime.project(self.project), self.run, outcome)
                 self.assertEqual(result['release']['state'], 'blocked')
-                self.assertIn('Legacy release verification did not pass: fail', result['release']['error'])
+                # 确定性检查失败必须保持检查语义：不能自称本地执行异常，
+                # 也不能把内部异常类名写进用户可见文本。
+                self.assertEqual(result['release']['error'], 'Legacy release verification did not pass: fail')
+                self.assertNotIn('could not run locally', result['release']['error'])
+                self.assertNotIn('_PinUnavailable', result['release']['error'])
             # 一次 pin 尝试做 baseline+candidate 两份快照；第二个 tick 被 retry_at
             # 拦截后不得再执行 snapshot/evaluate。
             self.assertEqual(snapshot.call_count, 2)
             self.assertEqual(evaluate.call_count, 1)
-        self.assertEqual(len(self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")), 1)
+        events = self.runtime.store.query("SELECT * FROM events WHERE kind='automation_error'")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['message'], 'Legacy release verification did not pass: fail')
         deferred = self.runtime.store.setting('legacy-release-pin:' + self.run['id'] + ':' + MERGED)
         self.assertGreater(deferred['retry_at'], time.time())
+        self.assertEqual(deferred['error'], 'Legacy release verification did not pass: fail')
         # retry_at 到期后允许再次评估，与 _PinUnavailable deferred 语义一致。
         with patch('adaptive_rsi.release.time.time', return_value=deferred['retry_at'] + 1), \
              patch('adaptive_rsi.gitops.snapshot', side_effect=lambda source, folder, sha: folder) as snapshot, \
