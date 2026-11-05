@@ -39,6 +39,117 @@ PATCH_PREVIEW_LIMIT = 2 * 1024 * 1024
 PATCH_PREVIEW_TOO_LARGE = ("Candidate patch exceeds the 2 MiB UI size limit; "
                            "download it from the run directory instead")
 
+# Every literal /api route dispatched by Handler._do_GET and Handler._do_POST.
+# The OpenAPI document is generated from this catalog; tests.test_server_hardening
+# compares it with the dispatch code and names any route missing from either side.
+# Prefix matches (/api/, /api/auth/, /api/model-center/) are fallbacks, not routes.
+OPENAPI_ROUTES = """
+GET /api/attention
+POST /api/auth/cancel
+POST /api/auth/complete
+POST /api/auth/key
+POST /api/auth/logout
+GET /api/auth/providers
+GET /api/auth/session
+POST /api/auth/start
+GET /api/auth/status
+GET /api/backup
+POST /api/backup
+POST /api/cancel
+GET /api/candidate
+GET /api/capabilities
+POST /api/cases
+POST /api/config
+GET /api/config-history
+POST /api/config/repair
+POST /api/config/repair-global
+POST /api/config/undo
+GET /api/contract
+POST /api/deliver
+POST /api/desktop-update
+GET /api/diagnostics
+POST /api/diagnostics/export
+GET /api/diagnostics/preview
+GET /api/diff-files
+GET /api/events
+POST /api/evolution/promote
+POST /api/goal
+GET /api/health
+GET /api/mobile
+GET /api/model-center
+POST /api/model-center/diagnose
+POST /api/model-center/fetch
+POST /api/model-center/model
+POST /api/model-center/probe
+POST /api/model-center/provider
+POST /api/model-center/remove
+POST /api/model-center/resume
+POST /api/model-center/routes
+POST /api/models
+GET /api/monitoring-feedback
+GET /api/operation
+POST /api/operations
+POST /api/operations/cancel
+GET /api/patch
+POST /api/pause
+POST /api/project/archive
+POST /api/project/restore
+POST /api/projects
+POST /api/projects/import
+GET /api/readiness
+GET /api/rehearsal
+POST /api/rehearsal
+GET /api/rehearse-restore
+POST /api/rehearse-restore
+POST /api/release-abandon
+POST /api/release-authorize
+GET /api/release-candidates
+POST /api/release-resolve
+POST /api/release-retry
+GET /api/release-status
+GET /api/release-workflows
+POST /api/request
+POST /api/retry
+POST /api/revert-code
+POST /api/rollback
+GET /api/run
+POST /api/session/rotate
+GET /api/shutdown-status
+GET /api/state
+GET /api/storage
+GET /api/sys-metrics
+GET /api/task
+GET /api/task-blockers
+GET /api/task-cancel-preview
+GET /api/task-groups
+GET /api/task-interventions
+GET /api/task-revision
+GET /api/task-revisions
+GET /api/task-runs
+POST /api/task/revise
+POST /api/task/schedule
+POST /api/task/schedule-time
+POST /api/task/value-feedback
+GET /api/tasks/batch
+POST /api/tasks/batch
+GET /api/tasks/batches
+POST /api/updates/apply
+POST /api/updates/check
+GET /api/usage
+GET /api/workflow-metrics
+"""
+
+
+def openapi_paths():
+    """Return OpenAPI path items generated from the declared route catalog."""
+    paths = {}
+    for entry in OPENAPI_ROUTES.strip().splitlines():
+        method, path = entry.split()
+        paths.setdefault(path, {})[method.lower()] = {
+            "responses": {"200": {"description": "JSON response"}}}
+    return paths
+
+
 # POST body fields that reach SQLite bindings must be scalars. A dict/list
 # raises sqlite3.ProgrammingError, which the error boundary keeps as a 500 bug
 # signal; validate these fields once at the POST entry instead. Fields the
@@ -440,13 +551,7 @@ class Handler(BaseHTTPRequestHandler):
                         "openapi": "3.1.0",
                         "info": {"title": "Adaptive RSI local API", "version": str(API_VERSION)},
                         "servers": [{"url": self.server.origin}],
-                        "paths": {
-                            "/api/health": {"get": {"responses": {"200": {"description": "Health and capabilities"}}}},
-                            "/api/state": {"get": {"responses": {"200": {"description": "Project-scoped state"}}}},
-                            "/api/config": {"post": {"responses": {"200": {"description": "Save settings"},
-                                                                    "400": {"description": "Revision conflict or validation error"}}}},
-                            "/api/operations": {"post": {"responses": {"200": {"description": "Background job receipt"}}}},
-                        },
+                        "paths": openapi_paths(),
                         "security": [{"sessionCookie": []}],
                         "components": {"securitySchemes": {"sessionCookie": {
                             "type": "apiKey", "in": "cookie", "name": self.server.cookie}}},
