@@ -726,26 +726,43 @@ def file_digest(path, check=None):
     return digest.hexdigest()
 
 
-def _cached_digests(store, entries, refresh):
+DIGEST_REFRESH_BUDGET = 64 * 1024 * 1024  # bytes one explicit refresh may re-read
+
+
+def _cached_digests(store, entries, refresh, budget=None):
     """Digest regular files, reusing prior results only for the same file identity.
 
     The cache is rebound to the files in the current manifest so removed or
     rotated backups cannot accumulate; the manifest itself bounds the entry
-    count. ``refresh`` deliberately re-reads every file, matching the full
-    verification cost of an explicit refresh.
+    count.  An explicit ``refresh`` re-reads files in manifest order until
+    ``budget`` bytes have been read: the rest keep their cached digest (or
+    ``None`` when never hashed) and are reported as pending, so one request
+    cannot walk an arbitrarily large state directory.
     """
-    previous = {} if refresh else dict(getattr(store, "_storage_digests", {}) or {})
-    current, digests = {}, {}
+    budget = DIGEST_REFRESH_BUDGET if budget is None else budget
+    previous = dict(getattr(store, "_storage_digests", {}) or {})
+    current, digests, pending = {}, {}, set()
+    hashed = 0
     for path, info in entries:
         identity = (str(path), info.st_dev, info.st_ino, info.st_size,
                     info.st_mtime_ns, info.st_ctime_ns)
-        digest = None if refresh else previous.get(identity)
-        if digest is None:
+        cached = previous.get(identity)
+        if refresh:
+            if hashed + info.st_size <= budget:
+                digest = file_digest(path)
+                hashed += info.st_size
+            else:
+                digest = cached
+                pending.add(path)
+        elif cached is None:
             digest = file_digest(path)
+            hashed += info.st_size
+        else:
+            digest = cached
         current[identity] = digest
         digests[path] = digest
     setattr(store, "_storage_digests", current)
-    return digests
+    return digests, hashed, pending
 
 
 def overview(store, refresh=False):
@@ -767,13 +784,19 @@ def overview(store, refresh=False):
                      key=lambda item: item[1].st_mtime, reverse=True)
     expiring, delivering, delivered = _approval_candidates(store)
     selected = backups[:20]
-    digests = _cached_digests(store, selected, refresh)
-    manifest = [{"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
+    digests, hashed_bytes, pending = _cached_digests(store, selected, refresh)
+    manifest = []
+    for p, info in selected:
+        entry = {"path": p.relative_to(store.root).as_posix(), "bytes": info.st_size,
                  "modified": info.st_mtime, "sha256": digests[p]}
-                for p, info in selected]
+        if p in pending:
+            entry["digest_pending"] = True
+        manifest.append(entry)
     result = {"bytes": categories, "backups": [{"id": p.stem, "bytes": info.st_size, "created": info.st_mtime}
             for p, info in selected], "backup_manifest": manifest,
             "expiring": expiring, "delivering": delivering, "delivered": delivered,
+            "hashed_bytes": hashed_bytes, "digest_budget_bytes": DIGEST_REFRESH_BUDGET,
+            "digest_pending": bool(pending),
             "scanned_at": time.time(), "cache_seconds": 10}
     store._storage_snapshot = {"clock": time.monotonic(), "data": copy.deepcopy(result)}
     return result
