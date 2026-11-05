@@ -1,4 +1,5 @@
 """服务会话、认证、异常及备份资源边界的真实 HTTP 回归。"""
+import ast
 import base64
 import concurrent.futures
 import hashlib
@@ -934,6 +935,32 @@ class ServerHardeningTest(unittest.TestCase):
         status, _, body = self.request(f"/api/rehearsal?id={self.identifier}")
         self.assertEqual(status, 400)
         self.assertNotIn(b"SECRET-FILE-CONTENT", body)
+
+    def test_openapi_document_covers_every_dispatched_api_route(self):
+        # 文档由 OPENAPI_ROUTES 生成；从 _do_GET/_do_POST 的字面量重新推导路由集合，
+        # 新增或改名却漏登记时这里会点名缺哪条。
+        source = (Path(__file__).resolve().parents[1] / "adaptive_rsi" / "server.py").read_text()
+        handler = next(node for node in ast.parse(source).body
+                       if isinstance(node, ast.ClassDef) and node.name == "Handler")
+        functions = {node.name: node for node in handler.body
+                     if isinstance(node, ast.FunctionDef)}
+        # 前缀匹配是兜底分支，不是独立路由。
+        prefixes = {"/api/", "/api/auth/", "/api/model-center/"}
+        dispatched = {}
+        for name, method in (("_do_GET", "get"), ("_do_POST", "post")):
+            for node in ast.walk(functions[name]):
+                if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                        and node.value.startswith("/api/") and node.value not in prefixes):
+                    dispatched.setdefault(node.value, set()).add(method)
+        status, _, payload = self.request("/api/contract?format=openapi")
+        self.assertEqual(status, 200)
+        document = {path: set(item) for path, item in json.loads(payload)["paths"].items()}
+        self.assertEqual([], sorted(set(dispatched) - set(document)),
+                         "OpenAPI 文档缺少已实现路由")
+        self.assertEqual([], sorted(set(document) - set(dispatched)),
+                         "OpenAPI 文档包含未实现的路由")
+        for path in sorted(dispatched):
+            self.assertEqual(sorted(dispatched[path]), sorted(document[path]), path)
 
     def test_connection_gate_releases_permit_when_thread_spawn_fails(self):
         # Thread.start() 抛错时 process_request 必须退还 gate 名额，
