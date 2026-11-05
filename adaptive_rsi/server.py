@@ -28,6 +28,7 @@ from .config import BUILTIN_PROVIDERS, compatibility
 from .contracts import API_VERSION, descriptor
 from .gitops import git
 from .evolution import Evolution
+from .maintenance import MAINTENANCE_INTERVAL
 from .release import ReconciliationRejected
 from .updates import UpdateInProgress, atomic_json
 
@@ -191,6 +192,41 @@ _POST_FIELD_TYPES = {
     "/api/revert-code": {"run": str},
     "/api/cases": {"project": str, "manifest": dict},
 }
+
+
+def maintenance_status(store, running=False, now=None):
+    """Expose the maintenance pass as structured state instead of event history.
+
+    只读 settings 的 ``maintenance-last`` / ``maintenance-retry``：缺失表示尚未
+    跑过，损坏或类型不符退化为 null，状态记录本身出错不能把 /api/sys-metrics
+    变成 500。字段形状固定，便于前端与运维脚本直接消费；不返回失败消息原文，
+    避免把运行路径带进接口。
+    """
+    now = time.time() if now is None else now
+    last = store.setting("maintenance-last", 0)
+    # 只接受有限的正时间戳；超大整数转 float 会溢出，损坏值一律降级为 null。
+    last_success = float(last) if type(last) in (int, float) and 0 < last <= 2 ** 62 else None
+
+    retry = store.setting("maintenance-retry", {})
+    failures, retry_at = None, None
+    if retry is None or retry == {}:
+        # 新装状态或成功一轮后清掉了退避记录：没有连续失败。
+        failures = 0
+    elif isinstance(retry, dict):
+        count = retry.get("failures", 0)
+        failures = count if type(count) is int and count >= 0 else None
+        try:
+            deadline = float(retry.get("retry_at", 0))
+        except (TypeError, ValueError):
+            deadline = 0.0
+        # 已过期的退避不是「待重试」；下一次到期回落到常规周期。
+        retry_at = deadline if 0 < deadline < float("inf") and deadline > now else None
+
+    next_due = retry_at
+    if next_due is None and last_success is not None:
+        next_due = last_success + MAINTENANCE_INTERVAL
+    return {"running": bool(running), "last_success": last_success, "next_due": next_due,
+            "failures": failures, "retry_at": retry_at, "degraded": None}
 
 
 def read_patch_preview(path):
@@ -868,6 +904,18 @@ class Handler(BaseHTTPRequestHandler):
                 blocked = [r for r in reports if not r.get("admitted", True)]
                 metrics["resource_pressure"] = {"admitted": not blocked,
                                                 "reasons": blocked[0].get("reasons", []) if blocked else []}
+                # 维护轮状态：上次成功 / 下次到期 / 连续失败 / 退避截止，不必再翻
+                # events 或直接查 settings 才能判断保留清理是否健康。
+                try:
+                    maintenance_running = bool(runtime.shutdown_status().get("maintenance_running"))
+                except Exception:
+                    maintenance_running = False
+                try:
+                    metrics["maintenance"] = maintenance_status(store, maintenance_running)
+                except Exception:
+                    metrics["maintenance"] = {"running": maintenance_running, "last_success": None,
+                                              "next_due": None, "failures": None,
+                                              "retry_at": None, "degraded": None}
                 self.respond(metrics)
             elif parsed.path == "/api/state":
                 with store.snapshot():
