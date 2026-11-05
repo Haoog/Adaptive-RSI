@@ -562,6 +562,46 @@ class ServerHardeningTest(unittest.TestCase):
         self.assertNotIn(b"private-secret-field", body)
         self.assertIn(b"core, candidates or analytics", body)
 
+    def test_revision_conflict_reports_the_same_structured_reason_for_config_and_routes(self):
+        # 同一条 revision 冲突必须让两个写端点返回相同的可操作原因码，而不是一个带原因、一个只剩通用兜底。
+        from adaptive_rsi.runtime import Runtime
+        runtime = Runtime(Store(self.root / "revision-state"))
+        server = Server(runtime)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        headers = {"Cookie": server.cookie + "=" + server.token, "Origin": server.local_origin,
+                   "X-RSI-CSRF": server.csrf, "Content-Type": "application/json"}
+
+        def post(path, body):
+            payload = json.dumps(body).encode()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                connection.request("POST", path, body=payload, headers=headers)
+                response = connection.getresponse()
+                return response.status, response.read()
+            finally:
+                connection.close()
+
+        try:
+            stale = runtime.store.config_revision()
+            runtime.configure({"schedule": {"weight": 3}})
+            self.assertNotEqual(runtime.store.config_revision(), stale)
+            secret = "private-revision-secret"
+            status, config_body = post("/api/config", {"values": {"schedule": {"weight": 4}}, "revision": stale})
+            self.assertEqual(status, 400)
+            status, routes_body = post("/api/model-center/routes",
+                                       {"models": {"planning": {"provider": secret}}, "revision": stale})
+            self.assertEqual(status, 400)
+            self.assertEqual(json.loads(config_body), json.loads(routes_body))
+            self.assertEqual(json.loads(routes_body)["reason_code"], "config_revision_conflict")
+            self.assertIsNone(json.loads(routes_body)["field_path"])
+            self.assertNotIn(secret.encode(), config_body + routes_body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(3)
+            runtime.close()
+
     def test_feedback_overview_is_read_only_and_project_scoped(self):
         for candidate, project in [("feedback-p", "p"), ("feedback-q", "q")]:
             self.store.execute("INSERT INTO candidates(id,project,kind,status,content,evidence,created) "
