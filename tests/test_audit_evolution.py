@@ -2433,7 +2433,7 @@ class AuditEvolutionTest(unittest.TestCase):
         self.assertIs(result['checks_passed'], True)
         self.assertFalse(result['reproducible'])
 
-    def test_save_hotpath_skips_reverification_in_evaluating_state(self):
+    def test_save_refreshes_derived_evidence_when_plan_or_trial_count_changes(self):
         data = {'repeats': 2, 'samples': [{'id': 'x', 'split': 'validation'}]}
         plan = {'data': data, 'sha256': fingerprint(data)}
         evidence = {'preregistered_plan': plan, 'trials': []}
@@ -2447,32 +2447,41 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertEqual(mock_summary.call_count, 1)
             self.assertEqual(evidence['plan_verification']['analysis'], 'planned_in_progress')
 
-            # 2. 追加 trial 后再次以 evaluating 保存：跳过完整重验，但 trials 正常持久化
+            # 2. 证据未变化时再次保存：沿用缓存，不重复计算
+            self.evolution.save('c', 'evaluating', evidence)
+            self.assertEqual(mock_verify.call_count, 1)
+            self.assertEqual(mock_summary.call_count, 1)
+
+            # 3. 追加 trial 后再次以 evaluating 保存：试验数变化必须刷新派生证据，
+            #    否则中断后落库的仍是 0 条试验时的胜场与计划执行进度。
             trial1 = {'case': 'x', 'split': 'validation', 'repetition': 0,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial1)
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 1)
-            self.assertEqual(mock_summary.call_count, 1)
+            self.assertEqual(mock_verify.call_count, 2)
+            self.assertEqual(mock_summary.call_count, 2)
             row1 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row1 is not None
             persisted = json.loads(row1['evidence'])
             self.assertEqual(len(persisted['trials']), 1)
+            self.assertEqual(persisted['win_rate']['wins'], 1)
+            self.assertEqual(persisted['plan_verification']['observed'], 1)
+            self.assertFalse(persisted['plan_verification']['valid'])
 
-            # 3. 计划变化时：触发重新验证
+            # 4. 计划变化时：触发重新验证
             modified_data = {'repeats': 1, 'samples': [{'id': 'x', 'split': 'validation'}]}
             evidence['preregistered_plan'] = {'data': modified_data, 'sha256': fingerprint(modified_data)}
             self.evolution.save('c', 'evaluating', evidence)
-            self.assertEqual(mock_verify.call_count, 2)
-            self.assertEqual(mock_summary.call_count, 2)
+            self.assertEqual(mock_verify.call_count, 3)
+            self.assertEqual(mock_summary.call_count, 3)
 
-            # 4. 终态保存：触发完整重验
+            # 5. 终态保存：触发完整重验
             trial2 = {'case': 'x', 'split': 'validation', 'repetition': 1,
                       'stable': {'pass': False}, 'candidate': {'pass': True}}
             evidence['trials'].append(trial2)
             self.evolution.save('c', 'ready', evidence)
-            self.assertEqual(mock_verify.call_count, 3)
-            self.assertEqual(mock_summary.call_count, 3)
+            self.assertEqual(mock_verify.call_count, 4)
+            self.assertEqual(mock_summary.call_count, 4)
             row2 = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
             assert row2 is not None
             persisted = json.loads(row2['evidence'])
@@ -2480,6 +2489,61 @@ class AuditEvolutionTest(unittest.TestCase):
             self.assertIn('wilson_95', persisted['win_rate'])
             # 终态清理缓存
             self.assertNotIn('c', getattr(self.evolution, '_plan_keys', {}))
+
+    def test_evaluating_save_refreshes_win_rate_and_plan_verification_after_each_trial(self):
+        # 崩溃恢复只改状态、不重算派生证据：评估中的每次 save 都必须让落库的
+        # win_rate / plan_verification 与当前试验数一致，不能停在 0 条试验。
+        data = {'repeats': 2, 'samples': [{'id': 'v1', 'split': 'validation'},
+                                          {'id': 'h1', 'split': 'holdout'}]}
+        plan = {'data': data, 'sha256': fingerprint(data)}
+        evidence = {'preregistered_plan': plan, 'trials': []}
+        self.candidate(evidence)
+
+        def persisted():
+            row = self.store.one("SELECT evidence FROM candidates WHERE id='c'")
+            assert row is not None
+            return json.loads(row['evidence'])
+
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(stored['win_rate']['wins'], 0)
+        self.assertIsNone(stored['win_rate']['estimate'])
+        self.assertEqual(stored['plan_verification']['observed'], 0)
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        all_trials = [
+            {'case': case, 'split': split, 'repetition': repetition,
+             'stable': {'pass': False}, 'candidate': {'pass': True}}
+            for case, split in (('v1', 'validation'), ('h1', 'holdout'))
+            for repetition in range(2)]
+        evidence['trials'] = all_trials[:2]
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 2)
+        self.assertEqual(stored['win_rate']['wins'], 1)
+        self.assertEqual(stored['plan_verification']['observed'], 2)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertFalse(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'planned_in_progress')
+
+        evidence['trials'] = all_trials
+        self.evolution.save('c', 'evaluating', evidence)
+        stored = persisted()
+        self.assertEqual(len(stored['trials']), 4)
+        self.assertEqual(stored['win_rate']['wins'], 2)
+        self.assertEqual(stored['win_rate']['estimate'], 1.0)
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+
+        # 终态结果不变：完整计划通过，分析口径仍为 preregistered。
+        self.evolution.save('c', 'ready', evidence)
+        stored = persisted()
+        self.assertTrue(stored['plan_verification']['valid'])
+        self.assertEqual(stored['plan_verification']['analysis'], 'preregistered')
+        self.assertEqual(stored['plan_verification']['observed'], 4)
+        self.assertEqual(stored['plan_verification']['expected'], 4)
 
     def test_case_selection_follows_population_share(self):
         from adaptive_rsi.evolution import case_stratum, select_cases
