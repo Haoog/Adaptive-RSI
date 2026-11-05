@@ -23,6 +23,17 @@ def captured(name):
     return json.loads((PROTECTION_FIXTURES / name).read_text(encoding='utf-8'))
 
 
+def cleanup_api(branches, pulls, calls):
+    """Paged `release.api` stub: serves one row list per page and records page numbers."""
+    def fake(repo, endpoint, *args, **kwargs):
+        kind = 'branches' if endpoint.startswith('branches') else 'pulls'
+        page = int(endpoint.rsplit('page=', 1)[1])
+        calls.setdefault(kind, []).append(page)
+        pages = branches if kind == 'branches' else pulls
+        return pages[page - 1] if page <= len(pages) else []
+    return fake
+
+
 class ClosedPublicationTest(unittest.TestCase):
     setUp = recovery_tests.DeliveryRecoveryTest.setUp
     publish = recovery_tests.DeliveryRecoveryTest.publish
@@ -82,13 +93,66 @@ class BaselineAndCleanupTest(unittest.TestCase):
         self.assertTrue(result['evidence_invalidated'])
         self.assertEqual(git(self.workspace, 'rev-parse', 'HEAD'), self.head)
 
-    def test_full_cleanup_page_yields_no_candidates(self):
-        branches = [{'name': 'feat/rsi-' + str(i), 'commit': {'sha': str(i)}} for i in range(100)]
-        prs = [{'state': 'CLOSED', 'head': {'ref': row['name'], 'sha': row['commit']['sha']}} for row in branches]
-        with patch.object(release, 'api', side_effect=[branches, prs]):
-            result = delivery.branch_cleanup_preview('example/project')
+    def test_cleanup_preview_reads_past_the_first_page_for_a_deletable_branch(self):
+        first = [{'name': 'feature-%d' % i, 'commit': {'sha': 'b' * 40}} for i in range(100)]
+        second = [{'name': 'fix/rsi-0123456789abcdef', 'commit': {'sha': 'a' * 40}}]
+        second += [{'name': 'feature-b-%d' % i, 'commit': {'sha': 'c' * 40}} for i in range(19)]
+        pulls = [[{'state': 'closed', 'head': {'ref': 'fix/rsi-0123456789abcdef', 'sha': 'a' * 40}}]]
+        calls = {}
+        with patch.object(release, 'api', side_effect=cleanup_api([first, second], pulls, calls)):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['truncated'])
+        self.assertEqual(result['candidates'], ['fix/rsi-0123456789abcdef'])
+        self.assertNotIn('incomplete_inventory', [row['reason'] for row in result['protected']])
+        self.assertFalse(result['deletion_performed'])
+        self.assertEqual(calls['branches'], [1, 2])
+        self.assertEqual(calls['pulls'], [1])
+
+    def test_cleanup_preview_reports_truncated_inventory_at_page_limit(self):
+        pages = []
+        for page in range(1, delivery.PAGE_LIMIT + 1):
+            rows = [{'name': 'feature-%d-%d' % (page, i), 'commit': {'sha': 'b' * 40}} for i in range(99)]
+            if page == 3:
+                rows.append({'name': 'fix/rsi-0123456789abcdef', 'commit': {'sha': 'a' * 40}})
+            else:
+                rows.append({'name': 'feature-%d-x' % page, 'commit': {'sha': 'c' * 40}})
+            pages.append(rows)
+        pulls = [[{'state': 'open', 'head': {'ref': 'other-%d' % i, 'sha': 'd' * 40}} for i in range(100)]
+                 for _ in range(delivery.PAGE_LIMIT)]
+        calls = {}
+        with patch.object(release, 'api', side_effect=cleanup_api(pages, pulls, calls)):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
         self.assertFalse(result['complete'])
+        self.assertTrue(result['truncated'])
         self.assertEqual(result['candidates'], [])
+        reasons = {row['branch']: row['reason'] for row in result['protected']}
+        self.assertEqual(reasons.get('fix/rsi-0123456789abcdef'), 'incomplete_inventory')
+        self.assertFalse(result['deletion_performed'])
+        self.assertEqual(calls['branches'], list(range(1, delivery.PAGE_LIMIT + 1)))
+        self.assertEqual(calls['pulls'], list(range(1, delivery.PAGE_LIMIT + 1)))
+
+    def test_cleanup_preview_keeps_the_cap_when_a_page_read_fails(self):
+        def failing(repo, endpoint, *args, **kwargs):
+            if endpoint.startswith('branches'):
+                raise RuntimeError('gh api failed (HTTP 502)')
+            return []
+
+        with patch.object(release, 'api', side_effect=failing):
+            result = delivery.branch_cleanup_preview('example/project', recovery_refs=set())
+        self.assertFalse(result['complete'])
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['candidates'], [])
+        self.assertFalse(result['deletion_performed'])
+
+    def test_cleanup_preview_requires_recovery_inventory_before_any_candidate(self):
+        branches = [{'name': 'feat/rsi-old', 'commit': {'sha': 'old'}}]
+        prs = [{'state': 'closed', 'head': {'ref': 'feat/rsi-old', 'sha': 'old'}}]
+        with patch.object(release, 'api', side_effect=cleanup_api([branches], [prs], {})):
+            result = delivery.branch_cleanup_preview('example/project')
+        self.assertEqual(result['candidates'], [])
+        self.assertEqual(result['protected'], [{'branch': 'feat/rsi-old', 'reason': 'recovery_inventory_unknown'}])
+        self.assertFalse(result['deletion_performed'])
 
     def test_cleanup_preview_protects_open_pr_recovery_and_unknown_branches(self):
         branches = [{'name': 'feat/rsi-old', 'commit': {'sha': 'old'}},
@@ -97,12 +161,14 @@ class BaselineAndCleanupTest(unittest.TestCase):
                     {'name': 'main', 'commit': {'sha': 'main'}}]
         prs = [{'state': 'CLOSED', 'head': {'ref': 'feat/rsi-old', 'sha': 'old'}},
                {'state': 'OPEN', 'head': {'ref': 'fix/rsi-open', 'sha': 'open'}}]
-        with patch.object(release, 'api', side_effect=[branches, prs]) as command:
+        with patch.object(release, 'api', side_effect=cleanup_api([branches], [prs], {})) as command:
             result = delivery.branch_cleanup_preview('example/project', recovery_refs=['backup'])
+        reasons = {item['branch']: item['reason'] for item in result['protected']}
         self.assertEqual(result['candidates'], ['feat/rsi-old'])
+        self.assertEqual(reasons.get('fix/rsi-open'), 'open_pr')
+        self.assertEqual(reasons.get('feat/rsi-backup'), 'protected_or_recovery')
+        self.assertEqual(reasons.get('main'), 'not_managed')
         self.assertFalse(result['deletion_performed'])
-        self.assertEqual(command.call_count, 2)
-        self.assertTrue(all(len(call.args) == 2 for call in command.call_args_list))
 
     def test_cleanup_preview_distinguishes_pushed_branch_without_pr(self):
         branches = [{'name': 'feat/rsi-pushed', 'commit': {'sha': 'pushed_sha'}},

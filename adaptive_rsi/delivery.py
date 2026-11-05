@@ -373,6 +373,30 @@ def pushed_branch_journal(repo, store):
     return journal
 
 
+PAGE_SIZE = 100
+PAGE_LIMIT = 10
+
+
+def _cleanup_inventory(api, repo, endpoint):
+    """Bounded read of one inventory; an unread page never yields partial truth.
+
+    A short page ends the inventory. Reaching PAGE_LIMIT full pages reports the
+    inventory as truncated instead of pretending the first page is all there is.
+    """
+    rows = []
+    for page in range(1, PAGE_LIMIT + 1):
+        try:
+            batch = api(repo, "%s&page=%d" % (endpoint, page))
+        except (RuntimeError, OSError):
+            return rows, True
+        if not isinstance(batch, list):
+            raise ValueError("Invalid branch cleanup response")
+        rows.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            return rows, False
+    return rows, True
+
+
 def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     """Read-only, bounded preview. Omitted pages and unknown ownership stay protected.
 
@@ -380,14 +404,16 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
     deletion endpoint is provided; candidates must be rechecked before deletion.
     A pushed branch with no PR at all is reported as `pushed_no_pr` when the local
     delivery journal still records that push, so an interrupted publish stays
-    distinguishable from a branch of unknown origin.
+    distinguishable from a branch of unknown origin. `truncated` separates a
+    clipped inventory from a repository that genuinely fits in the page limit.
     """
     from .release import api
-    branches = api(repo, "branches?per_page=100")
-    prs = api(repo, "pulls?state=all&per_page=100")
-    if not isinstance(branches, list) or not isinstance(prs, list):
-        raise ValueError("Invalid branch cleanup response")
-    complete = len(branches) < 100 and len(prs) < 100
+    branches, branches_truncated = _cleanup_inventory(api, repo,
+                                                      "branches?per_page=%d" % PAGE_SIZE)
+    prs, prs_truncated = _cleanup_inventory(api, repo,
+                                            "pulls?state=all&per_page=%d" % PAGE_SIZE)
+    truncated = branches_truncated or prs_truncated
+    complete = not truncated
     candidates, protected = [], []
     recovery = set(recovery_refs or ())
     pushed = pushed_branch_journal(repo, store)
@@ -422,7 +448,7 @@ def branch_cleanup_preview(repo, recovery_refs=None, store=None):
         else:
             candidates.append(name)
     return {"candidates": candidates, "protected": protected, "complete": complete,
-            "deletion_performed": False, "checked_at": time.time()}
+            "truncated": truncated, "deletion_performed": False, "checked_at": time.time()}
 
 
 def failure_attribution(merged, head, result):
