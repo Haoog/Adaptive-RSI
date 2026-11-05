@@ -31,6 +31,9 @@ const {chromium} = require('playwright');
     await page.locator('#goal-text').fill('Navigation must retain my unsent draft');
     const visible=async(name,project)=>{
       await page.waitForFunction(({name,project})=>view===name&&projectId===project&&!document.getElementById('view-'+name).hidden,{name,project});
+      // 初始路由在 state 返回前就设好 view/projectId，选择框要等首个 state 响应才填好选项；
+      // 先等目标项目出现，再断言选中项，避免把加载中的空选择框当成还原失败。
+      await page.waitForFunction(project=>[...document.getElementById('project-select').options].some(option=>option.value===project),project);
       assert.equal(await page.locator('#project-select').inputValue(),project);
     };
     await page.locator('.sidebar nav [data-view="usage"]').click();
