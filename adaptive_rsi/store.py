@@ -539,13 +539,24 @@ class Store:
         rows = self.query(sql, args)
         return rows[0] if rows else None
 
-    def execute(self, sql, args=()):
+    def execute(self, sql, args=(), busy_timeout=None):
         active = getattr(self._read_snapshot, "connection", None)
         if active is not None:
             active.execute(sql, args)
             return
         with self.connect() as db:
-            db.execute(sql, args)
+            if busy_timeout is None:
+                db.execute(sql, args)
+                return
+            previous = db.execute("PRAGMA busy_timeout").fetchone()[0]
+            db.execute("PRAGMA busy_timeout=%d" % busy_timeout)
+            try:
+                db.execute(sql, args)
+            finally:
+                try:
+                    db.execute("PRAGMA busy_timeout=%d" % previous)
+                except sqlite3.Error:
+                    pass
 
     @contextlib.contextmanager
     def snapshot(self):
@@ -637,8 +648,11 @@ class Store:
                     return False
                 self._poll_log_windows[path] = window
         try:
+            # 请求日志是 best-effort：写锁被占用（如后台长写）时不排队等待，
+            # 立即放弃并计入 failed，避免已响应的 handler 线程继续占着连接名额。
             self.execute("INSERT INTO request_log VALUES (?,?,?,?,?,?,?)",
-                         (request, method, path[:300], status, started, ended, error_code[:100]))
+                         (request, method, path[:300], status, started, ended, error_code[:100]),
+                         busy_timeout=0)
         except Exception:
             with self._metrics_lock:
                 self._request_log_counts["failed"] += 1
