@@ -1446,10 +1446,21 @@ class Evaluator:
         # uncertainty (invalid graph, unknown path, unavailable diff, harness
         # drift) leaves the complete set, which is behaviorally identical to
         # scheduling being off.
+        # Every stage copies the whole source tree, scans the harness and runs
+        # environment.setup. Splitting the candidate into two stages can only
+        # shorten wall-clock time when at least two stages may run at once;
+        # with a single stage worker the split just adds one more copy, scan
+        # and dependency install. Performance acceptance already forces one
+        # worker, so it keeps the unsplit stage too.
+        stage_workers = 1 if acceptance and acceptance.get("change_kind") == "performance" else int(
+            config.get("limits", {}).get("concurrency", 1))
         scheduled = None
+        scheduling_skipped = None
         if not harness_differs and not overlay and not test_first:
             graph = scheduling_scope(config, acceptance, changed_files)
-            if graph is not None:
+            if graph is not None and stage_workers < 2:
+                scheduling_skipped = "scheduled_checks_need_parallel_stages"
+            elif graph is not None:
                 affected = affected_checks(changed_files or [], full_checks, graph)
                 if affected != full_checks:
                     scheduled = affected
@@ -1536,8 +1547,7 @@ class Evaluator:
                 seeds, hidden)
         # Benchmarks have exclusive process-wide access; ordinary checks share
         # the global execution capacity while retaining stage concurrency.
-        outcomes = self._run_stages(stages, 1 if acceptance and acceptance.get("change_kind") == "performance"
-                                    else int(config.get("limits", {}).get("concurrency", 1)), stop=stage_stop)
+        outcomes = self._run_stages(stages, stage_workers, stop=stage_stop)
         for label in ["baseline", "acceptance_baseline", "candidate", "candidate_full", "acceptance_candidate"]:
             if label not in outcomes:
                 continue
@@ -1597,6 +1607,8 @@ class Evaluator:
                     changed_files, checks, acceptance["contract"]["check_dependencies"])],
                 "scheduled": [row["name"] for row in scheduled] if scheduled is not None else None,
                 "execution": "full_checks_retained_until_graph_is_independently_validated"}
+            if scheduling_skipped:
+                data["check_dependency_analysis"]["reason"] = scheduling_skipped
         if acceptance:
             from .workflow import improvement
             data["improvement"] = improvement(results, acceptance)
