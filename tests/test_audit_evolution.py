@@ -1527,6 +1527,44 @@ class AuditEvolutionTest(unittest.TestCase):
         (destination / 'evidence.json').write_text('{}')
         self.assertFalse(Evolution.verify_bundle(destination)['valid'])
 
+    def test_bundle_hashing_streams_instead_of_reading_whole_files(self):
+        """封存与校验摘要必须分块读取，峰值内存不随单个文件大小增长。
+
+        整文件 ``read_bytes()`` 会为每个文件临时分配等长内存；300 MiB 用例在 2 GB
+        机器上足以把校验/导出进程顶到 OOM，并连带中断同进程里的运行时。这里用
+        稀疏文件模拟大文件：磁盘占用近零，但读出的字节数与真实文件一致。
+        """
+        import tracemalloc
+        bundle = self.root / 'stream-bundle'
+        bundle.mkdir()
+        big = bundle / 'big.bin'
+        with big.open('wb') as out:
+            out.write(b'x' * 1024)
+            out.truncate(64 * 1024 * 1024)
+        expected = hashlib.sha256()
+        with big.open('rb') as source:
+            for block in iter(lambda: source.read(1024 * 1024), b''):
+                expected.update(block)
+        (bundle / 'bundle.json').write_text(json.dumps(
+            {'version': 1, 'files': {'big.bin': expected.hexdigest()}, 'limitations': []}),
+            encoding='utf-8')
+
+        tracemalloc.start()
+        try:
+            result = Evolution.verify_bundle(bundle)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertTrue(result['valid'], result['mismatches'])
+        self.assertLess(peak, 8 * 1024 * 1024, 'peak %d bytes' % peak)
+
+    def test_bundle_export_and_verify_never_read_whole_files(self):
+        """导出与校验都不能调用整文件读取；禁止 read_bytes 后仍应导出并校验成功。"""
+        import adaptive_rsi.build  # noqa: F401  # 预热模块级 BUILD_ID，避免其自身的小文件读取被误伤
+        with patch.object(Path, 'read_bytes', side_effect=AssertionError('whole-file read')):
+            destination = self.sealed_bundle(repo_name='repo-stream')
+            self.assertTrue(Evolution.verify_bundle(destination)['valid'])
+
     def test_bundle_verification_rejects_unregistered_files(self):
         """封存后新增的未登记文件必须判失效，并阻止复现执行任何检查。
 
